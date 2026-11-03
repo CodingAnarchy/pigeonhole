@@ -60,6 +60,29 @@
   - the probed lists are read with `Nearest::run_async` (D296 PR 5), which yields within a wide list.
 - **It never fans out:** `parallel` is ignored, as for `Nearest::run_async`.
 
+## `Index::open_reader` and `ReadIndex` (#1268 item 5)
+- **`Index::open_reader(&PigeonholeReader, name) -> Result<ReadIndex>`:** the index opened from a reader process, with `open`'s checks (`InvalidArgument` for a table that isn't a vector index).
+- **`ReadIndex`** (`Clone`, `Debug`): `spec()`, `options()`, and `search_f32`/`search_i8`/`search_bits` returning the same `Search`. So `nprobe`, `snapshot`, `parallel`, `run` and `run_async` all work. It has no write method.
+  - **The centroids load with reads only,** at the reader's snapshot. The handle keeps its own cache and reloads it when a search sees `G:layout` change, as `Index` does.
+  - **The results equal the writer's `Index` at the same snapshot.**
+  - **If the writer restarts,** a search fails with `NoWriter` or `SnapshotExpired` (`Error::Db`) until the reader reattaches; searching again is enough.
+  - **The layout cache follows a writer that lost commits:** a search at the current snapshot adopts its fresh layout when the cache's seqno is newer than any now visible (perf287 on #1385). The same rule applies to `Index`.
+- **Internal:** the centroid load and the layout check are shared through a crate-private `Rows` trait over `Table` and `ReadTable`, and `Search` reads either kind of index.
+
+## Half-precision indexes (#1268 item 7)
+- **`Index::create` takes `F16` and `BF16` specs** (ICR 0104's elements). Centroids stay `f32` of the same dimension and metric, since a mean of halves isn't a half.
+- **`Index::insert_f16(id, &[u16])`, `insert_bf16`:** each `u16` is a bit pattern, stored bit for bit. A split's move rewrites the patterns it read, exactly.
+- **`Index::search_f16(&[u16], k)`, `search_bf16`, and the same on `ReadIndex`:** the query widens to `f32` exactly and searches as `nearest_f32` searches a half family, so the hits equal `search_f32` with the widened query.
+- **`insert_f32` and `search_f32` work on a half index too.** A written `f32` vector is rounded to the element, as `put_vector_f32` rounds into a half family, and it's placed in its list by the rounded value, the one stored, so a later split or merge sees the same point (perf287 on #1387). Other mismatches (`i8` or bits in a half index, `f16` bits in a `bf16` index) are `InvalidArgument`.
+- **`Index::bulk_load_f16(expected, vectors)`, `bulk_load_bf16`:** `bulk_load_f32` for half bit patterns, stored bit for bit. The k-means sample and each vector's placement widen into `f32`; the streaming pass refills one buffer per vector. `bulk_load_f32` loads a half index too, rounding as `insert_f32` does.
+- **Internal:** a crate-private `half` module widens patterns into a caller's buffer (`Input::widen_into`), checked against `VectorRef::widen_into` over all 65,536 patterns, and rounds `f32` to a half (`half::narrow`), checked against the format's rounding that `put_vector_f32` uses.
+
+## A per-process registry (#1268 item 8, ICR 0110)
+- **`Index::open`, `open_with_rebalancer` and the `create` forms share an index already open in the process.** They return a clone of the open handle, sharing its centroid cache, its queue of lists to rebalance and its one rebalancing thread. Before, each open had its own, which was correct but duplicated the work.
+- **"Already open" means three things.** An application handle to it is still alive. It's in the same open database, by `Pigeonhole::same_database` (ICR 0110): not another file, a copy of one, or the same file reopened after a close. And its table is still the one opened: the options row still reads through the entry's own table handle, which a dropped (and perhaps recreated) table or a closed database refuses.
+- **The crate's thread starts once per index,** at the first `open` in background mode. `open_with_rebalancer` hands out a rebalancer on the shared queue; several take turns list by list (each list is claimed by one at a time), and they share one `set_wakeup`.
+- **Internal:** a process-wide `Mutex<Vec<Entry>>` of `(name, Weak<Inner>, Weak<user token>)`. The lock is held across a fresh open (a few reads), so concurrent first opens get one index, and across the stale-entry read. Nothing under it takes it again, and no `Inner` drops under it.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);

@@ -4175,3 +4175,45 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - the byte budget, the filters, the linear blend, several namespaces, the refusals, and a reader process recalling exactly what the writer does.
   - Mutations of `id_prefix`, 0-based ranks and the superseded filter were all caught.
 
+
+**T2 (#1336).** Forgetting, as revision 2 §4, with cli692's API on #1336:
+- **The persisted policy** (`StoreOptions::forget`/`episodic_ttl`, `set_forget_policy`) is the default. `forget()` takes a one-off `.policy`.
+- **Opening:** `OpenOptions` with `open_with`/`create_with`, and `take_forgetter` for an application-owned forgetter.
+- **Each deletion re-evaluates in its transaction (M2):** `forget_in` reads the stats, peak, meta and backlinks there, then deletes through `delete_in`. Protection covers pinned memories and the sources of a live semantic memory.
+- **Tests:**
+  - retention, TTL and protection, including protection lapsing when the semantic memory goes;
+  - bounded, resumable passes;
+  - forget racing `mark_used`, a merge's importance raise, and a new `DERIVED_FROM` link, each conflicting and ending in `verify`;
+  - the persisted policy;
+  - the application's forgetter and the crate's thread.
+  - Mutations of the transaction's reads and of protection were caught.
+
+**T3 (#1337).** Consolidation and near-duplicate dedup, as revision 2 §4, with cli692's API (c6589818220) and simp724's C1–C4 on #1337:
+- **The commit:** one transaction per group, skipped (never retried) on a change or a conflict.
+  - **The re-reads:** content, `consolidated`, `superseded_by` and `pinned`, plus the `sources` whose union moves to the new memories (C1).
+  - **A summary that merges into one of the group's own memories** makes that memory the result (C2).
+  - **Under `Delete`:** a deleted memory's superseded memories move to the summary (C3).
+- **Transaction reads are at the snapshot,** so the commit folds duplicate returned texts itself, and removes the links a result made to a memory it deletes.
+- **The policy is per call, with no thread.** A consolidator `Err` stops the pass with `Error::Consolidate { error, pass }`.
+- **Near dedup** is a persisted `NearDedup`, checked before `remember`'s transaction. `remember_in` doesn't check; `near_duplicate` is there for its callers.
+- **Tests:**
+  - two consolidations of one group: nested, so the second finds its group taken, and two threads, one committing and the other skipping;
+  - the three source policies, with nothing returned and with a summary equal to a source;
+  - grouping by session, similarity, age, pinning and limits;
+  - a consolidator's failure, the refusals, and the folding of duplicate texts;
+  - near dedup's policies, threshold, superseded match and exact precedence, the setting, `near_duplicate` and `remember_in`.
+  - Each ends in `verify`.
+  - Mutations of the `consolidated` re-read, the C3 re-pointing, the link removal under `Delete` and the folding were caught.
+
+**T4 (#1338).** Graph expansion in recall, as revision 2 §3 step 3. The calls on #1338 (c6593049416), with cli692's API and simp724's O1 and O2:
+- **`Recall::expand(Expand::hops(n).max(m))`:** 1 to 4 hops and at most `m` memories (default 20), seeded by the top 10 fused candidates. Seed `i` is worth `1 / i`.
+- **Both directions through `Traverse`:** a one-hop traversal of `links` and then `backlinks` per memory of the previous hop, at the recall's snapshot. One batched call per hop would keep destinations in key order, and so favour the newest seeds when cut.
+- **The graph value** is the best of a memory's shortest paths: the largest `value × weight` over its links to the previous hop.
+- **`max` keeps each hop's best-valued** memories (O1).
+- **The budget:** a separate pool of the recall's `byte_budget`, so a recall holds up to `2B`. A hop that doesn't fit whole is dropped, and the hops before it stay exact (O2).
+- **The walk uses the candidates' own filter,** so a superseded memory or another session's doesn't bridge.
+- **Tests:**
+  - every graph value, rank and fused score against a brute-force walk of the stored links, under no cut, a `max` cut, budget cuts and the filters;
+  - the budget at its boundary, `max` keeping the best-valued, and each filter on a bridge;
+  - no graph signal without `expand` or for seeds, the hop errors, and a reader process.
+  - Mutations dropping the backlink direction, and keeping a hop's first-found memories instead of its best, were caught.

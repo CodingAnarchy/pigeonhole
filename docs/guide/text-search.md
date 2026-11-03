@@ -132,7 +132,12 @@ Options are fixed when the index is created.
 | `max_term_bytes` | 64 | Longer words are dropped. |
 | `max_terms` | 10,000 | A document with more distinct terms is refused before anything is written. |
 
-A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which splits on Unicode word boundaries and lowercases.
+**Which normalisation to pick** (#1291). Normalisation runs on each token after the tokeniser splits the original text, so highlights still point into the text as written. Queries are normalised the same way (builder terms, phrase words and fuzzy terms included), and the setting is fixed at create.
+- **`Nfc`, the default, for nearly everything.** It only unifies different encodings of the same character, such as a precomposed `é` and `e` plus a combining accent, or composed and decomposed Hangul, so nothing a reader would call different is merged. macOS file names and some keyboards produce decomposed text, and most web text is composed.
+- **`Nfkc` for text whose characters vary in form, not meaning:** text extracted from PDFs or OCR (ligatures such as `ﬁ`), East Asian content with full-width letters and digits, and agent memory fed from mixed sources. It also folds forms some content means literally: `²` becomes `2`, `①` becomes `1`, `ﬁ` becomes `fi`, and full-width becomes ASCII. A memory store's own index is `Nfc` today; [#1381](https://github.com/CodingAnarchy/pigeonhole/issues/1381) adds a `pigeonhole-memory` option to choose.
+- **`None` only where code points must match exactly,** such as identifiers or hashes, or text already normalised before it's written.
+
+A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which splits on Unicode word boundaries and lowercases. Normalisation applies to its tokens too.
 - **Its name and fingerprint are stored,** and an open with another tokeniser fails with `Mismatch`.
 - **The built-in tokeniser's fingerprint includes its Unicode version,** so a dependency update that changes word boundaries makes `open` refuse until you `repair` into a new index.
 
@@ -142,7 +147,7 @@ A reader process opens the index with `Index::open_reader(&reader, name)`. That 
 ## Performance
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
-The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted, after a flush and a full compaction. They're the means of two runs, which agreed within 4%.
+The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted, after a flush and a full compaction. They're the means of two runs, which agreed within 4%. The fuzzy rows come from a later pair of runs, on #1363's build, which agreed within 5%.
 
 **Writing** goes one document per transaction, `Buffered`:
 
@@ -165,15 +170,15 @@ The write rate stays flat from the first document to the millionth. A full compa
 | that mixed phrase, slop 2 | 79 ms | 265 ms |
 | that mixed phrase, slop 10 | 81 ms | 357 ms |
 | two terms, top 1,000 | 28 ms | 188 ms |
-| a fuzzy term, 1 edit (41 expansions) | 17 ms | 142 ms |
-| a fuzzy term, 2 edits (44 expansions) | 21 ms | 142 ms |
-| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 15 ms | 110 ms |
-| a fuzzy term, 1 edit, and a term drawn by frequency | 26 ms | 2,932 ms |
+| a fuzzy term, 1 edit (41 expansions) | 16 ms | 138 ms |
+| a fuzzy term, 2 edits (44 expansions) | 19 ms | 136 ms |
+| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 14 ms | 102 ms |
+| a fuzzy term, 1 edit, and a term drawn by frequency | 13 ms | 438 ms |
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
 - **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Compaction doesn't change that, since it's the positions' size. Positional skipping is tracked in #1334.
 - **Fuzzy terms** cost a walk over the dictionary near the term, then the matching terms' postings. Once the top `k` are held, an expansion that can't lift a document into them stops being read (#1333). On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk.
-- **A fuzzy term beside a common term** has a long tail. When the common term drives, each of its documents looks the fuzzy term's expansions up. #1368 makes those lookups advance along the postings once that's cheaper, and #1363 tracks the opposite case: a fuzzy term over common expansions, beside a rare term.
+- **A fuzzy term beside another term** has a long tail. When a common term drives, each of its documents looks the fuzzy term's expansions up, and #1368 makes those lookups advance along the postings once that's cheaper. In the opposite case, a fuzzy term over common expansions beside a rare term, the fuzzy clause walks only the expansions that could bring a document in alone, and looks the rest up for the documents that can still make the top `k` (#1363).
 - **Positions are cheap to write:** 13% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors

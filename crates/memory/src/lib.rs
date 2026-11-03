@@ -17,17 +17,30 @@
 //!   (or a linear blend) within a byte budget, at one snapshot, and works in reader
 //!   processes ([`Store::open_reader`], [`ReadStore`]).
 
+mod consolidate;
+mod dedup;
 mod error;
+mod forget;
+/// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
+/// unstable, and never needed by applications.
+#[cfg(feature = "__unstable-hooks")]
+#[doc(hidden)]
+pub mod hooks;
 mod layout;
 mod recall;
 mod store;
 
+pub use consolidate::{
+    Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
+};
+pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
+pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use layout::{MemoryId, normalize};
-pub use recall::{Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
+pub use recall::{Expand, Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
 pub use store::{
-    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, ReadStore, Remembered, Source, Store,
-    StoreOptions, StoreStats, StoredMemory,
+    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
+    Source, Store, StoreOptions, StoreStats, StoredMemory,
 };
 
 #[cfg(doctest)]

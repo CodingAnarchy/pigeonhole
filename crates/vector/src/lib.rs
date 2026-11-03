@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod half;
 /// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
 /// unstable, and never needed by applications.
 #[cfg(feature = "__unstable-hooks")]
@@ -32,9 +33,10 @@ mod index;
 mod layout;
 mod point;
 mod rebalancer;
+mod registry;
 
 pub use error::{Error, Result};
-pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, Rebalance, Search};
+pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, ReadIndex, Rebalance, Search};
 pub use rebalancer::Rebalancer;
 
 /// The user guide's vectors page and the crate README, compiled and run as doctests.

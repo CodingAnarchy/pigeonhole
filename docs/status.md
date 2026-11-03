@@ -106,6 +106,14 @@ The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2
 
 ## On main since 1.0.0
 - **Aggregate families** ([D294](design/decisions/phase-3.md#d294), #487): min, max and HyperLogLog (distinct count) families beside counters (#1194, #1200, #1202). They're behind the first `incompat` feature bit, so a file holding one is refused by 1.0.x. ICR 0094; the guide's [Data modeling](guide/data-modeling.md#min-and-max).
+- **More aggregate families** ([D298](design/decisions/phase-3.md#d298), #488, ICR 0096), all in 1.1.0:
+  - **Kinds:** bitwise OR/AND/XOR over `u64`, `f64` min and max (#1213); an exact `f64` sum and mean/variance (#1220); fixed-bucket histograms and log-linear quantile sketches (#1221); bloom filters, with `aggregate_bytes` elements for bloom and HLL (#1224); roaring `u32` sets (#1295).
+  - **Large values:** bloom and set values may be separated into blob files, and compaction folds new inputs into them (#1246).
+  - **Checkpoints:** a read keeps a folded value once the inputs it folded add up to a quarter of the value's size, for every kind (#1310). That replaces #1246's 4 KiB and #1295's 256 KiB caps.
+  - **Compatibility:** all are under `incompat` bit 0, like D294's.
+  - **Docs:** the guide's [Data modeling](guide/data-modeling.md#bitwise-and-f64-aggregations).
+  - **Deferred:** the candidates D298 didn't take are in #1317.
+  - **Still owed:** §7's box measurement of the hub case (common neighbours of two 2M-element sets, ≤ 2 ms), #1319.
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
 ## Tracked follow-ups

@@ -225,6 +225,11 @@
 # knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
 # shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
 #
+# knn-exact-f16 lowered for #1393 (#1306; the f16 kernels widen 64 halves at a time with half's
+# convert_to_f32_slice, F16C under callgrind), the head's count (run 41574416929, 556670e7)
+# times (1 + 0.3%): 1976, from 2512 (count 2504 -> 1970, -21.3%). Still +16% on knn-exact: the
+# rest is half's wrapper, which only a fenced unsafe F16C call removes (#1396, Post-1.0).
+#
 # New shape for #1320 (#1302; D308's byte-budgeted nearest search, D193: every shape has a
 # ceiling), the head's count (run 41501153418, 2c6f21a8) times (1 + 0.3%): knn-budget 1694,
 # equal to knn-exact's: the budget bounds the result, not the read, and the cut over 10
@@ -291,6 +296,6 @@ knn-exact 1696 0.3
 knn-filtered 3400 0.3
 scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
-knn-exact-f16 2512 0.3
+knn-exact-f16 1976 0.3
 knn-exact-bf16 1693 0.3
 knn-budget 1700 0.3

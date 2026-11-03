@@ -17,6 +17,8 @@ doctest = false
 
 [dependencies]
 pigeonhole = { workspace = true }
+# `pigeonhole.memory` (D311 T6).
+pigeonhole-memory = { workspace = true }
 pyo3 = { version = "0.30.1", features = ["abi3-py311"] }
 
 [lints]

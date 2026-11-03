@@ -155,7 +155,48 @@ pub(crate) enum Command {
         /// `feed_poll` serves too: phdb's open inherits it.
         #[arg(long, value_name = "BYTES", conflicts_with = "read_only")]
         change_feed: Option<u64>,
+        /// The agent memory tools (D311 T7).
+        #[command(flatten)]
+        memory: MemoryArgs,
     },
+}
+
+/// `phdb mcp`'s agent memory options (D311 T7): a `pigeonhole-memory` store and the tools
+/// over it.
+#[derive(Debug, Clone, Default, clap::Args)]
+#[command(next_help_heading = "Agent memory")]
+pub(crate) struct MemoryArgs {
+    /// Serve the memory tools over the store NAME (its tables are `mem_NAME` and
+    /// `mem_NAME_text`), creating it if it is missing and the database is writable.
+    #[arg(long, value_name = "NAME")]
+    pub memory: Option<String>,
+    /// A new store's embedding model id, when the client supplies the embeddings: the store
+    /// is pinned to it, and refuses embeddings that name another model. With
+    /// `--memory-dim`.
+    #[arg(long, value_name = "ID", requires_all = ["memory", "memory_dim"], conflicts_with = "embed_url")]
+    pub memory_model: Option<String>,
+    /// A new store's embedding dimension, with `--memory-model`.
+    #[arg(long, value_name = "N", requires = "memory_model")]
+    pub memory_dim: Option<u32>,
+    /// A new store's embedding element: f32, f16 (half the size) or bf16.
+    #[arg(long, value_name = "ELEMENT", default_value = "f32", value_parser = ["f32", "f16", "bf16"], requires = "memory")]
+    pub memory_element: String,
+    /// A new store's episodic memories are forgotten this many hours after they were made,
+    /// unless pinned or a summary derives from them (the store's forget policy, D311 T2).
+    #[arg(long, value_name = "HOURS", requires = "memory")]
+    pub memory_episodic_ttl: Option<u64>,
+    /// Compute the embeddings in the server through this OpenAI-compatible `/embeddings`
+    /// endpoint (the full URL). The memory tools then take text only. Memory text and recall
+    /// queries are sent to it.
+    #[arg(long, value_name = "URL", requires_all = ["memory", "embed_model"])]
+    pub embed_url: Option<String>,
+    /// The endpoint's model name, sent with each request; a new store is pinned to it.
+    #[arg(long, value_name = "NAME", requires = "embed_url")]
+    pub embed_model: Option<String>,
+    /// The environment variable holding the endpoint's API key, sent as a bearer token. The
+    /// key itself is never a flag, and never logged.
+    #[arg(long, value_name = "VAR", requires = "embed_url")]
+    pub embed_key_env: Option<String>,
 }
 
 impl Cli {

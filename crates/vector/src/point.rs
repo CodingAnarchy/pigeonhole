@@ -30,24 +30,34 @@ impl Point {
     }
 }
 
-/// A caller's vector, borrowed.
+/// A caller's vector, borrowed. A half vector is its raw bit patterns (#1268 item 7).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Input<'a> {
     F32(&'a [f32]),
     I8(&'a [i8]),
     Bits(&'a [u8]),
+    F16(&'a [u16]),
+    BF16(&'a [u16]),
 }
 
 impl Input<'_> {
     /// Refuses a vector of another element type or dimension than `spec`'s. The components
     /// are checked by the write (or the search) itself.
+    ///
+    /// An `f32` vector also fits a half index: written, it's rounded to the element, as
+    /// `put_vector_f32` rounds into a half family; searched, it's compared in `f32`, as
+    /// `nearest_f32` compares a half family (ICR 0104).
     pub(crate) fn check(&self, spec: &VectorSpec) -> Result<()> {
         let (element, dim) = match self {
             Input::F32(x) => (Element::F32, x.len()),
             Input::I8(x) => (Element::I8, x.len()),
             Input::Bits(x) => (Element::Bit, 8 * x.len()),
+            Input::F16(x) => (Element::F16, x.len()),
+            Input::BF16(x) => (Element::BF16, x.len()),
         };
-        if element != spec.element() || dim != spec.dim() as usize {
+        let fits = element == spec.element()
+            || (element == Element::F32 && matches!(spec.element(), Element::F16 | Element::BF16));
+        if !fits || dim != spec.dim() as usize {
             return Err(Error::InvalidArgument(format!(
                 "the index holds vectors of {} {:?}, not {dim} {element:?}",
                 spec.dim(),
@@ -59,10 +69,65 @@ impl Input<'_> {
 
     pub(crate) fn point(&self) -> Point {
         match self {
-            Input::F32(x) => Point::F32(x.to_vec()),
-            Input::I8(x) => Point::F32(x.iter().map(|v| f32::from(*v)).collect()),
             Input::Bits(x) => Point::Bits(x.to_vec()),
+            _ => {
+                let mut out = Vec::new();
+                self.widen_into(&mut out);
+                Point::F32(out)
+            }
         }
+    }
+
+    /// The point a write places this vector by: [`point`](Self::point), except that an
+    /// `f32` vector written into a half index is first rounded to the element, so it's
+    /// placed by the value stored, the one a later split or merge reads back (#1387). A
+    /// search keeps `point`: it compares the query unrounded, as `nearest_f32` does.
+    pub(crate) fn placed(&self, spec: &VectorSpec) -> Point {
+        let mut out = Point::F32(Vec::new());
+        self.placed_into(spec, &mut out);
+        out
+    }
+
+    /// [`placed`](Self::placed) into `out`, reusing its buffer (a bulk load's per-vector
+    /// placement allocates nothing).
+    pub(crate) fn placed_into(&self, spec: &VectorSpec, out: &mut Point) {
+        if let Input::Bits(x) = self {
+            match out {
+                Point::Bits(b) => {
+                    b.clear();
+                    b.extend_from_slice(x);
+                }
+                _ => *out = Point::Bits(x.to_vec()),
+            }
+            return;
+        }
+        if !matches!(out, Point::F32(_)) {
+            *out = Point::F32(Vec::new());
+        }
+        let Point::F32(buf) = out else {
+            unreachable!("an f32 point")
+        };
+        buf.clear();
+        self.widen_into(buf);
+        if let (Input::F32(_), e @ (Element::F16 | Element::BF16)) = (self, spec.element()) {
+            for x in buf.iter_mut() {
+                *x = crate::half::round_trip(e, *x);
+            }
+        }
+    }
+
+    /// Appends the vector to `out` as `f32`s (an `i8` or half vector widened, exactly);
+    /// `false`, with nothing appended, for bits. A bulk load can widen every vector into
+    /// one reused buffer this way.
+    pub(crate) fn widen_into(&self, out: &mut Vec<f32>) -> bool {
+        match self {
+            Input::F32(x) => out.extend_from_slice(x),
+            Input::I8(x) => out.extend(x.iter().map(|v| f32::from(*v))),
+            Input::F16(x) => crate::half::widen_into(Element::F16, x, out),
+            Input::BF16(x) => crate::half::widen_into(Element::BF16, x, out),
+            Input::Bits(_) => return false,
+        }
+        true
     }
 
     pub(crate) fn put(&self, tx: &mut Transaction, t: &Table, row: &[u8], id: &[u8]) {
@@ -70,6 +135,8 @@ impl Input<'_> {
             Input::F32(x) => tx.put_vector_f32(t, row, crate::layout::VEC, id, x),
             Input::I8(x) => tx.put_vector_i8(t, row, crate::layout::VEC, id, x),
             Input::Bits(x) => tx.put_vector_bits(t, row, crate::layout::VEC, id, x),
+            Input::F16(x) => tx.put_vector_f16(t, row, crate::layout::VEC, id, x),
+            Input::BF16(x) => tx.put_vector_bf16(t, row, crate::layout::VEC, id, x),
         };
     }
 }
@@ -80,6 +147,9 @@ pub(crate) enum Stored {
     F32(Vec<f32>),
     I8(Vec<i8>),
     Bits(Vec<u8>),
+    /// A half vector's bit patterns, so a move rewrites it exactly.
+    F16(Vec<u16>),
+    BF16(Vec<u16>),
 }
 
 impl Stored {
@@ -88,6 +158,8 @@ impl Stored {
             Element::F32 => Stored::F32(v.to_f32_vec().unwrap_or_default()),
             Element::I8 => Stored::I8(v.as_bytes().iter().map(|b| *b as i8).collect()),
             Element::Bit => Stored::Bits(v.as_bytes().to_vec()),
+            Element::F16 => Stored::F16(halves(v.as_bytes())),
+            Element::BF16 => Stored::BF16(halves(v.as_bytes())),
             other => {
                 return Err(Error::Corruption(format!(
                     "a list holds a vector of element {other:?}"
@@ -101,12 +173,24 @@ impl Stored {
             Stored::F32(x) => Input::F32(x),
             Stored::I8(x) => Input::I8(x),
             Stored::Bits(x) => Input::Bits(x),
+            Stored::F16(x) => Input::F16(x),
+            Stored::BF16(x) => Input::BF16(x),
         }
     }
 }
 
-/// `p`'s distance to the centroid `c`, under the centroid family's spec (`f32` for `f32`
-/// and `i8` indexes, bits for bit indexes; the index's metric).
+/// A half vector's stored payload (little-endian `u16`s) as its bit patterns.
+fn halves(payload: &[u8]) -> Vec<u16> {
+    payload
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect()
+}
+
+/// `p`'s distance to the centroid `c`, under the centroid family's spec (`f32` for `f32`,
+/// `f16`, `bf16` and `i8` indexes, bits for bit indexes; the index's metric).
 pub(crate) fn distance(cen: &VectorSpec, p: &Point, c: &Vector) -> Result<f64> {
     Ok(match p {
         Point::F32(q) => cen.distance_f32(q, c.as_ref())?,
@@ -392,5 +476,25 @@ mod tests {
         assert!(moved.iter().step_by(2).all(|m| *m == moved[0]));
         assert!(moved.iter().skip(1).step_by(2).all(|m| *m == moved[1]));
         assert_ne!(moved[0], moved[1]);
+    }
+
+    /// An `f32` vector written into a half index is placed by the value stored (perf287 on
+    /// #1387); into an `f32` index, and as a search's query, it stays as given. A reused
+    /// point is refilled, whatever it held.
+    #[test]
+    fn a_write_places_by_the_stored_value() {
+        let f16 = VectorSpec::new(2, Element::F16, Metric::L2).unwrap();
+        let bf16 = VectorSpec::new(2, Element::BF16, Metric::L2).unwrap();
+        let f32s = VectorSpec::new(2, Element::F32, Metric::L2).unwrap();
+        let x = Input::F32(&[1.0001, 2.0]);
+        assert_eq!(x.placed(&f16), Input::F16(&[0x3c00, 0x4000]).point());
+        assert_eq!(x.placed(&bf16), Input::BF16(&[0x3f80, 0x4000]).point());
+        assert_eq!(x.placed(&f32s), x.point());
+        assert_eq!(x.point(), Point::F32(vec![1.0001, 2.0]));
+        let mut p = Point::Bits(vec![7]);
+        Input::F16(&[0x3c00, 0x4000]).placed_into(&f16, &mut p);
+        assert_eq!(p, Point::F32(vec![1.0, 2.0]));
+        Input::Bits(&[1, 2]).placed_into(&f16, &mut p);
+        assert_eq!(p, Point::Bits(vec![1, 2]));
     }
 }

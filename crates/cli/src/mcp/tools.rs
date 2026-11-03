@@ -75,7 +75,7 @@ const MAX_WAIT_MS: u64 = 30_000;
 /// node-key bytes, plus 4 a node for parents. Past it, a cursor runs the traversal again.
 const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
-type Outcome = Result<Map<String, Value>, Failure>;
+pub(super) type Outcome = Result<Map<String, Value>, Failure>;
 
 pub(super) struct Tools {
     db: Db,
@@ -88,6 +88,8 @@ pub(super) struct Tools {
     /// The id the next traversal run gets: its cursors carry it. Seeded from the clock, so a
     /// cursor kept across a server restart misses the new server's runs (ai1249 on #1365).
     runs: AtomicU64,
+    /// `--memory`: the agent memory tools (D311 T7).
+    memory: Option<super::memory::Memory>,
 }
 
 /// A traversal result kept for its cursors.
@@ -99,11 +101,17 @@ struct CachedTraversal {
 }
 
 impl Tools {
-    pub(super) fn new(db: Db, writable: bool, limits: Limits) -> Self {
+    pub(super) fn new(
+        db: Db,
+        writable: bool,
+        limits: Limits,
+        memory: Option<super::memory::Memory>,
+    ) -> Self {
         Self {
             db,
             writable,
             limits,
+            memory,
             traversal: Mutex::new(None),
             runs: AtomicU64::new(
                 std::time::SystemTime::now()
@@ -114,7 +122,15 @@ impl Tools {
     }
 
     pub(super) fn close(self) -> Result<(), Failure> {
+        if let Some(m) = self.memory {
+            m.close();
+        }
         self.db.close()
+    }
+
+    /// The memory tools, when `--memory` is set.
+    pub(super) fn memory(&self) -> Option<&super::memory::Memory> {
+        self.memory.as_ref()
     }
 
     /// `tools/list`: `nearest` only when the database has a vector family, and the write
@@ -135,7 +151,18 @@ impl Tools {
         if self.writable {
             tools.extend([write(), create_table()]);
         }
+        if let Some(m) = &self.memory {
+            tools.extend(m.list());
+        }
         tools
+    }
+
+    /// The names [`list`](Self::list) gives now.
+    pub(super) fn names(&self) -> Vec<String> {
+        self.list()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
     }
 
     /// `tools/call`, or `None` for a tool this server doesn't have.
@@ -150,7 +177,7 @@ impl Tools {
             "nearest" => self.nearest(a),
             "write" => self.write(a),
             "create_table" => self.create_table(a),
-            _ => return None,
+            _ => return self.memory.as_ref()?.call(name, args),
         })
     }
 
@@ -1367,7 +1394,7 @@ fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn object(v: Value) -> Map<String, Value> {
+pub(super) fn object(v: Value) -> Map<String, Value> {
     match v {
         Value::Object(m) => m,
         _ => unreachable!("json! of an object literal"),
@@ -1376,11 +1403,11 @@ fn object(v: Value) -> Map<String, Value> {
 
 /// A tool call's arguments.
 #[derive(Clone, Copy)]
-struct Args<'a>(&'a Map<String, Value>);
+pub(super) struct Args<'a>(pub(super) &'a Map<String, Value>);
 
 impl Args<'_> {
     /// Fails on an argument not in `allowed`, so a misspelt one isn't silently ignored.
-    fn only(&self, allowed: &[&str]) -> Result<(), Failure> {
+    pub(super) fn only(&self, allowed: &[&str]) -> Result<(), Failure> {
         match self.0.keys().find(|k| !allowed.contains(&k.as_str())) {
             Some(k) => Err(Failure::usage(&format!(
                 "unknown argument {k} (this tool takes {})",
@@ -1390,16 +1417,16 @@ impl Args<'_> {
         }
     }
 
-    fn get(&self, name: &str) -> Option<&Value> {
+    pub(super) fn get(&self, name: &str) -> Option<&Value> {
         self.0.get(name).filter(|v| !v.is_null())
     }
 
-    fn str(&self, name: &str) -> Result<&str, Failure> {
+    pub(super) fn str(&self, name: &str) -> Result<&str, Failure> {
         self.opt_str(name)?
             .ok_or_else(|| Failure::usage(&format!("{name} is required")))
     }
 
-    fn opt_str(&self, name: &str) -> Result<Option<&str>, Failure> {
+    pub(super) fn opt_str(&self, name: &str) -> Result<Option<&str>, Failure> {
         self.get(name)
             .map(|v| {
                 v.as_str()
@@ -1419,7 +1446,7 @@ impl Args<'_> {
             .transpose()
     }
 
-    fn list(&self, name: &str) -> Result<&[Value], Failure> {
+    pub(super) fn list(&self, name: &str) -> Result<&[Value], Failure> {
         match self.get(name) {
             None => Ok(&[]),
             Some(Value::Array(a)) if a.len() <= MAX_ITEMS => Ok(a),
@@ -1430,7 +1457,7 @@ impl Args<'_> {
         }
     }
 
-    fn str_list(&self, name: &str) -> Result<Vec<String>, Failure> {
+    pub(super) fn str_list(&self, name: &str) -> Result<Vec<String>, Failure> {
         self.list(name)?
             .iter()
             .map(|v| {
@@ -1448,7 +1475,7 @@ impl Args<'_> {
             .collect()
     }
 
-    fn opt_u64(&self, name: &str, min: u64, max: u64) -> Result<Option<u64>, Failure> {
+    pub(super) fn opt_u64(&self, name: &str, min: u64, max: u64) -> Result<Option<u64>, Failure> {
         self.get(name)
             .map(|v| {
                 v.as_u64()
@@ -1460,11 +1487,17 @@ impl Args<'_> {
             .transpose()
     }
 
-    fn u64_or(&self, name: &str, default: u64, min: u64, max: u64) -> Result<u64, Failure> {
+    pub(super) fn u64_or(
+        &self,
+        name: &str,
+        default: u64,
+        min: u64,
+        max: u64,
+    ) -> Result<u64, Failure> {
         Ok(self.opt_u64(name, min, max)?.unwrap_or(default))
     }
 
-    fn bool_or(&self, name: &str, default: bool) -> Result<bool, Failure> {
+    pub(super) fn bool_or(&self, name: &str, default: bool) -> Result<bool, Failure> {
         self.get(name).map_or(Ok(default), |v| {
             v.as_bool()
                 .ok_or_else(|| Failure::usage(&format!("{name}: true or false")))
@@ -1490,7 +1523,13 @@ fn bytes_schema(description: &str) -> Value {
     })
 }
 
-fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool) -> Value {
+pub(super) fn tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    schema: Value,
+    read_only: bool,
+) -> Value {
     json!({
         "name": name,
         "title": title,
@@ -1499,7 +1538,7 @@ fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bo
         "annotations": {
             "title": title,
             "readOnlyHint": read_only,
-            "destructiveHint": !read_only && name == "write",
+            "destructiveHint": !read_only && matches!(name, "write" | "memory_forget"),
             "idempotentHint": read_only || name == "create_table",
             "openWorldHint": false,
         },

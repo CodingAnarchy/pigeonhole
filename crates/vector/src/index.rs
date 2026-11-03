@@ -1,12 +1,13 @@
 //! The index (D306): writes, inline split and merge, search, and verification.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use pigeonhole::{
-    Element, ErrorCode, Family, KeySet, Pigeonhole, RetryPolicy, Snapshot, Table, Transaction,
-    Vector, VectorSpec,
+    Element, ErrorCode, Family, KeySet, KeysRead, Pigeonhole, PigeonholeReader, ReadTable,
+    RetryPolicy, Scan, Snapshot, Table, Transaction, Vector, VectorSpec,
 };
 
 use crate::layout::{
@@ -263,6 +264,22 @@ pub(crate) struct Inner {
     pending: Mutex<VecDeque<u32>>,
     /// Wakes the background rebalancer, and tells it when the last handle is gone.
     signal: Arc<Signal>,
+    /// The crate's rebalancing thread was started for this index ([`Index::open`] in
+    /// background mode): one per index, however many opens share it (#1268 item 8).
+    thread: AtomicBool,
+}
+
+impl Inner {
+    pub(crate) fn db(&self) -> &Pigeonhole {
+        &self.db
+    }
+
+    /// Whether this is still the index its table name names: its options row reads through
+    /// its own table handle. A dropped table (perhaps created again since) or a closed
+    /// database refuses the read (the registry's stale-entry check, #1268 item 8).
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self.table.get(GLOBAL, META, OPTS), Ok(Some(_)))
+    }
 }
 
 impl Drop for Inner {
@@ -355,7 +372,10 @@ fn corrupt(what: &str) -> Error {
 fn centroid_spec(spec: &VectorSpec) -> Result<VectorSpec> {
     match spec.element() {
         Element::Bit => Ok(*spec),
-        Element::F32 | Element::I8 => Ok(VectorSpec::new(spec.dim(), Element::F32, spec.metric())?),
+        // Half indexes keep `f32` centroids too (#1268 item 7): a mean of halves isn't a half.
+        Element::F32 | Element::I8 | Element::F16 | Element::BF16 => {
+            Ok(VectorSpec::new(spec.dim(), Element::F32, spec.metric())?)
+        }
         other => Err(Error::InvalidArgument(format!(
             "an index of {other:?} vectors is not supported"
         ))),
@@ -425,18 +445,62 @@ fn put_centroid(tx: &mut Transaction, t: &Table, list: u32, c: &Point) {
 }
 
 /// The centroids at `s`.
-fn load(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
-    let version = t
-        .get_at(s, GLOBAL, META, LAYOUT)?
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0);
+/// The reads a search and a centroid load make, from the writer's table or a reader
+/// process's (#1268 item 5, [`ReadIndex`]).
+pub(crate) trait Rows: Sync {
+    /// `G:layout` at `s`.
+    fn layout_version(&self, s: &Snapshot) -> Result<u64>;
+    /// [`layout_version`](Self::layout_version), without blocking on the device.
+    #[cfg(feature = "async")]
+    fn layout_version_async(&self, s: &Snapshot) -> pigeonhole::nonblocking::GetFuture;
+    /// Every `C{list}` row's centroid and metadata.
+    fn centroids(&self) -> Scan<'_>;
+    /// The rows of `keys`.
+    fn rows_of<'t>(&'t self, keys: &KeySet) -> KeysRead<'t>;
+}
+
+impl Rows for Table {
+    fn layout_version(&self, s: &Snapshot) -> Result<u64> {
+        Ok(self
+            .get_at(s, GLOBAL, META, LAYOUT)?
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0))
+    }
+    #[cfg(feature = "async")]
+    fn layout_version_async(&self, s: &Snapshot) -> pigeonhole::nonblocking::GetFuture {
+        self.get_at_async(s, GLOBAL, META, LAYOUT)
+    }
+    fn centroids(&self) -> Scan<'_> {
+        self.scan_prefix(b"C").families([CEN, META])
+    }
+    fn rows_of<'t>(&'t self, keys: &KeySet) -> KeysRead<'t> {
+        self.keys(keys)
+    }
+}
+
+impl Rows for ReadTable {
+    fn layout_version(&self, s: &Snapshot) -> Result<u64> {
+        Ok(self
+            .get_at(s, GLOBAL, META, LAYOUT)?
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0))
+    }
+    #[cfg(feature = "async")]
+    fn layout_version_async(&self, s: &Snapshot) -> pigeonhole::nonblocking::GetFuture {
+        self.get_at_async(s, GLOBAL, META, LAYOUT)
+    }
+    fn centroids(&self) -> Scan<'_> {
+        self.scan_prefix(b"C").families([CEN, META])
+    }
+    fn rows_of<'t>(&'t self, keys: &KeySet) -> KeysRead<'t> {
+        self.keys(keys)
+    }
+}
+
+fn load(t: &impl Rows, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
+    let version = t.layout_version(s)?;
     let mut lists = Vec::new();
-    for row in t
-        .scan_prefix(b"C")
-        .families([CEN, META])
-        .snapshot(s)
-        .iter()?
-    {
+    for row in t.centroids().snapshot(s).iter()? {
         lists.push(list_of_row(&row?, cen)?);
     }
     Ok(Layout {
@@ -448,19 +512,14 @@ fn load(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
 
 /// The centroids at `s`, as [`load`] reads them, without blocking on the device.
 #[cfg(feature = "async")]
-async fn load_async(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
+async fn load_async(t: &impl Rows, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
     use futures_core::Stream;
     let version = t
-        .get_at_async(s, GLOBAL, META, LAYOUT)
+        .layout_version_async(s)
         .await?
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
-    let mut rows = std::pin::pin!(
-        t.scan_prefix(b"C")
-            .families([CEN, META])
-            .snapshot(s)
-            .stream()
-    );
+    let mut rows = std::pin::pin!(t.centroids().snapshot(s).stream());
     let mut lists = Vec::new();
     while let Some(row) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
         lists.push(list_of_row(&row?, cen)?);
@@ -470,6 +529,76 @@ async fn load_async(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout>
         version,
         lists,
     })
+}
+
+/// The layout at `s` for a search: the shared cache when `G:layout` still matches it, else
+/// a fresh load, which replaces the cache when the search is at the current snapshot and the
+/// cache is older (rev 3 S4).
+fn layout_at(
+    t: &impl Rows,
+    cen: &VectorSpec,
+    cache: &RwLock<Arc<Layout>>,
+    s: &Snapshot,
+    current: Option<&dyn Fn() -> Option<u64>>,
+) -> Result<Arc<Layout>> {
+    let shared = cached(cache);
+    if t.layout_version(s)? == shared.version {
+        return Ok(shared);
+    }
+    Ok(adopt(cache, load(t, cen, s)?, current))
+}
+
+/// [`layout_at`], without blocking on the device.
+#[cfg(feature = "async")]
+async fn layout_at_async(
+    t: &impl Rows,
+    cen: &VectorSpec,
+    cache: &RwLock<Arc<Layout>>,
+    s: &Snapshot,
+    current: Option<&(dyn Fn() -> Option<u64> + Sync)>,
+) -> Result<Arc<Layout>> {
+    let shared = cached(cache);
+    let version = t
+        .layout_version_async(s)
+        .await?
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    if version == shared.version {
+        return Ok(shared);
+    }
+    // Converted after the await: the future holds only the `Sync` reference across it.
+    let fresh = load_async(t, cen, s).await?;
+    Ok(adopt(
+        cache,
+        fresh,
+        current.map(|f| f as &dyn Fn() -> Option<u64>),
+    ))
+}
+
+fn cached(cache: &RwLock<Arc<Layout>>) -> Arc<Layout> {
+    Arc::clone(&cache.read().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// A layout a search loaded replaces the shared cache when the search is at the current
+/// snapshot (`latest` given: the latest visible seqno now) and the cache is older (rev 3
+/// S4), so a slower search at an earlier snapshot never overwrites a newer layout. Or when
+/// the cache is from **beyond** the latest visible seqno: commits the writer lost (a
+/// restart after a power loss took a visible tail, perf287 on #1385). The cache then can't
+/// be current, and without this every search would reload the centroids until the writer
+/// passed the lost seqno again.
+fn adopt(
+    cache: &RwLock<Arc<Layout>>,
+    fresh: Layout,
+    latest: Option<&dyn Fn() -> Option<u64>>,
+) -> Arc<Layout> {
+    let fresh = Arc::new(fresh);
+    if let Some(latest) = latest {
+        let mut w = cache.write().unwrap_or_else(PoisonError::into_inner);
+        if fresh.seqno >= w.seqno || latest().is_some_and(|now| w.seqno > now) {
+            *w = Arc::clone(&fresh);
+        }
+    }
+    fresh
 }
 
 /// One `C{list}` row's list.
@@ -611,19 +740,31 @@ impl Index {
     /// [`open_with_rebalancer`](Self::open_with_rebalancer) instead: in an
     /// application-owned database (D284) the crate shouldn't start threads of its own.
     ///
-    /// Open an index once per process and clone the handle: each open has its own centroid
-    /// cache and, in background mode, its own rebalancer. Two would be correct (they
-    /// serialise on the index's rows, as two processes do) but would duplicate the work.
+    /// An index already open in this process (an application handle to it still alive) is
+    /// not opened again: `open` returns a clone of that handle, sharing its centroid cache,
+    /// its queue of lists to rebalance and its one rebalancing thread (#1268 item 8). "The
+    /// same index" is the same table name in the same open database
+    /// ([`Pigeonhole::same_database`]), and a table that was dropped since (and perhaps
+    /// created again) is opened afresh.
     ///
     /// The rebalancing thread holds the index, and with it a database handle, until it sees
     /// the last [`Index`] handle drop, at most one split later. To reopen the database in
     /// the same process, [`close`](Pigeonhole::close) it first: a closed database refuses
     /// the thread's next write, and the thread ends.
     pub fn open(db: &Pigeonhole, name: &str) -> Result<Index> {
-        let index = Self::open_inner(db, name)?;
-        if index.inner.opts.rebalance == Rebalance::Background {
-            crate::rebalancer::spawn(Rebalancer::new(&index, Arc::clone(&index.inner.signal)))
-                .map_err(|e| Error::InvalidArgument(format!("starting the rebalancer: {e}")))?;
+        let index = Self::registered(db, name)?;
+        if index.inner.opts.rebalance == Rebalance::Background
+            && !index.inner.thread.swap(true, Ordering::AcqRel)
+        {
+            let started =
+                crate::rebalancer::spawn(Rebalancer::new(&index, Arc::clone(&index.inner.signal)));
+            if let Err(e) = started {
+                // A later open tries again.
+                index.inner.thread.store(false, Ordering::Release);
+                return Err(Error::InvalidArgument(format!(
+                    "starting the rebalancer: {e}"
+                )));
+            }
         }
         Ok(index)
     }
@@ -633,10 +774,53 @@ impl Index {
     /// application-owned database, D284). With [`Rebalance::Background`] the application
     /// runs the rebalancer; with [`Rebalance::Inline`] the writes rebalance, and the
     /// rebalancer only finds what `open` queued.
+    ///
+    /// As with [`open`](Self::open), an index already open in this process shares its state:
+    /// the handle is a clone of the open one, and the rebalancer takes from the same queue as
+    /// any other (each list is split or merged by one of them at a time). They share one
+    /// [`set_wakeup`](Rebalancer::set_wakeup): the last one set is called. A later
+    /// [`open`](Self::open) of the index in background mode starts the crate's thread too,
+    /// which takes from the same queue: in an application-owned database, open with this
+    /// function only.
     pub fn open_with_rebalancer(db: &Pigeonhole, name: &str) -> Result<(Index, Rebalancer)> {
-        let index = Self::open_inner(db, name)?;
+        let index = Self::registered(db, name)?;
         let rebalancer = Rebalancer::new(&index, Arc::clone(&index.inner.signal));
         Ok((index, rebalancer))
+    }
+
+    /// Opens the index `name` from a reader process ([`PigeonholeReader`], #1268 item 5): a
+    /// [`ReadIndex`] that searches, at the reader's snapshots, and never writes. The
+    /// centroids load with reads only; the writer process inserts, deletes and rebalances.
+    /// The same checks as [`open`](Self::open) refuse a table that isn't a vector index.
+    pub fn open_reader(reader: &PigeonholeReader, name: &str) -> Result<ReadIndex> {
+        let table = reader.table(name)?;
+        let not = |why: &str| {
+            Error::InvalidArgument(format!("table {name:?} is not a vector index: {why}"))
+        };
+        let spec = table
+            .family_info(VEC)
+            .and_then(|f| f.vector)
+            .ok_or_else(|| not("it has no vector family `vec`"))?;
+        let cen = centroid_spec(&spec)?;
+        if table.family_info(CEN).and_then(|f| f.vector) != Some(cen) {
+            return Err(not("its centroid family doesn't match"));
+        }
+        let opts = table
+            .get(GLOBAL, META, OPTS)?
+            .and_then(|c| IndexOptions::decode(c.value()))
+            .ok_or_else(|| not("it has no options"))?;
+        let s = reader.snapshot()?;
+        let layout = load(&table, &cen, &s)?;
+        Ok(ReadIndex {
+            inner: Arc::new(ReadInner {
+                db: reader.clone(),
+                table,
+                spec,
+                cen,
+                opts,
+                layout: RwLock::new(Arc::new(layout)),
+            }),
+        })
     }
 
     /// A rebalancer's temporary handle: not one of the application's.
@@ -653,6 +837,15 @@ impl Index {
 
     pub(crate) fn user(&self) -> &Arc<()> {
         &self.user
+    }
+
+    /// The index from this process's registry, or opened and registered (#1268 item 8).
+    fn registered(db: &Pigeonhole, name: &str) -> Result<Index> {
+        let (inner, user) = crate::registry::open(db, name, || {
+            let index = Self::open_inner(db, name)?;
+            Ok((index.inner, index.user))
+        })?;
+        Ok(Index { inner, user })
     }
 
     fn open_inner(db: &Pigeonhole, name: &str) -> Result<Index> {
@@ -686,6 +879,7 @@ impl Index {
                 in_flight: Mutex::new(HashSet::new()),
                 pending: Mutex::new(VecDeque::new()),
                 signal: Arc::new(Signal::default()),
+                thread: AtomicBool::new(false),
             }),
         };
         index.queue_out_of_bounds(&s)?;
@@ -732,6 +926,18 @@ impl Index {
         self.insert(id, Input::Bits(vector))
     }
 
+    /// [`insert_f32`](Self::insert_f32) for an `f16` index: `vector` is IEEE binary16 bit
+    /// patterns, stored bit for bit (#1268 item 7). An `f16` or `bf16` index also takes
+    /// [`insert_f32`](Self::insert_f32), rounding each component to the element.
+    pub fn insert_f16(&self, id: &[u8], vector: &[u16]) -> Result<()> {
+        self.insert(id, Input::F16(vector))
+    }
+
+    /// [`insert_f16`](Self::insert_f16) for a `bf16` index (bfloat16 bit patterns).
+    pub fn insert_bf16(&self, id: &[u8], vector: &[u16]) -> Result<()> {
+        self.insert(id, Input::BF16(vector))
+    }
+
     /// Deletes `id`'s vector; `false` if there was none. A list that shrinks below its
     /// bound is merged into its nearest neighbour before the call returns.
     pub fn delete(&self, id: &[u8]) -> Result<bool> {
@@ -772,17 +978,29 @@ impl Index {
 
     /// The `k` vectors nearest the `f32` vector `query`, as a [`Search`] to run.
     pub fn search_f32<'a>(&'a self, query: &'a [f32], k: usize) -> Search<'a> {
-        Search::new(self, Input::F32(query), k)
+        Search::new(Of::W(self), Input::F32(query), k)
     }
 
     /// [`search_f32`](Self::search_f32) for an `i8` index.
     pub fn search_i8<'a>(&'a self, query: &'a [i8], k: usize) -> Search<'a> {
-        Search::new(self, Input::I8(query), k)
+        Search::new(Of::W(self), Input::I8(query), k)
     }
 
     /// [`search_f32`](Self::search_f32) for a bit index.
     pub fn search_bits<'a>(&'a self, query: &'a [u8], k: usize) -> Search<'a> {
-        Search::new(self, Input::Bits(query), k)
+        Search::new(Of::W(self), Input::Bits(query), k)
+    }
+
+    /// [`search_f32`](Self::search_f32) with an `f16` query (bit patterns), for an `f16`
+    /// index. The query widens to `f32` exactly, and the search compares in `f32`, as
+    /// `nearest_f32` does over a half family; [`search_f32`](Self::search_f32) works too.
+    pub fn search_f16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::W(self), Input::F16(query), k)
+    }
+
+    /// [`search_f16`](Self::search_f16) for a `bf16` index (a bfloat16 query).
+    pub fn search_bf16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::W(self), Input::BF16(query), k)
     }
 
     /// Loads many vectors into an **empty** index faster than inserting them one by one: it
@@ -839,6 +1057,35 @@ impl Index {
         self.bulk(expected, vectors, |v: &V| Input::Bits(v.as_ref()))
     }
 
+    /// [`bulk_load_f32`](Self::bulk_load_f32) for an `f16` index: each vector is IEEE
+    /// binary16 bit patterns, stored bit for bit, as [`insert_f16`](Self::insert_f16)
+    /// stores them. ([`bulk_load_f32`](Self::bulk_load_f32) also loads a half index,
+    /// rounding each component to the element.)
+    pub fn bulk_load_f16<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u16]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::F16(v.as_ref()))
+    }
+
+    /// [`bulk_load_f16`](Self::bulk_load_f16) for a `bf16` index (bfloat16 bit patterns).
+    pub fn bulk_load_bf16<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u16]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::BF16(v.as_ref()))
+    }
+
     fn bulk<K: AsRef<[u8]>, V>(
         &self,
         expected: u64,
@@ -865,7 +1112,7 @@ impl Index {
         for (_, v) in &sample {
             let v = input(v);
             v.check(&inn.spec)?;
-            points.push(v.point());
+            points.push(v.placed(&inn.spec));
         }
         let centroids = kmeans(&inn.cen, &points, want.min(sample.len()))?;
         drop(points);
@@ -887,10 +1134,13 @@ impl Index {
         let mut batches: HashMap<u32, Vec<(K, V)>> = HashMap::new();
         let mut waiting: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut loaded = 0u64;
+        // One point, refilled per vector: a half or `i8` vector widens into its buffer.
+        let mut point = Point::F32(Vec::new());
         for (id, v) in sample.into_iter().chain(it) {
             let vi = input(&v);
             vi.check(&inn.spec)?;
-            let l = layout.nearest(&inn.cen, &vi.point(), 1, &[])?[0];
+            vi.placed_into(&inn.spec, &mut point);
+            let l = layout.nearest(&inn.cen, &point, 1, &[])?[0];
             if let Some(prev) = waiting.insert(id.as_ref().to_vec(), l) {
                 let b = batches.get_mut(&prev).expect("a waiting id's batch");
                 b.retain(|(k, _)| k.as_ref() != id.as_ref());
@@ -1037,7 +1287,7 @@ impl Index {
 
     fn insert(&self, id: &[u8], v: Input<'_>) -> Result<()> {
         v.check(&self.inner.spec)?;
-        let point = v.point();
+        let point = v.placed(&self.inner.spec);
         let mut layout = self.layout();
         for _ in 0..RELOADS {
             let r = if layout.lists.is_empty() {
@@ -1163,52 +1413,15 @@ impl Index {
     /// a search at the current snapshot replaces the shared cache (rev 3 S4).
     fn layout_at(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
         let inn = &*self.inner;
-        let shared = self.layout();
-        let version = inn
-            .table
-            .get_at(s, GLOBAL, META, LAYOUT)?
-            .and_then(|c| c.as_u64())
-            .unwrap_or(0);
-        if version == shared.version {
-            return Ok(shared);
-        }
-        let fresh = load(&inn.table, &inn.cen, s)?;
-        Ok(self.adopt(fresh, current))
-    }
-
-    /// [`layout_at`](Self::layout_at), without blocking on the device.
-    #[cfg(feature = "async")]
-    async fn layout_at_async(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
-        let inn = &*self.inner;
-        let shared = self.layout();
-        let version = inn
-            .table
-            .get_at_async(s, GLOBAL, META, LAYOUT)
-            .await?
-            .and_then(|c| c.as_u64())
-            .unwrap_or(0);
-        if version == shared.version {
-            return Ok(shared);
-        }
-        let fresh = load_async(&inn.table, &inn.cen, s).await?;
-        Ok(self.adopt(fresh, current))
-    }
-
-    /// A layout loaded for a search: it replaces the shared cache when the search is at the
-    /// current snapshot and the cache is older (rev 3 S4).
-    fn adopt(&self, fresh: Layout, current: bool) -> Arc<Layout> {
-        let fresh = Arc::new(fresh);
-        if current {
-            let mut w = self
-                .inner
-                .layout
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if fresh.seqno >= w.seqno {
-                *w = Arc::clone(&fresh);
-            }
-        }
-        fresh
+        let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+        let latest: &dyn Fn() -> Option<u64> = &latest;
+        layout_at(
+            &inn.table,
+            &inn.cen,
+            &inn.layout,
+            s,
+            current.then_some(latest),
+        )
     }
 
     fn count(&self, list: u32) -> Result<u64> {
@@ -1671,12 +1884,80 @@ fn hits(near: Vec<pigeonhole::Neighbour>) -> Vec<Hit> {
         .collect()
 }
 
-/// A nearest-neighbour search under construction ([`Index::search_f32`] and its `i8` and
-/// bit forms). Finish with [`run`](Search::run).
+/// An index opened from a reader process ([`Index::open_reader`], #1268 item 5): searches
+/// only, at the reader's snapshots, with the same results as the writer's
+/// [`Index`] at the same snapshot. It holds its own centroid cache, reloaded when a search
+/// sees the layout changed. If the writer restarts, a search fails with `NoWriter` or
+/// `SnapshotExpired` (`Error::Db`) until the reader attaches to the new writer; searching
+/// again is enough. A reader process has its own block cache: size it as the writer's.
+#[derive(Clone)]
+pub struct ReadIndex {
+    inner: Arc<ReadInner>,
+}
+
+struct ReadInner {
+    db: PigeonholeReader,
+    table: ReadTable,
+    spec: VectorSpec,
+    cen: VectorSpec,
+    opts: IndexOptions,
+    layout: RwLock<Arc<Layout>>,
+}
+
+impl std::fmt::Debug for ReadIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadIndex")
+            .field("table", &self.inner.table.name())
+            .field("spec", &self.inner.spec)
+            .field("options", &self.inner.opts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadIndex {
+    /// The vectors' spec.
+    pub fn spec(&self) -> VectorSpec {
+        self.inner.spec
+    }
+
+    /// The options it was created with (the target list length as scaled).
+    pub fn options(&self) -> IndexOptions {
+        self.inner.opts
+    }
+
+    /// The `k` vectors nearest the `f32` vector `query`, as a [`Search`] to run.
+    pub fn search_f32<'a>(&'a self, query: &'a [f32], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::F32(query), k)
+    }
+
+    /// [`search_f32`](Self::search_f32) for an `i8` index.
+    pub fn search_i8<'a>(&'a self, query: &'a [i8], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::I8(query), k)
+    }
+
+    /// [`search_f32`](Self::search_f32) for a bit index.
+    pub fn search_bits<'a>(&'a self, query: &'a [u8], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::Bits(query), k)
+    }
+
+    /// [`Index::search_f16`] from a reader process.
+    pub fn search_f16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::F16(query), k)
+    }
+
+    /// [`Index::search_bf16`] from a reader process.
+    pub fn search_bf16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::BF16(query), k)
+    }
+}
+
+/// A nearest-neighbour search under construction ([`Index::search_f32`],
+/// [`ReadIndex::search_f32`] and their `i8` and bit forms). Finish with
+/// [`run`](Search::run).
 #[derive(Debug)]
 #[must_use = "a search does nothing until .run()"]
 pub struct Search<'a> {
-    index: &'a Index,
+    index: Of<'a>,
     query: Input<'a>,
     k: usize,
     nprobe: Option<u32>,
@@ -1684,8 +1965,102 @@ pub struct Search<'a> {
     parallel: usize,
 }
 
+/// The index a [`Search`] reads: the writer's, or a reader process's.
+#[derive(Debug, Clone, Copy)]
+enum Of<'a> {
+    W(&'a Index),
+    R(&'a ReadIndex),
+}
+
+impl<'a> Of<'a> {
+    fn spec(&self) -> &'a VectorSpec {
+        match *self {
+            Of::W(i) => &i.inner.spec,
+            Of::R(i) => &i.inner.spec,
+        }
+    }
+
+    fn cen(&self) -> &'a VectorSpec {
+        match *self {
+            Of::W(i) => &i.inner.cen,
+            Of::R(i) => &i.inner.cen,
+        }
+    }
+
+    fn nprobe(&self) -> u32 {
+        match *self {
+            Of::W(i) => i.inner.opts.nprobe,
+            Of::R(i) => i.inner.opts.nprobe,
+        }
+    }
+
+    fn snapshot(&self) -> pigeonhole::Result<Snapshot> {
+        match *self {
+            Of::W(i) => i.inner.db.snapshot(),
+            Of::R(i) => i.inner.db.snapshot(),
+        }
+    }
+
+    fn layout_at(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
+        match *self {
+            Of::W(i) => i.layout_at(s, current),
+            Of::R(i) => {
+                let inn = &*i.inner;
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &dyn Fn() -> Option<u64> = &latest;
+                layout_at(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    async fn layout_at_async(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
+        match *self {
+            Of::W(i) => {
+                let inn = &*i.inner;
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &(dyn Fn() -> Option<u64> + Sync) = &latest;
+                layout_at_async(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+                .await
+            }
+            Of::R(i) => {
+                let inn = &*i.inner;
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &(dyn Fn() -> Option<u64> + Sync) = &latest;
+                layout_at_async(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+                .await
+            }
+        }
+    }
+
+    fn rows_of(&self, keys: &KeySet) -> KeysRead<'a> {
+        match *self {
+            Of::W(i) => i.inner.table.rows_of(keys),
+            Of::R(i) => i.inner.table.rows_of(keys),
+        }
+    }
+}
+
 impl<'a> Search<'a> {
-    fn new(index: &'a Index, query: Input<'a>, k: usize) -> Self {
+    fn new(index: Of<'a>, query: Input<'a>, k: usize) -> Self {
         Self {
             index,
             query,
@@ -1725,13 +2100,12 @@ impl<'a> Search<'a> {
     /// distance makes the cut can differ between layouts; at one snapshot it's fixed.
     pub fn run(self) -> Result<Vec<Hit>> {
         let index = self.index;
-        let inn = &*index.inner;
-        self.query.check(&inn.spec)?;
+        self.query.check(index.spec())?;
         let taken;
         let s = match self.snapshot {
             Some(s) => s,
             None => {
-                taken = inn.db.snapshot()?;
+                taken = index.snapshot()?;
                 &taken
             }
         };
@@ -1751,13 +2125,12 @@ impl<'a> Search<'a> {
     #[cfg(feature = "async")]
     pub async fn run_async(self) -> Result<Vec<Hit>> {
         let index = self.index;
-        let inn = &*index.inner;
-        self.query.check(&inn.spec)?;
+        self.query.check(index.spec())?;
         let taken;
         let s = match self.snapshot {
             Some(s) => s,
             None => {
-                taken = inn.db.snapshot()?;
+                taken = index.snapshot()?;
                 &taken
             }
         };
@@ -1771,23 +2144,29 @@ impl<'a> Search<'a> {
 
     /// The probed lists' rows, or `None` when there's nothing to read.
     fn probed(&self, layout: &Layout) -> Result<Option<KeySet>> {
-        let inn = &*self.index.inner;
         if layout.lists.is_empty() || self.k == 0 {
             return Ok(None);
         }
-        let probe = self.nprobe.unwrap_or(inn.opts.nprobe).max(1) as usize;
-        let lists = layout.nearest(&inn.cen, &self.query.point(), probe, &[])?;
+        let probe = self.nprobe.unwrap_or(self.index.nprobe()).max(1) as usize;
+        let lists = layout.nearest(self.index.cen(), &self.query.point(), probe, &[])?;
         Ok(Some(KeySet::from_unsorted(
             lists.iter().map(|l| list_row(*l)),
         )))
     }
 
     fn nearest(&self, keys: &KeySet, s: &Snapshot) -> pigeonhole::Nearest<'a> {
-        let read = self.index.inner.table.keys(keys).family(VEC).snapshot(s);
+        let read = self.index.rows_of(keys).family(VEC).snapshot(s);
         match self.query {
             Input::F32(q) => read.nearest_f32(q, self.k),
             Input::I8(q) => read.nearest_i8(q, self.k),
             Input::Bits(q) => read.nearest_bits(q, self.k),
+            // A half query widens exactly and searches as `f32` (`nearest_f32` takes a half
+            // family; there's no `nearest_f16`). The search keeps its own copy.
+            q @ (Input::F16(_) | Input::BF16(_)) => {
+                let mut widened = Vec::new();
+                q.widen_into(&mut widened);
+                read.nearest_f32(&widened, self.k)
+            }
         }
     }
 }
@@ -1795,6 +2174,48 @@ impl<'a> Search<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(seqno: u64, version: u64) -> Layout {
+        Layout {
+            seqno,
+            version,
+            lists: Vec::new(),
+        }
+    }
+
+    /// The shared layout cache (rev 3 S4, perf287 on #1385): a search at the current snapshot
+    /// adopts a newer layout, never an older one a slower search loaded, and does adopt one
+    /// when the cache is from beyond the latest visible seqno (commits a restarted writer
+    /// lost). A search at an older snapshot never adopts.
+    #[test]
+    fn the_layout_cache_adopts_newer_layouts_and_drops_a_lost_tails() {
+        let cache = RwLock::new(Arc::new(layout(100, 5)));
+        let at = |c: &RwLock<Arc<Layout>>| (c.read().unwrap().seqno, c.read().unwrap().version);
+        let now_120 = || Some(120);
+        let now: &dyn Fn() -> Option<u64> = &now_120;
+        // A slower search's older layout, the cache still visible: kept.
+        adopt(&cache, layout(90, 4), Some(now));
+        assert_eq!(at(&cache), (100, 5));
+        // A newer one: adopted.
+        adopt(&cache, layout(110, 6), Some(now));
+        assert_eq!(at(&cache), (110, 6));
+        // Not at the current snapshot: never adopted.
+        adopt(&cache, layout(115, 7), None);
+        assert_eq!(at(&cache), (110, 6));
+        // The writer lost its tail: the latest visible seqno is 60, below the cache's 110.
+        // The fresh layout (seqno 55) replaces it, and later loads adopt as usual.
+        let now_60 = || Some(60);
+        let lost: &dyn Fn() -> Option<u64> = &now_60;
+        adopt(&cache, layout(55, 3), Some(lost));
+        assert_eq!(at(&cache), (55, 3));
+        adopt(&cache, layout(58, 4), Some(lost));
+        assert_eq!(at(&cache), (58, 4));
+        // The latest seqno unknown (the snapshot failed): an older layout is kept.
+        let unknown = || None;
+        let unknown: &dyn Fn() -> Option<u64> = &unknown;
+        adopt(&cache, layout(50, 2), Some(unknown));
+        assert_eq!(at(&cache), (58, 4));
+    }
 
     #[test]
     fn options_round_trip_and_scale_for_large_vectors() {

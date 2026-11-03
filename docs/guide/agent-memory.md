@@ -80,5 +80,124 @@ store.mark_used(&[hits[0].id.clone()])?;
 - **`mark_used(&ids)`** counts a use. It's how recall's use signal learns.
 - **`verify()`** checks the store against itself and its text index.
 
+## Forgetting
+A store can forget on its own. Give it a policy at create, or later with `set_forget_policy`:
+
+```rust
+# use pigeonhole::*;
+use std::time::Duration;
+use pigeonhole_memory::{ForgetPolicy, Kind, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let policy = ForgetPolicy::new()
+    .min_retention(0.05)
+    .max_age(Kind::Episodic, Duration::from_secs(30 * 24 * 3600));
+let store = Store::create(&db, "agents", StoreOptions::new().forget(policy))?;
+store.remember("agent:alice", Memory::new("A passing remark.").importance(0.01))?;
+// The crate's forgetter thread runs the policy hourly; a pass can also run now.
+let pass = store.forget().run()?;
+assert_eq!(pass.deleted, 1);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Retention:** `importance · exp(−since_last_use / half_life) + use_weight · ln(1 + uses)`. Memories below `min_retention` are forgotten. The use term doesn't decay, so a memory used often enough stays.
+- **`max_age(kind, age)`** forgets a kind's memories `age` after their creation: a TTL. `StoreOptions::episodic_ttl(age)` is the shorthand.
+- **Protected memories** are never forgotten: pinned ones, and the sources a live semantic memory was derived from.
+- **Each deletion re-checks its memory in its own transaction.** So a `mark_used`, a merge or a new link that lands meanwhile is respected.
+- **The `Forgetter`:** the crate runs one on its own thread when the store has a policy. An application that runs its own threads opens with `OpenOptions::new().own_forgetter()` and drives `take_forgetter()` itself.
+- **Failures and closing:** a failed pass is retried after 5 s, doubling with each failure in a row up to the policy's interval. `Pigeonhole::close` doesn't wait for a pass: the deletion in flight fails with `Closed` and is dropped whole, so nothing is left half-forgotten. To let a pass finish, drop the `Store` handles before closing.
+- **Forgotten memories are deletes,** so the change feed shows them.
+
+## Consolidation
+Consolidation folds episodic memories into semantic ones. The summariser is yours, behind the `Consolidator` trait. It's called outside any transaction, so it can call a model.
+
+```rust
+# use pigeonhole::*;
+use std::time::Duration;
+use pigeonhole_memory::{
+    ConsolidatePolicy, Consolidator, Kind, Memory, SourcePolicy, Store, StoreOptions, StoredMemory,
+};
+struct Summarise;
+impl Consolidator for Summarise {
+    fn consolidate(
+        &self,
+        group: &[StoredMemory],
+    ) -> Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>> {
+        // A model call in practice.
+        let text = group.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join(" ");
+        Ok(vec![Memory::new(format!("Summary: {text}")).importance(0.8)])
+    }
+}
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let store = Store::create(&db, "agents", StoreOptions::new())?;
+store.remember("agent:alice", Memory::new("Standup moved to 10.").session("s1"))?;
+store.remember("agent:alice", Memory::new("Standup is in room B.").session("s1"))?;
+let policy = ConsolidatePolicy::new().min_age(Duration::ZERO).sources(SourcePolicy::Keep);
+let pass = store.consolidate("agent:alice", &Summarise).policy(&policy).run()?;
+assert_eq!((pass.committed, pass.created), (1, 1));
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Groups:** episodic memories at least `min_age` old (an hour by default) that no consolidation took in.
+  - They're grouped by session first.
+  - With an embedding model, a memory then joins a group when its cosine to the group's first memory (its seed) is at least `group_similarity` (0.8).
+  - A pass looks at a bounded number of memories, newest first. When it stops short, `ConsolidatePass::resume` says where, and `.after(&id)` continues from there. A pass from the start also picks up memories that have aged in since.
+  - A memory with nothing like it is left alone, unless `min_group(1)` asks for rewrites.
+- **Each group commits in its own transaction:**
+  - the new memories, with `DERIVED_FROM` links to the group and the group's sources;
+  - then the source policy: `Keep` (the default) marks the group consolidated, `Delete` deletes it, and `Supersede` supersedes it by the first new memory.
+- **Recall and consolidated memories:** recall weights a consolidated memory's importance by `Weights::consolidated` (0.5), so its summary ranks ahead of it.
+- **Concurrent passes:** a group that changed while the consolidator ran is skipped, not retried, and so is one another pass took. The next pass regroups. `ConsolidatePass` counts both.
+- **A summary equal to one of its sources** merges into that source, which becomes the summary.
+- **A consolidator error** stops the pass with `Error::Consolidate { error, pass }`: its own `Err`, a returned memory the store refuses, or a returned link to a memory that's gone. The groups before it stay committed.
+- **When to run it:** on demand. Unlike forgetting, there's no thread.
+
+## Following links
+`expand` widens a recall to the memories its best candidates link to, or that link to them:
+```rust
+# use pigeonhole::*;
+# use pigeonhole_memory::{EmbeddingModel, Expand, LinkType, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let store = Store::create(&db, "agents", StoreOptions::new().embedding(EmbeddingModel::new("m", 4, Element::F32)?))?;
+let why = store.remember("agent:alice", Memory::new("Postgres won on JSON support.").embedding(vec![0.0, 0.0, 1.0, 0.0]))?.id().clone();
+let what = store.remember("agent:alice", Memory::new("The March meeting chose Postgres.").embedding(vec![0.9, 0.1, 0.0, 0.2]))?.id().clone();
+store.link(&what, &why, LinkType::custom(16)?, 0.9)?;
+let hits = store
+    .recall(&["agent:alice"])
+    .embedding(vec![0.8, 0.2, 0.0, 0.1])
+    .candidates(1)
+    .expand(Expand::hops(1))
+    .run()?;
+assert!(hits.iter().any(|h| h.id == why));
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Seeds:** the top 10 of the fused list. Seed `i` is worth `1 / i`.
+- **The graph signal:** a memory reached at a hop gets the best `value × link weight` over the links between it and the previous hop's memories, in either direction. It's ranked and fused like the other signals, with `Weights::graph` (0.5 by default), and is reported as `Signals::graph`. Seeds don't get one, and nothing does without `expand`.
+- **Bounds:** `Expand::hops(n)` takes 1 to 4 hops. `.max(m)` (default 20) caps how many memories get a graph signal; each hop keeps its best-valued ones while there's room.
+- **The byte budget:** with `byte_budget(B)`, the walk reads at most `B` bytes of nodes, besides the hits' own `B`. A hop that doesn't fit whole is dropped. `RecallStats::expanded` counts the memories reached, and `expansion_truncated` says when `max` or the budget stopped the walk.
+- **Filters:** the walk passes only through memories the recall could return, so a superseded memory or another session's doesn't bridge to its neighbours.
+
+## Near duplicates
+With an embedding model, a store can catch near duplicates as well as exact ones. Turn it on with `StoreOptions::near_dedup(NearDedup::new(0.95))`, or later with `set_near_dedup`. `remember` then looks up the nearest live memory first.
+- **Policies, for a match at or above the similarity:**
+  - `Link` (the default) writes the memory with a `SIMILAR_TO` link to the match;
+  - `Skip` writes nothing and returns `Remembered::Similar(id)`. **Careful:** `id()` is then the match, a memory this call didn't write. Code that links or pins `remember(..)?.id()` acts on the match once you turn `Skip` on;
+  - `Merge` merges into the match as an exact duplicate would.
+- **The check runs outside the transaction,** so two near duplicates written at once can both land. Consolidation folds them later. The match is read again inside the transaction, and one deleted or superseded meanwhile is ignored.
+- **Summaries skip it:** what a consolidator returns is meant to sit near its sources.
+- **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
+
 ## Reader processes
-`Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools.
+`Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
