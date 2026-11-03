@@ -88,7 +88,8 @@ class TestVectors < Minitest::Test
     assert_equal ranked.(vecs.keys).first(5), got.map(&:row)
     assert(got.all? { |nb| nb.qualifier == "v" && nb.ts.positive? })
     assert_equal got.map(&:distance).sort, got.map(&:distance)
-    assert got.first.frozen?
+    assert got.frozen? && got.first.frozen?
+    assert got.first.row.frozen? && got.first.qualifier.frozen?
     assert_equal got.first.row, n.nearest("emb", query, 5, parallel: 2).first.row
     in_range = ranked.(vecs.keys.select { |r| r >= "r050" && r < "r100" })
     assert_equal in_range.first(3), n.nearest("emb", query, 3, start: "r050", end: "r100").map(&:row)

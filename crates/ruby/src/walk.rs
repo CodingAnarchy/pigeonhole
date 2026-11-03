@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ops::Bound as KeyBound;
 use std::sync::Mutex;
 
-use magnus::{Error, IntoValue, RArray, Ruby, TryConvert, Value, prelude::*};
+use magnus::{Error, IntoValue, RArray, RString, Ruby, TryConvert, Value, prelude::*};
 use pigeonhole::KeySet;
 
 use crate::classes::{Pages, PagesState, Row, RowPosition, Snapshot, Table};
@@ -27,9 +27,17 @@ pub(crate) fn byte_list(a: RArray) -> Result<Vec<Vec<u8>>, Error> {
         .collect()
 }
 
-/// Binary Strings for `keys`.
+/// A frozen binary String, for a value inside a frozen `Data` result: mutating it would
+/// change the result's `==` and `hash`.
+fn frozen(ruby: &Ruby, b: &[u8]) -> RString {
+    let s = binary(ruby, b);
+    s.freeze();
+    s
+}
+
+/// Frozen binary Strings for `keys`.
 fn strings(ruby: &Ruby, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) -> RArray {
-    ruby.ary_from_iter(keys.into_iter().map(|k| binary(ruby, k.as_ref())))
+    ruby.ary_from_iter(keys.into_iter().map(|k| frozen(ruby, k.as_ref())))
 }
 
 impl Table {
@@ -76,9 +84,22 @@ impl Table {
                 }
                 Ok::<_, pigeonhole::Error>(())
             })?;
+            // A key's last occurrence takes its row; only a repeated key's earlier ones copy.
+            let mut left: HashMap<&[u8], usize> = HashMap::new();
+            for k in &given {
+                *left.entry(k.as_slice()).or_default() += 1;
+            }
             Ok(given
                 .iter()
-                .map(|k| found.get(k).cloned())
+                .map(|k| {
+                    let n = left.get_mut(k.as_slice()).expect("counted above");
+                    *n -= 1;
+                    if *n == 0 {
+                        found.remove(k)
+                    } else {
+                        found.get(k).cloned()
+                    }
+                })
                 .collect::<Vec<_>>())
         })?;
         let out = ruby.ary_new_capa(rows.len());
@@ -299,8 +320,8 @@ impl Table {
         let neighbours = ruby.ary_new_capa(found.len());
         for n in found {
             neighbours.push((
-                binary(ruby, &n.row),
-                binary(ruby, &n.qualifier),
+                frozen(ruby, &n.row),
+                frozen(ruby, &n.qualifier),
                 n.distance,
                 n.ts,
             ))?;
@@ -367,7 +388,7 @@ impl Pages {
 
 impl RowPosition {
     /// The position as bytes: stable, so a client can hand them back later.
-    pub(crate) fn to_bytes(ruby: &Ruby, rb_self: &Self) -> magnus::RString {
+    pub(crate) fn to_bytes(ruby: &Ruby, rb_self: &Self) -> RString {
         binary(ruby, &rb_self.0.to_bytes())
     }
 
@@ -380,14 +401,14 @@ impl RowPosition {
 
     /// The same position.
     pub(crate) fn eq(&self, other: Value) -> bool {
-        <&RowPosition>::try_convert(other).is_ok_and(|o| o.0.to_bytes() == self.0.to_bytes())
+        <&RowPosition>::try_convert(other).is_ok_and(|o| o.0 == self.0)
     }
 
     /// A hash consistent with `==`.
     pub(crate) fn hash(&self) -> i64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
-        self.0.to_bytes().hash(&mut h);
+        self.0.hash(&mut h);
         h.finish().cast_signed()
     }
 }

@@ -297,7 +297,7 @@ module Pigeonhole
                 snapshot: nil, parallel: nil)
       native_nearest(family, query, k, prefix, start, binding.local_variable_get(:end),
                      keys && Pigeonhole.__send__(:key_list, keys), qualifier_prefix, snapshot,
-                     parallel, nil).map { |a| Neighbour.new(*a) }
+                     parallel, nil).map { |a| Neighbour.new(*a) }.freeze
     end
 
     # `nearest`'s neighbours, nearest first, that fit `bytes` (D308), as a `NearestPage`. The

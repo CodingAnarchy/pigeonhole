@@ -45,6 +45,8 @@ class TestWalks < Minitest::Test
     assert_operator t.edges, :>=, 5
     refute t.cut_by_max_nodes
     assert t.frozen? && t.hops.frozen? && t.hops[0].frozen?
+    # simp724's N1 on #1401: the Strings inside are frozen too, so `==` and `hash` hold.
+    assert(t.seeds.all?(&:frozen?) && t.hops[0].nodes.all?(&:frozen?))
     assert_equal 2, t.hops[0].size
     assert_nil g.traverse(["n:a"], "out").hops[0].parents
     assert_equal ["n:b"], g.traverse(["n:a"], "out", per_node_limit: 1).hops[0].nodes
