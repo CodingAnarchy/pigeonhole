@@ -12,11 +12,20 @@ use crate::table::{Durability, Handle, Op};
 
 /// `Pigeonhole::Database`: the writer process's handle; `None` once closed.
 #[magnus::wrap(class = "Pigeonhole::Database", free_immediately, size)]
-pub(crate) struct Database(pub(crate) ForkSafe<RwLock<Option<pigeonhole::Pigeonhole>>>);
+pub(crate) struct Database(
+    pub(crate) ForkSafe<RwLock<Option<pigeonhole::Pigeonhole>>>,
+    /// The memory stores opened on it (PR 3a): `close` closes them first, so their forgetter
+    /// threads stop (simp724's P1 on #1340, as in Python).
+    pub(crate) crate::memory::Stores<crate::memory::StoreSlot>,
+);
 
 /// `Pigeonhole::Reader`: a reader process's handle; `None` once closed.
 #[magnus::wrap(class = "Pigeonhole::Reader", free_immediately, size)]
-pub(crate) struct Reader(pub(crate) ForkSafe<RwLock<Option<pigeonhole::PigeonholeReader>>>);
+pub(crate) struct Reader(
+    pub(crate) ForkSafe<RwLock<Option<pigeonhole::PigeonholeReader>>>,
+    /// The memory stores opened on it: `close` closes them first.
+    pub(crate) crate::memory::Stores<crate::memory::ReadSlot>,
+);
 
 /// `Pigeonhole::TableBuilder`'s state.
 pub(crate) struct Builder {
@@ -153,3 +162,62 @@ pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);
 /// `Pigeonhole::Feed`: a change feed subscription (its state is `crate::feed::FeedState`).
 #[magnus::wrap(class = "Pigeonhole::Feed", free_immediately, size)]
 pub(crate) struct Feed(pub(crate) ForkSafe<crate::feed::FeedState>);
+
+// ---- Pigeonhole::Memory (PR 3a; methods in memory.rs) ------------------------------
+
+/// `Pigeonhole::Memory::MemoryId`: a memory's id. Its text form is RFC 4648 base32 of its
+/// byte form (ICR 0107).
+#[magnus::wrap(class = "Pigeonhole::Memory::MemoryId", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct MemoryId(pub(crate) pigeonhole_memory::MemoryId);
+
+/// `Pigeonhole::Memory::EmbeddingModel`: the model a store is pinned to.
+#[magnus::wrap(class = "Pigeonhole::Memory::EmbeddingModel", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct EmbeddingModel(pub(crate) pigeonhole_memory::EmbeddingModel);
+
+/// `Pigeonhole::Memory::Weights`: recall's signal weights (1 by default; `recency` 0.25,
+/// `graph` and `consolidated` 0.5).
+#[magnus::wrap(class = "Pigeonhole::Memory::Weights", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct Weights(pub(crate) pigeonhole_memory::Weights);
+
+/// `Pigeonhole::Memory::Expand`: a recall's graph expansion (T4).
+#[magnus::wrap(class = "Pigeonhole::Memory::Expand", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct Expand(pub(crate) pigeonhole_memory::Expand);
+
+/// `Pigeonhole::Memory::ForgetPolicy`: a store's forget policy (T2).
+#[magnus::wrap(class = "Pigeonhole::Memory::ForgetPolicy", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct ForgetPolicy(pub(crate) pigeonhole_memory::ForgetPolicy);
+
+/// `Pigeonhole::Memory::ConsolidatePolicy`: how `consolidate` picks and folds groups (T3).
+#[magnus::wrap(
+    class = "Pigeonhole::Memory::ConsolidatePolicy",
+    free_immediately,
+    size
+)]
+#[derive(Clone)]
+pub(crate) struct ConsolidatePolicy(pub(crate) pigeonhole_memory::ConsolidatePolicy);
+
+/// `Pigeonhole::Memory::NearDedup`: a store's near-duplicate dedup (T3).
+#[magnus::wrap(class = "Pigeonhole::Memory::NearDedup", free_immediately, size)]
+#[derive(Clone, Copy)]
+pub(crate) struct NearDedup(pub(crate) pigeonhole_memory::NearDedup);
+
+/// `Pigeonhole::Memory::Memory`: a memory to write, what a consolidator returns.
+#[magnus::wrap(class = "Pigeonhole::Memory::Memory", free_immediately, size)]
+#[derive(Clone)]
+pub(crate) struct Memory {
+    pub(crate) text: String,
+    pub(crate) inner: pigeonhole_memory::Memory,
+}
+
+/// `Pigeonhole::Memory::Store`: a memory store in the writer process.
+#[magnus::wrap(class = "Pigeonhole::Memory::Store", free_immediately, size)]
+pub(crate) struct Store(pub(crate) ForkSafe<std::sync::Arc<crate::memory::StoreSlot>>);
+
+/// `Pigeonhole::Memory::ReadStore`: a memory store in a reader process.
+#[magnus::wrap(class = "Pigeonhole::Memory::ReadStore", free_immediately, size)]
+pub(crate) struct ReadStore(pub(crate) ForkSafe<std::sync::Arc<crate::memory::ReadSlot>>);

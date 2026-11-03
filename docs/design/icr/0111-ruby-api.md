@@ -111,8 +111,22 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - `ruby-gems.yml`'s `source` job installs the gem from a copy outside the checkout into an empty `GEM_HOME` on Linux and macOS, runs `script/source_gem_smoke.rb`, and uploads the gem as an artifact. A plain `gem build` from the checkout still refuses.
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
+### PR 3a: agent memory
+`pigeonhole-memory` as Python's `pigeonhole.memory` binds it (ICR 0102/0107), in Ruby's idioms. The design note and reviews are on #697.
+- **Names.** Everything is under `Pigeonhole::Memory`: `Store`, `ReadStore`, `MemoryId`, the option types (`EmbeddingModel`, `Weights`, `Expand`, `ForgetPolicy`, `ConsolidatePolicy`, `NearDedup`, `Memory`) and `LinkType`. The errors are `ModelMismatch < InvalidArgument` and `ConsolidateError < MergeFailed`, still in the base hierarchy (ai1249's Q1).
+- **Values.** `MemoryId` and the option types are native values that hold no Ruby object. Every result is a frozen `Data`, built in `memory.rb` from Arrays, as PR 2's are. Its Strings and Arrays are frozen too: `StoredMemory`, `RecallHit`, `Signals`, `Signal`, `RecallStats`, `ForgetPass`, `ConsolidatePass`, `Remembered`, `Marked`, `Link`, `Source` and `StoreStats`. Enums are Symbols, with `:unknown` for a kind a later engine adds. Durations are Numeric seconds, and points in time are µs Integers.
+- **`Store.create(..., normalization:)`** takes #1381's setting from the start.
+- **Lifecycle.** Each store handle sits in a slot that `close` empties. A call clones the handle and holds no lock while it runs (perf2's C4), so `close` during a call returns at once, and the call ends with its clone. `Database#close` and `Reader#close` close the stores opened on them first: the list and the handle are taken under one lock, so a store opened during the close is either closed by it or refused with `Closed`.
+- **The consolidator** follows the owner's O3, the channel pattern.
+  - The pass runs on a Rust thread that holds no Ruby value. For each group, that thread sends the group's owned memories over a channel and waits for the answer.
+  - The Ruby thread waits with the GVL released, in 100 ms slices with `thread_check_ints` between them. It calls the block with the GVL held, through a Proc argument and not a block, so an exception the method builds isn't handed the block. It sends the block's memories back.
+  - **A `StandardError` from the block**, or a return that isn't an Array of `Memory`, becomes `ConsolidateError`, whose `consolidated` is the pass so far and whose `cause` is the exception.
+  - **Anything else** takes effect as it is, once the worker has stopped and been joined: `break`, `throw`, `return`, a non-`StandardError` exception, or an interrupt while waiting. That covers perf2's C1, and `Timeout` and `Thread#raise` keep their meaning. It differs from Python, which wraps every exception.
+  - **Whichever way the pass stops,** no thread outlives the call, the committed groups stand, and a rerun is safe (C5).
+- **`test_signatures`** now walks nested modules, so `Pigeonhole::Memory::*` is held to the RBS like the rest.
+
 ## Later PRs
-- **PR 3:** `pigeonhole-memory`, `pigeonhole-text` and `pigeonhole-vector`.
+- **PR 3b:** `pigeonhole-text` (`Pigeonhole::Text`) and `pigeonhole-vector` (`Pigeonhole::Vector`), as the #697 design note and its reviews set out: no custom tokenizers in v1, and the `Rebalancer` driven from Ruby.
 
 ## Callers changed
 None. It's a new crate.
