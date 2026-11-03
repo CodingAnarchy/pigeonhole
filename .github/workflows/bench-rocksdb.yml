@@ -40,3 +40,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev clang
       - run: cargo clippy -p pigeonhole-bench --all-targets --all-features -- -D warnings
       - run: cargo test -p pigeonhole-bench --all-features
+      # The bench's docs with every runner, as `cargo doc --workspace --all-features` builds them:
+      # ci.yml's doc job builds the bench without `rocksdb`, so a broken link under it showed
+      # up only locally (a public method linking the crate-private `runners::rocksdb`).
+      - run: cargo doc -p pigeonhole-bench --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings

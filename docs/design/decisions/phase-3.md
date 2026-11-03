@@ -4218,6 +4218,11 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - no graph signal without `expand` or for seeds, the hop errors, and a reader process.
   - Mutations dropping the backlink direction, and keeping a hop's first-found memories instead of its best, were caught.
 
+**T5 (#1339).** The recall benchmark (`memrecall`, LongMemEval-S/M and LoCoMo, bge-small-en-v1.5; the results are in the agent memory guide). The owner's calls on #1402 (2026-11-03):
+- **Call 4, amended: `Weights::recency` defaults to 0.25, not 1.** At 1, fusion ranked below keyword alone on both benchmarks (NDCG@10 0.789 against 0.864 on LongMemEval-S). At 0.25 it beats every single signal on both (0.871 and 0.454). 0 is slightly better on these datasets, which ask nothing recency-shaped, but agents' questions do, so the default keeps some pull. The other weights are unchanged.
+- **T8 (#1342, IVF) stays in 1.1.0,** after #1403. At ~94k memories in one namespace a fused recall takes 68 ms p50, 37 ms of it the exact vector scan.
+- **Fuzzy keyword recall stays off** (revision 2 §8): it doesn't help recall and costs 18–100× the plain search.
+
 <a id="d312"></a>
 ## D312 — REJECTED: mapped `Buffered` WAL writes, with a group's frames stored through a shared mapping of the segment instead of `pwrite` (ctr274 / simp724, prototype approved 2026-11-02; owner shelved it 2026-11-03, call 4; io, wal; #1206 lever 4 B2, #1369)
 **Status: tried and rejected.** #1369 was closed unmerged, and WAL writes stay `pwrite`. Three box rounds showed that the `Buffered` throughput gain always comes with worse put tails, and pre-faulting made the tails worse still. This record is here so the idea isn't tried again without this data.

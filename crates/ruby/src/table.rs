@@ -11,7 +11,7 @@ use pigeonhole::{Aggregation, Compression, ErrorCode};
 
 use crate::classes::{
     Builder, Cell, Condition, Family, FamilyInfo, Mutation, MutationState, Row, ScanArgs, ScanSpec,
-    Snapshot, Table, TableBuilder,
+    Snapshot, Table, TableBuilder, VectorSpec,
 };
 use crate::convert::{
     self, Bytes, CellValue, Name, Secs, Val, arg_error, class_name, lock, type_error,
@@ -78,6 +78,29 @@ pub(crate) fn family_counter(
     options(
         ruby,
         pigeonhole::Family::counter(),
+        max_versions,
+        ttl,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// `Family.vector(dim, element, metric, max_versions:, ttl:)`: a vector family (D303).
+pub(crate) fn family_vector(
+    ruby: &Ruby,
+    dim: u32,
+    element: Value,
+    metric: Value,
+    max_versions: Option<u32>,
+    ttl: Option<Secs>,
+) -> Result<Family, Error> {
+    let spec = crate::vector::spec(ruby, dim, element, metric)?;
+    options(
+        ruby,
+        pigeonhole::Family::vector(spec),
         max_versions,
         ttl,
         None,
@@ -282,6 +305,11 @@ impl FamilyInfo {
         })
     }
 
+    /// A vector family's spec, or `nil`.
+    pub(crate) fn vector(&self) -> Option<VectorSpec> {
+        self.0.vector.map(VectorSpec)
+    }
+
     /// The family's options as a `Family`, to create the same family elsewhere.
     pub(crate) fn family(&self) -> Family {
         Family(self.0.family.clone())
@@ -360,6 +388,7 @@ pub(crate) enum Op {
     PutU64(String, Vec<u8>, Option<u64>, u64),
     Incr(String, Vec<u8>, Option<u64>, i64),
     Aggregate(String, Vec<u8>, Option<u64>, Input),
+    PutVector(String, Vec<u8>, Option<u64>, crate::vector::Vector),
     DeleteRow,
     DeleteFamily(String),
     DeleteColumn(String, Vec<u8>),
@@ -437,6 +466,22 @@ pub(crate) fn aggregate_input(
     })
 }
 
+/// `v` as a vector for `table`'s `family`, read by the family's element type.
+pub(crate) fn vector_input(
+    ruby: &Ruby,
+    table: &pigeonhole::Table,
+    family: &str,
+    v: Value,
+) -> Result<crate::vector::Vector, Error> {
+    let spec = crate::vector::family_spec(
+        ruby,
+        &Handle::Writer(table.clone()),
+        family,
+        "put_vector writes to",
+    )?;
+    crate::vector::vector(ruby, v, spec.element())
+}
+
 /// A delete's scope: the row; with `family`, that family; with `qualifier` too, the column;
 /// with `ts` too, that one version.
 pub(crate) fn delete_op(
@@ -494,6 +539,17 @@ pub(crate) fn commit_row(
             Op::Aggregate(f, q, Some(ts), Input::F64(x)) => m.aggregate_f64_at(f, q, *ts, *x),
             Op::Aggregate(f, q, None, Input::Bytes(b)) => m.aggregate_bytes(f, q, b),
             Op::Aggregate(f, q, Some(ts), Input::Bytes(b)) => m.aggregate_bytes_at(f, q, *ts, b),
+            Op::PutVector(f, q, ts, v) => {
+                use crate::vector::Vector;
+                match (v, ts) {
+                    (Vector::F32(x), None) => m.put_vector_f32(f, q, x),
+                    (Vector::F32(x), Some(ts)) => m.put_vector_f32_at(f, q, *ts, x),
+                    (Vector::I8(x), None) => m.put_vector_i8(f, q, x),
+                    (Vector::I8(x), Some(ts)) => m.put_vector_i8_at(f, q, *ts, x),
+                    (Vector::Bits(x), None) => m.put_vector_bits(f, q, x),
+                    (Vector::Bits(x), Some(ts)) => m.put_vector_bits_at(f, q, *ts, x),
+                }
+            }
             Op::DeleteRow => m.delete_row(),
             Op::DeleteFamily(f) => m.delete_family(f),
             Op::DeleteColumn(f, q) => m.delete_column(f, q),
@@ -828,6 +884,19 @@ impl Mutation {
             rb_self,
             Op::Aggregate(family.0, qualifier.0, ts, input),
         )
+    }
+
+    /// `put_vector(family, qualifier, vector, ts)`: read by the family's element type.
+    pub(crate) fn put_vector(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+        vector: Value,
+        ts: Option<u64>,
+    ) -> Result<(), Error> {
+        let v = vector_input(ruby, &rb_self.0.get(ruby)?.table, &family.0, vector)?;
+        Self::push(ruby, rb_self, Op::PutVector(family.0, qualifier.0, ts, v))
     }
 
     /// `delete(family, qualifier, ts)`.

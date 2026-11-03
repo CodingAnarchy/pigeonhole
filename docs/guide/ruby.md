@@ -14,6 +14,8 @@ bundle exec rake compile
 ruby -Ilib -e 'require "pigeonhole"; p Pigeonhole::VERSION'
 ```
 
+`bundle exec rake gem:source` builds the source gem, `pkg/source/pigeonhole-<version>.gem`. It carries the engine's crates, so it installs anywhere with Rust 1.96 or later and network access to crates.io: `gem install pkg/source/pigeonhole-*.gem` compiles the extension, with the versions `Cargo.lock` pins. The build is an optimised release build, about a minute on a recent laptop.
+
 ## A tour
 ```ruby
 require "pigeonhole"
@@ -48,6 +50,10 @@ With a block, `Pigeonhole.open` closes the database however the block exits. Wit
   - Rows are read in chunks with the GVL released.
   - Each enumeration reads at one snapshot (the one you pass, or one taken when it starts), so its rows are consistent however slowly you consume them.
   - Enumerating again (or `rewind`) sees newer writes.
+- **Many rows:** `table.multi_get(keys, families:, qualifier_prefix:, versions:, column_limit:, snapshot:)` reads the rows of many keys in one read. The result is aligned with `keys`: one entry per key, in the order given, with `nil` for a key with no row. `keys` is an Array, or another Enumerable such as a `Set`.
+- **A wide row in pages:** `table.pages(row, size, ...)` returns a `Pages`, `Enumerable` over pages of at most `size` cells each (a column's versions are never split). Each page is read when it's asked for, and no read stays open between pages.
+  - `position` is where the last page ended. Its `to_bytes` resumes the walk later, also in another process: `table.pages(row, size, after: Pigeonhole::RowPosition.from_bytes(token))`.
+  - **A walk is a cursor, not a collection:** every Enumerable method consumes the pages it reads. After `walk.first`, `walk.to_a` holds only the pages after the first, and a second `each` yields only what's left. Call `table.pages` again to read the row again.
 - **Snapshots:** `db.snapshot { |s| ... }` releases the snapshot when the block exits. Pass it as `snapshot:` to read several things at one point in time.
 
 ```ruby
@@ -62,6 +68,118 @@ Pigeonhole.open(path, create: true) do |db|
   end
   raise unless t.scan("event:").count == 4
   raise unless t.scan(start: "event:1", end: "event:9").map(&:key) == ["event:1", "event:2"]
+end
+```
+
+### Reads within a byte budget
+For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
+- **`scan_within(prefix, bytes:, ...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`.
+  - Each cell counts its qualifier, its value and 16 bytes, and each row its key once.
+  - A column is kept whole or not at all, and a row may be cut between columns.
+  - `limit:` applies too: whichever comes first stops the read.
+- **`multi_get_within(keys, bytes:, ...)`** returns a `KeysPage`, the same over a multi-get's rows. Unlike `multi_get`, its rows aren't aligned with `keys`: they come in key order, with no entry for a key that has no cell.
+- **A page** is a frozen `Data` with `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - `next_bytes` is the size of the first column that didn't fit, its row key included. A page resumed with that budget returns it.
+  - Pass `after: page.resume` to read the next page. `resume` is `nil` once the read is exhausted.
+  - A `ScanPosition` or `KeysPosition` has `to_bytes` and `.from_bytes`, to hand to a client. A position from another table, or of the other kind, raises `InvalidArgument`.
+  - A chain of pages is one consistent read only with one `snapshot:`.
+- **`nearest_within(family, query, k, bytes:)`** returns a `NearestPage`: `nearest`'s neighbours that fit. Each counts its row key, its qualifier and 16 bytes. The budget bounds the result, not the work, and there's no resume position.
+- **`traverse(..., byte_budget: n)`** stops the traversal at `n` bytes of nodes, and sets `cut_by_budget`.
+  - Each node counts its key and 16 bytes, plus 4 with `parents: true`. The seeds aren't counted.
+  - `nil`, the default, sets no budget, and 0 is refused.
+
+Budgets and sizes are bytes, not characters.
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true) do |db|
+  t = db.table("docs").family("text").create
+  100.times { |i| t.put(format("doc:%03d", i), "text", "body", "\0" * 200) }
+  page = t.scan_within("doc:", bytes: 2048)
+  raise unless page.bytes <= 2048 && page.cut_by_budget
+  token = page.resume.to_bytes # hand this to a client
+  nxt = t.scan_within("doc:", bytes: 2048, after: Pigeonhole::ScanPosition.from_bytes(token))
+  raise unless nxt.rows.first.key == "doc:009"
+end
+```
+
+## Vectors
+A vector family stores fixed-size vectors (D303):
+- **The family:** `Family.vector(dim, element, metric)`, with `element` one of `:f32`, `:i8`, `:bit`, `:f16` and `:bf16`, and `metric` one of `:l2`, `:cosine`, `:inner_product` and `:hamming`. `:f16` and `:bf16` (#1263) store each component in 2 bytes, under L2, inner product or cosine. `FamilyInfo#vector` returns its `VectorSpec` (`dim`, `element`, `metric`).
+- **Writes:** `put_vector` (on `Mutation`, and with the table and row first on `WriteBatch` and `Transaction`) takes the family's form:
+  - `:f32`, `:f16` and `:bf16`: an Array of Numerics. A half family rounds each component to nearest, ties to even, and refuses one that overflows.
+  - `:i8`: an Array of Integers in -128..127.
+  - `:bit`: the packed bits, as a String.
+
+  A String is refused for a numeric family, and an Array for a bit family: neither is read as the other. The family checks the dimension at commit.
+- **Reads:** `Cell#as_vector` (and `Cell#typed`) returns an Array of Floats (`:f16` and `:bf16` widened exactly), an Array of Integers, or the bits as a binary String.
+
+`nearest(family, query, k)` finds the `k` cells nearest `query` by the family's metric. It searches `prefix:`, a `start:`/`end:` range, the whole table, or the rows of `keys:`. It returns `Neighbour`s (`row`, `qualifier`, `distance`, `ts`; frozen `Data`) nearest first. The search is exact: every vector in the read is scored, and `parallel: n` shares the work across threads.
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true) do |db|
+  docs = db.table("docs")
+           .family("text")
+           .family("emb", Pigeonhole::Family.vector(4, :f32, :cosine))
+           .create
+  docs.mutate("d1").put("text", "body", "hello").put_vector("emb", "v", [0.5, 0.25, 0.125, 1.0]).commit
+  raise unless docs.get("d1", "emb", "v").as_vector == [0.5, 0.25, 0.125, 1.0]
+  docs.mutate("d2").put_vector("emb", "v", [1.0, 0.125, 0.25, 0.5]).commit
+  best = docs.nearest("emb", [0.5, 0.25, 0.125, 0.9], 1)
+  raise unless best.first.row == "d1"
+end
+```
+
+## Graphs
+Store a graph as adjacency rows, as in the [graphs guide](graphs.md): a row per node, and in an edge family one column per edge, its qualifier the destination's key. `traverse(seeds, family, hops:)` runs a breadth-first search inside the engine, with the GVL released.
+- **The result** is a `Traversal` with each hop's new nodes, sorted (`hops`, each a `Hop` with `nodes`), and `parents` with `parents: true`, for shortest paths.
+- **Limits:** it takes `per_node_limit:`, `hop_limit:`, `max_nodes:` and `byte_budget:`.
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true) do |db|
+  g = db.table("g").family("out").create
+  db.write_batch do |wb|
+    [%w[a b], %w[a c], %w[b d], %w[c d], %w[d e]].each { |a, b| wb.put(g, "n:#{a}", "out", "n:#{b}", "") }
+  end
+  t = g.traverse(["n:a"], "out", hops: 3, parents: true)
+  raise unless t.hops.map(&:nodes) == [%w[n:b n:c], ["n:d"], ["n:e"]]
+end
+```
+
+## The change feed
+Open the database with `change_feed:` (the history to keep, in bytes; `feed_age:` bounds it in time too). Later opens that don't mention the feed keep it, and `change_feed_off: true` turns it off. Then `table.feed` subscribes to a table's committed changes: whole commits, once each, in commit order.
+- **Delivery:** a commit arrives once it is durable at its level, so nothing delivered is ever undone (`visible: true` for sooner).
+- **What arrives:** each `Commit` has `seqno`, `timestamp` and `changes`. Each `Change` has `table`, `family`, `kind` (`:put`, `:merge`, `:delete_cell`, `:delete_column`, `:delete_family`), `row`, `qualifier`, `timestamp` and `value` (typed as reads type it, `nil` for deletes). Both are frozen `Data`.
+- **Waiting:** `feed.next(timeout: s)` waits for the next commit with the GVL released, and returns `nil` if none came in time. `try_next` never waits. `each` (and so `first(n)`) waits for each commit in turn; `each(timeout: s)` stops once one doesn't come in time.
+- **A feed has no end.** Like `Pages`, a feed is a cursor, and `Enumerable` methods that read to the end (`to_a`, `map`, `count`, `select`) wait for ever on a live feed. `first(n)`, `take(n)` and `find` return. To drain what's there now, use `feed.each(timeout: 1).to_a`.
+- **Kinds:** a change's `kind` is `:put`, `:merge`, `:delete_cell`, `:delete_column` or `:delete_family`, or `:unknown` for a kind a later engine adds. Give a `case` on kinds an `else`.
+  - A wait runs in 100 ms slices with an interrupt check between them, so `Thread#raise`, `Timeout.timeout` and Ctrl-C reach a consumer blocked in `next`.
+- **Resuming:** store `feed.token` with what the commits fed. `table.feed(resume: token)` continues there, after a reopen too.
+- **Choosing changes:** `tables: [...]` adds tables to the same feed, `prefix:` keeps only rows under it, and `from_snapshot:` starts after what a snapshot saw. So a consumer can load a snapshot and then follow the changes without missing or repeating any.
+- **Expiry:** when the history a feed needs is gone (retention passed it, or an open with `change_feed_off: true` ended it), the feed raises `FeedExpired` from then on. Rebuild from a snapshot and start again.
+- **Readers:** a reader process's table (`Pigeonhole.open_reader(path).table(...)`) subscribes too, following the running writer's feed. If that writer restarts, the feed follows it. While no writer runs, `next` raises `NoWriter` (or `SnapshotExpired` while a new one starts): call `next` again on the same feed.
+- **Blocks:** with a block, `table.feed` yields the feed and closes it afterwards. `close` ends a subscription early.
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true, change_feed: 64 << 20) do |db|
+  t = db.table("orders").family("f").create
+  token = t.feed do |feed|
+    t.put("order:1", "f", "status", "paid")
+    change = feed.next(timeout: 5).changes.first
+    raise unless [change.kind, change.row, change.value] == [:put, "order:1", "paid"]
+    feed.token # store it with what the commit fed
+  end
+  t.put("order:1", "f", "status", "shipped")
+  t.feed(resume: token) do |feed|
+    raise unless feed.next(timeout: 5).changes.first.value == "shipped"
+  end
 end
 ```
 

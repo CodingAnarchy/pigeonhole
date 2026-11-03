@@ -58,6 +58,35 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
   - Block forms return the block's value.
   - `Database#closed?` and `Reader#closed?` exist.
 
+### PR 2: vectors and the 1.1 reads
+ICR 0102's PR 2 and PR 3 (Python's `nearest`) and D308's byte budgets, in Ruby's idioms:
+- **Vectors (D303):**
+  - `VectorSpec.new(dim, element, metric)`, with `dim`, `element`, `metric`, `==`/`eql?`/`hash`; `Family.vector(dim, element, metric, max_versions:, ttl:)`; `FamilyInfo#vector`.
+  - Elements are `:f32`, `:i8`, `:bit`, `:f16` and `:bf16`, and metrics `:l2`, `:cosine`, `:inner_product` and `:hamming` (a Symbol or a String).
+  - `put_vector(family, qualifier, vector, ts:)` on `Mutation`, and with the table and row first on `WriteBatch` and `Transaction`. The family's element type decides the form: an Array of Numerics for `:f32`, `:f16` and `:bf16` (narrowed to `f32`; a half family rounds at the write), an Array of Integers in -128..127 for `:i8`, the packed bits as a String for `:bit`. A String for a numeric family, or an Array for a bit family, is a `TypeError`: Ruby has no typed-buffer protocol that would tell bytes and numbers apart, so neither form is read as the other (ICR 0102's S2, in Ruby).
+  - `Cell#as_vector`, and `Cell#typed` for a vector cell: an Array of Floats (`:f16` and `:bf16` widened exactly), an Array of Integers, or a binary String of bits.
+- **Reads:**
+  - `Table#multi_get(keys, families:, qualifier_prefix:, versions:, column_limit:, snapshot:)` returns an Array aligned with `keys`: one entry per key given, in that order, `nil` for a miss, a repeated key repeated. The read itself is one sorted multi-get (D299).
+  - `Table#traverse(seeds, family, hops:, per_node_limit:, hop_limit:, max_nodes:, byte_budget:, parents:, qualifier_prefix:, snapshot:, parallel:)` returns a `Traversal` (D304): `seeds` (sorted and deduplicated: hop 1's parents index them), `hops` (each a `Hop` with `nodes`, `parents` and `size`), `rows`, `edges`, `hops_cut`, `cut_by_max_nodes` and `cut_by_budget`.
+  - `Table#pages(row, size, families:, qualifier_prefix:, versions:, snapshot:, after:)` returns a `Pages` (D297): `Enumerable` over `Row` pages, each read with the GVL released when it is asked for and no read held open between pages, with `position`. A walk is one cursor: a second `each` continues where the first stopped. `RowPosition` has `to_bytes`, `.from_bytes`, `==`, `eql?` and `hash`.
+  - `Table#nearest(family, query, k, prefix:, start:, end:, keys:, qualifier_prefix:, snapshot:, parallel:)` returns `Neighbour`s (`row`, `qualifier`, `distance`, `ts`) nearest first (D296). `query` is read as `put_vector` reads a vector.
+- **Byte budgets (D308):**
+  - `Table#scan_within(prefix, bytes:, ...)` (the scan's arguments plus `after:`) returns a `ScanPage`; `Table#multi_get_within(keys, bytes:, ...)` (`multi_get`'s plus `after:`) returns a `KeysPage`. A page has `rows`, `bytes`, `cut_by_budget`, `next_bytes`, `resume` and `size`.
+  - `ScanPosition` (with `row`) and `KeysPosition` (with `key`) have `to_bytes`, `.from_bytes`, `==`, `eql?` and `hash`. A position of the other kind, or from another table, raises `InvalidArgument`.
+  - `Table#nearest_within(family, query, k, bytes:, ...)` returns a `NearestPage` (`neighbours`, `bytes`, `next_bytes`, `cut_by_budget`, `size`); `traverse(byte_budget:)` sets `cut_by_budget`, and 0 is an `ArgumentError`.
+- **Where Ruby differs from Python's spellings:**
+  - The result objects with no engine object behind them (`Neighbour`, `NearestPage`, `Hop`, `Traversal`, `ScanPage`, `KeysPage`) are frozen `Data` classes, so they compare by value and have `to_h` and `with`. The native side returns Arrays that the Ruby layer wraps, so no wrapped Rust struct holds a Ruby value (and none needs a GC mark function).
+  - `keys` and `seeds` take an Array or any other `Enumerable` (a `Set`), where Python takes any sequence.
+  - The positions and `Pages` are native classes: they hold engine values.
+
+### PR 2b: the change feed
+Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
+- **Opening:** `Pigeonhole.open` adds `change_feed:` (the history's size in bytes), `change_feed_off:`, `feed_age:` (seconds) and `feed_tables:`, with Python's rules: an open that names neither inherits the last open's feed, `feed_age:` needs `change_feed:`, and `change_feed_off:` with `change_feed:` is an `ArgumentError`.
+- **`Table#feed(tables:, prefix:, visible:, from_snapshot:, from_oldest:, resume:)`** returns a `Feed`; with a block, it yields the feed and closes it afterwards. At most one of the three starts; a reader process's table feeds from the writer's history.
+- **`Feed`:** `next(timeout:)`, `try_next`, `each(timeout:)` (`Enumerable`), `token` (a binary String), `oldest_retained`, `close` and `closed?`. A closed feed raises `Closed`.
+- **`Commit`** (`seqno`, `timestamp`, `changes`, `size`) and **`Change`** (`table`, `family`, `kind`, `row`, `qualifier`, `timestamp`, `value`) are frozen `Data`. `kind` is a Symbol, and `value` is typed as `Cell#typed` types it.
+- **Interrupts:** a wait releases the GVL in 100 ms slices and calls `thread_check_ints` between them, as Python's checks for signals, so `Thread#raise`, `Timeout` and Ctrl-C end a blocked `next` within a slice. One engine call still isn't interruptible (O3); a slice bounds how long one runs.
+
 ## The rules
 - **The GVL (O3, G1).** Every engine call runs through `gvl::without_gvl`, the crate's only hand-written `unsafe`:
   - The bounds `F: FnOnce() -> R + Send` and `R: Send` keep every Ruby value (all `!Send` in magnus) out of code that runs without the GVL.
@@ -75,11 +104,14 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
 ## CI and packaging
 - **`ruby.yml`:** the extension compiled, the Minitest suite (once plainly and once under `rbs test`'s runtime checking against `sig/pigeonhole.rbs`) and `rbs validate`, on Ruby 3.3 on Linux, macOS and Windows, and Ruby 4.0 on Linux and macOS.
 - **`ruby-gems.yml`:** precompiled native gems (oxidize-rb's `cross-gem` over `rb-sys-dock`) for x86_64 and aarch64 Linux (gnu and musl), x86_64 and arm64 macOS, and `x64-mingw-ucrt` Windows, for Ruby 3.3, 3.4 and 4.0, uploaded as artifacts only.
-- **The source-gem fallback** follows in its own PR, since it needs a standalone `Cargo.toml`.
+- **The source gem**, for platforms without a native gem: `rake gem:source` (`rakelib/source_gem.rake`) stages the gem in `pkg/source/` with the engine's path crates vendored under `vendor/`, as maturin's sdist does for Python. The design and both reviews are on #697.
+  - The vendored set is the closure of the declared normal and build path dependencies, optional ones included.
+  - Each crate is its tracked files, without `tests/`, `benches/`, `examples/` and `fuzz/`. Its manifest stands alone: the workspace inheritance is resolved from the root `Cargo.toml` (`edition` and `rust-version` stated explicitly), path dependencies point at the vendored copies, and every dev-dependency table and explicit target is dropped. Of `[lints]`, only `unexpected_cfgs` and its check-cfg list are kept, at "warn".
+  - Staging fails on a path dependency outside `vendor/`, and on an `include!`, `include_str!`, `include_bytes!` or `#[path]` target the copy doesn't carry (outside `#[cfg(doctest)]` modules). `crates/ruby/Cargo.lock` is copied unchanged and checked with `cargo metadata --locked`. `extconf.rb` builds with `--locked`, so a user gets the versions CI tested.
+  - `ruby-gems.yml`'s `source` job installs the gem from a copy outside the checkout into an empty `GEM_HOME` on Linux and macOS, runs `script/source_gem_smoke.rb`, and uploads the gem as an artifact. A plain `gem build` from the checkout still refuses.
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
 ## Later PRs
-- **PR 2:** vectors, `multi_get`, `traverse`, `pages`, byte-budgeted reads and the change feed.
 - **PR 3:** `pigeonhole-memory`, `pigeonhole-text` and `pigeonhole-vector`.
 
 ## Callers changed

@@ -16,18 +16,23 @@
 
 use magnus::{Error, Module, Object, RClass, RModule, Ruby, function, method, prelude::*};
 
+mod budget;
 mod classes;
 mod convert;
 mod db;
 mod error;
+mod feed;
 mod fork;
 mod gvl;
 mod read;
 mod table;
+mod vector;
+mod walk;
 
 use classes::{
-    Cell, Condition, Database, FamilyInfo, Mutation, Reader, Row, ScanCursor, ScanSpec, Snapshot,
-    Table, TableBuilder, Transaction, WriteBatch,
+    Cell, Condition, Database, FamilyInfo, Feed, KeysPosition, Mutation, Pages, Reader, Row,
+    RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder, Transaction,
+    VectorSpec, WriteBatch,
 };
 
 /// Defines `Pigeonhole::<name>` with no allocator: instances come only from the library.
@@ -46,6 +51,7 @@ macro_rules! writes {
         c.define_private_method("native_put_u64", method!(db::w_put_u64::<$t>, 6))?;
         c.define_private_method("native_incr", method!(db::w_incr::<$t>, 6))?;
         c.define_private_method("native_aggregate", method!(db::w_aggregate::<$t>, 6))?;
+        c.define_private_method("native_put_vector", method!(db::w_put_vector::<$t>, 6))?;
         c.define_private_method("native_delete", method!(db::w_delete::<$t>, 5))?;
     }};
 }
@@ -68,7 +74,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     error::register(ruby, m, native)?;
 
     m.singleton_class()?
-        .define_private_method("native_open", function!(db::open, 9))?;
+        .define_private_method("native_open", function!(db::open, 13))?;
     m.singleton_class()?
         .define_private_method("native_open_reader", function!(db::open_reader, 4))?;
     m.singleton_class()?
@@ -116,12 +122,23 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_put", method!(Table::put, 6))?;
     c.define_private_method("native_incr", method!(Table::incr, 6))?;
     c.define_private_method("native_delete", method!(Table::delete, 5))?;
+    c.define_private_method("native_multi_get", method!(Table::multi_get, 6))?;
+    c.define_private_method("native_traverse", method!(Table::traverse, 11))?;
+    c.define_private_method("native_pages", method!(Table::pages, 7))?;
+    c.define_private_method("native_nearest", method!(Table::nearest, 11))?;
+    c.define_private_method("native_scan_within", method!(Table::scan_within, 11))?;
+    c.define_private_method("native_feed", method!(Table::feed, 6))?;
+    c.define_private_method(
+        "native_multi_get_within",
+        method!(Table::multi_get_within, 8),
+    )?;
 
     let c = class(ruby, m, "Mutation")?;
     c.define_private_method("native_put", method!(Mutation::put, 4))?;
     c.define_private_method("native_put_u64", method!(Mutation::put_u64, 4))?;
     c.define_private_method("native_incr", method!(Mutation::incr, 4))?;
     c.define_private_method("native_aggregate", method!(Mutation::aggregate, 4))?;
+    c.define_private_method("native_put_vector", method!(Mutation::put_vector, 4))?;
     c.define_private_method("native_delete", method!(Mutation::delete, 3))?;
     c.define_private_method("native_durability", method!(Mutation::set_durability, 1))?;
     c.define_method("commit", method!(Mutation::commit, 0))?;
@@ -155,6 +172,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("as_int", method!(Cell::as_int, 0))?;
     c.define_method("as_u64", method!(Cell::as_u64, 0))?;
     c.define_method("as_float", method!(Cell::as_float, 0))?;
+    c.define_method("as_vector", method!(Cell::as_vector, 0))?;
     c.define_method("hll_estimate", method!(Cell::hll_estimate, 0))?;
     c.define_method("sum_f64", method!(Cell::sum_f64, 0))?;
     c.define_method("mean_var", method!(Cell::mean_var, 0))?;
@@ -177,6 +195,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     s.define_private_method("native_new", function!(table::family_new, 7))?;
     s.define_private_method("native_counter", function!(table::family_counter, 2))?;
     s.define_private_method("native_aggregate", function!(table::family_aggregate, 8))?;
+    s.define_private_method("native_vector", function!(table::family_vector, 5))?;
 
     let c = class(ruby, m, "FamilyInfo")?;
     c.define_method("name", method!(FamilyInfo::name, 0))?;
@@ -192,6 +211,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("merge_operator", method!(FamilyInfo::merge_operator, 0))?;
     c.define_method("cache_priority", method!(FamilyInfo::cache_priority, 0))?;
     c.define_method("compaction", method!(FamilyInfo::compaction, 0))?;
+    c.define_method("vector", method!(FamilyInfo::vector, 0))?;
     c.define_method("family", method!(FamilyInfo::family, 0))?;
     c.define_method("inspect", method!(FamilyInfo::inspect, 0))?;
 
@@ -199,6 +219,44 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_singleton_method("absent", function!(Condition::absent, 2))?;
     c.define_singleton_method("exists", function!(Condition::exists, 2))?;
     c.define_singleton_method("equals", function!(Condition::equals, 3))?;
+
+    let c = class(ruby, m, "VectorSpec")?;
+    c.define_singleton_method("new", function!(VectorSpec::new, 3))?;
+    c.define_method("dim", method!(VectorSpec::dim, 0))?;
+    c.define_method("element", method!(VectorSpec::element, 0))?;
+    c.define_method("metric", method!(VectorSpec::metric, 0))?;
+    c.define_method("==", method!(VectorSpec::eq, 1))?;
+    c.define_method("eql?", method!(VectorSpec::eq, 1))?;
+    c.define_method("hash", method!(VectorSpec::hash, 0))?;
+    c.define_method("inspect", method!(VectorSpec::inspect, 0))?;
+
+    /// Defines a position class and its shared methods; evaluates to the class.
+    macro_rules! position {
+        ($name:literal, $t:ty) => {{
+            let c = class(ruby, m, $name)?;
+            c.define_singleton_method("from_bytes", function!(<$t>::from_bytes, 1))?;
+            c.define_method("to_bytes", method!(<$t>::to_bytes, 0))?;
+            c.define_method("==", method!(<$t>::eq, 1))?;
+            c.define_method("eql?", method!(<$t>::eq, 1))?;
+            c.define_method("hash", method!(<$t>::hash, 0))?;
+            c
+        }};
+    }
+    position!("RowPosition", RowPosition);
+    position!("ScanPosition", ScanPosition).define_method("row", method!(ScanPosition::row, 0))?;
+    position!("KeysPosition", KeysPosition).define_method("key", method!(KeysPosition::key, 0))?;
+
+    let c = class(ruby, m, "Feed")?;
+    c.define_private_method("native_next", method!(Feed::next, 1))?;
+    c.define_private_method("native_try_next", method!(Feed::try_next, 0))?;
+    c.define_method("token", method!(Feed::token, 0))?;
+    c.define_method("oldest_retained", method!(Feed::oldest_retained, 0))?;
+    c.define_method("close", method!(Feed::close, 0))?;
+    c.define_method("closed?", method!(Feed::is_closed, 0))?;
+
+    let c = class(ruby, m, "Pages")?;
+    c.define_method("position", method!(Pages::position, 0))?;
+    c.define_private_method("native_next", method!(Pages::next_page, 0))?;
 
     let c = class(ruby, native, "ScanSpec")?;
     c.define_method("open", method!(ScanSpec::open, 1))?;
