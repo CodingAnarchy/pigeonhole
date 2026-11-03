@@ -4,6 +4,7 @@
 //! table (`mem_{name}`), and turns each commit's changes to memory rows into
 //! [`MemoryEvent`]s.
 
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{ChangeKind, Commit, Feed, FeedBuilder, FeedToken, Snapshot, Value};
@@ -157,6 +158,11 @@ impl WatchBuilder {
     }
 }
 
+/// The most commits without memory events one [`Watch::poll_next`] passes over before it
+/// yields (wakes its task and returns `Pending`). A tuning value, not a promise: it may
+/// change in any release (cli692 on #1438).
+pub const PASS_OVER_PER_POLL: usize = 64;
+
 /// A subscription to a store's memory events (D311 T9): each commit that touched a memory,
 /// once, in commit order, as a [`MemoryCommit`]. Commits that touched no memory (another
 /// table's, the store's own bookkeeping rows) are passed over.
@@ -198,6 +204,40 @@ impl Watch {
             }
         }
         Ok(None)
+    }
+
+    /// The next commit with memory events, for an async caller (D310 PR 5a's
+    /// `Feed::poll_next`): `Poll::Ready` with it or with an error, `Poll::Pending` until there
+    /// is one, with `cx`'s waker registered. Commits without memory events are passed over
+    /// within the call. A watch doesn't end on its own.
+    ///
+    /// The writer process only: in a reader process it's `Unsupported`; call
+    /// [`next`](Self::next) on a thread of its own there.
+    ///
+    /// A call passes over at most [`PASS_OVER_PER_POLL`] such commits, then wakes its task
+    /// and returns `Pending`, so a burst of commits it doesn't want (other namespaces', for a
+    /// watch of several) doesn't keep one poll (and its executor thread) busy (cli692 on
+    /// #1438).
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemoryCommit>> {
+        for _ in 0..PASS_OVER_PER_POLL {
+            match self.feed.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Ready(Ok(c)) => {
+                    if let Some(m) = events(c, &self.prefixes) {
+                        return Poll::Ready(Ok(m));
+                    }
+                }
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    /// [`poll_next`](Self::poll_next) as a future: the next commit with memory events,
+    /// without blocking a thread. Writer process only. The future is `Send`.
+    pub async fn next_async(&mut self) -> Result<MemoryCommit> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
     }
 
     /// Where the watch is: [`WatchBuilder::resume`] continues after the last commit it
@@ -290,3 +330,10 @@ const _: fn() = || {
     send::<WatchToken>();
     send::<MemoryCommit>();
 };
+
+// `next_async`'s future is `Send`, so a multi-threaded executor can move it.
+#[allow(dead_code)]
+fn next_async_is_send(w: &mut Watch) {
+    fn send<T: Send>(_: T) {}
+    send(w.next_async());
+}

@@ -265,3 +265,113 @@ fn bad_namespaces_and_a_database_without_a_feed_are_refused() {
     drop(store);
     db.close().unwrap();
 }
+
+/// #1343's async form (D310 PR 5a): `next_async` in the writer gets the same events, waits
+/// without a thread (a write from another thread wakes it), and passes over commits without
+/// memory events. In a reader process it's `Unsupported`.
+#[test]
+fn next_async_in_the_writer_and_unsupported_in_a_reader() {
+    use pigeonhole::doc_support::block_on;
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let mut w = store.watch(&[]).open().unwrap();
+    // Already there: ready at once.
+    let a = store
+        .remember("n", Memory::new("first"))
+        .unwrap()
+        .id()
+        .clone();
+    let c = block_on(w.next_async()).unwrap();
+    assert_eq!(c.events, vec![MemoryEvent::Remembered(a)]);
+    // Not yet there: the task waits, and a write from another thread wakes it. A commit to
+    // another table comes first and is passed over.
+    let other = db
+        .table("other")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            other.mutate(b"x").put("f", b"q", b"v").commit().unwrap();
+            store
+                .remember("n", Memory::new("second"))
+                .unwrap()
+                .id()
+                .clone()
+        })
+    };
+    let c = block_on(w.next_async()).unwrap();
+    let b = writer.join().unwrap();
+    assert_eq!(c.events, vec![MemoryEvent::Remembered(b)]);
+
+    let reader = Pigeonhole::open_reader(dir.join("mem.phdb"), ReaderOptions::default()).unwrap();
+    let rs = Store::open_reader_without_embeddings(&reader, "notes").unwrap();
+    let mut rw = rs.watch(&[]).open().unwrap();
+    let r = block_on(rw.next_async());
+    assert!(
+        matches!(&r, Err(e) if e.code() == pigeonhole::ErrorCode::Unsupported),
+        "{r:?}"
+    );
+    drop(rw);
+    drop(rs);
+    drop(reader);
+    db.close().unwrap();
+}
+
+/// cli692 on #1438: a burst of commits the watch passes over (another namespace's, for a
+/// watch of several, which reads every commit of the store) makes `poll_next` yield after
+/// `PASS_OVER_PER_POLL` of them (waking its task), rather than run through them all in one
+/// call; the memory event after the burst still arrives.
+#[test]
+fn poll_next_yields_during_a_burst_of_other_commits() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let mut w = store.watch(&["a", "b"]).open().unwrap();
+    let burst = 3 * pigeonhole_memory::PASS_OVER_PER_POLL + 5;
+    for i in 0..burst {
+        store
+            .remember("other", Memory::new(format!("not watched {i}")))
+            .unwrap();
+    }
+    let m = store
+        .remember("a", Memory::new("after the burst"))
+        .unwrap()
+        .id()
+        .clone();
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut pendings = 0;
+    let got = loop {
+        match w.poll_next(&mut cx) {
+            Poll::Ready(r) => break r.unwrap(),
+            Poll::Pending => {
+                pendings += 1;
+                assert!(pendings < 1000, "never became ready");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    assert_eq!(got.events, vec![MemoryEvent::Remembered(m)]);
+    // At least the burst's yields, each with a wake of its own.
+    assert!(pendings >= 3, "{pendings} pendings");
+    assert!(count.0.load(Ordering::SeqCst) >= 3);
+    db.close().unwrap();
+}

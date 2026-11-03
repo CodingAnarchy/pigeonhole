@@ -279,7 +279,8 @@ assert_eq!(commit.events, vec![MemoryEvent::Remembered(r.id().clone())]);
   Commits that touch no memory are passed over.
 - **An empty namespace list** watches every namespace.
 - **Resuming:** `watch.token()` gives a `WatchToken` to store (`as_bytes`/`from_bytes`), and `store.watch(..).resume(&token)` continues after it, in a later open too. `from_snapshot(&s)` starts after what a snapshot sees: read the store at `s`, then watch, and nothing is missed or seen twice.
-- **In a reader process,** `read_store.watch(..)` follows the writer's events from its feed history. `next` blocks, so call it on a thread of its own.
+- **Async, in the writer:** `watch.next_async().await` waits without holding a thread (its future is `Send`), and `poll_next(cx)` is the same for hand-written futures.
+- **In a reader process,** `read_store.watch(..)` follows the writer's events from its feed history. There `next_async` is `Unsupported`, and `next` blocks, so call it on a thread of its own.
 - **Delivery** is at durability by default. `.visible()` delivers a commit as soon as reads see it, at the cost the change feed describes.
 - **If the feed's history is recycled past a watch,** `next` fails with `FeedExpired`. Read the store afresh at a snapshot and watch `from_snapshot` it.
 
