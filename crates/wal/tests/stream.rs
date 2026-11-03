@@ -314,6 +314,61 @@ fn durability_none_is_buffered_until_a_stronger_commit_writes() {
     assert_eq!(got.seqnos(), [1, 2]);
 }
 
+/// D312 (owner call 2): a mapped stream stores through the mapping until its first
+/// `GroupSync` or `Sync` record, and writes with `pwrite` from then on, in later segments too.
+/// Syncs without such a record (here `Wal::sync` after Buffered groups) keep the mapping.
+#[test]
+fn a_mapped_stream_stops_mapping_at_its_first_durable_record() {
+    let sim = pigeonhole_io::sim::SimVfs::new(14);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let mut o = opts(4, 1);
+    o.mapped_writes = true;
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    let c = wal.counters();
+    let mut seqno = 0;
+    let mut group = |wal: &mut WalStream, level: Durability| {
+        seqno += 1;
+        let t = wal.append(&batch(seqno, 100).record(), level).unwrap();
+        wal.write().unwrap();
+        t
+    };
+    group(&mut wal, Durability::Buffered);
+    group(&mut wal, Durability::None);
+    group(&mut wal, Durability::Buffered);
+    wal.sync().unwrap();
+    group(&mut wal, Durability::Buffered);
+    let mapped = c.mapped_writes();
+    assert!(
+        mapped >= 3,
+        "{mapped} mapped writes before a durable record"
+    );
+    assert_eq!(c.mapped_stops(), 0);
+
+    let t = group(&mut wal, Durability::GroupSync);
+    wal.sync().unwrap();
+    assert!(wal.satisfies(&t));
+    assert_eq!(c.mapped_stops(), 1);
+    assert_eq!(
+        c.mapped_writes(),
+        mapped,
+        "the durable record's group is written"
+    );
+    // Buffered groups after it, across rollovers into new segments, are written too.
+    let epoch = wal.written().epoch();
+    while wal.written().epoch() < epoch + 2 {
+        group(&mut wal, Durability::Buffered);
+    }
+    group(&mut wal, Durability::Sync);
+    assert_eq!((c.mapped_writes(), c.mapped_stops()), (mapped, 1));
+
+    // Everything, mapped or written, survives a power loss after the last sync.
+    wal.sync().unwrap();
+    drop(wal);
+    sim.crash(pigeonhole_io::sim::CrashKind::Power);
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), (1..=seqno).collect::<Vec<_>>());
+}
+
 #[test]
 fn spares_are_prepared_off_the_shard_thread_and_taken_before_growing() {
     let vfs = sim(13);

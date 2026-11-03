@@ -42,6 +42,8 @@ struct Trace {
     unexpected: Option<String>,
     /// Group writes the stream stored through its mapping (D312).
     mapped: u64,
+    /// Whether the stream stopped mapping at its first `GroupSync` or `Sync` record (D312).
+    stopped: u64,
 }
 
 const GROUPS: u64 = 14;
@@ -58,7 +60,7 @@ fn workload(vfs: &VfsRef, opts: WalOptions, seed: u64) -> Trace {
         }
     };
     let mut seqno = 0;
-    'groups: for _ in 0..GROUPS {
+    'groups: for g in 0..GROUPS {
         let n = 1 + rng.below(4);
         let mut group = Vec::new();
         let mut strongest = Durability::Buffered;
@@ -74,11 +76,18 @@ fn workload(vfs: &VfsRef, opts: WalOptions, seed: u64) -> Trace {
                 1 => commit(seqno, &[STREAM]),
                 _ => batch(seqno, size),
             };
-            let level = [
-                Durability::Buffered,
-                Durability::GroupSync,
-                Durability::Sync,
-            ][rng.below(3) as usize];
+            // D312: a mapped stream stops mapping at its first durable record, so its first
+            // half is Buffered only: it stores through the mapping, then switches to `pwrite`
+            // mid-segment, and both halves meet every crash point.
+            let level = if opts.mapped_writes && g < GROUPS / 2 {
+                Durability::Buffered
+            } else {
+                [
+                    Durability::Buffered,
+                    Durability::GroupSync,
+                    Durability::Sync,
+                ][rng.below(3) as usize]
+            };
             strongest = strongest.max(level);
             match wal.append(&rec.record(), level) {
                 Ok(t) => {
@@ -136,6 +145,7 @@ fn workload(vfs: &VfsRef, opts: WalOptions, seed: u64) -> Trace {
         }
     }
     trace.mapped = wal.counters().mapped_writes();
+    trace.stopped = wal.counters().mapped_stops();
     trace
 }
 
@@ -327,6 +337,7 @@ fn mapped_writes_survive_power_loss_at_every_operation() {
 }
 
 fn survive_power_loss_at_every_operation(opts: WalOptions, seeds: std::ops::Range<u64>) {
+    let mut stopped = 0;
     for seed in seeds {
         // Size the sweep from a crash-free run.
         let dry = SimVfs::new(seed);
@@ -340,6 +351,11 @@ fn survive_power_loss_at_every_operation(opts: WalOptions, seeds: std::ops::Rang
             "seed {seed}: {} mapped writes",
             trace.mapped
         );
+        assert!(
+            trace.stopped <= u64::from(opts.mapped_writes),
+            "seed {seed}"
+        );
+        stopped += trace.stopped;
         check(&dry_vfs, &trace, |_| true, &format!("seed {seed} no crash"));
         let total = dry.mutating_ops();
         assert!(total > 20, "seed {seed}: {total} ops");
@@ -367,6 +383,12 @@ fn survive_power_loss_at_every_operation(opts: WalOptions, seeds: std::ops::Rang
             }
         }
     }
+    // Some mapped run switched to `pwrite` mid-run, so the sweep covered the switch too.
+    assert_eq!(
+        stopped > 0,
+        opts.mapped_writes,
+        "{stopped} streams stopped mapping"
+    );
 }
 
 #[test]

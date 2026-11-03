@@ -191,6 +191,9 @@ pub struct WalOptions {
     /// `pwrite`, where the file supports it (Linux), and with `pwrite` otherwise. The same
     /// guarantee (the frames are in the page cache, as after a completed write) with no
     /// system call. Segment headers are always written with `pwrite` (FORMAT §10.1 rule 1).
+    /// A stream maps only until its first `GroupSync` or `Sync` record, and writes with
+    /// `pwrite` from then on ([`WalCounters::mapped_stops`]): a sync per group over mapped
+    /// pages costs a write fault per group.
     pub mapped_writes: bool,
 }
 

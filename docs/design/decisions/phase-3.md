@@ -4194,3 +4194,15 @@ The stage's instructions are about 0.25 µs. (`.coord/ctr274-1206-lever4-b2-deci
 - the first store to each page takes a minor fault, about one per 15–25 frames, mitigated by the read-ahead;
 - the unmap of the full segment at rollover (a TLB shootdown, once per 64 MiB);
 - SIGBUS, ruled out by mapping only within the file's length.
+
+**Box A/B ×3 and owner call 2 (2026-11-02).** The gate rows ×3 on the AX102 (#1369's results comment):
+- **Default collapsed:** throughput fell 5–25× on every row that writes, with put and commit p99 at 2–4.4 ms, about one sync per group. A sync writes back the mapped pages and write-protects them, so the next store into them takes a write fault, and at Default that happens on every group. The device doesn't require stable pages, so it isn't the stable-page wait; the rest of the fault's cost is unprofiled.
+- **Buffered was mixed:** counters +18%, transfer +9.5%, ycsb-a +4%, ycsb-f +3%, against sparse-wide −3.5% (put p99.9 2.85×), time-series-ttl −4%, and ycsb-b/e put p99.9 about 1.5×.
+
+The owner picked option 1: **a stream maps only until its first durable record, then writes with `pwrite` for good.**
+- **The trigger is the record, not the sync.** `WalStream::append` with `GroupSync` or `Sync` drops the mapping before framing that record (`stop_mapping`, `WalCounters::mapped_stops`). A stream also syncs without one (a rollover, a flush barrier, the feed's background sync, a held header). Those are rare next to the groups between them and keep the mapping, so a Buffered workload keeps its gain.
+- **Per stream, not per segment:** later segments aren't mapped either. A workload that commits durably once is likely to do it again, and remapping each segment would pay the Default cost again per segment. Per stream is also simpler to reason about: once a stream has stopped, it behaves exactly as without D312.
+- **The switch is safe mid-segment.** Stores already made stay in the page cache, `pwrite`s of the same pages find them (one page cache), and the next sync covers both.
+- **Tests:** `a_mapped_stream_stops_mapping_at_its_first_durable_record` (WAL `stream.rs`). The mapped crash sweep now runs its first half Buffered only, so every crash point meets mapped stores, the switch and the `pwrite`s after it. A mutation that never switches fails the sweep.
+- **What the env-var suites now cover:** with `PIGEONHOLE_WAL_MAPPED=1`, the engine suites' streams stop mapping at their first durable commit, so the mapped path there runs mostly in `Buffered`/`None` tests. The WAL crash sweep is the one that covers it under faults.
+- **Still before the default decision:** a box re-run of sparse-wide and ycsb-e at Buffered ×3 (is the put p99.9 tail first-touch faults on a fresh segment?), Default parity rows, the five sweeps and the crash suites on the new head, and perf287's review.

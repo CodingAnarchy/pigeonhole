@@ -389,6 +389,7 @@ pub struct WalCounters {
     rollover_waits: AtomicU64,
     retained_taken: AtomicU64,
     mapped_writes: AtomicU64,
+    mapped_stops: AtomicU64,
 }
 
 impl WalCounters {
@@ -427,6 +428,12 @@ impl WalCounters {
     /// prototype, [`WalOptions::mapped_writes`](crate::WalOptions::mapped_writes)).
     pub fn mapped_writes(&self) -> u64 {
         self.mapped_writes.load(Ordering::Relaxed)
+    }
+
+    /// Streams that stopped mapping at their first `GroupSync` or `Sync` record (D312, owner
+    /// call 2): 0 or 1 per stream.
+    pub fn mapped_stops(&self) -> u64 {
+        self.mapped_stops.load(Ordering::Relaxed)
     }
 }
 
@@ -1364,7 +1371,8 @@ pub struct WalStream {
     held: Option<HeldHeader>,
     /// The epoch the current segment's slot held before, if it was recycled.
     stale: Option<u32>,
-    /// D312: write frames through a mapping of the current segment's slot.
+    /// D312: write frames through a mapping of the current segment's slot. Cleared for good
+    /// at the stream's first `GroupSync` or `Sync` record ([`Self::stop_mapping`]).
     mapped_writes: bool,
     /// The current segment's slot, mapped for writing (D312), when `mapped_writes` and the file
     /// supports it; frames are `pwrite`n otherwise.
@@ -2072,6 +2080,25 @@ impl WalStream {
         r
     }
 
+    /// D312 (owner call 2): the stream's first record that a commit syncs for (`GroupSync`
+    /// or `Sync`) ends its mapped writes, for good: from here on every group is written with
+    /// `pwrite`, as without D312. A sync after mapped stores write-protects the pages it
+    /// writes back, so every later store into them takes a write fault; with a sync per group
+    /// that cost 5–25x the throughput of Default rows (#1369's box A/B). Frames already stored
+    /// through the mapping stay in the page cache, where a `pwrite` of the same pages finds
+    /// them, and the syncs to come cover them. Syncs a stream makes without such a record (a
+    /// rollover, a flush barrier, the feed's, a held header's) keep the mapping: they're rare
+    /// next to the groups between them.
+    #[cold]
+    fn stop_mapping(&mut self) {
+        self.mapped_writes = false;
+        self.map = None;
+        self.shared
+            .counters
+            .mapped_stops
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     fn write_buf(&mut self) -> Result<()> {
         if self.held.is_some() {
@@ -2124,6 +2151,9 @@ impl Wal for WalStream {
         let len = head.len() + body.len();
         if len > self.max_payload {
             return Err(Error::RecordTooLarge);
+        }
+        if self.mapped_writes && durability > Durability::Buffered {
+            self.stop_mapping();
         }
         let end = self.append_parts(&[head, body], len);
         let end = self.poison_on_err(end)?;
