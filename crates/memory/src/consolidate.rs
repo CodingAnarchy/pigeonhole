@@ -242,6 +242,14 @@ impl<'a> Consolidate<'a> {
     /// What the consolidator returns skips near dedup ([`NearDedup`](crate::NearDedup)): a
     /// summary is meant to sit near its sources.
     pub fn run(self) -> Result<ConsolidatePass> {
+        let store = self.store;
+        let r = self.run_inner();
+        // The pass's IVF writes, after its transactions (D311 T8).
+        store.ivf_settle();
+        r
+    }
+
+    fn run_inner(self) -> Result<ConsolidatePass> {
         check_namespace(self.ns)?;
         if let Some(a) = self.after
             && a.namespace() != self.ns
