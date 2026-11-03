@@ -713,6 +713,18 @@ pub struct Stalls {
     /// the next segment's header still waited for a sync (D213 exports it; expected near 0).
     #[serde(default)]
     pub wal_rollover_blocks: u64,
+    /// D312's mapped WAL writes (`PIGEONHOLE_WAL_MAPPED=1`): group writes stored through a
+    /// segment's mapping during the measured phase, summed over shards.
+    #[serde(default)]
+    pub wal_mapped_writes: u64,
+    /// The fewest mapped group writes any one shard made since open: 0 means some shard
+    /// never mapped, so a mapped run that shows it measured `pwrite` there.
+    #[serde(default)]
+    pub wal_mapped_writes_min_shard: u64,
+    /// Streams that stopped mapping since open, at their first `GroupSync` or `Sync` record
+    /// (D312, owner call 2): above 0 in a Buffered run, it fell back to `pwrite`.
+    #[serde(default)]
+    pub wal_mapped_stops: u64,
     /// Tablet splits and moves refused because a shard's memtable arena serves no more
     /// slots (a size split found due counts once per balancer pass; #123).
     #[serde(default)]
@@ -804,6 +816,10 @@ impl Stalls {
             visibility_contended: d(before.visibility_contended, after.visibility_contended),
             slot_refusals: d(before.slot_refusals, after.slot_refusals),
             wal_rollover_blocks: d(before.wal_rollover_blocks, after.wal_rollover_blocks),
+            wal_mapped_writes: d(before.wal_mapped_writes, after.wal_mapped_writes),
+            // Since open, not counts in the phase: what the stream did before it counts too.
+            wal_mapped_writes_min_shard: after.wal_mapped_writes_min_shard,
+            wal_mapped_stops: after.wal_mapped_stops,
             row_cache_hits: d(before.row_cache_hits, after.row_cache_hits),
             row_cache_misses: d(before.row_cache_misses, after.row_cache_misses),
             row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),

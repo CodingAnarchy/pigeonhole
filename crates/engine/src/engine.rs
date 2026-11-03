@@ -105,6 +105,18 @@ pub struct CommitInfo {
     pub durability: Durability,
 }
 
+/// D312's mapped WAL writes in [`Metrics::wal_mapped`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WalMapped {
+    /// Group writes stored through a segment's mapping, summed over shards.
+    pub writes: u64,
+    /// The fewest group writes any one shard stored through its mapping.
+    pub min: u64,
+    /// Streams that stopped mapping at their first `GroupSync` or `Sync` record.
+    pub stops: u64,
+}
+
 /// Counters and latencies.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -166,6 +178,11 @@ pub struct Metrics {
     /// while that segment's header still waited for the previous segment's sync (#19).
     /// Expected to stay near 0.
     pub wal_rollover_blocks: u64,
+    /// D312's prototype (`WalOptions::mapped_writes`): group writes stored through a
+    /// segment's mapping, summed over shards; the fewest any one shard stored; and the
+    /// streams that stopped mapping at their first `GroupSync` or `Sync` record. A run meant
+    /// to be mapped throughout has `min` above 0 and no stops.
+    pub wal_mapped: WalMapped,
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
@@ -3093,7 +3110,14 @@ impl Engine {
                 }
             }
         }
+        let mut mapped_min: Option<u64> = None;
         for s in &shared.metrics {
+            if let Some(c) = s.wal.get() {
+                m.wal_mapped.writes += c.mapped_writes();
+                m.wal_mapped.stops += c.mapped_stops();
+                mapped_min =
+                    Some(mapped_min.map_or(c.mapped_writes(), |v| v.min(c.mapped_writes())));
+            }
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
@@ -3121,6 +3145,7 @@ impl Engine {
             x.max_attempts_blind = x.max_attempts_blind.max(most(0));
             x.max_attempts_reading = x.max_attempts_reading.max(most(1));
         }
+        m.wal_mapped.min = mapped_min.unwrap_or(0);
         let pager = shared.pager.stats();
         m.stalls = (
             m.room_stalls.0 + m.pacing_stalls.0,
