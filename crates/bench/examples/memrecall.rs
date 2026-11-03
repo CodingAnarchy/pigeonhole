@@ -15,7 +15,8 @@
 //!   weight 1), which the graph expansion walks. Then every question runs under each
 //!   configuration:
 //!   - `vector`, `keyword` and `recency`: that signal alone (its weight 1, the others' 0);
-//!   - `fused`: the default weights, and `fused-no-recency`: those but recency's (and use's);
+//!   - `fused`: the default weights, and `fused-no-recency`, `fused-recency-0.25` and
+//!     `fused-recency-0.5`: those with recency's (and use's) at 0, 0.25 or 0.5;
 //!   - `fused+graph`: the default weights with `expand(Expand::hops(1))`;
 //!   - `keyword-fuzzy`: the text index directly, terms of 5 or more characters as
 //!     `Fuzziness::Auto` fuzzy terms, against `keyword-index`, the same search without them.
@@ -290,9 +291,9 @@ impl Tally {
 
 fn weights(only: Option<usize>) -> Weights {
     let mut w = Weights::default();
-    if only == Some(9) {
-        w.recency = 0.0;
-        w.uses = 0.0;
+    if let Some(i @ 10..=12) = only {
+        w.recency = [0.0, 0.25, 0.5][i - 10];
+        w.uses = w.recency;
         return w;
     }
     if let Some(i) = only {
@@ -335,13 +336,16 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
     for m in &f.mems {
         *ns_size.entry(&m.ns).or_default() += 1;
     }
-    let configs: [(&str, Option<usize>, bool); 6] = [
+    let configs: [(&str, Option<usize>, bool); 8] = [
         ("vector", Some(0), false),
         ("keyword", Some(1), false),
         ("recency", Some(2), false),
         ("fused", None, false),
-        // The default weights but recency's (and use's, which these datasets don't have).
-        ("fused-no-recency", Some(9), false),
+        // The default weights with recency's (and use's, which these datasets don't have)
+        // at 0, 0.25 and 0.5.
+        ("fused-no-recency", Some(10), false),
+        ("fused-recency-0.25", Some(11), false),
+        ("fused-recency-0.5", Some(12), false),
         ("fused+graph", None, true),
     ];
     let ranked_of = |ids: Vec<Vec<u8>>| -> Vec<Vec<String>> {

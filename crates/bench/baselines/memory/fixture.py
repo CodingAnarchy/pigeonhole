@@ -31,6 +31,8 @@ import sys
 import urllib.request
 
 MODEL = "BAAI/bge-small-en-v1.5"
+# The revision the published results used (manifest.json records the one loaded).
+REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 # bge's instruction for retrieval queries; passages take none.
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
@@ -42,7 +44,7 @@ SOURCES = {
     ),
     "lme_m": (
         "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_m_cleaned.json",
-        None,
+        "9d79e5524794a2e6900a3aa9cb7d9152c5a3e8319c9a87c25494ba1eacee495f",
     ),
     "locomo": (
         "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
@@ -203,7 +205,7 @@ def main():
 
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(MODEL, device="cpu")
+    model = SentenceTransformer(MODEL, device="cpu", revision=REVISION)
     manifest = {
         "model": MODEL,
         "revision": getattr(model[0].auto_model.config, "_commit_hash", None),
