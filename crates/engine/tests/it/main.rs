@@ -20,6 +20,7 @@ mod gate;
 mod admission;
 mod aggregates;
 mod applier_release;
+mod arena_small_entries;
 mod background_workers;
 mod blobs;
 mod blocking_commits;
