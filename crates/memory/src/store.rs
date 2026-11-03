@@ -388,6 +388,9 @@ pub struct StoredMemory {
     pub pinned: bool,
     /// Whether a consolidation took it in ([`Store::consolidate`], T3).
     pub consolidated: bool,
+    /// Whether a consolidator wrote it, as a group's summary (T9, `meta:summary`). Memories
+    /// from before T9 read `false`.
+    pub summary: bool,
     /// The memory that superseded it, if one did.
     pub superseded_by: Option<MemoryId>,
     /// Its sources, each with its first-seen time (µs).
@@ -1481,6 +1484,7 @@ pub(crate) fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<
         .map(|c| String::from_utf8_lossy(c.value()).into_owned());
     let pinned = view.get(META, PINNED).is_some();
     let consolidated = view.get(META, CONSOLIDATED).is_some();
+    let summary = view.get(META, SUMMARY).is_some();
     let superseded_by = view
         .get(META, SUPERSEDED_BY)
         .map(|c| MemoryId::from_row(c.value()).ok_or_else(|| corrupt("superseded_by")))
@@ -1512,6 +1516,7 @@ pub(crate) fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<
         session,
         pinned,
         consolidated,
+        summary,
         superseded_by,
         sources,
         links,

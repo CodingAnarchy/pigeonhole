@@ -316,6 +316,7 @@ pub pigeonhole_memory::StoredMemory::links: alloc::vec::Vec<pigeonhole_memory::L
 pub pigeonhole_memory::StoredMemory::pinned: bool
 pub pigeonhole_memory::StoredMemory::session: core::option::Option<alloc::string::String>
 pub pigeonhole_memory::StoredMemory::sources: alloc::vec::Vec<pigeonhole_memory::Source>
+pub pigeonhole_memory::StoredMemory::summary: bool
 pub pigeonhole_memory::StoredMemory::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::StoredMemory::text: alloc::string::String
 pub pigeonhole_memory::StoredMemory::uses: u64

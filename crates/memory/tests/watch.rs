@@ -145,6 +145,9 @@ fn each_write_gives_its_events() {
         })
         .collect();
     assert_eq!(summaries.len(), 1, "{ev:?}");
+    let stored = store.get(summaries[0]).unwrap().unwrap();
+    assert!(stored.summary, "StoredMemory::summary");
+    assert!(!store.get(&a).unwrap().unwrap().summary);
     assert!(ev.contains(&MemoryEvent::Updated(c1)), "{ev:?}");
     assert!(ev.contains(&MemoryEvent::Updated(c2)), "{ev:?}");
     assert!(
