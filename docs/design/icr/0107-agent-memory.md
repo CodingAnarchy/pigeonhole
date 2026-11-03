@@ -178,6 +178,23 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
   - **`remember_in` doesn't check:** the check reads outside a transaction. `Store::near_duplicate(ns, &Memory) -> Result<Option<(MemoryId, f32)>>` runs it for a caller first, and is `InvalidArgument` without a setting.
   - **The race (S2):** two concurrent near duplicates can both insert, and consolidation folds them.
 
+## T6: Python bindings (#1340)
+The design is on #1340 (cli692, c6594184297), reviewed by ai1249 and simp724 there. It's `pigeonhole.memory`, in `pigeonhole-db` (ICR 0102's conventions: the GIL released around every call, stubs checked by `mypy.stubtest`, and errors as `pigeonhole.Error` subclasses by code). The Rust crate's API is unchanged.
+- **The names are the crate's:**
+  - `Store` (`create`, `open(model=)`, `open_reader`) and `ReadStore`;
+  - `Memory` (as keyword arguments, and as a consolidator's return value), `MemoryId` (its text form accepted wherever an id is), `EmbeddingModel`, `Weights`, `ForgetPolicy` (all six builders), `ConsolidatePolicy` and `NearDedup`;
+  - the result types;
+  - `Kind` (`StrEnum`) and `LinkType` (`IntEnum`; any `int` from 16 for an application's).
+- **Errors:** `ModelMismatch` subclasses `InvalidArgument` (the crate's `Mismatch`), and `NotFound` is `InvalidArgument` as its code is.
+- **A Python consolidator** is any callable `(list[StoredMemory]) -> list[Memory]`:
+  - The pass runs with the GIL released, and the crate's `Consolidator` impl takes it for the call only. So the callable may call the store, and other threads run meanwhile.
+  - An exception (`KeyboardInterrupt` included), or a return of the wrong type, stops the pass as `ConsolidateError` (a `MergeFailed` subclass), with `consolidated` (the pass so far) and `__cause__`.
+- **Lifecycle (simp724's P1):**
+  - `Store.close()` and `with` empty the handle's slot, and the forgetter thread stops once every handle to the store is closed.
+  - `Database.close()` (and `Reader.close()`) close the stores opened on them first.
+  - Afterwards calls raise `Closed`, and a call already running ends with the database's `Closed`.
+- **Not bound in T6:** `own_forgetter`/`take_forgetter` (a Python application drives passes with `forget()`), and `Expand` (it follows #1391).
+
 ## T7: `phdb mcp` memory tools (#1341)
 The design is on #1341 (cli692, c6593086022), plus the owner's three-part decision there. The flags and tools are `phdb`'s interface. They're not part of `pigeonhole-memory`'s API, which T7 doesn't change.
 - **`phdb mcp --memory NAME`** serves the store `NAME`. A writable server creates it when it's missing.

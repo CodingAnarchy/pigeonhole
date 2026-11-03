@@ -36,7 +36,7 @@ pub(crate) fn metric(ob: &Bound<'_, PyAny>) -> PyResult<Metric> {
     }
 }
 
-fn element_name(e: Element) -> &'static str {
+pub(crate) fn element_name(e: Element) -> &'static str {
     match e {
         Element::F32 => "f32",
         Element::I8 => "i8",

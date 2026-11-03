@@ -180,10 +180,22 @@ macro_rules! write_methods {
 /// The open database, as the writer process. Close it with `close()`, or use it as a
 /// context manager.
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Database(RwLock<Option<pigeonhole::Pigeonhole>>);
+pub(crate) struct Database(
+    RwLock<Option<pigeonhole::Pigeonhole>>,
+    /// The memory stores opened on it (D311 T6): `close` closes them first, so their
+    /// forgetter threads stop (simp724's P1 on #1340).
+    Mutex<Vec<std::sync::Weak<crate::memory::StoreSlot>>>,
+);
 
 impl Database {
-    fn db(&self) -> PyResult<pigeonhole::Pigeonhole> {
+    /// Registers a memory store opened on this database, for `close` to close first.
+    pub(crate) fn adopt_store(&self, slot: &std::sync::Arc<crate::memory::StoreSlot>) {
+        let mut stores = self.1.lock().expect("not poisoned");
+        stores.retain(|w| w.strong_count() > 0);
+        stores.push(std::sync::Arc::downgrade(slot));
+    }
+
+    pub(crate) fn db(&self) -> PyResult<pigeonhole::Pigeonhole> {
         self.0
             .read()
             .expect("not poisoned")
@@ -269,7 +281,7 @@ pub(crate) fn open(
     let db = py
         .detach(move || pigeonhole::Pigeonhole::open(path, o))
         .or_py()?;
-    Ok(Database(RwLock::new(Some(db))))
+    Ok(Database(RwLock::new(Some(db)), Mutex::new(Vec::new())))
 }
 
 #[pymethods]
@@ -398,6 +410,12 @@ impl Database {
     /// Closes the database: flushes, checkpoints and releases the writer lock. Using it, or
     /// its tables, afterwards raises `Closed`. Closing twice does nothing.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        // The memory stores first: dropping their handles stops their forgetters (a slice in
+        // flight fails with `Closed`, its deletion dropped whole).
+        let stores = std::mem::take(&mut *self.1.lock().expect("not poisoned"));
+        for s in stores.iter().filter_map(std::sync::Weak::upgrade) {
+            crate::memory::close_slot(&s);
+        }
         let db = self.0.write().expect("not poisoned").take();
         match db {
             Some(db) => py.detach(move || db.close()).or_py(),
@@ -424,10 +442,21 @@ impl Database {
 /// A database opened as a reader process: it sees what the running writer process commits,
 /// and can't write.
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Reader(RwLock<Option<pigeonhole::PigeonholeReader>>);
+pub(crate) struct Reader(
+    RwLock<Option<pigeonhole::PigeonholeReader>>,
+    /// The memory stores opened on it: `close` closes them first.
+    Mutex<Vec<std::sync::Weak<crate::memory::ReadSlot>>>,
+);
 
 impl Reader {
-    fn db(&self) -> PyResult<pigeonhole::PigeonholeReader> {
+    /// Registers a memory store opened on this reader, for `close` to close first.
+    pub(crate) fn adopt_store(&self, slot: &std::sync::Arc<crate::memory::ReadSlot>) {
+        let mut stores = self.1.lock().expect("not poisoned");
+        stores.retain(|w| w.strong_count() > 0);
+        stores.push(std::sync::Arc::downgrade(slot));
+    }
+
+    pub(crate) fn db(&self) -> PyResult<pigeonhole::PigeonholeReader> {
         self.0
             .read()
             .expect("not poisoned")
@@ -460,7 +489,7 @@ pub(crate) fn open_reader(
     let r = py
         .detach(move || pigeonhole::Pigeonhole::open_reader(path, o))
         .or_py()?;
-    Ok(Reader(RwLock::new(Some(r))))
+    Ok(Reader(RwLock::new(Some(r)), Mutex::new(Vec::new())))
 }
 
 #[pymethods]
@@ -496,6 +525,10 @@ impl Reader {
 
     /// Closes the reader. Closing twice does nothing.
     fn close(&self) {
+        let stores = std::mem::take(&mut *self.1.lock().expect("not poisoned"));
+        for s in stores.iter().filter_map(std::sync::Weak::upgrade) {
+            s.write().expect("not poisoned").take();
+        }
         self.0.write().expect("not poisoned").take();
     }
 
@@ -619,6 +652,20 @@ impl Transaction {
         })
         .or_py()
         .map(|i| i.seqno)
+    }
+}
+
+impl Transaction {
+    /// Runs `f` on the open transaction (the memory store's `*_in` calls), with the GIL
+    /// released; `ValueError` once it's committed or rolled back.
+    pub(crate) fn with_txn<R: Send>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut pigeonhole::Transaction) -> R + Send,
+    ) -> PyResult<R> {
+        let mut guard = self.0.lock().expect("not poisoned");
+        let txn = guard.as_mut().ok_or_else(done)?;
+        Ok(py.detach(move || f(txn)))
     }
 }
 
