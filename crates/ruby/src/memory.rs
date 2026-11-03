@@ -1059,6 +1059,15 @@ fn answer(ruby: &Ruby, out: Value) -> Result<Vec<mem::Memory>, Error> {
         .collect()
 }
 
+/// Records an interrupt (or a jump) as how the pass ends. It replaces a `StandardError`
+/// the block raised before it: the interrupt (Ctrl-C, `Timeout`) is the one the caller
+/// must see (perf2 on #1425). An earlier jump stays.
+fn note_jump(early: &mut Option<Early>, e: Error) {
+    if !matches!(early, Some(Early::Jump(_))) {
+        *early = Some(Early::Jump(e));
+    }
+}
+
 /// How the Ruby side of a pass ended early.
 enum Early {
     /// A `StandardError` from the block (or from converting its answer):
@@ -1463,7 +1472,7 @@ impl Store {
             let msg = match without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE)) {
                 Ok(msg) => msg,
                 Err(e) => {
-                    early.get_or_insert(Early::Jump(e));
+                    note_jump(&mut early, e);
                     continue;
                 }
             };
@@ -1505,7 +1514,7 @@ impl Store {
         let panicked = match joined {
             Ok(p) => p.unwrap_or(false),
             Err(e) => {
-                early.get_or_insert(Early::Jump(e));
+                note_jump(&mut early, e);
                 lock(&worker).take().is_some_and(|w| w.join().is_err())
             }
         };
