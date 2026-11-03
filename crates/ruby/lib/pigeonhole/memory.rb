@@ -119,9 +119,11 @@ module Pigeonhole
 
     # One step of a `ConsolidateLoop`: the events it read, its passes (`[namespace,
     # ConsolidatePass]`), the namespaces whose pass failed (`[namespace, exception]`: a
-    # `StandardError` from the block is the block's own), when the next pass falls due (µs),
-    # and the loop's position as bytes.
-    LoopStep = Data.define(:events, :passes, :failed, :next_due, :token)
+    # `StandardError` from the block is the block's own), the namespaces whose pass stopped
+    # without failing (`[namespace, ConsolidatePass]`, the pass so far: an interrupt refused
+    # their groups, and they're due again at the next step), when the next pass falls due
+    # (µs), and the loop's position as bytes.
+    LoopStep = Data.define(:events, :passes, :failed, :stopped, :next_due, :token)
 
     # Recall's signal weights: 1 each by default, but `recency` 0.25 and `graph` and
     # `consolidated` 0.5. A weight of 0 leaves the signal out.
@@ -313,14 +315,15 @@ module Pigeonhole
       # slices, since each step saves the loop's position (a commit). A `StandardError` from the block fails that
       # namespace's pass (it's in `failed`, retried after `min_age`). `throw`, another
       # exception (`Interrupt`) or an interrupt stops the step and takes effect; the groups
-      # the step still had are refused, and the loop treats their namespaces as failed too,
-      # so it retries them after `min_age` (the crate can't tell a refusal from a failure). (`break` in
+      # the step still had are refused, and their namespaces are due again at the next step
+      # (in `stopped`, had the step returned). (`break` in
       # the block raises `LocalJumpError`, a `StandardError`: the block outlives the
       # `consolidate_loop` call that took it.)
       def run_once(timeout = 1.0)
-        events, passes, failed, next_due, token = native_run_once(timeout, @consolidator)
-        LoopStep.new(events, passes.map { |ns, p| [ns, ConsolidatePass.new(*p)].freeze }.freeze,
-                     failed.map { |ns, e| [ns, e].freeze }.freeze, next_due, token)
+        events, passes, failed, stopped, next_due, token = native_run_once(timeout, @consolidator)
+        pairs = ->(list) { list.map { |ns, p| [ns, ConsolidatePass.new(*p)].freeze }.freeze }
+        LoopStep.new(events, pairs.(passes), failed.map { |ns, e| [ns, e].freeze }.freeze, pairs.(stopped),
+                     next_due, token)
       end
     end
 

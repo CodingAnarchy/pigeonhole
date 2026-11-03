@@ -1081,11 +1081,20 @@ impl std::fmt::Display for Stopped {
 
 impl std::error::Error for Stopped {}
 
+/// The Ruby side's answer for one group.
+enum Answer {
+    /// The block's memories.
+    Memories(Vec<mem::Memory>),
+    /// The block raised: the group's pass failed.
+    Failed,
+    /// The group was refused, not answered (an interrupt, or an earlier failure in a
+    /// `consolidate`): a `ConsolidateLoop` keeps its namespace due (#1442's
+    /// `ConsolidateStopped`).
+    Refused,
+}
+
 /// One drive's channels: groups to the Ruby thread, answers back.
-type Channels = (
-    Sender<Vec<mem::StoredMemory>>,
-    Receiver<Option<Vec<mem::Memory>>>,
-);
+type Channels = (Sender<Vec<mem::StoredMemory>>, Receiver<Answer>);
 
 /// The crate's `Consolidator`, answered by the Ruby thread over the channels `drive`
 /// installs for each call (a `ConsolidateLoop` keeps one across its steps). With none
@@ -1108,8 +1117,10 @@ impl mem::Consolidator for SlotConsolidator {
             .send(group.to_vec())
             .map_err(|_| Box::new(Stopped))?;
         match answers.recv() {
-            Ok(Some(memories)) => Ok(memories),
-            _ => Err(Box::new(Stopped)),
+            Ok(Answer::Memories(memories)) => Ok(memories),
+            Ok(Answer::Failed) => Err(Box::new(Stopped)),
+            // Refused, or the Ruby side is gone: stopped rather than failed.
+            Ok(Answer::Refused) | Err(_) => Err(Box::new(mem::ConsolidateStopped)),
         }
     }
 }
@@ -1147,7 +1158,7 @@ fn drive<R: Send + 'static>(
     work: impl FnOnce() -> R + Send + 'static,
 ) -> Result<Driven<R>, Error> {
     let (to_ruby, groups) = mpsc::channel::<Vec<mem::StoredMemory>>();
-    let (answer_tx, answers) = mpsc::channel::<Option<Vec<mem::Memory>>>();
+    let (answer_tx, answers) = mpsc::channel::<Answer>();
     *lock(&slot.slot) = Some((to_ruby, answers));
     // The worker empties the slot as soon as its work returns, dropping the sender, so the
     // wait below sees `Disconnected` at once rather than at the end of a slice (ai1249's
@@ -1186,21 +1197,21 @@ fn drive<R: Send + 'static>(
             Ok(group) => {
                 let refuse = jump.is_some() || (on_raise == OnRaise::StopAll && !raised.is_empty());
                 let reply = if refuse {
-                    None
+                    Answer::Refused
                 } else {
                     match call_block(ruby, block, &group) {
-                        Ok(memories) => Some(memories),
+                        Ok(memories) => Answer::Memories(memories),
                         Err(Early::Raised(e)) => {
                             let ns = group
                                 .first()
                                 .map(|m| m.id.namespace().to_owned())
                                 .unwrap_or_default();
                             raised.push((ns, e));
-                            None
+                            Answer::Failed
                         }
                         Err(Early::Jump(e)) => {
                             jump = Some(e);
-                            None
+                            Answer::Refused
                         }
                     }
                 };
@@ -2104,10 +2115,15 @@ impl ConsolidateLoop {
             };
             failed.push((ns, exc.value().unwrap_or_else(|| ruby.qnil().as_value())))?;
         }
-        let a = ruby.ary_new_capa(5);
+        let stopped = ruby.ary_new_capa(step.stopped.len());
+        for (ns, p) in step.stopped {
+            stopped.push((ns, consolidate_pass(ruby, p)?))?;
+        }
+        let a = ruby.ary_new_capa(6);
         a.push(step.events)?;
         a.push(passes)?;
         a.push(failed)?;
+        a.push(stopped)?;
         a.push(step.next_due)?;
         a.push(crate::convert::binary(ruby, step.token.as_bytes()))?;
         Ok(a)
