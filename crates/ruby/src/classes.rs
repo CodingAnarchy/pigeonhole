@@ -115,3 +115,37 @@ pub(crate) struct ScanCursor {
     pub(crate) rows: ForkSafe<Mutex<Option<pigeonhole::RowIter<'static>>>>,
     pub(crate) chunk: usize,
 }
+
+/// `Pigeonhole::VectorSpec`: a vector family's dimension, element type and metric.
+#[magnus::wrap(class = "Pigeonhole::VectorSpec", free_immediately, size)]
+pub(crate) struct VectorSpec(pub(crate) pigeonhole::VectorSpec);
+
+/// `Pigeonhole::RowPosition`: where a walk of a row's pages stopped.
+#[magnus::wrap(class = "Pigeonhole::RowPosition", free_immediately, size)]
+pub(crate) struct RowPosition(pub(crate) pigeonhole::RowPosition);
+
+/// `Pigeonhole::ScanPosition`: where a `scan_within` page stopped.
+#[magnus::wrap(class = "Pigeonhole::ScanPosition", free_immediately, size)]
+pub(crate) struct ScanPosition(pub(crate) pigeonhole::ScanPosition);
+
+/// `Pigeonhole::KeysPosition`: where a `multi_get_within` page stopped.
+#[magnus::wrap(class = "Pigeonhole::KeysPosition", free_immediately, size)]
+pub(crate) struct KeysPosition(pub(crate) pigeonhole::KeysPosition);
+
+/// What a walk of a row's pages reads, and where it is.
+pub(crate) struct PagesState {
+    pub(crate) table: Handle,
+    pub(crate) row: Vec<u8>,
+    pub(crate) size: usize,
+    pub(crate) families: Option<Vec<String>>,
+    pub(crate) qualifier_prefix: Option<Vec<u8>>,
+    pub(crate) versions: u32,
+    pub(crate) snapshot: Option<pigeonhole::Snapshot>,
+    /// Where the last page ended.
+    pub(crate) position: Option<pigeonhole::RowPosition>,
+    pub(crate) done: bool,
+}
+
+/// `Pigeonhole::Pages`: a wide row's pages, each read when it is asked for.
+#[magnus::wrap(class = "Pigeonhole::Pages", free_immediately, size)]
+pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);

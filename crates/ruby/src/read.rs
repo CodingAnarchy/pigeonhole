@@ -16,13 +16,15 @@ use crate::table::either;
 
 // ---- Cell ---------------------------------------------------------------------------------
 
-/// A cell's value as its Ruby type: a binary String, an Integer (an `i64` cell) or a Float
-/// (an `f64` cell); `nil` for a type this build doesn't read (vectors, PR 2).
+/// A cell's value as its Ruby type: a binary String, an Integer (an `i64` cell), a Float
+/// (an `f64` cell) or a vector (an Array, or the packed bits as a String; see
+/// [`crate::vector::to_rb`]); `nil` for a type this build doesn't read.
 fn typed(ruby: &Ruby, v: pigeonhole::Value<'_>) -> Value {
     match v {
         pigeonhole::Value::I64(n) | pigeonhole::Value::Varint(n) => n.into_value_with(ruby),
         pigeonhole::Value::F64(x) => x.into_value_with(ruby),
         pigeonhole::Value::Bytes(b) => binary(ruby, b).as_value(),
+        pigeonhole::Value::Vector(v) => crate::vector::to_rb(ruby, v),
         _ => ruby.qnil().as_value(),
     }
 }
@@ -52,6 +54,11 @@ impl Cell {
     /// The value's 8 bytes as an unsigned Integer (bitwise aggregate families, `put_u64`).
     pub(crate) fn as_u64(&self) -> Option<u64> {
         self.0.as_u64()
+    }
+
+    /// A vector cell's vector (see [`crate::vector::to_rb`]), or `nil`.
+    pub(crate) fn as_vector(ruby: &Ruby, rb_self: &Self) -> Option<Value> {
+        rb_self.0.as_vector().map(|v| crate::vector::to_rb(ruby, v))
     }
 
     /// The value as a Float, if it is an `f64` cell.
