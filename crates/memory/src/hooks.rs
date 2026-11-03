@@ -79,3 +79,9 @@ pub(crate) fn hold(at: Hold) {
         s = cv.wait(s).unwrap_or_else(PoisonError::into_inner);
     }
 }
+
+/// The IVF write records a store has waiting to settle (D311 T8): an inspection helper for
+/// the bounded-growth test (simp724's R1 on #1424).
+pub fn ivf_pending(store: &crate::Store) -> usize {
+    store.ivf_pending_len()
+}

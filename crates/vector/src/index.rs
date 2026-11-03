@@ -2415,6 +2415,11 @@ impl<'a> Search<'a> {
     /// search that probes every list is exact for the prefix.
     ///
     /// Ties among the hits come back by probe round, then by list, then by id.
+    ///
+    /// **Cost:** a seek into each probed list, then the prefix's own cells there: the list's
+    /// other cells aren't read (the prefix becomes the read's qualifier seek). On one 100,000
+    /// cell row, 100 cells under a prefix took 0.01 ms against 5.14 ms for the whole row
+    /// (#1342, R1).
     pub fn id_prefix(mut self, prefix: &'a [u8]) -> Self {
         self.id_prefix = Some(prefix);
         self
