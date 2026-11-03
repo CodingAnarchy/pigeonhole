@@ -11,7 +11,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::{Rng, V, check, exact, open, seeds, specs};
+use common::{Rng, V, check, exact, half_specs, open, seeds, specs};
 use pigeonhole::{Element, Metric, VectorSpec};
 use pigeonhole_vector::{Error, Index, IndexOptions, ReadIndex};
 
@@ -22,7 +22,7 @@ fn small() -> IndexOptions {
 #[test]
 fn a_seeded_model_holds_the_invariants_after_every_operation() {
     for seed in seeds(&[1, 2, 3]) {
-        for spec in specs() {
+        for spec in specs().into_iter().chain(half_specs()) {
             let ctx = format!("seed {seed}, {spec:?}");
             let dir = pigeonhole::doc_support::temp_dir();
             let db = open(&dir);
@@ -297,7 +297,7 @@ const FLOOR: f64 = 0.94;
 /// has no write methods; a table that isn't an index is refused as `open` refuses it.
 #[test]
 fn a_reader_process_searches_as_the_writer_does() {
-    for spec in specs() {
+    for spec in specs().into_iter().chain(half_specs()) {
         let ctx = format!("{spec:?}");
         let dir = pigeonhole::doc_support::temp_dir();
         let db = open(&dir);
@@ -343,6 +343,8 @@ fn a_reader_process_searches_as_the_writer_does() {
             V::F32(x) => read.search_f32(x, 10).nprobe(lists).snapshot(&snap).run(),
             V::I8(x) => read.search_i8(x, 10).nprobe(lists).snapshot(&snap).run(),
             V::Bits(x) => read.search_bits(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::F16(x) => read.search_f16(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::BF16(x) => read.search_bf16(x, 10).nprobe(lists).snapshot(&snap).run(),
         }
         .unwrap();
         let nearest = V::random(&mut rng, &spec, 2);
@@ -351,6 +353,8 @@ fn a_reader_process_searches_as_the_writer_does() {
             V::F32(x) => read.search_f32(x, 10).nprobe(lists).snapshot(&snap).run(),
             V::I8(x) => read.search_i8(x, 10).nprobe(lists).snapshot(&snap).run(),
             V::Bits(x) => read.search_bits(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::F16(x) => read.search_f16(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::BF16(x) => read.search_bf16(x, 10).nprobe(lists).snapshot(&snap).run(),
         }
         .unwrap();
         assert_eq!(before, again, "{ctx}: the snapshot hides later writes");
@@ -439,5 +443,63 @@ fn a_reader_index_keeps_searching_across_a_writer_restart() {
     );
     exact(&index, &model, &q, 5, "after the restart");
     drop((read, reader, index));
+    db.close().unwrap();
+}
+
+/// #1268 item 7: half-precision indexes. `insert_f16`/`insert_bf16` store the bit patterns
+/// exactly, through splits (a move rewrites the bits it read); `insert_f32` rounds into a
+/// half index as `put_vector_f32` does; `search_f32` and the half searches agree; and the
+/// other elements' vectors are refused.
+#[test]
+fn half_indexes_store_exact_bits_and_take_f32() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let f16 = VectorSpec::new(2, Element::F16, Metric::L2).unwrap();
+    let index = Index::create(&db, "h", f16, small()).expect("create");
+    // Enough vectors in two clusters to split lists: every stored pattern survives.
+    let mut model = BTreeMap::new();
+    for i in 0..60u16 {
+        // 1.0 + i/1024 and 2.0 or 8.0: exact f16 patterns (0x3c00 is 1.0).
+        let v = vec![0x3c00 + i, if i % 2 == 0 { 0x4000 } else { 0x4800 }];
+        index.insert_f16(&i.to_be_bytes(), &v).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), V::F16(v));
+    }
+    check(&index, &model, "f16");
+    assert!(
+        index.verify().unwrap().list_lens.len() > 1,
+        "the lists split"
+    );
+    let q = V::F16(vec![0x3c10, 0x4000]);
+    exact(&index, &model, &q, 5, "f16");
+    // The same query as f32 (1.015625, 2.0) gives the same hits.
+    let as_f32 = index
+        .search_f32(&[1.015_625, 2.0], 5)
+        .nprobe(u32::MAX)
+        .run()
+        .unwrap();
+    assert_eq!(as_f32, q.search(&index, 5, u32::MAX));
+    // insert_f32 rounds: 1.0001 is stored as f16 1.0 (0x3c00), an exact tie with id 0.
+    index.insert_f32(b"rounded", &[1.0001, 2.0]).unwrap();
+    let hits = index
+        .search_f16(&[0x3c00, 0x4000], 2)
+        .nprobe(u32::MAX)
+        .run()
+        .unwrap();
+    assert!(hits.iter().all(|h| h.distance == 0.0), "{hits:?}");
+    // Other elements are refused, f16 bits in a bf16 index included.
+    assert!(matches!(
+        index.insert_i8(b"x", &[1, 2]),
+        Err(Error::InvalidArgument(_))
+    ));
+    let bf16 = VectorSpec::new(2, Element::BF16, Metric::L2).unwrap();
+    let b = Index::create(&db, "b", bf16, small()).expect("create bf16");
+    assert!(matches!(
+        b.insert_f16(b"x", &[0x3c00, 0x4000]),
+        Err(Error::InvalidArgument(_))
+    ));
+    b.insert_bf16(b"one", &[0x3f80, 0x4000]).unwrap();
+    let hit = b.search_bf16(&[0x3f80, 0x4000], 1).run().unwrap();
+    assert_eq!((hit[0].id.as_slice(), hit[0].distance), (&b"one"[..], 0.0));
+    drop((index, b));
     db.close().unwrap();
 }

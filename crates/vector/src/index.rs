@@ -355,7 +355,10 @@ fn corrupt(what: &str) -> Error {
 fn centroid_spec(spec: &VectorSpec) -> Result<VectorSpec> {
     match spec.element() {
         Element::Bit => Ok(*spec),
-        Element::F32 | Element::I8 => Ok(VectorSpec::new(spec.dim(), Element::F32, spec.metric())?),
+        // Half indexes keep `f32` centroids too (#1268 item 7): a mean of halves isn't a half.
+        Element::F32 | Element::I8 | Element::F16 | Element::BF16 => {
+            Ok(VectorSpec::new(spec.dim(), Element::F32, spec.metric())?)
+        }
         other => Err(Error::InvalidArgument(format!(
             "an index of {other:?} vectors is not supported"
         ))),
@@ -876,6 +879,18 @@ impl Index {
         self.insert(id, Input::Bits(vector))
     }
 
+    /// [`insert_f32`](Self::insert_f32) for an `f16` index: `vector` is IEEE binary16 bit
+    /// patterns, stored bit for bit (#1268 item 7). An `f16` or `bf16` index also takes
+    /// [`insert_f32`](Self::insert_f32), rounding each component to the element.
+    pub fn insert_f16(&self, id: &[u8], vector: &[u16]) -> Result<()> {
+        self.insert(id, Input::F16(vector))
+    }
+
+    /// [`insert_f16`](Self::insert_f16) for a `bf16` index (bfloat16 bit patterns).
+    pub fn insert_bf16(&self, id: &[u8], vector: &[u16]) -> Result<()> {
+        self.insert(id, Input::BF16(vector))
+    }
+
     /// Deletes `id`'s vector; `false` if there was none. A list that shrinks below its
     /// bound is merged into its nearest neighbour before the call returns.
     pub fn delete(&self, id: &[u8]) -> Result<bool> {
@@ -927,6 +942,18 @@ impl Index {
     /// [`search_f32`](Self::search_f32) for a bit index.
     pub fn search_bits<'a>(&'a self, query: &'a [u8], k: usize) -> Search<'a> {
         Search::new(Of::W(self), Input::Bits(query), k)
+    }
+
+    /// [`search_f32`](Self::search_f32) with an `f16` query (bit patterns), for an `f16`
+    /// index. The query widens to `f32` exactly, and the search compares in `f32`, as
+    /// `nearest_f32` does over a half family; [`search_f32`](Self::search_f32) works too.
+    pub fn search_f16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::W(self), Input::F16(query), k)
+    }
+
+    /// [`search_f16`](Self::search_f16) for a `bf16` index (a bfloat16 query).
+    pub fn search_bf16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::W(self), Input::BF16(query), k)
     }
 
     /// Loads many vectors into an **empty** index faster than inserting them one by one: it
@@ -1833,6 +1860,16 @@ impl ReadIndex {
     pub fn search_bits<'a>(&'a self, query: &'a [u8], k: usize) -> Search<'a> {
         Search::new(Of::R(self), Input::Bits(query), k)
     }
+
+    /// [`Index::search_f16`] from a reader process.
+    pub fn search_f16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::F16(query), k)
+    }
+
+    /// [`Index::search_bf16`] from a reader process.
+    pub fn search_bf16<'a>(&'a self, query: &'a [u16], k: usize) -> Search<'a> {
+        Search::new(Of::R(self), Input::BF16(query), k)
+    }
 }
 
 /// A nearest-neighbour search under construction ([`Index::search_f32`],
@@ -2044,6 +2081,13 @@ impl<'a> Search<'a> {
             Input::F32(q) => read.nearest_f32(q, self.k),
             Input::I8(q) => read.nearest_i8(q, self.k),
             Input::Bits(q) => read.nearest_bits(q, self.k),
+            // A half query widens exactly and searches as `f32` (`nearest_f32` takes a half
+            // family; there's no `nearest_f16`). The search keeps its own copy.
+            q @ (Input::F16(_) | Input::BF16(_)) => {
+                let mut widened = Vec::new();
+                q.widen_into(&mut widened);
+                read.nearest_f32(&widened, self.k)
+            }
         }
     }
 }
