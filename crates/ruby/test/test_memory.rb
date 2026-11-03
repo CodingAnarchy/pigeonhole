@@ -370,15 +370,9 @@ class TestMemory < Minitest::Test
     end
   end
 
-  # The pass's threads alive now, by name; nil where the platform doesn't show them (only
-  # Linux's /proc does, which CI runs).
-  def consolidation_threads
-    return nil unless File.directory?("/proc/self/task")
-
-    Dir["/proc/self/task/*/comm"].count { |f| File.read(f).start_with?("pigeonhole-cons") }
-  rescue SystemCallError
-    nil
-  end
+  # The pass's threads still listed (`named_threads_left`, which allows for a joined thread
+  # being unlisted a moment late); nil where the platform doesn't show threads.
+  def consolidation_threads = named_threads_left("pigeonhole-cons")
 
   # ai1249's B1 and perf2's S1 on #1425: an interrupt arriving at any point (inside the
   # block, between waits, at the final join) never returns while the pass's thread still

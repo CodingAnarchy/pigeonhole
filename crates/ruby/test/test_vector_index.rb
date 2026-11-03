@@ -124,15 +124,9 @@ class TestVectorIndex < Minitest::Test
     assert_bad_call(TypeError) { V::Index.create(db, "bulk3", spec(4)).bulk_load([[1]], expected: 1) }
   end
 
-  # The loader threads alive now, by name; nil where the platform doesn't show them (only
-  # Linux's /proc does, which CI runs).
-  def loader_threads
-    return nil unless File.directory?("/proc/self/task")
-
-    Dir["/proc/self/task/*/comm"].count { |f| File.read(f).start_with?("pigeonhole-bulk") }
-  rescue SystemCallError
-    nil
-  end
+  # The loader threads still listed (`named_threads_left`); nil where the platform doesn't
+  # show threads.
+  def loader_threads = named_threads_left("pigeonhole-bulk")
 
   # ai1249's B1 on #1434: an interrupt during a bulk load (in a push or in the final join)
   # never returns while the loader thread still runs.
