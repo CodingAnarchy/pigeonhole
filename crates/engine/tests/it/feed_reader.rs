@@ -517,3 +517,49 @@ fn an_aborted_rounds_prepare_is_dropped_once_its_checkpoint_passes() {
     assert_eq!(got.last(), Some(&later));
     assert_eq!(r.held_prepares(), 0, "the aborted PREPARE is dropped");
 }
+
+/// #1448: a poll reads the streams only when the frontier moved since they were last read
+/// to their ends (every commit moves it). An idle feed reads nothing more, also after a
+/// commit to a table it doesn't follow, and still delivers the next commit it does follow.
+#[test]
+fn an_idle_feed_reads_the_streams_once_per_frontier() {
+    let vfs = SimVfs::new(3148);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let c = db
+        .create_table("c", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"a1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let idle = |r: &mut FeedReader| {
+        let reads = r.stream_reads();
+        for _ in 0..100 {
+            assert!(matches!(r.try_next().unwrap(), Next::Pending));
+        }
+        assert_eq!(r.stream_reads(), reads, "an idle poll read the streams");
+    };
+    idle(&mut r);
+
+    // A commit outside the feed moves the frontier: the streams are read once more, and
+    // nothing is delivered.
+    let other = single(&db, &c, b"c1", Durability::GroupSync);
+    let reads = r.stream_reads();
+    for _ in 0..1_000 {
+        assert!(matches!(r.try_next().unwrap(), Next::Pending));
+        if r.frontier() >= other {
+            break;
+        }
+    }
+    assert!(r.frontier() >= other, "the frontier never reached {other}");
+    assert!(
+        r.stream_reads() > reads,
+        "the moved frontier didn't read the streams"
+    );
+    idle(&mut r);
+
+    let s2 = single(&db, &b, b"b1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s2);
+    idle(&mut r);
+    db.close().unwrap();
+}
