@@ -335,10 +335,13 @@ pub pigeonhole::EngineMetrics::compaction_failures: u64
 pub pigeonhole::EngineMetrics::compactions: u64
 pub pigeonhole::EngineMetrics::compactions_reclaimed: u64
 pub pigeonhole::EngineMetrics::cross_shard: pigeonhole::CrossShardMetrics
+pub pigeonhole::EngineMetrics::feed_background_syncs: u64
+pub pigeonhole::EngineMetrics::feed_sidecar_syncs: u64
 pub pigeonhole::EngineMetrics::file_growth_nanos: u64
 pub pigeonhole::EngineMetrics::file_growths: u64
 pub pigeonhole::EngineMetrics::flush_failures: u64
 pub pigeonhole::EngineMetrics::flushes: u64
+pub pigeonhole::EngineMetrics::group_syncs: u64
 pub pigeonhole::EngineMetrics::pacing_stall_nanos: u64
 pub pigeonhole::EngineMetrics::pacing_stalls: u64
 pub pigeonhole::EngineMetrics::reader_pin_seqno_lag: u64

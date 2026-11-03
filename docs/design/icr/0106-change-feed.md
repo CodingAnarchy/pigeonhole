@@ -95,5 +95,8 @@
 - **pigeonhole-engine:** `FeedReader::poll_next(&mut Context) -> Poll<Result<Next<'_>>>`. In a reader process it returns `Unsupported` (the coordinator's option (b); the process-wide feed-tick thread is #1407, Post-1.0).
 - **Internal:** `Feed::{hold_waiters, has_hold_waiters}` and the shard's wake when it lets a WRITTEN or SYNCED hold go (concurrency.md).
 
-## Later PRs
-- PR 5b: the bench rows (reader-process delivery latency among them) and mirror-on-rise; no API change planned.
+## PR 5b: sync counters and the measurements
+- **pigeonhole** (additive; cli692's call, 2026-11-03): `EngineMetrics::{group_syncs, feed_background_syncs, feed_sidecar_syncs}`, cumulative from open like the rest, summed over shards. `group_syncs` counts with the feed on or off; the `feed_*` fields stay 0 while it's off. The hidden `ShardStats` (`__unstable-hooks`, ICR 0010) gains `feed_retained_taken`: mechanism, for the bench, outside the semver promise.
+- **pigeonhole-engine:** `Engine::group_syncs`, and `ShardStats::feed_retained_taken`.
+- **Internal:** `ShardMetrics::group_syncs` (concurrency.md). `FeedMarks` mirrors the floor and checkpoint only when they rise (perf287 on #1352).
+- **phdb-bench:** the feed flags and the `feed` report section (D310 PR 5b's rows).

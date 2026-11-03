@@ -391,7 +391,7 @@ fn a_durable_feed_waits_for_a_sync_on_buffered_commits() {
         1,
         "the GroupSync commit's sync, counted once"
     );
-    assert_eq!(db.feed_retained_taken(), 0);
+    assert!(db.shard_stats().iter().all(|s| s.feed_retained_taken == 0));
     close_real(&db, &mut shard);
 }
 

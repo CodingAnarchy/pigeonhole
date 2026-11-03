@@ -338,6 +338,12 @@ pub struct ShardStats {
     /// commit rounds in flight at the shard: summed over shards, the concurrency packing
     /// sizes the active shards by.
     pub commit_inflight_nanos: u64,
+    /// WAL rollovers of the shard's stream that reused the oldest change-feed-retained
+    /// segment because no free or prepared segment was ready (D310,
+    /// [`WalCounters::retained_taken`](pigeonhole_wal::WalCounters::retained_taken)): each
+    /// cut the feed's history by a segment early instead of making the writer wait. A count
+    /// of rollovers; expected to stay 0, and 0 with the feed off.
+    pub feed_retained_taken: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -2793,26 +2799,15 @@ impl Engine {
     }
 
     /// Group syncs completed since open (D310 PR 5b): one per sync covering `GroupSync`
-    /// commits, however many groups it covered. Set against [`Engine::feed_background_syncs`]
-    /// to see how often the feed's background sync runs beside the commits' own.
+    /// commits, however many groups it covered, with the feed on or off. Set against
+    /// [`Engine::feed_background_syncs`] to see how often the feed's background sync runs
+    /// beside the commits' own.
     pub fn group_syncs(&self) -> u64 {
         self.inner
             .shared
             .metrics
             .iter()
             .map(|m| m.group_syncs.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Rollovers that took the oldest retained segment's slot since open (D310,
-    /// [`WalCounters::retained_taken`](pigeonhole_wal::WalCounters::retained_taken)): the
-    /// feed's history lost a segment early rather than a writer waiting. Expected to stay 0.
-    pub fn feed_retained_taken(&self) -> u64 {
-        self.inner
-            .shared
-            .metrics
-            .iter()
-            .map(|m| m.wal.get().map_or(0, |c| c.retained_taken()))
             .sum()
     }
 
@@ -3021,6 +3016,7 @@ impl Engine {
                 pool_busy_nanos: 0,
                 spin_time_nanos: 0,
                 commit_inflight_nanos: m.commit_inflight_nanos.load(Ordering::Relaxed),
+                feed_retained_taken: m.wal.get().map_or(0, |c| c.retained_taken()),
             })
             .collect();
         if let Some(subs) = shared.submitters.get() {
