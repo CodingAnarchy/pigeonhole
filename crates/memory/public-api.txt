@@ -1,4 +1,5 @@
 pub mod pigeonhole_memory
+pub use pigeonhole_memory::Normalization
 #[non_exhaustive] pub enum pigeonhole_memory::DedupPolicy
 pub pigeonhole_memory::DedupPolicy::Link
 pub pigeonhole_memory::DedupPolicy::Merge
@@ -179,6 +180,7 @@ pub struct pigeonhole_memory::ReadStore
 impl pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
 pub fn pigeonhole_memory::ReadStore::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
+pub fn pigeonhole_memory::ReadStore::normalization(&self) -> pigeonhole_text::layout::Normalization
 pub fn pigeonhole_memory::ReadStore::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::ReadStore::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
 impl core::fmt::Debug for pigeonhole_memory::ReadStore
@@ -245,6 +247,7 @@ pub fn pigeonhole_memory::Store::forget_policy(&self) -> pigeonhole_memory::Resu
 pub fn pigeonhole_memory::Store::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
 pub fn pigeonhole_memory::Store::link(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::mark_used(&self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<pigeonhole_memory::Marked>
+pub fn pigeonhole_memory::Store::normalization(&self) -> pigeonhole_text::layout::Normalization
 pub fn pigeonhole_memory::Store::open(&pigeonhole::db::Pigeonhole, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_without_embeddings(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
@@ -274,6 +277,7 @@ pub fn pigeonhole_memory::StoreOptions::episodic_ttl(self, core::time::Duration)
 pub fn pigeonhole_memory::StoreOptions::forget(self, pigeonhole_memory::ForgetPolicy) -> Self
 pub fn pigeonhole_memory::StoreOptions::near_dedup(self, pigeonhole_memory::NearDedup) -> Self
 pub fn pigeonhole_memory::StoreOptions::new() -> Self
+pub fn pigeonhole_memory::StoreOptions::normalization(self, pigeonhole_text::layout::Normalization) -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::StoreStats
 pub pigeonhole_memory::StoreStats::broken_links: u64
 pub pigeonhole_memory::StoreStats::dangling_superseded: u64
