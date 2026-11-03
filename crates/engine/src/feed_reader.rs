@@ -253,6 +253,12 @@ pub struct FeedReader {
     delivered: Seqno,
     /// The frontier as of the last poll.
     frontier: Seqno,
+    /// The frontier the streams were last read to their ends under (#1448): while the
+    /// frontier stays there, no commit happened since, and every record at or below it was
+    /// read then, so a poll reads nothing.
+    read_through: Option<Seqno>,
+    /// Polls that read the streams (an inspection count for tests).
+    stream_reads: u64,
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
@@ -361,6 +367,8 @@ impl FeedReader {
             history,
             delivered: 0,
             frontier: 0,
+            read_through: None,
+            stream_reads: 0,
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
@@ -745,6 +753,22 @@ impl FeedReader {
             .hooks
             .sites
             .run(crate::engine::hooks::HookSite::ReaderFeedReads);
+        // Nothing committed since the streams were last read to their ends under this
+        // frontier (it rises with every commit): by M1 every record at or below it was read
+        // then, and `emit` above found none left to deliver. Reading again would only find
+        // the same ends, which costs a stream's segment headers and a chunk of frames each
+        // (#1448: an idle reader process spent 1-1.7 ms of CPU per poll there). Not while a
+        // PREPARE is held: a checkpoint or floor can move without a commit (a flush), and
+        // `drop_aborted` (rule C) must see it, or the commits behind an aborted round wait
+        // for an unrelated one (feed1248's P1 on #1449). A writer restart since the stale
+        // check above is seen here, as after the reads below.
+        if self.read_through == Some(frontier) && self.held.is_empty() {
+            if self.shm.is_stale() {
+                return Err(Error::SnapshotExpired);
+            }
+            return Ok(self.pending_state());
+        }
+        self.stream_reads += 1;
         for s in 0..self.streams.len() {
             if !self.read_stream(s)? {
                 return Ok(Polled::Expired);
@@ -766,21 +790,33 @@ impl FeedReader {
             return Ok(Polled::Expired);
         }
         self.frontier = self.frontier.max(frontier);
+        self.read_through = Some(frontier);
         if self.emit()? {
             return Ok(Polled::Commit);
         }
         if self.expired.is_some() {
             return Ok(Polled::Expired);
         }
-        // Held by the feed's own holds: the visible watermark may be past the frontier.
+        Ok(self.pending_state())
+    }
+
+    /// Nothing to deliver now: whether the feed's own holds keep the frontier below the
+    /// watermark it follows (the visible watermark may be past the frontier).
+    fn pending_state(&self) -> Polled {
         let watermark = if self.durable {
             self.shm.durable_seqno()
         } else {
             self.shm.visible_seqno()
         };
-        Ok(Polled::Pending {
+        Polled::Pending {
             held: watermark > self.frontier,
-        })
+        }
+    }
+
+    /// Polls that read the streams to their ends since the reader opened (#1448).
+    #[cfg(feature = "test-hooks")]
+    pub fn stream_reads(&self) -> u64 {
+        self.stream_reads
     }
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.
