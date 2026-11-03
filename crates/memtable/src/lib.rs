@@ -1512,9 +1512,11 @@ impl std::ops::Deref for ArenaSlice {
     }
 }
 
-/// Entries [`MemIter::skip_row`] steps before it seeks past the row: a narrow row ends
-/// within them, and a step costs less than a search.
-const ROW_SKIP_STEPS: usize = 8;
+/// Entries [`MemIter::skip_row`] steps before it seeks past the row. A step costs much less
+/// than a finger search, so ordinary rows (a ycsb record's 10 fields and their versions)
+/// keep stepping, as with `Cursor`'s default: at 8 they sought, and callgrind's ycsb-c rose
+/// by 110 instructions per unit (#1428). Only a row wider than this seeks.
+const ROW_SKIP_STEPS: usize = 64;
 
 impl Cursor for MemIter {
     type Error = Error;
@@ -1576,7 +1578,7 @@ impl Cursor for MemIter {
         Ok(())
     }
 
-    /// Steps a few entries, as most rows end within them, then finger-searches past the
+    /// Steps up to 64 entries, as most rows end within them, then finger-searches past the
     /// row: `escaped row ++ 00 02` sorts after every key of the row and before every later
     /// row, as the SST's row skip seeks (#1426). The default steps through the whole row, so
     /// a filter's `SkipRow` in a wide row (a qualifier prefix in the middle of 100,000
