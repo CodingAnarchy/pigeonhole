@@ -126,7 +126,7 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 
 | Crate | License | Used by | Why |
 |---|---|---|---|
-| `crc32c` | Apache-2.0/MIT | format | WAL CRC32C with hardware acceleration and a safe fallback; the spec mandates CRC32C. |
+| `crc-fast` | MIT OR Apache-2.0 | format | WAL CRC32C (`Crc32Iscsi`) with hardware acceleration and an inlined small-input path; the spec mandates CRC32C. On x86, a 160-byte frame takes 115 instructions against `crc32c` 0.6's 322 (#1206 lever 4). Default features off except `std` (it pulls `digest`, `generic-array`, `typenum`, `crypto-common` and `spin`). |
 | `twox-hash` (`xxhash3_64` only) | MIT | format | xxh3-64 block, footer, manifest and filter hashing; the spec mandates xxh3. Chosen over `xxhash-rust`, which is BSL-1.0 and outside D6's license list. |
 | `lz4_flex` (safe encode/decode, no frame) | MIT | format | Default block codec, pure safe Rust. |
 | `libc` (unix) | MIT/Apache-2.0 | io | `pread`/`pwrite`, OFD and `fcntl` locks, `shm_open`/`mmap`, affinity, process start time. |
