@@ -21,7 +21,7 @@ use crate::store::{
 /// to a model, as [`Store::remember`] requires. Returning nothing says nothing in the group
 /// is worth keeping.
 pub trait Consolidator: Send + Sync {
-    /// Folds `group` (oldest first) into memories. An `Err` stops the pass
+    /// Folds `group` (newest first, as ids sort) into memories. An `Err` stops the pass
     /// ([`Error::Consolidate`]).
     fn consolidate(
         &self,
@@ -87,7 +87,7 @@ impl ConsolidatePolicy {
         self
     }
 
-    /// The cosine similarity to a group's oldest memory (its seed) a memory needs to join
+    /// The cosine similarity to a group's first memory (its seed) a memory needs to join
     /// the group: 0.8 by default, from −1 to 1. A store without an embedding model ignores
     /// it: its groups are a session's memories in creation order.
     pub fn group_similarity(mut self, s: f32) -> Self {
@@ -191,6 +191,12 @@ pub struct ConsolidatePass {
     pub merged: u64,
     /// Group memories kept, deleted or superseded by their source policy.
     pub sources: u64,
+    /// Where to resume ([`Consolidate::after`]) when the pass stopped short of the
+    /// namespace's end: its scan reached its limit, or `max_groups` left groups for later.
+    /// `None` once it looked at every candidate. Groups never span a resume position (cli692's
+    /// A1 on #1386: without it, old memories that never group would hold every pass at the
+    /// scan's limit).
+    pub resume: Option<MemoryId>,
 }
 
 /// A consolidation pass ([`Store::consolidate`]): set what you need, then [`run`](Self::run).
@@ -201,9 +207,16 @@ pub struct Consolidate<'a> {
     consolidator: &'a dyn Consolidator,
     policy: Option<&'a ConsolidatePolicy>,
     now_us: Option<u64>,
+    after: Option<&'a MemoryId>,
 }
 
 impl<'a> Consolidate<'a> {
+    /// Starts after `id`, where an earlier pass stopped ([`ConsolidatePass::resume`]).
+    pub fn after(mut self, id: &'a MemoryId) -> Self {
+        self.after = Some(id);
+        self
+    }
+
     /// The policy: [`ConsolidatePolicy::new`]'s defaults if not set.
     pub fn policy(mut self, policy: &'a ConsolidatePolicy) -> Self {
         self.policy = Some(policy);
@@ -218,15 +231,33 @@ impl<'a> Consolidate<'a> {
 
     /// Forms the groups, then for each one calls the consolidator and commits what it
     /// returned (D311 §4). Groups that commit stay committed if a later one fails.
+    ///
+    /// The consolidator's failures end the pass with [`Error::Consolidate`], which carries
+    /// the pass so far: its own `Err`, a returned memory the store refuses, or one whose
+    /// link names a memory that's gone (that group isn't committed). Another error (the
+    /// database's) doesn't report the groups before it, which stay committed.
+    ///
+    /// What the consolidator returns skips near dedup ([`NearDedup`](crate::NearDedup)): a
+    /// summary is meant to sit near its sources.
     pub fn run(self) -> Result<ConsolidatePass> {
         check_namespace(self.ns)?;
+        if let Some(a) = self.after
+            && a.namespace() != self.ns
+        {
+            return Err(Error::InvalidArgument(format!(
+                "a resume position in namespace {:?}, for a pass over {:?}",
+                a.namespace(),
+                self.ns
+            )));
+        }
         let default = ConsolidatePolicy::default();
         let policy = self.policy.unwrap_or(&default);
         policy.check()?;
         let now = self.now_us.unwrap_or_else(now_us);
-        let groups = self.groups(policy, now)?;
+        let (groups, resume) = self.groups(policy, now)?;
         let mut pass = ConsolidatePass {
             groups: groups.len() as u64,
+            resume,
             ..ConsolidatePass::default()
         };
         for group in groups {
@@ -238,12 +269,16 @@ impl<'a> Consolidate<'a> {
             let mut made = Vec::with_capacity(out.len());
             let mut texts = BTreeSet::new();
             let mut folded = 0;
-            for mut m in out {
+            for (i, mut m) in out.into_iter().enumerate() {
                 if m.kind != Kind::Procedural {
                     m.kind = Kind::Semantic;
                 }
                 m.session = session.clone();
-                self.store.check_memory(self.ns, &m)?;
+                // The consolidator's output, not the caller's arguments (cli692's A2).
+                if let Err(e) = self.store.check_memory(self.ns, &m) {
+                    let error = format!("the consolidator's memory {i} was refused: {e}").into();
+                    return Err(Error::Consolidate { error, pass });
+                }
                 // The transaction reads at its snapshot, so a second memory of the same
                 // text wouldn't see the first's dedup row: fold it here, as dedup would.
                 let norm = normalize(&m.text);
@@ -253,31 +288,65 @@ impl<'a> Consolidate<'a> {
                 }
                 made.push(m);
             }
-            if self.commit(policy, &group, &made, now, &mut pass)? {
-                pass.merged += folded;
+            match self.commit(policy, &group, &made, now, &mut pass) {
+                Ok(true) => pass.merged += folded,
+                Ok(false) => {}
+                // A returned link to a memory that's gone (M4), or another refusal of what the
+                // consolidator returned (simp724's N1): its fault, with the pass so far.
+                Err(e @ (Error::NotFound(_) | Error::InvalidArgument(_))) => {
+                    return Err(Error::Consolidate {
+                        error: Box::new(e),
+                        pass,
+                    });
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(pass)
     }
 
-    /// The candidates, oldest first: episodic memories of the namespace at least `min_age`
-    /// old that no consolidation took in, not superseded and not pinned. Then the groups:
-    /// by session, then greedily by similarity to a seed (the oldest left).
-    fn groups(&self, p: &ConsolidatePolicy, now: u64) -> Result<Vec<Vec<StoredMemory>>> {
+    /// The candidates in id order, which is newest first: episodic memories of the
+    /// namespace at least `min_age` old that no consolidation took in, not superseded and
+    /// not pinned. Then the groups: by session, then greedily by similarity to a seed (the
+    /// first left in that order), in the order of their seeds. A group's members follow its
+    /// seed, so a resume after a kept group's seed finds every group left out.
+    fn groups(
+        &self,
+        p: &ConsolidatePolicy,
+        now: u64,
+    ) -> Result<(Vec<Vec<StoredMemory>>, Option<MemoryId>)> {
         let cutoff = now.saturating_sub(p.min_age.as_micros().min(u64::MAX as u128) as u64);
         // Enough for `max_groups` full groups, with room for those that don't fill.
         let cap = p.max_groups.saturating_mul(p.max_group).saturating_mul(4);
         let mut by_session: BTreeMap<Option<String>, Vec<StoredMemory>> = BTreeMap::new();
         let mut seen = 0usize;
+        let mut last: Option<MemoryId> = None;
+        let mut capped = false;
         let prefix = [self.ns.as_bytes(), MEMORY_TAG].concat();
-        let mut it = self.store.table().scan_prefix(&prefix).iter()?;
+        // The namespace's memory rows end where `{ns}\0m` does: before `{ns}\0n`.
+        let mut end = prefix.clone();
+        *end.last_mut().expect("the tag") += 1;
+        // A rid starts with `u64::MAX − created_us`, big-endian, so memory rows sort newest
+        // first, and the first old enough is at the cutoff's key: start there, or after the
+        // resume position if that's further on.
+        let old_enough = [prefix.as_slice(), &(u64::MAX - cutoff).to_be_bytes()].concat();
+        let after = self.after.map(MemoryId::row).filter(|a| *a >= old_enough);
+        let start = match &after {
+            Some(a) => std::ops::Bound::Excluded(a.as_slice()),
+            None => std::ops::Bound::Included(old_enough.as_slice()),
+        };
+        let mut it = self
+            .store
+            .table()
+            .scan_bounds(start, std::ops::Bound::Excluded(end.as_slice()))
+            .iter()?;
         while let Some(r) = it.next_ref()? {
             let Some(id) = MemoryId::from_row(r.key()) else {
                 continue;
             };
+            last = Some(id.clone());
             if id.created_us() > cutoff {
-                // Ids are in creation order within a namespace: the rest are younger.
-                break;
+                continue;
             }
             let Some(m) = crate::store::read_memory(id, &r.to_owned())? else {
                 continue;
@@ -288,6 +357,7 @@ impl<'a> Consolidate<'a> {
             by_session.entry(m.session.clone()).or_default().push(m);
             seen += 1;
             if seen >= cap {
+                capped = true;
                 break;
             }
         }
@@ -317,10 +387,20 @@ impl<'a> Consolidate<'a> {
                 }
             }
         }
-        // The oldest groups first, across sessions.
+        // In their seeds' order (newest first), across sessions.
         groups.sort_by(|a, b| a[0].id.cmp(&b[0].id));
-        groups.truncate(p.max_groups);
-        Ok(groups)
+        // Where the next pass resumes. Groups left out by `max_groups` have seeds after the
+        // last kept one, and members after their seeds, so resuming after that seed finds
+        // them. Otherwise it's where the scan stopped, if it stopped at its limit.
+        let resume = if groups.len() > p.max_groups {
+            groups.truncate(p.max_groups);
+            groups.last().map(|g| g[0].id.clone())
+        } else if capped {
+            last
+        } else {
+            None
+        };
+        Ok((groups, resume))
     }
 
     /// One group's commit (S1): re-reads, the new memories, then the source policy, in one
@@ -522,6 +602,7 @@ impl Store {
             consolidator,
             policy: None,
             now_us: None,
+            after: None,
         }
     }
 }

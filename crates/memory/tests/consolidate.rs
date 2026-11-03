@@ -525,12 +525,42 @@ fn a_bad_policy_or_returned_memory_is_refused() {
             "{p:?}"
         );
     }
-    // An embedding in a store without a model: refused before anything is written.
+    // An embedding in a store without a model: the consolidator's fault (cli692's A2),
+    // reported with the pass, before anything is written.
     let bad = F(|_: &[StoredMemory]| Ok(vec![Memory::new("note s").embedding(vec![1.0])]));
-    assert!(matches!(
-        store.consolidate("a", &bad).policy(&any_age()).run(),
-        Err(Error::InvalidArgument(_))
-    ));
+    let err = store
+        .consolidate("a", &bad)
+        .policy(&any_age())
+        .run()
+        .unwrap_err();
+    let Error::Consolidate { error, pass } = &err else {
+        panic!("{err:?}")
+    };
+    assert!(error.to_string().contains("memory 0"), "{error}");
+    assert_eq!((pass.groups, pass.committed), (1, 0));
+    // A returned link to a memory that's gone (simp724's N1): the same, with the pass.
+    let gone = store
+        .remember("a", Memory::new("note gone"))
+        .unwrap()
+        .id()
+        .clone();
+    store.delete(&gone).unwrap();
+    let dangling = F(move |_: &[StoredMemory]| {
+        Ok(vec![Memory::new("note s").link(
+            gone.clone(),
+            LinkType::DERIVED_FROM,
+            1.0,
+        )])
+    });
+    let err = store
+        .consolidate("a", &dangling)
+        .policy(&any_age())
+        .run()
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Consolidate { error, .. } if error.to_string().contains("not found")),
+        "{err:?}"
+    );
     assert!(semantic(&store).is_empty());
     check(&store, "refused");
     db.close().unwrap();
@@ -558,5 +588,173 @@ fn two_returned_memories_of_one_text_are_one() {
     let r = store.remember("a", Memory::new("note summary")).unwrap();
     assert!(matches!(r, Remembered::Merged(_)), "{r:?}");
     check(&store, "folded");
+    db.close().unwrap();
+}
+
+/// simp724's F2 on #1386: a member that changes while the consolidator runs. A delete, a
+/// supersede and a forget each skip the group; a merge that adds a source to a member is in
+/// the provenance (C1), since the commit reads `sources` in its transaction.
+#[test]
+fn a_member_changed_while_the_consolidator_runs() {
+    for race in ["delete", "supersede", "forget", "merge"] {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let store = plain(&db);
+        let a = put(&store, "note one", "s1", "c1");
+        put(&store, "note two", "s1", "c2");
+        let c = F(|_: &[StoredMemory]| {
+            match race {
+                "delete" => assert!(store.delete(&a).unwrap()),
+                "supersede" => {
+                    let newer = store
+                        .remember("a", Memory::new("note newer").kind(Kind::Semantic))
+                        .unwrap()
+                        .id()
+                        .clone();
+                    store.supersede(&a, &newer).unwrap();
+                }
+                "forget" => {
+                    let p = pigeonhole_memory::ForgetPolicy::new().min_retention(0.9);
+                    let pass = store.forget().policy(&p).run().unwrap();
+                    assert!(pass.deleted >= 2, "{pass:?}");
+                }
+                _ => {
+                    let r = store
+                        .remember("a", Memory::new("note one").source("c9"))
+                        .unwrap();
+                    assert_eq!(r, Remembered::Merged(a.clone()));
+                }
+            }
+            Ok(vec![Memory::new("note summary")])
+        });
+        let pass = store.consolidate("a", &c).policy(&any_age()).run().unwrap();
+        if race == "merge" {
+            assert_eq!(pass.committed, 1, "{race}: {pass:?}");
+            let s = semantic(&store).remove(0);
+            let mut names: Vec<&str> = s.sources.iter().map(|x| x.name.as_str()).collect();
+            names.sort();
+            assert_eq!(names, ["c1", "c2", "c9"], "{race}");
+        } else {
+            assert_eq!((pass.committed, pass.skipped), (0, 1), "{race}: {pass:?}");
+            assert!(
+                semantic(&store).iter().all(|m| m.text != "note summary"),
+                "{race}"
+            );
+        }
+        check(&store, race);
+        db.close().unwrap();
+    }
+}
+
+/// cli692's A1 on #1386: memories that never group don't hold every pass at the scan's
+/// limit. The pass reports where it stopped, and the next one resumes there.
+#[test]
+fn a_pass_resumes_past_memories_that_never_group() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = plain(&db);
+    // The scan's limit is max_groups · max_group · 4 = 8, and it goes newest first: twelve
+    // singletons, each in its own session and newer than the pair, fill it. A millisecond
+    // apart, so ids (by creation time) sort in this order.
+    let x = put(&store, "note pair one", "pair", "c");
+    let y = put(&store, "note pair two", "pair", "c");
+    for i in 0..12 {
+        std::thread::sleep(Duration::from_millis(1));
+        put(&store, &format!("note lone {i}"), &format!("lone{i}"), "c");
+    }
+    let seen = Mutex::new(Vec::new());
+    let c = F(|g: &[StoredMemory]| {
+        seen.lock().unwrap().push(g.len());
+        Ok(vec![])
+    });
+    let p = any_age().max_groups(1).max_group(2);
+    let first = store.consolidate("a", &c).policy(&p).run().unwrap();
+    assert_eq!(first.groups, 0, "{first:?}");
+    let at = first.resume.clone().expect("stopped at the scan's limit");
+    // Without resuming, the same pass again finds nothing: the stall A1 describes.
+    assert_eq!(
+        store.consolidate("a", &c).policy(&p).run().unwrap().groups,
+        0
+    );
+    let second = store
+        .consolidate("a", &c)
+        .policy(&p)
+        .after(&at)
+        .run()
+        .unwrap();
+    assert_eq!(
+        (second.groups, second.committed, second.resume.clone()),
+        (1, 1, None),
+        "{second:?}"
+    );
+    assert!(store.get(&x).unwrap().unwrap().consolidated);
+    assert!(store.get(&y).unwrap().unwrap().consolidated);
+    // A resume position from another namespace is refused.
+    let other = store
+        .remember("b", Memory::new("note b"))
+        .unwrap()
+        .id()
+        .clone();
+    assert!(matches!(
+        store.consolidate("a", &c).policy(&p).after(&other).run(),
+        Err(Error::InvalidArgument(_))
+    ));
+    check(&store, "resumed");
+    db.close().unwrap();
+}
+
+/// A1 with `max_groups`: groups a pass leaves out are found by resuming after the last kept
+/// group's seed.
+#[test]
+fn groups_left_by_max_groups_come_next_from_the_resume_position() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = plain(&db);
+    for s in ["s1", "s2", "s3"] {
+        put(&store, &format!("note {s} one"), s, "c");
+        put(&store, &format!("note {s} two"), s, "c");
+    }
+    let c = F(|_: &[StoredMemory]| Ok(vec![]));
+    let p = any_age().max_groups(1);
+    let mut at: Option<MemoryId> = None;
+    let mut committed = 0;
+    for _ in 0..5 {
+        let mut run = store.consolidate("a", &c).policy(&p);
+        if let Some(a) = &at {
+            run = run.after(a);
+        }
+        let pass = run.run().unwrap();
+        committed += pass.committed;
+        at = pass.resume;
+        if at.is_none() {
+            break;
+        }
+    }
+    assert_eq!(committed, 3);
+    assert_eq!(at, None);
+    check(&store, "max_groups resume");
+    db.close().unwrap();
+}
+
+/// Memory rows sort newest first, so a young memory comes before old ones: it's skipped,
+/// and the old ones behind it are still grouped (the scan starts at the age cutoff).
+#[test]
+fn young_memories_dont_hide_old_ones() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = plain(&db);
+    let a = put(&store, "note old one", "s1", "c1");
+    let b = put(&store, "note old two", "s1", "c2");
+    std::thread::sleep(Duration::from_millis(200));
+    let young = put(&store, "note young", "s1", "c3");
+    let c = F(summary("note summary"));
+    let p = ConsolidatePolicy::new().min_age(Duration::from_millis(100));
+    let pass = store.consolidate("a", &c).policy(&p).run().unwrap();
+    assert_eq!((pass.groups, pass.committed), (1, 1), "{pass:?}");
+    for id in [&a, &b] {
+        assert!(store.get(id).unwrap().unwrap().consolidated);
+    }
+    assert!(!store.get(&young).unwrap().unwrap().consolidated);
+    check(&store, "young and old");
     db.close().unwrap();
 }

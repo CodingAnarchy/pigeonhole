@@ -147,7 +147,8 @@ assert_eq!((pass.committed, pass.created), (1, 1));
 
 - **Groups:** episodic memories at least `min_age` old (an hour by default) that no consolidation took in.
   - They're grouped by session first.
-  - With an embedding model, a memory then joins a group when its cosine to the group's oldest memory is at least `group_similarity` (0.8).
+  - With an embedding model, a memory then joins a group when its cosine to the group's first memory (its seed) is at least `group_similarity` (0.8).
+  - A pass looks at a bounded number of memories, newest first. When it stops short, `ConsolidatePass::resume` says where, and `.after(&id)` continues from there. A pass from the start also picks up memories that have aged in since.
   - A memory with nothing like it is left alone, unless `min_group(1)` asks for rewrites.
 - **Each group commits in its own transaction:**
   - the new memories, with `DERIVED_FROM` links to the group and the group's sources;
@@ -155,16 +156,17 @@ assert_eq!((pass.committed, pass.created), (1, 1));
 - **Recall and consolidated memories:** recall weights a consolidated memory's importance by `Weights::consolidated` (0.5), so its summary ranks ahead of it.
 - **Concurrent passes:** a group that changed while the consolidator ran is skipped, not retried, and so is one another pass took. The next pass regroups. `ConsolidatePass` counts both.
 - **A summary equal to one of its sources** merges into that source, which becomes the summary.
-- **A consolidator error** stops the pass with `Error::Consolidate { error, pass }`. The groups before it stay committed.
+- **A consolidator error** stops the pass with `Error::Consolidate { error, pass }`: its own `Err`, a returned memory the store refuses, or a returned link to a memory that's gone. The groups before it stay committed.
 - **When to run it:** on demand. Unlike forgetting, there's no thread.
 
 ## Near duplicates
 With an embedding model, a store can catch near duplicates as well as exact ones. Turn it on with `StoreOptions::near_dedup(NearDedup::new(0.95))`, or later with `set_near_dedup`. `remember` then looks up the nearest live memory first.
 - **Policies, for a match at or above the similarity:**
   - `Link` (the default) writes the memory with a `SIMILAR_TO` link to the match;
-  - `Skip` writes nothing and returns `Remembered::Similar(id)`;
+  - `Skip` writes nothing and returns `Remembered::Similar(id)`. **Careful:** `id()` is then the match, a memory this call didn't write. Code that links or pins `remember(..)?.id()` acts on the match once you turn `Skip` on;
   - `Merge` merges into the match as an exact duplicate would.
-- **The check runs outside the transaction,** so two near duplicates written at once can both land. Consolidation folds them later.
+- **The check runs outside the transaction,** so two near duplicates written at once can both land. Consolidation folds them later. The match is read again inside the transaction, and one deleted or superseded meanwhile is ignored.
+- **Summaries skip it:** what a consolidator returns is meant to sit near its sources.
 - **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
 
 ## Reader processes

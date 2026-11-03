@@ -47,6 +47,7 @@ pub pigeonhole_memory::SourcePolicy::Keep
 pub pigeonhole_memory::SourcePolicy::Supersede
 pub struct pigeonhole_memory::Consolidate<'a>
 impl<'a> pigeonhole_memory::Consolidate<'a>
+pub fn pigeonhole_memory::Consolidate<'a>::after(self, &'a pigeonhole_memory::MemoryId) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::now_us(self, u64) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::policy(self, &'a pigeonhole_memory::ConsolidatePolicy) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::run(self) -> pigeonhole_memory::Result<pigeonhole_memory::ConsolidatePass>
@@ -55,6 +56,7 @@ pub pigeonhole_memory::ConsolidatePass::committed: u64
 pub pigeonhole_memory::ConsolidatePass::created: u64
 pub pigeonhole_memory::ConsolidatePass::groups: u64
 pub pigeonhole_memory::ConsolidatePass::merged: u64
+pub pigeonhole_memory::ConsolidatePass::resume: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::ConsolidatePass::skipped: u64
 pub pigeonhole_memory::ConsolidatePass::sources: u64
 #[non_exhaustive] pub struct pigeonhole_memory::ConsolidatePolicy

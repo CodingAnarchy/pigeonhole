@@ -21,6 +21,11 @@ mod consolidate;
 mod dedup;
 mod error;
 mod forget;
+/// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
+/// unstable, and never needed by applications.
+#[cfg(feature = "__unstable-hooks")]
+#[doc(hidden)]
+pub mod hooks;
 mod layout;
 mod recall;
 mod store;

@@ -136,9 +136,15 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
 - **`SourcePolicy`** (`#[non_exhaustive]`): `Keep` (the default), `Delete` or `Supersede`.
 - **Candidates:** episodic memories of `ns`, at least `min_age` old, not consolidated, superseded or pinned, oldest first.
   - **The scan's limit:** at most `max_groups · max_group · 4` candidates.
-  - **Grouping:** by session, then greedily. The oldest left is the seed; the others join while their cosine to the seed is at least `group_similarity`, up to `max_group`. Groups under `min_group` are left alone.
+  - **Order:** ids, which sort newest first (a rid starts with `u64::MAX − created_us`). The scan starts at the age cutoff's key, so too-young memories aren't read.
+  - **Grouping:** by session, then greedily. The first left is the seed; the others join while their cosine to the seed is at least `group_similarity`, up to `max_group`. Groups under `min_group` are left alone. A group's members follow its seed in id order.
   - **Without a model:** a session's memories, in creation order.
-  - The oldest groups go first, across sessions.
+  - Groups go in their seeds' order, across sessions, and the consolidator gets each one newest first.
+  - **Resuming (cli692's A1):** `ConsolidatePass::resume` and `Consolidate::after(&MemoryId)`.
+    - When `max_groups` cuts groups off, `resume` is the last kept seed. Groups left out have later seeds, and members after those, so the next pass finds them.
+    - When the scan hits its limit, `resume` is the last row scanned.
+    - Otherwise it's `None`. Groups never span a resume position.
+    - Memories that age past `min_age` behind a resume position wait for a pass from the start.
 - **The commit:** one transaction per group, never retried. A group whose memories changed, or whose commit conflicts, counts as `skipped`.
   1. **The re-reads**, per memory: `content:text`, `meta:consolidated`, `meta:superseded_by`, `meta:pinned` (C4), and its `sources` row (C1). The union of the `sources` rows moves to the new memories, so a merge that adds a source conflicts.
   2. **The new memories** go through `remember`'s path, with exact dedup and no near dedup.
@@ -154,7 +160,7 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
      - `Keep` and `Supersede` mark the memories consolidated;
      - `Delete` deletes them, except one that superseded another, which is marked consolidated instead (C3).
 - **`ConsolidatePass`** (`#[non_exhaustive]`): `groups`, `committed`, `skipped`, `created`, `merged` and `sources`.
-- **`Error::Consolidate { error, pass }`:** a consolidator `Err` stops the pass, and the groups before it stay committed. Its `code()` is `MergeFailed`, the closest code: like a merge operator, the consolidator is application code that combines values (cli692 on #1386).
+- **`Error::Consolidate { error, pass }`:** the consolidator's failures stop the pass, and the groups before it stay committed. Those are its `Err`, a returned memory the store refuses (cli692's A2), and a returned link to a memory that's gone (simp724's N1). A database error mid-pass doesn't carry the pass. Summaries skip near dedup (N2). Its `code()` is `MergeFailed`, the closest code: like a merge operator, the consolidator is application code that combines values (cli692 on #1386).
 - **`StoredMemory::consolidated`**, and **`Weights::consolidated`** (default 0.5): a factor on a consolidated memory's importance signal in recall.
 - **Near-duplicate dedup:**
   - **The setting:** `NearDedup::new(similarity).policy(DedupPolicy)` (`#[non_exhaustive]`, `Copy`, getters), with `similarity` from −1 to 1.
@@ -164,10 +170,11 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
   - **The check:** `remember` checks before its transaction, when the memory has an embedding.
     - It looks at the nearest of the namespace's live, unsuperseded memories: up to 8 nearest are read, and superseded ones are skipped.
     - An exact duplicate still merges.
-    - `Skip` returns the new **`Remembered::Similar(id)`** and writes nothing.
+    - `Skip` returns the new **`Remembered::Similar(id)`** and writes nothing. `Remembered::id()` is then the match (cli692's A3).
     - `Merge` merges as an exact duplicate does.
     - `Link` writes the memory with a `SIMILAR_TO` link, weighted by the similarity.
-    - `Merge` and `Link` read the match's `content:text` and `superseded_by` in the transaction. A match that's gone or superseded is ignored.
+    - Every policy reads the match's `content:text` and `superseded_by` in the transaction, `Skip` included (simp724's F1). A match that's gone or superseded is ignored.
+    - The similarity must be above 0 and at most 1.
   - **`remember_in` doesn't check:** the check reads outside a transaction. `Store::near_duplicate(ns, &Memory) -> Result<Option<(MemoryId, f32)>>` runs it for a caller first, and is `InvalidArgument` without a setting.
   - **The race (S2):** two concurrent near duplicates can both insert, and consolidation folds them.
 

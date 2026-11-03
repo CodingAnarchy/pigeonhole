@@ -59,8 +59,9 @@ pub struct NearDedup {
 }
 
 impl NearDedup {
-    /// Near duplicates at `similarity` (cosine, up to 1) or above, linked
-    /// ([`DedupPolicy::Link`]).
+    /// Near duplicates at `similarity` (cosine, above 0 and up to 1) or above, linked
+    /// ([`DedupPolicy::Link`]). 0 or below is refused: almost every write would be a near
+    /// duplicate.
     pub fn new(similarity: f32) -> Self {
         NearDedup {
             similarity,
@@ -85,9 +86,9 @@ impl NearDedup {
     }
 
     pub(crate) fn check(&self) -> Result<()> {
-        if !(-1.0..=1.0).contains(&self.similarity) {
+        if !(self.similarity > 0.0 && self.similarity <= 1.0) {
             return Err(Error::InvalidArgument(
-                "a near dedup similarity is from -1 to 1".into(),
+                "a near dedup similarity is above 0 and at most 1".into(),
             ));
         }
         Ok(())

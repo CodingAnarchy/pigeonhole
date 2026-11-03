@@ -343,7 +343,9 @@ pub enum Remembered {
 }
 
 impl Remembered {
-    /// The memory written or merged into.
+    /// The memory written, merged into, or, for [`Similar`](Remembered::Similar), the near
+    /// duplicate that stopped the write: a memory this call didn't write. Code that links or
+    /// pins the returned id acts on the match once a store turns on [`DedupPolicy::Skip`].
     pub fn id(&self) -> &MemoryId {
         match self {
             Remembered::New(id) | Remembered::Merged(id) | Remembered::Similar(id) => id,
@@ -714,6 +716,10 @@ impl Store {
             Some(setting) => self.near(ns, &memory, setting)?,
             None => None,
         };
+        #[cfg(feature = "__unstable-hooks")]
+        if near.is_some() {
+            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
+        }
         let now = now_us();
         let rid = new_rid(now)?;
         let (r, _) = self.db.transact(&RetryPolicy::default(), |txn| {
@@ -848,14 +854,13 @@ impl Store {
             return self.insert(txn, ns, m, rid, now, importance, dedup);
         };
         let id = || MemoryId::from_row(&n.row).ok_or_else(|| corrupt("a near match's row"));
-        if n.policy == DedupPolicy::Skip {
-            return Ok(Remembered::Similar(id()?));
-        }
-        // The match read here (M1's rule for a near match): gone or superseded since the
-        // check, it's ignored.
+        // The match read here, for every policy (M1's rule for a near match; simp724's F1 on
+        // #1386 for Skip): gone or superseded since the check, it's ignored, and the memory
+        // is written as new.
         let live = txn.get(t, &n.row, CONTENT, TEXT)?.is_some()
             && txn.get(t, &n.row, META, SUPERSEDED_BY)?.is_none();
         match n.policy {
+            DedupPolicy::Skip if live => Ok(Remembered::Similar(id()?)),
             DedupPolicy::Merge if live => {
                 txn.aggregate(t, &n.row, PEAK, IMPORTANCE, importance)
                     .incr(t, &n.row, STATS, USES, 1);
