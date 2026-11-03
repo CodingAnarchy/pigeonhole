@@ -182,6 +182,7 @@ fn build(f: &Fixture, db: &Pigeonhole, el: Element) -> BTreeMap<Vec<u8>, Vec<Str
     let mut keys: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
     let mut prev: Option<(String, MemoryId)> = None;
     let mut busy = 0u64;
+    let mut written = 0u64;
     let t = Instant::now();
     for (m, v) in f.mems.iter().zip(&f.mem_vecs) {
         let mut mem = Memory::new(m.text.clone())
@@ -193,6 +194,14 @@ fn build(f: &Fixture, db: &Pigeonhole, el: Element) -> BTreeMap<Vec<u8>, Vec<Str
             mem = mem.link(id.clone(), follows, 1.0);
         }
         let id = remember(&store, &m.ns, mem, &mut busy);
+        written += 1;
+        if written.is_multiple_of(10_000) {
+            // A watchdog can tell a stuck build from a slow one by these lines.
+            eprintln!(
+                "progress {written} memories, {busy} Busy retries, {:.0} s",
+                t.elapsed().as_secs_f64()
+            );
+        }
         let key = if f.by_session { &m.session } else { &m.unit };
         keys.entry(row_key(&id)).or_default().push(key.clone());
         prev = Some((m.session.clone(), id));
@@ -348,9 +357,11 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
         ("fused-recency-0.5", Some(12), false),
         ("fused+graph", None, true),
     ];
+    // Every hit is a memory this run wrote (simp724's N1 on #1402): an unknown id fails
+    // rather than scoring as a miss.
     let ranked_of = |ids: Vec<Vec<u8>>| -> Vec<Vec<String>> {
         ids.iter()
-            .map(|k| keys.get(k).cloned().unwrap_or_default())
+            .map(|k| keys.get(k).cloned().expect("a hit this run didn't write"))
             .collect()
     };
     for (name, only, graph) in configs {
@@ -383,19 +394,34 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
     }
     for (name, fuzzy) in [("keyword-index", false), ("keyword-fuzzy", true)] {
         let mut t = Tally::default();
-        for (q, _) in f.qs.iter().zip(&f.q_vecs) {
-            let query = if fuzzy {
-                fuzzy_query(&q.text)
-            } else {
-                Query::new().text(q.text.clone())
-            };
-            let prefix = [q.ns.as_bytes(), b"\0m"].concat();
-            let start = Instant::now();
-            let hits = index.search(query, 10).id_prefix(prefix).run().unwrap();
-            let us = start.elapsed().as_micros() as u64;
-            let ranked = ranked_of(hits.into_iter().map(|h| h.id).collect());
-            t.add(score(&ranked, &q.evidence), us, ns_size[q.ns.as_str()]);
+        let mut found = 0usize;
+        // One untimed pass warms the caches, as for the recall rows (simp724's N2 on #1402).
+        for pass in 0..2 {
+            for (q, _) in f.qs.iter().zip(&f.q_vecs) {
+                let query = if fuzzy {
+                    fuzzy_query(&q.text)
+                } else {
+                    Query::new().text(q.text.clone())
+                };
+                // The store's memory rows are `{ns}\0m{rid}` (ICR 0107's frozen layout), as
+                // its own recall passes `id_prefix`.
+                let prefix = [q.ns.as_bytes(), b"\0m"].concat();
+                let start = Instant::now();
+                let hits = index.search(query, 10).id_prefix(prefix).run().unwrap();
+                let us = start.elapsed().as_micros() as u64;
+                if pass == 1 {
+                    found += hits.len();
+                    let ranked = ranked_of(hits.into_iter().map(|h| h.id).collect());
+                    t.add(score(&ranked, &q.evidence), us, ns_size[q.ns.as_str()]);
+                }
+            }
         }
+        // The index's name and the id prefix are the store's layout: a change there would
+        // read as no hits, not fail (cli692's N2 on #1402).
+        assert!(
+            found > 0,
+            "{name}: no hits at all; has the store's index name or layout changed?"
+        );
         t.print(dataset, el_name, name);
     }
     drop(index);
@@ -459,30 +485,37 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         if el == "f32" {
             let db = open(&dir);
             let store = Store::open(&db, STORE, &f.model).unwrap();
-            let mut us = Vec::new();
-            for pass in 0..2 {
-                for (q, v) in f.qs.iter().zip(&f.q_vecs) {
-                    let start = Instant::now();
-                    let hits = store
-                        .recall(&["size"])
-                        .text(q.text.clone())
-                        .embedding(v.clone())
-                        .k(10)
-                        .run()
-                        .unwrap();
-                    assert!(!hits.is_empty());
-                    if pass == 1 {
-                        us.push(start.elapsed().as_micros() as u64);
+            // Fused, and each of its two query-dependent signals alone, so the large
+            // namespace's cost can be told apart (perf287's S1 on #1402).
+            for (name, only) in [("fused", None), ("vector", Some(0)), ("keyword", Some(1))] {
+                let mut us = Vec::new();
+                for pass in 0..2 {
+                    for (q, v) in f.qs.iter().zip(&f.q_vecs) {
+                        let mut r = store.recall(&["size"]).k(10).weights(weights(only));
+                        if only != Some(1) {
+                            r = r.embedding(v.clone());
+                        }
+                        if only != Some(0) {
+                            r = r.text(q.text.clone());
+                        }
+                        let start = Instant::now();
+                        let hits = r.run().unwrap();
+                        assert!(!hits.is_empty());
+                        if pass == 1 {
+                            us.push(start.elapsed().as_micros() as u64);
+                        }
                     }
                 }
+                let n_q = us.len();
+                println!(
+                    "{}",
+                    json!({
+                        "mode": "size-latency", "config": name, "memories": n, "questions": n_q,
+                        "p50_us": percentile(&mut us, 0.5), "p90_us": percentile(&mut us, 0.9),
+                        "max_us": percentile(&mut us, 1.0),
+                    })
+                );
             }
-            println!(
-                "{}",
-                json!({
-                    "mode": "size-latency", "memories": n, "questions": us.len(),
-                    "p50_us": percentile(&mut us, 0.5), "p99_us": percentile(&mut us, 0.99),
-                })
-            );
             drop(store);
             db.close().unwrap();
         }
