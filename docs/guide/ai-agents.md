@@ -24,6 +24,7 @@ The server speaks MCP's stdio transport: one JSON-RPC message per line on standa
 | `--change-feed BYTES` | Turn the [change feed](#following-changes) on, keeping up to `BYTES` of history. Without it, a database whose application already feeds keeps that feed: `phdb`'s open inherits it, and `feed_poll` serves it. Only as the writer. |
 | `--max-value-bytes N` | The longest value a read returns whole by default (4 KiB). A longer one comes back as `{"omitted_bytes": n}`; a read can ask for more with `max_value_bytes`. |
 | `--shm-dir DIR`, `--reader`, `--writer` | As for every `phdb` command ([CLI guide](cli.md#how-phdb-opens-a-database)). |
+| `--memory NAME` and the `--memory-*`/`--embed-*` flags | Serve the [memory tools](#the-memory-tools) over an [agent memory](agent-memory.md) store. |
 
 **How it opens the database.** Without `--read-only`, the server opens as `phdb shell` does. With no writer running, it becomes the writer: it holds the writer lock for as long as the client keeps it running, so your application can't open the database as the writer meanwhile (its open fails with `WriterLocked`). With your application running, it opens as a reader process, and the write tools are left out.
 
@@ -86,6 +87,39 @@ Eight tools, each with a JSON schema and a description written for the agent. `t
 **Encoding.** Values use [`phdb dump`](cli.md#phdb-dump)'s JSON shapes. Row keys, qualifiers and byte values are JSON strings when they are UTF-8, else `{"base64": "..."}`. Integer and float cells are `{"i64": n}` and `{"f64": x}`. Timestamps are microseconds since the Unix epoch. A cell in a result is `{"family", "qualifier", "ts", "value"}`.
 
 **Errors.** A tool that fails returns a result with `isError` and `{"error": {"code", "code_num", "message"}}`, with the [`ErrorCode`](errors.md) name when the database refused the call (`TableNotFound`, `FamilyNotFound`, `ReadOnly`, ...) and `Usage` for a bad argument. The agent sees it and can correct the call. An unknown argument is an error, not ignored, so a misspelt `limt` doesn't silently scan 100 rows.
+
+## The memory tools
+`phdb mcp --memory NAME` adds six tools over a [`pigeonhole-memory`](agent-memory.md) store named `NAME` (its tables are `mem_NAME` and `mem_NAME_text`). The store keeps memories with ranked recall, deduplication, superseding and forgetting, so an agent doesn't have to model them in tables itself. When the database is writable and the store is missing, the server creates it.
+
+```sh
+phdb mcp --create --memory agent memory.phdb                          # keyword and recency recall
+phdb mcp --create --memory agent --memory-model text-embedding-3-small --memory-dim 1536 memory.phdb
+OPENAI_API_KEY=... phdb mcp --create --memory agent \
+  --embed-url https://api.openai.com/v1/embeddings --embed-model text-embedding-3-small \
+  --embed-key-env OPENAI_API_KEY memory.phdb                          # the server embeds
+```
+
+| Tool | What it does |
+|---|---|
+| `memory_recall` | The best memories for a `text` query and/or an `embedding`, best first, in the `namespace` (or `namespaces`) given. Ranks by keywords, similarity, recency, importance and use. `k` (default 10), `max_bytes` (the hits' size budget, default `--max-result-bytes`; `truncated` says it cut them), `session` and `include_superseded`. Each hit has `id`, `text`, `kind`, `importance`, `created_us` and `score`. |
+| `memory_remember` | Stores one memory: `text`, with `kind` (`episodic`, `semantic`, `procedural`), `importance` (0 to 1), `source`, `session`, `pinned` and `links`. An exact duplicate merges (outcome `merged`). `supersedes` names a memory the new one replaces. That's a second step after the write, so a crash between the two leaves the old memory unsuperseded. |
+| `memory_mark_used` | Counts a use of the memories that helped, which ranks them higher and keeps them longer. |
+| `memory_supersede` | Marks `old` replaced by `new`: recall leaves `old` out. |
+| `memory_link` | A typed, weighted link between two memories of a namespace: `derived_from`, `similar_to`, or an application's number from 16. |
+| `memory_forget` | Deletes memories. |
+
+A reader process (`--read-only`) serves `memory_recall` only. Memory ids are `MemoryId`'s text form. A `namespace` defaults to `"default"`.
+
+**What the agent is told.** With `--memory`, the server's MCP `instructions` gain a paragraph on using memory well: what to remember and what not to, namespaces and importance, recalling before acting with `max_bytes` sized to the context, `mark_used`, superseding instead of storing contradictions, and the embedding rule below. Each memory tool's description carries its part. The full guide is an MCP resource, `memory://guide` (its source is [`crates/cli/src/mcp/memory_guide.md`](../../crates/cli/src/mcp/memory_guide.md)).
+
+**Embeddings.** A store is pinned to one embedding model when it's created: the model's id and dimension. It refuses vectors that don't fit, because vectors from different models aren't comparable, and mixing them silently ruins recall. There are three ways to run it:
+- **No model** (just `--memory`): the store recalls by keyword, recency, importance and use. Such a store can never take embeddings later, so choose before it's created.
+- **The client supplies embeddings** (`--memory-model ID --memory-dim N`, and `--memory-element f16` or `bf16` to halve the size): `memory_remember` needs an `embedding` of the text, with `embedding_model` set to the store's id. A call that names another model is refused. `memory_recall` takes one too, or text alone.
+- **The server embeds** (`--embed-url URL --embed-model NAME [--embed-key-env VAR]`): the server calls an OpenAI-compatible `/embeddings` endpoint for every memory and recall query, so the tools take text only and refuse client vectors. A new store is pinned to `NAME`, with the dimension of the endpoint's first answer. **The memory text and the recall queries are sent to that endpoint.** The API key is read from the environment variable `VAR` and sent as a bearer token; it's never a flag value, and never logged. `https://` uses the operating system's trust store. Local servers that speak the same API (Ollama, llama.cpp, LM Studio) work over `http://`. A `phdb` built with `--no-default-features` leaves the endpoint client out (the `embed` feature).
+
+Reopening a store with a model flag that names another model than the store's fails at startup.
+
+**Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs. A store whose application set a policy forgets under it too.
 
 ## Long results and cursors
 A result that would pass `--max-result-bytes` stops early and carries a `cursor`. Calling the same tool again with the same arguments plus that `cursor` returns the next part. An agent pages through anything this way, a million-edge hub included, without flooding its context.
