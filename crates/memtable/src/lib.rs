@@ -1582,10 +1582,8 @@ impl Cursor for MemIter {
     /// a filter's `SkipRow` in a wide row (a qualifier prefix in the middle of 100,000
     /// cells) walked the rest of it.
     ///
-    /// Out of line: gets and row reads never skip a row, but inlined into the merged
-    /// cursor this function changed how that cursor compiled for every read, and
-    /// callgrind's ycsb-c rose 110 instructions per operation without a single skip
-    /// (#1428, #1433).
+    /// Out of line: gets and row reads never skip a row, so it needn't add to the merged
+    /// cursor's code.
     #[inline(never)]
     fn skip_row(&mut self) -> Result<()> {
         if !self.valid() {
@@ -1613,7 +1611,13 @@ impl Cursor for MemIter {
         if let Some(last) = row.last_mut() {
             *last = 0x02;
         }
-        self.seek_forward(row)
+        // `seek_forward`'s finger search, written out rather than called: a second caller
+        // of `seek_forward` changed how it compiled into every read's seek (#1433).
+        let finger = self.preds[0] != NULL;
+        let found = self.reader.search(row, &mut self.preds, finger)?;
+        self.walk.steps = 0;
+        self.set(found);
+        Ok(())
     }
 
     /// With a stale-tail index (D194): jumps to the tail recorded for the current entry,
