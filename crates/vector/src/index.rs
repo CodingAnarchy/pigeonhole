@@ -1,6 +1,7 @@
 //! The index (D306): writes, inline split and merge, search, and verification.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -263,6 +264,22 @@ pub(crate) struct Inner {
     pending: Mutex<VecDeque<u32>>,
     /// Wakes the background rebalancer, and tells it when the last handle is gone.
     signal: Arc<Signal>,
+    /// The crate's rebalancing thread was started for this index ([`Index::open`] in
+    /// background mode): one per index, however many opens share it (#1268 item 8).
+    thread: AtomicBool,
+}
+
+impl Inner {
+    pub(crate) fn db(&self) -> &Pigeonhole {
+        &self.db
+    }
+
+    /// Whether this is still the index its table name names: its options row reads through
+    /// its own table handle. A dropped table (perhaps created again since) or a closed
+    /// database refuses the read (the registry's stale-entry check, #1268 item 8).
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self.table.get(GLOBAL, META, OPTS), Ok(Some(_)))
+    }
 }
 
 impl Drop for Inner {
@@ -723,19 +740,31 @@ impl Index {
     /// [`open_with_rebalancer`](Self::open_with_rebalancer) instead: in an
     /// application-owned database (D284) the crate shouldn't start threads of its own.
     ///
-    /// Open an index once per process and clone the handle: each open has its own centroid
-    /// cache and, in background mode, its own rebalancer. Two would be correct (they
-    /// serialise on the index's rows, as two processes do) but would duplicate the work.
+    /// An index already open in this process (an application handle to it still alive) is
+    /// not opened again: `open` returns a clone of that handle, sharing its centroid cache,
+    /// its queue of lists to rebalance and its one rebalancing thread (#1268 item 8). "The
+    /// same index" is the same table name in the same open database
+    /// ([`Pigeonhole::same_database`]), and a table that was dropped since (and perhaps
+    /// created again) is opened afresh.
     ///
     /// The rebalancing thread holds the index, and with it a database handle, until it sees
     /// the last [`Index`] handle drop, at most one split later. To reopen the database in
     /// the same process, [`close`](Pigeonhole::close) it first: a closed database refuses
     /// the thread's next write, and the thread ends.
     pub fn open(db: &Pigeonhole, name: &str) -> Result<Index> {
-        let index = Self::open_inner(db, name)?;
-        if index.inner.opts.rebalance == Rebalance::Background {
-            crate::rebalancer::spawn(Rebalancer::new(&index, Arc::clone(&index.inner.signal)))
-                .map_err(|e| Error::InvalidArgument(format!("starting the rebalancer: {e}")))?;
+        let index = Self::registered(db, name)?;
+        if index.inner.opts.rebalance == Rebalance::Background
+            && !index.inner.thread.swap(true, Ordering::AcqRel)
+        {
+            let started =
+                crate::rebalancer::spawn(Rebalancer::new(&index, Arc::clone(&index.inner.signal)));
+            if let Err(e) = started {
+                // A later open tries again.
+                index.inner.thread.store(false, Ordering::Release);
+                return Err(Error::InvalidArgument(format!(
+                    "starting the rebalancer: {e}"
+                )));
+            }
         }
         Ok(index)
     }
@@ -745,8 +774,16 @@ impl Index {
     /// application-owned database, D284). With [`Rebalance::Background`] the application
     /// runs the rebalancer; with [`Rebalance::Inline`] the writes rebalance, and the
     /// rebalancer only finds what `open` queued.
+    ///
+    /// As with [`open`](Self::open), an index already open in this process shares its state:
+    /// the handle is a clone of the open one, and the rebalancer takes from the same queue as
+    /// any other (each list is split or merged by one of them at a time). They share one
+    /// [`set_wakeup`](Rebalancer::set_wakeup): the last one set is called. A later
+    /// [`open`](Self::open) of the index in background mode starts the crate's thread too,
+    /// which takes from the same queue: in an application-owned database, open with this
+    /// function only.
     pub fn open_with_rebalancer(db: &Pigeonhole, name: &str) -> Result<(Index, Rebalancer)> {
-        let index = Self::open_inner(db, name)?;
+        let index = Self::registered(db, name)?;
         let rebalancer = Rebalancer::new(&index, Arc::clone(&index.inner.signal));
         Ok((index, rebalancer))
     }
@@ -802,6 +839,15 @@ impl Index {
         &self.user
     }
 
+    /// The index from this process's registry, or opened and registered (#1268 item 8).
+    fn registered(db: &Pigeonhole, name: &str) -> Result<Index> {
+        let (inner, user) = crate::registry::open(db, name, || {
+            let index = Self::open_inner(db, name)?;
+            Ok((index.inner, index.user))
+        })?;
+        Ok(Index { inner, user })
+    }
+
     fn open_inner(db: &Pigeonhole, name: &str) -> Result<Index> {
         let table = db.table(name)?.open()?;
         let not = |why: &str| {
@@ -833,6 +879,7 @@ impl Index {
                 in_flight: Mutex::new(HashSet::new()),
                 pending: Mutex::new(VecDeque::new()),
                 signal: Arc::new(Signal::default()),
+                thread: AtomicBool::new(false),
             }),
         };
         index.queue_out_of_bounds(&s)?;
