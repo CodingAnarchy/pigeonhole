@@ -108,7 +108,8 @@ impl WatchBuilder {
         }
         prefixes.sort();
         prefixes.dedup();
-        // One namespace: the feed filters rows itself. Several: by prefix here.
+        // One namespace: the feed filters rows itself. Several (or every one): the feed
+        // delivers every commit of the store's table, and they're filtered here.
         let feed = match prefixes.as_slice() {
             [one] => feed.prefix(one),
             _ => feed,
@@ -225,6 +226,9 @@ struct Seen {
 /// and every row that isn't a memory's are skipped).
 fn events(c: &Commit, prefixes: &[Vec<u8>]) -> Option<MemoryCommit> {
     let mut rows: Vec<(Vec<u8>, Seen)> = Vec::new();
+    // Each row's place in `rows`, so a large commit (a bulk `remember_in`) stays linear
+    // (simp724's N1 on #1430).
+    let mut at_row: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
     for ch in c.changes() {
         let row = ch.row();
         if !prefixes.is_empty() && !prefixes.iter().any(|p| row.starts_with(p)) {
@@ -233,9 +237,10 @@ fn events(c: &Commit, prefixes: &[Vec<u8>]) -> Option<MemoryCommit> {
         if MemoryId::from_row(row).is_none() {
             continue;
         }
-        let at = match rows.iter().position(|(r, _)| r.as_slice() == row) {
-            Some(i) => i,
+        let at = match at_row.get(row) {
+            Some(&i) => i,
             None => {
+                at_row.insert(row.to_vec(), rows.len());
                 rows.push((row.to_vec(), Seen::default()));
                 rows.len() - 1
             }

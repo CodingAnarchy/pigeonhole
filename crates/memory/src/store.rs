@@ -721,6 +721,11 @@ impl Store {
     /// Watches the store's memory events in `namespaces` (every namespace when empty)
     /// through the database's change feed (D311 T9): see [`Watch`](crate::Watch). The feed
     /// must be on and follow the store's table (`mem_{name}`); `open` says so otherwise.
+    ///
+    /// One namespace is filtered by the feed itself. Several, or none (every namespace),
+    /// read every commit of the store's table and filter here, so a watch of a few
+    /// namespaces in a busy store costs as much as a watch of all of them (simp724's N2 on
+    /// #1430).
     pub fn watch(&self, namespaces: &[&str]) -> crate::WatchBuilder {
         crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
     }
