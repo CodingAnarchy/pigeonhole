@@ -283,6 +283,43 @@ assert_eq!(commit.events, vec![MemoryEvent::Remembered(r.id().clone())]);
 - **Delivery** is at durability by default. `.visible()` delivers a commit as soon as reads see it, at the cost the change feed describes.
 - **If the feed's history is recycled past a watch,** `next` fails with `FeedExpired`. Read the store afresh at a snapshot and watch `from_snapshot` it.
 
+## Consolidating as memories arrive
+`store.consolidate_loop(name, &consolidator)` runs consolidation passes as new memories arrive, instead of on a schedule. It watches the store through the change feed (as above), and runs a pass for a namespace once its oldest new memory is the policy's `min_age` old:
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_memory::{ConsolidatePolicy, Consolidator, Memory, Store, StoreOptions, StoredMemory};
+# struct Summarize;
+# impl Consolidator for Summarize {
+#     fn consolidate(&self, g: &[StoredMemory]) -> std::result::Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>> {
+#         Ok(vec![Memory::new(format!("{} notes", g.len()))])
+#     }
+# }
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default().change_feed(FeedRetention::bytes(64 << 20)))?;
+# let store = Store::create(&db, "agents", StoreOptions::new())?;
+let policy = ConsolidatePolicy::new().min_age(std::time::Duration::from_secs(3600));
+let mut each_hour = store
+    .consolidate_loop("main", std::sync::Arc::new(Summarize))
+    .policy(&policy);
+// In the application's own thread or task: one step reads new memories for up to a second,
+// then runs the passes that are due.
+let step = each_hour.run_once(std::time::Duration::from_secs(1))?;
+assert!(step.passes.is_empty()); // nothing is an hour old yet
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **What starts a pass:** a new memory (`Remembered`). A pass's own summaries, merges and `mark_used` don't, so recalling a namespace never triggers its consolidation.
+- **Restarts:** the loop keeps its position under its name in the store, including the namespaces still waiting out their `min_age`. A loop started again with that name resumes there. With no saved position, or after its feed history was recycled, it catches up once by scanning for namespaces with unconsolidated memories.
+- **One loop per name:** a loop that starts takes the name over, and an older one still running fails its next step with `Error::LoopTakenOver` (code `Conflict`). Passes that race on the same memories conflict group by group, so nothing is consolidated twice.
+- **At least once:** a loop stopped between a pass and saving its position runs that pass again, which skips what's already consolidated. A consolidator that fails partway leaves the groups before it committed, and the namespace is retried after `min_age`.
+- **Steps:** `run_once(timeout)`'s timeout bounds the wait for new memories (in real time), not the passes. `next_due()` says when the next pass is due, `run(&stop)` loops until a flag is set, and `.clock(..)` replaces the clock `min_age` is measured on, for tests.
+- **The loop owns what it needs** (a store handle, the consolidator as an `Arc`, its clock), so it can live on a thread of its own.
+- **It runs in the writer process,** since passes write. Other processes can still `watch`.
+
 ## Reader processes
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
 

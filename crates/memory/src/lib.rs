@@ -20,6 +20,7 @@
 mod consolidate;
 mod dedup;
 mod error;
+mod feed_loop;
 mod forget;
 /// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
 /// unstable, and never needed by applications.
@@ -37,6 +38,7 @@ pub use consolidate::{
 };
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
+pub use feed_loop::{ConsolidateLoop, LoopStep};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use ivf::IvfOptions;
 pub use layout::{MemoryId, normalize};

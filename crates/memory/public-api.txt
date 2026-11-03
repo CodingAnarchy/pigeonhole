@@ -11,6 +11,7 @@ pub pigeonhole_memory::Error::Consolidate::pass: pigeonhole_memory::ConsolidateP
 pub pigeonhole_memory::Error::Corruption(alloc::string::String)
 pub pigeonhole_memory::Error::Db(pigeonhole::error::Error)
 pub pigeonhole_memory::Error::InvalidArgument(alloc::string::String)
+pub pigeonhole_memory::Error::LoopTakenOver(alloc::string::String)
 pub pigeonhole_memory::Error::Mismatch(alloc::string::String)
 pub pigeonhole_memory::Error::NotFound(alloc::string::String)
 pub pigeonhole_memory::Error::Text(pigeonhole_text::error::Error)
@@ -65,6 +66,16 @@ pub fn pigeonhole_memory::Consolidate<'a>::after(self, &'a pigeonhole_memory::Me
 pub fn pigeonhole_memory::Consolidate<'a>::now_us(self, u64) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::policy(self, &'a pigeonhole_memory::ConsolidatePolicy) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::run(self) -> pigeonhole_memory::Result<pigeonhole_memory::ConsolidatePass>
+pub struct pigeonhole_memory::ConsolidateLoop
+impl pigeonhole_memory::ConsolidateLoop
+pub fn pigeonhole_memory::ConsolidateLoop::clock(self, impl core::ops::function::Fn() -> u64 + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::namespaces(self, &[&str]) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::next_due(&self) -> core::option::Option<u64>
+pub fn pigeonhole_memory::ConsolidateLoop::policy(self, &pigeonhole_memory::ConsolidatePolicy) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::run(&mut self, &core::sync::atomic::AtomicBool) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::ConsolidateLoop::run_once(&mut self, core::time::Duration) -> pigeonhole_memory::Result<pigeonhole_memory::LoopStep>
+impl core::fmt::Debug for pigeonhole_memory::ConsolidateLoop
+pub fn pigeonhole_memory::ConsolidateLoop::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::ConsolidatePass
 pub pigeonhole_memory::ConsolidatePass::committed: u64
 pub pigeonhole_memory::ConsolidatePass::created: u64
@@ -162,6 +173,12 @@ pub const pigeonhole_memory::LinkType::SIMILAR_TO: pigeonhole_memory::LinkType
 pub const pigeonhole_memory::LinkType::SUPERSEDES: pigeonhole_memory::LinkType
 pub fn pigeonhole_memory::LinkType::custom(u8) -> pigeonhole_memory::Result<pigeonhole_memory::LinkType>
 pub fn pigeonhole_memory::LinkType::get(self) -> u8
+#[non_exhaustive] pub struct pigeonhole_memory::LoopStep
+pub pigeonhole_memory::LoopStep::events: usize
+pub pigeonhole_memory::LoopStep::failed: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::Error)>
+pub pigeonhole_memory::LoopStep::next_due: core::option::Option<u64>
+pub pigeonhole_memory::LoopStep::passes: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
+pub pigeonhole_memory::LoopStep::token: pigeonhole_memory::WatchToken
 #[non_exhaustive] pub struct pigeonhole_memory::Marked
 pub pigeonhole_memory::Marked::marked: usize
 pub pigeonhole_memory::Marked::missing: alloc::vec::Vec<pigeonhole_memory::MemoryId>
@@ -272,6 +289,7 @@ pub struct pigeonhole_memory::Store
 impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::consolidate<'a>(&'a self, &'a str, &'a dyn pigeonhole_memory::Consolidator) -> pigeonhole_memory::Consolidate<'a>
 impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::consolidate_loop(&self, &str, alloc::rcs::arc::Arc<dyn pigeonhole_memory::Consolidator>) -> pigeonhole_memory::ConsolidateLoop
 pub fn pigeonhole_memory::Store::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::create_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::delete(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>

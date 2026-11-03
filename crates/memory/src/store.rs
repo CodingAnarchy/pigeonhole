@@ -816,6 +816,20 @@ impl Store {
         crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
     }
 
+    /// A feed-driven consolidation loop named `name` (D311 T9): see
+    /// [`ConsolidateLoop`](crate::ConsolidateLoop). The name keys its saved position in the
+    /// store: non-empty, without `:`.
+    ///
+    /// The loop owns what it needs (a handle on the store, the consolidator, its clock), so
+    /// it can be kept across calls or moved to a thread of its own.
+    pub fn consolidate_loop(
+        &self,
+        name: &str,
+        consolidator: std::sync::Arc<dyn crate::Consolidator>,
+    ) -> crate::ConsolidateLoop {
+        crate::feed_loop::ConsolidateLoop::new(self, name, consolidator)
+    }
+
     /// The store's IVF options, if it was created with [`StoreOptions::ivf`].
     pub fn ivf(&self) -> Option<IvfOptions> {
         self.ivf.as_ref().map(Ivf::options)

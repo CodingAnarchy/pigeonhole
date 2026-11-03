@@ -30,6 +30,12 @@ pub enum Error {
     Mismatch(String),
     /// The store's rows don't parse.
     Corruption(String),
+    /// A [`ConsolidateLoop`](crate::ConsolidateLoop) of the same name started since this
+    /// one last saved, and took the name over (D311 T9): this loop should stop. Its
+    /// [`code`](Error::code) is `Conflict`, but don't retry it, or make a new loop of the name
+    /// in its place: the newer loop is already running, and two supervisors that recreate on
+    /// this would take the name back and forth for ever (cli692 on #1432).
+    LoopTakenOver(String),
     /// The application's [`Consolidator`](crate::Consolidator) failed, which stops the pass
     /// ([`Store::consolidate`](crate::Store::consolidate)). The groups before it committed:
     /// `pass` counts them. Its [`code`](Error::code) is `MergeFailed`, the closest code: like
@@ -54,6 +60,7 @@ impl Error {
                 ErrorCode::InvalidArgument
             }
             Error::Corruption(_) => ErrorCode::Corruption,
+            Error::LoopTakenOver(_) => ErrorCode::Conflict,
             Error::Consolidate { .. } => ErrorCode::MergeFailed,
         }
     }
@@ -69,6 +76,10 @@ impl fmt::Display for Error {
             Error::NotFound(m) => write!(f, "not found: {m}"),
             Error::Mismatch(m) => write!(f, "embedding model mismatch: {m}"),
             Error::Corruption(m) => write!(f, "store corruption: {m}"),
+            Error::LoopTakenOver(name) => write!(
+                f,
+                "another consolidation loop named {name:?} started on this store and took it over"
+            ),
             Error::Consolidate { error, .. } => write!(f, "the consolidator failed: {error}"),
         }
     }
