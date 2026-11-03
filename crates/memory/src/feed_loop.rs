@@ -191,6 +191,11 @@ impl ConsolidateLoop {
     }
 
     /// One step: reads the store's new memories for up to `timeout` (less if a pass falls
+    /// due sooner), runs the passes that are due, and saves the loop's position. An
+    /// [`Error::LoopTakenOver`] means another loop of this name now runs: stop this one, and
+    /// don't recreate it.
+    ///
+    /// In detail: reads the store's new memories for up to `timeout` (less if a pass falls
     /// due sooner), runs the passes that are due, and saves the loop's position. `timeout`
     /// bounds the wait, not the passes, which take as long as the consolidator does (cli692's
     /// A5).

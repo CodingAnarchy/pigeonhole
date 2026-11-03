@@ -30,7 +30,9 @@ pub enum Error {
     Corruption(String),
     /// A [`ConsolidateLoop`](crate::ConsolidateLoop) of the same name started since this
     /// one last saved, and took the name over (D311 T9): this loop should stop. Its
-    /// [`code`](Error::code) is `Conflict`.
+    /// [`code`](Error::code) is `Conflict`, but don't retry it, or make a new loop of the name
+    /// in its place: the newer loop is already running, and two supervisors that recreate on
+    /// this would take the name back and forth for ever (cli692 on #1432).
     LoopTakenOver(String),
     /// The application's [`Consolidator`](crate::Consolidator) failed, which stops the pass
     /// ([`Store::consolidate`](crate::Store::consolidate)). The groups before it committed:
