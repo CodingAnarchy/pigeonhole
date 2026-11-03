@@ -1512,11 +1512,9 @@ impl std::ops::Deref for ArenaSlice {
     }
 }
 
-/// Entries [`MemIter::skip_row`] steps before it seeks past the row. A step costs much less
-/// than a finger search, so ordinary rows (a ycsb record's 10 fields and their versions)
-/// keep stepping, as with `Cursor`'s default: at 8 they sought, and callgrind's ycsb-c rose
-/// by 110 instructions per unit (#1428). Only a row wider than this seeks.
-const ROW_SKIP_STEPS: usize = 64;
+/// Entries [`MemIter::skip_row`] steps before it seeks past the row: a narrow row ends
+/// within them, and a step costs less than a search.
+const ROW_SKIP_STEPS: usize = 8;
 
 impl Cursor for MemIter {
     type Error = Error;
@@ -1583,6 +1581,12 @@ impl Cursor for MemIter {
     /// row, as the SST's row skip seeks (#1426). The default steps through the whole row, so
     /// a filter's `SkipRow` in a wide row (a qualifier prefix in the middle of 100,000
     /// cells) walked the rest of it.
+    ///
+    /// Out of line: gets and row reads never skip a row, but inlined into the merged
+    /// cursor this function changed how that cursor compiled for every read, and
+    /// callgrind's ycsb-c rose 110 instructions per operation without a single skip
+    /// (#1428, #1433).
+    #[inline(never)]
     fn skip_row(&mut self) -> Result<()> {
         if !self.valid() {
             return Ok(());
