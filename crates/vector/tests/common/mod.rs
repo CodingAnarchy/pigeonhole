@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use pigeonhole::{Element, Metric, Options, Pigeonhole, Vector, VectorSpec};
-use pigeonhole_vector::{Hit, Index};
+use pigeonhole_vector::{Hit, Index, ReadIndex};
 
 /// The seeds a test runs: `VECTOR_SEED` alone when set, else `defaults`.
 pub fn seeds(defaults: &[u64]) -> Vec<u64> {
@@ -81,6 +81,16 @@ impl V {
     }
 
     pub fn search(&self, index: &Index, k: usize, nprobe: u32) -> Vec<Hit> {
+        match self {
+            V::F32(x) => index.search_f32(x, k).nprobe(nprobe).run(),
+            V::I8(x) => index.search_i8(x, k).nprobe(nprobe).run(),
+            V::Bits(x) => index.search_bits(x, k).nprobe(nprobe).run(),
+        }
+        .expect("search")
+    }
+
+    /// [`search`](Self::search) through a reader process's handle (#1268 item 5).
+    pub fn search_read(&self, index: &ReadIndex, k: usize, nprobe: u32) -> Vec<Hit> {
         match self {
             V::F32(x) => index.search_f32(x, k).nprobe(nprobe).run(),
             V::I8(x) => index.search_i8(x, k).nprobe(nprobe).run(),
