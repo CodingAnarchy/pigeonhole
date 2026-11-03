@@ -126,8 +126,17 @@ jobs:
           cp "${srcs[@]}" /tmp/base/crates/bench/examples/
           # Shared example modules (the `Measured` guard), also at the head's version.
           cp -R crates/bench/examples/support /tmp/base/crates/bench/examples/
-          (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
-            --target-dir "$GITHUB_WORKSPACE/target")
+          # A PR whose new shapes use an API it adds (D314's commit_returning) can't build the
+          # head's examples against base: base then builds its own, and runs only the shapes it
+          # has a ceiling for. The new shapes show as new, with no base count.
+          if ! (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
+            --target-dir "$GITHUB_WORKSPACE/target"); then
+            echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples"
+            git -C /tmp/base checkout -q -- crates/bench/examples
+            (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
+              --target-dir "$GITHUB_WORKSPACE/target")
+            touch /tmp/base-own-examples
+          fi
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
       - name: count
         shell: bash
@@ -135,9 +144,27 @@ jobs:
           set -euo pipefail
           for side in base head; do
             groups=()
-            for g in $SHAPES; do groups+=("/tmp/bin-$side/$g"); done
+            for g in $SHAPES; do
+              # Base on its own examples: only the shapes base has a ceiling for.
+              if [ "$side" = base ] && [ -e /tmp/base-own-examples ]; then
+                keep=()
+                IFS=, read -ra list <<< "${g#*:}"
+                for s in "${list[@]}"; do
+                  if awk -v s="$s" '$1 == s { f = 1 } END { exit !f }' \
+                    /tmp/base/crates/bench/baselines/instruction-ceilings.txt; then
+                    keep+=("$s")
+                  fi
+                done
+                [ "${#keep[@]}" -gt 0 ] || continue
+                g="${g%%:*}:$(IFS=,; echo "${keep[*]}")"
+              fi
+              groups+=("/tmp/bin-$side/$g")
+            done
             scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
           done
+          # Base and head by name: `name base head`, base `-` for a shape new in the head.
+          awk 'NR == FNR { b[$1] = $2; next } { print $1, (($1 in b) ? b[$1] : "-"), $2 }' \
+            /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
           {
             echo "### Instructions per unit (callgrind)"
             echo
@@ -145,9 +172,13 @@ jobs:
             echo
             echo "| State or shape | base | head | change |"
             echo "|---|--:|--:|--:|"
-            paste -d' ' /tmp/base.txt /tmp/head.txt | awk '{ print $1, $2, $4 }' | while read -r state b h; do
-              echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
-            done
+            while read -r state b h; do
+              if [ "$b" = - ]; then
+                echo "| $state | (new) | $h | new |"
+              else
+                echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
+              fi
+            done < /tmp/pairs.txt
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # The head must also stay at or below every shape's absolute ceiling (D193): the
           # Phase 2 floors may not regress, not even in steps below the per-PR thresholds.
@@ -158,19 +189,21 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           ceilings=0
           python3 scripts/instruction-ceilings.py check /tmp/head.txt | tee -a "$GITHUB_STEP_SUMMARY" || ceilings=1
-          paste -d' ' /tmp/base.txt /tmp/head.txt | awk -v thresholds="$THRESHOLDS" '
+          awk -v thresholds="$THRESHOLDS" '
             BEGIN {
               n = split(thresholds, kv, " ")
               for (i = 1; i <= n; i++) { split(kv[i], p, "="); limit[p[1]] = p[2] }
             }
+            # A shape new in the head has no base to compare; its absolute ceiling still holds.
+            $2 == "-" { next }
             {
               t = ($1 in limit) ? limit[$1] : limit["default"]
-              if ($4 > $2 * (1 + t / 100)) {
-                printf "regression: %s %s -> %s (%+.2f%%, threshold %s%%)\n", $1, $2, $4, 100 * ($4 - $2) / $2, t
+              if ($3 > $2 * (1 + t / 100)) {
+                printf "regression: %s %s -> %s (%+.2f%%, threshold %s%%)\n", $1, $2, $3, 100 * ($3 - $2) / $2, t
                 bad = 1
               }
             }
-            END { exit bad }'
+            END { exit bad }' /tmp/pairs.txt
           if [ "$ceilings" != 0 ]; then
             echo "a shape is above its absolute ceiling, or has none (D193)"
             exit 1
