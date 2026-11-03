@@ -642,7 +642,7 @@ impl<'a> Recall<'a> {
                 for fam in [LINKS, BACKLINKS] {
                     // With nothing left, a budget of 1 still cuts at the first node (and
                     // only if there is one); 0 would mean no budget.
-                    let left = budget.map_or(0, |b| (b - read).max(1));
+                    let left = budget.map_or(0, |b| b.saturating_sub(read).max(1));
                     let (edges, cut) = self.rows.edges(s, q, fam, left)?;
                     if cut {
                         stats.expansion_truncated = true;
@@ -666,7 +666,7 @@ impl<'a> Recall<'a> {
                 }
             }
             if let Some(b) = budget.as_mut() {
-                *b -= read;
+                *b = b.saturating_sub(read);
             }
             // The recall's own filters: what it couldn't return is neither scored nor walked
             // through.
