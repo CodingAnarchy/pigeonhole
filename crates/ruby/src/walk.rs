@@ -13,7 +13,7 @@ use magnus::{Error, IntoValue, RArray, RString, Ruby, TryConvert, Value, prelude
 use pigeonhole::KeySet;
 
 use crate::classes::{Pages, PagesState, Row, RowPosition, Snapshot, Table};
-use crate::convert::{self, Bytes, Name, arg_error, binary, lock};
+use crate::convert::{self, Bytes, Name, arg_error, binary, frozen, lock};
 use crate::error::{OrRb, engine};
 use crate::fork::ForkSafe;
 use crate::read::snapshot_arg;
@@ -25,14 +25,6 @@ pub(crate) fn byte_list(a: RArray) -> Result<Vec<Vec<u8>>, Error> {
     a.into_iter()
         .map(|v| Bytes::try_convert(v).map(|b| b.0))
         .collect()
-}
-
-/// A frozen binary String, for a value inside a frozen `Data` result: mutating it would
-/// change the result's `==` and `hash`.
-fn frozen(ruby: &Ruby, b: &[u8]) -> RString {
-    let s = binary(ruby, b);
-    s.freeze();
-    s
 }
 
 /// Frozen binary Strings for `keys`.

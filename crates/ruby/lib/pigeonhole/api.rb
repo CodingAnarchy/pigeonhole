@@ -121,7 +121,9 @@ module Pigeonhole
   # merge operand, a counter increment or an aggregate input, `:delete_cell`,
   # `:delete_column`, or `:delete_family`, which a row delete is one of per family), its row
   # key and qualifier (empty for `:delete_family`), its timestamp, and the value written or
-  # merged, typed as `Cell#typed` types it (nil for deletes).
+  # merged, typed as `Cell#typed` types it (nil for deletes). Its Strings are frozen, as it
+  # is. A kind this build doesn't know (one a later engine adds) arrives as `:unknown`, so a
+  # `case` on kinds should have an `else`.
   Change = Data.define(:table, :family, :kind, :row, :qualifier, :timestamp, :value)
 
   # A `multi_get_within` page (D308), as `ScanPage` describes; its rows are in key order,
@@ -489,7 +491,9 @@ module Pigeonhole
   # A subscription to some tables' committed changes (`Table#feed`). Each wait releases the
   # GVL in short slices with an interrupt check between them, so `Thread#raise`, `Timeout`
   # and Ctrl-C reach a consumer blocked in `next`. Like `Pages`, it's a cursor: every Enumerable
-  # method consumes the commits it reads.
+  # method consumes the commits it reads. A live feed has no end, so the methods that read to
+  # the end (`to_a`, `map`, `count`, `select`) wait for ever; `first(n)`, `take(n)` and `find`
+  # return. To drain what's there, `feed.each(timeout: 1).to_a`.
   class Feed
     include Enumerable
 

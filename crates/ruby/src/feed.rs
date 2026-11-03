@@ -11,7 +11,7 @@ use magnus::{Error, RArray, RString, Ruby, TryConvert, prelude::*};
 use pigeonhole::{ChangeKind, ErrorCode};
 
 use crate::classes::{Feed, Snapshot, Table};
-use crate::convert::{Bytes, Secs, arg_error, binary, lock};
+use crate::convert::{Bytes, Secs, arg_error, binary, frozen, lock};
 use crate::error::{engine, with_code};
 use crate::fork::ForkSafe;
 use crate::gvl::without_gvl;
@@ -95,21 +95,29 @@ fn kind_name(kind: ChangeKind) -> &'static str {
     }
 }
 
-/// A commit as `[seqno, timestamp, changes]`.
+/// A commit as `[seqno, timestamp, changes]`. Every String and Array inside a change is
+/// frozen, as its `Data` is (ai1249's P1 on #1411): mutating one would change the change's
+/// `==` and `hash`.
 fn commit(ruby: &Ruby, c: &pigeonhole::Commit) -> Result<RArray, Error> {
+    let name = |s: &str| {
+        let s = ruby.str_new(s);
+        s.freeze();
+        s
+    };
     let changes = ruby.ary_new_capa(c.changes().len());
     for ch in c.changes() {
         let a = ruby.ary_new_capa(7);
-        a.push(ch.table())?;
-        a.push(ch.family())?;
+        a.push(name(ch.table()))?;
+        a.push(name(ch.family()))?;
         a.push(ruby.to_symbol(kind_name(ch.kind())))?;
-        a.push(binary(ruby, ch.row()))?;
-        a.push(binary(ruby, ch.qualifier()))?;
+        a.push(frozen(ruby, ch.row()))?;
+        a.push(frozen(ruby, ch.qualifier()))?;
         a.push(ch.timestamp())?;
-        a.push(
-            ch.value()
-                .map_or_else(|| ruby.qnil().as_value(), |v| typed(ruby, v)),
-        )?;
+        let value = ch
+            .value()
+            .map_or_else(|| ruby.qnil().as_value(), |v| typed(ruby, v));
+        value.freeze();
+        a.push(value)?;
         changes.push(a)?;
     }
     let out = ruby.ary_new_capa(3);
@@ -222,7 +230,7 @@ pub(crate) fn options(
         if change_feed.is_some() || feed_age.is_some() {
             return Err(arg_error(
                 ruby,
-                "change_feed_off: or change_feed:, not both",
+                "change_feed_off: can't take change_feed: or feed_age:",
             ));
         }
         o = o.change_feed_off();

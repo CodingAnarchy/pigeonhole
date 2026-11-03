@@ -382,7 +382,8 @@ module Pigeonhole
   end
 
   # A change feed subscription. A cursor, like Pages: every Enumerable method consumes the
-  # commits it reads.
+  # commits it reads. A live feed has no end: `to_a`, `map` and `count` wait for ever, and
+  # `each(timeout: s).to_a` drains what's there.
   class Feed
     include Enumerable[Commit]
 
@@ -412,7 +413,7 @@ module Pigeonhole
     def size: () -> Integer
   end
 
-  # One mutation of a commit.
+  # One mutation of a commit. A kind a later engine adds arrives as :unknown.
   class Change < Data
     type kind = :put | :merge | :delete_cell | :delete_column | :delete_family | :unknown
     type typed = String | Integer | Float | Array[Float] | Array[Integer] | nil

@@ -156,6 +156,14 @@ pub(crate) fn binary(ruby: &Ruby, b: &[u8]) -> RString {
     ruby.str_from_slice(b)
 }
 
+/// A frozen binary String, for a value inside a frozen `Data` result: mutating it would
+/// change the result's `==` and `hash`.
+pub(crate) fn frozen(ruby: &Ruby, b: &[u8]) -> RString {
+    let s = binary(ruby, b);
+    s.freeze();
+    s
+}
+
 /// `v`'s class name, for messages.
 pub(crate) fn class_name(v: Value) -> String {
     v.class().inspect()

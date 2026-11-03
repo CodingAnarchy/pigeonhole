@@ -30,6 +30,8 @@ class TestFeed < Minitest::Test
     assert_equal ["t", "f", :put, "r", "q", "v"], [c.table, c.family, c.kind, c.row, c.qualifier, c.value]
     assert c.timestamp.positive? && put.timestamp.positive?
     assert put.frozen? && put.changes.frozen? && c.frozen?
+    # ai1249's P1 on #1411: the Strings inside are frozen too, so `==` and `hash` hold.
+    assert [c.table, c.family, c.row, c.qualifier, c.value].all?(&:frozen?)
     merge = feed.next(timeout: 5)
     assert_operator merge.seqno, :>, put.seqno
     assert_equal [:merge, 3], [merge.changes[0].kind, merge.changes[0].value]
@@ -128,6 +130,10 @@ class TestFeed < Minitest::Test
     assert_raises(ArgumentError) do
       Pigeonhole.open(File.join(@dir, "both.phdb"), create: true, change_feed: FEED, change_feed_off: true)
     end
+    e = assert_raises(ArgumentError) do
+      Pigeonhole.open(File.join(@dir, "off.phdb"), create: true, change_feed_off: true, feed_age: 5)
+    end
+    assert_match(/change_feed_off: can't take change_feed: or feed_age:/, e.message)
     assert_raises(Pigeonhole::InvalidArgument) { t.feed(resume: "not a token") }
     assert_bad_call(TypeError) { t.feed(tables: ["t"]) }
     feed = t.feed
@@ -188,6 +194,9 @@ class TestFeed < Minitest::Test
       rt.feed(resume: token) do |feed|
         assert_equal "after the token", feed.next(timeout: 5).changes[0].row
       end
+      # ai1249's N2 on #1411: a feed can't mix a writer's tables with a reader process's.
+      assert_raises(Pigeonhole::InvalidArgument) { t.feed(tables: [rt]) }
+      assert_raises(Pigeonhole::InvalidArgument) { rt.feed(tables: [t]) }
     end
   end
 end
