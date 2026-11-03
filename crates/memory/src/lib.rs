@@ -37,7 +37,7 @@ pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use layout::{MemoryId, normalize};
-pub use recall::{Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
+pub use recall::{Expand, Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
 pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
     Source, Store, StoreOptions, StoreStats, StoredMemory,
