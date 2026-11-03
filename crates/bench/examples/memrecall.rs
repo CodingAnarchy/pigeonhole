@@ -15,7 +15,7 @@
 //!   weight 1), which the graph expansion walks. Then every question runs under each
 //!   configuration:
 //!   - `vector`, `keyword` and `recency`: that signal alone (its weight 1, the others' 0);
-//!   - `fused`: the default weights;
+//!   - `fused`: the default weights, and `fused-no-recency`: those but recency's (and use's);
 //!   - `fused+graph`: the default weights with `expand(Expand::hops(1))`;
 //!   - `keyword-fuzzy`: the text index directly, terms of 5 or more characters as
 //!     `Fuzziness::Auto` fuzzy terms, against `keyword-index`, the same search without them.
@@ -290,6 +290,11 @@ impl Tally {
 
 fn weights(only: Option<usize>) -> Weights {
     let mut w = Weights::default();
+    if only == Some(9) {
+        w.recency = 0.0;
+        w.uses = 0.0;
+        return w;
+    }
     if let Some(i) = only {
         let mut v = [0.0; 5];
         v[i] = 1.0;
@@ -330,11 +335,13 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
     for m in &f.mems {
         *ns_size.entry(&m.ns).or_default() += 1;
     }
-    let configs: [(&str, Option<usize>, bool); 5] = [
+    let configs: [(&str, Option<usize>, bool); 6] = [
         ("vector", Some(0), false),
         ("keyword", Some(1), false),
         ("recency", Some(2), false),
         ("fused", None, false),
+        // The default weights but recency's (and use's, which these datasets don't have).
+        ("fused-no-recency", Some(9), false),
         ("fused+graph", None, true),
     ];
     let ranked_of = |ids: Vec<Vec<u8>>| -> Vec<Vec<String>> {
