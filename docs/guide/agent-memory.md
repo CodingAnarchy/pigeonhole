@@ -33,7 +33,7 @@ assert_eq!(again, Remembered::Merged(r.id().clone()));
 - **Every write is one transaction:** the memory, its text index entry, its dedup row and both directions of its links commit together. `remember_in` joins your own transaction.
 - **Exact dedup:** the same text after trimming and collapsing whitespace merges into the live memory that has it. It keeps the larger importance, adds the source and counts a use. There's no case folding.
 - **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
-- **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
+- **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
 
 ## Recall
 ```rust

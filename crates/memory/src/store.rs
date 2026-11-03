@@ -110,8 +110,9 @@ impl StoreOptions {
     /// [`Normalization::Nfc`] by default. [`Normalization::Nfkc`] also folds ligatures and
     /// full-width forms into their plain ones, which suits memories gathered from mixed
     /// sources (PDF and OCR text, East Asian content). Fixed at create: the store reads it
-    /// back from the index ([`Store::normalization`]). The full-text guide's "Which
-    /// normalisation to pick" has the trade-offs (#1291).
+    /// back from the index ([`Store::normalization`]). To change it, create a new store with
+    /// the other setting and remember the old store's memories into it. The full-text
+    /// guide's "Which normalisation to pick" has the trade-offs (#1291).
     pub fn normalization(mut self, n: Normalization) -> Self {
         self.normalization = n;
         self
