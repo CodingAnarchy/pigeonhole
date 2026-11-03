@@ -277,7 +277,7 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
   - `Updated` (anything else on the row).
   - Dedup rows, counter rows and `G` are never events.
 - **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it. `StoredMemory::summary` reads it (cli692 on #1430).
-- **Async:** `next_async` in the writer, once #1408 (D310 PR 5a) is merged. A reader calls the sync `next` on a thread of its own.
+- **Async (after #1408, D310 PR 5a):** `Watch::poll_next(&mut Context) -> Poll<Result<MemoryCommit>>` and `Watch::next_async() -> Result<MemoryCommit>` (its future is `Send`), over `Feed::poll_next`. Commits without memory events are passed over within the call. It's writer only: a reader process gets `Unsupported`, as from `Feed::poll_next`, and calls the sync `next` on a thread of its own.
 
 ## T9, part 2: the feed-driven consolidation loop (#1343)
 - **`Store::consolidate_loop(name, Arc<dyn Consolidator>) -> ConsolidateLoop`:** owned and `Send + 'static`, holding a `Store` clone, so a binding can keep it across calls or move it to a thread (cli692's B2 on #1432).

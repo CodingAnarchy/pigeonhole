@@ -265,3 +265,59 @@ fn bad_namespaces_and_a_database_without_a_feed_are_refused() {
     drop(store);
     db.close().unwrap();
 }
+
+/// #1343's async form (D310 PR 5a): `next_async` in the writer gets the same events, waits
+/// without a thread (a write from another thread wakes it), and passes over commits without
+/// memory events. In a reader process it's `Unsupported`.
+#[test]
+fn next_async_in_the_writer_and_unsupported_in_a_reader() {
+    use pigeonhole::doc_support::block_on;
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let mut w = store.watch(&[]).open().unwrap();
+    // Already there: ready at once.
+    let a = store
+        .remember("n", Memory::new("first"))
+        .unwrap()
+        .id()
+        .clone();
+    let c = block_on(w.next_async()).unwrap();
+    assert_eq!(c.events, vec![MemoryEvent::Remembered(a)]);
+    // Not yet there: the task waits, and a write from another thread wakes it. A commit to
+    // another table comes first and is passed over.
+    let other = db
+        .table("other")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            other.mutate(b"x").put("f", b"q", b"v").commit().unwrap();
+            store
+                .remember("n", Memory::new("second"))
+                .unwrap()
+                .id()
+                .clone()
+        })
+    };
+    let c = block_on(w.next_async()).unwrap();
+    let b = writer.join().unwrap();
+    assert_eq!(c.events, vec![MemoryEvent::Remembered(b)]);
+
+    let reader = Pigeonhole::open_reader(dir.join("mem.phdb"), ReaderOptions::default()).unwrap();
+    let rs = Store::open_reader_without_embeddings(&reader, "notes").unwrap();
+    let mut rw = rs.watch(&[]).open().unwrap();
+    let r = block_on(rw.next_async());
+    assert!(
+        matches!(&r, Err(e) if e.code() == pigeonhole::ErrorCode::Unsupported),
+        "{r:?}"
+    );
+    drop(rw);
+    drop(rs);
+    drop(reader);
+    db.close().unwrap();
+}

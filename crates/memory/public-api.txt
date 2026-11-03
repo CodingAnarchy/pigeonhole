@@ -364,7 +364,9 @@ pub pigeonhole_memory::StoredMemory::uses: u64
 pub struct pigeonhole_memory::Watch
 impl pigeonhole_memory::Watch
 pub fn pigeonhole_memory::Watch::next(&mut self, core::time::Duration) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::MemoryCommit>>
+pub async fn pigeonhole_memory::Watch::next_async(&mut self) -> pigeonhole_memory::Result<pigeonhole_memory::MemoryCommit>
 pub fn pigeonhole_memory::Watch::oldest_retained(&self) -> core::option::Option<u64>
+pub fn pigeonhole_memory::Watch::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole_memory::Result<pigeonhole_memory::MemoryCommit>>
 pub fn pigeonhole_memory::Watch::token(&self) -> pigeonhole_memory::WatchToken
 pub fn pigeonhole_memory::Watch::try_next(&mut self) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::MemoryCommit>>
 pub struct pigeonhole_memory::WatchBuilder

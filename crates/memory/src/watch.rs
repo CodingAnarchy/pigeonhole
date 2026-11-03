@@ -4,6 +4,7 @@
 //! table (`mem_{name}`), and turns each commit's changes to memory rows into
 //! [`MemoryEvent`]s.
 
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{ChangeKind, Commit, Feed, FeedBuilder, FeedToken, Snapshot, Value};
@@ -200,6 +201,33 @@ impl Watch {
         Ok(None)
     }
 
+    /// The next commit with memory events, for an async caller (D310 PR 5a's
+    /// `Feed::poll_next`): `Poll::Ready` with it or with an error, `Poll::Pending` until there
+    /// is one, with `cx`'s waker registered. Commits without memory events are passed over
+    /// within the call. A watch doesn't end on its own.
+    ///
+    /// The writer process only: in a reader process it's `Unsupported`; call
+    /// [`next`](Self::next) on a thread of its own there.
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemoryCommit>> {
+        loop {
+            match self.feed.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Ready(Ok(c)) => {
+                    if let Some(m) = events(c, &self.prefixes) {
+                        return Poll::Ready(Ok(m));
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`poll_next`](Self::poll_next) as a future: the next commit with memory events,
+    /// without blocking a thread. Writer process only. The future is `Send`.
+    pub async fn next_async(&mut self) -> Result<MemoryCommit> {
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
     /// Where the watch is: [`WatchBuilder::resume`] continues after the last commit it
     /// delivered, or passed over.
     pub fn token(&self) -> WatchToken {
@@ -290,3 +318,10 @@ const _: fn() = || {
     send::<WatchToken>();
     send::<MemoryCommit>();
 };
+
+// `next_async`'s future is `Send`, so a multi-threaded executor can move it.
+#[allow(dead_code)]
+fn next_async_is_send(w: &mut Watch) {
+    fn send<T: Send>(_: T) {}
+    send(w.next_async());
+}
