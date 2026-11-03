@@ -1,6 +1,6 @@
 # Ruby
 
-> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111), and nothing has been published to RubyGems yet.
+> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111): the core API, vectors, graphs, byte budgets, the change feed, agent memory, full-text search and the vector index. Nothing has been published to RubyGems yet.
 
 The `pigeonhole` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
