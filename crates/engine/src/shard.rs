@@ -723,6 +723,11 @@ impl Shared {
     pub(crate) fn wake_all_visible(&self) {
         self.waiters.wake_all(|w| self.wake(w));
         self.durable_waiters.wake_all(|w| self.wake(w));
+        // Async change feeds waiting on a feed hold, too: each re-polls and ends (or, in
+        // pigeonhole, follows a recovery).
+        if let Some(feed) = &self.feed {
+            feed.wake_hold_waiters();
+        }
     }
 
     /// Runs a watermark waiter's wake.
@@ -5374,13 +5379,20 @@ impl ShardState {
             .map_or((Lsn::default(), Lsn::default()), |w| {
                 (w.written(), w.durable())
             });
+        let mut released = false;
         if self.feed_low.get() != u64::MAX && written >= self.feed_end.get() {
             self.feed_low.set(u64::MAX);
             self.shared.shm.publish_written(shard, u64::MAX);
+            released = true;
         }
         if durable >= self.feed_sync_end.get() {
+            released |= self.feed_sync_low.get() != u64::MAX;
             self.feed_sync_low.set(u64::MAX);
             self.shared.shm.publish_synced(shard, u64::MAX);
+        }
+        // An async feed waiting on one of these holds (D310 PR 5a): after the publish.
+        if released && let Some(feed) = &self.shared.feed {
+            feed.wake_hold_waiters();
         }
     }
 

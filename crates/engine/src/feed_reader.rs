@@ -272,6 +272,15 @@ pub struct FeedReader {
     current: u64,
 }
 
+impl Drop for FeedReader {
+    fn drop(&mut self) {
+        // An async reader may have left a waker for the feed's holds.
+        if let Some(feed) = &self.writer {
+            feed.forget_hold_waiter(self.key);
+        }
+    }
+}
+
 impl std::fmt::Debug for FeedReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FeedReader")
@@ -516,6 +525,54 @@ impl FeedReader {
                 }
             }
             std::thread::park_timeout(park);
+        }
+    }
+
+    /// The next whole commit, for an async caller (D310 PR 5a): `Poll::Ready` with what
+    /// [`try_next`](Self::try_next) would return once there is a commit or an expiry,
+    /// `Poll::Pending` otherwise, with `cx`'s waker registered so the task is woken (never
+    /// spinning) when the frontier can move: by the watermark the feed follows, or, where
+    /// the feed's own holds keep it back, by the shard as it lets a hold go.
+    ///
+    /// The writer process only: in a reader process nothing in this process learns of the
+    /// writer's progress, so it is `Unsupported` there; use [`wait`](Self::wait) on a thread
+    /// of its own (#1407 tracks an async form).
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Next<'_>>> {
+        use std::task::Poll;
+        let Some(feed) = self.writer.clone() else {
+            return Poll::Ready(Err(Error::Unsupported(
+                "an async change feed in a reader process: call the feed's blocking `next` on a \
+                 thread of its own (#1407)",
+            )));
+        };
+        loop {
+            let polled = match self.poll() {
+                Ok(p) => p,
+                Err(e) => return Poll::Ready(Err(e)),
+            };
+            let Polled::Pending { held } = polled else {
+                return Poll::Ready(Ok(self.lend(polled)));
+            };
+            let target = self.frontier.saturating_add(1);
+            if held {
+                // The feed's own holds keep the frontier below the watermark: the shard wakes
+                // this when it lets one go.
+                feed.wait_for_hold(self.key, cx.waker());
+            } else {
+                let waiters = if self.durable {
+                    &self.shared.durable_waiters
+                } else {
+                    &self.shared.waiters
+                };
+                waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
+            }
+            // A publish or a release that missed the registration is seen here.
+            if self.shm.written_seqno(self.durable) < target {
+                return Poll::Pending;
+            }
         }
     }
 

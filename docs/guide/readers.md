@@ -93,4 +93,4 @@ Every limit is an error, never a hang:
 - **Block cache per process.** Each reader has its own block cache, 256 MiB by default (`ReaderOptions::block_cache`), on top of the writer's.
 
 ## Where next
-[Concepts](concepts.md#multi-process-readers) · [Errors](errors.md) · [Agent reference](agent-reference.md)
+[Concepts](concepts.md#multi-process-readers) · [Change feed](change-feed.md#reader-processes) · [Errors](errors.md) · [Agent reference](agent-reference.md)

@@ -470,3 +470,78 @@ fn nothing_the_durable_frontier_passed_is_lost_to_a_power_loss() {
         db.close().unwrap();
     }
 }
+
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct WakeCount(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn an_async_feed_held_back_by_the_synced_hold_is_woken_when_the_shard_lets_it_go() {
+    // D310 PR 5a: a durable feed's frontier stays below a `Buffered` commit until a sync
+    // covers it (the SYNCED hold), though the durable watermark passed it. `poll_next` leaves
+    // its waker with the hold, and the shard wakes it as the hold goes.
+    use pigeonhole_engine::{FeedSpec, FeedStart, Next};
+    let dir = TempDir::new("async-hold");
+    let vfs = real_vfs();
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(Duration::from_secs(600)));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    let mut feed = db
+        .feed(FeedSpec {
+            tables: vec![t.id],
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+        })
+        .unwrap();
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&count));
+    let held = drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(
+        db.feed_frontier(true) < held.seqno,
+        "held until a sync covers it"
+    );
+    {
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            feed.poll_next(&mut cx).is_pending(),
+            "pending, its waker left with the hold"
+        );
+    }
+    let before = count.0.load(std::sync::atomic::Ordering::SeqCst);
+    // A `GroupSync` commit's sync covers the held record: the hold goes, the task is woken.
+    let synced = drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"b"), Some(Durability::GroupSync))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(db.feed_frontier(true) >= synced.seqno);
+    assert!(
+        count.0.load(std::sync::atomic::Ordering::SeqCst) > before,
+        "the hold's release (or the publish with it) woke the task"
+    );
+    let mut cx = Context::from_waker(&waker);
+    match feed.poll_next(&mut cx) {
+        Poll::Ready(Ok(Next::Commit(c))) => assert_eq!(c.seqno, held.seqno),
+        other => panic!("{:?}", other.map(|r| r.map(|n| format!("{n:?}")))),
+    }
+    drop(feed);
+    close_real(&db, &mut shard);
+}

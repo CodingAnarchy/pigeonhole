@@ -28,6 +28,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 19. [Full-text search](text-search.md): `pigeonhole-text`'s BM25 index over a source column: writing through the index in your transaction, the query syntax, phrases and slop, normalisation and options, namespaces with `id_prefix`, reader processes, and search latency on the AX102.
 20. [Agent memory](agent-memory.md): `pigeonhole-memory`'s long-term memory for agents: namespaces, a pinned embedding model, writes in transactions with exact dedup, links and supersede, and hybrid recall (vector, keyword, recency) fused by RRF within a byte budget, in reader processes too.
 21. [Ruby](ruby.md): the `pigeonhole` gem (`require "pigeonhole"`): values and types, reads and scans, batches and transactions, readers, threads and forking servers, and errors.
+22. [Change feed](change-feed.md): the committed changes of some tables as whole commits in order: turning it on and keeping its history across opens, subscribing, where a feed starts, tokens, durable or visible delivery, expiry, async streams, reader processes, Python and `phdb mcp`, and what it costs.
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers) has the overview.
 
