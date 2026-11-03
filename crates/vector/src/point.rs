@@ -151,8 +151,8 @@ fn halves(payload: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// `p`'s distance to the centroid `c`, under the centroid family's spec (`f32` for `f32`
-/// and `i8` indexes, bits for bit indexes; the index's metric).
+/// `p`'s distance to the centroid `c`, under the centroid family's spec (`f32` for `f32`,
+/// `f16`, `bf16` and `i8` indexes, bits for bit indexes; the index's metric).
 pub(crate) fn distance(cen: &VectorSpec, p: &Point, c: &Vector) -> Result<f64> {
     Ok(match p {
         Point::F32(q) => cen.distance_f32(q, c.as_ref())?,

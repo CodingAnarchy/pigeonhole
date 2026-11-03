@@ -35,7 +35,8 @@ pub(crate) fn bf16_to_f32(b: u16) -> f32 {
 pub(crate) fn widen_into(element: Element, bits: &[u16], out: &mut Vec<f32>) {
     match element {
         Element::BF16 => out.extend(bits.iter().map(|b| bf16_to_f32(*b))),
-        _ => out.extend(bits.iter().map(|h| f16_to_f32(*h))),
+        Element::F16 => out.extend(bits.iter().map(|h| f16_to_f32(*h))),
+        other => unreachable!("half::widen_into for a {other:?} vector"),
     }
 }
 
