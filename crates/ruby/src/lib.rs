@@ -24,6 +24,7 @@ mod error;
 mod feed;
 mod fork;
 mod gvl;
+mod index;
 mod memory;
 mod read;
 mod table;
@@ -265,6 +266,85 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("next_chunk", method!(ScanCursor::next_chunk, 0))?;
     c.define_method("close", method!(ScanCursor::close, 0))?;
     memory_classes(ruby, m)?;
+    index_classes(ruby, m)?;
+    Ok(())
+}
+
+/// `Pigeonhole::Text` and `Pigeonhole::Vector`'s native classes (PR 3b);
+/// `lib/pigeonhole/index.rb` adds the rest.
+fn index_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
+    use classes::{
+        Placed, Rebalancer, TextIndex, TextQuery, TextReadIndex, VectorBulkLoad, VectorIndex,
+        VectorReadIndex,
+    };
+    let t = m.define_module("Text")?;
+
+    let c = class(ruby, t, "Query")?;
+    c.define_singleton_method("new", function!(TextQuery::new, 0))?;
+    c.define_singleton_method("parse", function!(TextQuery::parse, 1))?;
+    c.define_method("term", method!(TextQuery::term, 1))?;
+    c.define_method("text", method!(TextQuery::text, 1))?;
+    c.define_private_method("native_phrase", method!(TextQuery::phrase, 2))?;
+    c.define_private_method("native_fuzzy", method!(TextQuery::fuzzy, 2))?;
+    c.define_method("==", method!(TextQuery::eq, 1))?;
+    c.define_method("inspect", method!(TextQuery::inspect, 0))?;
+
+    let c = class(ruby, t, "Index")?;
+    let s = c.singleton_class()?;
+    s.define_private_method("native_create", function!(TextIndex::create, 6))?;
+    s.define_private_method("native_open", function!(TextIndex::open, 2))?;
+    s.define_private_method("native_open_reader", function!(TextIndex::open_reader, 2))?;
+    c.define_method("put", method!(TextIndex::put, 2))?;
+    c.define_method("put_in", method!(TextIndex::put_in, 3))?;
+    c.define_method("delete", method!(TextIndex::delete, 1))?;
+    c.define_method("delete_in", method!(TextIndex::delete_in, 2))?;
+    c.define_private_method("native_rebuild", method!(TextIndex::rebuild, 0))?;
+    c.define_private_method("native_repair", method!(TextIndex::repair, 0))?;
+    c.define_private_method("native_verify", method!(TextIndex::verify, 0))?;
+    c.define_private_method("native_options", method!(TextIndex::options, 0))?;
+    c.define_private_method("native_source", method!(TextIndex::source, 0))?;
+    c.define_private_method("native_search", method!(TextIndex::search, 3))?;
+
+    let c = class(ruby, t, "ReadIndex")?;
+    c.define_private_method("native_verify", method!(TextReadIndex::verify, 0))?;
+    c.define_private_method("native_options", method!(TextReadIndex::options, 0))?;
+    c.define_private_method("native_source", method!(TextReadIndex::source, 0))?;
+    c.define_private_method("native_search", method!(TextReadIndex::search, 3))?;
+
+    let v = m.define_module("Vector")?;
+    let c = class(ruby, v, "Index")?;
+    let s = c.singleton_class()?;
+    s.define_private_method("native_create", function!(VectorIndex::create, 5))?;
+    s.define_private_method("native_open", function!(VectorIndex::open, 3))?;
+    s.define_private_method("native_open_reader", function!(VectorIndex::open_reader, 2))?;
+    c.define_method("spec", method!(VectorIndex::spec, 0))?;
+    c.define_method("rebalance", method!(VectorIndex::rebalance, 0))?;
+    c.define_method("max_list_len", method!(VectorIndex::max_list_len, 0))?;
+    c.define_method("min_list_len", method!(VectorIndex::min_list_len, 0))?;
+    c.define_method("insert", method!(VectorIndex::insert, 2))?;
+    c.define_method("delete", method!(VectorIndex::delete, 1))?;
+    c.define_method("insert_in", method!(VectorIndex::insert_in, 4))?;
+    c.define_method("delete_in", method!(VectorIndex::delete_in, 3))?;
+    c.define_method("after_commit", method!(VectorIndex::after_commit, 1))?;
+    c.define_private_method("native_verify", method!(VectorIndex::verify, 0))?;
+    c.define_private_method("native_search", method!(VectorIndex::search, 3))?;
+    c.define_private_method("native_bulk_load", method!(VectorIndex::bulk_load, 1))?;
+
+    let c = class(ruby, v, "ReadIndex")?;
+    c.define_method("spec", method!(VectorReadIndex::spec, 0))?;
+    c.define_private_method("native_search", method!(VectorReadIndex::search, 3))?;
+
+    let c = class(ruby, v, "Placed")?;
+    c.define_singleton_method("new", function!(Placed::new, 0))?;
+
+    let c = class(ruby, v, "Rebalancer")?;
+    c.define_method("run_once", method!(Rebalancer::run_once, 1))?;
+    c.define_method("wait", method!(Rebalancer::wait, 1))?;
+    c.define_method("closed?", method!(Rebalancer::is_closed, 0))?;
+
+    let c = class(ruby, v, "BulkLoad")?;
+    c.define_method("push", method!(VectorBulkLoad::push, 1))?;
+    c.define_private_method("native_finish", method!(VectorBulkLoad::finish, 0))?;
     Ok(())
 }
 

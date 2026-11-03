@@ -471,6 +471,8 @@ dependencies = [
  "magnus",
  "pigeonhole",
  "pigeonhole-memory",
+ "pigeonhole-text",
+ "pigeonhole-vector",
  "rb-sys",
 ]
 
@@ -506,6 +508,14 @@ dependencies = [
  "pigeonhole",
  "unicode-normalization",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "pigeonhole-vector"
+version = "1.0.0"
+dependencies = [
+ "futures-core",
+ "pigeonhole",
 ]
 
 [[package]]
