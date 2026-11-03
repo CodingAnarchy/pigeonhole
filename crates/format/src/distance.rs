@@ -140,9 +140,10 @@ fn le16(bytes: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])
 }
 
-/// The half-precision kernels (#1263): the `f32` kernels with each stored lane widened to
-/// `f32` (`$widen`) where they read an `f32`, the same 16 lanes, pairwise tree and tail order.
-/// So each equals its `f32` kernel over the widened vector, bit for bit.
+/// The `bf16` kernels (#1263): the `f32` kernels with each stored lane widened to `f32`
+/// (`$widen`, a shift) where they read an `f32`, the same 16 lanes, pairwise tree and tail
+/// order. So each equals its `f32` kernel over the widened vector, bit for bit. The `f16`
+/// kernels below widen a chunk at a time instead (#1306).
 macro_rules! half_kernels {
     ($elem:literal, $widen:path, $l2:ident, $dot_norm:ident, $norm2:ident) => {
         #[doc = concat!("[`l2_f32_le`] over a vector of little-endian `", $elem, "` bits.")]
@@ -207,13 +208,103 @@ macro_rules! half_kernels {
     };
 }
 
-half_kernels!(
-    "f16",
-    crate::half::f16_to_f32,
-    l2_f16_le,
-    dot_norm_f16_le,
-    norm2_f16_le
-);
+/// Halves widened per call of [`f16_wide`]: a multiple of [`LANES`], so a chunk holds whole
+/// lane groups and the kernels' order is the `f32` kernels' order.
+const F16_CHUNK: usize = 16 * LANES;
+
+/// Widens the little-endian `f16` bits of `v` to `f32`, [`F16_CHUNK`] halves at a time, and
+/// hands each widened chunk to `each` in order (#1306). `half`'s `convert_to_f32_slice` uses
+/// F16C (x86-64) or the FP16 extension (aarch64) when the CPU has it, detected at run time, and
+/// an exact software widen otherwise. Every path gives the bits of
+/// [`f16_to_f32`](crate::half::f16_to_f32) for every non-NaN half, and a stored half vector is
+/// always finite (D303), so the kernels below equal the `f32` kernels over the widened vector,
+/// bit for bit. One call per chunk, not per lane, keeps the detection off the inner loop.
+#[inline(always)]
+fn f16_wide(v: &[u8], mut each: impl FnMut(&[f32])) {
+    use ::half::slice::HalfFloatSliceExt;
+    let mut bits = [::half::f16::ZERO; F16_CHUNK];
+    let mut wide = [0f32; F16_CHUNK];
+    for c in v.chunks(2 * F16_CHUNK) {
+        let (pairs, _) = c.as_chunks::<2>();
+        let n = pairs.len();
+        for (b, p) in bits[..n].iter_mut().zip(pairs) {
+            *b = ::half::f16::from_bits(u16::from_le_bytes(*p));
+        }
+        bits[..n].convert_to_f32_slice(&mut wide[..n]);
+        each(&wide[..n]);
+    }
+}
+
+/// [`l2_f32_le`] over a vector of little-endian `f16` bits.
+pub fn l2_f16_le(q: &[f32], v: &[u8]) -> f32 {
+    debug_assert_eq!(v.len(), 2 * q.len());
+    let (gq, tq) = q.as_chunks::<LANES>();
+    let (vg, vt) = v.split_at(2 * LANES * gq.len());
+    let mut acc = [0f32; LANES];
+    let mut groups = gq.iter();
+    f16_wide(vg, |w| {
+        for (cw, cq) in w.as_chunks::<LANES>().0.iter().zip(groups.by_ref()) {
+            for i in 0..LANES {
+                let d = cq[i] - cw[i];
+                acc[i] += d * d;
+            }
+        }
+    });
+    let mut sum = tree(acc);
+    f16_wide(vt, |w| {
+        for (x, y) in tq.iter().zip(w) {
+            let d = x - y;
+            sum += d * d;
+        }
+    });
+    sum
+}
+
+/// [`dot_norm_f32_le`] over a vector of little-endian `f16` bits.
+pub fn dot_norm_f16_le(q: &[f32], v: &[u8]) -> (f32, f32) {
+    debug_assert_eq!(v.len(), 2 * q.len());
+    let (gq, tq) = q.as_chunks::<LANES>();
+    let (vg, vt) = v.split_at(2 * LANES * gq.len());
+    let (mut dot, mut norm) = ([0f32; LANES], [0f32; LANES]);
+    let mut groups = gq.iter();
+    f16_wide(vg, |w| {
+        for (cw, cq) in w.as_chunks::<LANES>().0.iter().zip(groups.by_ref()) {
+            for i in 0..LANES {
+                let x = cw[i];
+                dot[i] += cq[i] * x;
+                norm[i] += x * x;
+            }
+        }
+    });
+    let (mut d, mut n) = (tree(dot), tree(norm));
+    f16_wide(vt, |w| {
+        for (y, x) in tq.iter().zip(w) {
+            d += y * x;
+            n += x * x;
+        }
+    });
+    (d, n)
+}
+
+/// [`norm2_f32`] of a vector of little-endian `f16` bits, widened.
+pub fn norm2_f16_le(v: &[u8]) -> f32 {
+    let (vg, vt) = v.split_at(v.len() / (2 * LANES) * (2 * LANES));
+    let mut acc = [0f32; LANES];
+    f16_wide(vg, |w| {
+        for c in w.as_chunks::<LANES>().0 {
+            for (i, a) in acc.iter_mut().enumerate() {
+                *a += c[i] * c[i];
+            }
+        }
+    });
+    let mut sum = tree(acc);
+    f16_wide(vt, |w| {
+        for x in w {
+            sum += x * x;
+        }
+    });
+    sum
+}
 half_kernels!(
     "bf16",
     crate::half::bf16_to_f32,
@@ -366,6 +457,42 @@ mod tests {
             cosine_from(0.0, 0.0, 1.0).is_nan(),
             "a zero norm is NaN, for the caller"
         );
+    }
+
+    /// #1306: the chunked widen the `f16` kernels use (`half`'s slice conversion, with F16C or
+    /// FP16 where this machine has it) gives `f16_to_f32`'s bits for every one of the 65,536
+    /// halves. NaNs are compared as NaN: hardware may quiet a signalling one, and a stored half
+    /// is never NaN (D303). Fed through `f16_wide`, so chunking and order are covered too.
+    #[test]
+    fn the_f16_widen_equals_the_scalar_widen_for_every_half() {
+        let all: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let mut got = Vec::with_capacity(1 << 16);
+        f16_wide(&all, |w| got.extend_from_slice(w));
+        assert_eq!(got.len(), 1 << 16);
+        for (h, g) in (0..=u16::MAX).zip(got) {
+            let want = crate::half::f16_to_f32(h);
+            if want.is_nan() {
+                assert!(g.is_nan(), "{h:#06x}: {g}");
+            } else {
+                assert_eq!(g.to_bits(), want.to_bits(), "{h:#06x}");
+            }
+        }
+    }
+
+    /// #1306: the software widen a machine without F16C or FP16 takes (`half`'s
+    /// `to_f32_const`, the path its slice conversion falls back to) gives the same bits for
+    /// every non-NaN half.
+    #[test]
+    fn the_software_f16_widen_equals_the_scalar_widen() {
+        for h in 0..=u16::MAX {
+            let want = crate::half::f16_to_f32(h);
+            let got = ::half::f16::from_bits(h).to_f32_const();
+            if want.is_nan() {
+                assert!(got.is_nan(), "{h:#06x}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{h:#06x}");
+            }
+        }
     }
 
     /// #1263: each half kernel equals its `f32` kernel over the widened vector, bit for bit,
