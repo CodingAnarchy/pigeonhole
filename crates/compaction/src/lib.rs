@@ -46,7 +46,9 @@ pub use merge::{
     MergeError, MergeOperator, MergeRegistry, SetOps,
 };
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
-pub use resolver::{COUNTER_FOLD_MIN, CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};
+pub use resolver::{
+    COUNTER_FOLD_MIN, CellResolver, NoPin, PinValue, ResolveOptions, ResolvedCell, ValuePredicate,
+};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

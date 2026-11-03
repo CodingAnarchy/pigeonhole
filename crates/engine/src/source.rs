@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use pigeonhole_cache::{Cell, Priority};
-use pigeonhole_compaction::{CellResolver, FilteredCursor, MergingCursor};
+use pigeonhole_compaction::{CellResolver, FilteredCursor, MergingCursor, PinValue};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::filter::{column_hash, row_hash};
 use pigeonhole_format::key::{
@@ -201,6 +201,30 @@ impl Source {
 pub(crate) type Merged = MergingCursor<Source>;
 /// The MVCC resolver over them.
 pub(crate) type Resolver = CellResolver<Merged>;
+/// The resolver of a scan's or a reduction's lane: a plain value it returns stays pinned in
+/// its memtable or block rather than copied (#1283 lever 2). Lanes give their resolver back
+/// (reset, so no pin outlives the read); a point get's resolver, kept by its thread between
+/// gets, copies instead, so it pins nothing while idle.
+pub(crate) type LaneResolver = CellResolver<Merged, SourcePin>;
+
+/// Pins a merged cursor's current value through [`Source::pin_value`] (#1283 lever 2).
+#[derive(Debug)]
+pub(crate) enum SourcePin {}
+
+impl PinValue<Merged> for SourcePin {
+    type Pin = Pinned;
+    const PINS: bool = true;
+    /// A 64-dimension `f32` vector and up: below this a memcpy costs about what a pin's
+    /// reference count does.
+    const MIN: usize = 256;
+    #[inline]
+    fn pin(cursor: &Merged) -> Pinned {
+        cursor
+            .current()
+            .expect("pinned only on a valid cursor")
+            .pin_value()
+    }
+}
 
 /// Memtable sources of `set`, newest first.
 pub(crate) fn mem_sources(set: &MemSet, filter: &ScanFilter, out: &mut Vec<Source>) {

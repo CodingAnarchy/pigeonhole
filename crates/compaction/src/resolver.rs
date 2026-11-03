@@ -196,6 +196,8 @@ enum Out {
     Source(Timestamp),
     /// `out_key` / `out_val`.
     Buffer(Timestamp),
+    /// `out_key` / `out_pin`.
+    Pinned(Timestamp),
 }
 
 /// The newest put of the group being examined.
@@ -206,6 +208,37 @@ enum Base {
     Copied,
     /// Too large to copy: re-found by seeking to `base_key`.
     Large,
+    /// Pinned where it lies (`base_pin`), not copied: a plain put the group returns as it
+    /// is (#1283 lever 2).
+    Pinned,
+}
+
+/// How a [`CellResolver`] holds a put's value past the cursor's next step without copying
+/// it (#1283 lever 2): a pin of the cursor's current value in its storage. A resolver pins
+/// only a group's plain base (a put no operand folds onto) of [`PinValue::MIN`] to 4 KiB;
+/// every other value is copied as before. [`NoPin`], the default, never pins.
+pub trait PinValue<C> {
+    /// The pinned value.
+    type Pin: std::ops::Deref<Target = [u8]> + std::fmt::Debug;
+    /// Whether this pins at all (a resolver that doesn't compiles no pin path).
+    const PINS: bool;
+    /// The least value it pins: below it a copy costs less than a pin's reference count.
+    const MIN: usize;
+    /// Pins `cursor`'s current value. Called only when `PINS` and the cursor is valid.
+    fn pin(cursor: &C) -> Self::Pin;
+}
+
+/// The [`PinValue`] that never pins: every buffered value is copied.
+#[derive(Debug)]
+pub enum NoPin {}
+
+impl<C> PinValue<C> for NoPin {
+    type Pin = Vec<u8>;
+    const PINS: bool = false;
+    const MIN: usize = usize::MAX;
+    fn pin(_: &C) -> Vec<u8> {
+        unreachable!("NoPin never pins")
+    }
 }
 
 /// Applies MVCC visibility to an ordered cursor: snapshot seqno, cell/column/family deletes,
@@ -221,8 +254,10 @@ enum Base {
 ///
 /// Because a delete can follow the put it hides inside one `(column, timestamp)` group (it
 /// was committed earlier), the resolver reads a whole group before returning its version.
-/// Values up to 4 KiB are copied meanwhile (`from_source == false`); a larger value is
-/// re-found with one seek and returned borrowed from the source (`from_source == true`).
+/// Values up to 4 KiB are copied meanwhile (`from_source == false`), or, with a pinning `P`
+/// ([`PinValue`]), a plain put of `P::MIN` and up is pinned where it lies instead; a larger
+/// value is re-found with one seek and returned borrowed from the source
+/// (`from_source == true`).
 ///
 /// ```
 /// use pigeonhole_compaction::{CellResolver, ResolveOptions, VecCursor};
@@ -253,7 +288,7 @@ enum Base {
 /// assert_eq!(r.next_cell().unwrap().unwrap().value, b"\x00old");
 /// ```
 #[derive(Debug)]
-pub struct CellResolver<C> {
+pub struct CellResolver<C, P: PinValue<C> = NoPin> {
     cursor: C,
     opts: ResolveOptions,
 
@@ -320,6 +355,9 @@ pub struct CellResolver<C> {
     out_key: Vec<u8>,
     out_val: Vec<u8>,
     past_col: Vec<u8>,
+    /// The group's base, pinned (`Base::Pinned`), and the returned cell's (`Out::Pinned`).
+    base_pin: Option<P::Pin>,
+    out_pin: Option<P::Pin>,
 
     /// The last counter group read: how many entries it stepped over, and the seqno of its
     /// newest entry at or below the read point (D291's checkpoint seqno).
@@ -390,6 +428,16 @@ where
 {
     /// A resolver over `cursor`.
     pub fn new(cursor: C, options: ResolveOptions) -> Self {
+        Self::new_pinning(cursor, options)
+    }
+}
+
+impl<C: Cursor, P: PinValue<C>> CellResolver<C, P>
+where
+    C::Error: From<MergeError>,
+{
+    /// A resolver over `cursor` that holds plain values with `P` (see [`PinValue`]).
+    pub fn new_pinning(cursor: C, options: ResolveOptions) -> Self {
         let r = Self {
             cursor,
             opts: options,
@@ -424,6 +472,8 @@ where
             out_key: Vec::new(),
             out_val: Vec::new(),
             past_col: Vec::new(),
+            base_pin: None,
+            out_pin: None,
             fold: None,
             fold_bytes: 0,
         };
@@ -629,6 +679,12 @@ where
                 value: &self.out_val,
                 from_source: false,
             },
+            Out::Pinned(ts) => ResolvedCell {
+                key: &self.out_key,
+                ts,
+                value: self.out_pin.as_deref().unwrap_or(&[]),
+                from_source: false,
+            },
         })
     }
 
@@ -728,6 +784,8 @@ where
             out_key,
             out_val,
             past_col,
+            base_pin,
+            out_pin,
             // Set by every counter group before it can be read, so never stale for the read
             // that asks (and a reset per point get measured 4 instructions, D193).
             fold: _,
@@ -765,6 +823,8 @@ where
         out_key.clear();
         out_val.clear();
         past_col.clear();
+        *base_pin = None;
+        *out_pin = None;
     }
 
     /// Whether every field but the cursor and options holds its value in
@@ -806,6 +866,8 @@ where
             out_key,
             out_val,
             past_col,
+            base_pin,
+            out_pin,
             fold: _,
             fold_bytes: _,
         } = self;
@@ -816,6 +878,8 @@ where
         .iter()
         .all(|b| b.is_empty())
             && markers.is_empty()
+            && base_pin.is_none()
+            && out_pin.is_none()
             && family_cover.is_none()
             && *columns_in_row == 0
             && col_cover.is_none()
@@ -1097,7 +1161,15 @@ where
                         let value = self.cursor.value();
                         self.base_key.clear();
                         self.base_key.extend_from_slice(self.cursor.key());
-                        if value.len() <= COPY_LIMIT || ops || fold_ready {
+                        if P::PINS
+                            && !ops
+                            && !fold_ready
+                            && (P::MIN..=COPY_LIMIT).contains(&value.len())
+                        {
+                            // Returned as it is: held where it lies, not copied.
+                            self.base_pin = Some(P::pin(&self.cursor));
+                            base = Base::Pinned;
+                        } else if value.len() <= COPY_LIMIT || ops || fold_ready {
                             self.base_val.clear();
                             self.base_val.extend_from_slice(value);
                             base = Base::Copied;
@@ -1186,6 +1258,16 @@ where
         }
 
         match (base, ops) {
+            (Base::Pinned, false) => {
+                std::mem::swap(&mut self.out_key, &mut self.base_key);
+                self.out_pin = self.base_pin.take();
+                if !self.opts.in_time_range(ts) {
+                    return Ok(None);
+                }
+                let first_ok = self.col_versions != 0
+                    || self.predicate_ok(self.out_pin.as_deref().unwrap_or(&[]));
+                Ok(self.count_version(first_ok).then_some(Out::Pinned(ts)))
+            }
             (Base::Copied, false) => {
                 std::mem::swap(&mut self.out_key, &mut self.base_key);
                 std::mem::swap(&mut self.out_val, &mut self.base_val);
@@ -1247,7 +1329,7 @@ where
             && !self.opts.counter
             && !run
             && !hidden
-            && base == Base::Copied
+            && matches!(base, Base::Copied | Base::Pinned)
             && self.opts.versions != 0
             && self.col_versions + 1 >= self.opts.versions
             && self.opts.in_time_range(ts)

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
 use pigeonhole_compaction::{
-    BlobFetch, CellResolver, Error, I64Add, MergeError, MergingCursor, NewBlobFile, ResolveOptions,
-    ValuePredicate, VecCursor, blob_pointer,
+    BlobFetch, CellResolver, Error, I64Add, MergeError, MergingCursor, NewBlobFile, PinValue,
+    ResolveOptions, ValuePredicate, VecCursor, blob_pointer,
 };
 use pigeonhole_format::key::{Kind, TERMINATOR, encode_key, encode_marker_key, escape_into};
 use pigeonhole_format::manifest::{FamilyKind, FamilyOptions, SstMeta};
@@ -410,7 +410,7 @@ fn row_of(key: &[u8]) -> Vec<u8> {
 }
 
 /// Drains a resolver into cells, stopping at the first error.
-fn drain<C: Cursor<Error = Error>>(r: &mut CellResolver<C>) -> Cells {
+fn drain<C: Cursor<Error = Error>, P: PinValue<C>>(r: &mut CellResolver<C, P>) -> Cells {
     let mut out = Vec::new();
     loop {
         match r.next_cell() {
@@ -475,10 +475,11 @@ pub fn model_reads(h: &History, snapshot: Seqno, now: Timestamp) -> Reads {
 }
 
 /// The same reads through resolvers built by `make`.
-pub fn resolver_reads<C, F>(h: &History, snapshot: Seqno, now: Timestamp, mut make: F) -> Reads
+pub fn resolver_reads<C, P, F>(h: &History, snapshot: Seqno, now: Timestamp, mut make: F) -> Reads
 where
     C: Cursor<Error = Error>,
-    F: FnMut(ResolveOptions) -> CellResolver<C>,
+    P: PinValue<C>,
+    F: FnMut(ResolveOptions) -> CellResolver<C, P>,
 {
     let mut gets = Vec::new();
     let mut rows = Vec::new();
@@ -790,9 +791,10 @@ fn columns(row: &[FullCell]) -> Vec<Vec<FullCell>> {
 
 /// Scans the whole family through a fresh resolver, calling `after_cell` after each cell
 /// (true: skip the rest of the row). `Err(())` on a merge failure.
-fn scan_with<C, F>(r: &mut CellResolver<C>, mut after_cell: F) -> Result<Vec<FullCell>, ()>
+fn scan_with<C, P, F>(r: &mut CellResolver<C, P>, mut after_cell: F) -> Result<Vec<FullCell>, ()>
 where
     C: Cursor<Error = Error>,
+    P: PinValue<C>,
     F: FnMut() -> bool,
 {
     r.seek(b"").unwrap();
@@ -815,10 +817,16 @@ where
 /// resolved-version time ranges (D22 amendment). Cases where the model's read fails are
 /// checked only for multi-version scans (a limit or filter may legitimately avoid the
 /// failing version).
-pub fn check_extras<C, F>(h: &History, snapshot: Seqno, now: Timestamp, rng: &mut Rng, mut make: F)
-where
+pub fn check_extras<C, P, F>(
+    h: &History,
+    snapshot: Seqno,
+    now: Timestamp,
+    rng: &mut Rng,
+    mut make: F,
+) where
     C: Cursor<Error = Error>,
-    F: FnMut(ResolveOptions) -> CellResolver<C>,
+    P: PinValue<C>,
+    F: FnMut(ResolveOptions) -> CellResolver<C, P>,
 {
     let what = format!("snapshot {snapshot} now {now}");
     for versions in [0u32, 2] {

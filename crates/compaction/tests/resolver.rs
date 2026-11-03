@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use common::*;
 use pigeonhole_compaction::{
-    CellResolver, Error, FilteredCursor, I64Add, MergeOperator, MergingCursor, ResolveOptions,
-    ValuePredicate, VecCursor,
+    CellResolver, Error, FilteredCursor, I64Add, MergeOperator, MergingCursor, PinValue,
+    ResolveOptions, ValuePredicate, VecCursor,
 };
 use pigeonhole_format::key::{Kind, encode_column_prefix, encode_key, encode_marker_key};
 use pigeonhole_format::scan::ScanFilter;
@@ -62,6 +62,37 @@ fn check_history_of(seed: u64, h: History) {
             let mut r = Rng::new(parts_seed);
             CellResolver::new(MergingCursor::new(vec_sources(&h.entries, n, &mut r)), o)
         });
+        // A pinning resolver that pins every plain base (#1283 lever 2) reads the same.
+        let actual = resolver_reads(&h, snapshot, now, |o| {
+            let mut r = Rng::new(parts_seed);
+            CellResolver::<_, PinAll>::new_pinning(
+                MergingCursor::new(vec_sources(&h.entries, n, &mut r)),
+                o,
+            )
+        });
+        assert_same(&format!("pinned, seed {seed}"), &expected, &actual);
+        check_extras(&h, snapshot, now, &mut rng, |o| {
+            let mut r = Rng::new(parts_seed);
+            CellResolver::<_, PinAll>::new_pinning(
+                MergingCursor::new(vec_sources(&h.entries, n, &mut r)),
+                o,
+            )
+        });
+    }
+}
+
+/// A [`PinValue`] that pins every plain base, whatever its length, by taking a copy of the
+/// value where the cursor stands (a `VecCursor` has no storage to pin in): the pinning
+/// resolver's control flow on every group the model test makes.
+#[derive(Debug)]
+enum PinAll {}
+
+impl<C: Cursor> PinValue<C> for PinAll {
+    type Pin = Vec<u8>;
+    const PINS: bool = true;
+    const MIN: usize = 0;
+    fn pin(cursor: &C) -> Vec<u8> {
+        cursor.value().to_vec()
     }
 }
 

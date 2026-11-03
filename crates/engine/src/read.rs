@@ -20,7 +20,7 @@ use pigeonhole_sst::QualifierFilter;
 
 use crate::catalog::{FamilyMeta, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
-use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
+use crate::source::{ColumnKey, LaneResolver, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
 
 pub(crate) mod keys;
@@ -567,7 +567,7 @@ struct Lane {
     /// The family's merge operator name when the build does not know it (to name it in the
     /// error a merge then fails with), `None` otherwise: no copy of the family's metadata.
     unknown_merge: Option<String>,
-    resolver: Resolver,
+    resolver: LaneResolver,
     /// A value the resolver buffered was too large to keep its buffers for the next scan.
     grew: bool,
     /// The view's SSTs and blob files, to read separated values.
@@ -1332,7 +1332,7 @@ thread_local! {
     /// point gets keep theirs: a scan takes one per lane and gives it back when the lane ends
     /// (its tablet or the scan does, or the cursor is dropped). Each comes back with no source
     /// and default options, so the pool pins no memtable, SST or blob reader.
-    static SCAN_RESOLVERS: RefCell<Vec<Resolver>> = const { RefCell::new(Vec::new()) };
+    static SCAN_RESOLVERS: RefCell<Vec<LaneResolver>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Resolvers a thread keeps for its scans (one per family a scan reads, for a few families).
@@ -1340,7 +1340,7 @@ const SCAN_RESOLVERS_KEPT: usize = 4;
 
 /// A resolver for a scan lane: one of the thread's, or a new one. The pool is sized here,
 /// when a scan starts, so giving a resolver back (at its end) never allocates.
-fn take_scan_resolver() -> Resolver {
+fn take_scan_resolver() -> LaneResolver {
     SCAN_RESOLVERS
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -1349,13 +1349,15 @@ fn take_scan_resolver() -> Resolver {
         })
         .ok()
         .flatten()
-        .unwrap_or_else(point_resolver)
+        .unwrap_or_else(|| {
+            LaneResolver::new_pinning(MergingCursor::new(Vec::new()), ResolveOptions::new(0, 0))
+        })
 }
 
 /// Returns a lane's resolver to the thread's pool: its sources (each pins its memtable or
 /// SST) and options (merge operator, blob reader) go now, its allocations stay. Past
 /// [`SCAN_RESOLVERS_KEPT`] it is dropped.
-fn give_back(mut resolver: Resolver) {
+fn give_back(mut resolver: LaneResolver) {
     let cursor = resolver.cursor_mut();
     cursor.sources_mut().clear();
     cursor.reset();
