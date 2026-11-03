@@ -778,7 +778,10 @@ impl Index {
     /// As with [`open`](Self::open), an index already open in this process shares its state:
     /// the handle is a clone of the open one, and the rebalancer takes from the same queue as
     /// any other (each list is split or merged by one of them at a time). They share one
-    /// [`set_wakeup`](Rebalancer::set_wakeup): the last one set is called.
+    /// [`set_wakeup`](Rebalancer::set_wakeup): the last one set is called. A later
+    /// [`open`](Self::open) of the index in background mode starts the crate's thread too,
+    /// which takes from the same queue: in an application-owned database, open with this
+    /// function only.
     pub fn open_with_rebalancer(db: &Pigeonhole, name: &str) -> Result<(Index, Rebalancer)> {
         let index = Self::registered(db, name)?;
         let rebalancer = Rebalancer::new(&index, Arc::clone(&index.inner.signal));

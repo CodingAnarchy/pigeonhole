@@ -41,6 +41,13 @@ static OPEN: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 /// stale-entry read. Nothing called under it takes it again: `open` doesn't, and no
 /// `Inner` can drop under it, since an entry is used only while an application handle holds
 /// its `Inner`.
+///
+/// **Reads only under this lock (simp724's R1 on #1392):** nothing called under it may
+/// submit work to a shard and wait for it: no commit, transaction, reduce or traverse. In an
+/// application-owned database that wait needs the application's driver thread, which may
+/// itself be blocked here opening another index. Today `open` and the stale-entry read only
+/// get and scan. If an open ever has to write, open outside the lock, take it again, and use a
+/// live entry that appeared meanwhile instead of yours (no thread has started for yours yet).
 pub(crate) fn open(
     db: &Pigeonhole,
     name: &str,
