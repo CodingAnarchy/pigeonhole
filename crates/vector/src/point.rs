@@ -78,6 +78,44 @@ impl Input<'_> {
         }
     }
 
+    /// The point a write places this vector by: [`point`](Self::point), except that an
+    /// `f32` vector written into a half index is first rounded to the element, so it's
+    /// placed by the value stored, the one a later split or merge reads back (#1387). A
+    /// search keeps `point`: it compares the query unrounded, as `nearest_f32` does.
+    pub(crate) fn placed(&self, spec: &VectorSpec) -> Point {
+        let mut out = Point::F32(Vec::new());
+        self.placed_into(spec, &mut out);
+        out
+    }
+
+    /// [`placed`](Self::placed) into `out`, reusing its buffer (a bulk load's per-vector
+    /// placement allocates nothing).
+    pub(crate) fn placed_into(&self, spec: &VectorSpec, out: &mut Point) {
+        if let Input::Bits(x) = self {
+            match out {
+                Point::Bits(b) => {
+                    b.clear();
+                    b.extend_from_slice(x);
+                }
+                _ => *out = Point::Bits(x.to_vec()),
+            }
+            return;
+        }
+        if !matches!(out, Point::F32(_)) {
+            *out = Point::F32(Vec::new());
+        }
+        let Point::F32(buf) = out else {
+            unreachable!("an f32 point")
+        };
+        buf.clear();
+        self.widen_into(buf);
+        if let (Input::F32(_), e @ (Element::F16 | Element::BF16)) = (self, spec.element()) {
+            for x in buf.iter_mut() {
+                *x = crate::half::round_trip(e, *x);
+            }
+        }
+    }
+
     /// Appends the vector to `out` as `f32`s (an `i8` or half vector widened, exactly);
     /// `false`, with nothing appended, for bits. A bulk load can widen every vector into
     /// one reused buffer this way.
@@ -438,5 +476,25 @@ mod tests {
         assert!(moved.iter().step_by(2).all(|m| *m == moved[0]));
         assert!(moved.iter().skip(1).step_by(2).all(|m| *m == moved[1]));
         assert_ne!(moved[0], moved[1]);
+    }
+
+    /// An `f32` vector written into a half index is placed by the value stored (perf287 on
+    /// #1387); into an `f32` index, and as a search's query, it stays as given. A reused
+    /// point is refilled, whatever it held.
+    #[test]
+    fn a_write_places_by_the_stored_value() {
+        let f16 = VectorSpec::new(2, Element::F16, Metric::L2).unwrap();
+        let bf16 = VectorSpec::new(2, Element::BF16, Metric::L2).unwrap();
+        let f32s = VectorSpec::new(2, Element::F32, Metric::L2).unwrap();
+        let x = Input::F32(&[1.0001, 2.0]);
+        assert_eq!(x.placed(&f16), Input::F16(&[0x3c00, 0x4000]).point());
+        assert_eq!(x.placed(&bf16), Input::BF16(&[0x3f80, 0x4000]).point());
+        assert_eq!(x.placed(&f32s), x.point());
+        assert_eq!(x.point(), Point::F32(vec![1.0001, 2.0]));
+        let mut p = Point::Bits(vec![7]);
+        Input::F16(&[0x3c00, 0x4000]).placed_into(&f16, &mut p);
+        assert_eq!(p, Point::F32(vec![1.0, 2.0]));
+        Input::Bits(&[1, 2]).placed_into(&f16, &mut p);
+        assert_eq!(p, Point::Bits(vec![1, 2]));
     }
 }

@@ -73,8 +73,9 @@
 - **`Index::create` takes `F16` and `BF16` specs** (ICR 0104's elements). Centroids stay `f32` of the same dimension and metric, since a mean of halves isn't a half.
 - **`Index::insert_f16(id, &[u16])`, `insert_bf16`:** each `u16` is a bit pattern, stored bit for bit. A split's move rewrites the patterns it read, exactly.
 - **`Index::search_f16(&[u16], k)`, `search_bf16`, and the same on `ReadIndex`:** the query widens to `f32` exactly and searches as `nearest_f32` searches a half family, so the hits equal `search_f32` with the widened query.
-- **`insert_f32` and `search_f32` work on a half index too.** A written `f32` vector is rounded to the element, as `put_vector_f32` rounds into a half family. Other mismatches (`i8` or bits in a half index, `f16` bits in a `bf16` index) are `InvalidArgument`.
-- **Internal:** a crate-private `half` module widens patterns into a caller's buffer (`Input::widen_into`), checked against `VectorRef::widen_into` over all 65,536 patterns. The `bulk_load_f16`/`bf16` forms (perf287) are thin over it, and follow.
+- **`insert_f32` and `search_f32` work on a half index too.** A written `f32` vector is rounded to the element, as `put_vector_f32` rounds into a half family, and it's placed in its list by the rounded value, the one stored, so a later split or merge sees the same point (perf287 on #1387). Other mismatches (`i8` or bits in a half index, `f16` bits in a `bf16` index) are `InvalidArgument`.
+- **`Index::bulk_load_f16(expected, vectors)`, `bulk_load_bf16`:** `bulk_load_f32` for half bit patterns, stored bit for bit. The k-means sample and each vector's placement widen into `f32`; the streaming pass refills one buffer per vector. `bulk_load_f32` loads a half index too, rounding as `insert_f32` does.
+- **Internal:** a crate-private `half` module widens patterns into a caller's buffer (`Input::widen_into`), checked against `VectorRef::widen_into` over all 65,536 patterns, and rounds `f32` to a half (`half::narrow`), checked against the format's rounding that `put_vector_f32` uses.
 
 ## The table (internal, not promised)
 The table holds:
