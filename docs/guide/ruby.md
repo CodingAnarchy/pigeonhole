@@ -1,6 +1,6 @@
 # Ruby
 
-> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111), and nothing has been published to RubyGems yet. This is PR 1: the core API. Vectors, graphs, byte-budgeted reads and the change feed follow, as do the memory, text and vector-index surfaces.
+> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111), and nothing has been published to RubyGems yet. The full-text and vector-index surfaces follow.
 
 The `pigeonhole` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
@@ -179,6 +179,59 @@ Pigeonhole.open(path, create: true, change_feed: 64 << 20) do |db|
   t.put("order:1", "f", "status", "shipped")
   t.feed(resume: token) do |feed|
     raise unless feed.next(timeout: 5).changes.first.value == "shipped"
+  end
+end
+```
+
+## Agent memory
+`Pigeonhole::Memory` binds the [`pigeonhole-memory`](agent-memory.md) store: long-term memory for an agent, with ranked recall, dedup, superseding, forgetting and consolidation, kept in the same file as the application's data. The names and rules are the Rust crate's ([ICR 0107](../design/icr/0107-agent-memory.md)), as Python's `pigeonhole.memory` binds them. Every call releases the GVL.
+
+- **Opening.**
+  - `Store.create(db, name, embedding: EmbeddingModel.new(id, dim, :f32))` pins the store to one embedding model. Without `embedding:`, recall is by keyword and recency.
+  - `forget:`, `episodic_ttl:` (seconds) and `near_dedup:` set the store's policies. `normalization:` (`:nfc` by default, `:nfkc` or `:none`) sets how its text index compares terms, and is fixed at create.
+  - `Store.open(db, name, model: id)` opens the store again. It raises `ModelMismatch` (an `InvalidArgument`) for another model, and `model: nil` gives a handle that recalls without embeddings.
+  - `Store.open_reader(reader, name, model: ...)` gives a `ReadStore` in a reader process, with `recall`, `get` and `verify`.
+  - Each takes a block, which gets the store and closes it afterwards.
+- **Writing.**
+  - `store.remember(ns, text, embedding:, kind:, importance:, source:, session:, links: [[id, LinkType::DERIVED_FROM, 0.5]], pinned:)` returns `Remembered(id, outcome)`.
+  - `outcome` is `:new`, `:merged` (an exact duplicate) or `:similar` (a near duplicate the store's `NearDedup` with policy `:skip` didn't write).
+  - `delete`, `link`, `supersede` and `mark_used` take ids as a `MemoryId` or its text form.
+- **Transactions.**
+  - `remember_in(txn, ...)`, `delete_in` and `forget_in` write in a `Pigeonhole::Transaction` and commit with it.
+  - They read in the transaction, so they're safe inside `db.transact { |txn| ... }`, whose retries re-read.
+  - `remember_in` skips near dedup: call `store.near_duplicate(ns, text, embedding:)` first if you need it. Its reads are at the transaction's snapshot, so two `remember_in` of the same text in one transaction both write.
+  - `forget_in` returns `:deleted`, `:protected`, `:not_due` or `:gone`, and none of these is an error.
+- **Recall.**
+  - `store.recall(namespaces, text:, embedding:, k:, byte_budget:, weights: Weights.new(...), fusion: :rrf, include_superseded:, session:, snapshot:, with_signals:)` returns `RecallHit`s, best first, at one snapshot.
+  - `recall_with_stats` returns `[hits, RecallStats]`. Its `truncated` says the budget cut the hits.
+  - `expand: Expand.new(1)` also follows the best candidates' links both ways and gives the memories it reaches a `graph` signal (`Weights.new(graph:)`, 0.5 by default). `RecallStats#expanded` counts them.
+- **Forgetting.** With a policy (`forget: ForgetPolicy.new(...)`, or `store.forget_policy = ...`), a thread of the crate's own forgets in the background. `store.forget(policy:, after:)` runs one pass now.
+- **Consolidation.** `store.consolidate(ns, policy: ConsolidatePolicy.new(...)) { |group| ... }` runs a pass. The block gets each group of episodic memories (an Array of `StoredMemory`) and returns an Array of `Memory` to keep in their place. An empty Array keeps the group, marked consolidated.
+  - **The pass runs on a thread of its own, and the block on yours,** outside every transaction and with no lock held. So the block may call the store (`recall` for context) and take its time, for example calling a model.
+  - **A group that changes before its commit is skipped,** not retried: `skipped` counts it, and the next pass finds it again.
+  - **A `StandardError` from the block,** or a return that isn't an Array of `Memory`, stops the pass with `ConsolidateError` (a `MergeFailed`). Its `consolidated` is the pass so far, and its `cause` is the exception.
+  - **Anything else stops the pass too, then takes effect as it is:** `break`, `throw` or `return` out of the block, another exception (`Interrupt`, `SystemExit`), or an interrupt (`Thread#raise`, `Timeout`, Ctrl-C). This differs from Python, where every exception becomes `ConsolidateError`: here it's whatever `rescue => e` would catch.
+  - **However the pass stops,** its thread has ended, the groups committed before stay committed, and running the pass again is safe.
+- **Closing.** Close a store when you're done with it (`store.close`, or a block form). Its forgetter thread stops once every handle to the store is closed. `db.close` closes the stores opened on it first. After either, store calls raise `Closed`, and a call already running ends with `Closed`.
+
+```ruby
+mem = Pigeonhole::Memory
+Pigeonhole.open(path, create: true) do |db|
+  mem::Store.create(db, "agents", embedding: mem::EmbeddingModel.new("toy", 3, :f32)) do |store|
+    old = store.remember("user:dana", "Dana uses vim", embedding: [1.0, 0, 0]).id
+    new = store.remember("user:dana", "Dana switched to helix", embedding: [0.9, 0.1, 0])
+    store.supersede(old, new.id)
+    hit = store.recall("user:dana", text: "Dana editor helix", k: 1).first
+    raise "recall" unless hit.id == new.id
+
+    store.mark_used([hit.id])
+    ["Dana opened the design doc", "Dana commented on the design doc"].each do |note|
+      store.remember("user:dana", note, embedding: [0, 1.0, 0], session: "mon")
+    end
+    passed = store.consolidate("user:dana", policy: mem::ConsolidatePolicy.new(min_age: 0)) do |group|
+      [mem::Memory.new("Monday: #{group.map(&:text).join('; ')}", embedding: [0, 1.0, 0], kind: :semantic)]
+    end
+    raise "consolidate" unless passed.committed == 1
   end
 end
 ```

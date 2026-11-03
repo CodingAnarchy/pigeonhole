@@ -29,3 +29,4 @@ module Pigeonhole
 end
 
 require_relative "pigeonhole/api"
+require_relative "pigeonhole/memory"

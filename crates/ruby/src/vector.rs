@@ -10,7 +10,7 @@ use crate::error::{OrRb, with_code};
 use crate::gvl::without_gvl;
 
 /// A Symbol's (or a String's) name, for the element and metric arguments.
-fn sym_name(ruby: &Ruby, v: Value, what: &str) -> Result<String, Error> {
+pub(crate) fn sym_name(ruby: &Ruby, v: Value, what: &str) -> Result<String, Error> {
     if let Some(s) = Symbol::from_value(v) {
         return Ok(s.name()?.into_owned());
     }
@@ -56,7 +56,7 @@ pub(crate) fn metric(ruby: &Ruby, v: Value) -> Result<Metric, Error> {
     })
 }
 
-fn element_name(e: Element) -> &'static str {
+pub(crate) fn element_name(e: Element) -> &'static str {
     match e {
         Element::F32 => "f32",
         Element::I8 => "i8",

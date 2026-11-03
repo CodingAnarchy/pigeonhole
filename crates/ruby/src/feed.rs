@@ -55,15 +55,15 @@ impl FeedState {
         guard
     }
 
-    /// Waits, with the GVL released, until no other thread wants the lock or a slice has
-    /// passed: a consumer between slices lets the others in first.
-    fn give_way(&self, ruby: &Ruby) -> Result<(), Error> {
+    /// Waits, with the GVL released, until no other thread wants the lock or `limit` (at
+    /// most a slice) has passed: a consumer between slices lets the others in first.
+    fn give_way(&self, ruby: &Ruby, limit: Duration) -> Result<(), Error> {
         if self.wanted.load(Ordering::SeqCst) == 0 {
             return Ok(());
         }
         without_gvl(ruby, || {
             let start = Instant::now();
-            while self.wanted.load(Ordering::SeqCst) > 0 && start.elapsed() < SLICE {
+            while self.wanted.load(Ordering::SeqCst) > 0 && start.elapsed() < limit {
                 std::thread::sleep(Duration::from_millis(1));
             }
         })
@@ -212,11 +212,15 @@ impl Feed {
         loop {
             // Another thread waiting for the feed (`token`, `close`, a second consumer) goes
             // first; then this one checks for interrupts before its next slice.
-            state.give_way(ruby)?;
+            // Never past a short `timeout:`'s deadline (ai1249's nit on #1411).
+            let left = || {
+                deadline.map_or(SLICE, |d| {
+                    d.saturating_duration_since(Instant::now()).min(SLICE)
+                })
+            };
+            state.give_way(ruby, left())?;
             ruby.thread_check_ints()?;
-            let slice = deadline.map_or(SLICE, |d| {
-                d.saturating_duration_since(Instant::now()).min(SLICE)
-            });
+            let slice = left();
             if let Some(c) = Self::poll(ruby, rb_self, Some(slice))? {
                 return commit(ruby, &c).map(Some);
             }
