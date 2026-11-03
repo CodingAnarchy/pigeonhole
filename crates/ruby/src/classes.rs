@@ -271,4 +271,4 @@ pub(crate) struct Watch(pub(crate) ForkSafe<crate::index::Fair<Option<pigeonhole
 
 /// `Pigeonhole::Memory::ConsolidateLoop`: feed-driven consolidation (T9).
 #[magnus::wrap(class = "Pigeonhole::Memory::ConsolidateLoop", free_immediately, size)]
-pub(crate) struct ConsolidateLoop(pub(crate) ForkSafe<Mutex<Option<crate::memory::LoopState>>>);
+pub(crate) struct ConsolidateLoop(pub(crate) ForkSafe<Mutex<crate::memory::LoopSlot>>);

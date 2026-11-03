@@ -274,8 +274,9 @@ module Pigeonhole
     class Watch
       include Enumerable
 
-      # The next `MemoryCommit`, waiting up to `timeout` seconds (nil waits until one comes);
-      # nil if none came in time. `FeedExpired` once the history it needs is gone.
+      # The next `MemoryCommit`, waiting up to `timeout` seconds; nil if none came in time.
+      # `timeout: nil` waits until a commit comes or the thread is interrupted (perf2's N2 on
+      # #1441). `FeedExpired` once the history it needs is gone.
       def next(timeout: nil)
         c = native_next(timeout)
         c && Build.commit(c)
@@ -306,7 +307,10 @@ module Pigeonhole
     class ConsolidateLoop
       # One step: reads new memories for up to `timeout` seconds (less if a pass falls due),
       # runs the passes that are due, and saves the position. `timeout` bounds the wait, not
-      # the passes, which run the block. A `StandardError` from the block fails that
+      # the passes, which run the block. An interrupt (`Timeout`, `Thread#raise`, Ctrl-C)
+      # takes effect once the step's wait for new memories ends, so keep `timeout` short
+      # (the default, 1 s) in a loop that must stop promptly: the step can't be cut into
+      # slices, since each step saves the loop's position (a commit). A `StandardError` from the block fails that
       # namespace's pass (it's in `failed`, retried after `min_age`). `throw`, another
       # exception (`Interrupt`) or an interrupt stops the step and takes effect; the groups
       # the step still had are refused, and the loop treats their namespaces as failed too,

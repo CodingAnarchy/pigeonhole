@@ -1999,13 +1999,43 @@ impl Store {
         if let Some(off) = clock_offset_us {
             lp = lp.clock(move || now_us().saturating_add_signed(off));
         }
-        Ok(ConsolidateLoop(ForkSafe::new(Mutex::new(Some(
-            LoopState { lp, slot },
+        Ok(ConsolidateLoop(ForkSafe::new(Mutex::new(LoopSlot::Idle(
+            Box::new(LoopState { lp, slot }),
         )))))
     }
 }
 
-const LOOP_BUSY: &str = "the consolidation loop is closed, or a step of it is running";
+/// Where a `ConsolidateLoop` is: ready, in a step on another thread, closed, or lost to a
+/// worker panic (perf2's N1 on #1441: each says why a call can't run).
+pub(crate) enum LoopSlot {
+    Idle(Box<LoopState>),
+    Running,
+    Closed,
+    Lost,
+}
+
+impl LoopSlot {
+    /// The loop, if it's ready; else why it isn't.
+    fn take(&mut self, ruby: &Ruby) -> Result<LoopState, Error> {
+        match std::mem::replace(self, LoopSlot::Running) {
+            LoopSlot::Idle(s) => Ok(*s),
+            other => {
+                let why = other.why();
+                *self = other;
+                Err(spent(ruby, why))
+            }
+        }
+    }
+
+    fn why(&self) -> &'static str {
+        match self {
+            LoopSlot::Running => "a step of this consolidation loop is running on another thread",
+            LoopSlot::Closed => "the consolidation loop is closed",
+            LoopSlot::Lost => "the consolidation loop's thread panicked: the loop is gone",
+            LoopSlot::Idle(_) => "the consolidation loop is ready",
+        }
+    }
+}
 
 impl ConsolidateLoop {
     /// `native_run_once(timeout, block)`: one step on a worker thread, its consolidator
@@ -2019,7 +2049,7 @@ impl ConsolidateLoop {
         block: magnus::block::Proc,
     ) -> Result<RArray, Error> {
         let m = rb_self.0.get(ruby)?;
-        let LoopState { mut lp, slot } = lock(m).take().ok_or_else(|| spent(ruby, LOOP_BUSY))?;
+        let LoopState { mut lp, slot } = lock(m).take(ruby)?;
         let d = drive(
             ruby,
             &slot,
@@ -2031,10 +2061,22 @@ impl ConsolidateLoop {
                 (lp, step)
             },
         );
-        // An error here means the worker panicked: the loop went with it.
-        let d = d?;
+        let d = match d {
+            Ok(d) => d,
+            // The worker panicked: the loop went with it.
+            Err(e) => {
+                *lock(m) = LoopSlot::Lost;
+                return Err(e);
+            }
+        };
         let (lp, step) = d.out;
-        *lock(m) = Some(LoopState { lp, slot });
+        {
+            let mut g = lock(m);
+            // A `close` while the step ran leaves the loop closed.
+            if matches!(*g, LoopSlot::Running) {
+                *g = LoopSlot::Idle(Box::new(LoopState { lp, slot }));
+            }
+        }
         if let Some(e) = d.jump {
             return Err(e);
         }
@@ -2064,15 +2106,26 @@ impl ConsolidateLoop {
 
     /// The µs time the next pass falls due, if any.
     pub(crate) fn next_due(ruby: &Ruby, rb_self: &Self) -> Result<Option<u64>, Error> {
-        Ok(lock(rb_self.0.get(ruby)?)
-            .as_ref()
-            .ok_or_else(|| spent(ruby, LOOP_BUSY))?
-            .lp
-            .next_due())
+        match &*lock(rb_self.0.get(ruby)?) {
+            LoopSlot::Idle(s) => Ok(s.lp.next_due()),
+            other => Err(spent(ruby, other.why())),
+        }
     }
 
+    /// Closes the loop. A step running on another thread finishes, and the loop is then
+    /// dropped instead of kept.
     pub(crate) fn close(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        let s = lock(rb_self.0.get(ruby)?).take();
+        let s = {
+            let mut g = lock(rb_self.0.get(ruby)?);
+            match std::mem::replace(&mut *g, LoopSlot::Closed) {
+                LoopSlot::Lost => {
+                    *g = LoopSlot::Lost;
+                    None
+                }
+                LoopSlot::Idle(s) => Some(s),
+                _ => None,
+            }
+        };
         without_gvl(ruby, move || drop(s))
     }
 }
