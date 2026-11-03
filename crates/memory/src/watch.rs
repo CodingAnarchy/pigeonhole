@@ -159,7 +159,8 @@ impl WatchBuilder {
 }
 
 /// The most commits without memory events one [`Watch::poll_next`] passes over before it
-/// yields (wakes its task and returns `Pending`).
+/// yields (wakes its task and returns `Pending`). A tuning value, not a promise: it may
+/// change in any release (cli692 on #1438).
 pub const PASS_OVER_PER_POLL: usize = 64;
 
 /// A subscription to a store's memory events (D311 T9): each commit that touched a memory,
