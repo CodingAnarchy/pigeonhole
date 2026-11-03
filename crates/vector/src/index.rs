@@ -1010,6 +1010,35 @@ impl Index {
         self.bulk(expected, vectors, |v: &V| Input::Bits(v.as_ref()))
     }
 
+    /// [`bulk_load_f32`](Self::bulk_load_f32) for an `f16` index: each vector is IEEE
+    /// binary16 bit patterns, stored bit for bit, as [`insert_f16`](Self::insert_f16)
+    /// stores them. ([`bulk_load_f32`](Self::bulk_load_f32) also loads a half index,
+    /// rounding each component to the element.)
+    pub fn bulk_load_f16<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u16]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::F16(v.as_ref()))
+    }
+
+    /// [`bulk_load_f16`](Self::bulk_load_f16) for a `bf16` index (bfloat16 bit patterns).
+    pub fn bulk_load_bf16<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u16]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::BF16(v.as_ref()))
+    }
+
     fn bulk<K: AsRef<[u8]>, V>(
         &self,
         expected: u64,
@@ -1036,7 +1065,7 @@ impl Index {
         for (_, v) in &sample {
             let v = input(v);
             v.check(&inn.spec)?;
-            points.push(v.point());
+            points.push(v.placed(&inn.spec));
         }
         let centroids = kmeans(&inn.cen, &points, want.min(sample.len()))?;
         drop(points);
@@ -1058,10 +1087,13 @@ impl Index {
         let mut batches: HashMap<u32, Vec<(K, V)>> = HashMap::new();
         let mut waiting: HashMap<Vec<u8>, u32> = HashMap::new();
         let mut loaded = 0u64;
+        // One point, refilled per vector: a half or `i8` vector widens into its buffer.
+        let mut point = Point::F32(Vec::new());
         for (id, v) in sample.into_iter().chain(it) {
             let vi = input(&v);
             vi.check(&inn.spec)?;
-            let l = layout.nearest(&inn.cen, &vi.point(), 1, &[])?[0];
+            vi.placed_into(&inn.spec, &mut point);
+            let l = layout.nearest(&inn.cen, &point, 1, &[])?[0];
             if let Some(prev) = waiting.insert(id.as_ref().to_vec(), l) {
                 let b = batches.get_mut(&prev).expect("a waiting id's batch");
                 b.retain(|(k, _)| k.as_ref() != id.as_ref());
@@ -1208,7 +1240,7 @@ impl Index {
 
     fn insert(&self, id: &[u8], v: Input<'_>) -> Result<()> {
         v.check(&self.inner.spec)?;
-        let point = v.point();
+        let point = v.placed(&self.inner.spec);
         let mut layout = self.layout();
         for _ in 0..RELOADS {
             let r = if layout.lists.is_empty() {
