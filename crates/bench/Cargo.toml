@@ -55,4 +55,7 @@ pigeonhole-sst = { workspace = true }
 pigeonhole-arrow = { workspace = true }
 # The `hotagg` and `hubset` examples write roaring sets and set operands (D298).
 pigeonhole-format = { workspace = true }
+# The `memrecall` example measures agent-memory recall (D311 T5).
+pigeonhole-memory = { workspace = true }
+pigeonhole-text = { workspace = true }
 
