@@ -257,7 +257,9 @@ pub(crate) struct Placed(pub(crate) ForkSafe<Mutex<Option<pigeonhole_vector::Pla
 /// `Pigeonhole::Vector::Rebalancer`: a background-mode index's rebalancing, for a Ruby
 /// thread to drive.
 #[magnus::wrap(class = "Pigeonhole::Vector::Rebalancer", free_immediately, size)]
-pub(crate) struct Rebalancer(pub(crate) ForkSafe<Mutex<pigeonhole_vector::Rebalancer>>);
+pub(crate) struct Rebalancer(
+    pub(crate) ForkSafe<crate::index::Fair<pigeonhole_vector::Rebalancer>>,
+);
 
 /// `Pigeonhole::Vector::BulkLoad`: a bulk load in progress; `None` once finished.
 #[magnus::wrap(class = "Pigeonhole::Vector::BulkLoad", free_immediately, size)]

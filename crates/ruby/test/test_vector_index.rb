@@ -195,7 +195,7 @@ class TestVectorIndex < Minitest::Test
     t0 = monotonic
     refute_predicate reb, :closed?
     ticker.join
-    assert_operator monotonic - t0, :<, 1.0, "closed? waited out the run_once with the GVL held"
+    assert_operator monotonic - t0, :<, 1.0, "closed? waited out the run_once"
     assert_equal 20, ticks
     worker.kill
     worker.join

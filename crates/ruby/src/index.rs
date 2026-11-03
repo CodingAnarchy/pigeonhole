@@ -1003,11 +1003,55 @@ fn join_sliced<T: Send + 'static>(
     }
 }
 
+/// A mutex whose waiters a holder looping in slices gives way to, as `Feed`'s state does
+/// (#1411): `std`'s mutex isn't fair, so a thread that locks again right after each slice
+/// starves the others. On Linux, `closed?` waited out a whole 3 s `run_once` that way, where
+/// macOS happened to let it in (#1434's CI).
+pub(crate) struct Fair<T> {
+    m: Mutex<T>,
+    wanted: std::sync::atomic::AtomicUsize,
+}
+
+impl<T> Fair<T> {
+    fn new(v: T) -> Self {
+        Self {
+            m: Mutex::new(v),
+            wanted: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The value, counted in `wanted` until the lock is ours.
+    fn acquire(&self) -> std::sync::MutexGuard<'_, T> {
+        use std::sync::atomic::Ordering;
+        self.wanted.fetch_add(1, Ordering::SeqCst);
+        let g = lock(&self.m);
+        self.wanted.fetch_sub(1, Ordering::SeqCst);
+        g
+    }
+
+    /// Waits, with the GVL released, until nobody else wants the lock or `limit` passes.
+    fn give_way(&self, ruby: &Ruby, limit: Duration) -> Result<(), Error>
+    where
+        T: Send,
+    {
+        use std::sync::atomic::Ordering;
+        if self.wanted.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        without_gvl(ruby, || {
+            let start = Instant::now();
+            while self.wanted.load(Ordering::SeqCst) > 0 && start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    }
+}
+
 /// `[index, rebalancer]`.
 fn pair(ruby: &Ruby, i: vidx::Index, r: vidx::Rebalancer) -> Result<RArray, Error> {
     let a = ruby.ary_new_capa(2);
     a.push(VectorIndex(ForkSafe::new(i)))?;
-    a.push(Rebalancer(ForkSafe::new(Mutex::new(r))))?;
+    a.push(Rebalancer(ForkSafe::new(Fair::new(r))))?;
     Ok(a)
 }
 
@@ -1062,11 +1106,12 @@ impl Rebalancer {
             let left = deadline.map_or(SLICE, |d| {
                 d.saturating_duration_since(Instant::now()).min(SLICE)
             });
-            let more = vcall(ruby, move || lock(m).run_once(left))?;
+            let more = vcall(ruby, move || m.acquire().run_once(left))?;
             any |= more;
             if !more || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(any);
             }
+            m.give_way(ruby, SLICE)?;
             ruby.thread_check_ints()?;
         }
     }
@@ -1085,7 +1130,7 @@ impl Rebalancer {
             let slice = left.min(SLICE);
             let woke = without_gvl(ruby, move || {
                 let start = Instant::now();
-                let mut r = lock(m);
+                let mut r = m.acquire();
                 r.wait(slice);
                 // Woken before the slice ended: a write marked a list, or the index closed.
                 start.elapsed() < slice || r.closed()
@@ -1093,6 +1138,7 @@ impl Rebalancer {
             if woke {
                 return Ok(());
             }
+            m.give_way(ruby, SLICE)?;
             ruby.thread_check_ints()?;
         }
     }
@@ -1102,9 +1148,10 @@ impl Rebalancer {
     /// S3 on #1434: holding the GVL there stalled every Ruby thread).
     pub(crate) fn is_closed(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
         let m = rb_self.0.get(ruby)?;
-        if let Ok(r) = m.try_lock() {
+        if let Ok(r) = m.m.try_lock() {
             return Ok(r.closed());
         }
-        without_gvl(ruby, move || lock(m).closed())
+        // Counted as wanted, so a looping `run_once` or `wait` lets it in after its slice.
+        without_gvl(ruby, move || m.acquire().closed())
     }
 }
