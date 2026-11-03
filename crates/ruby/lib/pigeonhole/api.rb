@@ -1,0 +1,334 @@
+# frozen_string_literal: true
+
+# The public, keyword-taking methods over the native core (whose methods take positional
+# arguments and are private, named `native_*`), the block forms and the scan Enumerator.
+#
+# The block forms are Ruby on purpose (simp724's R2 on #697): a `break`, `throw` or early
+# `return` out of a block runs these `ensure` clauses, never unwinding through Rust. A block
+# form commits only when its block returns normally (`next` included: it is a normal
+# return); any other exit, an exception or a non-local one, discards or rolls back.
+module Pigeonhole
+  class << self
+    # Opens (with `create: true`, creates) the database at `path` as the writer process.
+    # With a block, yields the database, closes it when the block exits however it exits,
+    # and returns the block's value.
+    def open(path, create: false, shards: nil, durability: nil, block_cache: nil, row_cache: nil,
+             memtable_budget: nil, shm_dir: nil, read_only_fallback: nil)
+      db = native_open(path, create, shards, durability, block_cache, row_cache, memtable_budget,
+                       shm_dir, read_only_fallback)
+      return db unless block_given?
+
+      begin
+        yield db
+      ensure
+        db.close
+      end
+    end
+
+    # Opens the database at `path` as a reader process of the writer that has it open
+    # (`NoWriter` without one). With a block, yields the reader and closes it afterwards.
+    def open_reader(path, shm_dir: nil, block_cache: nil, row_cache: nil)
+      reader = native_open_reader(path, shm_dir, block_cache, row_cache)
+      return reader unless block_given?
+
+      begin
+        yield reader
+      ensure
+        reader.close
+      end
+    end
+  end
+
+  # Yields `handle` to the block and runs `finish(completed)` however the block exits:
+  # `completed` is true only when the block returned normally.
+  def self.scoped(handle)
+    completed = false
+    begin
+      result = yield handle
+      completed = true
+      result
+    ensure
+      if completed
+        handle.__send__(:native_commit, nil) if handle.__send__(:native_open?)
+      else
+        handle.__send__(:native_discard)
+      end
+    end
+  end
+  private_class_method :scoped
+
+  # The open database, as the writer process.
+  class Database
+    # A consistent view of everything committed (with `durable: true`, of what is durable
+    # at its level). With a block, yields it and releases it afterwards.
+    def snapshot(durable: false)
+      s = native_snapshot(durable)
+      return s unless block_given?
+
+      begin
+        yield s
+      ensure
+        s.release
+      end
+    end
+
+    # A batch of writes to any rows and tables, committed atomically by `commit`. With a
+    # block, yields it, commits it when the block returns normally (`next` included) and
+    # discards it on an exception or any non-local exit (`break`, `throw`, `return`);
+    # returns the block's value.
+    def write_batch(&)
+      b = native_write_batch
+      return b unless block_given?
+
+      Pigeonhole.__send__(:scoped, b, &)
+    end
+
+    # An optimistic transaction: reads see one snapshot, and `commit` raises `Conflict` if a
+    # cell it read changed since. With a block, yields it, commits it when the block returns
+    # normally and rolls it back otherwise; returns the block's value.
+    def transaction(&)
+      t = native_transaction
+      return t unless block_given?
+
+      Pigeonhole.__send__(:scoped, t, &)
+    end
+
+    # Runs the block with a fresh transaction and commits it, retrying on `Conflict` and
+    # `Busy` as the library's `RetryPolicy` does: with backoff, up to `max_attempts`
+    # (default 8) or `deadline` seconds. Returns the block's value. The block may run more
+    # than once, so it should have no effects outside the transaction. Any other exception,
+    # or a non-local exit, rolls the attempt back and ends the call.
+    def transact(max_attempts: nil, deadline: nil, durability: nil)
+      raise ArgumentError, "transact needs a block" unless block_given?
+
+      Pigeonhole.__send__(:native_retry_check, max_attempts, deadline)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      attempt = 1
+      while true # rubocop:disable Style/InfiniteLoop -- `loop` would swallow StopIteration
+        txn = native_transaction
+        pause = nil
+        begin
+          result = yield txn
+          txn.commit(durability: durability)
+          return result
+        rescue Conflict, Busy => e
+          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+          pause = Pigeonhole.__send__(:native_retry_pause, max_attempts, deadline, e.code_num,
+                                      attempt, elapsed)
+          raise if pause.nil?
+        ensure
+          txn.__send__(:native_discard)
+        end
+        sleep(pause)
+        attempt += 1
+      end
+    end
+  end
+
+  # A database opened as a reader process: it sees what the running writer process commits,
+  # and can't write.
+  class Reader
+    # A consistent view of everything the writer committed (with `durable: true`, of what is
+    # durable at its level). With a block, yields it and releases it afterwards.
+    def snapshot(durable: false)
+      s = native_snapshot(durable)
+      return s unless block_given?
+
+      begin
+        yield s
+      ensure
+        s.release
+      end
+    end
+  end
+
+  # Builds a table: add families, then `create`, `create_if_missing` or `open`.
+  class TableBuilder
+    # Adds the family `name` (`options`: a `Family`, or nil for a plain one). Returns self.
+    def family(name, options = nil)
+      native_family(name, options)
+      self
+    end
+  end
+
+  # A table: reads, and with the writer's handle, writes.
+  class Table
+    # The newest version of one cell, or nil.
+    def get(row, family, qualifier, snapshot: nil)
+      native_get(row, family, qualifier, snapshot)
+    end
+
+    # One row's cells, or nil when the row has none the read selects. `families` selects
+    # families (and their order), `qualifier_prefix` columns, `versions` the versions per
+    # column (0 for all), and `column_limit` at most that many columns per family.
+    def row(row, families: nil, qualifier_prefix: nil, versions: 1, column_limit: nil, snapshot: nil)
+      native_row(row, families, qualifier_prefix, versions, column_limit, snapshot)
+    end
+
+    # Rows in key order, as an Enumerator: those starting with `prefix`, or from `start`
+    # (inclusive) to `end` (exclusive), or all. Rows are read `chunk` at a time with the
+    # GVL released.
+    #
+    # Each enumeration (`each`, the first `next`, each `rewind`) reads at one snapshot: the
+    # given `snapshot:`, or one it takes when it starts (simp724's R3), so its rows are
+    # consistent however lazily they are consumed. An external enumeration (`next`) that is
+    # abandoned holds its snapshot until the Enumerator is garbage collected.
+    def scan(prefix = nil, start: nil, end: nil, families: nil, qualifier_prefix: nil, versions: 1,
+             limit: nil, column_limit: nil, snapshot: nil, chunk: 256)
+      spec = native_scan_spec(prefix, start, binding.local_variable_get(:end), families,
+                              qualifier_prefix, versions, limit, column_limit, chunk)
+      Enumerator.new do |y|
+        cursor = spec.open(snapshot)
+        begin
+          until (rows = cursor.next_chunk).empty?
+            rows.each { |r| y << r }
+          end
+        ensure
+          cursor.close
+        end
+      end
+    end
+
+    # Puts one cell and commits it; returns the commit's sequence number. A String is bytes,
+    # an Integer an i64 and a Float an f64.
+    def put(row, family, qualifier, value, ts: nil, durability: nil)
+      native_put(row, family, qualifier, value, ts, durability)
+    end
+
+    # Adds `delta` to a counter cell and commits it; returns the commit's sequence number.
+    def incr(row, family, qualifier, delta, ts: nil, durability: nil)
+      native_incr(row, family, qualifier, delta, ts, durability)
+    end
+
+    # Deletes `row`; with `family`, that family; with `qualifier` too, the column; with `ts:`
+    # too, that one version. Returns the commit's sequence number.
+    def delete(row, family = nil, qualifier = nil, ts: nil, durability: nil)
+      native_delete(row, family, qualifier, ts, durability)
+    end
+  end
+
+  # Writes to one row, committed atomically by `commit` or `commit_if`. Each write method
+  # returns self.
+  class Mutation
+    # Puts a cell: a String (bytes), an Integer (i64) or a Float (f64).
+    def put(family, qualifier, value, ts: nil)
+      native_put(family, qualifier, value, ts)
+      self
+    end
+
+    # Puts a cell holding an unsigned 64-bit Integer.
+    def put_u64(family, qualifier, value, ts: nil)
+      native_put_u64(family, qualifier, value, ts)
+      self
+    end
+
+    # Adds `delta` to a counter cell.
+    def incr(family, qualifier, delta, ts: nil)
+      native_incr(family, qualifier, delta, ts)
+      self
+    end
+
+    # Adds an input to an aggregate family's cell, read by the family's kind.
+    def aggregate(family, qualifier, value, ts: nil)
+      native_aggregate(family, qualifier, value, ts)
+      self
+    end
+
+    # Deletes the row; with `family`, that family; with `qualifier` too, the column; with
+    # `ts:` too, that one version.
+    def delete(family = nil, qualifier = nil, ts: nil)
+      native_delete(family, qualifier, ts)
+      self
+    end
+
+    # Sets the commit's durability (`:none`, `:buffered`, `:group_sync` or `:sync`).
+    def durability(durability)
+      native_durability(durability)
+      self
+    end
+  end
+
+  # The write methods `WriteBatch` and `Transaction` share: the table and row first; each
+  # returns self.
+  [WriteBatch, Transaction].each do |klass|
+    klass.class_eval do
+      # Puts a cell in `table`'s `row`: a String (bytes), an Integer (i64) or a Float (f64).
+      def put(table, row, family, qualifier, value, ts: nil)
+        native_put(table, row, family, qualifier, value, ts)
+        self
+      end
+
+      # Puts a cell holding an unsigned 64-bit Integer.
+      def put_u64(table, row, family, qualifier, value, ts: nil)
+        native_put_u64(table, row, family, qualifier, value, ts)
+        self
+      end
+
+      # Adds `delta` to a counter cell.
+      def incr(table, row, family, qualifier, delta, ts: nil)
+        native_incr(table, row, family, qualifier, delta, ts)
+        self
+      end
+
+      # Adds an input to an aggregate family's cell, read by the family's kind.
+      def aggregate(table, row, family, qualifier, value, ts: nil)
+        native_aggregate(table, row, family, qualifier, value, ts)
+        self
+      end
+
+      # Deletes `row`; with `family`, that family; with `qualifier` too, the column; with
+      # `ts:` too, that one version.
+      def delete(table, row, family = nil, qualifier = nil, ts: nil)
+        native_delete(table, row, family, qualifier, ts)
+        self
+      end
+
+      # Commits; returns the commit's sequence number. A transaction raises `Conflict` if a
+      # cell or family it read changed since its snapshot.
+      def commit(durability: nil)
+        native_commit(durability)
+      end
+    end
+  end
+
+  # A row: its key and cells, by family (in the read's family order), then qualifier, then
+  # newest version first. Enumerable over `[family, qualifier, cell]`.
+  class Row
+    include Enumerable
+
+    # Yields each `[family, qualifier, cell]`; without a block, an Enumerator.
+    def each(&)
+      return enum_for(:each) { size } unless block_given?
+
+      cells.each(&)
+      self
+    end
+  end
+
+  # A column family's options.
+  class Family
+    class << self
+      # A plain family. `max_versions`: versions kept per column (0 keeps all); `ttl`:
+      # cells expire this many seconds after their timestamp; `compression`: `:lz4` (the
+      # default), `:zstd` or `:none`, with `zstd_level` for zstd.
+      def new(max_versions: nil, ttl: nil, bloom_bits: nil, block_size: nil, blob_threshold: nil,
+              compression: nil, zstd_level: nil)
+        native_new(max_versions, ttl, bloom_bits, block_size, blob_threshold, compression, zstd_level)
+      end
+
+      # A counter family: `incr` adds to its cells.
+      def counter(max_versions: nil, ttl: nil)
+        native_counter(max_versions, ttl)
+      end
+
+      # An aggregate family of `kind`: `:sum`, `:min`, `:max`, `:hll`, `:bit_or`, `:bit_and`,
+      # `:bit_xor`, `:min_f64`, `:max_f64`, `:sum_f64`, `:mean_var`, `:histogram` (with
+      # `bounds:`), `:quantiles` (with optional `mantissa_bits:` and `max_buckets:`) or
+      # `:bloom` (with `bits:` and `hashes:`).
+      def aggregate(kind, bounds: nil, mantissa_bits: nil, max_buckets: nil, bits: nil, hashes: nil,
+                    max_versions: nil, ttl: nil)
+        native_aggregate(kind, bounds, mantissa_bits, max_buckets, bits, hashes, max_versions, ttl)
+      end
+    end
+  end
+end

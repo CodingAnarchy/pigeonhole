@@ -749,7 +749,16 @@ fn young_memories_dont_hide_old_ones() {
     let young = put(&store, "note young", "s1", "c3");
     let c = F(summary("note summary"));
     let p = ConsolidatePolicy::new().min_age(Duration::from_millis(100));
-    let pass = store.consolidate("a", &c).policy(&p).run().unwrap();
+    // The pass's clock is fixed 50 ms after `young`, not read from the wall: a slow runner
+    // would otherwise make `young` old enough too (#1391's Windows job).
+    let now = young.created_us() + 50_000;
+    assert!(a.created_us() + 100_000 <= now && b.created_us() + 100_000 <= now);
+    let pass = store
+        .consolidate("a", &c)
+        .policy(&p)
+        .now_us(now)
+        .run()
+        .unwrap();
     assert_eq!((pass.groups, pass.committed), (1, 1), "{pass:?}");
     for id in [&a, &b] {
         assert!(store.get(id).unwrap().unwrap().consolidated);

@@ -163,7 +163,7 @@ assert_eq!(stats.vectors, 500);
   - Until it runs, a list can be longer than its bound, which slows the searches that probe it, never their results.
 
 ### Things to know
-- **Open an index once per process,** and clone the handle. Clones share the centroid cache and the rebalancer.
+- **An index is open once per process.** A second `Index::open` (or `open_with_rebalancer`) of an index the process already has open, in the same open database, returns a clone of the first handle: they share the centroid cache, the queue of lists to rebalance and, in background mode, the one rebalancing thread. Once every handle has dropped, the next open starts afresh.
 - **To reopen a database in the same process, `close()` it first.** A rebalancing thread can hold a handle for up to one split after the last `Index` drops.
 - **Search from a reader process** with `Index::open_reader(&reader, name)`. It gives a `ReadIndex` with the same searches, at the reader's snapshots, and no writes; the writer process inserts and rebalances. A reader process has its own block cache (`ReaderOptions::block_cache`), so size it as you would the writer's (see [Sizing the block cache](#sizing-the-block-cache)). A `ReadIndex` outlives a writer restart: while no writer runs a search fails with `NoWriter` (or `SnapshotExpired` as one starts), and searching again is enough.
 - **The index's table holds its rows only.** Don't write to it directly.

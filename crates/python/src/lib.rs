@@ -14,6 +14,7 @@ mod convert;
 mod db;
 mod error;
 mod feed;
+mod memory;
 mod read;
 mod table;
 mod vector;
@@ -54,6 +55,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<feed::Commit>()?;
     m.add_class::<feed::Change>()?;
     error::register(m)?;
+    // `pigeonhole.memory` (D311 T6): a native submodule, re-exported by `memory.py`. Its
+    // name starts with `_` so the package's `from pigeonhole._native import *` leaves it
+    // out, and `pigeonhole.memory` is the Python module.
+    let memory = PyModule::new(m.py(), "_memory")?;
+    memory::register(&memory)?;
+    m.add_submodule(&memory)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

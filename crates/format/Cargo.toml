@@ -19,15 +19,18 @@ readme = "README.md"
 __unstable-fixed-seed = []
 
 [dependencies]
-crc32c = { workspace = true }
+crc-fast = { workspace = true }
 foldhash = { workspace = true }
+# The f16 kernels' widen (#1306): `convert_to_f32_slice` uses F16C or NEON when the CPU has
+# it, detected at run time (`std`), and an exact software widen otherwise. It keeps format
+# free of `unsafe` (the coordinator's choice on #1306, as #1366 did for checksums).
+half = { workspace = true, features = ["std"] }
 twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-half = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

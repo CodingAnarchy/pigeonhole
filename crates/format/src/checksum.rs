@@ -13,11 +13,22 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 
 /// Extends a running CRC32C with `bytes`.
 pub fn crc32c_append(crc: u32, bytes: &[u8]) -> u32 {
-    // The crc32c crate uses inline assembly, which Miri cannot run.
+    // The SIMD paths are intrinsics Miri cannot run.
     if cfg!(miri) {
         crc32c_soft(crc, bytes)
+    } else if crc == 0 {
+        // The common case (every frame, header and record): crc-fast's whole-buffer entry,
+        // which skips the digest's set-up (#1206 lever 4).
+        crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, bytes) as u32
     } else {
-        ::crc32c::crc32c_append(crc, bytes)
+        // Continuing a finished CRC: the digest's state is the register before the final
+        // inversion, so it starts at `!crc`.
+        let mut d = crc_fast::Digest::new_with_init_state(
+            crc_fast::CrcAlgorithm::Crc32Iscsi,
+            u64::from(!crc),
+        );
+        d.update(bytes);
+        d.finalize() as u32
     }
 }
 
@@ -92,14 +103,30 @@ mod tests {
     #[test]
     fn soft_crc_matches() {
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + i / 3) as u8).collect();
-        // The standard CRC32C check value.
+        // The standard CRC32C check value, on both paths.
         assert_eq!(super::crc32c_soft(0, b"123456789"), 0xE306_9283);
-        for split in [0, 1, 17, 999, 1000] {
-            let (a, b) = data.split_at(split);
-            assert_eq!(
-                super::crc32c_soft(super::crc32c_soft(0, a), b),
-                ::crc32c::crc32c(&data)
-            );
+        assert_eq!(super::crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(super::crc32c(b""), 0);
+        // Every length a frame takes (the small-input path below 16 bytes and around the
+        // SIMD block sizes), and continuing a finished CRC at any split.
+        for len in [
+            0, 1, 7, 8, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000,
+        ] {
+            let whole = super::crc32c(&data[..len]);
+            assert_eq!(whole, super::crc32c_soft(0, &data[..len]), "len {len}");
+            for split in [0, 1, len / 2, len.saturating_sub(1), len] {
+                let (a, b) = data[..len].split_at(split.min(len));
+                assert_eq!(
+                    super::crc32c_soft(super::crc32c_soft(0, a), b),
+                    whole,
+                    "soft len {len} split {split}"
+                );
+                assert_eq!(
+                    super::crc32c_append(super::crc32c(a), b),
+                    whole,
+                    "len {len} split {split}"
+                );
+            }
         }
     }
 }

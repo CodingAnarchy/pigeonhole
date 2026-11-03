@@ -225,6 +225,11 @@
 # knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
 # shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
 #
+# knn-exact-f16 lowered for #1393 (#1306; the f16 kernels widen 64 halves at a time with half's
+# convert_to_f32_slice, F16C under callgrind), the head's count (run 41574416929, 556670e7)
+# times (1 + 0.3%): 1976, from 2512 (count 2504 -> 1970, -21.3%). Still +16% on knn-exact: the
+# rest is half's wrapper, which only a fenced unsafe F16C call removes (#1396, Post-1.0).
+#
 # New shape for #1320 (#1302; D308's byte-budgeted nearest search, D193: every shape has a
 # ceiling), the head's count (run 41501153418, 2c6f21a8) times (1 + 0.3%): knn-budget 1694,
 # equal to knn-exact's: the budget bounds the result, not the read, and the cut over 10
@@ -253,6 +258,13 @@
 # commit-one 8834 -> 8806, commit-sixteen 38937 -> 38504, commit-overwrite 10829 -> 10818,
 # commit-at 9787 -> 9769, commit-async 8956 -> 8928. ycsb-a is left: its lowering would be 7
 # instructions, inside its run-to-run spread.
+#
+# Lowered by #1366 (#1206 lever 4 A, CRC32C through crc-fast) from its head 75420ac4's counts,
+# merged onto main (instructions run 41590984156), with `instruction-ceilings.py lower` on the
+# shapes it moves: commit-one 8806 -> 8589, commit-sixteen 38504 -> 36529, commit-overwrite
+# 10818 -> 10608, commit-at 9769 -> 9532, commit-async 8928 -> 8713, ycsb-a 25940 -> 25844 (its
+# 107-instruction drop is twice its run-to-run spread). Shapes the run lists as lowerable but
+# this change leaves level are left; multi-get-dense's 2 instructions are noise.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -267,18 +279,18 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
-commit-one 8806 0.3
-commit-sixteen 38504 0.3
+commit-one 8589 0.3
+commit-sixteen 36529 0.3
 flush 2199 0.3
 compact 2783 0.5
 ycsb-c 43293 1.0
-ycsb-a 25940 1.0
-commit-overwrite 10818 0.5
-commit-at 9769 0.3
+ycsb-a 25844 1.0
+commit-overwrite 10608 0.5
+commit-at 9532 0.3
 scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
-commit-async 8928 0.3
+commit-async 8713 0.3
 scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
@@ -291,6 +303,6 @@ knn-exact 1696 0.3
 knn-filtered 3400 0.3
 scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
-knn-exact-f16 2512 0.3
+knn-exact-f16 1976 0.3
 knn-exact-bf16 1693 0.3
 knn-budget 1700 0.3
