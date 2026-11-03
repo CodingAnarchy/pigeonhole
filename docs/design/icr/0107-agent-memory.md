@@ -154,7 +154,7 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
      - `Keep` and `Supersede` mark the memories consolidated;
      - `Delete` deletes them, except one that superseded another, which is marked consolidated instead (C3).
 - **`ConsolidatePass`** (`#[non_exhaustive]`): `groups`, `committed`, `skipped`, `created`, `merged` and `sources`.
-- **`Error::Consolidate { error, pass }`:** a consolidator `Err` stops the pass, and the groups before it stay committed. Its `code()` is `MergeFailed`, the code for a failed application callback.
+- **`Error::Consolidate { error, pass }`:** a consolidator `Err` stops the pass, and the groups before it stay committed. Its `code()` is `MergeFailed`, the closest code: like a merge operator, the consolidator is application code that combines values (cli692 on #1386).
 - **`StoredMemory::consolidated`**, and **`Weights::consolidated`** (default 0.5): a factor on a consolidated memory's importance signal in recall.
 - **Near-duplicate dedup:**
   - **The setting:** `NearDedup::new(similarity).policy(DedupPolicy)` (`#[non_exhaustive]`, `Copy`, getters), with `similarity` from −1 to 1.

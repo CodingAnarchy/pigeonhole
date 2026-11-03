@@ -30,8 +30,9 @@ pub enum Error {
     Corruption(String),
     /// The application's [`Consolidator`](crate::Consolidator) failed, which stops the pass
     /// ([`Store::consolidate`](crate::Store::consolidate)). The groups before it committed:
-    /// `pass` counts them. Its [`code`](Error::code) is `MergeFailed`, the code for an
-    /// application callback that failed; match the variant to tell it apart.
+    /// `pass` counts them. Its [`code`](Error::code) is `MergeFailed`, the closest code: like
+    /// a merge operator, the consolidator is application code that combines values. Match
+    /// the variant to tell it apart.
     Consolidate {
         /// The consolidator's error.
         error: Box<dyn std::error::Error + Send + Sync>,
