@@ -4108,6 +4108,18 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 
 **A fix after PR 4 (#1370; simp724's D312 heads-up).** A cursor that reads a frame mid-write stops short. If the successor's header lands in the same step, `chain()` used to report the mismatch as corruption. Now the first stop short of a successor's recorded end, per `(epoch, stop)`, is "not yet" (`End`), and the next step reads again from there. The same stop on the second look is still corruption. M1 makes the deferral safe: a torn read only hits records past the frontier the poll loaded before reading. A D312 mapped store completes before its group's seqno is published, so that holds there too.
 
+**How PR 5a builds it** (async feeds; the coordinator's split of PR 5):
+- **`FeedReader::poll_next`** polls as `wait` does and, when nothing is ready, registers the task's waker instead of parking a thread. It registers in the watermark registry the feed follows (`waiters`, or `durable_waiters`), at the frontier plus one. Where the feed's own holds keep the frontier below the watermark (a lazy flush or background sync to come; `wait` re-polls every millisecond there), it registers in `Feed::hold_waiters`, and the shard wakes that list when `settle_feed_written` lets a WRITTEN or SYNCED hold go, after publishing it. Either way the poll then loads the frontier again and polls once more if it moved, so a publish between the poll and the registration isn't missed. The hold list's empty check is a flag with a SeqCst fence on each side (the release's store before its load, the registration's store before the re-check's load), and its wake is out of line, so the shard's settle pays one fence only when it releases a hold. Close and failure wake it too (`wake_all_visible`).
+- **Reader processes: `Unsupported`** (option (b), confirmed by the coordinator). There is no writer-side wake to register with, and a waker-driven backoff would need a timer thread per process. The blocking `next` on a thread of its own serves it. Option (a), a process-wide feed-tick thread, is #1407 (Post-1.0).
+- **Public:** `Feed::poll_next` follows recoveries as `next` does. `Unsupported` isn't sticky, so the same feed can still use `next`. `nonblocking::FeedStream` yields owned commits, yields an error once and then ends, and keeps the token (`token`, `into_inner`).
+- **The guide:** `docs/guide/change-feed.md`, doctested.
+- **Tests:**
+  - `it/feed_async.rs`: a pending feed woken by the commit it waits for, and the reader-process refusal.
+  - `it/feed_written.rs`: an async feed that the SYNCED hold keeps back is woken when the shard lets it go (real VFS; mutation-checked: without the shard's wake it isn't woken).
+  - `pigeonhole/tests/nonblocking.rs`: a `FeedStream` woken by a commit from another thread, whose token then resumes.
+
+**A fix after PR 4 (#1415, found by PR 5b's bench).** The synced hold was one `(low, end)` pair per shard, released only once a sync passed `end`. A sync covers what was logged when it was submitted, and under steady `Buffered` load records logged while it was in flight pushed `end` past it, so the hold never let go and a durable feed was delivered nothing while the load lasted. The hold's records now go in buckets: each sync the shard submits (group, batched group, a flush's or checkpoint's barrier, or the feed's background sync) closes the open bucket, and a completion drops the buckets it passed and moves the hold up to the lowest seqno left. The per-commit work is unchanged; the group-sync paths check one cell and close the bucket out of line. The WRITTEN hold doesn't have the race, since the lazy flush's write is synchronous on the shard thread. `it::feed_written::a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered` covers a group sync and the background sync on the real VFS (mutation-checked). With PR 5a's async feeds, a rise wakes the hold waiters as a release does (`released |= low != held` in `settle_feed_written`), or an async durable feed would sleep through the load; `it::feed_written::an_async_durable_feed_is_woken_when_the_synced_hold_rises` covers it (mutation-checked).
+
 <a id="d311"></a>
 ## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
 **Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
@@ -4217,6 +4229,19 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - the budget at its boundary, `max` keeping the best-valued, and each filter on a bridge;
   - no graph signal without `expand` or for seeds, the hop errors, and a reader process.
   - Mutations dropping the backlink direction, and keeping a hop's first-found memories instead of its best, were caught.
+
+**T5 (#1339).** The recall benchmark (`memrecall`, LongMemEval-S/M and LoCoMo, bge-small-en-v1.5; the results are in the agent memory guide). The owner's calls on #1402 (2026-11-03):
+- **Call 4, amended: `Weights::recency` defaults to 0.25, not 1.** At 1, fusion ranked below keyword alone on both benchmarks (NDCG@10 0.789 against 0.864 on LongMemEval-S). At 0.25 it beats every single signal on both (0.871 and 0.454). 0 is slightly better on these datasets, which ask nothing recency-shaped, but agents' questions do, so the default keeps some pull. The other weights are unchanged.
+- **T8 (#1342, IVF) stays in 1.1.0,** after #1403. At ~94k memories in one namespace a fused recall takes 68 ms p50, 37 ms of it the exact vector scan.
+- **Fuzzy keyword recall stays off** (revision 2 §8): it doesn't help recall and costs 18–100× the plain search.
+
+**T8 (#1342).** IVF recall for large namespaces, opt-in at create (`StoreOptions::ivf`). The design is on #1342 (c6605838140), reviewed by cli692 (API), perf287 (R1–R3) and simp724. #1412 added the vector half.
+- **Vector half (#1412):** `insert_*_in`/`delete_in` in a caller's transaction, with a per-transaction `Placed` record and `after_commit`, plus `Search::id_prefix`/`max_probe`.
+- **Index shape:** one per store, keyed by the memory's row key; a namespace is its row-key prefix. A prefixed search seeks in each list: R1 measured 0.01 ms for 100 of 100,000 cells against 5.14 ms for the whole row.
+- **Namespace counter:** `{ns}\0c:stats:embedded`, a blind increment in each write. It's advisory, and is read at the recall's snapshot to pick exact or IVF (at least `min_namespace_len`, 10,000).
+- **Fallback:** a search that would widen past `max(nprobe, count / 64)` lists searches exactly instead (perf287's per-list rule).
+- **`after_commit` never fails a write** (simp724).
+- **`verify`** reports index mismatch and counter drift separately.
 
 <a id="d312"></a>
 ## D312 — REJECTED: mapped `Buffered` WAL writes, with a group's frames stored through a shared mapping of the segment instead of `pwrite` (ctr274 / simp724, prototype approved 2026-11-02; owner shelved it 2026-11-03, call 4; io, wal; #1206 lever 4 B2, #1369)

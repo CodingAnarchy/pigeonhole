@@ -1,0 +1,13 @@
+# D311 T5 (#1339): the fixture's embedding model, on CPU. Install into a venv:
+#   python3 -m venv .venv && .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.15.0 && .venv/bin/pip install -r requirements.txt
+# 5.6.0 and later fix GHSA-jhr6-gm9c-rqjv (a local model's code ran without trust_remote_code).
+sentence-transformers==5.6.1
+# transformers 5 fixes advisories 4.x has (perf2's P1 on #1422), and needs torch 2.6 or later.
+# The published fixture was embedded with sentence-transformers 3.3.1, transformers 4.57.6 and
+# torch 2.5.1; these pins embed the same texts to within 3e-7 per component, with every
+# query's top 10 unchanged on a 2,000-memory sample (#1422).
+transformers==5.22.1
+tokenizers==0.23.3
+huggingface-hub==2.4.0
+safetensors==0.8.0
+numpy==2.1.3

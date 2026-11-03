@@ -29,6 +29,23 @@ pub trait Consolidator: Send + Sync {
     ) -> std::result::Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// A [`Consolidator`] error that means "stopped before answering", not "failed": return it
+/// (boxed) when the consolidator can't answer for a reason that isn't the group's, such as
+/// a binding whose caller was interrupted. A pass ends on it as on any consolidator error
+/// ([`Error::Consolidate`](crate::Error::Consolidate)), but a
+/// [`ConsolidateLoop`](crate::ConsolidateLoop) keeps the namespace due at its next step
+/// instead of postponing it by `min_age` ([`LoopStep::stopped`](crate::LoopStep::stopped)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsolidateStopped;
+
+impl std::fmt::Display for ConsolidateStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the consolidator stopped before answering")
+    }
+}
+
+impl std::error::Error for ConsolidateStopped {}
+
 /// What a consolidation does with a group's memories once it commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -242,6 +259,14 @@ impl<'a> Consolidate<'a> {
     /// What the consolidator returns skips near dedup ([`NearDedup`](crate::NearDedup)): a
     /// summary is meant to sit near its sources.
     pub fn run(self) -> Result<ConsolidatePass> {
+        let store = self.store;
+        let r = self.run_inner();
+        // The pass's IVF writes, after its transactions (D311 T8).
+        store.ivf_settle();
+        r
+    }
+
+    fn run_inner(self) -> Result<ConsolidatePass> {
         check_namespace(self.ns)?;
         if let Some(a) = self.after
             && a.namespace() != self.ns
@@ -448,7 +473,12 @@ impl<'a> Consolidate<'a> {
         for m in made {
             let r = store.remember_with(&mut txn, self.ns, m, new_rid(now)?, now, None)?;
             match &r {
-                Remembered::New(_) => counts.0 += 1,
+                Remembered::New(id) => {
+                    counts.0 += 1;
+                    // Marks it a summary (T9): a watch reports it as `Summarized`, and the
+                    // feed-driven loop doesn't take its own writes for new memories.
+                    txn.put(t, &id.row(), META, SUMMARY, b"1");
+                }
                 _ => counts.1 += 1,
             }
             let id = r.id().clone();

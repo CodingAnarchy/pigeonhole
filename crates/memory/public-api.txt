@@ -11,15 +11,19 @@ pub pigeonhole_memory::Error::Consolidate::pass: pigeonhole_memory::ConsolidateP
 pub pigeonhole_memory::Error::Corruption(alloc::string::String)
 pub pigeonhole_memory::Error::Db(pigeonhole::error::Error)
 pub pigeonhole_memory::Error::InvalidArgument(alloc::string::String)
+pub pigeonhole_memory::Error::LoopTakenOver(alloc::string::String)
 pub pigeonhole_memory::Error::Mismatch(alloc::string::String)
 pub pigeonhole_memory::Error::NotFound(alloc::string::String)
 pub pigeonhole_memory::Error::Text(pigeonhole_text::error::Error)
+pub pigeonhole_memory::Error::Vector(pigeonhole_vector::error::Error)
 impl pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::code(&self) -> pigeonhole::error::ErrorCode
 impl core::convert::From<pigeonhole::error::Error> for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::from(pigeonhole::error::Error) -> Self
 impl core::convert::From<pigeonhole_text::error::Error> for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::from(pigeonhole_text::error::Error) -> Self
+impl core::convert::From<pigeonhole_vector::error::Error> for pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::from(pigeonhole_vector::error::Error) -> Self
 impl core::error::Error for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for pigeonhole_memory::Error
@@ -36,6 +40,16 @@ pub pigeonhole_memory::Fusion::Rrf
 pub pigeonhole_memory::Kind::Episodic
 pub pigeonhole_memory::Kind::Procedural
 pub pigeonhole_memory::Kind::Semantic
+#[non_exhaustive] pub enum pigeonhole_memory::MemoryEvent
+pub pigeonhole_memory::MemoryEvent::Deleted(pigeonhole_memory::MemoryId)
+pub pigeonhole_memory::MemoryEvent::Remembered(pigeonhole_memory::MemoryId)
+pub pigeonhole_memory::MemoryEvent::Summarized(pigeonhole_memory::MemoryId)
+pub pigeonhole_memory::MemoryEvent::Superseded
+pub pigeonhole_memory::MemoryEvent::Superseded::by: pigeonhole_memory::MemoryId
+pub pigeonhole_memory::MemoryEvent::Superseded::id: pigeonhole_memory::MemoryId
+pub pigeonhole_memory::MemoryEvent::Updated(pigeonhole_memory::MemoryId)
+impl pigeonhole_memory::MemoryEvent
+pub fn pigeonhole_memory::MemoryEvent::id(&self) -> &pigeonhole_memory::MemoryId
 #[non_exhaustive] pub enum pigeonhole_memory::Remembered
 pub pigeonhole_memory::Remembered::Merged(pigeonhole_memory::MemoryId)
 pub pigeonhole_memory::Remembered::New(pigeonhole_memory::MemoryId)
@@ -52,6 +66,16 @@ pub fn pigeonhole_memory::Consolidate<'a>::after(self, &'a pigeonhole_memory::Me
 pub fn pigeonhole_memory::Consolidate<'a>::now_us(self, u64) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::policy(self, &'a pigeonhole_memory::ConsolidatePolicy) -> Self
 pub fn pigeonhole_memory::Consolidate<'a>::run(self) -> pigeonhole_memory::Result<pigeonhole_memory::ConsolidatePass>
+pub struct pigeonhole_memory::ConsolidateLoop
+impl pigeonhole_memory::ConsolidateLoop
+pub fn pigeonhole_memory::ConsolidateLoop::clock(self, impl core::ops::function::Fn() -> u64 + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::namespaces(self, &[&str]) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::next_due(&self) -> core::option::Option<u64>
+pub fn pigeonhole_memory::ConsolidateLoop::policy(self, &pigeonhole_memory::ConsolidatePolicy) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::run(&mut self, &core::sync::atomic::AtomicBool) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::ConsolidateLoop::run_once(&mut self, core::time::Duration) -> pigeonhole_memory::Result<pigeonhole_memory::LoopStep>
+impl core::fmt::Debug for pigeonhole_memory::ConsolidateLoop
+pub fn pigeonhole_memory::ConsolidateLoop::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::ConsolidatePass
 pub pigeonhole_memory::ConsolidatePass::committed: u64
 pub pigeonhole_memory::ConsolidatePass::created: u64
@@ -77,6 +101,10 @@ pub fn pigeonhole_memory::ConsolidatePolicy::new() -> Self
 pub fn pigeonhole_memory::ConsolidatePolicy::sources(self, pigeonhole_memory::SourcePolicy) -> Self
 impl core::default::Default for pigeonhole_memory::ConsolidatePolicy
 pub fn pigeonhole_memory::ConsolidatePolicy::default() -> Self
+pub struct pigeonhole_memory::ConsolidateStopped
+impl core::error::Error for pigeonhole_memory::ConsolidateStopped
+impl core::fmt::Display for pigeonhole_memory::ConsolidateStopped
+pub fn pigeonhole_memory::ConsolidateStopped::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_memory::EmbeddingModel
 impl pigeonhole_memory::EmbeddingModel
 pub fn pigeonhole_memory::EmbeddingModel::dim(&self) -> u32
@@ -126,6 +154,17 @@ pub fn pigeonhole_memory::Forgetter::set_wakeup(&mut self, alloc::boxed::Box<(dy
 pub fn pigeonhole_memory::Forgetter::wait(&mut self, core::time::Duration)
 impl core::fmt::Debug for pigeonhole_memory::Forgetter
 pub fn pigeonhole_memory::Forgetter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_memory::IvfOptions
+impl pigeonhole_memory::IvfOptions
+pub fn pigeonhole_memory::IvfOptions::get_min_namespace_len(&self) -> u64
+pub fn pigeonhole_memory::IvfOptions::get_nprobe(&self) -> core::option::Option<u32>
+pub fn pigeonhole_memory::IvfOptions::get_target_list_len(&self) -> core::option::Option<u32>
+pub fn pigeonhole_memory::IvfOptions::min_namespace_len(self, u64) -> Self
+pub fn pigeonhole_memory::IvfOptions::new() -> Self
+pub fn pigeonhole_memory::IvfOptions::nprobe(self, u32) -> Self
+pub fn pigeonhole_memory::IvfOptions::target_list_len(self, u32) -> Self
+impl core::default::Default for pigeonhole_memory::IvfOptions
+pub fn pigeonhole_memory::IvfOptions::default() -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::Link
 pub pigeonhole_memory::Link::id: pigeonhole_memory::MemoryId
 pub pigeonhole_memory::Link::ty: pigeonhole_memory::LinkType
@@ -138,6 +177,13 @@ pub const pigeonhole_memory::LinkType::SIMILAR_TO: pigeonhole_memory::LinkType
 pub const pigeonhole_memory::LinkType::SUPERSEDES: pigeonhole_memory::LinkType
 pub fn pigeonhole_memory::LinkType::custom(u8) -> pigeonhole_memory::Result<pigeonhole_memory::LinkType>
 pub fn pigeonhole_memory::LinkType::get(self) -> u8
+#[non_exhaustive] pub struct pigeonhole_memory::LoopStep
+pub pigeonhole_memory::LoopStep::events: usize
+pub pigeonhole_memory::LoopStep::failed: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::Error)>
+pub pigeonhole_memory::LoopStep::next_due: core::option::Option<u64>
+pub pigeonhole_memory::LoopStep::passes: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
+pub pigeonhole_memory::LoopStep::stopped: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
+pub pigeonhole_memory::LoopStep::token: pigeonhole_memory::WatchToken
 #[non_exhaustive] pub struct pigeonhole_memory::Marked
 pub pigeonhole_memory::Marked::marked: usize
 pub pigeonhole_memory::Marked::missing: alloc::vec::Vec<pigeonhole_memory::MemoryId>
@@ -151,6 +197,10 @@ pub fn pigeonhole_memory::Memory::new(impl core::convert::Into<alloc::string::St
 pub fn pigeonhole_memory::Memory::pinned(self, bool) -> Self
 pub fn pigeonhole_memory::Memory::session(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_memory::Memory::source(self, impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct pigeonhole_memory::MemoryCommit
+pub pigeonhole_memory::MemoryCommit::events: alloc::vec::Vec<pigeonhole_memory::MemoryEvent>
+pub pigeonhole_memory::MemoryCommit::seqno: u64
+pub pigeonhole_memory::MemoryCommit::timestamp_us: u64
 pub struct pigeonhole_memory::MemoryId
 impl pigeonhole_memory::MemoryId
 pub fn pigeonhole_memory::MemoryId::created_us(&self) -> u64
@@ -180,9 +230,11 @@ pub struct pigeonhole_memory::ReadStore
 impl pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
 pub fn pigeonhole_memory::ReadStore::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
+pub fn pigeonhole_memory::ReadStore::ivf(&self) -> core::option::Option<pigeonhole_memory::IvfOptions>
 pub fn pigeonhole_memory::ReadStore::normalization(&self) -> pigeonhole_text::layout::Normalization
 pub fn pigeonhole_memory::ReadStore::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::ReadStore::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+pub fn pigeonhole_memory::ReadStore::watch(&self, &[&str]) -> pigeonhole_memory::WatchBuilder
 impl core::fmt::Debug for pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_memory::Recall<'a>
@@ -190,12 +242,14 @@ impl<'a> pigeonhole_memory::Recall<'a>
 pub fn pigeonhole_memory::Recall<'a>::byte_budget(self, u64) -> Self
 pub fn pigeonhole_memory::Recall<'a>::candidates(self, usize) -> Self
 pub fn pigeonhole_memory::Recall<'a>::embedding(self, impl core::convert::Into<alloc::vec::Vec<f32>>) -> Self
+pub fn pigeonhole_memory::Recall<'a>::exact(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::expand(self, pigeonhole_memory::Expand) -> Self
 pub fn pigeonhole_memory::Recall<'a>::fusion(self, pigeonhole_memory::Fusion) -> Self
 pub fn pigeonhole_memory::Recall<'a>::half_life(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::Recall<'a>::include_superseded(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::k(self, usize) -> Self
 pub fn pigeonhole_memory::Recall<'a>::now_us(self, u64) -> Self
+pub fn pigeonhole_memory::Recall<'a>::nprobe(self, u32) -> Self
 pub fn pigeonhole_memory::Recall<'a>::run(self) -> pigeonhole_memory::Result<alloc::vec::Vec<pigeonhole_memory::RecallHit>>
 pub fn pigeonhole_memory::Recall<'a>::run_with_stats(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
 pub fn pigeonhole_memory::Recall<'a>::session(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -220,6 +274,8 @@ pub pigeonhole_memory::RecallHit::text: alloc::string::String
 pub pigeonhole_memory::RecallStats::candidates: usize
 pub pigeonhole_memory::RecallStats::expanded: usize
 pub pigeonhole_memory::RecallStats::expansion_truncated: bool
+pub pigeonhole_memory::RecallStats::ivf_fallbacks: usize
+pub pigeonhole_memory::RecallStats::ivf_namespaces: usize
 pub pigeonhole_memory::RecallStats::truncated: bool
 #[non_exhaustive] pub struct pigeonhole_memory::Signal
 pub pigeonhole_memory::Signal::rank: u32
@@ -238,6 +294,7 @@ pub struct pigeonhole_memory::Store
 impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::consolidate<'a>(&'a self, &'a str, &'a dyn pigeonhole_memory::Consolidator) -> pigeonhole_memory::Consolidate<'a>
 impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::consolidate_loop(&self, &str, alloc::rcs::arc::Arc<dyn pigeonhole_memory::Consolidator>) -> pigeonhole_memory::ConsolidateLoop
 pub fn pigeonhole_memory::Store::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::create_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::delete(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
@@ -245,6 +302,7 @@ pub fn pigeonhole_memory::Store::delete_in(&self, &mut pigeonhole::write::Transa
 pub fn pigeonhole_memory::Store::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
 pub fn pigeonhole_memory::Store::forget_policy(&self) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::ForgetPolicy>>
 pub fn pigeonhole_memory::Store::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
+pub fn pigeonhole_memory::Store::ivf(&self) -> core::option::Option<pigeonhole_memory::IvfOptions>
 pub fn pigeonhole_memory::Store::link(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::mark_used(&self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<pigeonhole_memory::Marked>
 pub fn pigeonhole_memory::Store::normalization(&self) -> pigeonhole_text::layout::Normalization
@@ -258,6 +316,7 @@ pub fn pigeonhole_memory::Store::set_forget_policy(&self, core::option::Option<p
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::take_forgetter(&self) -> core::option::Option<pigeonhole_memory::Forgetter>
 pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+pub fn pigeonhole_memory::Store::watch(&self, &[&str]) -> pigeonhole_memory::WatchBuilder
 impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::forget(&self) -> pigeonhole_memory::Forget<'_>
 pub fn pigeonhole_memory::Store::forget_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId, u64) -> pigeonhole_memory::Result<pigeonhole_memory::Forgot>
@@ -275,12 +334,15 @@ impl pigeonhole_memory::StoreOptions
 pub fn pigeonhole_memory::StoreOptions::embedding(self, pigeonhole_memory::EmbeddingModel) -> Self
 pub fn pigeonhole_memory::StoreOptions::episodic_ttl(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::StoreOptions::forget(self, pigeonhole_memory::ForgetPolicy) -> Self
+pub fn pigeonhole_memory::StoreOptions::ivf(self, pigeonhole_memory::IvfOptions) -> Self
 pub fn pigeonhole_memory::StoreOptions::near_dedup(self, pigeonhole_memory::NearDedup) -> Self
 pub fn pigeonhole_memory::StoreOptions::new() -> Self
 pub fn pigeonhole_memory::StoreOptions::normalization(self, pigeonhole_text::layout::Normalization) -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::StoreStats
 pub pigeonhole_memory::StoreStats::broken_links: u64
 pub pigeonhole_memory::StoreStats::dangling_superseded: u64
+pub pigeonhole_memory::StoreStats::ivf_counter_drift: u64
+pub pigeonhole_memory::StoreStats::ivf_mismatched: u64
 pub pigeonhole_memory::StoreStats::memories: u64
 pub pigeonhole_memory::StoreStats::missing_embeddings: u64
 pub pigeonhole_memory::StoreStats::no_content: u64
@@ -300,9 +362,28 @@ pub pigeonhole_memory::StoredMemory::links: alloc::vec::Vec<pigeonhole_memory::L
 pub pigeonhole_memory::StoredMemory::pinned: bool
 pub pigeonhole_memory::StoredMemory::session: core::option::Option<alloc::string::String>
 pub pigeonhole_memory::StoredMemory::sources: alloc::vec::Vec<pigeonhole_memory::Source>
+pub pigeonhole_memory::StoredMemory::summary: bool
 pub pigeonhole_memory::StoredMemory::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::StoredMemory::text: alloc::string::String
 pub pigeonhole_memory::StoredMemory::uses: u64
+pub struct pigeonhole_memory::Watch
+impl pigeonhole_memory::Watch
+pub fn pigeonhole_memory::Watch::next(&mut self, core::time::Duration) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::MemoryCommit>>
+pub async fn pigeonhole_memory::Watch::next_async(&mut self) -> pigeonhole_memory::Result<pigeonhole_memory::MemoryCommit>
+pub fn pigeonhole_memory::Watch::oldest_retained(&self) -> core::option::Option<u64>
+pub fn pigeonhole_memory::Watch::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole_memory::Result<pigeonhole_memory::MemoryCommit>>
+pub fn pigeonhole_memory::Watch::token(&self) -> pigeonhole_memory::WatchToken
+pub fn pigeonhole_memory::Watch::try_next(&mut self) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::MemoryCommit>>
+pub struct pigeonhole_memory::WatchBuilder
+impl pigeonhole_memory::WatchBuilder
+pub fn pigeonhole_memory::WatchBuilder::from_snapshot(self, &pigeonhole::db::Snapshot) -> Self
+pub fn pigeonhole_memory::WatchBuilder::open(self) -> pigeonhole_memory::Result<pigeonhole_memory::Watch>
+pub fn pigeonhole_memory::WatchBuilder::resume(self, &pigeonhole_memory::WatchToken) -> Self
+pub fn pigeonhole_memory::WatchBuilder::visible(self) -> Self
+pub struct pigeonhole_memory::WatchToken(_)
+impl pigeonhole_memory::WatchToken
+pub fn pigeonhole_memory::WatchToken::as_bytes(&self) -> &[u8]
+pub fn pigeonhole_memory::WatchToken::from_bytes(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::Weights
 pub pigeonhole_memory::Weights::consolidated: f64
 pub pigeonhole_memory::Weights::graph: f64
@@ -313,6 +394,7 @@ pub pigeonhole_memory::Weights::uses: f64
 pub pigeonhole_memory::Weights::vector: f64
 impl core::default::Default for pigeonhole_memory::Weights
 pub fn pigeonhole_memory::Weights::default() -> Self
+pub const pigeonhole_memory::PASS_OVER_PER_POLL: usize
 pub trait pigeonhole_memory::Consolidator: core::marker::Send + core::marker::Sync
 pub fn pigeonhole_memory::Consolidator::consolidate(&self, &[pigeonhole_memory::StoredMemory]) -> core::result::Result<alloc::vec::Vec<pigeonhole_memory::Memory>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub fn pigeonhole_memory::normalize(&str) -> alloc::string::String

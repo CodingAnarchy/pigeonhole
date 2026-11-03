@@ -15,6 +15,9 @@ pub enum Hold {
     DeleteBeforeCommit,
     /// A phase 2 transaction, after its reads and writes and before its commit.
     ReassignBeforeCommit,
+    /// A merge, after its commit and before it reloads the shared centroid cache: the
+    /// cache still names the merged-away list (D311 T8's stale-cache writes).
+    MergeBeforeReload,
 }
 
 type Gate = Arc<(Mutex<State>, Condvar)>;

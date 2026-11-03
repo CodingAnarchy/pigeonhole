@@ -79,7 +79,7 @@ class EmbeddingModel:
 
 @final
 class Weights:
-    """Recall's signal weights: every one 1 by default, `graph` and `consolidated` 0.5."""
+    """Recall's signal weights: 1 by default; `recency` 0.25, `graph` and `consolidated` 0.5."""
 
     def __new__(
         cls,
@@ -414,6 +414,7 @@ class Store:
         forget: ForgetPolicy | None = None,
         episodic_ttl: Seconds | None = None,
         near_dedup: NearDedup | None = None,
+        normalization: Literal["nfc", "nfkc", "none"] | None = None,
     ) -> Store: ...
     @staticmethod
     def open(db: Database, name: str, *, model: str | None) -> Store: ...
@@ -429,6 +430,8 @@ class Store:
     ) -> bool: ...
     @property
     def embedding_model(self) -> EmbeddingModel | None: ...
+    @property
+    def normalization(self) -> Literal["nfc", "nfkc", "none", "unknown"]: ...
     def remember(
         self,
         ns: str,
@@ -544,6 +547,8 @@ class ReadStore:
     ) -> bool: ...
     @property
     def embedding_model(self) -> EmbeddingModel | None: ...
+    @property
+    def normalization(self) -> Literal["nfc", "nfkc", "none", "unknown"]: ...
     def get(self, id: Id) -> StoredMemory | None: ...
     def verify(self) -> StoreStats: ...
     def recall(

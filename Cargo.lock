@@ -1116,7 +1116,9 @@ dependencies = [
  "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",
+ "pigeonhole-memory",
  "pigeonhole-sst",
+ "pigeonhole-text",
  "pigeonhole-vector",
  "proptest",
  "rocksdb",
@@ -1232,6 +1234,7 @@ dependencies = [
  "pigeonhole",
  "pigeonhole-memory",
  "pigeonhole-text",
+ "pigeonhole-vector",
  "twox-hash",
 ]
 

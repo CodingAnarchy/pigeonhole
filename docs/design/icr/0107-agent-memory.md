@@ -61,7 +61,7 @@
   - **What a hit carries:** `.with_signals(bool)` and `.with_embeddings(bool)`.
   - **Running it:** `run() -> Result<Vec<RecallHit>>` and `run_with_stats() -> Result<(Vec<RecallHit>, RecallStats)>`.
 - **`Fusion`** (`#[non_exhaustive]`, default `Rrf`): `Rrf` or `Linear`.
-- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph` (default 0.5).
+- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1 but `recency`, 0.25 since T5: D311's call 4 amendment): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph` (default 0.5).
 - **`RecallHit`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `created_us`, `superseded_by: Option<MemoryId>` (set only under `include_superseded`; cli692's S1 on #1374), `score`, `signals: Option<Signals>` and `embedding: Option<Vec<f32>>`.
 - **The signal types** are `#[non_exhaustive]`:
   - `Signals` has `vector`, `keyword`, `recency`, `importance` and `uses`, each an `Option<Signal>`;
@@ -238,18 +238,80 @@ The design is on #1341 (cli692, c6593086022), plus the owner's three-part decisi
 - **`StoreOptions::normalization(Normalization)`** sets the Unicode normalisation of the store's text index at create. The default is `Nfc`, so existing stores and every call that doesn't set it behave as before.
 - **`Store::normalization()` and `ReadStore::normalization()`** read it back from the index. The index fixes it at create, so nothing at open can disagree.
 - **`pigeonhole_memory::Normalization`** re-exports `pigeonhole_text::Normalization` (`#[non_exhaustive]`), so callers don't need the text crate.
+- **The other surfaces (#1405):** Python's `Store.create(..., normalization="nfc" | "nfkc" | "none")` (`InvalidArgument` for anything else) with `Store.normalization` and `ReadStore.normalization` (`"unknown"` for a form this build doesn't name), and `phdb mcp --memory-normalization nfc|nfkc|none` for a new store, checked against an existing store's at startup (exit 2 on a mismatch, as for the model flags).
 - **It's a keyword-recall setting only:** exact dedup's text normalisation (trim, collapse whitespace, no case folding) is unchanged.
+
+## T8: IVF recall for large namespaces (#1342)
+The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–R3) and simp724's, and the vector half in #1412.
+- **`StoreOptions::ivf(IvfOptions)`**, create-only. It needs an embedding model (else `InvalidArgument`).
+  - **`IvfOptions`** (`#[non_exhaustive]`, `Copy`, `Default`): `min_namespace_len` (10,000, at least 1), `nprobe` and `target_list_len` (the vector index's defaults when unset, at least 1 when set), with `get_*` getters.
+  - **`Store::ivf()` and `ReadStore::ivf()`** read the options back. `open` takes them from `G`, so a store's IVF can't be turned on or off at open.
+- **The index:** `mem_{name}_ivf`, a `pigeonhole-vector` index in background rebalancing mode, of the model's spec, keyed by the memory's row key. Each embedding is stored twice, in `emb:v` and in its list.
+- **Writes** go in the memory's own transaction: `insert_f32_in` in `remember`/`remember_in`'s insert (merges and supersedes write no vector), and `delete_in` in `Store::delete_in`.
+  - Every removal goes through `Store::delete_in`, including `forget` and consolidation's `Delete`, so the index follows them. A comment there says a future removal path must too (simp724).
+  - **Each write makes its own `Placed` in the transaction's body** and parks it. `remember`, `delete` and the forget and consolidate passes hand the parked records to `after_commit` once their transactions return.
+  - **`after_commit`'s errors are dropped:** the memories are committed, and a missed rebalance waits for the next write to those lists (simp724).
+  - **A `remember_in` caller's records** wait for the store's next write call.
+- **The namespace counter:** `{ns}\0c:stats:embedded` (the `stats` counter family), incremented blind by ±1 with each indexed insert and delete, so concurrent remembers don't conflict through it (a test commits two overlapping `remember_in`s). It's advisory: drift changes only which path a recall takes.
+- **Recall:**
+  - **Choosing the path:** each namespace's counter is read at the recall's snapshot. At `min_namespace_len` or more, the vector signal comes from the index (`id_prefix("{ns}\0m")`, at the same snapshot), else from the exact `nearest` scan.
+  - **The fallback:** the search widens to at most `max(nprobe, count / 64)` lists (64 is a seek's cost in scored cells, perf287's rule after R1). A search cut there falls back to the exact scan for that namespace.
+  - **`Recall::exact(bool)`** forces the exact scan, and **`Recall::nprobe(u32)`** sets the first probe per recall.
+  - **`RecallStats::ivf_namespaces` and `ivf_fallbacks`** say which path ran.
+- **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
+- **`Error::Vector(pigeonhole_vector::Error)`**, with the index's database errors mapped to `Error::Db`.
+
+## T9, part 1: memory events from the change feed (#1343)
+The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The feed-driven consolidation loop is part 2.
+- **`Store::watch(&[&str]) -> WatchBuilder`** and **`ReadStore::watch`**, over `Table::feed`/`ReadTable::feed`.
+  - An empty list means every namespace. One namespace becomes the feed's row prefix `{ns}\0m`, and several are filtered in the crate.
+  - A bad namespace is `InvalidArgument` at `open`, as is a database whose change feed is off or doesn't follow `mem_{name}`.
+- **`WatchBuilder`:** `from_snapshot(&Snapshot)`, `resume(&WatchToken)`, `visible()` and `open() -> Result<Watch>`.
+- **`Watch`:** `next(Duration) -> Result<Option<MemoryCommit>>`, `try_next()`, `token() -> WatchToken` and `oldest_retained()`. `FeedExpired` passes through, as `Error::Db`.
+- **`WatchToken`:** the feed's token, with `as_bytes()`/`from_bytes()`. Resuming with another namespace list continues the same feed position (cli692's A4).
+- **`MemoryCommit`** (`#[non_exhaustive]`) holds `seqno`, `timestamp_us` and `events` (at least one). Commits with no memory events are passed over.
+- **`MemoryEvent`** (`#[non_exhaustive]`), with `id()`. There's one per memory per commit, the strongest winning (cli692's A2):
+  - `Deleted` (a `DeleteFamily` of `content`);
+  - `Remembered` (a `content:text` put), or `Summarized` (with `meta:summary`);
+  - `Superseded { id, by }` (a `meta:superseded_by` put; `by`, an existing memory, sees `Updated` for the link);
+  - `Updated` (anything else on the row).
+  - Dedup rows, counter rows and `G` are never events.
+- **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it. `StoredMemory::summary` reads it (cli692 on #1430).
+- **Async (after #1408, D310 PR 5a):** `Watch::poll_next(&mut Context) -> Poll<Result<MemoryCommit>>` and `Watch::next_async() -> Result<MemoryCommit>` (its future is `Send`), over `Feed::poll_next`. Commits without memory events are passed over within the call, at most `PASS_OVER_PER_POLL` (64) of them, after which it wakes its task and returns `Pending` (cli692 on #1438). It's writer only: a reader process gets `Unsupported`, as from `Feed::poll_next`, and calls the sync `next` on a thread of its own.
+
+## T9, part 2: the feed-driven consolidation loop (#1343)
+- **`Store::consolidate_loop(name, Arc<dyn Consolidator>) -> ConsolidateLoop`:** owned and `Send + 'static`, holding a `Store` clone, so a binding can keep it across calls or move it to a thread (cli692's B2 on #1432).
+  - builders `policy(&ConsolidatePolicy)`, `namespaces(&[&str])` (empty means all) and `clock(Fn() -> u64 + Send + Sync + 'static)` (cli692's A3). The clock is used for `min_age` and the due times only; the step's timeout is real time (simp724's L4 on #1432);
+  - `run_once(Duration) -> Result<LoopStep>`, `next_due() -> Option<u64>` and `run(&AtomicBool)`;
+  - the name is non-empty without `:` (`InvalidArgument` at the first step).
+- **`LoopStep`** (`#[non_exhaustive]`): `events`, `passes: Vec<(String, ConsolidatePass)>`, `failed: Vec<(String, Error)>`, `next_due` and `token: WatchToken`.
+- **Scheduling:**
+  - Only `Remembered` marks a namespace, from its memory's `created_us` (cli692's A1, simp724's R3). `Summarized` and `Updated` (merges, `mark_used`, links) never do.
+  - A namespace is due at its oldest pending memory plus `min_age`. After a pass at `now`, the next pending time comes from a newest-first scan of its memory rows, stopping at the first older than `now − min_age`.
+  - A failed pass (`Error::Consolidate`) leaves the namespace pending from `now`, so it's retried after `min_age`. A database error ends the step.
+  - **`ConsolidateStopped`** (a unit struct, `std::error::Error`) is a consolidator's way to say it stopped rather than failed, as an interrupted binding does. Its namespace keeps its pending time, so it's due again at the next step, and is listed in **`LoopStep::stopped: Vec<(String, ConsolidatePass)>`**, with the pass so far, rather than `failed` (cli692 on #1441 and #1442). `Store::consolidate` still ends with `Error::Consolidate` on it.
+  - `run_once`'s wait is the smaller of its timeout and the next due time (A5: it bounds the wait, not the passes).
+- **Position:** `G:meta:loop:{name}` holds a version byte (1), a generation (u64), the watch token, and the pending map ((namespace, µs) pairs), little endian.
+  - **Saving:** each step ends with a transaction that reads the cell, requires the generation it last saved, and writes it plus one.
+  - **Claiming:** a loop claims the name at its first step (a save). So the newest loop of a name owns it, and an older one fails its next step with **`Error::LoopTakenOver(name)`** (code `Conflict`; cli692's B1 on #1432). A conflicting commit of the save means the same: the read is of that one cell, which only another loop of the name writes (D275 per-cell reads; simp724's L2).
+  - **The generation moves only after the commit succeeds** (simp724's L1 on #1432), so a save that fails otherwise (`Busy`, I/O) doesn't fence the loop out. `hooks::fail_next_loop_save` (a fault seam) tests it.
+- **Racing passes** conflict group by group: each group's transaction reads its sources' `meta:consolidated` (and content, supersede, pin), and a conflicting group is skipped (simp724's R1).
+- **A group's summary, the sources' marks and any deletes commit in one transaction** (R2). A failure between groups leaves the earlier groups committed, and the retry folds only the rest (tested).
+- **Catch-up** (no saved position, or `FeedExpired` at the resume's open or at a later `next`; cli692's B3 on #1432): at a snapshot, every watched namespace with an unconsolidated, non-summary memory is pending from its oldest one (R4). The watch then starts `from_snapshot`. The scan reads `meta` only, since a memory row that exists is live (simp724's L3).
 
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
   - `emb:v`, the embedding;
-  - `meta`: `kind` (a 1-byte code), `session`, `pinned`, `consolidated` (T3: `1`, once a consolidation took it in), `superseded_by` (the newer memory's row key) and `valid_to` (µs);
+  - `meta`: `kind` (a 1-byte code), `session`, `pinned`, `consolidated` (T3: `1`, once a consolidation took it in), `summary` (T9: `1`, a memory a consolidator returned), `superseded_by` (the newer memory's row key) and `valid_to` (µs);
   - `sources:{id}`, the first-seen µs;
   - `stats:uses`, a counter;
   - `peak:importance` (parts per million) and `peak:last_used` (µs), both `max` aggregates;
   - `links:{target row}` and `backlinks:{source row}`, each `[type u8][weight f32 LE]`.
 - **Dedup rows:** `{ns}\0h{xxh3_128 of the normalised text, big-endian}`, holding `meta:rid` (the memory's row key).
+- **Counter rows (T8, IVF stores only):** `{ns}\0c`, holding `stats:embedded`, the namespace's memories with an embedding.
 - **`G`'s `meta`:** `layout` (1), `text_index`, `model_id`, `model_dim` and `model_element` (`0` for F32, `1` for F16, `2` for BF16).
   - `near_dedup` (T3) holds the setting: a version byte (1), the similarity (`f32` LE), and the policy (`0` Skip, `1` Merge, `2` Link).
+  - `loop:{name}` (T9) holds a consolidation loop's position (above).
+  - `ivf` (T8) holds `IvfOptions`: a version byte (1), `min_namespace_len` (8 bytes), then `nprobe` and `target_list_len` (4 bytes each, 0 for the index's default), little endian.
   - `forget` (T2) holds the policy: a version byte (1), `min_retention` (a flag, then `f64`), `half_life` µs, `use_weight`, `max_per_pass`, `interval` µs (each 8 bytes, little endian), then a count and the `(kind u8, max_age µs)` pairs.

@@ -137,6 +137,9 @@ impl Memory {
                     options = options
                         .episodic_ttl(std::time::Duration::from_secs(hours.saturating_mul(3600)));
                 }
+                if let Some(n) = &args.memory_normalization {
+                    options = options.normalization(normalization(n));
+                }
                 let store = Store::create(p, &name, options).map_err(fail)?;
                 let _ = writeln!(
                     stderr,
@@ -173,6 +176,21 @@ impl Memory {
                 }
             }
         };
+        // The normalisation is fixed at create: a flag naming another one for an existing
+        // store fails at startup, as a model that doesn't match does (#1405).
+        if let Some(want) = &args.memory_normalization {
+            let have = match &store {
+                Handle::Writer(s) => s.normalization(),
+                Handle::Reader(s) => s.normalization(),
+            };
+            if have != normalization(want) {
+                return Err(Failure::usage(&format!(
+                    "--memory-normalization {want}: memory store {name}'s text index is {}, \
+                     fixed when it was created",
+                    normalization_name(have)
+                )));
+            }
+        }
         if exists && (args.memory_episodic_ttl.is_some() || args.memory_dim.is_some()) {
             let _ = writeln!(
                 stderr,
@@ -686,6 +704,25 @@ impl Memory {
             ),
             (None, None) => "The store has no embedding model: send text only.".into(),
         }
+    }
+}
+
+/// `--memory-normalization`'s value (clap admits only these three).
+fn normalization(flag: &str) -> pigeonhole_memory::Normalization {
+    match flag {
+        "nfkc" => pigeonhole_memory::Normalization::Nfkc,
+        "none" => pigeonhole_memory::Normalization::None,
+        _ => pigeonhole_memory::Normalization::Nfc,
+    }
+}
+
+/// A normalisation as `--memory-normalization` names it.
+fn normalization_name(n: pigeonhole_memory::Normalization) -> &'static str {
+    match n {
+        pigeonhole_memory::Normalization::Nfc => "nfc",
+        pigeonhole_memory::Normalization::Nfkc => "nfkc",
+        pigeonhole_memory::Normalization::None => "none",
+        _ => "another normalisation",
     }
 }
 

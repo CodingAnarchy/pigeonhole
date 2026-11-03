@@ -247,6 +247,7 @@ These calls have no async form (owner decision recorded in [D196](../design/deci
 - **`Transaction::get_row` and `Pigeonhole::transact`:** a transaction's row read is blocking, and so is `transact`'s retry loop. Async code drives the loop itself with `Pigeonhole::transaction`, `Transaction::get_async`, `commit_async` and `RetryPolicy::next_pause` ([Transactions](transactions.md)).
 - **Open, close and schema calls:** `open`, `open_reader`, `open_application_owned`, `close`, `table(..)` with `create`, `create_if_missing` or `open`, and `drop_table`. They are short, and you usually call them at startup and shutdown.
 - **Cheap calls** that never wait on I/O in a writer process: `snapshot`, `write_batch`, `transaction`, the builders, `tables`, `engine_metrics`, and the durability getters and setters.
+- **A change feed in a reader process:** `Feed::poll_next` and `FeedStream` work in the writer process only. In a reader process, call the feed's blocking `next` on a thread of its own ([Change feed](change-feed.md#async)).
 
 ## Next
-[Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Agent reference](agent-reference.md)
+[Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Change feed](change-feed.md) · [Agent reference](agent-reference.md)

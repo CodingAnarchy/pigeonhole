@@ -20,22 +20,27 @@
 mod consolidate;
 mod dedup;
 mod error;
+mod feed_loop;
 mod forget;
 /// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
 /// unstable, and never needed by applications.
 #[cfg(feature = "__unstable-hooks")]
 #[doc(hidden)]
 pub mod hooks;
+mod ivf;
 mod layout;
 mod recall;
 mod store;
+mod watch;
 
 pub use consolidate::{
-    Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
+    Consolidate, ConsolidatePass, ConsolidatePolicy, ConsolidateStopped, Consolidator, SourcePolicy,
 };
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
+pub use feed_loop::{ConsolidateLoop, LoopStep};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
+pub use ivf::IvfOptions;
 pub use layout::{MemoryId, normalize};
 /// The text index's Unicode normalisation ([`StoreOptions::normalization`]), re-exported from
 /// `pigeonhole-text`.
@@ -45,6 +50,7 @@ pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
     Source, Store, StoreOptions, StoreStats, StoredMemory,
 };
+pub use watch::{MemoryCommit, MemoryEvent, PASS_OVER_PER_POLL, Watch, WatchBuilder, WatchToken};
 
 #[cfg(doctest)]
 mod guide {

@@ -19,6 +19,11 @@ doctest = false
 
 [dependencies]
 pigeonhole = { path = "../pigeonhole", version = "1.0.0" }
+# `Pigeonhole::Memory` (PR 3a).
+pigeonhole-memory = { path = "../memory", version = "1.0.0" }
+# `Pigeonhole::Text` and `Pigeonhole::Vector` (PR 3b).
+pigeonhole-text = { path = "../text", version = "1.0.0" }
+pigeonhole-vector = { path = "../vector", version = "1.0.0" }
 # `bytes`: `RString::to_bytes`, the safe copy of a String's bytes.
 magnus = { version = "0.9", features = ["bytes"] }
 # `gvl.rs` only: `rb_thread_call_without_gvl2`, which magnus doesn't wrap (ICR 0111, O3).

@@ -65,6 +65,12 @@ pub trait CellVisitor {
     /// What it hands the reducer.
     type Item;
 
+    /// Whether [`visit`](Self::visit) reads its `qualifier`. A visitor that doesn't (a
+    /// nearest-neighbour search scores the value alone) gets an empty one, and a range read
+    /// unescapes the qualifier only for an item the reducer [`admits`](Reducer::admits)
+    /// (#1283 lever 1). A constant, so a visitor that reads it compiles as before.
+    const QUALIFIER: bool = true;
+
     /// One cell, borrowed for the call: `row` and `qualifier` unescaped, `value` the stored
     /// value with its tag byte (in place where the source holds it).
     fn visit(
@@ -177,6 +183,15 @@ pub trait Reducer: Send {
     /// One item from `cell`. A group pushes in cell order. `Break` ends this group's read
     /// (the reducer is full, or has all it can take).
     fn push(&mut self, cell: CellRef<'_>, item: Self::Item) -> ControlFlow<()>;
+
+    /// Whether `item` could be kept, judged before its cell is built: `false` only when
+    /// [`push`](Self::push) would drop it whatever its cell, and then it isn't pushed (#1283
+    /// lever 1). It never changes what is kept: an item that ties the bound is admitted, and
+    /// `push` breaks the tie by cell.
+    #[inline]
+    fn admits(&self, _item: &Self::Item) -> bool {
+        true
+    }
 
     /// Folds another group's result in.
     fn merge(&mut self, other: Self);
@@ -641,17 +656,15 @@ where
             while in_row(lane, &row_esc) {
                 let col = lane.col();
                 let end = col.len().saturating_sub(2).max(row_len);
-                qualifier.clear();
-                Escaped::new(&col[row_len..end]).unescape_into(&mut qualifier);
+                // Unescaped before the visit only for a visitor that reads it; otherwise only
+                // for an item the reducer admits (#1283 lever 1).
+                if V::QUALIFIER {
+                    qualifier.clear();
+                    Escaped::new(&col[row_len..end]).unescape_into(&mut qualifier);
+                }
                 stats.cells += 1;
-                let visit = visitor.visit(&row, lane.family, &qualifier, lane.ts, lane.value());
-                let cell = CellRef {
-                    row: &row,
-                    family_rank,
-                    family: lane.family,
-                    qualifier: &qualifier,
-                    ts: lane.ts,
-                };
+                let q: &[u8] = if V::QUALIFIER { &qualifier } else { &[] };
+                let visit = visitor.visit(&row, lane.family, q, lane.ts, lane.value());
                 let (item, after) = match visit {
                     Visit::Skip => (None, None),
                     Visit::Emit(item) => (Some(item), None),
@@ -660,9 +673,23 @@ where
                     Visit::Stop => return Ok(false),
                 };
                 if let Some(item) = item
-                    && reducer.push(cell, item).is_break()
+                    && (V::QUALIFIER || reducer.admits(&item))
                 {
-                    return Ok(true);
+                    if !V::QUALIFIER {
+                        let col = lane.col();
+                        qualifier.clear();
+                        Escaped::new(&col[row_len..end]).unescape_into(&mut qualifier);
+                    }
+                    let cell = CellRef {
+                        row: &row,
+                        family_rank,
+                        family: lane.family,
+                        qualifier: &qualifier,
+                        ts: lane.ts,
+                    };
+                    if reducer.push(cell, item).is_break() {
+                        return Ok(true);
+                    }
                 }
                 if after.is_some() {
                     next_row = true;
@@ -963,6 +990,16 @@ impl<S: Ord + Send> Reducer for TopK<S> {
             self.insert(item, cell.to_key());
         }
         ControlFlow::Continue(())
+    }
+
+    /// A score above the worst kept one, with `k` kept, can't enter whatever its cell; one
+    /// equal to it can, by a smaller cell.
+    #[inline]
+    fn admits(&self, item: &S) -> bool {
+        match self.kept.last() {
+            Some((worst, _)) if self.kept.len() == self.k => item <= worst,
+            _ => self.k > 0,
+        }
     }
 
     fn merge(&mut self, other: Self) {
@@ -1531,6 +1568,31 @@ mod tests {
             y.merge(x);
             assert_eq!(y.finish(), want, "split at {split}");
         }
+    }
+
+    /// #1283 lever 1: `admits` refuses exactly the scores `push` would drop whatever their
+    /// cell (above the worst kept, with `k` kept), and admits a tie, which `push` settles
+    /// by cell. Dropping a refused item before its push keeps the same result.
+    #[test]
+    fn top_k_admits_every_score_that_could_enter() {
+        assert!(!TopK::<u32>::new(0).admits(&0));
+        let mut t = TopK::new(2);
+        assert!(t.admits(&9), "room left");
+        let _ = t.push(cell("b", 0, "q", 1), 5u32);
+        assert!(t.admits(&9), "room left");
+        let _ = t.push(cell("c", 0, "q", 1), 7);
+        assert!(t.admits(&6) && t.admits(&7), "below and tying the worst");
+        assert!(!t.admits(&8), "above the worst");
+        // A tie with a smaller cell enters; it was admitted.
+        let _ = t.push(cell("a", 0, "q", 1), 7);
+        assert_eq!(
+            rows(&t.clone().finish()),
+            vec![(&b"b"[..], 0, &b"q"[..], 1), (b"a", 0, b"q", 1)]
+        );
+        // Every refused score is one `push` drops.
+        let before = t.clone().finish();
+        let _ = t.push(cell("0", 0, "", 0), 8);
+        assert_eq!(t.finish(), before);
     }
 
     #[test]

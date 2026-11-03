@@ -10,6 +10,10 @@ use crate::error::{Error, Result};
 pub(crate) const MEMORY_TAG: &[u8] = b"\0m";
 /// The dedup rows' tag: `{ns}\0h{hash}`.
 pub(crate) const DEDUP_TAG: &[u8] = b"\0h";
+/// A namespace's counter row's tag: `{ns}\0c` (D311 T8), `stats:embedded` counting the
+/// namespace's memories with an embedding, so recall can choose the IVF index for a large
+/// one. A blind increment in each write: advisory, as drift only changes the path.
+pub(crate) const COUNT_TAG: &[u8] = b"\0c";
 /// The store's own row: the layout version, the embedding model, the text index's name.
 pub(crate) const GLOBAL: &[u8] = b"G";
 
@@ -27,6 +31,9 @@ pub(crate) const SESSION: &[u8] = b"session";
 pub(crate) const PINNED: &[u8] = b"pinned";
 /// Set once a consolidation took the memory in (T3).
 pub(crate) const CONSOLIDATED: &[u8] = b"consolidated";
+/// `meta:summary` (`1`): a memory a consolidator returned (D311 T9), so watchers and the
+/// feed-driven loop can tell a pass's own writes from new memories.
+pub(crate) const SUMMARY: &[u8] = b"summary";
 pub(crate) const SUPERSEDED_BY: &[u8] = b"superseded_by";
 pub(crate) const VALID_TO: &[u8] = b"valid_to";
 pub(crate) const RID: &[u8] = b"rid";
@@ -35,6 +42,8 @@ pub(crate) const SOURCES: &str = "sources";
 /// `stats` (a counter): `uses`.
 pub(crate) const STATS: &str = "stats";
 pub(crate) const USES: &[u8] = b"uses";
+/// `{ns}\0c:stats:embedded`, the namespace counter (D311 T8).
+pub(crate) const EMBEDDED: &[u8] = b"embedded";
 /// `peak` (a `max` aggregate): `importance` (parts per million) and `last_used` (µs).
 pub(crate) const PEAK: &str = "peak";
 pub(crate) const IMPORTANCE: &[u8] = b"importance";
@@ -54,6 +63,8 @@ pub(crate) const TEXT_INDEX: &[u8] = b"text_index";
 pub(crate) const FORGET: &[u8] = b"forget";
 /// `G`: the near-duplicate dedup setting (T3).
 pub(crate) const NEAR_DEDUP: &[u8] = b"near_dedup";
+/// `G:meta:ivf`: the store's IVF recall options (D311 T8), when it has the index.
+pub(crate) const IVF: &[u8] = b"ivf";
 
 pub(crate) const LAYOUT_VERSION: u64 = 1;
 
@@ -83,6 +94,11 @@ pub(crate) fn check_namespace(ns: &str) -> Result<()> {
 /// A memory's row key: `{ns}\0m{rid}`.
 pub(crate) fn memory_row(ns: &str, rid: &[u8; 16]) -> Vec<u8> {
     [ns.as_bytes(), MEMORY_TAG, rid].concat()
+}
+
+/// A namespace's counter row: `{ns}\0c` (D311 T8).
+pub(crate) fn count_row(ns: &str) -> Vec<u8> {
+    [ns.as_bytes(), COUNT_TAG].concat()
 }
 
 /// A dedup row's key: `{ns}\0h{hash}`.

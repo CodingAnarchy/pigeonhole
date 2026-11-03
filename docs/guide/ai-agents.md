@@ -1,6 +1,6 @@
 # Using Pigeonhole from AI agents
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)).
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.1, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)).
 
 `phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs, find nearest vectors and write in atomic batches, with no glue code. Agent code written in Python can use the [Python bindings](python.md) directly instead.
 
@@ -118,6 +118,8 @@ A reader process (`--read-only`) serves `memory_recall` only. Memory ids are `Me
 - **The server embeds** (`--embed-url URL --embed-model NAME [--embed-key-env VAR]`): the server calls an OpenAI-compatible `/embeddings` endpoint for every memory and recall query, so the tools take text only and refuse client vectors. A new store is pinned to `NAME`, with the dimension of the endpoint's first answer. **The memory text and the recall queries are sent to that endpoint.** The API key is read from the environment variable `VAR` and sent as a bearer token; it's never a flag value, and never logged. A key goes only over `https://`, or plain `http://` to this machine (`localhost`, `127.0.0.1`, `[::1]`). `https://` uses the operating system's trust store. Local servers that speak the same API (Ollama, llama.cpp, LM Studio) work over `http://`. A `phdb` built with `--no-default-features` leaves the endpoint client out (the `embed` feature).
 
 Reopening a store with a model flag that names another model than the store's fails at startup.
+
+**Keyword matching.** `--memory-normalization nfkc` makes a new store's keyword recall match ligatures and full-width forms against plain text, for memories from PDFs, OCR or East Asian sources (`nfc` is the default; `none` compares code points as written). It's fixed when the store is created: for an existing store, a value other than the store's stops the server at startup.
 
 **Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs. A store whose application set a policy forgets under it too.
 

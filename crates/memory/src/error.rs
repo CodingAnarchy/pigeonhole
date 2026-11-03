@@ -13,6 +13,8 @@ pub enum Error {
     /// The text index refused or failed it (passed through, `Busy` during its repair
     /// included).
     Text(pigeonhole_text::Error),
+    /// The store's IVF index refused or failed it (D311 T8; [`StoreOptions::ivf`](crate::StoreOptions::ivf)).
+    Vector(pigeonhole_vector::Error),
     /// The arguments don't fit the store:
     /// - a bad namespace, or a malformed `MemoryId`;
     /// - a memory with neither text nor embedding;
@@ -28,6 +30,12 @@ pub enum Error {
     Mismatch(String),
     /// The store's rows don't parse.
     Corruption(String),
+    /// A [`ConsolidateLoop`](crate::ConsolidateLoop) of the same name started since this
+    /// one last saved, and took the name over (D311 T9): this loop should stop. Its
+    /// [`code`](Error::code) is `Conflict`, but don't retry it, or make a new loop of the name
+    /// in its place: the newer loop is already running, and two supervisors that recreate on
+    /// this would take the name back and forth for ever (cli692 on #1432).
+    LoopTakenOver(String),
     /// The application's [`Consolidator`](crate::Consolidator) failed, which stops the pass
     /// ([`Store::consolidate`](crate::Store::consolidate)). The groups before it committed:
     /// `pass` counts them. Its [`code`](Error::code) is `MergeFailed`, the closest code: like
@@ -47,10 +55,12 @@ impl Error {
         match self {
             Error::Db(e) => e.code(),
             Error::Text(e) => e.code(),
+            Error::Vector(e) => e.code(),
             Error::InvalidArgument(_) | Error::NotFound(_) | Error::Mismatch(_) => {
                 ErrorCode::InvalidArgument
             }
             Error::Corruption(_) => ErrorCode::Corruption,
+            Error::LoopTakenOver(_) => ErrorCode::Conflict,
             Error::Consolidate { .. } => ErrorCode::MergeFailed,
         }
     }
@@ -61,10 +71,15 @@ impl fmt::Display for Error {
         match self {
             Error::Db(e) => e.fmt(f),
             Error::Text(e) => e.fmt(f),
+            Error::Vector(e) => e.fmt(f),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
             Error::Mismatch(m) => write!(f, "embedding model mismatch: {m}"),
             Error::Corruption(m) => write!(f, "store corruption: {m}"),
+            Error::LoopTakenOver(name) => write!(
+                f,
+                "another consolidation loop named {name:?} started on this store and took it over"
+            ),
             Error::Consolidate { error, .. } => write!(f, "the consolidator failed: {error}"),
         }
     }
@@ -75,6 +90,7 @@ impl std::error::Error for Error {
         match self {
             Error::Db(e) => Some(e),
             Error::Text(e) => Some(e),
+            Error::Vector(e) => Some(e),
             Error::Consolidate { error, .. } => Some(error.as_ref()),
             _ => None,
         }
@@ -93,6 +109,16 @@ impl From<pigeonhole_text::Error> for Error {
             // The text index's database errors are the database's.
             pigeonhole_text::Error::Db(e) => Error::Db(e),
             e => Error::Text(e),
+        }
+    }
+}
+
+impl From<pigeonhole_vector::Error> for Error {
+    fn from(e: pigeonhole_vector::Error) -> Self {
+        match e {
+            // The index's database errors are the database's.
+            pigeonhole_vector::Error::Db(e) => Error::Db(e),
+            e => Error::Vector(e),
         }
     }
 }

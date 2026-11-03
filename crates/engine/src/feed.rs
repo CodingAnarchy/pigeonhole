@@ -17,6 +17,7 @@
 //! - **A clean close keeps the WAL files** with the feed on (their checkpoints at their
 //!   ends), and the next open adopts them without replaying anything (`final_close`).
 
+use pigeonhole_format::hash::FastMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -350,6 +351,14 @@ pub(crate) struct Feed {
     /// Each stream's checkpoint history, for the feed reader's start positions
     /// ([`Feed::start_at`]).
     checkpoints: Vec<Mutex<CheckpointHistory>>,
+    /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
+    /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
+    /// waits on the visible or durable watermark, but a hold releasing moves the frontier
+    /// without a publish there, so the shard wakes these when it releases one.
+    hold_waiters: Mutex<FastMap<u64, std::task::Waker>>,
+    /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
+    /// release with no async feed waiting costs one load.
+    has_hold_waiters: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a sidecar sync is in flight, and whether appends since its submission wait for
@@ -392,6 +401,8 @@ impl Feed {
             sidecar_sync: Mutex::default(),
             sidecar_syncs: AtomicU64::new(0),
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
+            hold_waiters: Mutex::default(),
+            has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -528,6 +539,59 @@ impl Feed {
                     false
                 }
             },
+        }
+    }
+
+    /// Registers `waker` (reader `key`, replacing its last one) to be woken when a hold lets
+    /// go. The caller loads the frontier again afterwards: a release that published before
+    /// this registration is seen there; one after it finds the waker.
+    pub(crate) fn wait_for_hold(&self, key: u64, waker: &std::task::Waker) {
+        let mut w = self
+            .hold_waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        w.insert(key, waker.clone());
+        self.has_hold_waiters.store(true, Ordering::SeqCst);
+        drop(w);
+        // Pairs with the fence in `wake_hold_waiters`: the caller's re-check of the frontier
+        // (an Acquire load of WRITTEN/SYNCED) can't be ordered before this store, so either
+        // it sees the shard's release or the shard sees this flag.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Forgets reader `key`'s waker (the reader is dropped).
+    pub(crate) fn forget_hold_waiter(&self, key: u64) {
+        let mut w = self
+            .hold_waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        w.remove(&key);
+        if w.is_empty() {
+            self.has_hold_waiters.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// After a shard let one of its holds go (its WRITTEN or SYNCED store published first):
+    /// wakes every async reader waiting on a hold. One load when none waits; out of line, so
+    /// the shard's settle stays small (perf287's codegen lesson on #1297).
+    #[inline(never)]
+    pub(crate) fn wake_hold_waiters(&self) {
+        // The release's WRITTEN/SYNCED store (Release) before the flag's load: store then
+        // load on different atomics needs a SeqCst fence on each side (`wait_for_hold`).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.has_hold_waiters.load(Ordering::SeqCst) {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut w = self
+                .hold_waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.has_hold_waiters.store(false, Ordering::SeqCst);
+            w.drain().map(|(_, waker)| waker).collect()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 

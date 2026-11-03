@@ -153,6 +153,29 @@ fn ids_arg(ob: &Bound<'_, PyAny>) -> PyResult<Vec<mem::MemoryId>> {
     ob.try_iter()?.map(|x| id_arg(&x?)).collect()
 }
 
+/// `"nfc"`, `"nfkc"` or `"none"` as the text index's normalisation (#1405).
+fn normalization_arg(s: &str) -> PyResult<mem::Normalization> {
+    Ok(match s {
+        "nfc" => mem::Normalization::Nfc,
+        "nfkc" => mem::Normalization::Nfkc,
+        "none" => mem::Normalization::None,
+        _ => {
+            return Err(invalid(format!("normalization {s:?}: nfc, nfkc or none")));
+        }
+    })
+}
+
+/// A normalisation's name; `"unknown"` for one this build doesn't name (the type is
+/// `#[non_exhaustive]`).
+fn normalization_name(n: mem::Normalization) -> &'static str {
+    match n {
+        mem::Normalization::Nfc => "nfc",
+        mem::Normalization::Nfkc => "nfkc",
+        mem::Normalization::None => "none",
+        _ => "unknown",
+    }
+}
+
 fn kind(s: &str) -> PyResult<mem::Kind> {
     Ok(match s {
         "episodic" => mem::Kind::Episodic,
@@ -250,7 +273,7 @@ impl EmbeddingModel {
     }
 }
 
-/// Recall's signal weights (every one 1 by default; `graph` and `consolidated` 0.5).
+/// Recall's signal weights (1 by default; `recency` 0.25, `graph` and `consolidated` 0.5).
 #[pyclass(module = "pigeonhole.memory", frozen)]
 #[derive(Clone)]
 pub(crate) struct Weights(mem::Weights);
@@ -1222,9 +1245,12 @@ impl Store {
     /// Creates the store `name` (tables `mem_NAME` and `mem_NAME_text`) and opens it.
     /// `embedding` pins it to a model; without one, recall is by keyword and recency.
     /// `forget` (or the `episodic_ttl` shorthand) is its forget policy, run on a thread of the
-    /// crate's own; `near_dedup` its near-duplicate dedup.
+    /// crate's own; `near_dedup` its near-duplicate dedup; `normalization` the text index's
+    /// Unicode normalisation, `"nfc"` (the default), `"nfkc"` or `"none"`, fixed at create
+    /// (#1405).
     #[staticmethod]
-    #[pyo3(signature = (db, name, *, embedding=None, forget=None, episodic_ttl=None, near_dedup=None))]
+    #[pyo3(signature = (db, name, *, embedding=None, forget=None, episodic_ttl=None, near_dedup=None, normalization=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create(
         py: Python<'_>,
         db: &Bound<'_, Database>,
@@ -1233,8 +1259,12 @@ impl Store {
         forget: Option<&Bound<'_, ForgetPolicy>>,
         episodic_ttl: Option<&Bound<'_, PyAny>>,
         near_dedup: Option<&Bound<'_, NearDedup>>,
+        normalization: Option<&str>,
     ) -> PyResult<Self> {
         let mut o = mem::StoreOptions::new();
+        if let Some(n) = normalization {
+            o = o.normalization(normalization_arg(n)?);
+        }
         if let Some(m) = embedding {
             o = o.embedding(m.get().0.clone());
         }
@@ -1324,6 +1354,13 @@ impl Store {
             .embedding_model()
             .cloned()
             .map(EmbeddingModel))
+    }
+
+    /// The text index's Unicode normalisation, set at create: `"nfc"`, `"nfkc"` or `"none"`
+    /// (`"unknown"` for one this build doesn't name).
+    #[getter]
+    fn normalization(&self) -> PyResult<&'static str> {
+        Ok(normalization_name(self.handle()?.normalization()))
     }
 
     /// Remembers one memory in namespace `ns`, in one transaction. An exact duplicate (after
@@ -1763,6 +1800,12 @@ impl ReadStore {
     #[getter]
     fn embedding_model(&self) -> PyResult<Option<EmbeddingModel>> {
         Ok(self.store()?.embedding_model().cloned().map(EmbeddingModel))
+    }
+
+    /// The text index's Unicode normalisation ([`Store.normalization`]).
+    #[getter]
+    fn normalization(&self) -> PyResult<&'static str> {
+        Ok(normalization_name(self.store()?.normalization()))
     }
 
     fn get(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<Option<StoredMemory>> {

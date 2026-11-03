@@ -1,5 +1,5 @@
-//! Hold seams for tests (`__unstable-hooks` only, ICR 0085's convention). They pause; they
-//! never run another path.
+//! Hold and fault seams for tests (`__unstable-hooks` only, ICR 0085's convention). They
+//! pause or fail; they never run another path.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
@@ -78,4 +78,32 @@ pub(crate) fn hold(at: Hold) {
     while !s.released {
         s = cv.wait(s).unwrap_or_else(PoisonError::into_inner);
     }
+}
+
+static FAIL_LOOP_SAVE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Fails the next save of the consolidation loop named `name` at its commit, with an error
+/// that isn't a conflict (simp724's L1 on #1432: a failed save mustn't fence the loop out).
+/// By name, so tests running in parallel don't take each other's.
+pub fn fail_next_loop_save(name: &str) {
+    *FAIL_LOOP_SAVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(name.to_owned());
+}
+
+pub(crate) fn take_fail_loop_save(name: &str) -> bool {
+    let mut armed = FAIL_LOOP_SAVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if armed.as_deref() == Some(name) {
+        *armed = None;
+        return true;
+    }
+    false
+}
+
+/// The IVF write records a store has waiting to settle (D311 T8): an inspection helper for
+/// the bounded-growth test (simp724's R1 on #1424).
+pub fn ivf_pending(store: &crate::Store) -> usize {
+    store.ivf_pending_len()
 }

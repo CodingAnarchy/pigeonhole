@@ -18,7 +18,7 @@ use crate::convert::{Bytes, CellValue, Name, Secs, Val, lock, names};
 use crate::error::{OrRb, engine, spent, with_code};
 use crate::fork::ForkSafe;
 use crate::gvl::without_gvl;
-use crate::table::{Durability, Handle, Input, Op, aggregate_input, delete_op};
+use crate::table::{Durability, Handle, Input, Op, aggregate_input, delete_op, vector_input};
 
 /// Applies one recorded write to a `WriteBatch` or `Transaction` (the same method names and
 /// arguments: the table and row first).
@@ -50,6 +50,17 @@ macro_rules! apply {
             Op::Aggregate(f, q, Some(ts), Input::Bytes(v)) => {
                 b.aggregate_bytes_at(t, row, f, q, *ts, v)
             }
+            Op::PutVector(f, q, ts, v) => {
+                use crate::vector::Vector;
+                match (v, ts) {
+                    (Vector::F32(x), None) => b.put_vector_f32(t, row, f, q, x),
+                    (Vector::F32(x), Some(ts)) => b.put_vector_f32_at(t, row, f, q, *ts, x),
+                    (Vector::I8(x), None) => b.put_vector_i8(t, row, f, q, x),
+                    (Vector::I8(x), Some(ts)) => b.put_vector_i8_at(t, row, f, q, *ts, x),
+                    (Vector::Bits(x), None) => b.put_vector_bits(t, row, f, q, x),
+                    (Vector::Bits(x), Some(ts)) => b.put_vector_bits_at(t, row, f, q, *ts, x),
+                }
+            }
             Op::DeleteRow => b.delete_row(t, row),
             Op::DeleteFamily(f) => b.delete_family(t, row, f),
             Op::DeleteColumn(f, q) => b.delete_column(t, row, f, q),
@@ -69,8 +80,9 @@ fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 // ---- Opening ------------------------------------------------------------------------------
 
 /// `Pigeonhole.native_open(path, create, shards, durability, block_cache, row_cache,
-/// memtable_budget, shm_dir, read_only_fallback)`: opens (with `create`, creates) the
-/// database at `path` as the writer process.
+/// memtable_budget, shm_dir, read_only_fallback, change_feed, change_feed_off, feed_age,
+/// feed_tables)`: opens (with `create`, creates) the database at `path` as the writer
+/// process.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     ruby: &Ruby,
@@ -83,6 +95,10 @@ pub(crate) fn open(
     memtable_budget: Option<u64>,
     shm_dir: Option<PathBuf>,
     read_only_fallback: Option<bool>,
+    change_feed: Option<u64>,
+    change_feed_off: bool,
+    feed_age: Option<Secs>,
+    feed_tables: Option<magnus::RArray>,
 ) -> Result<Database, Error> {
     let mut o = pigeonhole::Options::default().create_if_missing(create);
     if let Some(n) = shards {
@@ -106,8 +122,12 @@ pub(crate) fn open(
     if let Some(b) = read_only_fallback {
         o = o.read_only_fallback(b);
     }
+    let o = crate::feed::options(ruby, o, change_feed, change_feed_off, feed_age, feed_tables)?;
     let db = engine(ruby, move || pigeonhole::Pigeonhole::open(path, o))?;
-    Ok(Database(ForkSafe::new(RwLock::new(Some(db)))))
+    Ok(Database(
+        ForkSafe::new(RwLock::new(Some(db))),
+        Mutex::default(),
+    ))
 }
 
 /// `Pigeonhole.native_open_reader(path, shm_dir, block_cache, row_cache)`: opens the
@@ -131,7 +151,10 @@ pub(crate) fn open_reader(
         o = o.row_cache(n);
     }
     let r = engine(ruby, move || pigeonhole::Pigeonhole::open_reader(path, o))?;
-    Ok(Reader(ForkSafe::new(RwLock::new(Some(r)))))
+    Ok(Reader(
+        ForkSafe::new(RwLock::new(Some(r))),
+        Mutex::default(),
+    ))
 }
 
 /// The library's `RetryPolicy` with `transact`'s options.
@@ -181,7 +204,7 @@ pub(crate) fn retry_pause(
 // ---- Database -----------------------------------------------------------------------------
 
 impl Database {
-    fn db(&self, ruby: &Ruby) -> Result<pigeonhole::Pigeonhole, Error> {
+    pub(crate) fn db(&self, ruby: &Ruby) -> Result<pigeonhole::Pigeonhole, Error> {
         read(self.0.get(ruby)?)
             .clone()
             .ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the database is closed"))
@@ -252,7 +275,15 @@ impl Database {
             // `ForkSafe::drop` forgets the parent's handle; nothing to do now.
             return Ok(());
         }
-        let db = write(rb_self.0.get(ruby)?).take();
+        // The memory stores first: dropping their handles stops their forgetters. The list
+        // and the handle are taken under the stores lock, so a store opened meanwhile is in
+        // the list or refused (simp724's L1 on #1395, as in Python).
+        let (stores, db) = {
+            let mut stores = lock(&rb_self.1);
+            let db = write(rb_self.0.get(ruby)?).take();
+            (std::mem::take(&mut *stores), db)
+        };
+        crate::memory::close_stores(ruby, stores)?;
         match db {
             Some(db) => engine(ruby, move || db.close()),
             None => Ok(()),
@@ -268,7 +299,7 @@ impl Database {
 // ---- Reader -------------------------------------------------------------------------------
 
 impl Reader {
-    fn db(&self, ruby: &Ruby) -> Result<pigeonhole::PigeonholeReader, Error> {
+    pub(crate) fn db(&self, ruby: &Ruby) -> Result<pigeonhole::PigeonholeReader, Error> {
         read(self.0.get(ruby)?)
             .clone()
             .ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the reader is closed"))
@@ -304,7 +335,12 @@ impl Reader {
         if rb_self.0.forked() {
             return Ok(());
         }
-        let r = write(rb_self.0.get(ruby)?).take();
+        let (stores, r) = {
+            let mut stores = lock(&rb_self.1);
+            let r = write(rb_self.0.get(ruby)?).take();
+            (std::mem::take(&mut *stores), r)
+        };
+        crate::memory::close_stores(ruby, stores)?;
         without_gvl(ruby, move || drop(r))
     }
 
@@ -413,6 +449,28 @@ pub(crate) fn w_aggregate<T: Record>(
     )
 }
 
+/// `native_put_vector(table, row, family, qualifier, vector, ts)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn w_put_vector<T: Record>(
+    ruby: &Ruby,
+    rb_self: &T,
+    table: &Table,
+    row: Bytes,
+    family: Name,
+    qualifier: Bytes,
+    vector: Value,
+    ts: Option<u64>,
+) -> Result<(), Error> {
+    let v = vector_input(ruby, table.writer(ruby)?, &family.0, vector)?;
+    T::record(
+        ruby,
+        rb_self,
+        table,
+        row.0,
+        Op::PutVector(family.0, qualifier.0, ts, v),
+    )
+}
+
 /// `native_delete(table, row, family, qualifier, ts)`.
 pub(crate) fn w_delete<T: Record>(
     ruby: &Ruby,
@@ -497,7 +555,7 @@ impl WriteBatch {
 
 // ---- Transaction --------------------------------------------------------------------------
 
-const TXN_SPENT: &str = "the transaction was already committed or rolled back";
+pub(crate) const TXN_SPENT: &str = "the transaction was already committed or rolled back";
 
 // The transaction's mutex is taken only inside `without_gvl` closures, and no guard outlives
 // the closure that took it (simp724 on #1399). So a thread never waits on the mutex while

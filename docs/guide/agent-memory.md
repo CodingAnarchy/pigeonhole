@@ -33,7 +33,7 @@ assert_eq!(again, Remembered::Merged(r.id().clone()));
 - **Every write is one transaction:** the memory, its text index entry, its dedup row and both directions of its links commit together. `remember_in` joins your own transaction.
 - **Exact dedup:** the same text after trimming and collapsing whitespace merges into the live memory that has it. It keeps the larger importance, adds the source and counts a use. There's no case folding.
 - **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
-- **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
+- **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. Python's `Store.create(..., normalization="nfkc")` and `phdb mcp --memory-normalization nfkc` set it too. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
 
 ## Recall
 ```rust
@@ -200,5 +200,173 @@ With an embedding model, a store can catch near duplicates as well as exact ones
 - **Summaries skip it:** what a consolidator returns is meant to sit near its sources.
 - **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
 
+## Large namespaces: IVF recall
+Recall searches a namespace's embeddings exactly. That stays fast up to a few thousand memories per namespace. For larger ones, create the store with an IVF index (`pigeonhole-vector`):
+
+```rust
+# use pigeonhole::*;
+use pigeonhole_memory::{EmbeddingModel, IvfOptions, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let model = EmbeddingModel::new("my-embedder-v1", 4, Element::F32)?;
+let store = Store::create(
+    &db,
+    "agents",
+    StoreOptions::new().embedding(model).ivf(IvfOptions::new().min_namespace_len(10_000)),
+)?;
+store.remember("shared:docs", Memory::new("Deploys run at noon.").embedding(vec![0.9, 0.1, 0.0, 0.2]))?;
+let (hits, stats) = store
+    .recall(&["shared:docs"])
+    .embedding(vec![0.8, 0.2, 0.0, 0.1])
+    .run_with_stats()?;
+assert_eq!(hits.len(), 1);
+// One memory is far below min_namespace_len: this recall searched exactly.
+assert_eq!(stats.ivf_namespaces, 0);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Per namespace:** a namespace with at least `min_namespace_len` memories with an embedding (10,000 by default) is searched through the index, and a smaller one exactly. A namespace counter, kept in each write, decides at the recall's snapshot.
+- **Every write keeps the index in step:** a memory's vector goes into the index in the memory's own transaction, and leaves it when the memory is deleted, forgotten or consolidated away. `verify` checks both (`ivf_mismatched`, and `ivf_counter_drift`, which is advisory).
+- **Exactness:** an IVF search probes the lists nearest the query, so it can miss a memory an exact search finds. `Recall::nprobe(n)` probes more for one recall, and `Recall::exact(true)` searches exactly, for checking. A namespace that's sparse among the lists nearest the query (a small one in a big store) falls back to an exact search on its own. `RecallStats::ivf_namespaces` and `ivf_fallbacks` say which path ran.
+- **Cost:** a second copy of each embedding (about 159 MB per 100k memories at `f32`, 82 MB at `f16`), and the index's lists to maintain as memories arrive. The index rebalances in the background.
+- **It's fixed at create.** To add an index to an existing store, create a new store with it and remember the memories into it.
+
+On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157 memories in one namespace and 10,000 in another, remembered interleaved so the second is spread thinly over the index's lists. The latency is warm and single-threaded at the default `nprobe`, p50 over LongMemEval-M's 50 questions:
+
+| | exact | IVF | IVF's recall@10 of the exact vector ranking |
+|---|---|---|---|
+| 89k namespace, vector only | 31.8 ms | 19.2 ms | 0.99 |
+| 89k namespace, fused | 65.1 ms | 49.9 ms | |
+| 10k namespace, vector only | 3.4 ms | 2.3 ms | 0.97 |
+| 10k namespace, fused | 15.3 ms | 13.7 ms | |
+
+- **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (T5's split).
+- **Writes don't contend through it:** 1, 4 and 8 threads remembering into the large namespace committed 1,540, 5,100 and 5,940 memories/s with no conflicts or retries. A list's version only changes when it splits.
+- **Building it:** the 99k memories took 60 s, about the same rate as T5's builds without the index.
+
+## Watching for new memories
+`store.watch(&[namespaces])` follows the store's memory events through the database's change feed, so another part of the application, or another process, learns that a memory arrived without polling. The database must be opened with the change feed on (`Options::change_feed`), following the store's table `mem_{name}` (every table by default):
+
+```rust
+# use pigeonhole::*;
+use pigeonhole_memory::{Memory, MemoryEvent, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(
+    dir.join("guide.phdb"),
+    Options::default().change_feed(FeedRetention::bytes(64 << 20)),
+)?;
+let store = Store::create(&db, "agents", StoreOptions::new())?;
+let mut watch = store.watch(&["shared:team"]).open()?;
+let r = store.remember("shared:team", Memory::new("The demo moved to Friday."))?;
+let commit = watch.next(std::time::Duration::from_secs(1))?.expect("one commit");
+assert_eq!(commit.events, vec![MemoryEvent::Remembered(r.id().clone())]);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Events, one per memory per commit:**
+  - `Remembered`: a new memory;
+  - `Summarized`: a consolidation's summary;
+  - `Superseded { id, by }`;
+  - `Deleted`: also from a forget pass or a consolidation's `Delete`;
+  - `Updated`: an exact-dedup merge, `mark_used`, a link, a source added, or a consolidation taking the memory in.
+
+  Commits that touch no memory are passed over.
+- **An empty namespace list** watches every namespace.
+- **Resuming:** `watch.token()` gives a `WatchToken` to store (`as_bytes`/`from_bytes`), and `store.watch(..).resume(&token)` continues after it, in a later open too. `from_snapshot(&s)` starts after what a snapshot sees: read the store at `s`, then watch, and nothing is missed or seen twice.
+- **Async, in the writer:** `watch.next_async().await` waits without holding a thread (its future is `Send`), and `poll_next(cx)` is the same for hand-written futures.
+- **In a reader process,** `read_store.watch(..)` follows the writer's events from its feed history. There `next_async` is `Unsupported`, and `next` blocks, so call it on a thread of its own.
+- **Delivery** is at durability by default. `.visible()` delivers a commit as soon as reads see it, at the cost the change feed describes.
+- **If the feed's history is recycled past a watch,** `next` fails with `FeedExpired`. Read the store afresh at a snapshot and watch `from_snapshot` it.
+
+## Consolidating as memories arrive
+`store.consolidate_loop(name, &consolidator)` runs consolidation passes as new memories arrive, instead of on a schedule. It watches the store through the change feed (as above), and runs a pass for a namespace once its oldest new memory is the policy's `min_age` old:
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_memory::{ConsolidatePolicy, Consolidator, Memory, Store, StoreOptions, StoredMemory};
+# struct Summarize;
+# impl Consolidator for Summarize {
+#     fn consolidate(&self, g: &[StoredMemory]) -> std::result::Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>> {
+#         Ok(vec![Memory::new(format!("{} notes", g.len()))])
+#     }
+# }
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default().change_feed(FeedRetention::bytes(64 << 20)))?;
+# let store = Store::create(&db, "agents", StoreOptions::new())?;
+let policy = ConsolidatePolicy::new().min_age(std::time::Duration::from_secs(3600));
+let mut each_hour = store
+    .consolidate_loop("main", std::sync::Arc::new(Summarize))
+    .policy(&policy);
+// In the application's own thread or task: one step reads new memories for up to a second,
+// then runs the passes that are due.
+let step = each_hour.run_once(std::time::Duration::from_secs(1))?;
+assert!(step.passes.is_empty()); // nothing is an hour old yet
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **What starts a pass:** a new memory (`Remembered`). A pass's own summaries, merges and `mark_used` don't, so recalling a namespace never triggers its consolidation.
+- **Restarts:** the loop keeps its position under its name in the store, including the namespaces still waiting out their `min_age`. A loop started again with that name resumes there. With no saved position, or after its feed history was recycled, it catches up once by scanning for namespaces with unconsolidated memories.
+- **One loop per name:** a loop that starts takes the name over, and an older one still running fails its next step with `Error::LoopTakenOver` (code `Conflict`). Passes that race on the same memories conflict group by group, so nothing is consolidated twice.
+- **At least once:** a loop stopped between a pass and saving its position runs that pass again, which skips what's already consolidated. A consolidator that fails partway leaves the groups before it committed, and the namespace is retried after `min_age`. One that can't answer for a reason that isn't the group's (it was interrupted, say) can return `ConsolidateStopped` instead: the namespace is then due again at the next step, and `LoopStep::stopped` lists it.
+- **Steps:** `run_once(timeout)`'s timeout bounds the wait for new memories (in real time), not the passes. `next_due()` says when the next pass is due, `run(&stop)` loops until a flag is set, and `.clock(..)` replaces the clock `min_age` is measured on, for tests.
+- **The loop owns what it needs** (a store handle, the consolidator as an `Arc`, its clock), so it can live on a thread of its own.
+- **It runs in the writer process,** since passes write. Other processes can still `watch`.
+
 ## Reader processes
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
+
+## How well it recalls
+These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX102 (D311 T5, #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision. The published vectors were embedded with sentence-transformers 3.3.1 on transformers 4.57.6. The script now pins 5.6.1 on transformers 5.22.1 (security fixes, #1422), which embeds the same texts to within 3e-7 per component and leaves every query's top 10 unchanged on a 2,000-memory sample, so the numbers below weren't re-run.
+- **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
+- **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
+
+Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks the memory hits as returned, and counts each evidence session or turn once, at its first hit. So it's over memories, and may differ from LongMemEval's own session-level NDCG:
+
+| | LongMemEval-S | LoCoMo |
+|---|---|---|
+| vector | 0.955 / 0.974 / 0.853 | 0.545 / 0.658 / 0.426 |
+| keyword | 0.957 / 0.974 / 0.864 | 0.511 / 0.587 / 0.409 |
+| recency | 0.047 / 0.109 / 0.045 | 0.003 / 0.011 / 0.004 |
+| **fused, default weights** (`recency` 0.25) | 0.964 / 0.981 / 0.871 | 0.583 / 0.658 / 0.454 |
+| fused, `recency` at 1 (the default before 1.1.0) | 0.964 / 0.979 / 0.789 | 0.553 / 0.642 / 0.409 |
+| fused, `recency` at 0.5 | 0.968 / 0.981 / 0.855 | 0.581 / 0.655 / 0.444 |
+| fused, `recency` at 0 | 0.960 / 0.987 / 0.883 | 0.583 / 0.658 / 0.457 |
+| fused, `recency` at 1, `expand(Expand::hops(1))` | 0.951 / 0.977 / 0.751 | 0.541 / 0.666 / 0.400 |
+
+- **Fused beats any one signal** at the default weights, on both benchmarks. That's why recency's default is 0.25 and not 1. At 1, recency outweighed what was asked, and ranking quality fell below keyword alone (NDCG 0.789 against 0.864 on LongMemEval-S). Neither benchmark asks about recent events, so recency there is noise, and 0 does slightly better still. But agents' questions often do lean on what happened lately, so the default keeps some pull. Raise it with `Weights` (per call) for an agent that asks mostly about recent events.
+- **These runs set `uses` with `recency`,** but neither dataset marks memories used, so the use signal is empty and only recency's weight matters.
+- **The graph signal** (measured with `recency` at 1) here follows only each turn's link to the previous turn of its session, the one link every application can write. Recall is about level (+0.008 recall@10 on LoCoMo, about 12 of 1,531 questions), and ranking quality drops on both. Links that carry meaning (entities, `derived_from`) are what it's for.
+- **`f16` and `bf16` embeddings** recall the same as `f32`, to within 0.001 on every LongMemEval-S row.
+- **Fuzzy keyword terms** (`Fuzziness::Auto` on words of 5 or more letters) don't help. Recall@10 changes by under a point either way, and the keyword search takes 18 to 100 times as long. Recall doesn't take a fuzziness option for that reason.
+
+**Latency,** fused, `k = 10`, warm, one thread, measured with `recency` at 1 (weights don't change the work a recall does). The last two rows have 50 questions, so their "p99" is the slowest of 50:
+
+| namespace size | p50 | p99 | with `expand(hops(1))`, p50 / p99 |
+|---|---|---|---|
+| ~250 memories (LongMemEval-S) | 2.0 ms | 3.7 ms | 9.9 / 33 ms |
+| ~590 (LoCoMo) | 1.3 ms | 4.3 ms | 2.8 / 5.7 ms |
+| ~2,400 (LongMemEval-M) | 7.9 ms | 14.6 ms | 15.9 / 37 ms |
+| 94,000 in one namespace | 68 ms | 107 ms | |
+
+At 94,000 memories, the exact vector search is 37 ms of that (p50) and the keyword search 28 ms (slowest 66 ms). Both grow with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. In a single namespace of 100,000, an approximate vector index (IVF, D311 T8) would take the vector part off, but not the keyword part.
+
+**Size,** per 100,000 LongMemEval memories (about 2 KB of text each, 1.1 KB once compressed), in use after a full compaction:
+
+| embeddings | the store | embeddings | the keyword index | the text | other |
+|---|---|---|---|---|---|
+| `f32` | 962 MB | 159 MB | 637 MB | 116 MB | 50 MB |
+| `f16` | 882 MB | 82 MB | 637 MB | 116 MB | 47 MB |
+| `bf16` | 879 MB | 82 MB | 637 MB | 116 MB | 44 MB |
+
+- **The keyword index is most of the store** with text this long, about 5.5 times the compressed text. It keeps a posting for every distinct term of every memory (the memory's id, with the term's frequency and the memory's length), plus each memory's own terms so a delete can find its postings.
+- **"Other"** is the memories' metadata and use counts, the dedup rows, and what the file's extents hold beyond their data.
+- **Half-precision embeddings** save 8%.

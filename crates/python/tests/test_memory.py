@@ -104,7 +104,7 @@ def test_recall_ranks_signals_budgets_and_snapshots(db):
         # Weights that only count recency put the newer memory first.
         only_recency = mem.Weights(vector=0, keyword=0, importance=0, uses=0)
         assert s.recall("n", text="cache", weights=only_recency)[0].id == b
-        assert only_recency.recency == 1.0 and mem.Weights() == mem.Weights()
+        assert only_recency.recency == 0.25 and mem.Weights() == mem.Weights()
         with pytest.raises(ph.InvalidArgument):
             s.recall("n")  # neither text nor embedding
         with pytest.raises(ph.InvalidArgument):
@@ -351,6 +351,34 @@ def test_a_reader_recalls(db, path):
             rs2 = mem.Store.open_reader(reader, "agents", model=None)
         with pytest.raises(ph.Closed):
             rs2.get(rid)
+
+
+def test_normalization_is_set_at_create(db, path):
+    # #1405: an NFKC store's keyword recall matches ligatures and full-width forms; an NFC
+    # one (the default) doesn't. Recency still returns the memory, so check the signal.
+    def keyword(s, q):
+        hit = s.recall("n", text=q, with_signals=True)[0]
+        return hit.signals.keyword
+
+    with mem.Store.create(db, "nfkc", normalization="nfkc") as s:
+        s.remember("n", "the deploy configuration file")
+        assert s.normalization == "nfkc"
+        assert keyword(s, "\ufb01le") is not None  # the "fi" ligature
+        assert keyword(s, "\uff46\uff49\uff4c\uff45") is not None  # full-width "file"
+    with mem.Store.create(db, "nfc") as s:
+        s.remember("n", "the deploy configuration file")
+        assert s.normalization == "nfc"
+        assert keyword(s, "\ufb01le") is None
+    with mem.Store.create(db, "plain", normalization="none") as s:
+        assert s.normalization == "none"
+    with pytest.raises(ph.InvalidArgument):
+        mem.Store.create(db, "bad", normalization="nfd")
+    # It reads back after an open, and in a reader process.
+    with mem.Store.open(db, "nfkc", model=None) as s:
+        assert s.normalization == "nfkc"
+    with ph.open_reader(path) as reader:
+        with mem.Store.open_reader(reader, "nfkc", model=None) as rs:
+            assert rs.normalization == "nfkc"
 
 
 def test_near_dedup_settings(db):

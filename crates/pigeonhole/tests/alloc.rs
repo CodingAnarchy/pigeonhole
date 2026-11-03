@@ -260,7 +260,9 @@ fn multi_get_allocations_do_not_grow_with_rows() {
             .commit()
             .expect("commit");
     }
-    db.flush().expect("flush");
+    // A full compaction, not a flush, so no background compaction lands between the warm-up
+    // and the measured reads and makes them read new files' blocks cold (#1419).
+    db.compact().expect("compact");
     // A first pass reads every block into the cache: a miss allocates its block.
     let all =
         pigeonhole::KeySet::from_unsorted((0..3_000u32).map(|i| format!("r{i:05}").into_bytes()));
@@ -325,7 +327,11 @@ fn traversal_allocations_grow_with_new_nodes_not_edges() {
             m.commit().expect("commit");
         }
     }
-    db.flush().expect("flush");
+    // A full compaction, not a flush: a flush leaves L0 files whose background compaction
+    // can land between a group's warm-up and its measured run, and the run then reads the
+    // new files' blocks cold (Windows CI measured the wide group 7 calls high, #1419).
+    // After `compact` every row is in one last-level run and no background work is left.
+    db.compact().expect("compact");
     let measure = |seeds: &pigeonhole::KeySet, per_node: u32| {
         // The first run reads every block into the cache.
         for _ in 0..2 {

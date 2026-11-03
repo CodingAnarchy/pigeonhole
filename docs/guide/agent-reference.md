@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status:** describes `main`; crates.io has 1.0.0 (what `main` adds after it: [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes `main`; crates.io has 1.0.1 (what `main` adds after it: [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 
@@ -281,6 +281,55 @@ Guide: [`graphs.md`](graphs.md).
 | `TraverseStats` | `rows`, `edges`, `hops_cut: u32` (cut by `hop_limit` or `max_nodes`), `cut_by_max_nodes: bool`. |
 
 Traversal model: a node is a row; an edge is a column of the edge family, whose qualifier is the destination's row key. Per hop, the frontier's rows are read in key order and their newest edges in qualifier order; each destination not visited before is kept once, ranked by its first edge; `per_node_limit` counts edges read and skips the rest of the row with a seek. The visited set is held in memory, about (key length + 48) bytes per node.
+
+## Byte budgets (1.1.0, D308)
+Guide: [`scans-and-filters.md`](scans-and-filters.md). A budget counts each row's key once, and each cell's qualifier, value and 16 bytes. The size definition is stable across runs and releases.
+
+| Signature | Semantics |
+|---|---|
+| `Scan::read_within(self, bytes: u64) -> Result<ScanPage>` | The longest prefix of the scan's cells, in order, that fits `bytes`. A column (with the versions the read selects) is taken whole or not at all. When the first doesn't fit, the page is empty and cut, and `next_bytes()` is its size: retry from the same `resume()` with at least that. `limit` applies too. |
+| `KeysRead::read_within(self, bytes: u64) -> Result<KeysPage>` | The same for a multi-get. |
+| `ScanPage` / `KeysPage` | `rows()`, `into_rows()`, `bytes()`, `cut_by_budget()`, `next_bytes()` (the next cell's size, if cut), `resume() -> Option<&ScanPosition>` (`&KeysPosition`). |
+| `Scan::resume_after(self, &ScanPosition)`, `KeysRead::resume_after(self, &KeysPosition)` | Continue after a page. Positions have `to_bytes`/`from_bytes`. |
+| `Nearest::run_within(self, bytes: u64) -> Result<NearestPage>` (and `run_within_async`) | `nearest_*`'s neighbours, nearest first, while their sizes fit. `NearestPage::neighbours()`, `cut_by_budget()`, `next_bytes()`. |
+
+## Vectors (1.1.0)
+Guide: [`vectors.md`](vectors.md).
+
+| Signature | Semantics |
+|---|---|
+| `Family::vector(VectorSpec::new(dim, Element, Metric)?)` | A vector family. `Element`: `F32`, `F16`, `BF16`, `I8`, `Bit`. `Metric`: `L2`, `Cosine`, `InnerProduct`, `Hamming`; smaller is nearer. `Bit` vectors use `Hamming` only. |
+| `RowMutation::put_vector_f32(family, qualifier, &[f32])` (and `_i8`, `_bits`, `_f16`, `_bf16`) | Write a vector; the wrong dimension or element is `InvalidArgument`. A `f32` write to a half family rounds to the element. |
+| `CellRef::as_vector() -> Option<VectorRef<'_>>` | Read one. |
+| `Scan::nearest_f32(self, &[f32], k) -> Nearest`, `KeysRead::nearest_f32(..)` (and `_i8`, `_bits`) | Exact top-`k` over the selection's vectors: `run()` / `run_async()` / `run_within(bytes)`. `Neighbour { row, qualifier, distance, ts }`, nearest first. |
+| `pigeonhole-vector` | An IVF index for collections past exact search's latency: see [Companion crates](#companion-crates-110). |
+
+## Change feed (1.1.0, D310)
+Guide: [`change-feed.md`](change-feed.md). The database must be opened with `Options::change_feed(FeedRetention::bytes(n))`; see `Options` above.
+
+| Signature | Semantics |
+|---|---|
+| `Table::feed(&self) -> FeedBuilder` (also `ReadTable::feed`) | Subscribe to committed changes. `table(&Table)` / `read_table(&ReadTable)` add tables, `prefix(&[u8])` filters rows, `visible()` delivers at visibility rather than durability, and `from_snapshot(&s)` / `from_oldest()` / `resume(&FeedToken)` choose the start. `open() -> Result<Feed>`. |
+| `Feed::next(&mut self, Duration) -> Result<Option<&Commit>>`, `try_next()` | The next whole commit, in commit order, once each. |
+| `Feed::poll_next(&mut self, cx) -> Poll<Result<&Commit>>`; `nonblocking::FeedStream` | Async, **writer process only** (`Unsupported` in a reader: use `next` on a thread). |
+| `Feed::token() -> FeedToken` (`as_bytes`/`from_bytes`), `oldest_retained()` | Resume later, in a later open too. Once retention passes a feed: `FeedExpired`. |
+| `Commit` | `seqno()`, `timestamp()`, `changes() -> &[Change]`. `Change`: `table()`, `family()`, `kind() -> ChangeKind` (`Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily`), `row()`, `qualifier()`, `timestamp()`, `value() -> Option<Value>`. |
+
+<a id="companion-crates-110"></a>
+## Companion crates and bindings (1.1.0)
+Each companion crate is on the public 1.x line and is built on `pigeonhole`'s public API. Their own guides have the full API.
+
+| Crate | Entry points |
+|---|---|
+| `pigeonhole-text` ([guide](text-search.md), ICR 0105) | `Index::create(&db, name, Source::new(&table, family, qualifier), IndexOptions)`, `open`, `open_reader -> ReadIndex`. Writes: `put_in(&mut txn, id, text)` / `delete_in` (in your transaction), or `put` / `delete`. `search(query, k)`: `id_prefix(..)`, `highlight(true)`, `run() -> Vec<Hit>`. `Query::parse(&str)` or `Query::new().term(..).phrase(..).fuzzy(.., Fuzziness::Auto).text(..)`. `rebuild`, `verify`. |
+| `pigeonhole-vector` ([guide](vectors.md#the-ivf-index-pigeonhole-vector), ICR 0100) | `Index::create(&db, name, VectorSpec, IndexOptions)`, `open`, `open_reader -> ReadIndex`. `insert_f32(id, &v)`, `delete(id)`, or `insert_f32_in(&mut txn, &mut Placed, id, &v)` / `delete_in` with `after_commit(placed)` (one `Placed` per index and transaction, made in the transaction's body). `search_f32(&q, k)`: `nprobe(n)`, `id_prefix(p)`, `max_probe(n)`, `run()` / `run_with_stats()` / `run_async()`. `bulk_load_f32(expected, pairs)`, `verify`. |
+| `pigeonhole-memory` ([guide](agent-memory.md), ICR 0107) | `Store::create(&db, name, StoreOptions)` (`embedding`, `forget`, `near_dedup`, `normalization`, `ivf`), `open(&db, name, model_id)`, `open_reader -> ReadStore`. `remember(ns, Memory)` / `remember_in(&mut txn, ..)`, `delete`, `link`, `supersede`, `mark_used`, `near_duplicate`. `recall(&[ns])`: `text`, `embedding`, `k`, `byte_budget`, `expand(Expand::hops(n))`, `exact`, `run()` / `run_with_stats()`. `forget()`, `consolidate(ns, &consolidator)`, `consolidate_loop(name, Arc<dyn Consolidator>)`, `watch(&[ns]) -> WatchBuilder`, `verify`. |
+
+| Binding | Where |
+|---|---|
+| Python, `pigeonhole-db` (`import pigeonhole`, D307) | [`python.md`](python.md): the core API, vectors, graphs, byte budgets, the change feed and `pigeonhole.memory`. Not on PyPI yet. |
+| Ruby, the `pigeonhole` gem (ICR 0111) | [`ruby.md`](ruby.md): the core API, vectors, graphs, byte budgets, the change feed, `Pigeonhole::Memory` (watches and the consolidation loop too), `Pigeonhole::Text` and `Pigeonhole::Vector`. Not on RubyGems yet. |
+| MCP, `phdb mcp` | [`ai-agents.md`](ai-agents.md): data tools, `nearest`, the change feed, and the memory tools over a `pigeonhole-memory` store. |
 
 ## Results
 | Type | Methods |

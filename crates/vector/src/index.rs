@@ -177,6 +177,85 @@ pub struct Hit {
     pub distance: f64,
 }
 
+/// One transaction's writes to an index ([`Index::insert_f32_in`] and its forms,
+/// [`Index::delete_in`]): make one per transaction with [`Placed::new`], pass it to each
+/// write, and to [`Index::after_commit`] once the transaction commits.
+///
+/// A transaction's reads don't see its own writes, so the index remembers here where it
+/// put each id: a second write of an id in the same transaction (an upsert, a delete after
+/// an insert, an insert after a delete) acts on that, not on the snapshot (cli692's B1 on
+/// #1412). Writes of one transaction through two `Placed` lose that, so use one.
+///
+/// **Make it inside the transaction's body** (the closure
+/// [`Pigeonhole::transact`](pigeonhole::Pigeonhole::transact) runs), so a retried attempt
+/// starts with a fresh one: one made outside would carry an aborted attempt's record into
+/// the retry. A `Placed` belongs to the index its first write used; using it with another
+/// index is [`Error::InvalidArgument`] (cli692's C1 and C2).
+#[derive(Debug, Clone, Default)]
+#[must_use = "pass it to Index::after_commit once the transaction commits; dropping it only delays a split or merge until the next write to its lists"]
+pub struct Placed {
+    lists: Vec<u32>,
+    /// Each id this transaction wrote: the list it's in now, or `None` once deleted.
+    ids: HashMap<Vec<u8>, Option<u32>>,
+    /// This transaction created list 0 (the index was empty at its snapshot).
+    bootstrapped: bool,
+    /// The index it belongs to, set by its first write. A `Weak` keeps the shared state's
+    /// allocation reserved, so another index can't reuse its address while this lives
+    /// (cli692 on #1412).
+    index: Option<std::sync::Weak<Inner>>,
+}
+
+impl PartialEq for Placed {
+    fn eq(&self, other: &Self) -> bool {
+        self.lists == other.lists
+            && self.ids == other.ids
+            && self.bootstrapped == other.bootstrapped
+            && match (&self.index, &other.index) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.ptr_eq(b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Placed {}
+
+// A `Placed` crosses threads with the transaction it records (cli692 on #1412).
+const _: fn() = || {
+    fn send<T: Send + Sync>() {}
+    send::<Placed>();
+};
+
+impl Placed {
+    /// No writes yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Binds this record to `index` on first use; another index is `InvalidArgument`.
+    fn bind(&mut self, index: &Index) -> Result<()> {
+        match &self.index {
+            None => {
+                self.index = Some(Arc::downgrade(&index.inner));
+                Ok(())
+            }
+            Some(i) if std::ptr::eq(i.as_ptr(), Arc::as_ptr(&index.inner)) => Ok(()),
+            Some(_) => Err(Error::InvalidArgument(
+                "a Placed records one index's writes: make one per index and transaction".into(),
+            )),
+        }
+    }
+
+    fn wrote(&mut self, id: &[u8], now: Option<u32>, lists: impl IntoIterator<Item = u32>) {
+        for l in lists {
+            if !self.lists.contains(&l) {
+                self.lists.push(l);
+            }
+        }
+        self.ids.insert(id.to_vec(), now);
+    }
+}
+
 /// What a bulk load did ([`Index::bulk_load_f32`] and its forms).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -364,6 +443,14 @@ fn is_conflict(t: &Tx) -> bool {
     matches!(t, Tx::Db(e) if e.code() == ErrorCode::Conflict)
 }
 
+/// A transaction's snapshot shows `M{id}` naming a list with no centroid. A merge moves a
+/// list's vectors and mappings and deletes its centroid in one transaction that reads the
+/// list's whole row, so no consistent snapshot shows this: it's what `verify` reports as
+/// corruption (cli692's B2 on #1412).
+fn unmapped() -> Error {
+    corrupt("a mapping names a list with no centroid")
+}
+
 fn corrupt(what: &str) -> Error {
     Error::Corruption(what.to_owned())
 }
@@ -434,6 +521,59 @@ fn read_stored(
             Ok(Some(Stored::of(v)?))
         }
     }
+}
+
+/// Writes `id`'s vector into list `l`, moving it out of `old` (the list `id` is in) when
+/// that's another list. The caller has read `l`'s version in `tx`. With `check_old` (`old`
+/// came from `M{id}` at `tx`'s snapshot) this reads `old`'s version, and a mapping to a
+/// list with no centroid is `Stale`; without it, `old` is the list this transaction itself
+/// wrote `id` to.
+fn write_into(
+    tx: &mut Transaction,
+    t: &Table,
+    l: u32,
+    old: Option<u32>,
+    check_old: bool,
+    id: &[u8],
+    v: Input<'_>,
+) -> std::result::Result<(), Tx> {
+    match old {
+        // An upsert within its list: the vector only (M2).
+        Some(o) if o == l => v.put(tx, t, &list_row(l), id),
+        Some(o) => {
+            if check_old && read_version(tx, t, o)?.is_none() {
+                return Err(Tx::Stale);
+            }
+            tx.delete_column(t, &list_row(o), VEC, id);
+            v.put(tx, t, &list_row(l), id);
+            tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l))
+                .incr(t, &count_row(o), CNT, b"", -1)
+                .incr(t, &count_row(l), CNT, b"", 1);
+        }
+        None => {
+            v.put(tx, t, &list_row(l), id);
+            tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l)).incr(
+                t,
+                &count_row(l),
+                CNT,
+                b"",
+                1,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The bootstrap's writes: list 0, centred on `centroid`, holding `id`. The caller has read
+/// `G:meta:next` as 0 in `tx`.
+fn write_bootstrap(tx: &mut Transaction, t: &Table, centroid: &Point, id: &[u8], v: Input<'_>) {
+    put_centroid(tx, t, 0, centroid);
+    tx.put_u64(t, &centroid_row(0), META, VERSION, 1)
+        .put_u64(t, GLOBAL, META, NEXT, 1)
+        .put_u64(t, GLOBAL, META, LAYOUT, 1);
+    v.put(tx, t, &list_row(0), id);
+    tx.put_u64(t, &map_row(id), MAP, LIST, 0)
+        .incr(t, &count_row(0), CNT, b"", 1);
 }
 
 fn put_centroid(tx: &mut Transaction, t: &Table, list: u32, c: &Point) {
@@ -976,6 +1116,139 @@ impl Index {
         ))
     }
 
+    /// [`insert_f32`](Self::insert_f32) inside the caller's transaction `tx`, so the vector
+    /// commits or rolls back with the caller's other writes (D311 T8). `placed` records the
+    /// transaction's writes to this index: one [`Placed`] per transaction, passed to every
+    /// `*_in` write of it, so writing an id twice in one transaction acts on the first write
+    /// (a transaction's reads don't see its own writes). It neither retries nor splits:
+    /// pass `placed` to [`after_commit`](Self::after_commit) once `tx` commits, so a list
+    /// that grew past its bound is split (or, with [`Rebalance::Background`], marked for
+    /// the rebalancer).
+    ///
+    /// ```
+    /// use pigeonhole::{Element, Family, Metric, Options, Pigeonhole, RetryPolicy, VectorSpec};
+    /// use pigeonhole_vector::{Index, IndexOptions, Placed};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let spec = VectorSpec::new(2, Element::F32, Metric::L2)?;
+    /// let index = Index::create(&db, "points", spec, IndexOptions::new())?;
+    /// let docs = db.table("docs")?.family("f", Family::default()).create_if_missing()?;
+    /// let (placed, _) = db.transact(&RetryPolicy::default(), |tx| {
+    ///     let mut placed = Placed::new();
+    ///     tx.put(&docs, b"d1", "f", b"", b"text");
+    ///     index.insert_f32_in(tx, &mut placed, b"d1", &[1.0, 2.0])?;
+    ///     index.insert_f32_in(tx, &mut placed, b"d1", &[3.0, 4.0])?; // an upsert of it
+    ///     Ok::<_, pigeonhole_vector::Error>(placed)
+    /// })?;
+    /// index.after_commit(placed)?;
+    /// assert_eq!(index.verify()?.vectors, 1);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// It places against the centroids the index has cached, reloaded once if the list's
+    /// version read in `tx` differs. If it still differs, `tx`'s snapshot predates a split
+    /// or a merge: the vector is written anyway, and the commit fails with `Conflict`
+    /// (retried by [`Pigeonhole::transact`](pigeonhole::Pigeonhole::transact)), because the
+    /// version `tx` read has been rewritten since. A snapshot showing `id` mapped to a list
+    /// with no centroid is [`Error::Corruption`], as [`verify`](Self::verify) reports it: a
+    /// merge is one transaction, so no consistent snapshot shows that.
+    pub fn insert_f32_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        vector: &[f32],
+    ) -> Result<()> {
+        self.insert_in(tx, placed, id, Input::F32(vector))
+    }
+
+    /// [`insert_f32_in`](Self::insert_f32_in) for an `i8` index.
+    pub fn insert_i8_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        vector: &[i8],
+    ) -> Result<()> {
+        self.insert_in(tx, placed, id, Input::I8(vector))
+    }
+
+    /// [`insert_f32_in`](Self::insert_f32_in) for a bit index.
+    pub fn insert_bits_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        vector: &[u8],
+    ) -> Result<()> {
+        self.insert_in(tx, placed, id, Input::Bits(vector))
+    }
+
+    /// [`insert_f32_in`](Self::insert_f32_in) for an `f16` index (bit patterns).
+    pub fn insert_f16_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        vector: &[u16],
+    ) -> Result<()> {
+        self.insert_in(tx, placed, id, Input::F16(vector))
+    }
+
+    /// [`insert_f32_in`](Self::insert_f32_in) for a `bf16` index (bit patterns).
+    pub fn insert_bf16_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        vector: &[u16],
+    ) -> Result<()> {
+        self.insert_in(tx, placed, id, Input::BF16(vector))
+    }
+
+    /// [`delete`](Self::delete) inside the caller's transaction `tx`, recorded in `placed`
+    /// as [`insert_f32_in`](Self::insert_f32_in) records: `false` (and nothing written)
+    /// when there's no vector for `id`, as of this transaction's own earlier writes, else
+    /// as of its snapshot. Pass `placed` to [`after_commit`](Self::after_commit) once `tx`
+    /// commits, so a list that shrank below its bound is merged.
+    pub fn delete_in(&self, tx: &mut Transaction, placed: &mut Placed, id: &[u8]) -> Result<bool> {
+        placed.bind(self)?;
+        let t = &self.inner.table;
+        let l = match placed.ids.get(id).copied() {
+            Some(Some(l)) => l,
+            Some(None) => return Ok(false),
+            None => {
+                let Some(l) = read_list_of(tx, t, id)? else {
+                    return Ok(false);
+                };
+                if read_version(tx, t, l)?.is_none() {
+                    return Err(unmapped());
+                }
+                l
+            }
+        };
+        tx.delete_column(t, &list_row(l), VEC, id)
+            .delete_column(t, &map_row(id), MAP, LIST)
+            .incr(t, &count_row(l), CNT, b"", -1);
+        placed.wrote(id, None, [l]);
+        Ok(true)
+    }
+
+    /// After the transaction `placed` recorded has committed: splits or merges the lists
+    /// its writes left out of bounds, as [`insert_f32`](Self::insert_f32) and
+    /// [`delete`](Self::delete) do after theirs. It reads the lists' current lengths, so
+    /// calling it after a rollback, twice, or late is harmless, and never calling it only
+    /// delays a rebalance until the next write to those lists. A `Placed` of another index is
+    /// [`Error::InvalidArgument`].
+    pub fn after_commit(&self, mut placed: Placed) -> Result<()> {
+        placed.bind(self)?;
+        self.after_write(placed.lists)
+    }
+
     /// The `k` vectors nearest the `f32` vector `query`, as a [`Search`] to run.
     pub fn search_f32<'a>(&'a self, query: &'a [f32], k: usize) -> Search<'a> {
         Search::new(Of::W(self), Input::F32(query), k)
@@ -1306,6 +1579,75 @@ impl Index {
         ))
     }
 
+    /// `insert_*_in`'s body: see [`insert_f32_in`](Self::insert_f32_in).
+    fn insert_in(
+        &self,
+        tx: &mut Transaction,
+        placed: &mut Placed,
+        id: &[u8],
+        v: Input<'_>,
+    ) -> Result<()> {
+        let inn = &*self.inner;
+        v.check(&inn.spec)?;
+        placed.bind(self)?;
+        let point = v.placed(&inn.spec);
+        let t = &inn.table;
+        // Where `id` is: as this transaction left it, else as its snapshot shows it.
+        let tracked = placed.ids.get(id).copied();
+        let l = if placed.bootstrapped {
+            // This transaction created list 0, the only one its snapshot can have.
+            0
+        } else {
+            let mut layout = self.layout();
+            let mut reloaded = false;
+            loop {
+                if layout.lists.is_empty() {
+                    if read_u64(tx, t, GLOBAL, META, NEXT)? == Some(0) {
+                        write_bootstrap(tx, t, &unit(inn.cen.metric(), point.clone()), id, v);
+                        placed.bootstrapped = true;
+                        placed.wrote(id, Some(0), [0]);
+                        return Ok(());
+                    }
+                    if reloaded {
+                        // `G:meta:next` isn't 0 in `tx` though the fresh layout has no
+                        // lists: the layout and `tx` disagree (a lost tail, say). A `tx`
+                        // older than a racing first insert reads 0 and bootstraps, and its
+                        // commit conflicts.
+                        return Err(Error::Conflict(
+                            "the index's layout is newer in the transaction than in the database"
+                                .into(),
+                        ));
+                    }
+                    layout = self.reload()?;
+                    reloaded = true;
+                    continue;
+                }
+                let l = layout.nearest(&inn.cen, &point, 1, &[])?[0];
+                let want = layout.list(l).expect("a listed list").version;
+                if read_version(tx, t, l)? != Some(want) && !reloaded {
+                    layout = self.reload()?;
+                    reloaded = true;
+                    continue;
+                }
+                // The version `tx` read is `want`, or was rewritten after `tx`'s snapshot (the
+                // reload's snapshot is newer than it): then the commit fails with `Conflict`.
+                break l;
+            }
+        };
+        let old = match tracked {
+            Some(now) => now,
+            None => read_list_of(tx, t, id)?,
+        };
+        match write_into(tx, t, l, old, tracked.is_none(), id, v) {
+            Ok(()) => {
+                placed.wrote(id, Some(l), std::iter::once(l).chain(old));
+                Ok(())
+            }
+            Err(Tx::Stale) => Err(unmapped()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The first insert into an empty index: list 0, centred on the vector.
     fn bootstrap(
         &self,
@@ -1321,13 +1663,7 @@ impl Index {
             if read_u64(tx, t, GLOBAL, META, NEXT)? != Some(0) {
                 return Err(Tx::Stale);
             }
-            put_centroid(tx, t, 0, &centroid);
-            tx.put_u64(t, &centroid_row(0), META, VERSION, 1)
-                .put_u64(t, GLOBAL, META, NEXT, 1)
-                .put_u64(t, GLOBAL, META, LAYOUT, 1);
-            v.put(tx, t, &list_row(0), id);
-            tx.put_u64(t, &map_row(id), MAP, LIST, 0)
-                .incr(t, &count_row(0), CNT, b"", 1);
+            write_bootstrap(tx, t, &centroid, id, v);
             Ok(())
         })?;
         Ok(vec![0])
@@ -1353,30 +1689,7 @@ impl Index {
             if read_version(tx, t, l)? != Some(want) {
                 return Err(Tx::Stale);
             }
-            match old {
-                // An upsert within its list: the vector only (M2).
-                Some(o) if o == l => v.put(tx, t, &list_row(l), id),
-                Some(o) => {
-                    if read_version(tx, t, o)?.is_none() {
-                        return Err(Tx::Stale);
-                    }
-                    tx.delete_column(t, &list_row(o), VEC, id);
-                    v.put(tx, t, &list_row(l), id);
-                    tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l))
-                        .incr(t, &count_row(o), CNT, b"", -1)
-                        .incr(t, &count_row(l), CNT, b"", 1);
-                }
-                None => {
-                    v.put(tx, t, &list_row(l), id);
-                    tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l)).incr(
-                        t,
-                        &count_row(l),
-                        CNT,
-                        b"",
-                        1,
-                    );
-                }
-            }
+            write_into(tx, t, l, old, true, id, v)?;
             #[cfg(feature = "__unstable-hooks")]
             crate::hooks::hold(crate::hooks::Hold::PlaceBeforeCommit);
             Ok(old)
@@ -1859,6 +2172,8 @@ impl Index {
             match r {
                 Ok((merged, _)) => {
                     if merged {
+                        #[cfg(feature = "__unstable-hooks")]
+                        crate::hooks::hold(crate::hooks::Hold::MergeBeforeReload);
                         self.reload()?;
                         self.queue([dst]);
                     }
@@ -1873,6 +2188,11 @@ impl Index {
         }
         Ok(())
     }
+}
+
+/// The rows of `lists`, for one multi-get.
+fn rows(lists: &[u32]) -> KeySet {
+    KeySet::from_unsorted(lists.iter().map(|l| list_row(*l)))
 }
 
 fn hits(near: Vec<pigeonhole::Neighbour>) -> Vec<Hit> {
@@ -1963,6 +2283,19 @@ pub struct Search<'a> {
     nprobe: Option<u32>,
     snapshot: Option<&'a Snapshot>,
     parallel: usize,
+    id_prefix: Option<&'a [u8]>,
+    max_probe: Option<u32>,
+}
+
+/// What a [`Search`] read ([`Search::run_with_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SearchStats {
+    /// Lists probed: `nprobe` (at most every list), or more for a search with an
+    /// [`id_prefix`](Search::id_prefix) that widened to find `k` hits.
+    pub lists_probed: u32,
+    /// Lists in the index at the search's snapshot.
+    pub lists: u32,
 }
 
 /// The index a [`Search`] reads: the writer's, or a reader process's.
@@ -2068,7 +2401,35 @@ impl<'a> Search<'a> {
             nprobe: None,
             snapshot: None,
             parallel: 1,
+            id_prefix: None,
+            max_probe: None,
         }
+    }
+
+    /// Only ids starting with `prefix`. The probed lists hold every id near the query, so a
+    /// prefix that's rare among them can leave fewer than `k` hits at `nprobe`: the search
+    /// then doubles the lists it probes (nearest first) until `k` hits pass, every list is
+    /// probed, or [`max_probe`](Self::max_probe) lists are. Each round reads only its new
+    /// lists, each list once: a round widens only when the earlier ones found fewer than
+    /// `k`, so it already holds every prefixed vector of the lists they read. A prefixed
+    /// search that probes every list is exact for the prefix.
+    ///
+    /// Ties among the hits come back by probe round, then by list, then by id.
+    ///
+    /// **Cost:** a seek into each probed list, then the prefix's own cells there: the list's
+    /// other cells aren't read (the prefix becomes the read's qualifier seek). On one 100,000
+    /// cell row, 100 cells under a prefix took 0.01 ms against 5.14 ms for the whole row
+    /// (#1342, R1).
+    pub fn id_prefix(mut self, prefix: &'a [u8]) -> Self {
+        self.id_prefix = Some(prefix);
+        self
+    }
+
+    /// With an [`id_prefix`](Self::id_prefix), widen to at most `n` lists (default: every
+    /// list). Never fewer than `nprobe`. Without a prefix it has no effect.
+    pub fn max_probe(mut self, n: u32) -> Self {
+        self.max_probe = Some(n);
+        self
     }
 
     /// Probe the `n` lists whose centroids are nearest the query (at least 1; the index's
@@ -2095,10 +2456,18 @@ impl<'a> Search<'a> {
     /// Runs the search: at most `k` hits, nearest first. One snapshot covers the centroids
     /// and the lists, so a concurrent split never shows a vector twice or hides it.
     ///
-    /// Hits at an equal distance come back by the list that holds them, then by id. A split
+    /// Hits at an equal distance come back by the list that holds them, then by id (for a
+    /// widened [`id_prefix`](Self::id_prefix) search, by probe round first). A split
     /// can move a tied id to another list, so which of several ids tied at the `k`-th
     /// distance makes the cut can differ between layouts; at one snapshot it's fixed.
     pub fn run(self) -> Result<Vec<Hit>> {
+        Ok(self.run_with_stats()?.0)
+    }
+
+    /// [`run`](Self::run), with what it read. A prefixed search that stopped at
+    /// [`max_probe`](Self::max_probe) shows fewer hits than `k` with `lists_probed` below
+    /// `lists`. [`run_async_with_stats`](Self::run_async_with_stats) is its async form.
+    pub fn run_with_stats(self) -> Result<(Vec<Hit>, SearchStats)> {
         let index = self.index;
         self.query.check(index.spec())?;
         let taken;
@@ -2110,11 +2479,87 @@ impl<'a> Search<'a> {
             }
         };
         let layout = index.layout_at(s, self.snapshot.is_none())?;
-        let Some(keys) = self.probed(&layout)? else {
-            return Ok(Vec::new());
+        let Some(order) = self.order(&layout)? else {
+            return Ok((Vec::new(), self.stats(&layout, 0)));
         };
-        let near = self.nearest(&keys, s).parallel(self.parallel).run()?;
-        Ok(hits(near))
+        let (mut done, mut probe) = (0, self.first_probe(&layout));
+        let mut found = Vec::new();
+        loop {
+            let keys = rows(&order[done..probe]);
+            let near = self.nearest(&keys, s).parallel(self.parallel).run()?;
+            self.union(&mut found, near);
+            match self.widen(&layout, probe, found.len()) {
+                Some(next) => (done, probe) = (probe, next),
+                None => return Ok((hits(found), self.stats(&layout, probe))),
+            }
+        }
+    }
+
+    /// The lists this search may probe, nearest the query first: `nprobe` of them, or, with
+    /// an [`id_prefix`](Self::id_prefix), as many as it may widen to. `None` when there's
+    /// nothing to read.
+    fn order(&self, layout: &Layout) -> Result<Option<Vec<u32>>> {
+        if layout.lists.is_empty() || self.k == 0 {
+            return Ok(None);
+        }
+        let first = self.first_probe(layout);
+        let n = if self.id_prefix.is_some() {
+            self.cap(layout, first)
+        } else {
+            first
+        };
+        Ok(Some(layout.nearest(
+            self.index.cen(),
+            &self.query.point(),
+            n,
+            &[],
+        )?))
+    }
+
+    /// Adds a round's hits to the earlier rounds'. A round widens only when the earlier
+    /// ones found fewer than `k`, so `found` then holds every prefixed vector of the lists
+    /// they read, and the nearest `k` of the union are the nearest of every list probed.
+    /// The sort is stable: ties keep the earlier round's hits first, then each round's own
+    /// order (list, then id).
+    fn union(&self, found: &mut Vec<pigeonhole::Neighbour>, near: Vec<pigeonhole::Neighbour>) {
+        if found.is_empty() {
+            *found = near;
+            return;
+        }
+        found.extend(near);
+        found.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        found.truncate(self.k);
+    }
+
+    /// Lists to probe first: `nprobe`, at least 1, at most every list.
+    fn first_probe(&self, layout: &Layout) -> usize {
+        let probe = self.nprobe.unwrap_or(self.index.nprobe()).max(1) as usize;
+        probe.min(layout.lists.len().max(1))
+    }
+
+    /// After probing `probe` lists for `found` hits: how many to probe next, or `None` to
+    /// stop. Only a prefixed search short of `k` widens, doubling up to `max_probe`.
+    fn widen(&self, layout: &Layout, probe: usize, found: usize) -> Option<usize> {
+        self.id_prefix?;
+        let cap = self.cap(layout, probe);
+        (found < self.k && probe < cap).then(|| probe.saturating_mul(2).min(cap))
+    }
+
+    /// The most lists a prefixed search widens to: `max_probe` (default every list), at
+    /// least `first`.
+    fn cap(&self, layout: &Layout, first: usize) -> usize {
+        let all = layout.lists.len();
+        self.max_probe
+            .map_or(all, |m| (m as usize).min(all))
+            .max(first)
+    }
+
+    fn stats(&self, layout: &Layout, probed: usize) -> SearchStats {
+        let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
+        SearchStats {
+            lists_probed: n(probed),
+            lists: n(layout.lists.len()),
+        }
     }
 
     /// [`run`](Self::run) as a future that never blocks on the device (D296 PR 5): the
@@ -2124,6 +2569,13 @@ impl<'a> Search<'a> {
     /// [`parallel`](Self::parallel) is ignored. The future is `Send`.
     #[cfg(feature = "async")]
     pub async fn run_async(self) -> Result<Vec<Hit>> {
+        Ok(self.run_async_with_stats().await?.0)
+    }
+
+    /// [`run_async`](Self::run_async), with what it read, as
+    /// [`run_with_stats`](Self::run_with_stats) reports it. The future is `Send`.
+    #[cfg(feature = "async")]
+    pub async fn run_async_with_stats(self) -> Result<(Vec<Hit>, SearchStats)> {
         let index = self.index;
         self.query.check(index.spec())?;
         let taken;
@@ -2135,27 +2587,27 @@ impl<'a> Search<'a> {
             }
         };
         let layout = index.layout_at_async(s, self.snapshot.is_none()).await?;
-        let Some(keys) = self.probed(&layout)? else {
-            return Ok(Vec::new());
+        let Some(order) = self.order(&layout)? else {
+            return Ok((Vec::new(), self.stats(&layout, 0)));
         };
-        let near = self.nearest(&keys, s).run_async().await?;
-        Ok(hits(near))
-    }
-
-    /// The probed lists' rows, or `None` when there's nothing to read.
-    fn probed(&self, layout: &Layout) -> Result<Option<KeySet>> {
-        if layout.lists.is_empty() || self.k == 0 {
-            return Ok(None);
+        let (mut done, mut probe) = (0, self.first_probe(&layout));
+        let mut found = Vec::new();
+        loop {
+            let keys = rows(&order[done..probe]);
+            let near = self.nearest(&keys, s).run_async().await?;
+            self.union(&mut found, near);
+            match self.widen(&layout, probe, found.len()) {
+                Some(next) => (done, probe) = (probe, next),
+                None => return Ok((hits(found), self.stats(&layout, probe))),
+            }
         }
-        let probe = self.nprobe.unwrap_or(self.index.nprobe()).max(1) as usize;
-        let lists = layout.nearest(self.index.cen(), &self.query.point(), probe, &[])?;
-        Ok(Some(KeySet::from_unsorted(
-            lists.iter().map(|l| list_row(*l)),
-        )))
     }
 
     fn nearest(&self, keys: &KeySet, s: &Snapshot) -> pigeonhole::Nearest<'a> {
-        let read = self.index.rows_of(keys).family(VEC).snapshot(s);
+        let mut read = self.index.rows_of(keys).family(VEC).snapshot(s);
+        if let Some(p) = self.id_prefix {
+            read = read.qualifier_prefix(p);
+        }
         match self.query {
             Input::F32(q) => read.nearest_f32(q, self.k),
             Input::I8(q) => read.nearest_i8(q, self.k),
