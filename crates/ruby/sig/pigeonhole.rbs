@@ -1025,26 +1025,29 @@ module Pigeonhole
       attr_reader passes: Array[[String, ConsolidatePass]]
       attr_reader failed: Array[[String, Exception]]
       attr_reader stopped: Array[[String, ConsolidatePass]]
+      attr_reader interrupted: bool
       attr_reader next_due: Integer?
       attr_reader token: String
 
       def self.new: (Integer events, Array[[String, ConsolidatePass]] passes,
                      Array[[String, Exception]] failed, Array[[String, ConsolidatePass]] stopped,
-                     Integer? next_due, String token) -> instance
+                     bool interrupted, Integer? next_due, String token) -> instance
                   | (events: Integer, passes: Array[[String, ConsolidatePass]],
                      failed: Array[[String, Exception]], stopped: Array[[String, ConsolidatePass]],
-                     next_due: Integer?, token: String) -> instance
+                     interrupted: bool, next_due: Integer?, token: String) -> instance
       def self.[]: (Integer events, Array[[String, ConsolidatePass]] passes,
                     Array[[String, Exception]] failed, Array[[String, ConsolidatePass]] stopped,
-                    Integer? next_due, String token) -> instance
+                    bool interrupted, Integer? next_due, String token) -> instance
                  | (events: Integer, passes: Array[[String, ConsolidatePass]],
                     failed: Array[[String, Exception]], stopped: Array[[String, ConsolidatePass]],
-                    next_due: Integer?, token: String) -> instance
+                    interrupted: bool, next_due: Integer?, token: String) -> instance
       def self.members: () -> Array[Symbol]
       def self.inspect: () -> String
       def initialize: (events: Integer, passes: Array[[String, ConsolidatePass]],
                        failed: Array[[String, Exception]],
-                       stopped: Array[[String, ConsolidatePass]], next_due: Integer?, token: String) -> void
+                       stopped: Array[[String, ConsolidatePass]], interrupted: bool,
+                       next_due: Integer?, token: String) -> void
+      def interrupted?: () -> bool
     end
 
     # Another consolidation loop of the same name took over.

@@ -521,6 +521,44 @@ class TestMemory < Minitest::Test
     s.close
   end
 
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  # perf2's S1 on #1441, with #1447's interrupter: an interrupt ends an idle step's wait
+  # within about 50 ms, not at its timeout.
+  def test_an_interrupt_ends_an_idle_steps_wait
+    s = M::Store.create(feed_db, "agents")
+    lp = s.consolidate_loop("main", policy: min_age0) { |_| [] }
+    lp.run_once(0.1) # the first step catches up and claims the name
+    t0 = monotonic
+    assert_raises(Timeout::Error) { Timeout.timeout(0.2) { lp.run_once(5.0) } }
+    assert_operator monotonic - t0, :<, 1.5, "the step waited out its timeout"
+    step = lp.run_once(0.1)
+    refute_predicate step, :interrupted? # the interrupt was the last step's
+    lp.close
+    s.close
+  end
+
+  # #1442's ConsolidateStopped: the groups an interrupted step refused leave their
+  # namespaces due at the next step, rather than postponed by min_age, as a failure would.
+  def test_refused_groups_stay_due
+    s = M::Store.create(feed_db, "agents")
+    %w[a b].each { |ns| 2.times { |i| s.remember(ns, "#{ns} note #{i}", session: "s") } }
+    hour = M::ConsolidatePolicy.new(min_age: 3_600)
+    slow = true
+    lp = s.consolidate_loop("main", policy: hour, clock_offset: 7_200) do |g|
+      sleep 0.3 if slow
+      [M::Memory.new("summary #{g[0].id.namespace}")]
+    end
+    assert_raises(Timeout::Error) { Timeout.timeout(0.1) { lp.run_once(1.0) } }
+    slow = false
+    step = lp.run_once(1.0)
+    # Both namespaces are still due on the loop's clock (2 h ahead); failed ones would wait
+    # out min_age (an hour more).
+    assert_equal %w[a b], step.passes.map(&:first).sort
+    lp.close
+    s.close
+  end
+
   # Python's KeyboardInterrupt case, in Ruby's terms: a StandardError from the block becomes
   # ConsolidateError with the pass so far; Interrupt (not a StandardError) stops the pass and
   # propagates as itself. The groups before either stay committed.

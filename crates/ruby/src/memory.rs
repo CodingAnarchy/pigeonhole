@@ -1149,14 +1149,24 @@ struct Driven<R> {
 /// released in 100 ms slices, with interrupt checks between them, and calls the block with
 /// the GVL held. However the wait ends, the worker is joined before this returns (ai1249's
 /// B1 and perf2's S1 on #1425), so no thread outlives the call.
+///
+/// `interrupter`, for a loop's step, is tripped as soon as a jump or interrupt is recorded,
+/// so the step stops waiting for new memories within about 50 ms instead of at its timeout
+/// (perf2's S1 on #1441, #1447's `LoopInterrupter`).
 fn drive<R: Send + 'static>(
     ruby: &Ruby,
     slot: &Arc<SlotConsolidator>,
     block: magnus::block::Proc,
     on_raise: OnRaise,
     name: &str,
+    interrupter: Option<&mem::LoopInterrupter>,
     work: impl FnOnce() -> R + Send + 'static,
 ) -> Result<Driven<R>, Error> {
+    let trip = || {
+        if let Some(i) = interrupter {
+            i.interrupt();
+        }
+    };
     let (to_ruby, groups) = mpsc::channel::<Vec<mem::StoredMemory>>();
     let (answer_tx, answers) = mpsc::channel::<Answer>();
     *lock(&slot.slot) = Some((to_ruby, answers));
@@ -1190,6 +1200,7 @@ fn drive<R: Send + 'static>(
             Ok(msg) => msg,
             Err(e) => {
                 jump.get_or_insert(e);
+                trip();
                 continue;
             }
         };
@@ -1211,6 +1222,7 @@ fn drive<R: Send + 'static>(
                         }
                         Err(Early::Jump(e)) => {
                             jump = Some(e);
+                            trip();
                             Answer::Refused
                         }
                     }
@@ -1227,6 +1239,7 @@ fn drive<R: Send + 'static>(
                 {
                     // The worker is inside the engine; its next group is refused.
                     jump = Some(e);
+                    trip();
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1665,6 +1678,7 @@ impl Store {
             block,
             OnRaise::StopAll,
             "pigeonhole-consolidate",
+            None,
             move || {
                 let mut run = s.consolidate(&ns, &*consolidator);
                 if let Some(p) = &policy {
@@ -2061,12 +2075,14 @@ impl ConsolidateLoop {
     ) -> Result<RArray, Error> {
         let m = rb_self.0.get(ruby)?;
         let LoopState { mut lp, slot } = lock(m).take(ruby)?;
+        let interrupter = lp.interrupter();
         let d = drive(
             ruby,
             &slot,
             block,
             OnRaise::PerGroup,
             "pigeonhole-consolidate-loop",
+            Some(&interrupter),
             move || {
                 let step = lp.run_once(timeout.0);
                 (lp, step)
@@ -2119,11 +2135,12 @@ impl ConsolidateLoop {
         for (ns, p) in step.stopped {
             stopped.push((ns, consolidate_pass(ruby, p)?))?;
         }
-        let a = ruby.ary_new_capa(6);
+        let a = ruby.ary_new_capa(7);
         a.push(step.events)?;
         a.push(passes)?;
         a.push(failed)?;
         a.push(stopped)?;
+        a.push(step.interrupted)?;
         a.push(step.next_due)?;
         a.push(crate::convert::binary(ruby, step.token.as_bytes()))?;
         Ok(a)
