@@ -500,8 +500,8 @@ pub(crate) fn top_k(
     let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
-    // The last document decided: a walk that starts being walked again steps past it. One
-    // buffer, reused, so a candidate costs no allocation for it.
+    // The last document decided: a walk that starts being walked again steps past it. It's
+    // the candidate's own buffer, reused.
     let mut last: Vec<u8> = Vec::new();
     let mut decided = false;
     // Whether an essential fuzzy clause has unwalked expansions: only then does a candidate
@@ -539,18 +539,20 @@ pub(crate) fn top_k(
             }
         }
         let essential = &by_bound[skip..];
-        let Some(doc) = essential
-            .iter()
-            .filter_map(|&c| clauses[c].doc())
-            .min()
-            .map(<[u8]>::to_vec)
-        else {
+        let Some(next) = essential.iter().filter_map(|&c| clauses[c].doc()).min() else {
             break;
         };
+        // The candidate, in `last`'s buffer: once it's decided, it's the last document
+        // decided, which the next pass's re-walk steps past. No allocation per candidate; a
+        // document that enters the top `k` is copied.
+        last.clear();
+        last.extend_from_slice(next);
+        decided = true;
+        let doc: &[u8] = &last;
         has.iter_mut().for_each(|h| *h = false);
         let mut partial = 0.0;
         for &c in essential {
-            if clauses[c].doc() == Some(doc.as_slice()) {
+            if clauses[c].doc() == Some(doc) {
                 contrib[c] = clauses[c].here();
                 has[c] = true;
                 partial += contrib[c];
@@ -580,16 +582,13 @@ pub(crate) fn top_k(
                 break;
             }
             gains -= up - here;
-            let v = clauses[c].lookup_unwalked(t, s, bm, &doc)?;
+            let v = clauses[c].lookup_unwalked(t, s, bm, doc)?;
             if v > here {
                 contrib[c] = v;
                 has[c] = true;
                 partial += v - here;
             }
         }
-        last.clear();
-        last.extend_from_slice(&doc);
-        decided = true;
         if pruned {
             continue;
         }
@@ -601,7 +600,7 @@ pub(crate) fn top_k(
                 break;
             }
             let c = by_bound[i];
-            let v = clauses[c].lookup(t, s, bm, &doc)?;
+            let v = clauses[c].lookup(t, s, bm, doc)?;
             if v != 0.0 {
                 contrib[c] = v;
                 has[c] = true;
@@ -618,13 +617,21 @@ pub(crate) fn top_k(
                 score += contrib[c];
             }
         }
-        let entry = Held(score, doc);
         if held.len() < k {
-            held.push(entry);
-        } else if entry < *held.peek().expect("k > 0 held") {
-            // Better than the worst held: it takes the worst one's place.
-            held.pop();
-            held.push(entry);
+            held.push(Held(score, doc.to_vec()));
+        } else {
+            // Better than the worst held (`Held`'s order: a higher score, or an equal score
+            // and a smaller id): it takes the worst one's place.
+            let worst = held.peek().expect("k > 0 held");
+            let better = match score.total_cmp(&worst.0) {
+                Ordering::Greater => true,
+                Ordering::Equal => doc < worst.1.as_slice(),
+                Ordering::Less => false,
+            };
+            if better {
+                held.pop();
+                held.push(Held(score, doc.to_vec()));
+            }
         }
     }
     // Best first: score descending, then id ascending (`Held` orders the worst greatest).
