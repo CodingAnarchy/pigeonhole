@@ -1053,14 +1053,19 @@ impl Rebalancer {
         // In slices of at most `SLICE`, with an interrupt check between them, so Ctrl-C or
         // `Thread#raise` waits at most a slice (and one split) rather than the whole budget
         // (perf2's S3 on #1434). Each call is whole, so stopping between them is safe.
+        // The crate's answer means "it did some work, or work is left", so the call's is
+        // whether any slice said so, not the last one's (perf2's R1 on #1434: a call that
+        // drained the work in its first slice returned false).
         let deadline = Instant::now().checked_add(budget.0);
+        let mut any = false;
         loop {
             let left = deadline.map_or(SLICE, |d| {
                 d.saturating_duration_since(Instant::now()).min(SLICE)
             });
             let more = vcall(ruby, move || lock(m).run_once(left))?;
+            any |= more;
             if !more || deadline.is_some_and(|d| Instant::now() >= d) {
-                return Ok(more);
+                return Ok(any);
             }
             ruby.thread_check_ints()?;
         }

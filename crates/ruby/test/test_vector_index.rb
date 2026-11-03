@@ -170,6 +170,19 @@ class TestVectorIndex < Minitest::Test
 
   # perf2's S3 on #1434: while a run_once works, closed? from another thread doesn't hold
   # the GVL waiting for it, and the run_once itself stops promptly on an interrupt.
+  # perf2's R1 on #1434: a run_once that drains the work in its first slice still says it
+  # worked. Over several seeds, as perf2's probe found the regression in 3 of 12.
+  def test_run_once_says_it_worked_when_it_drained_the_work
+    6.times do |seed|
+      rng = Random.new(seed)
+      idx, reb = V::Index.create(db, "drain#{seed}", spec(2), target_list_len: 4, rebalance: :background,
+                                                               rebalancer: true)
+      30.times { |i| idx.insert("v#{i}", [rng.rand, rng.rand]) }
+      assert reb.run_once(5.0), "seed #{seed}: run_once did the splits but said it didn't"
+      refute reb.run_once(0.05), "seed #{seed}: nothing is left"
+    end
+  end
+
   def test_a_busy_rebalancer_stays_responsive
     rng = Random.new(3)
     idx, reb = V::Index.create(db, "busy", spec(8), target_list_len: 4, rebalance: :background, rebalancer: true)
