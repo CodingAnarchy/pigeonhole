@@ -75,7 +75,11 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
 ## CI and packaging
 - **`ruby.yml`:** the extension compiled, the Minitest suite (once plainly and once under `rbs test`'s runtime checking against `sig/pigeonhole.rbs`) and `rbs validate`, on Ruby 3.3 on Linux, macOS and Windows, and Ruby 4.0 on Linux and macOS.
 - **`ruby-gems.yml`:** precompiled native gems (oxidize-rb's `cross-gem` over `rb-sys-dock`) for x86_64 and aarch64 Linux (gnu and musl), x86_64 and arm64 macOS, and `x64-mingw-ucrt` Windows, for Ruby 3.3, 3.4 and 4.0, uploaded as artifacts only.
-- **The source-gem fallback** follows in its own PR, since it needs a standalone `Cargo.toml`.
+- **The source gem**, for platforms without a native gem: `rake gem:source` (`rakelib/source_gem.rake`) stages the gem in `pkg/source/` with the engine's path crates vendored under `vendor/`, as maturin's sdist does for Python. The design and both reviews are on #697.
+  - The vendored set is the closure of the declared normal and build path dependencies, optional ones included.
+  - Each crate is its tracked files, without `tests/`, `benches/`, `examples/` and `fuzz/`. Its manifest stands alone: the workspace inheritance is resolved from the root `Cargo.toml` (`edition` and `rust-version` stated explicitly), path dependencies point at the vendored copies, and every dev-dependency table and explicit target is dropped. Of `[lints]`, only `unexpected_cfgs` and its check-cfg list are kept, at "warn".
+  - Staging fails on a path dependency outside `vendor/`, and on an `include_str!`, `include_bytes!` or `#[path]` target the copy doesn't carry (outside `#[cfg(doctest)]` modules). `crates/ruby/Cargo.lock` is copied unchanged and checked with `cargo metadata --locked`. `extconf.rb` builds with `--locked`, so a user gets the versions CI tested.
+  - `ruby-gems.yml`'s `source` job installs the gem from a copy outside the checkout into an empty `GEM_HOME` on Linux and macOS, runs `script/source_gem_smoke.rb`, and uploads the gem as an artifact. A plain `gem build` from the checkout still refuses.
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
 ## Later PRs
