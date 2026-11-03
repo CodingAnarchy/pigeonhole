@@ -150,6 +150,9 @@ def test_recall_expands_through_links(db):
         for bad in (0, mem.Expand.MAX_HOPS + 1):
             with pytest.raises(ph.InvalidArgument):
                 s.recall("n", expand=mem.Expand(bad), **q)
+        for bad in (dict(hops=-1), dict(max=-1), dict(hops=2**40)):
+            with pytest.raises(ph.InvalidArgument):
+                mem.Expand(**bad)
 
 
 def test_open_checks_the_model(db):

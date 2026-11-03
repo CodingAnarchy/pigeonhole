@@ -343,15 +343,24 @@ impl Expand {
     #[classattr]
     const MAX_HOPS: u32 = mem::Expand::MAX_HOPS;
 
-    /// `hops` from 1 to `MAX_HOPS` (the recall refuses others with `InvalidArgument`).
+    /// `hops` from 1 to `MAX_HOPS` (the recall refuses others with `InvalidArgument`); a
+    /// negative `hops` or `max` is `InvalidArgument` here.
     #[new]
     #[pyo3(signature = (hops=1, *, max=None))]
-    fn new(hops: u32, max: Option<usize>) -> Self {
+    fn new(hops: i64, max: Option<i64>) -> PyResult<Self> {
+        let hops = u32::try_from(hops).map_err(|_| {
+            invalid(format!(
+                "Expand: hops {hops}, from 1 to {}",
+                mem::Expand::MAX_HOPS
+            ))
+        })?;
         let mut x = mem::Expand::hops(hops);
         if let Some(m) = max {
+            let m =
+                usize::try_from(m).map_err(|_| invalid(format!("Expand: max {m}, 0 or more")))?;
             x = x.max(m);
         }
-        Self(x)
+        Ok(Self(x))
     }
 
     #[getter]
