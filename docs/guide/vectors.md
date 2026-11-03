@@ -100,10 +100,35 @@ assert!(index.delete(&42u32.to_be_bytes())?);
   - `nprobe(n)`: the lists probed. It overrides the index's own default, `IndexOptions::nprobe`: 24 for an index created now. Options are fixed when an index is created, so an older index keeps the default it was created with;
   - `snapshot(&s)`;
   - `parallel(n)`;
-  - `run_async()`.
+  - `id_prefix(p)`: only ids starting with `p`, for example one tenant's or namespace's. Probed lists hold every id near the query, so a rare prefix could leave fewer than `k` hits at `nprobe`. The search therefore doubles the lists it probes, nearest first, until `k` hits pass, every list is probed, or `max_probe(n)` lists are;
+  - `run_async()`, and `run_with_stats()`, which also reports the lists probed.
 
-  With every list probed, a search is exact: it equals `nearest_*` over the index's vectors.
-- **Ties:** hits at an equal distance come back by the list that holds them, then by id. A split can move a tied id to another list, so which of several ids tied at the k-th distance makes the cut can change between layouts.
+  With every list probed, a search is exact: it equals `nearest_*` over the index's vectors, or over those with the prefix.
+- **Writing in your own transaction:** `insert_f32_in(&mut tx, &mut placed, id, &v)` (and the other elements) and `delete_in(&mut tx, &mut placed, id)` write the index inside a `Transaction`, so the vector commits or rolls back with your other writes. `placed` is a `Placed::new()` you make once per transaction and pass to each write. It records where the index put each id, because a transaction's reads don't see its own writes, so writing one id twice works. Once the transaction commits, pass it to `after_commit`, which splits or merges what the writes left out of bounds:
+
+  ```rust
+  # use pigeonhole::*;
+  # use pigeonhole_vector::{Index, IndexOptions, Placed};
+  # fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+  # let dir = pigeonhole::doc_support::temp_dir();
+  # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+  # let spec = VectorSpec::new(2, Element::F32, Metric::L2)?;
+  # let index = Index::create(&db, "docs_idx", spec, IndexOptions::new())?;
+  let docs = db.table("docs")?.family("body", Family::default()).create_if_missing()?;
+  let (placed, _) = db.transact(&RetryPolicy::default(), |tx| {
+      let mut placed = Placed::new();
+      tx.put(&docs, b"doc1", "body", b"", b"hello");
+      index.insert_f32_in(tx, &mut placed, b"doc1", &[0.5, 0.5])?;
+      Ok::<_, pigeonhole_vector::Error>(placed)
+  })?;
+  index.after_commit(placed)?;
+  # drop(index);
+  # db.close()?;
+  # Ok(())
+  # }
+  ```
+  A transaction whose snapshot predates a split of the list it writes fails its commit with `Conflict`, and `transact` retries it. Use one `Placed` per transaction: two of them in one transaction can't see each other's writes.
+- **Ties:** hits at an equal distance come back by the list that holds them, then by id (for a widened `id_prefix` search, by probe round first). A split can move a tied id to another list, so which of several ids tied at the k-th distance makes the cut can change between layouts.
 - **`verify()`** checks the index's rows against each other. It's for tests and repair tools.
 
 ### Recall against latency

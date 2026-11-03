@@ -125,3 +125,45 @@ fn run_async_is_send(index: &Index, q: &[f32]) {
     fn send<T: Send>(_: T) {}
     send(index.search_f32(q, 3).run_async());
 }
+
+/// D311 T8: a prefixed search widens the same way async (`run_async` against `run`).
+#[test]
+fn a_prefixed_async_search_widens_as_the_sync_one_does() {
+    let spec =
+        pigeonhole::VectorSpec::new(2, pigeonhole::Element::F32, pigeonhole::Metric::L2).unwrap();
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let index = Index::create(&db, "idx", spec, IndexOptions::new().target_list_len(8)).unwrap();
+    for i in 0..300u32 {
+        let id = [b"b/".as_slice(), &i.to_be_bytes()].concat();
+        let v = [(i % 5) as f32 * 10.0 + (i % 97) as f32 * 0.01, 0.0];
+        index.insert_f32(&id, &v).unwrap();
+    }
+    for i in 0..6u32 {
+        let id = [b"a/".as_slice(), &i.to_be_bytes()].concat();
+        index.insert_f32(&id, &[100.0 + i as f32, 50.0]).unwrap();
+    }
+    let q = [0.0f32, 0.0];
+    for (k, max) in [(3, None), (10, None), (3, Some(2))] {
+        both(
+            || {
+                let s = index.search_f32(&q, k).nprobe(1).id_prefix(b"a/");
+                match max {
+                    Some(m) => s.max_probe(m),
+                    None => s,
+                }
+            },
+            &format!("k {k}, max_probe {max:?}"),
+        );
+    }
+    let hits = block_on(
+        index
+            .search_f32(&q, 10)
+            .nprobe(1)
+            .id_prefix(b"a/")
+            .run_async(),
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 6, "widened to every list");
+    db.close().unwrap();
+}

@@ -36,7 +36,10 @@ mod rebalancer;
 mod registry;
 
 pub use error::{Error, Result};
-pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, ReadIndex, Rebalance, Search};
+pub use index::{
+    BulkStats, Hit, Index, IndexOptions, IndexStats, Placed, ReadIndex, Rebalance, Search,
+    SearchStats,
+};
 pub use rebalancer::Rebalancer;
 
 /// The user guide's vectors page and the crate README, compiled and run as doctests.
