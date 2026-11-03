@@ -170,6 +170,17 @@ impl Failure {
         }
     }
 
+    /// An error of a crate over the public API (`pigeonhole-memory`) by its code, with
+    /// phdb's message.
+    pub(crate) fn coded(code: ErrorCode, message: String) -> Self {
+        Self {
+            code: format!("{code:?}"),
+            code_num: Some(code as u32),
+            message,
+            status: status_of(code),
+        }
+    }
+
     /// A database error with phdb's own message, keeping the error's code and status.
     pub(crate) fn db_with(message: String, e: &Error) -> Self {
         Self {
