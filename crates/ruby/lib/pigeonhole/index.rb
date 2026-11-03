@@ -173,16 +173,25 @@ module Pigeonhole
 
       # Loads `pairs` (an Enumerable of `[id, vector]`) into an empty index, faster than
       # inserting them one by one. `expected` is about how many there are: it chooses how
-      # many lists to start with. The pairs stream to the index `batch` at a time; if
-      # enumerating them raises, the vectors before are loaded.
+      # many lists to start with. The pairs stream to the index `batch` at a time. If
+      # enumerating them raises, the batches sent before stay loaded (a bulk load isn't one
+      # transaction), and the exception propagates. An interrupt waits for the load of what
+      # was sent to end, then takes effect.
       def bulk_load(pairs, expected:, batch: 4096)
         loader = native_bulk_load(expected)
         begin
           pairs.each_slice(batch) { |b| loader.push(b) }
-        ensure
-          stats = loader.__send__(:native_finish)
+        rescue Exception # rubocop:disable Lint/RescueException
+          # End the load (the batches sent stay loaded) and keep the caller's exception: a
+          # failure of the load itself mustn't replace it (ai1249's N1 on #1434).
+          begin
+            loader.__send__(:native_finish)
+          rescue Pigeonhole::Error
+            nil
+          end
+          raise
         end
-        BulkStats.new(*stats)
+        BulkStats.new(*loader.__send__(:native_finish))
       end
     end
 

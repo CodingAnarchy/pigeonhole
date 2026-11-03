@@ -827,27 +827,41 @@ fn load(
             expected,
             batches.filter_map(|(id, v)| match v {
                 Vector::I8(v) => Some((id, v)),
-                _ => None,
+                _ => {
+                    // `push` converts every pair by the index's spec, so all have one form.
+                    debug_assert!(false, "a bulk load's pairs have one form");
+                    None
+                }
             }),
         ),
         Some(2) => i.bulk_load_bits(
             expected,
             batches.filter_map(|(id, v)| match v {
                 Vector::Bits(v) => Some((id, v)),
-                _ => None,
+                _ => {
+                    // `push` converts every pair by the index's spec, so all have one form.
+                    debug_assert!(false, "a bulk load's pairs have one form");
+                    None
+                }
             }),
         ),
         _ => i.bulk_load_f32(
             expected,
             batches.filter_map(|(id, v)| match v {
                 Vector::F32(v) => Some((id, v)),
-                _ => None,
+                _ => {
+                    // `push` converts every pair by the index's spec, so all have one form.
+                    debug_assert!(false, "a bulk load's pairs have one form");
+                    None
+                }
             }),
         ),
     }
 }
 
-/// A bulk load in progress: the batches' channel and its thread.
+/// A bulk load in progress: the batches' channel and its thread. Dropped without `finish`
+/// (a `BulkLoad` collected unfinished), the channel closes and the loader commits what it
+/// got before ending on its own (ai1249's N2 on #1434); `bulk_load` always finishes.
 pub(crate) struct BulkState {
     spec: pigeonhole::VectorSpec,
     tx: SyncSender<Vec<(Vec<u8>, Vector)>>,
@@ -912,16 +926,21 @@ impl VectorBulkLoad {
     }
 }
 
-/// Joins `worker` in slices with interrupt checks between them; an interrupt leaves it
-/// running to its end (a bulk load can't stop midway) and raises.
+/// Joins `worker` in slices with interrupt checks between them. An interrupt doesn't end
+/// the join: a bulk load can't stop midway, and returning would leave the loader running
+/// detached with its index (ai1249's B1 on #1434, #1425's shape). It's recorded, the join
+/// goes on until the loader ends (it has only the batches already sent), and then it's
+/// raised.
 fn join_sliced<T: Send + 'static>(
     ruby: &Ruby,
     worker: std::thread::JoinHandle<T>,
 ) -> Result<T, Error> {
     let worker = Mutex::new(Some(worker));
+    let mut interrupted: Option<Error> = None;
     loop {
         let w = &worker;
-        let done = without_gvl(ruby, move || {
+        // `without_gvl` raises an interrupt already pending instead of running: recorded too.
+        let done = match without_gvl(ruby, move || {
             let start = Instant::now();
             loop {
                 let finished = lock(w)
@@ -932,14 +951,28 @@ fn join_sliced<T: Send + 'static>(
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-        })?;
+        }) {
+            Ok(done) => done,
+            Err(e) => {
+                interrupted.get_or_insert(e);
+                false
+            }
+        };
         if done {
             let h = lock(&worker).take().expect("present until joined");
-            return h.join().map_err(|_| {
-                crate::error::uncoded(ruby, "Error", "the bulk load thread panicked")
-            });
+            let out = h
+                .join()
+                .map_err(|_| crate::error::uncoded(ruby, "Error", "the bulk load thread panicked"));
+            return match interrupted {
+                Some(e) => Err(e),
+                None => out,
+            };
         }
-        ruby.thread_check_ints()?;
+        if interrupted.is_none()
+            && let Err(e) = ruby.thread_check_ints()
+        {
+            interrupted = Some(e);
+        }
     }
 }
 

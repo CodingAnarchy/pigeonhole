@@ -4,6 +4,7 @@
 # the element forms, writes in a transaction with Placed and after_commit, prefixed
 # searches, bulk loads, readers and a Ruby-driven Rebalancer. Mirrors crates/vector/tests.
 require_relative "test_helper"
+require "timeout"
 
 class TestVectorIndex < Minitest::Test
   include PigeonholeTest
@@ -121,6 +122,34 @@ class TestVectorIndex < Minitest::Test
     assert_raises(boom) { fresh.bulk_load(each_then_raise, expected: 10, batch: 2) }
     assert_equal 2, fresh.verify.vectors # the batch sent before the failure loaded
     assert_bad_call(TypeError) { V::Index.create(db, "bulk3", spec(4)).bulk_load([[1]], expected: 1) }
+  end
+
+  # The loader threads alive now, by name; nil where the platform doesn't show them (only
+  # Linux's /proc does, which CI runs).
+  def loader_threads
+    return nil unless File.directory?("/proc/self/task")
+
+    Dir["/proc/self/task/*/comm"].count { |f| File.read(f).start_with?("pigeonhole-bulk") }
+  rescue SystemCallError
+    nil
+  end
+
+  # ai1249's B1 on #1434: an interrupt during a bulk load (in a push or in the final join)
+  # never returns while the loader thread still runs.
+  def test_an_interrupt_leaves_no_loader_behind
+    rng = Random.new(1434)
+    pairs = Array.new(4_000) { |i| [format("v%05d", i), Array.new(16) { rng.rand }] }
+    12.times do |n|
+      idx = V::Index.create(db, "int#{n}", spec(16))
+      begin
+        Timeout.timeout(rng.rand * 0.05) { idx.bulk_load(pairs, expected: 4_000, batch: 500) }
+      rescue Timeout::Error
+        nil
+      end
+      left = loader_threads
+      assert_equal 0, left, "a loader thread outlived bulk_load" if left
+      assert_operator idx.verify.vectors, :<=, 4_000
+    end
   end
 
   def test_a_reader_searches
