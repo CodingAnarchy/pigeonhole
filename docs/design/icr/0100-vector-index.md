@@ -69,6 +69,13 @@
   - **The layout cache follows a writer that lost commits:** a search at the current snapshot adopts its fresh layout when the cache's seqno is newer than any now visible (perf287 on #1385). The same rule applies to `Index`.
 - **Internal:** the centroid load and the layout check are shared through a crate-private `Rows` trait over `Table` and `ReadTable`, and `Search` reads either kind of index.
 
+## Half-precision indexes (#1268 item 7)
+- **`Index::create` takes `F16` and `BF16` specs** (ICR 0104's elements). Centroids stay `f32` of the same dimension and metric, since a mean of halves isn't a half.
+- **`Index::insert_f16(id, &[u16])`, `insert_bf16`:** each `u16` is a bit pattern, stored bit for bit. A split's move rewrites the patterns it read, exactly.
+- **`Index::search_f16(&[u16], k)`, `search_bf16`, and the same on `ReadIndex`:** the query widens to `f32` exactly and searches as `nearest_f32` searches a half family, so the hits equal `search_f32` with the widened query.
+- **`insert_f32` and `search_f32` work on a half index too.** A written `f32` vector is rounded to the element, as `put_vector_f32` rounds into a half family. Other mismatches (`i8` or bits in a half index, `f16` bits in a `bf16` index) are `InvalidArgument`.
+- **Internal:** a crate-private `half` module widens patterns into a caller's buffer (`Input::widen_into`), checked against `VectorRef::widen_into` over all 65,536 patterns. The `bulk_load_f16`/`bf16` forms (perf287) are thin over it, and follow.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);

@@ -55,6 +55,7 @@ let pages = db
 | Distributions in fixed buckets (response codes, latency bands) | `Family::aggregate(Aggregation::Histogram(HistogramParams::new(bounds)?))`; read with `histogram_counts` |
 | Membership checks (seen this user? this URL?) | `Family::aggregate(Aggregation::Bloom(BloomParams::new(bits, hashes)?))`; write with `aggregate` or `aggregate_bytes`, read with `bloom_contains` |
 | Percentiles (p50, p99 latency) | `Family::aggregate(Aggregation::Quantiles(QuantileParams::default()))`; read with `quantile(0.99)` |
+| Sets of ids (a node's neighbours, who did something) | `Family::aggregate(Aggregation::Set)`; write with `set_add` and `set_remove`, read with `as_set` ([Sets of integers](#sets-of-integers)) |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -292,7 +293,7 @@ assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
 
 `aggregate_bytes` also feeds an HLL family. Hash a string key there with it, rather than converting it to an `i64` yourself. A bytes element and an `i64` hash apart, so `aggregate_bytes(&7i64.to_le_bytes())` and `aggregate(7)` are two elements.
 
-Aggregate cells are never moved to blob files, whatever `blob_threshold` says, with two exceptions: a bloom filter or a set larger than its family's `blob_threshold` is, like any large value. Reads and compactions fold new elements into it there, so a large filter costs one blob read per get plus its pending elements, and compaction rewrites it once per pass. A get that folds a filter of at most 4 KiB keeps the result in memory for the next reads; a larger one relies on compaction instead.
+Aggregate cells are never moved to blob files, whatever `blob_threshold` says, with two exceptions: a bloom filter or a set larger than its family's `blob_threshold` is, like any large value. Reads and compactions fold new elements into it there, so a large filter costs one blob read per get plus its pending elements, and compaction rewrites it once per pass. A get that folds many inputs keeps the result in memory for the next reads (a checkpoint), of any aggregate kind and size, once the inputs it folded add up to at least a quarter of the result's size. So a large filter or set read under a trickle of small inputs relies on compaction instead, and keeps memory use in proportion to what was written (D298).
 
 ## Sets of integers
 
