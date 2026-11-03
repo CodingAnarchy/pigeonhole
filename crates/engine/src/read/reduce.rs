@@ -263,6 +263,8 @@ pub struct ReduceStats {
     pub cells: u64,
     /// Threads used (1 when the read ran on the caller's thread).
     pub threads: u64,
+    /// Lanes read straight from their one SST, with nothing to resolve (#1283 lever 3).
+    pub plain_lanes: u64,
 }
 
 impl ReduceStats {
@@ -270,6 +272,7 @@ impl ReduceStats {
         self.groups += o.groups;
         self.rows += o.rows;
         self.cells += o.cells;
+        self.plain_lanes += o.plain_lanes;
     }
 }
 
@@ -457,13 +460,13 @@ impl Resume {
         match rank.cmp(&self.rank) {
             std::cmp::Ordering::Less => {
                 lane.pending = false;
-                lane.resolver.skip_row()
+                lane.skip_row()
             }
             std::cmp::Ordering::Equal => {
                 if lane.col() < self.past.as_slice() {
                     lane.pending = false;
                     lane.pinned = None;
-                    lane.resolver.seek(&self.past)?;
+                    lane.seek(&self.past)?;
                     lane.fetch()?;
                 }
                 Ok(())
@@ -505,6 +508,15 @@ fn open_lanes(ctx: &Ctx<'_>, g: &Group<'_>, lanes: &mut Vec<Lane>) -> Result<()>
             continue;
         }
         opts.skip_columns = skips_columns(resolver.cursor_mut().sources());
+        let plain = super::plain_lane(
+            &located,
+            meta,
+            &opts,
+            &filter,
+            resolver.cursor_mut().sources_mut(),
+            ctx.snapshot.seqno,
+            g.hi.as_deref(),
+        );
         resolver.cursor_mut().reset();
         resolver.reset(opts);
         resolver.set_upper_bound(g.hi.as_deref());
@@ -520,9 +532,10 @@ fn open_lanes(ctx: &Ctx<'_>, g: &Group<'_>, lanes: &mut Vec<Lane>) -> Result<()>
             pinned: None,
             pending: false,
             done: false,
+            plain,
         });
         let lane = lanes.last_mut().expect("pushed above");
-        lane.resolver.seek(g.lo.as_deref().unwrap_or(&[]))?;
+        lane.seek(g.lo.as_deref().unwrap_or(&[]))?;
     }
     Ok(())
 }
@@ -550,7 +563,7 @@ fn skip_row(lanes: &mut [Lane], row_esc: &[u8]) -> Result<()> {
     for lane in lanes {
         if in_row(lane, row_esc) {
             lane.pending = false;
-            lane.resolver.skip_row()?;
+            lane.skip_row()?;
         }
     }
     Ok(())
@@ -571,6 +584,7 @@ where
     ctx.snapshot.check_process()?;
     let mut lanes = Vec::new();
     let opened = open_lanes(ctx, g, &mut lanes);
+    stats.plain_lanes += lanes.iter().filter(|l| l.plain.is_some()).count() as u64;
     // Each lane's family position in the read's family order, once per group (perf287's
     // nit on #1209: not a search per cell).
     let ranks: Vec<u32> = lanes

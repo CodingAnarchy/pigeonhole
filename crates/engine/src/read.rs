@@ -12,6 +12,7 @@ use pigeonhole_compaction::{
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
 };
+use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
 use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
@@ -20,7 +21,7 @@ use pigeonhole_sst::QualifierFilter;
 
 use crate::catalog::{FamilyMeta, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
-use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
+use crate::source::{ColumnKey, Located, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
 
 pub(crate) mod keys;
@@ -581,6 +582,83 @@ struct Lane {
     pinned: Option<LaneValue>,
     pending: bool,
     done: bool,
+    /// A reduction lane over one SST source with nothing to resolve (#1283 lever 3): its
+    /// cells are read straight from the source, `None` for every other lane.
+    plain: Option<Box<PlainLane>>,
+}
+
+/// A lane over the one SST source of its family in the tablet, when nothing in it needs the
+/// MVCC resolver (#1283 lever 3, [`plain_lane`]): no deletes, every entry visible at the read
+/// point, a standard family without a merge operator, and a read of one version with no
+/// time range, column limit or value predicate. Then a column's first entry in key order is
+/// its version (newest timestamp, then newest seqno), so the lane takes it from the block as
+/// it lies and steps past the column's older entries, with no merge, group walk or copy.
+#[derive(Debug, Default)]
+struct PlainLane {
+    /// The column prefix of the cell last taken: an entry still in it is an older version.
+    col: Vec<u8>,
+    /// The tablet's end (an encoded row prefix), as `CellResolver::set_upper_bound`.
+    hi: Option<Vec<u8>>,
+    /// The source is on the held cell (it moves past it on the next fetch).
+    held: bool,
+}
+
+/// A [`PlainLane`] for a lane whose `sources` (filled for `located` with `filter`) and
+/// options `opts` meet its conditions at read point `snapshot`, `None` otherwise; when it
+/// is one, `sources` keeps only the SST. Every condition is checked once, when the lane
+/// opens (simp724's review on #1283):
+/// 1. one SST source (an SST, or one level's SSTs), and every memtable of the family here
+///    empty. `scan_sources_located` adds a source for every memtable, the empty active one
+///    included; one empty when the lane opens holds nothing at or below the read point,
+///    since every commit there applied before the read point became visible;
+/// 2. no delete entries (cell, column or family: `SstMeta::deletes` counts every kind) in
+///    any of the family's SSTs here;
+/// 3. every entry at or below the read point;
+/// 4. a standard family with no merge operator, known or not (no operands);
+/// 5. one version, no time range (the resolver's or the filter's), no column limit and no
+///    value predicate;
+/// 6. no TTL.
+fn plain_lane(
+    located: &Located<'_>,
+    meta: &FamilyMeta,
+    opts: &ResolveOptions,
+    filter: &ScanFilter,
+    sources: &mut Vec<Source>,
+    snapshot: Seqno,
+    hi: Option<&[u8]>,
+) -> Option<Box<PlainLane>> {
+    let ssts = located.ssts?;
+    let one_sst = sources
+        .iter()
+        .filter(|s| matches!(s, Source::Sst(_)))
+        .count()
+        == 1;
+    let plain = one_sst
+        && located
+            .mems
+            .is_none_or(|m| m.readers.iter().all(|r| r.is_empty()))
+        && ssts
+            .iter()
+            .all(|s| s.meta.deletes == 0 && s.meta.seqno_range.1 <= snapshot)
+        && meta.options.kind == FamilyKind::Standard
+        // No operator at all: `merge_op` alone is also `None` for an operator this build
+        // doesn't know (`MergeKind::Unknown`), whose operands are still there.
+        && meta.merge == MergeKind::None
+        && meta.merge_op.is_none()
+        && meta.options.ttl_micros == 0
+        && opts.versions == 1
+        && opts.time_range.is_none()
+        && filter.time_range.is_none()
+        && opts.columns_per_row == 0
+        && opts.value.is_none();
+    if !plain {
+        return None;
+    }
+    sources.retain(|s| matches!(s, Source::Sst(_)));
+    Some(Box::new(PlainLane {
+        hi: hi.map(<[u8]>::to_vec),
+        ..PlainLane::default()
+    }))
 }
 
 impl std::fmt::Debug for Lane {
@@ -601,6 +679,9 @@ impl Lane {
         self.pinned = None;
         if self.done {
             return Ok(());
+        }
+        if self.plain.is_some() {
+            return self.fetch_plain();
         }
         let (from_source, len) = {
             let next = self.resolver.next_cell();
@@ -637,8 +718,79 @@ impl Lane {
         Ok(())
     }
 
+    /// [`Lane::fetch`] for a plain lane: the next column's first entry, from the source.
+    /// Out of line: scans never take it, so their fetch gains one branch only.
+    #[inline(never)]
+    fn fetch_plain(&mut self) -> Result<()> {
+        let plain = self.plain.as_deref_mut().expect("a plain lane");
+        let src = &mut self.resolver.cursor_mut().sources_mut()[0];
+        if std::mem::take(&mut plain.held) {
+            src.next()?;
+        }
+        while src.valid() {
+            let key = src.key();
+            if plain.hi.as_deref().is_some_and(|hi| key >= hi) {
+                break;
+            }
+            let (col, ts, _, kind) = pigeonhole_format::key::split_suffix(key)?;
+            if col == plain.col.as_slice() {
+                // An older version of the column just taken.
+                src.next()?;
+                continue;
+            }
+            if kind != pigeonhole_format::Kind::Put {
+                // `plain_lane` checked the SST holds no deletes, and the family no operands.
+                return Err(Error::Corruption(
+                    "an entry other than a put in an SST counted without deletes or operands"
+                        .into(),
+                ));
+            }
+            plain.col.clear();
+            plain.col.extend_from_slice(col);
+            plain.held = true;
+            self.ts = ts;
+            if let Some(v) = self.ssts.read_blob(src.value())? {
+                self.pinned = Some(LaneValue::Pinned(Pinned::Block(v)));
+            }
+            self.pending = true;
+            return Ok(());
+        }
+        self.done = true;
+        Ok(())
+    }
+
+    /// The plain lane's source (only for a plain lane).
+    fn plain_source(&self) -> &Source {
+        &self.resolver.cursor().sources()[0]
+    }
+
+    /// Positions the lane at the first entry `>= key` (an encoded row prefix or a column
+    /// past which a resumed reduction continues), as [`CellResolver::seek`].
+    fn seek(&mut self, key: &[u8]) -> Result<()> {
+        if let Some(plain) = self.plain.as_deref_mut() {
+            plain.col.clear();
+            plain.held = false;
+            self.done = false;
+            return self.resolver.cursor_mut().sources_mut()[0].seek(key);
+        }
+        self.resolver.seek(key)
+    }
+
+    /// Drops the rest of the held cell's row, as [`CellResolver::skip_row`].
+    fn skip_row(&mut self) -> Result<()> {
+        if let Some(plain) = self.plain.as_deref_mut() {
+            // The source is on the held cell, in the row: skip from there.
+            plain.held = false;
+            return self.resolver.cursor_mut().sources_mut()[0].skip_row();
+        }
+        self.resolver.skip_row()
+    }
+
     /// The held cell's column prefix (only while `pending`).
     fn col(&self) -> &[u8] {
+        if self.plain.is_some() {
+            return column_of(self.plain_source().key());
+        }
         self.resolver.current().map_or(&[], |c| column_of(c.key))
     }
 
@@ -646,6 +798,7 @@ impl Lane {
     fn value(&self) -> &[u8] {
         match &self.pinned {
             Some(v) => v,
+            None if self.plain.is_some() => self.plain_source().value(),
             None => self.resolver.current().map_or(&[], |c| c.value),
         }
     }
@@ -1035,6 +1188,7 @@ impl ScanCursor {
                 pinned: None,
                 pending: false,
                 done: false,
+                plain: None,
             });
             // A failed seek leaves the lane in place; its sources go with the others.
             let lane = self.lanes.last_mut().expect("pushed above");
