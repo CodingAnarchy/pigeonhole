@@ -1,2 +1,3 @@
 ### Added
 - `pigeonhole-memory`: `Store::watch` and `ReadStore::watch` follow a store's memory events through the change feed (D311 T9, #1343), in the writer or in a reader process: `Remembered`, `Summarized`, `Superseded`, `Deleted` and `Updated`, one per memory per commit, with a resumable `WatchToken`. Consolidation now marks the summaries it writes (`meta:summary`), so a watch can tell them from new memories.
+- `pigeonhole-memory`: `Store::consolidate_loop` runs consolidation passes as new memories arrive, through the change feed (D311 T9, #1343): a namespace's pass once its oldest new memory is the policy's `min_age` old, with the loop's position kept in the store so it resumes after a restart.

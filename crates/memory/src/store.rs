@@ -730,6 +730,17 @@ impl Store {
         crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
     }
 
+    /// A feed-driven consolidation loop named `name` (D311 T9): see
+    /// [`ConsolidateLoop`](crate::ConsolidateLoop). The name keys its saved position in the
+    /// store: non-empty, without `:`.
+    pub fn consolidate_loop<'a>(
+        &'a self,
+        name: &str,
+        consolidator: &'a dyn crate::Consolidator,
+    ) -> crate::ConsolidateLoop<'a> {
+        crate::feed_loop::ConsolidateLoop::new(self, name, consolidator)
+    }
+
     /// The Unicode normalisation of the store's text index, set at create
     /// ([`StoreOptions::normalization`]).
     pub fn normalization(&self) -> Normalization {

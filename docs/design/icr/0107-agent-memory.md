@@ -258,6 +258,24 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
 - **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it.
 - **Async:** `next_async` in the writer, once #1408 (D310 PR 5a) is merged. A reader calls the sync `next` on a thread of its own.
 
+## T9, part 2: the feed-driven consolidation loop (#1343)
+- **`Store::consolidate_loop(name, &dyn Consolidator) -> ConsolidateLoop`:**
+  - builders `policy(&ConsolidatePolicy)`, `namespaces(&[&str])` (empty means all) and `clock(Fn() -> u64)` (cli692's A3);
+  - `run_once(Duration) -> Result<LoopStep>`, `next_due() -> Option<u64>` and `run(&AtomicBool)`;
+  - the name is non-empty without `:` (`InvalidArgument` at the first step).
+- **`LoopStep`** (`#[non_exhaustive]`): `events`, `passes: Vec<(String, ConsolidatePass)>`, `failed: Vec<(String, Error)>`, `next_due` and `token: WatchToken`.
+- **Scheduling:**
+  - Only `Remembered` marks a namespace, from its memory's `created_us` (cli692's A1, simp724's R3). `Summarized` and `Updated` (merges, `mark_used`, links) never do.
+  - A namespace is due at its oldest pending memory plus `min_age`. After a pass at `now`, the next pending time comes from a newest-first scan of its memory rows, stopping at the first older than `now − min_age`.
+  - A failed pass (`Error::Consolidate`) leaves the namespace pending from `now`, so it's retried after `min_age`. A database error ends the step.
+  - `run_once`'s wait is the smaller of its timeout and the next due time (A5: it bounds the wait, not the passes).
+- **Position:** `G:meta:loop:{name}` holds a version byte (1), a generation (u64), the watch token, and the pending map ((namespace, µs) pairs), little endian.
+  - **Saving:** each step ends with a transaction that reads the cell, requires the generation it last saved, and writes it plus one.
+  - **Claiming:** a loop claims the name at its first step (a save). So the newest loop of a name owns it, and an older one fails its next step with `InvalidArgument` ("another consolidation loop named …").
+- **Racing passes** conflict group by group: each group's transaction reads its sources' `meta:consolidated` (and content, supersede, pin), and a conflicting group is skipped (simp724's R1).
+- **A group's summary, the sources' marks and any deletes commit in one transaction** (R2). A failure between groups leaves the earlier groups committed, and the retry folds only the rest (tested).
+- **Catch-up** (no saved position, or `FeedExpired`): at a snapshot, every watched namespace with a live, unconsolidated, non-summary memory is pending from its oldest one (R4). The watch then starts `from_snapshot`.
+
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
@@ -270,4 +288,5 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
 - **Dedup rows:** `{ns}\0h{xxh3_128 of the normalised text, big-endian}`, holding `meta:rid` (the memory's row key).
 - **`G`'s `meta`:** `layout` (1), `text_index`, `model_id`, `model_dim` and `model_element` (`0` for F32, `1` for F16, `2` for BF16).
   - `near_dedup` (T3) holds the setting: a version byte (1), the similarity (`f32` LE), and the policy (`0` Skip, `1` Merge, `2` Link).
+  - `loop:{name}` (T9) holds a consolidation loop's position (above).
   - `forget` (T2) holds the policy: a version byte (1), `min_retention` (a flag, then `f64`), `half_life` µs, `use_weight`, `max_per_pass`, `interval` µs (each 8 bytes, little endian), then a count and the `(kind u8, max_age µs)` pairs.
