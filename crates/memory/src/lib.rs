@@ -26,6 +26,7 @@ mod forget;
 #[cfg(feature = "__unstable-hooks")]
 #[doc(hidden)]
 pub mod hooks;
+mod ivf;
 mod layout;
 mod recall;
 mod store;
@@ -37,6 +38,7 @@ pub use consolidate::{
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
+pub use ivf::IvfOptions;
 pub use layout::{MemoryId, normalize};
 /// The text index's Unicode normalisation ([`StoreOptions::normalization`]), re-exported from
 /// `pigeonhole-text`.

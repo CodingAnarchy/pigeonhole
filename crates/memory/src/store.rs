@@ -11,6 +11,7 @@ use pigeonhole_text::{Index, IndexOptions, Normalization, ReadIndex};
 
 use crate::dedup::{DedupPolicy, Near, NearDedup};
 use crate::forget::{ForgetPolicy, Forgetter, Signal, UserToken};
+use crate::ivf::{Ivf, IvfOptions, ivf_name};
 use crate::recall::{Idx, Recall, Rows, Snap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -76,6 +77,7 @@ pub struct StoreOptions {
     forget: Option<ForgetPolicy>,
     near_dedup: Option<NearDedup>,
     normalization: Normalization,
+    ivf: Option<IvfOptions>,
 }
 
 impl StoreOptions {
@@ -115,6 +117,18 @@ impl StoreOptions {
     /// guide's "Which normalisation to pick" has the trade-offs (#1291).
     pub fn normalization(mut self, n: Normalization) -> Self {
         self.normalization = n;
+        self
+    }
+
+    /// IVF recall for large namespaces (D311 T8): the store keeps a `pigeonhole-vector`
+    /// index of its embeddings (`mem_{name}_ivf`) beside `emb:v`, written in each memory's
+    /// own transaction, and recall searches it for a namespace with at least
+    /// [`IvfOptions::min_namespace_len`] memories with an embedding (an exact search below
+    /// that). It needs an [`embedding`](Self::embedding) model, and costs a second copy of
+    /// each embedding. Fixed at create: [`Store::ivf`] reads it back, and a store created
+    /// without it never has the index.
+    pub fn ivf(mut self, options: IvfOptions) -> Self {
+        self.ivf = Some(options);
         self
     }
 
@@ -421,6 +435,21 @@ pub struct StoreStats {
     pub dangling_superseded: u64,
     /// The text index's own check failed ([`pigeonhole_text::IndexStats::is_consistent`]).
     pub text_index_inconsistent: bool,
+    /// For a store with an IVF index ([`StoreOptions::ivf`]): how far the index's vector
+    /// count is from the memories with an embedding (0 when they agree). The index's own
+    /// row checks (`pigeonhole_vector::Index::verify`) run too, and fail `verify` as
+    /// [`Error::Vector`] if they find corruption. Checked in the writer process only.
+    ///
+    /// The index counts at its own snapshot, not `verify`'s, so a write between the two
+    /// shows up here: read it on a quiet store. That's why
+    /// [`is_consistent`](Self::is_consistent) leaves it out (simp724's R2 on #1424). It
+    /// compares totals, so a missing vector and a stale one cancel out (#1427).
+    pub ivf_mismatched: u64,
+    /// Namespaces whose counter (memories with an embedding, which chooses exact or IVF
+    /// recall) differs from a count of them. It's advisory: drift changes only which path a
+    /// recall takes, so it's reported apart from the mismatches above, and
+    /// [`is_consistent`](Self::is_consistent) leaves it out.
+    pub ivf_counter_drift: u64,
 }
 
 impl StoreStats {
@@ -444,6 +473,8 @@ pub struct Store {
     db: Pigeonhole,
     table: Table,
     index: Index,
+    /// The IVF index, for a store created with [`StoreOptions::ivf`] (D311 T8).
+    ivf: Option<Ivf>,
     /// The store's pinned model.
     model: Option<EmbeddingModel>,
     /// Whether this handle was opened with the store's model (always so for a store
@@ -462,6 +493,18 @@ struct Shared {
     /// Whether a forgetter runs (the crate's thread) or was handed out.
     started: AtomicBool,
     own: bool,
+    /// The IVF index's writes awaiting [`after_commit`](pigeonhole_vector::Index::after_commit)
+    /// (D311 T8): each write's own record, made in its transaction's body, handed on once a
+    /// write call's transaction returns. `after_commit` is harmless after a rollback, so a
+    /// rolled-back write's record costs a count read at most.
+    ///
+    /// The list is shared by the store's handles, so one thread's settle can take another's
+    /// record before that one commits: its `after_commit` then reads the counts too early,
+    /// which only delays a split to the list's next write. At most [`IVF_PENDING_MAX`]
+    /// records wait, the oldest dropped past it (simp724's R1 on #1424): a caller writing only
+    /// through `remember_in`/`delete_in` never settles, and a dropped record only delays a
+    /// split the same way.
+    ivf_pending: Mutex<std::collections::VecDeque<pigeonhole_vector::Placed>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -473,6 +516,9 @@ impl std::fmt::Debug for Store {
             .finish()
     }
 }
+
+/// The most IVF write records a store keeps waiting to settle ([`Shared::ivf_pending`]).
+pub(crate) const IVF_PENDING_MAX: usize = 1_024;
 
 fn table_name(name: &str) -> String {
     format!("mem_{name}")
@@ -505,6 +551,14 @@ impl Store {
     ) -> Result<Store> {
         if let Some(p) = &store.forget {
             p.check()?;
+        }
+        if let Some(o) = &store.ivf {
+            o.check()?;
+            if store.embedding.is_none() {
+                return Err(Error::InvalidArgument(
+                    "an IVF index is of embeddings, and the store has no model".into(),
+                ));
+            }
         }
         if let Some(n) = &store.near_dedup {
             n.check()?;
@@ -542,6 +596,24 @@ impl Store {
         }
         if let Some(n) = &store.near_dedup {
             g = g.put(META, NEAR_DEDUP, &n.encode());
+        }
+        if let (Some(o), Some(m)) = (&store.ivf, &store.embedding) {
+            let mut v = pigeonhole_vector::IndexOptions::new()
+                .rebalance(pigeonhole_vector::Rebalance::Background);
+            if let Some(n) = o.get_nprobe() {
+                v = v.nprobe(n);
+            }
+            if let Some(n) = o.get_target_list_len() {
+                v = v.target_list_len(n);
+            }
+            // Created before `G` names it, so a store whose `G` has `ivf` has the index.
+            drop(pigeonhole_vector::Index::create(
+                db,
+                &ivf_name(name),
+                m.spec(),
+                v,
+            )?);
+            g = g.put(META, IVF, &o.encode());
         }
         g.commit()?;
         Index::create(
@@ -592,7 +664,14 @@ impl Store {
             }
         };
         let index = Index::open(db, &index_name(name))?;
-        let s = Store::assemble(db, table, index, model, embeds, options.own_forgetter);
+        let ivf = match table.get(GLOBAL, META, IVF)? {
+            Some(c) => Some(Ivf::W(
+                pigeonhole_vector::Index::open(db, &ivf_name(name))?,
+                IvfOptions::decode(c.value())?,
+            )),
+            None => None,
+        };
+        let s = Store::assemble(db, table, index, ivf, model, embeds, options.own_forgetter);
         s.start_forgetter_if_due()?;
         Ok(s)
     }
@@ -601,6 +680,7 @@ impl Store {
         db: &Pigeonhole,
         table: Table,
         index: Index,
+        ivf: Option<Ivf>,
         model: Option<EmbeddingModel>,
         embeds: bool,
         own: bool,
@@ -610,6 +690,7 @@ impl Store {
             db: db.clone(),
             table,
             index,
+            ivf,
             model,
             embeds,
             user: Some(Arc::new(UserToken(Arc::clone(&signal)))),
@@ -618,6 +699,7 @@ impl Store {
                 forgetter: Mutex::new(None),
                 started: AtomicBool::new(false),
                 own,
+                ivf_pending: Mutex::new(std::collections::VecDeque::new()),
             }),
         }
     }
@@ -710,6 +792,7 @@ impl Store {
         Recall::new(
             Rows::W(&self.table),
             Idx::W(&self.index),
+            self.ivf.as_ref(),
             self.model.as_ref().filter(|_| self.embeds),
             Snap::W(&self.db),
             namespaces,
@@ -731,6 +814,11 @@ impl Store {
     /// #1430).
     pub fn watch(&self, namespaces: &[&str]) -> crate::WatchBuilder {
         crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
+    }
+
+    /// The store's IVF options, if it was created with [`StoreOptions::ivf`].
+    pub fn ivf(&self) -> Option<IvfOptions> {
+        self.ivf.as_ref().map(Ivf::options)
     }
 
     /// The Unicode normalisation of the store's text index, set at create
@@ -758,10 +846,11 @@ impl Store {
         }
         let now = now_us();
         let rid = new_rid(now)?;
-        let (r, _) = self.db.transact(&RetryPolicy::default(), |txn| {
+        let r = self.db.transact(&RetryPolicy::default(), |txn| {
             self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
-        })?;
-        Ok(r)
+        });
+        self.ivf_settle();
+        Ok(r?.0)
     }
 
     /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
@@ -946,6 +1035,7 @@ impl Store {
         }
         if let Some(e) = &m.embedding {
             txn.put_vector_f32(t, &row, EMB, V, e);
+            self.ivf_insert(txn, ns, &row, e)?;
         }
         if let Some(src) = &m.source {
             txn.put_u64(t, &row, SOURCES, src.as_bytes(), now);
@@ -985,13 +1075,23 @@ impl Store {
     /// Deletes the memory `id` (D311 §4), in one transaction: its row through the text
     /// index, its dedup row, and both directions of every link. `false` if it didn't exist.
     pub fn delete(&self, id: &MemoryId) -> Result<bool> {
-        let (r, _) = self
+        let r = self
             .db
-            .transact(&RetryPolicy::default(), |txn| self.delete_in(txn, id))?;
-        Ok(r)
+            .transact(&RetryPolicy::default(), |txn| self.delete_in(txn, id));
+        self.ivf_settle();
+        Ok(r?.0)
     }
 
     /// [`delete`](Self::delete) inside the caller's transaction.
+    ///
+    /// Every removal of a memory goes through here (`forget` and consolidation's `Delete`
+    /// too), so it's also where the IVF index and its namespace counter follow (D311 T8). A
+    /// future removal path, a column TTL say, must call it rather than delete rows itself
+    /// (simp724 on #1342).
+    ///
+    /// It reads at `txn`'s snapshot, so a memory this same transaction remembered isn't
+    /// there yet: `false`, and nothing deleted (neither the memory nor, in an IVF store, its
+    /// vector).
     pub fn delete_in(&self, txn: &mut Transaction, id: &MemoryId) -> Result<bool> {
         let t = &self.table;
         let row = id.row();
@@ -1048,8 +1148,78 @@ impl Store {
             txn.delete_column(t, from, LINKS, &row);
         }
         self.index.delete_in(txn, &row)?;
+        self.ivf_delete(txn, id.namespace(), &row)?;
         txn.delete_row(t, &row);
         Ok(true)
+    }
+
+    /// The IVF index's half of a memory's insert (D311 T8): its vector in the index, in the
+    /// memory's transaction, and the namespace counter's blind increment.
+    fn ivf_insert(&self, txn: &mut Transaction, ns: &str, row: &[u8], e: &[f32]) -> Result<()> {
+        let Some(Ivf::W(index, _)) = &self.ivf else {
+            return Ok(());
+        };
+        let mut placed = pigeonhole_vector::Placed::new();
+        index.insert_f32_in(txn, &mut placed, row, e)?;
+        crate::ivf::counted(txn, &self.table, ns, 1);
+        self.park(placed);
+        Ok(())
+    }
+
+    /// The IVF index's half of a memory's delete: the counter goes down only when the index
+    /// held the memory's vector (a memory without an embedding has none).
+    fn ivf_delete(&self, txn: &mut Transaction, ns: &str, row: &[u8]) -> Result<()> {
+        let Some(Ivf::W(index, _)) = &self.ivf else {
+            return Ok(());
+        };
+        let mut placed = pigeonhole_vector::Placed::new();
+        if index.delete_in(txn, &mut placed, row)? {
+            crate::ivf::counted(txn, &self.table, ns, -1);
+            self.park(placed);
+        }
+        Ok(())
+    }
+
+    fn park(&self, placed: pigeonhole_vector::Placed) {
+        let mut q = self
+            .shared
+            .ivf_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if q.len() >= IVF_PENDING_MAX {
+            q.pop_front();
+        }
+        q.push_back(placed);
+    }
+
+    /// The IVF records waiting to settle (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_pending_len(&self) -> usize {
+        self.shared
+            .ivf_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Hands the parked IVF writes to `after_commit`, which splits or merges (in background
+    /// mode, marks for the rebalancer) the lists they left out of bounds. Its errors are
+    /// dropped: the memories are committed, and a missed rebalance waits for the next write
+    /// to those lists (simp724 on #1342: an `after_commit` failure mustn't fail a write).
+    pub(crate) fn ivf_settle(&self) {
+        let Some(Ivf::W(index, _)) = &self.ivf else {
+            return;
+        };
+        let pending = std::mem::take(
+            &mut *self
+                .shared
+                .ivf_pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for p in pending {
+            let _ = index.after_commit(p);
+        }
     }
 
     /// Links `from` to `to` with type `ty` and weight `weight`, both directions in one
@@ -1156,7 +1326,19 @@ impl Store {
     pub fn verify(&self) -> Result<StoreStats> {
         let s = self.db.snapshot()?;
         let text_ok = self.index.verify()?.is_consistent();
-        verify(Rows::W(&self.table), &s, self.model.as_ref(), text_ok)
+        let ivf_vectors = match &self.ivf {
+            Some(Ivf::W(index, _)) => Some(index.verify()?.vectors),
+            _ => None,
+        };
+        let ivf = self.ivf.is_some();
+        verify(
+            Rows::W(&self.table),
+            &s,
+            self.model.as_ref(),
+            text_ok,
+            ivf,
+            ivf_vectors,
+        )
     }
 }
 
@@ -1166,6 +1348,7 @@ pub struct ReadStore {
     reader: PigeonholeReader,
     table: ReadTable,
     index: ReadIndex,
+    ivf: Option<Ivf>,
     model: Option<EmbeddingModel>,
     embeds: bool,
 }
@@ -1205,10 +1388,18 @@ impl Store {
         let table = reader.table(&table_name(name))?;
         let model = load(Rows::R(&table))?;
         let index = Index::open_reader(reader, &index_name(name))?;
+        let ivf = match Rows::R(&table).global(IVF)? {
+            Some(b) => Some(Ivf::R(
+                pigeonhole_vector::Index::open_reader(reader, &ivf_name(name))?,
+                IvfOptions::decode(&b)?,
+            )),
+            None => None,
+        };
         Ok(ReadStore {
             reader: reader.clone(),
             table,
             index,
+            ivf,
             model,
             embeds: false,
         })
@@ -1228,6 +1419,11 @@ impl ReadStore {
         crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
     }
 
+    /// The store's IVF options ([`Store::ivf`]).
+    pub fn ivf(&self) -> Option<IvfOptions> {
+        self.ivf.as_ref().map(Ivf::options)
+    }
+
     /// The Unicode normalisation of the store's text index ([`Store::normalization`]).
     pub fn normalization(&self) -> Normalization {
         self.index.options().get_normalization()
@@ -1239,6 +1435,7 @@ impl ReadStore {
         Recall::new(
             Rows::R(&self.table),
             Idx::R(&self.index),
+            self.ivf.as_ref(),
             self.model.as_ref().filter(|_| self.embeds),
             Snap::R(&self.reader),
             namespaces,
@@ -1257,7 +1454,15 @@ impl ReadStore {
     pub fn verify(&self) -> Result<StoreStats> {
         let s = self.reader.snapshot()?;
         let text_ok = self.index.verify()?.is_consistent();
-        verify(Rows::R(&self.table), &s, self.model.as_ref(), text_ok)
+        let ivf = self.ivf.is_some();
+        verify(
+            Rows::R(&self.table),
+            &s,
+            self.model.as_ref(),
+            text_ok,
+            ivf,
+            None,
+        )
     }
 }
 
@@ -1313,8 +1518,13 @@ fn verify(
     s: &pigeonhole::Snapshot,
     model: Option<&EmbeddingModel>,
     text_ok: bool,
+    ivf: bool,
+    ivf_vectors: Option<u64>,
 ) -> Result<StoreStats> {
     let mut st = StoreStats::default();
+    // Per namespace: memories with an embedding, and the counter's value (D311 T8).
+    let mut embedded: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut counters: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
     let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
     let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
@@ -1359,6 +1569,17 @@ fn verify(
             if model.is_some() && !has_emb {
                 st.missing_embeddings += 1;
             }
+            if has_emb && let Some(id) = MemoryId::from_row(key) {
+                *embedded
+                    .entry(id.namespace().as_bytes().to_vec())
+                    .or_default() += 1;
+            }
+        } else if ivf && let Some(ns) = key.strip_suffix(COUNT_TAG) {
+            let n = row
+                .get(STATS, EMBEDDED)
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0);
+            counters.insert(ns.to_vec(), n);
         } else if let Some(c) = row.get(META, RID) {
             dedups.push((key.to_vec(), c.value().to_vec()));
         } else {
@@ -1391,6 +1612,19 @@ fn verify(
         .filter(|s| !texts.contains_key(*s))
         .count() as u64;
     st.text_index_inconsistent = !text_ok;
+    if ivf {
+        let all: BTreeSet<&Vec<u8>> = embedded.keys().chain(counters.keys()).collect();
+        st.ivf_counter_drift = all
+            .into_iter()
+            .filter(|ns| {
+                embedded.get(*ns).copied().unwrap_or(0) != counters.get(*ns).copied().unwrap_or(0)
+            })
+            .count() as u64;
+        if let Some(v) = ivf_vectors {
+            let have: i64 = embedded.values().sum();
+            st.ivf_mismatched = v.abs_diff(have.max(0) as u64);
+        }
+    }
     Ok(st)
 }
 

@@ -206,9 +206,14 @@ def main():
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(MODEL, device="cpu", revision=REVISION)
+    # `revision=` loads exactly that revision or fails. transformers 4 also reports the hash
+    # it loaded (`_commit_hash`, a cross-check); transformers 5 doesn't (#1422).
+    loaded = getattr(model[0].auto_model.config, "_commit_hash", None)
+    if loaded not in (None, REVISION):
+        sys.exit(f"loaded revision {loaded}, not {REVISION}")
     manifest = {
         "model": MODEL,
-        "revision": getattr(model[0].auto_model.config, "_commit_hash", None),
+        "revision": REVISION,
         "dim": model.get_sentence_embedding_dimension(),
         "datasets": {},
     }
