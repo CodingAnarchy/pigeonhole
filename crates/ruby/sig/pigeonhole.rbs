@@ -795,31 +795,33 @@ module Pigeonhole
       attr_reader links: Array[Link]
       attr_reader backlinks: Array[Link]
       attr_reader embedding: Array[Float]?
+      attr_reader summary: bool
 
       def self.new: (MemoryId id, String text, kind kind, Float importance, Integer uses,
                      Integer? last_used_us, String? session, bool pinned, bool consolidated,
                      MemoryId? superseded_by, Array[Source] sources, Array[Link] links,
-                     Array[Link] backlinks, Array[Float]? embedding) -> instance
+                     Array[Link] backlinks, Array[Float]? embedding, bool summary) -> instance
                   | (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
                      last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
                      superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
-                     backlinks: Array[Link], embedding: Array[Float]?) -> instance
+                     backlinks: Array[Link], embedding: Array[Float]?, summary: bool) -> instance
       def self.[]: (MemoryId id, String text, kind kind, Float importance, Integer uses,
                     Integer? last_used_us, String? session, bool pinned, bool consolidated,
                     MemoryId? superseded_by, Array[Source] sources, Array[Link] links,
-                    Array[Link] backlinks, Array[Float]? embedding) -> instance
+                    Array[Link] backlinks, Array[Float]? embedding, bool summary) -> instance
                  | (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
                     last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
                     superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
-                    backlinks: Array[Link], embedding: Array[Float]?) -> instance
+                    backlinks: Array[Link], embedding: Array[Float]?, summary: bool) -> instance
       def self.members: () -> Array[Symbol]
       def self.inspect: () -> String
       def initialize: (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
                        last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
                        superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
-                       backlinks: Array[Link], embedding: Array[Float]?) -> void
+                       backlinks: Array[Link], embedding: Array[Float]?, summary: bool) -> void
       def pinned?: () -> bool
       def consolidated?: () -> bool
+      def summary?: () -> bool
     end
 
     # `verify`'s counts.
@@ -986,6 +988,91 @@ module Pigeonhole
                        merged: Integer, sources: Integer, resume: MemoryId?) -> void
     end
 
+    # One memory event of a commit.
+    class MemoryEvent < Data
+      attr_reader kind: Symbol
+      attr_reader id: MemoryId
+      attr_reader by: MemoryId?
+
+      def self.new: (Symbol kind, MemoryId id, MemoryId? by) -> instance
+                  | (kind: Symbol, id: MemoryId, by: MemoryId?) -> instance
+      def self.[]: (Symbol kind, MemoryId id, MemoryId? by) -> instance
+                 | (kind: Symbol, id: MemoryId, by: MemoryId?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (kind: Symbol, id: MemoryId, by: MemoryId?) -> void
+    end
+
+    # One commit's memory events.
+    class MemoryCommit < Data
+      attr_reader seqno: Integer
+      attr_reader timestamp_us: Integer
+      attr_reader events: Array[MemoryEvent]
+
+      def self.new: (Integer seqno, Integer timestamp_us, Array[MemoryEvent] events) -> instance
+                  | (seqno: Integer, timestamp_us: Integer, events: Array[MemoryEvent]) -> instance
+      def self.[]: (Integer seqno, Integer timestamp_us, Array[MemoryEvent] events) -> instance
+                 | (seqno: Integer, timestamp_us: Integer, events: Array[MemoryEvent]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (seqno: Integer, timestamp_us: Integer, events: Array[MemoryEvent]) -> void
+      def size: () -> Integer
+    end
+
+    # One step of a ConsolidateLoop.
+    class LoopStep < Data
+      attr_reader events: Integer
+      attr_reader passes: Array[[String, ConsolidatePass]]
+      attr_reader failed: Array[[String, Exception]]
+      attr_reader next_due: Integer?
+      attr_reader token: String
+
+      def self.new: (Integer events, Array[[String, ConsolidatePass]] passes,
+                     Array[[String, Exception]] failed, Integer? next_due, String token) -> instance
+                  | (events: Integer, passes: Array[[String, ConsolidatePass]],
+                     failed: Array[[String, Exception]], next_due: Integer?, token: String) -> instance
+      def self.[]: (Integer events, Array[[String, ConsolidatePass]] passes,
+                    Array[[String, Exception]] failed, Integer? next_due, String token) -> instance
+                 | (events: Integer, passes: Array[[String, ConsolidatePass]],
+                    failed: Array[[String, Exception]], next_due: Integer?, token: String) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (events: Integer, passes: Array[[String, ConsolidatePass]],
+                       failed: Array[[String, Exception]], next_due: Integer?, token: String) -> void
+    end
+
+    # Another consolidation loop of the same name took over.
+    class LoopTakenOver < Conflict
+    end
+
+    # The watch method Store and ReadStore share.
+    module Watches
+      def watch: (?(String | Array[String]) namespaces, ?from_snapshot: Snapshot?, ?resume: String?, ?visible: bool) -> Watch
+               | [T] (?(String | Array[String]) namespaces, ?from_snapshot: Snapshot?, ?resume: String?,
+                      ?visible: bool) { (Watch) -> T } -> T
+    end
+
+    # A store's memory events.
+    class Watch
+      include Enumerable[MemoryCommit]
+
+      def next: (?timeout: Numeric?) -> MemoryCommit?
+      def try_next: () -> MemoryCommit?
+      def each: (?timeout: Numeric?) { (MemoryCommit) -> void } -> self
+              | (?timeout: Numeric?) -> Enumerator[MemoryCommit, self]
+      def token: () -> String
+      def oldest_retained: () -> Integer?
+      def close: () -> nil
+      def closed?: () -> bool
+    end
+
+    # Feed-driven consolidation.
+    class ConsolidateLoop
+      def run_once: (?Numeric timeout) -> LoopStep
+      def next_due: () -> Integer?
+      def close: () -> nil
+    end
+
     # The recall methods Store and ReadStore share.
     module Recalls
       def recall: (String | Array[String] namespaces, ?text: String?, ?embedding: Array[Numeric]?, ?k: Integer?,
@@ -1006,6 +1093,9 @@ module Pigeonhole
     # A memory store in the writer process.
     class Store
       include Recalls
+      include Watches
+
+      def consolidate_loop: (String name, ?policy: ConsolidatePolicy?, ?namespaces: Array[String]?, ?clock_offset: Numeric?) { (Array[StoredMemory]) -> Array[Memory] } -> ConsolidateLoop
 
       def self.create: (Database db, String name, ?embedding: EmbeddingModel?, ?forget: ForgetPolicy?,
                         ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?,
@@ -1045,6 +1135,7 @@ module Pigeonhole
     # A memory store in a reader process.
     class ReadStore
       include Recalls
+      include Watches
 
       def close: () -> nil
       def closed?: () -> bool

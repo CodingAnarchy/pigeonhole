@@ -405,6 +405,122 @@ class TestMemory < Minitest::Test
     end
   end
 
+  # T9: a database whose change feed follows the store's tables.
+  def feed_db = @feed_db ||= Pigeonhole.open(File.join(@dir, "feed.phdb"), create: true, shards: 1,
+                                                                            change_feed: 16 << 20)
+
+  def teardown
+    @feed_db&.close
+    super
+  end
+
+  # T9 part 1 (#1430): a watch's events, filtered by namespace, resumed from a token, and in
+  # a reader process.
+  def test_a_watch_follows_memory_events
+    s = M::Store.create(feed_db, "agents")
+    # (`to_enum`, not a blockless `each`: `rbs test` iterates an Enumerator a hooked method
+    # returns, which would use up this one-shot watch.)
+    w = s.watch("n")
+    a = s.remember("n", "first").id
+    s.remember("other", "not watched")
+    b = s.remember("n", "second").id
+    s.supersede(a, b)
+    s.mark_used([b])
+    s.delete(a)
+    kinds = w.to_enum(:each, timeout: 0.5).flat_map(&:events).map { |e| [e.kind, e.id, e.by] }
+    assert_equal [[:remembered, a, nil], [:remembered, b, nil], [:superseded, a, b], [:deleted, a, nil]],
+                 kinds.reject { |k, _, _| k == :updated }
+    # mark_used, and the backlinks supersede and delete change on b, are updates to b.
+    assert(kinds.select { |k, _, _| k == :updated }.all? { |_, id, _| id == b })
+    refute_empty(kinds.select { |k, _, _| k == :updated })
+    token = w.token
+    assert_equal Encoding::BINARY, token.encoding
+    w.close
+    assert_predicate w, :closed?
+    assert_raises(Pigeonhole::Closed) { w.try_next }
+    c = s.remember("n", "third").id
+    s.watch("n", resume: token) do |w2|
+      commit = w2.next(timeout: 5)
+      assert_equal [[:remembered, c]], commit.events.map { |e| [e.kind, e.id] }
+      assert commit.frozen? && commit.events.frozen?
+    end
+    Pigeonhole.open_reader(File.join(@dir, "feed.phdb")) do |r|
+      M::Store.open_reader(r, "agents", model: nil) do |rs|
+        rs.watch do |rw|
+          d = s.remember("n", "seen by the reader").id
+          assert_equal d, rw.next(timeout: 5).events[0].id
+        end
+      end
+    end
+    s.close
+  end
+
+  # T9 part 2 (#1432): the loop runs a due pass with its block, writes summaries
+  # (`summary?`, and `:summarized` to a watch), reports a block's StandardError per
+  # namespace, and loses its name to a newer loop.
+  def test_a_consolidation_loop
+    s = M::Store.create(feed_db, "agents")
+    w = s.watch
+    lp = s.consolidate_loop("main", policy: min_age0) do |group|
+      raise ArgumentError, "the model refused" if group[0].id.namespace == "bad"
+
+      [M::Memory.new("summary of #{group.size}")]
+    end
+    3.times { |i| s.remember("n", "note #{i}", session: "s") }
+    2.times { |i| s.remember("bad", "note #{i}", session: "s") }
+    step = lp.run_once(0.5)
+    assert_equal ["n"], step.passes.map(&:first)
+    assert_equal 1, step.passes[0][1].committed
+    ns, exc = step.failed[0]
+    assert_equal "bad", ns
+    assert_kind_of ArgumentError, exc
+    assert step.frozen? && step.passes.frozen?
+    summary = s.recall("n", text: "summary", k: 10).find { |h| h.text.start_with?("summary") }
+    assert_predicate s.get(summary.id), :summary?
+    assert(w.to_enum(:each, timeout: 0.5).flat_map(&:events).any? { |e| e.kind == :summarized && e.id == summary.id })
+    newer = s.consolidate_loop("main", policy: min_age0) { |_| [] }
+    newer.run_once(0.1)
+    e = assert_raises(M::LoopTakenOver) { lp.run_once(0.1) }
+    assert_kind_of Pigeonhole::Conflict, e
+    newer.close
+    lp.close
+    assert_raises(Pigeonhole::Error) { lp.run_once(0.1) }
+    w.close
+    s.close
+  end
+
+  # A pass falls due once its memories are min_age old, on the loop's clock (clock_offset:).
+  def test_a_loop_waits_for_min_age
+    s = M::Store.create(feed_db, "agents")
+    hour = M::ConsolidatePolicy.new(min_age: 3_600)
+    2.times { |i| s.remember("n", "note #{i}", session: "s") }
+    now = s.consolidate_loop("now", policy: hour) { |_| [M::Memory.new("summary")] }
+    assert_empty now.run_once(0.2).passes
+    refute_nil now.next_due
+    now.close
+    later = s.consolidate_loop("later", policy: hour, clock_offset: 7_200) { |_| [M::Memory.new("summary")] }
+    assert_equal ["n"], later.run_once(0.2).passes.map(&:first)
+    later.close
+    s.close
+  end
+
+  # An interrupt during a step never leaves the step's thread running (the same rule as
+  # consolidate's, #1425).
+  def test_an_interrupted_loop_step_leaves_no_thread
+    s = M::Store.create(feed_db, "agents")
+    20.times { |i| s.remember("n", "note #{i}", session: "s#{i % 5}") }
+    lp = s.consolidate_loop("main", policy: min_age0) do |g|
+      sleep 0.05
+      [M::Memory.new("summary #{g[0].session}")]
+    end
+    assert_raises(Timeout::Error) { Timeout.timeout(0.1) { lp.run_once(2.0) } }
+    left = consolidation_threads
+    assert_equal 0, left, "a loop step's thread outlived its call" if left
+    lp.run_once(1.0) # it carries on from where it was
+    lp.close
+    s.close
+  end
+
   # Python's KeyboardInterrupt case, in Ruby's terms: a StandardError from the block becomes
   # ConsolidateError with the pass so far; Interrupt (not a StandardError) stops the pass and
   # propagates as itself. The groups before either stay committed.

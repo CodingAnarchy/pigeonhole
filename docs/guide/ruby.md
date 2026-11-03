@@ -213,6 +213,15 @@ end
   - **A `StandardError` from the block,** or a return that isn't an Array of `Memory`, stops the pass with `ConsolidateError` (a `MergeFailed`). Its `consolidated` is the pass so far, and its `cause` is the exception.
   - **Anything else stops the pass too, then takes effect as it is:** `break`, `throw` or `return` out of the block, another exception (`Interrupt`, `SystemExit`), or an interrupt (`Thread#raise`, `Timeout`, Ctrl-C). This differs from Python, where every exception becomes `ConsolidateError`: here it's whatever `rescue => e` would catch.
   - **However the pass stops,** its thread has ended, the groups committed before stay committed, and running the pass again is safe.
+- **Watching** (T9). `store.watch(namespaces, from_snapshot:, resume:, visible:)` returns a `Watch` of the store's memory events through the change feed. The feed must be on (`change_feed:` at open) and follow the store's table (`mem_NAME`).
+  - `next(timeout:)` returns a `MemoryCommit` of `MemoryEvent`s, each with a `kind` of `:remembered`, `:summarized`, `:superseded` (`by` is the newer memory), `:deleted` or `:updated`.
+  - `token` gives a position for a later `resume:`. A reader process's `ReadStore#watch` follows the writer.
+  - Like `Feed`, a watch is a cursor: a live watch has no end.
+- **A consolidation loop** (T9). `store.consolidate_loop(name, policy:) { |group| ... }` returns a `ConsolidateLoop`, whose `run_once(timeout)` reads new memories and runs a pass with the block for each namespace once its memories are `min_age` old. It returns a `LoopStep`.
+  - **Position:** the loop saves where it is in the store under `name`, so a restart resumes it.
+  - **Failures:** a `StandardError` from the block fails that namespace's pass. It's reported in `LoopStep#failed` and retried after `min_age`.
+  - **One loop per name:** a newer loop takes the name over, and the older one's next step raises `LoopTakenOver` (a `Conflict`). Stop the older loop then: don't retry it or recreate it.
+  - **Clock:** `clock_offset:` shifts the loop's clock for tests.
 - **Closing.** Close a store when you're done with it (`store.close`, or a block form). Its forgetter thread stops once every handle to the store is closed. `db.close` closes the stores opened on it first. After either, store calls raise `Closed`, and a call already running ends with `Closed`.
 
 ```ruby
