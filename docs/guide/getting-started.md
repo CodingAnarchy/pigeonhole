@@ -1,6 +1,6 @@
 # Getting started
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). [The last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.1, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). [The last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
@@ -393,7 +393,6 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 
-Available ahead of their phase: `Transaction` and reader processes (`open_reader`).
 
 ## Next
 [Durability](durability.md) · [Transactions](transactions.md) · [Async](async.md) · [Scans and filters](scans-and-filters.md) · [Data modeling](data-modeling.md) · [Reader processes](readers.md) · [Recovery](recovery.md) · [Errors](errors.md) · [Command line](cli.md) · [Arrow export](arrow.md) · [Performance](performance.md) · [Agent reference](agent-reference.md)

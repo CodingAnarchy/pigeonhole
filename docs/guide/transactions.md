@@ -50,7 +50,7 @@ Both read at the transaction's snapshot, and every read is recorded.
 
 **A row or cell that wasn't there counts as read too:** a commit that creates it makes the transaction conflict.
 
-**Scans aren't available inside a transaction** (planned after 1.0). A scan outside it isn't part of what's checked.
+**Scans aren't available inside a transaction.** A scan outside it isn't part of what's checked.
 
 ## Isolation
 

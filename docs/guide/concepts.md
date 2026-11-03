@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.1, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
