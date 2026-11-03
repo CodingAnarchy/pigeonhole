@@ -124,7 +124,10 @@ pub(crate) fn open(
     }
     let o = crate::feed::options(ruby, o, change_feed, change_feed_off, feed_age, feed_tables)?;
     let db = engine(ruby, move || pigeonhole::Pigeonhole::open(path, o))?;
-    Ok(Database(ForkSafe::new(RwLock::new(Some(db)))))
+    Ok(Database(
+        ForkSafe::new(RwLock::new(Some(db))),
+        Mutex::default(),
+    ))
 }
 
 /// `Pigeonhole.native_open_reader(path, shm_dir, block_cache, row_cache)`: opens the
@@ -148,7 +151,10 @@ pub(crate) fn open_reader(
         o = o.row_cache(n);
     }
     let r = engine(ruby, move || pigeonhole::Pigeonhole::open_reader(path, o))?;
-    Ok(Reader(ForkSafe::new(RwLock::new(Some(r)))))
+    Ok(Reader(
+        ForkSafe::new(RwLock::new(Some(r))),
+        Mutex::default(),
+    ))
 }
 
 /// The library's `RetryPolicy` with `transact`'s options.
@@ -198,7 +204,7 @@ pub(crate) fn retry_pause(
 // ---- Database -----------------------------------------------------------------------------
 
 impl Database {
-    fn db(&self, ruby: &Ruby) -> Result<pigeonhole::Pigeonhole, Error> {
+    pub(crate) fn db(&self, ruby: &Ruby) -> Result<pigeonhole::Pigeonhole, Error> {
         read(self.0.get(ruby)?)
             .clone()
             .ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the database is closed"))
@@ -269,7 +275,15 @@ impl Database {
             // `ForkSafe::drop` forgets the parent's handle; nothing to do now.
             return Ok(());
         }
-        let db = write(rb_self.0.get(ruby)?).take();
+        // The memory stores first: dropping their handles stops their forgetters. The list
+        // and the handle are taken under the stores lock, so a store opened meanwhile is in
+        // the list or refused (simp724's L1 on #1395, as in Python).
+        let (stores, db) = {
+            let mut stores = lock(&rb_self.1);
+            let db = write(rb_self.0.get(ruby)?).take();
+            (std::mem::take(&mut *stores), db)
+        };
+        crate::memory::close_stores(ruby, stores)?;
         match db {
             Some(db) => engine(ruby, move || db.close()),
             None => Ok(()),
@@ -285,7 +299,7 @@ impl Database {
 // ---- Reader -------------------------------------------------------------------------------
 
 impl Reader {
-    fn db(&self, ruby: &Ruby) -> Result<pigeonhole::PigeonholeReader, Error> {
+    pub(crate) fn db(&self, ruby: &Ruby) -> Result<pigeonhole::PigeonholeReader, Error> {
         read(self.0.get(ruby)?)
             .clone()
             .ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the reader is closed"))
@@ -321,7 +335,12 @@ impl Reader {
         if rb_self.0.forked() {
             return Ok(());
         }
-        let r = write(rb_self.0.get(ruby)?).take();
+        let (stores, r) = {
+            let mut stores = lock(&rb_self.1);
+            let r = write(rb_self.0.get(ruby)?).take();
+            (std::mem::take(&mut *stores), r)
+        };
+        crate::memory::close_stores(ruby, stores)?;
         without_gvl(ruby, move || drop(r))
     }
 
@@ -536,7 +555,7 @@ impl WriteBatch {
 
 // ---- Transaction --------------------------------------------------------------------------
 
-const TXN_SPENT: &str = "the transaction was already committed or rolled back";
+pub(crate) const TXN_SPENT: &str = "the transaction was already committed or rolled back";
 
 // The transaction's mutex is taken only inside `without_gvl` closures, and no guard outlives
 // the closure that took it (simp724 on #1399). So a thread never waits on the mutex while
