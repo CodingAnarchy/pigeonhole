@@ -33,6 +33,7 @@ mod index;
 mod layout;
 mod point;
 mod rebalancer;
+mod registry;
 
 pub use error::{Error, Result};
 pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, ReadIndex, Rebalance, Search};

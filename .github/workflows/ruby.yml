@@ -1,0 +1,83 @@
+name: Ruby
+
+# The Ruby bindings (#697, ICR 0111): build the native extension, run the Minitest suite
+# (under RBS's runtime type checking where it works), validate the RBS signatures (the API's
+# snapshot) and check every public method has one. Native gems for every platform are
+# ruby-gems.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.lock'
+      - '.github/workflows/ruby.yml'
+  pull_request:
+    paths:
+      - 'crates/ruby/**'
+      - 'crates/pigeonhole/src/**'
+      - '.github/workflows/ruby.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # rake compile builds into crates/ruby/target (not under tmp/), which rust-cache keeps.
+  RB_SYS_CARGO_TARGET_DIR: ${{ github.workspace }}/crates/ruby/target
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: minitest (${{ matrix.os }}, Ruby ${{ matrix.ruby }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ruby (3.3, the owner's floor) on every OS, and the newest
+          # on Linux and macOS.
+          - { os: ubuntu-latest, ruby: '3.3' }
+          - { os: macos-latest, ruby: '3.3' }
+          - { os: windows-latest, ruby: '3.3' }
+          - { os: ubuntu-latest, ruby: '4.0' }
+          - { os: macos-latest, ruby: '4.0' }
+    defaults:
+      run:
+        working-directory: crates/ruby
+    steps:
+      - uses: actions/checkout@v5
+      # Ruby, Rust and the cache together (oxidize-rb, rb-sys's maintainers): on Windows it
+      # sets up the MinGW toolchain RubyInstaller's Ruby needs and points bindgen at MSYS2's
+      # headers, which plain setup-ruby plus rustup don't.
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          working-directory: crates/ruby
+          rustup-components: clippy, rustfmt
+      - name: Compile the extension
+        run: bundle exec rake compile
+      # crates/ruby is a workspace of its own (the root's `cargo --workspace` jobs don't see it):
+      # lint, document and licence-check it here, once.
+      - name: clippy, rustdoc and fmt
+        if: matrix.os == 'ubuntu-latest' && matrix.ruby == '3.3'
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo doc --locked --no-deps
+          cargo fmt --check
+      - uses: taiki-e/install-action@v2
+        if: matrix.os == 'ubuntu-latest' && matrix.ruby == '3.3'
+        with:
+          tool: cargo-deny
+      - name: cargo deny (the root's deny.toml)
+        if: matrix.os == 'ubuntu-latest' && matrix.ruby == '3.3'
+        run: cargo deny --config ../../deny.toml check
+      - name: Minitest
+        run: bundle exec rake test
+      - name: Minitest under RBS runtime type checking (sig/pigeonhole.rbs)
+        run: bundle exec rake test:rbs
+      - name: RBS signatures validate
+        run: bundle exec rbs -I sig validate

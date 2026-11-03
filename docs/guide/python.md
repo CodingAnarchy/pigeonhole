@@ -214,6 +214,48 @@ with ph.open(path, create=True, change_feed=64 << 20) as db:
         assert feed.next(timeout=5).changes[0].value == b"shipped"
 ```
 
+## Agent memory
+`pigeonhole.memory` binds the [`pigeonhole-memory`](agent-memory.md) store: long-term memory for an agent, with ranked recall, dedup, superseding, forgetting and consolidation, kept in the same file as the application's data. The names and rules are the Rust crate's ([ICR 0107](../design/icr/0107-agent-memory.md)). Every call releases the GIL.
+
+- **Opening.** `mem.Store.create(db, name, embedding=mem.EmbeddingModel(id, dim, "f32"))` pins the store to one embedding model. Without `embedding`, recall is by keyword and recency. `forget=`, `episodic_ttl=` and `near_dedup=` set the store's policies. `mem.Store.open(db, name, model=id)` opens it again: `ModelMismatch` (an `InvalidArgument`) for another model, and `model=None` for a handle that recalls without embeddings. `mem.Store.open_reader(reader, name, model=...)` gives a `ReadStore` in a reader process, with `recall`, `get` and `verify`.
+- **Writing.** `store.remember(ns, text, embedding=..., kind=..., importance=..., source=..., session=..., links=[(id, mem.LinkType.DERIVED_FROM, 0.5)], pinned=...)` returns `Remembered(id, outcome)`, where `outcome` is `"new"`, `"merged"` (an exact duplicate) or `"similar"` (a near duplicate the store's `NearDedup(policy="skip")` didn't write). `delete`, `link`, `supersede` and `mark_used` take ids as `MemoryId` or their text form.
+- **Transactions.** `remember_in(txn, ...)`, `delete_in` and `forget_in` write in a `pigeonhole.Transaction` and commit with it. They read in the transaction, so they're safe inside `db.transact(fn)`, whose retries re-read. `remember_in` skips near dedup, whose check reads outside the transaction: call `store.near_duplicate(ns, text, embedding=...)` first if you need it. Its reads are at the transaction's snapshot, which doesn't see the transaction's own writes, so two `remember_in` of the same text in one transaction both write. `forget_in` returns `"deleted"`, `"protected"`, `"not_due"` or `"gone"`, and none of these is an error.
+- **Recall.** `store.recall(namespaces, text=..., embedding=..., k=10, byte_budget=..., weights=mem.Weights(...), fusion="rrf", include_superseded=..., session=..., snapshot=..., with_signals=...)` returns `RecallHit`s, best first, at one snapshot. `recall_with_stats` adds `RecallStats` (`truncated` says the budget cut the hits).
+- **Forgetting.** With a policy (`forget=mem.ForgetPolicy(...)` or `store.set_forget_policy(...)`), a thread of the crate's own forgets in the background. `store.forget(policy=..., after=...)` runs one pass now.
+- **Consolidation.** `store.consolidate(ns, fn, policy=mem.ConsolidatePolicy(...))` calls `fn(group)`, a Python callable, for each group of episodic memories. It returns a list of `mem.Memory` to keep in their place (none keeps the group, marked consolidated).
+  - **The callable runs outside every transaction, with no lock held,** so it may call the store (`recall` for context) and take its time, for example calling a model.
+  - **A group that changes before its commit is skipped,** not retried: `skipped` counts it, and the next pass finds it again.
+  - **An exception from `fn`,** `KeyboardInterrupt` included, or a return that isn't a list of `Memory`, stops the pass with `mem.ConsolidateError` (a `MergeFailed`). Its `consolidated` is the pass so far, whose groups stay committed, and its `__cause__` is the exception.
+  - **Ctrl-C during a pass** arrives at `fn`'s next call, stopping the pass as above, or when the pass returns: Python handles signals only while it runs Python code.
+- **Closing.** Close a store when you're done with it (`store.close()`, or `with`). Its forgetter thread stops once every handle to the store is closed. `db.close()` closes the stores opened on it first. After either, store calls raise `Closed`, and a call already running ends with `Closed`.
+
+```python
+import pigeonhole as ph
+from pigeonhole import memory as mem
+
+with ph.open(path, create=True) as db, mem.Store.create(
+    db, "agents", embedding=mem.EmbeddingModel("toy", 3, "f32")
+) as store:
+    old = store.remember("user:dana", "Dana uses vim", embedding=[1.0, 0.0, 0.0]).id
+    new = store.remember("user:dana", "Dana switched to helix", embedding=[0.9, 0.1, 0.0])
+    store.supersede(old, new.id)
+    (hit,) = store.recall("user:dana", text="Dana editor helix", k=1)
+    assert hit.id == new.id
+    store.mark_used([hit.id])
+
+    for note in ["Dana opened the design doc", "Dana commented on the design doc"]:
+        store.remember("user:dana", note, embedding=[0.0, 1.0, 0.0], session="mon")
+
+    def summarise(group):
+        text = "; ".join(m.text for m in group)
+        return [mem.Memory(f"Monday: {text}", embedding=[0.0, 1.0, 0.0], kind="semantic")]
+
+    passed = store.consolidate(
+        "user:dana", summarise, policy=mem.ConsolidatePolicy(min_age=0)
+    )
+    assert passed.committed == 1
+```
+
 ## Readers, threads and processes
 - **Processes:** one process opens a database as the writer (`ph.open`). Any number of others open it as readers (`ph.open_reader(path)`), which see every commit and can't write ([reader processes](readers.md)).
 - **Threads:** every engine call releases the GIL, so threads in one process run reads and commits in parallel. Handles (`Database`, `Table`, `Snapshot`) are safe to share between threads.

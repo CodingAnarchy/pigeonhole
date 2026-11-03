@@ -168,7 +168,9 @@ impl Rebalancer {
 
     /// Calls `wakeup` whenever a write marks a list (and once when the index closes), for an
     /// application whose threads wait in an event loop rather than in
-    /// [`wait`](Self::wait). It runs on the writing thread: keep it short.
+    /// [`wait`](Self::wait). It runs on the writing thread: keep it short. An index's
+    /// rebalancers share one wakeup (opens in one process share the index, #1268 item 8):
+    /// the last one set is called.
     pub fn set_wakeup(&mut self, wakeup: Box<dyn Fn() + Send + Sync>) {
         *self
             .signal

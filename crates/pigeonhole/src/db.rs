@@ -1008,6 +1008,17 @@ impl Pigeonhole {
         ))
     }
 
+    /// Whether `other` is a handle to the same open database as this one: a clone of it, or
+    /// of a handle from the same [`open`](Self::open) (ICR 0110). Two opens of one file are
+    /// different databases, even after the first is closed, and so are two copies of one
+    /// file (a file copied while closed keeps its [`DatabaseInfo::db_id`](crate::DatabaseInfo)).
+    /// An automatic recovery ([`Options::auto_recover`](crate::Options::auto_recover)) keeps
+    /// the open, so it keeps the answer. Cheap (a pointer comparison): a library that keeps
+    /// per-database state, such as a registry of open handles, can key on it.
+    pub fn same_database(&self, other: &Pigeonhole) -> bool {
+        Arc::ptr_eq(&self.db, &other.db)
+    }
+
     /// Whether this instance has failed (ICR 0040): a shard's thread panicked, an
     /// application-owned shard's driver was dropped before the close finished, a shard
     /// stopped after a WAL write or sync failed (or its in-memory state could not be
