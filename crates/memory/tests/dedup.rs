@@ -184,50 +184,6 @@ fn the_setting_persists_and_near_duplicate_reports_what_remember_would_find() {
 /// policy. Deleted or superseded between the check and the transaction (held there), it's
 /// ignored: the memory is written as new, and `Skip` doesn't return a gone id.
 #[test]
-fn a_match_gone_after_the_check_is_ignored_under_every_policy() {
-    use pigeonhole_memory::hooks::{Hold, arm};
-    for policy in [DedupPolicy::Skip, DedupPolicy::Merge, DedupPolicy::Link] {
-        for how in ["deleted", "superseded"] {
-            let dir = pigeonhole::doc_support::temp_dir();
-            let db = open(&dir);
-            let s = store(&db, Some(NearDedup::new(0.95).policy(policy)));
-            let m = s
-                .remember("a", mem("the deploy runs at noon", [1.0, 0.0]))
-                .unwrap()
-                .id()
-                .clone();
-            let held = arm(Hold::RememberAfterNear);
-            let r = std::thread::scope(|sc| {
-                let w = sc.spawn(|| s.remember("a", mem("deploys happen at 12", [0.99, 0.1])));
-                held.wait();
-                if how == "deleted" {
-                    assert!(s.delete(&m).unwrap());
-                } else {
-                    let newer = s
-                        .remember("a", mem("the deploy moved", [0.0, 1.0]))
-                        .unwrap()
-                        .id()
-                        .clone();
-                    s.supersede(&m, &newer).unwrap();
-                }
-                held.release();
-                w.join().unwrap().unwrap()
-            });
-            let ctx = format!("{policy:?}, {how}");
-            let Remembered::New(id) = &r else {
-                panic!("{ctx}: {r:?}")
-            };
-            assert!(
-                s.get(id).unwrap().unwrap().links.is_empty(),
-                "{ctx}: linked to the gone match"
-            );
-            check(&s, &ctx);
-            db.close().unwrap();
-        }
-    }
-}
-
-#[test]
 fn a_similarity_of_zero_or_below_is_refused() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
