@@ -137,6 +137,22 @@ fn fixture(dir: &Path, name: &str) -> Fixture {
     }
 }
 
+/// `remember`, retried on `Busy` (a write stall past its timeout: the writes outran
+/// flushes and compactions), as the error says to; the retries are counted in `busy`.
+fn remember(store: &Store, ns: &str, m: Memory, busy: &mut u64) -> MemoryId {
+    loop {
+        match store.remember(ns, m.clone()) {
+            Ok(r) => return r.id().clone(),
+            Err(pigeonhole_memory::Error::Db(e)) if e.code() == pigeonhole::ErrorCode::Busy => {
+                *busy += 1;
+                assert!(*busy < 1_000, "Busy 1,000 times: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => panic!("remember: {e}"),
+        }
+    }
+}
+
 fn element(s: &str) -> Element {
     match s {
         "f16" => Element::F16,
@@ -164,6 +180,7 @@ fn build(f: &Fixture, db: &Pigeonhole, el: Element) -> BTreeMap<Vec<u8>, Vec<Str
     let follows = LinkType::custom(16).unwrap();
     let mut keys: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
     let mut prev: Option<(String, MemoryId)> = None;
+    let mut busy = 0u64;
     let t = Instant::now();
     for (m, v) in f.mems.iter().zip(&f.mem_vecs) {
         let mut mem = Memory::new(m.text.clone())
@@ -174,13 +191,17 @@ fn build(f: &Fixture, db: &Pigeonhole, el: Element) -> BTreeMap<Vec<u8>, Vec<Str
         {
             mem = mem.link(id.clone(), follows, 1.0);
         }
-        let id = store.remember(&m.ns, mem).unwrap().id().clone();
+        let id = remember(&store, &m.ns, mem, &mut busy);
         let key = if f.by_session { &m.session } else { &m.unit };
         keys.entry(row_key(&id)).or_default().push(key.clone());
         prev = Some((m.session.clone(), id));
     }
+    println!(
+        "{}",
+        json!({"build": f.mems.len(), "seconds": t.elapsed().as_secs_f64(), "busy_retries": busy})
+    );
     eprintln!(
-        "built {} memories in {:.1} s",
+        "built {} memories in {:.1} s ({busy} Busy retries)",
         f.mems.len(),
         t.elapsed().as_secs_f64()
     );
@@ -393,16 +414,17 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         let db = open(&dir);
         let model = EmbeddingModel::new(f.model.clone(), f.dim, element(el)).unwrap();
         let store = Store::create(&db, STORE, StoreOptions::new().embedding(model)).unwrap();
+        let mut busy = 0u64;
         for &i in &picked {
             let m = &f.mems[i];
-            store
-                .remember(
-                    "size",
-                    Memory::new(m.text.clone())
-                        .embedding(f.mem_vecs[i].clone())
-                        .session(m.session.clone()),
-                )
-                .unwrap();
+            remember(
+                &store,
+                "size",
+                Memory::new(m.text.clone())
+                    .embedding(f.mem_vecs[i].clone())
+                    .session(m.session.clone()),
+                &mut busy,
+            );
         }
         drop(store);
         db.compact().unwrap();
@@ -442,7 +464,7 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         println!(
             "{}",
             json!({
-                "mode": "size", "element": el, "memories": n, "bytes": bytes,
+                "mode": "size", "element": el, "memories": n, "bytes": bytes, "busy_retries": busy,
                 "bytes_per_100k": bytes as f64 * 100_000.0 / n as f64,
                 "text_bytes": text, "embedding_bytes_raw": n as u64 * f.dim as u64 * match el { "f32" => 4, _ => 2 },
             })
