@@ -448,7 +448,12 @@ impl<'a> Consolidate<'a> {
         for m in made {
             let r = store.remember_with(&mut txn, self.ns, m, new_rid(now)?, now, None)?;
             match &r {
-                Remembered::New(_) => counts.0 += 1,
+                Remembered::New(id) => {
+                    counts.0 += 1;
+                    // Marks it a summary (T9): a watch reports it as `Summarized`, and the
+                    // feed-driven loop doesn't take its own writes for new memories.
+                    txn.put(t, &id.row(), META, SUMMARY, b"1");
+                }
                 _ => counts.1 += 1,
             }
             let id = r.id().clone();

@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole-memory`: `Store::watch` and `ReadStore::watch` follow a store's memory events through the change feed (D311 T9, #1343), in the writer or in a reader process: `Remembered`, `Summarized`, `Superseded`, `Deleted` and `Updated`, one per memory per commit, with a resumable `WatchToken`. Consolidation now marks the summaries it writes (`meta:summary`), so a watch can tell them from new memories.

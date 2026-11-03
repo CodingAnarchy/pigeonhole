@@ -718,6 +718,13 @@ impl Store {
         self.model.as_ref()
     }
 
+    /// Watches the store's memory events in `namespaces` (every namespace when empty)
+    /// through the database's change feed (D311 T9): see [`Watch`](crate::Watch). The feed
+    /// must be on and follow the store's table (`mem_{name}`); `open` says so otherwise.
+    pub fn watch(&self, namespaces: &[&str]) -> crate::WatchBuilder {
+        crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
+    }
+
     /// The Unicode normalisation of the store's text index, set at create
     /// ([`StoreOptions::normalization`]).
     pub fn normalization(&self) -> Normalization {
@@ -1204,6 +1211,13 @@ impl ReadStore {
     /// The model the store is pinned to, if any.
     pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
         self.model.as_ref()
+    }
+
+    /// [`Store::watch`], from a reader process: the writer's memory events, from its feed
+    /// history (D310). Call [`Watch::next`](crate::Watch::next) on a thread of its own: it
+    /// blocks.
+    pub fn watch(&self, namespaces: &[&str]) -> crate::WatchBuilder {
+        crate::watch::WatchBuilder::new(self.table.feed(), namespaces)
     }
 
     /// The Unicode normalisation of the store's text index ([`Store::normalization`]).

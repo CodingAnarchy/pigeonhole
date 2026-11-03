@@ -200,6 +200,42 @@ With an embedding model, a store can catch near duplicates as well as exact ones
 - **Summaries skip it:** what a consolidator returns is meant to sit near its sources.
 - **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
 
+## Watching for new memories
+`store.watch(&[namespaces])` follows the store's memory events through the database's change feed, so another part of the application, or another process, learns that a memory arrived without polling. The database must be opened with the change feed on (`Options::change_feed`), following the store's table `mem_{name}` (every table by default):
+
+```rust
+# use pigeonhole::*;
+use pigeonhole_memory::{Memory, MemoryEvent, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(
+    dir.join("guide.phdb"),
+    Options::default().change_feed(FeedRetention::bytes(64 << 20)),
+)?;
+let store = Store::create(&db, "agents", StoreOptions::new())?;
+let mut watch = store.watch(&["shared:team"]).open()?;
+let r = store.remember("shared:team", Memory::new("The demo moved to Friday."))?;
+let commit = watch.next(std::time::Duration::from_secs(1))?.expect("one commit");
+assert_eq!(commit.events, vec![MemoryEvent::Remembered(r.id().clone())]);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Events, one per memory per commit:**
+  - `Remembered`: a new memory;
+  - `Summarized`: a consolidation's summary;
+  - `Superseded { id, by }`;
+  - `Deleted`: also from a forget pass or a consolidation's `Delete`;
+  - `Updated`: an exact-dedup merge, `mark_used`, a link, a source added, or a consolidation taking the memory in.
+
+  Commits that touch no memory are passed over.
+- **An empty namespace list** watches every namespace.
+- **Resuming:** `watch.token()` gives a `WatchToken` to store (`as_bytes`/`from_bytes`), and `store.watch(..).resume(&token)` continues after it, in a later open too. `from_snapshot(&s)` starts after what a snapshot sees: read the store at `s`, then watch, and nothing is missed or seen twice.
+- **In a reader process,** `read_store.watch(..)` follows the writer's events from its feed history. `next` blocks, so call it on a thread of its own.
+- **Delivery** is at durability by default. `.visible()` delivers a commit as soon as reads see it, at the cost the change feed describes.
+- **If the feed's history is recycled past a watch,** `next` fails with `FeedExpired`. Read the store afresh at a snapshot and watch `from_snapshot` it.
+
 ## Reader processes
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
 

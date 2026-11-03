@@ -27,6 +27,9 @@ pub(crate) const SESSION: &[u8] = b"session";
 pub(crate) const PINNED: &[u8] = b"pinned";
 /// Set once a consolidation took the memory in (T3).
 pub(crate) const CONSOLIDATED: &[u8] = b"consolidated";
+/// `meta:summary` (`1`): a memory a consolidator returned (D311 T9), so watchers and the
+/// feed-driven loop can tell a pass's own writes from new memories.
+pub(crate) const SUMMARY: &[u8] = b"summary";
 pub(crate) const SUPERSEDED_BY: &[u8] = b"superseded_by";
 pub(crate) const VALID_TO: &[u8] = b"valid_to";
 pub(crate) const RID: &[u8] = b"rid";
