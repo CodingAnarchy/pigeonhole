@@ -12,6 +12,9 @@
 //! | `commit-overwrite` | 500 commits of one 100-byte cell over one of 2,000 existing rows (`ycsb-a`'s write) | commits |
 //! | `commit-async` | 500 commits of one 100-byte cell through `commit_async`, each awaited (an uncontended async commit, D210) | commits |
 //! | `commit-at` | 500 timestamped appends of one 100-byte cell to a new row of a family with a TTL (`time-series-ttl`'s write) | commits |
+//! | `commit-incr` | 500 blind `incr`s of one counter, its base in an SST | commits |
+//! | `commit-incr-returning` | the same through `commit_returning` (D314): the fold from the active memtable, a checkpoint every 8 | commits |
+//! | `commit-incr-returning-spread` | 500 `commit_returning` increments of 500 counters, each once, their bases in an SST: every fold is a full read, then a checkpoint | commits |
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
 //! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level, with inline I/O and a stepped clock (`support/inline_io.rs`, #794) | entries |
 //!
@@ -125,6 +128,35 @@ fn main() {
             measure(&mut || shape_commit_at(&m, &points));
             points.len()
         }
+        "commit-incr" | "commit-incr-returning" | "commit-incr-returning-spread" => {
+            // A counter table of its own (D314), so the other shapes' setup is unchanged. Each
+            // cell is incremented once and flushed first, so its base is in an SST.
+            let k = db
+                .table("k")
+                .unwrap()
+                .family("c", Family::counter())
+                .create_if_missing()
+                .unwrap();
+            let spread = shape.ends_with("-spread");
+            let cells = if spread {
+                rows("sp", 500 * iters)
+            } else {
+                rows("hot", 1)
+            };
+            for row in &cells {
+                k.mutate(row).incr("c", b"n", 1).commit().unwrap();
+            }
+            db.flush().unwrap();
+            let order: Vec<Vec<u8>> = (0..500 * iters)
+                .map(|i| cells[i % cells.len()].clone())
+                .collect();
+            if shape.starts_with("commit-incr-returning") {
+                measure(&mut || shape_commit_incr_returning(&k, &order));
+            } else {
+                measure(&mut || shape_commit_incr(&k, &order));
+            }
+            order.len()
+        }
         "flush" => {
             let rows = rows("six", 125 * iters);
             commit_sixteen(&t, &rows, &quals);
@@ -145,7 +177,8 @@ fn main() {
         }
         other => panic!(
             "unknown shape {other}: commit-one, commit-sixteen, commit-overwrite, commit-at, \
-             commit-async, flush or compact"
+             commit-async, commit-incr, commit-incr-returning, commit-incr-returning-spread, \
+             flush or compact"
         ),
     };
     eprintln!("units {}", if setup_only { 0 } else { units });
@@ -181,6 +214,25 @@ fn shape_commit_at(m: &Table, points: &[(Vec<u8>, u64)]) {
             .commit()
             .unwrap();
     }
+}
+
+#[inline(never)]
+fn shape_commit_incr(k: &Table, rows: &[Vec<u8>]) {
+    let _measured = Measured::start();
+    for row in rows {
+        k.mutate(row).incr("c", b"n", 1).commit().unwrap();
+    }
+}
+
+#[inline(never)]
+fn shape_commit_incr_returning(k: &Table, rows: &[Vec<u8>]) {
+    let _measured = Measured::start();
+    let mut sum = 0i64;
+    for row in rows {
+        let r = k.mutate(row).incr("c", b"n", 1).commit_returning().unwrap();
+        sum = sum.wrapping_add(r.value("c", b"n").unwrap().unwrap());
+    }
+    std::hint::black_box(sum);
 }
 
 #[inline(never)]

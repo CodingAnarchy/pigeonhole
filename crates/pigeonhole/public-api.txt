@@ -29,6 +29,10 @@ pub struct pigeonhole::nonblocking::MaintenanceFuture
 impl core::future::future::Future for pigeonhole::nonblocking::MaintenanceFuture
 pub type pigeonhole::nonblocking::MaintenanceFuture::Output = core::result::Result<(), pigeonhole::Error>
 pub fn pigeonhole::nonblocking::MaintenanceFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::ReturningFuture
+impl core::future::future::Future for pigeonhole::nonblocking::ReturningFuture
+pub type pigeonhole::nonblocking::ReturningFuture::Output = core::result::Result<pigeonhole::Incremented, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::ReturningFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
 pub struct pigeonhole::nonblocking::RowFuture
 impl core::future::future::Future for pigeonhole::nonblocking::RowFuture
 pub type pigeonhole::nonblocking::RowFuture::Output = core::result::Result<core::option::Option<pigeonhole::Row>, pigeonhole::Error>
@@ -465,6 +469,12 @@ pub fn pigeonhole::HistogramParams::new(impl core::convert::Into<alloc::vec::Vec
 impl pigeonhole::Hop
 pub fn pigeonhole::Hop::nodes(&self) -> &pigeonhole_engine::read::keys::KeySet
 pub fn pigeonhole::Hop::parents(&self) -> core::option::Option<&[u32]>
+#[non_exhaustive] pub struct pigeonhole::Incremented
+pub pigeonhole::Incremented::info: pigeonhole::CommitInfo
+impl pigeonhole::Incremented
+pub fn pigeonhole::Incremented::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &[u8], u64, pigeonhole::Result<core::option::Option<i64>>)>
+pub fn pigeonhole::Incremented::value(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<i64>>
+pub fn pigeonhole::Incremented::value_at(&self, &str, &[u8], u64) -> pigeonhole::Result<core::option::Option<i64>>
 #[non_exhaustive] pub struct pigeonhole::IoRings
 pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
@@ -717,6 +727,7 @@ pub fn pigeonhole::RowMutation<'_>::aggregate_u64(self, &str, &[u8], u64) -> Sel
 pub fn pigeonhole::RowMutation<'_>::aggregate_u64_at(self, &str, &[u8], u64, u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
 pub fn pigeonhole::RowMutation<'_>::commit_if(self, &pigeonhole::Condition) -> pigeonhole::Result<core::option::Option<pigeonhole::CommitInfo>>
+pub fn pigeonhole::RowMutation<'_>::commit_returning(self) -> pigeonhole::Result<pigeonhole::Incremented>
 pub fn pigeonhole::RowMutation<'_>::delete_cell(self, &str, &[u8], u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::delete_column(self, &str, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::delete_family(self, &str) -> Self
@@ -751,6 +762,8 @@ impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_if_async(self, &pigeonhole::Condition) -> pigeonhole::nonblocking::CheckFuture
+impl pigeonhole::RowMutation<'_>
+pub fn pigeonhole::RowMutation<'_>::commit_returning_async(self) -> pigeonhole::nonblocking::ReturningFuture
 pub struct pigeonhole::RowPages<'t>
 impl pigeonhole::RowPages<'_>
 pub fn pigeonhole::RowPages<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'_>>>

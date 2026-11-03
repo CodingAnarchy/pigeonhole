@@ -169,6 +169,11 @@ pub enum Fault {
     /// applies as usual. For tests that poison a shard with a share still to apply somewhere,
     /// which would otherwise take the fault in its place (#998).
     NextSingleApply = 11,
+    /// While on, a coordinator holds every commit `Decide` it would send another shard (in
+    /// `Hooks::held_decides`) instead of sending it, until `Engine::release_held_decides`
+    /// sends them: a participant's turn between a share's decision and its apply there
+    /// (D314's ordering tests).
+    HoldDecides = 12,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
@@ -212,6 +217,9 @@ pub(crate) struct Hooks {
     /// PREPAREs held by `Fault::HoldPrepares`, with their participant, in send order
     /// (`Engine::release_held_prepares`).
     pub held_prepares: Mutex<Vec<(pigeonhole_runtime::ShardId, crate::shard::ShardMsg)>>,
+    /// Commit `Decide`s held by `Fault::HoldDecides`, with their participant, in send order
+    /// (`Engine::release_held_decides`).
+    pub held_decides: Mutex<Vec<(pigeonhole_runtime::ShardId, crate::shard::ShardMsg)>>,
     /// Whether `compactions` and `appended` record (`Engine::record_history`); off until a
     /// test turns it on.
     pub record: AtomicBool,
@@ -497,6 +505,30 @@ impl Engine {
             "release_held_prepares with Fault::HoldPrepares still on"
         );
         let held = std::mem::take(&mut *hooks.held_prepares.lock().unwrap());
+        let n = held.len();
+        let subs = self
+            .inner
+            .shared
+            .submitters
+            .get()
+            .expect("the shards started");
+        for (to, msg) in held {
+            let _ = subs[usize::from(to.0)].submit(msg);
+        }
+        n
+    }
+
+    /// Sends the oldest `max` of the `Decide`s `Fault::HoldDecides` held, in the order they
+    /// were held; returns how many (test hook). The rest stay held, so a test can let one
+    /// decision land before another; switch `HoldDecides` off before the last release.
+    #[doc(hidden)]
+    pub fn release_held_decides(&self, max: usize) -> usize {
+        let hooks = &self.inner.shared.hooks;
+        let held: Vec<_> = {
+            let mut h = hooks.held_decides.lock().unwrap();
+            let n = max.min(h.len());
+            h.drain(..n).collect()
+        };
         let n = held.len();
         let subs = self
             .inner

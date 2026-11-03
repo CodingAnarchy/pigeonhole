@@ -262,6 +262,41 @@ impl Builder {
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
 
+    /// [`commit`](Self::commit), returning the incremented counters (D314).
+    fn commit_returning(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+    ) -> Result<(CommitInfo, Vec<pigeonhole_engine::Returned>)> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let largest = self.largest_value;
+        engine
+            .commit_returning(self.batch, durability.map(Durability::engine))
+            .map(|(info, cells)| (CommitInfo::from_engine(info), cells))
+            .map_err(|e| commit_error(e, largest, max_value))
+    }
+
+    /// Submits a returning commit as an async one (D314, D210).
+    #[cfg(feature = "async")]
+    fn submit_returning(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+    ) -> Result<(pigeonhole_engine::PendingReturning, usize)> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let largest = self.largest_value;
+        engine
+            .submit_returning(self.batch, durability.map(Durability::engine))
+            .map(|p| (p, largest))
+            .map_err(|e| commit_error(e, largest, max_value))
+    }
+
     /// Commits through `db`, reporting the first builder error instead if there was one.
     fn commit(
         self,
@@ -407,7 +442,11 @@ impl CommitTicket {
 }
 
 /// A commit's error: `ValueTooLarge` names the largest value of the commit.
-fn commit_error(e: pigeonhole_engine::Error, largest_value: usize, max_value: usize) -> Error {
+pub(crate) fn commit_error(
+    e: pigeonhole_engine::Error,
+    largest_value: usize,
+    max_value: usize,
+) -> Error {
     match e {
         pigeonhole_engine::Error::ValueTooLarge => value_too_large(largest_value, max_value),
         e => e.into(),
@@ -867,6 +906,62 @@ impl RowMutation<'_> {
         builder
             .commit(&table.engine(), table.db.max_value, durability)
             .map_err(|e| table.db.after_commit_closed(generation, e))
+    }
+
+    /// Commits like [`commit`](Self::commit), and returns each counter cell this mutation
+    /// incremented or set (`incr`, `incr_at`, `put_i64`, `put_i64_at`), as a read at the
+    /// commit's seqno sees it (BigTable's
+    /// `ReadModifyWriteRow`; D314). Concurrent increments of one cell each get a different
+    /// value: `N` callers adding 1 from zero get exactly `1..=N`.
+    ///
+    /// A value is as durable as the commit, which returns only once it meets its durability
+    /// level; with [`Durability::Buffered`] or [`Durability::None`] a crash can lose the commit
+    /// and hand its value out again. After [`ErrorCode::OutcomeUnknown`](crate::ErrorCode)
+    /// there is no value, and retrying the increment counts it twice if it landed.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db.table("seq")?.family("n", Family::counter()).create_if_missing()?;
+    /// let r = t.mutate(b"orders").incr("n", b"next", 1).commit_returning()?;
+    /// assert_eq!(r.value("n", b"next")?, Some(1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn commit_returning(self) -> Result<Incremented> {
+        let RowMutation {
+            table,
+            builder,
+            durability,
+            ..
+        } = self;
+        let generation = table.db.before_commit()?;
+        let (info, cells) = builder
+            .commit_returning(&table.engine(), table.db.max_value, durability)
+            .map_err(|e| table.db.after_commit_closed(generation, e))?;
+        Ok(Incremented::new(info, &table.info, cells))
+    }
+
+    /// Submits as an async returning commit (D314, D210).
+    #[cfg(feature = "async")]
+    pub(crate) fn submit_returning_async(
+        self,
+    ) -> Result<(
+        pigeonhole_engine::PendingReturning,
+        Arc<pigeonhole_engine::TableInfo>,
+        usize,
+        usize,
+    )> {
+        let watch = self.table.db.watch();
+        let max_value = self.table.db.max_value;
+        let info = Arc::clone(&self.table.info);
+        self.builder
+            .submit_returning(&self.table.engine(), max_value, self.durability)
+            .map(|(p, largest)| (p, info, largest, max_value))
+            .map_err(|e| watch.refused(e))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
@@ -2645,5 +2740,76 @@ impl Transaction {
     /// Commits with `durability`.
     pub fn commit_with(self, durability: Durability) -> Result<CommitInfo> {
         self.finish(Some(durability))
+    }
+}
+
+/// The counter cells a [`RowMutation::commit_returning`] incremented or set, after its
+/// commit (D314).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Incremented {
+    /// The commit.
+    pub info: CommitInfo,
+    table: Arc<pigeonhole_engine::TableInfo>,
+    cells: Vec<IncrementedCell>,
+}
+
+/// One cell of an [`Incremented`]: family, qualifier, timestamp, value.
+type IncrementedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
+
+impl Incremented {
+    pub(crate) fn new(
+        info: CommitInfo,
+        table: &Arc<pigeonhole_engine::TableInfo>,
+        cells: Vec<pigeonhole_engine::Returned>,
+    ) -> Self {
+        Self {
+            info,
+            table: Arc::clone(table),
+            cells: cells
+                .into_iter()
+                .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
+                .collect(),
+        }
+    }
+
+    /// The counter `incr` (or `put_i64`) wrote in `family` at `qualifier`, after the commit.
+    ///
+    /// `Ok(None)` only if a read at the commit sees no cell. An `Err` is the error that kept
+    /// the value from being read once the commit had applied: **the commit succeeded**, so
+    /// don't retry it. `InvalidArgument` if the commit didn't write that counter.
+    pub fn value(&self, family: &str, qualifier: &[u8]) -> Result<Option<i64>> {
+        self.value_at(family, qualifier, 0)
+    }
+
+    /// The bucket `incr_at(family, qualifier, ts, ..)` incremented, after the commit:
+    /// `Ok(None)` if the bucket was already past the family's TTL at the commit's timestamp.
+    /// Errors as [`value`](Self::value).
+    pub fn value_at(&self, family: &str, qualifier: &[u8], ts: u64) -> Result<Option<i64>> {
+        let id = self.table.family(family).map(|f| f.id);
+        self.cells
+            .iter()
+            .find(|(f, q, t, _)| Some(*f) == id && q == qualifier && *t == ts)
+            .map(|c| c.3.clone())
+            .unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    format!("the commit did not increment {family}:{qualifier:?} at {ts}"),
+                ))
+            })
+    }
+
+    /// Every cell, as `(family, qualifier, ts, value)`, in the order the mutation first
+    /// wrote each. `ts` is 0 for a plain counter.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8], u64, Result<Option<i64>>)> {
+        self.cells.iter().map(|(f, q, ts, v)| {
+            let name = self
+                .table
+                .families
+                .iter()
+                .find(|x| x.id == *f)
+                .map_or("", |x| x.name.as_str());
+            (name, q.as_slice(), *ts, v.clone())
+        })
     }
 }

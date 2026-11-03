@@ -1916,6 +1916,48 @@ impl Engine {
         self.inner.commit_blocking(batch, durability)
     }
 
+    /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
+    /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
+    /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
+    /// must touch one row. A cell whose value could not be read after the commit applied
+    /// holds that error; the commit itself succeeded.
+    pub fn commit_returning(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<(CommitInfo, Vec<Returned>)> {
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        let out = crate::shard::ReturnSlot::default();
+        let inner = &self.inner;
+        let info = match inner.route_and_send_with(
+            batch,
+            durability,
+            None,
+            None,
+            Some(Arc::clone(&out)),
+            NoAdmission,
+        )? {
+            Routed::Sent {
+                mut waiter, spins, ..
+            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
+            Routed::Held(p) => inner.send(p)?.wait(),
+        }?;
+        Ok((info, returned(&out)))
+    }
+
+    /// [`commit_returning`](Self::commit_returning) without waiting, as
+    /// [`submit_async`](Self::submit_async) submits (D210): the [`PendingReturning`]
+    /// resolves as `commit_returning` returns.
+    pub fn submit_returning(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<PendingReturning> {
+        let out = crate::shard::ReturnSlot::default();
+        let pending = self.submit_async_with(batch, durability, Some(Arc::clone(&out)))?;
+        Ok(PendingReturning { pending, out })
+    }
+
     /// Applies `batch` (which must touch only `row`) if `predicate` holds, atomically on the
     /// owning shard. Returns whether it applied (Phase 2).
     pub fn check_and_mutate(
@@ -1959,16 +2001,29 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingCommit> {
+        self.submit_async_with(batch, durability, None)
+    }
+
+    /// [`submit_async`](Self::submit_async), for a commit that may return its incremented
+    /// counters (D314; `None` everywhere else, folded away).
+    #[inline(always)]
+    fn submit_async_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        returning: Option<crate::shard::ReturnSlot>,
+    ) -> Result<PendingCommit> {
         let inner = &self.inner;
         let Some(a) = &inner.admission else {
             return inner
-                .submit(batch, durability, None, None)
+                .route_and_send_with(batch, durability, None, None, returning, NoAdmission)
+                .and_then(|routed| inner.submission(routed))
                 .map(PendingCommit::from);
         };
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        match inner.route_and_send(batch, durability, None, None, (&**a, bytes))? {
+        match inner.route_and_send_with(batch, durability, None, None, returning, (&**a, bytes))? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -2751,6 +2806,18 @@ impl Engine {
             (
                 k + m.checkpoints.load(Ordering::Relaxed),
                 d + m.checkpoints_dropped.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Returning commits' cells (D314) folded from the active memtable, and those that took
+    /// the full read, since open. For tests and benchmarks.
+    #[doc(hidden)]
+    pub fn returning_folds(&self) -> (u64, u64) {
+        self.inner.shared.metrics.iter().fold((0, 0), |(f, r), m| {
+            (
+                f + m.returning_fast.load(Ordering::Relaxed),
+                r + m.returning_full.load(Ordering::Relaxed),
             )
         })
     }
@@ -4241,6 +4308,22 @@ impl Inner {
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
+        self.route_and_send_with(batch, durability, validate, predicate, None, admit)
+    }
+
+    /// [`route_and_send`](Self::route_and_send), for a commit that may return its
+    /// incremented counters (D314): `returning` is `None` on every other path, a constant the
+    /// inlined body folds away.
+    #[inline(always)]
+    pub(crate) fn route_and_send_with<A: Admitter>(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        validate: Option<Arc<Validate>>,
+        predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        returning: Option<crate::shard::ReturnSlot>,
+        admit: A,
+    ) -> Result<Routed<A::Charge>> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -4276,7 +4359,13 @@ impl Inner {
                     ShardMsg::Commit(CommitReq {
                         bytes: builder,
                         durability,
-                        reply: Reply::Commit(tx),
+                        reply: match returning {
+                            None => Reply::Commit(tx),
+                            Some(out) => Reply::Returning(Box::new(crate::shard::Returning {
+                                notifier: tx,
+                                out,
+                            })),
+                        },
                         submitted_at,
                         validate,
                         predicate: predicate.map(Box::new),
@@ -4305,6 +4394,11 @@ impl Inner {
         if predicate.is_some() {
             return Err(Error::InvalidArgument(
                 "check_and_mutate touches one row".to_owned(),
+            ));
+        }
+        if returning.is_some() {
+            return Err(Error::InvalidArgument(
+                "a returning commit touches one row".to_owned(),
             ));
         }
         let parts = split_by_shard(&view, &builder, &shards)?;
@@ -5889,5 +5983,60 @@ impl View {
             _pin: None,
             released: false,
         })
+    }
+}
+
+/// One counter cell a returning commit incremented, after the commit (D314).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Returned {
+    /// Its family.
+    pub family: FamilyId,
+    /// Its qualifier.
+    pub qualifier: Vec<u8>,
+    /// Its timestamp: 0 for a plain counter (`incr`), else its bucket's.
+    pub ts: Timestamp,
+    /// Its value after the commit (`None`: absent, as a bucket past its TTL is), or the error
+    /// that kept the shard from reading it once the commit had applied.
+    pub value: Result<Option<i64>>,
+}
+
+/// The cells the shard left in `out` (set before the commit's reply, which orders it).
+fn returned(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
+    out.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
+
+/// A submitted [`Engine::submit_returning`]: resolves to the commit and its values.
+#[derive(Debug)]
+pub struct PendingReturning {
+    pending: PendingCommit,
+    out: crate::shard::ReturnSlot,
+}
+
+impl PendingReturning {
+    /// Waits for the commit, as [`PendingCommit::wait`] does.
+    pub fn wait(self) -> Result<(CommitInfo, Vec<Returned>)> {
+        let info = self.pending.wait()?;
+        Ok((info, returned(&self.out)))
+    }
+}
+
+impl std::future::Future for PendingReturning {
+    type Output = Result<(CommitInfo, Vec<Returned>)>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.pending).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(r) => {
+                std::task::Poll::Ready(r.map(|info| (info, returned(&this.out))))
+            }
+        }
     }
 }

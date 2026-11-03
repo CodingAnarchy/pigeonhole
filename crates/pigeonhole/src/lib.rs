@@ -190,7 +190,9 @@ pub use retry::RetryPolicy;
 pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
-pub use write::{CommitInfo, CommitTicket, Durability, RowMutation, Transaction, WriteBatch};
+pub use write::{
+    CommitInfo, CommitTicket, Durability, Incremented, RowMutation, Transaction, WriteBatch,
+};
 
 pub use merge::{MergeError, MergeOperator};
 pub use metrics::RowCacheStats;

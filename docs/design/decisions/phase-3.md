@@ -4281,3 +4281,38 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - The `pwrite` is still the WAL stage of a `Buffered` commit. #1206 lever 4 continues with what merged: CRC32C through `crc-fast` (#1366).
 - A future attempt would need a way to store into the WAL without the per-page fault after each sync, for example a slot that is never synced while it's being written. None was found that keeps `Buffered`'s and `Default`'s shared WAL.
 - The D310 cursor fix that D312's review prompted (#1370, above) stands on its own: any torn read past the frontier is handled the same way.
+
+<a id="d314"></a>
+## D314 — A row mutation's counters can return their values after its commit: `commit_returning`, folded on the row's shard right after the commit applies (perf2, design; owner decision, 2026-11-03; reviewed by simp724 and perf287; engine, pigeonhole, #1440, ICR 0113)
+
+**Decided:** `RowMutation::commit_returning` (and `commit_returning_async`) commits like `commit` and returns each counter cell the mutation wrote: each `incr`, `incr_at`, `put_i64`, `put_i64_at` and `delete_cell` in a `Counter` family, valued as a get of that version at the commit's seqno *Y*. This is BigTable's `ReadModifyWriteRow`. A column, family or row delete writes no single cell, so it adds none. It covers one row. `WriteBatch`, `Transaction` and `commit_if` returning forms are not in 1.1.0. Blind `incr` and `commit` are unchanged.
+
+**The value.**
+- **What it is:** a get of that version at *Y*, so every operand at or below *Y* folded over the newest base, with the commit's own deletes hiding only older entries (D186).
+- **TTL:** judged at the commit's own timestamp (D271's allocator, simp724's Q3).
+- **`max_versions`:** applied as a read applies it.
+- **`None`:** a bucket past its TTL, a version `max_versions` hides, or a cell the commit deleted last.
+- **Errors:** a read error after the apply is that cell's `Err`. The commit has succeeded either way.
+- **Uniqueness and 1..N hold for increments:** *N* concurrent `+1`s on one cell get exactly `1..=N`, because the row's shard applies its commits one at a time in seqno order (`follow_commit`'s one applier per row).
+
+**Ordering rule (simp724's Q2).** *At a returning member's apply, every seqno below it that writes its row has been applied on its shard.* Under D271 a blind write over an undecided share's write is admitted, and a share decided below *Y* could then apply after the fold. That would miss its operand, and a checkpoint at *Y* would hide it from every later read. So a returning single counts its row as read, as a conditional single's predicate row is:
+- `overlaps_undecided` makes it wait for undecided shares writing the row.
+- `read_rows` makes PREPAREs writing the row wait for it.
+
+Blind commits pay nothing, because both checks sit behind the existing early-outs. Two hand-driven tests (`it/returning_order.rs`, with `Fault::HoldDecides` holding a share's decision back from the row's shard) fail with either half removed. Random seeds reach the window only rarely: in the prototype, the counters target found the missing wait at seed 123 of 300, and the `returning` target not at all in 400.
+
+**The fold.** It runs in `run_group`'s apply loop, right after the member's apply. The shard derives the cells from the batch it already holds, so the client sends only a result slot, boxed in `Reply::Returning`, and `Settled`, `CommitReq` and `Member` keep their size.
+- **Fast path:** the active memtable, from the column's first key. It folds this version's operands at or below *Y* down to a `Put` base or a delete, and gives up (taking the full read) when:
+  - it leaves the active memtable without a base;
+  - a column delete at a newer timestamp, or a row or family marker, lies between its base and *Y*;
+  - the family keeps `max_versions`.
+- **Why the active memtable alone is enough:** every other source of the slot lies wholly below the active memtable's seqnos (D287). A memtable freezes only once all below it is durable, and a decided share not yet applied holds `CROSS_HELD`. So nothing outside the active memtable lies above the walk's base, and a tablet change freezes the slot first.
+- **Full read:** a point read through the view at snapshot *Y* (not the applied state, since a share decided after the member's stamp may already have applied above it). It is limited to this version, with the TTL at the commit's timestamp and the family's `max_versions`.
+- **Write-side checkpoint:** a fold of `K` operands or more (perf287's sweep picks `K`), or one that took the full read, leaves its value as a D291 checkpoint at *Y*, through `try_counter_checkpoint`'s unchanged guards. A `None` never does. This is D291's "write-side checkpoint" follow-up, written only by returning commits.
+
+**Durability and `OutcomeUnknown`.**
+- **When the caller has the value:** only once the commit meets its durability level.
+- **How long a value stays unique:** as long as its commit survives. That means across power loss with `GroupSync` or `Sync`, across a process crash with `Buffered`, and only within the open with `None`. Other readers may see the new total first (D227).
+- **After `OutcomeUnknown`:** there is no value, and a blind retry counts the increment twice if it landed.
+
+**Testing.** `tests/returning.rs` is a model-check target of its own. Its families are a plain `sum`, `sum_v2` (2 versions), `sum_ttl` and `f`. Returning commits there include members of concurrent batches beside blind cross-shard writers, with and without deletes. Each value is compared with the model's fold at *Y*, and the run asserts the fast path is taken. Its sweep is conditional: it runs on #1440's PRs and on any PR touching counter or returning apply code (REQUIRE_SWEEPS=6).
