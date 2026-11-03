@@ -168,8 +168,6 @@ class TestVectorIndex < Minitest::Test
 
   def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-  # perf2's S3 on #1434: while a run_once works, closed? from another thread doesn't hold
-  # the GVL waiting for it, and the run_once itself stops promptly on an interrupt.
   # perf2's R1 on #1434: a run_once that drains the work in its first slice still says it
   # worked. Over several seeds, as perf2's probe found the regression in 3 of 12.
   def test_run_once_says_it_worked_when_it_drained_the_work
@@ -183,6 +181,8 @@ class TestVectorIndex < Minitest::Test
     end
   end
 
+  # perf2's S3 on #1434: while a run_once works, closed? from another thread doesn't hold
+  # the GVL waiting for it, and the run_once itself stops promptly on an interrupt.
   def test_a_busy_rebalancer_stays_responsive
     rng = Random.new(3)
     idx, reb = V::Index.create(db, "busy", spec(8), target_list_len: 4, rebalance: :background, rebalancer: true)
