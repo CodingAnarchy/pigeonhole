@@ -63,6 +63,8 @@ jobs:
       # check it first (#1366's crc-fast drifted it unnoticed).
       - name: Cargo.lock is current
         working-directory: crates/ruby
+        # bash on every runner: Windows' default PowerShell reads /dev/null as a path.
+        shell: bash
         run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Compile the extension
         run: bundle exec rake compile
