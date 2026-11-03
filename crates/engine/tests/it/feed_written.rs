@@ -612,10 +612,20 @@ fn an_async_durable_feed_is_woken_when_the_synced_hold_rises() {
             count.0.load(std::sync::atomic::Ordering::SeqCst) > before,
             "the hold's rise past `a` woke the task (attempt {attempt})"
         );
-        match feed.poll_next(&mut cx) {
-            Poll::Ready(Ok(Next::Commit(c))) => assert_eq!(c.seqno, a),
-            other => panic!("{:?}", other.map(|r| r.map(|n| format!("{n:?}")))),
+        // What the rise let through: `a`, after any `b` an earlier attempt left held (its
+        // sync was done before that `b` was logged, and the background sync is 600 s away).
+        let mut got = Vec::new();
+        loop {
+            match feed.poll_next(&mut cx) {
+                Poll::Pending => break,
+                Poll::Ready(Ok(Next::Commit(c))) => got.push(c.seqno),
+                Poll::Ready(other) => panic!("{:?}", other.map(|n| format!("{n:?}"))),
+            }
         }
+        assert!(
+            got.contains(&a) && got.iter().all(|&s| s < b),
+            "the rise delivered `a` and nothing from `b` on (attempt {attempt}): {got:?}, a {a}, b {b}"
+        );
         caught = true;
         break;
     }
