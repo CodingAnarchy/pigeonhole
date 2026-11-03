@@ -1530,6 +1530,10 @@ impl std::ops::Deref for ArenaSlice {
     }
 }
 
+/// Entries [`MemIter::skip_row`] steps before it seeks past the row: a narrow row ends
+/// within them, and a step costs less than a search.
+const ROW_SKIP_STEPS: usize = 8;
+
 impl Cursor for MemIter {
     type Error = Error;
 
@@ -1588,6 +1592,40 @@ impl Cursor for MemIter {
         self.walk.steps = 0;
         self.set(found);
         Ok(())
+    }
+
+    /// Steps a few entries, as most rows end within them, then finger-searches past the
+    /// row: `escaped row ++ 00 02` sorts after every key of the row and before every later
+    /// row, as the SST's row skip seeks (#1426). The default steps through the whole row, so
+    /// a filter's `SkipRow` in a wide row (a qualifier prefix in the middle of 100,000
+    /// cells) walked the rest of it.
+    fn skip_row(&mut self) -> Result<()> {
+        if !self.valid() {
+            return Ok(());
+        }
+        let Ok(n) = pigeonhole_format::key::row_prefix_len(self.key()) else {
+            return self.next();
+        };
+        // Copied to the stack, which holds most row prefixes (no allocation per skip).
+        let mut inline = [0u8; 64];
+        let mut heap = Vec::new();
+        let row: &mut [u8] = if let Some(buf) = inline.get_mut(..n) {
+            buf.copy_from_slice(&self.key()[..n]);
+            buf
+        } else {
+            heap.extend_from_slice(&self.key()[..n]);
+            &mut heap
+        };
+        for _ in 0..ROW_SKIP_STEPS {
+            self.next()?;
+            if !self.valid() || !self.key().starts_with(row) {
+                return Ok(());
+            }
+        }
+        if let Some(last) = row.last_mut() {
+            *last = 0x02;
+        }
+        self.seek_forward(row)
     }
 
     /// With a stale-tail index (D194): jumps to the tail recorded for the current entry,

@@ -119,6 +119,8 @@ A reader process (`--read-only`) serves `memory_recall` only. Memory ids are `Me
 
 Reopening a store with a model flag that names another model than the store's fails at startup.
 
+**Keyword matching.** `--memory-normalization nfkc` makes a new store's keyword recall match ligatures and full-width forms against plain text, for memories from PDFs, OCR or East Asian sources (`nfc` is the default; `none` compares code points as written). It's fixed when the store is created: for an existing store, a value other than the store's stops the server at startup.
+
 **Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs. A store whose application set a policy forgets under it too.
 
 ## Long results and cursors

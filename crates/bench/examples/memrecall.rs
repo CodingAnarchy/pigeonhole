@@ -4,6 +4,7 @@
 //! ```text
 //! cargo run --release -p pigeonhole-bench --example memrecall -- FIXTURE_DIR DB_DIR recall DATASET [ELEMENT]
 //! cargo run --release -p pigeonhole-bench --example memrecall -- FIXTURE_DIR DB_DIR size [N]
+//! cargo run --release -p pigeonhole-bench --example memrecall -- FIXTURE_DIR DB_DIR ivf [N]
 //! ```
 //!
 //! `FIXTURE_DIR` is what `baselines/memory/fixture.py` wrote. `DATASET` is `lme_s`, `lme_m` or
@@ -40,7 +41,7 @@ use std::time::Instant;
 
 use pigeonhole::{Element, Options, Pigeonhole};
 use pigeonhole_memory::{
-    EmbeddingModel, Expand, LinkType, Memory, MemoryId, Store, StoreOptions, Weights,
+    EmbeddingModel, Expand, IvfOptions, LinkType, Memory, MemoryId, Store, StoreOptions, Weights,
 };
 use pigeonhole_text::{Fuzziness, Index, Query};
 use serde_json::{Value, json};
@@ -533,9 +534,159 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
     }
 }
 
+/// D311 T8 (#1342): IVF recall (`StoreOptions::ivf`, defaults) in one f32 store of `lme_m`'s
+/// unique memories: `big` (N, 100,000 by default, less the others), and `sparse` (10,000,
+/// remembered interleaved with `big`'s, so it is spread thinly over the index's lists),
+/// with 5,000 held back for the writers. Per namespace, over `lme_m`'s 50 questions twice
+/// (the second pass timed): fused and vector-only latency, exact and through the index, and
+/// the index's recall@10 of the exact vector-only ranking, with the recalls' IVF counts.
+/// Then simp724's parallel-writer rows (#1342 C1): 1, 4 and 8 threads remembering the held
+/// memories into `big`, with throughput and the transaction retries and conflicts.
+fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
+    let f = fixture(fix_dir, "lme_m");
+    let mut seen = BTreeSet::new();
+    let picked: Vec<usize> = (0..f.mems.len())
+        .filter(|&i| seen.insert(f.mems[i].text.as_str()))
+        .take(n)
+        .collect();
+    let (held, rest) = picked.split_at(5_000.min(picked.len() / 4));
+    let sparse_n = 10_000.min(rest.len() / 4);
+    let dir = db_dir.join("ivf");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = open(&dir);
+    let model = EmbeddingModel::new(f.model.clone(), f.dim, Element::F32).unwrap();
+    let store = Store::create(
+        &db,
+        STORE,
+        StoreOptions::new().embedding(model).ivf(IvfOptions::new()),
+    )
+    .unwrap();
+    let mut busy = 0u64;
+    let every = rest.len() / sparse_n.max(1);
+    let t = Instant::now();
+    for (j, &i) in rest.iter().enumerate() {
+        let m = &f.mems[i];
+        let ns = if j % every == 0 && j / every < sparse_n {
+            "sparse"
+        } else {
+            "big"
+        };
+        remember(
+            &store,
+            ns,
+            Memory::new(m.text.clone()).embedding(f.mem_vecs[i].clone()),
+            &mut busy,
+        );
+        if (j + 1) % 10_000 == 0 {
+            eprintln!(
+                "progress {} memories, {:.0} s",
+                j + 1,
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+    println!(
+        "{}",
+        json!({"mode": "ivf-build", "memories": rest.len(), "sparse": sparse_n,
+               "seconds": t.elapsed().as_secs_f64(), "busy_retries": busy})
+    );
+    for ns in ["big", "sparse"] {
+        for (name, only) in [("fused", None), ("vector", Some(0))] {
+            let mut lat = [Vec::new(), Vec::new()];
+            let (mut found, mut total, mut ivf_ns, mut fallbacks) = (0usize, 0usize, 0, 0);
+            for pass in 0..2 {
+                for (q, v) in f.qs.iter().zip(&f.q_vecs) {
+                    let mut got: [Vec<MemoryId>; 2] = [Vec::new(), Vec::new()];
+                    for (k, exact) in [true, false].into_iter().enumerate() {
+                        let mut r = store
+                            .recall(&[ns])
+                            .k(10)
+                            .weights(weights(only))
+                            .embedding(v.clone())
+                            .exact(exact);
+                        if only.is_none() {
+                            r = r.text(q.text.clone());
+                        }
+                        let start = Instant::now();
+                        let (hits, st) = r.run_with_stats().unwrap();
+                        if pass == 1 {
+                            lat[k].push(start.elapsed().as_micros() as u64);
+                            if !exact {
+                                ivf_ns += st.ivf_namespaces;
+                                fallbacks += st.ivf_fallbacks;
+                            }
+                        }
+                        got[k] = hits.into_iter().map(|h| h.id).collect();
+                    }
+                    if pass == 1 && only == Some(0) {
+                        let want: BTreeSet<&MemoryId> = got[0].iter().collect();
+                        found += got[1].iter().filter(|id| want.contains(id)).count();
+                        total += want.len();
+                    }
+                }
+            }
+            let [mut exact, mut via] = lat;
+            println!(
+                "{}",
+                json!({
+                    "mode": "ivf-recall", "namespace": ns, "config": name,
+                    "exact_p50_us": percentile(&mut exact, 0.5), "exact_max_us": percentile(&mut exact, 1.0),
+                    "ivf_p50_us": percentile(&mut via, 0.5), "ivf_max_us": percentile(&mut via, 1.0),
+                    "recall_at_10_vs_exact": (total > 0).then(|| found as f64 / total as f64),
+                    "ivf_namespaces": ivf_ns, "ivf_fallbacks": fallbacks,
+                })
+            );
+        }
+    }
+    // Parallel writers into `big` (simp724's C1 on #1342): the held memories, split.
+    let mut off = 0;
+    for threads in [1usize, 4, 8] {
+        let each = held.len() / 13;
+        let chunk = &held[off..off + each * threads];
+        off += each * threads;
+        let before = db.engine_metrics();
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for part in chunk.chunks(each) {
+                let (store, f) = (&store, &f);
+                sc.spawn(move || {
+                    let mut busy = 0;
+                    for &i in part {
+                        remember(
+                            store,
+                            "big",
+                            Memory::new(f.mems[i].text.clone()).embedding(f.mem_vecs[i].clone()),
+                            &mut busy,
+                        );
+                    }
+                });
+            }
+        });
+        let secs = t.elapsed().as_secs_f64();
+        let after = db.engine_metrics();
+        println!(
+            "{}",
+            json!({
+                "mode": "ivf-writers", "threads": threads, "memories": chunk.len(),
+                "per_second": chunk.len() as f64 / secs,
+                "retries": after.transaction_retries - before.transaction_retries,
+                "conflicts": after.transaction_conflicts - before.transaction_conflicts,
+            })
+        );
+    }
+    let st = store.verify().unwrap();
+    println!(
+        "{}",
+        json!({"mode": "ivf-verify", "consistent": st.is_consistent(),
+               "ivf_mismatched": st.ivf_mismatched, "ivf_counter_drift": st.ivf_counter_drift})
+    );
+    drop(store);
+    db.close().unwrap();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "memrecall FIXTURE_DIR DB_DIR (recall DATASET [ELEMENT] | size [N])";
+    let usage = "memrecall FIXTURE_DIR DB_DIR (recall DATASET [ELEMENT] | size [N] | ivf [N])";
     let fix = PathBuf::from(args.get(1).expect(usage));
     let db = PathBuf::from(args.get(2).expect(usage));
     std::fs::create_dir_all(&db).unwrap();
@@ -547,6 +698,11 @@ fn main() {
             args.get(5).map_or("f32", String::as_str),
         ),
         Some("size") => size(
+            &fix,
+            &db,
+            args.get(4).map_or(100_000, |n| n.parse().expect("N")),
+        ),
+        Some("ivf") => ivf(
             &fix,
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),

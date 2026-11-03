@@ -149,6 +149,9 @@ mod guide {
     #[cfg(feature = "async")]
     #[doc = include_str!("../../../docs/guide/async.md")]
     struct Async;
+    #[cfg(feature = "async")]
+    #[doc = include_str!("../../../docs/guide/change-feed.md")]
+    struct ChangeFeed;
     #[doc = include_str!("../README.md")]
     struct CrateReadme;
     #[doc = include_str!("../../../README.md")]

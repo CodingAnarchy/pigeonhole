@@ -238,7 +238,28 @@ The design is on #1341 (cli692, c6593086022), plus the owner's three-part decisi
 - **`StoreOptions::normalization(Normalization)`** sets the Unicode normalisation of the store's text index at create. The default is `Nfc`, so existing stores and every call that doesn't set it behave as before.
 - **`Store::normalization()` and `ReadStore::normalization()`** read it back from the index. The index fixes it at create, so nothing at open can disagree.
 - **`pigeonhole_memory::Normalization`** re-exports `pigeonhole_text::Normalization` (`#[non_exhaustive]`), so callers don't need the text crate.
+- **The other surfaces (#1405):** Python's `Store.create(..., normalization="nfc" | "nfkc" | "none")` (`InvalidArgument` for anything else) with `Store.normalization` and `ReadStore.normalization` (`"unknown"` for a form this build doesn't name), and `phdb mcp --memory-normalization nfc|nfkc|none` for a new store, checked against an existing store's at startup (exit 2 on a mismatch, as for the model flags).
 - **It's a keyword-recall setting only:** exact dedup's text normalisation (trim, collapse whitespace, no case folding) is unchanged.
+
+## T8: IVF recall for large namespaces (#1342)
+The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–R3) and simp724's, and the vector half in #1412.
+- **`StoreOptions::ivf(IvfOptions)`**, create-only. It needs an embedding model (else `InvalidArgument`).
+  - **`IvfOptions`** (`#[non_exhaustive]`, `Copy`, `Default`): `min_namespace_len` (10,000, at least 1), `nprobe` and `target_list_len` (the vector index's defaults when unset, at least 1 when set), with `get_*` getters.
+  - **`Store::ivf()` and `ReadStore::ivf()`** read the options back. `open` takes them from `G`, so a store's IVF can't be turned on or off at open.
+- **The index:** `mem_{name}_ivf`, a `pigeonhole-vector` index in background rebalancing mode, of the model's spec, keyed by the memory's row key. Each embedding is stored twice, in `emb:v` and in its list.
+- **Writes** go in the memory's own transaction: `insert_f32_in` in `remember`/`remember_in`'s insert (merges and supersedes write no vector), and `delete_in` in `Store::delete_in`.
+  - Every removal goes through `Store::delete_in`, including `forget` and consolidation's `Delete`, so the index follows them. A comment there says a future removal path must too (simp724).
+  - **Each write makes its own `Placed` in the transaction's body** and parks it. `remember`, `delete` and the forget and consolidate passes hand the parked records to `after_commit` once their transactions return.
+  - **`after_commit`'s errors are dropped:** the memories are committed, and a missed rebalance waits for the next write to those lists (simp724).
+  - **A `remember_in` caller's records** wait for the store's next write call.
+- **The namespace counter:** `{ns}\0c:stats:embedded` (the `stats` counter family), incremented blind by ±1 with each indexed insert and delete, so concurrent remembers don't conflict through it (a test commits two overlapping `remember_in`s). It's advisory: drift changes only which path a recall takes.
+- **Recall:**
+  - **Choosing the path:** each namespace's counter is read at the recall's snapshot. At `min_namespace_len` or more, the vector signal comes from the index (`id_prefix("{ns}\0m")`, at the same snapshot), else from the exact `nearest` scan.
+  - **The fallback:** the search widens to at most `max(nprobe, count / 64)` lists (64 is a seek's cost in scored cells, perf287's rule after R1). A search cut there falls back to the exact scan for that namespace.
+  - **`Recall::exact(bool)`** forces the exact scan, and **`Recall::nprobe(u32)`** sets the first probe per recall.
+  - **`RecallStats::ivf_namespaces` and `ivf_fallbacks`** say which path ran.
+- **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
+- **`Error::Vector(pigeonhole_vector::Error)`**, with the index's database errors mapped to `Error::Db`.
 
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
@@ -250,6 +271,8 @@ The design is on #1341 (cli692, c6593086022), plus the owner's three-part decisi
   - `peak:importance` (parts per million) and `peak:last_used` (µs), both `max` aggregates;
   - `links:{target row}` and `backlinks:{source row}`, each `[type u8][weight f32 LE]`.
 - **Dedup rows:** `{ns}\0h{xxh3_128 of the normalised text, big-endian}`, holding `meta:rid` (the memory's row key).
+- **Counter rows (T8, IVF stores only):** `{ns}\0c`, holding `stats:embedded`, the namespace's memories with an embedding.
 - **`G`'s `meta`:** `layout` (1), `text_index`, `model_id`, `model_dim` and `model_element` (`0` for F32, `1` for F16, `2` for BF16).
   - `near_dedup` (T3) holds the setting: a version byte (1), the similarity (`f32` LE), and the policy (`0` Skip, `1` Merge, `2` Link).
+  - `ivf` (T8) holds `IvfOptions`: a version byte (1), `min_namespace_len` (8 bytes), then `nprobe` and `target_list_len` (4 bytes each, 0 for the index's default), little endian.
   - `forget` (T2) holds the policy: a version byte (1), `min_retention` (a flag, then `f64`), `half_life` µs, `use_weight`, `max_per_pass`, `interval` µs (each 8 bytes, little endian), then a count and the `(kind u8, max_age µs)` pairs.

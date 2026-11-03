@@ -43,6 +43,7 @@ mod durable_freeze;
 mod durable_snapshot;
 mod early_decide;
 mod exact_aggregates;
+mod feed_async;
 mod feed_head;
 mod feed_reader;
 mod feed_reader_process;

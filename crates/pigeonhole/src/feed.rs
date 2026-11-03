@@ -462,6 +462,57 @@ impl Feed {
         }
     }
 
+    /// The next commit, for an async caller (D310 PR 5a): `Poll::Ready` with it, or with an
+    /// error as [`next`](Self::next) would end with (they end the feed the same way), and
+    /// `Poll::Pending` until there is one, with `cx`'s waker registered so the task is woken,
+    /// never spinning, when the frontier can move. A feed doesn't end on its own, so there is
+    /// no `None`. It follows an automatic recovery as `next` does.
+    ///
+    /// The writer process only: in a reader process it is
+    /// [`ErrorCode::Unsupported`]; call the blocking [`next`](Self::next) on a thread of its
+    /// own (#1407). [`nonblocking::FeedStream`](crate::nonblocking::FeedStream) wraps this
+    /// as a `Stream` of owned commits.
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<&Commit>> {
+        use std::task::Poll;
+        if let Err(e) = self.check_failed() {
+            return Poll::Ready(Err(e));
+        }
+        loop {
+            if let Err(e) = self.follow_recovery() {
+                return Poll::Ready(Err(e));
+            }
+            let next = match self.reader.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(next)) => next,
+                // The old engine failing under a recovery's swap: follow it and look again.
+                Poll::Ready(Err(_)) if swapped(&self.db, self.generation) => continue,
+                // `Unsupported` in a reader process: not the feed's failure, so not kept.
+                Poll::Ready(Err(e @ pigeonhole_engine::Error::Unsupported(_))) => {
+                    return Poll::Ready(Err(e.into()));
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(fail(&mut self.failed, e.into()))),
+            };
+            return match next {
+                Next::Commit(c) => {
+                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
+                        return Poll::Ready(Err(fail(&mut self.failed, e)));
+                    }
+                    Poll::Ready(Ok(&self.commit))
+                }
+                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
+                Next::Expired(e) => {
+                    self.oldest_retained = e.oldest_retained;
+                    Poll::Ready(Err(expired(e)))
+                }
+                // The engine's `poll_next` returns `Poll::Pending` instead.
+                Next::Pending => Poll::Pending,
+            };
+        }
+    }
+
     /// The error that ended the feed, again.
     fn check_failed(&self) -> Result<()> {
         match &self.failed {

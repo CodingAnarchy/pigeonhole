@@ -980,3 +980,50 @@ fn a_scan_stream_over_a_cache_that_keeps_nothing_reads_synchronously_and_matches
     drop(t);
     db.close().unwrap();
 }
+
+/// D310 PR 5a: a `FeedStream` is woken by a commit made on another thread while it waits
+/// (never spinning), yields owned commits, and its token resumes after the last one.
+#[test]
+fn a_feed_stream_is_woken_by_a_commit_and_its_token_resumes() {
+    use pigeonhole::nonblocking::FeedStream;
+    use pigeonhole::{FeedRetention, Options};
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("feed.phdb"),
+        Options::default()
+            .shards(2)
+            .change_feed(FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut stream = FeedStream::new(t.feed().open().unwrap());
+    let writer = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            t.mutate(b"one").put("f", b"q", b"1").commit().unwrap()
+        })
+    };
+    let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx));
+    let c = block_on(next).expect("a commit").unwrap();
+    let one = writer.join().unwrap();
+    assert_eq!((c.seqno(), c.changes()[0].row()), (one.seqno, &b"one"[..]));
+    let token = stream.token();
+    let two = t.mutate(b"two").put("f", b"q", b"2").commit().unwrap();
+    drop(stream);
+    let mut stream = FeedStream::new(t.feed().resume(&token).open().unwrap());
+    let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx));
+    let c = block_on(next).expect("a commit").unwrap();
+    assert_eq!(
+        c.seqno(),
+        two.seqno,
+        "resumed after the last commit yielded"
+    );
+    drop(stream);
+    db.close().unwrap();
+}
