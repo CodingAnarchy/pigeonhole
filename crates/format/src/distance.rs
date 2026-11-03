@@ -209,8 +209,10 @@ macro_rules! half_kernels {
 }
 
 /// Halves widened per call of [`f16_wide`]: a multiple of [`LANES`], so a chunk holds whole
-/// lane groups and the kernels' order is the `f32` kernels' order.
-const F16_CHUNK: usize = 16 * LANES;
+/// lane groups and the kernels' order is the `f32` kernels' order. Small, because both stack
+/// buffers are zeroed on every call (384 bytes at 64 halves), and the common dimensions (128,
+/// 384, 768, 1536) are multiples of it.
+const F16_CHUNK: usize = 4 * LANES;
 
 /// Widens the little-endian `f16` bits of `v` to `f32`, [`F16_CHUNK`] halves at a time, and
 /// hands each widened chunk to `each` in order (#1306). `half`'s `convert_to_f32_slice` uses
@@ -218,7 +220,8 @@ const F16_CHUNK: usize = 16 * LANES;
 /// an exact software widen otherwise. Every path gives the bits of
 /// [`f16_to_f32`](crate::half::f16_to_f32) for every non-NaN half, and a stored half vector is
 /// always finite (D303), so the kernels below equal the `f32` kernels over the widened vector,
-/// bit for bit. One call per chunk, not per lane, keeps the detection off the inner loop.
+/// bit for bit. One call per chunk, not per lane, keeps the detection off the inner loop. The
+/// tail of fewer than [`LANES`] halves is widened one at a time by [`f16_tail`] instead.
 #[inline(always)]
 fn f16_wide(v: &[u8], mut each: impl FnMut(&[f32])) {
     use ::half::slice::HalfFloatSliceExt;
@@ -233,6 +236,16 @@ fn f16_wide(v: &[u8], mut each: impl FnMut(&[f32])) {
         bits[..n].convert_to_f32_slice(&mut wide[..n]);
         each(&wide[..n]);
     }
+}
+
+/// The halves of a tail shorter than [`LANES`], widened one at a time by
+/// [`f16_to_f32`](crate::half::f16_to_f32): exact, like [`f16_wide`], without its buffers.
+#[inline(always)]
+fn f16_tail(v: &[u8]) -> impl Iterator<Item = f32> {
+    v.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| crate::half::f16_to_f32(u16::from_le_bytes(*p)))
 }
 
 /// [`l2_f32_le`] over a vector of little-endian `f16` bits.
@@ -251,12 +264,10 @@ pub fn l2_f16_le(q: &[f32], v: &[u8]) -> f32 {
         }
     });
     let mut sum = tree(acc);
-    f16_wide(vt, |w| {
-        for (x, y) in tq.iter().zip(w) {
-            let d = x - y;
-            sum += d * d;
-        }
-    });
+    for (x, y) in tq.iter().zip(f16_tail(vt)) {
+        let d = x - y;
+        sum += d * d;
+    }
     sum
 }
 
@@ -277,12 +288,10 @@ pub fn dot_norm_f16_le(q: &[f32], v: &[u8]) -> (f32, f32) {
         }
     });
     let (mut d, mut n) = (tree(dot), tree(norm));
-    f16_wide(vt, |w| {
-        for (y, x) in tq.iter().zip(w) {
-            d += y * x;
-            n += x * x;
-        }
-    });
+    for (y, x) in tq.iter().zip(f16_tail(vt)) {
+        d += y * x;
+        n += x * x;
+    }
     (d, n)
 }
 
@@ -298,11 +307,9 @@ pub fn norm2_f16_le(v: &[u8]) -> f32 {
         }
     });
     let mut sum = tree(acc);
-    f16_wide(vt, |w| {
-        for x in w {
-            sum += x * x;
-        }
-    });
+    for x in f16_tail(vt) {
+        sum += x * x;
+    }
     sum
 }
 half_kernels!(
