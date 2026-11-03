@@ -122,7 +122,12 @@ module SourceGem
     raise "#{dir}: the manifest doesn't state #{missing.join(', ')}" unless missing.empty?
 
     DROPPED.each { |s| m.delete(s) }
-    m["lints"] = lints(root) if m.key?("lints")
+    if m.key?("lints")
+      # A crate's own lint table would be replaced silently (ai1249's N5 on #1414).
+      raise "#{dir}: [lints] isn't `workspace = true`; teach the task about it" unless m["lints"] == { "workspace" => true }
+
+      m["lints"] = lints(root)
+    end
     deps = root.fetch("workspace").fetch("dependencies")
     dependency_tables(m).each do |table|
       table.each { |key, spec| table[key] = dependency(key, spec, deps, dirs, "../") }
@@ -159,9 +164,16 @@ module SourceGem
     end
   end
 
+  # A `#[cfg(doctest)]` module's body as the crates write it: `#[doc = include_str!(..)]`
+  # attributes on unit structs, `#[cfg(..)]` attributes and comments, none with a brace.
+  DOCTEST_BODY = %r{\A(?:\s+|//[^\n]*|#\[doc\s*=\s*include_str!\(\s*"[^"]*"\s*\)\]|#\[cfg\([^\]{}]*\)\]|struct\s+\w+\s*;)*\z}
+
   # `src` with each `#[cfg(doctest)] mod name { ... }` block removed: they compile only for
   # doctests, so what they include (the guide, the root README) never reaches a gem build.
-  def without_doctests(src)
+  # The end of a block is found by counting braces, which is only sound for bodies of doc
+  # attributes, so any other body fails staging rather than being misread (ai1249's N2 on
+  # #1414).
+  def without_doctests(src, file)
     out = +""
     rest = src
     while (m = rest.match(/#\[cfg\(doctest\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{/))
@@ -173,12 +185,17 @@ module SourceGem
         depth -= 1 if rest[i] == "}"
         i += 1
       end
+      body = rest[m.end(0)...(i - 1)]
+      unless depth.zero? && body.match?(DOCTEST_BODY)
+        raise "#{file}: a #[cfg(doctest)] module holds more than doc includes; teach the task about it"
+      end
+
       rest = rest[i..] || ""
     end
     out << rest
   end
 
-  INCLUDE = /include_(?:str|bytes)!\s*\(\s*(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?"([^"]+)"/
+  INCLUDE = /\binclude(?:_str|_bytes)?!\s*\(\s*(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?"([^"]+)"/
   PATH_ATTR = /#\[path\s*=\s*"([^"]+)"\]/
 
   # Fails, naming them, on files a vendored crate's code includes that aren't in the vendored
@@ -188,7 +205,7 @@ module SourceGem
     bad = []
     Dir.glob("**/*.rs", base: crate_dir).each do |rel|
       file = File.join(crate_dir, rel)
-      src = without_doctests(File.read(file))
+      src = without_doctests(File.read(file), rel)
       targets = src.scan(INCLUDE).map do |manifest_dir, path|
         manifest_dir ? File.join(crate_dir, path) : File.expand_path(path, File.dirname(file))
       end
@@ -246,6 +263,9 @@ module SourceGem
       table.each { |key, spec| table[key] = dependency(key, spec, {}, dirs, "vendor/") }
     end
     m["workspace"] = { "exclude" => ["vendor"] }
+    # A user's build keeps the release profile's optimisations but not its debug info, which
+    # only slows the link and grows the installed extension (ai1249's N4 on #1414).
+    m.dig("profile", "release")&.delete("debug")
     File.write(File.join(STAGE, "Cargo.toml"),
                format(HEADER, "crates/ruby/Cargo.toml for the source gem") + toml.dump(m))
     manifests[STAGE] = m

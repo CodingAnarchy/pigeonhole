@@ -66,7 +66,7 @@ jobs:
   # The source gem (rakelib/source_gem.rake): the engine's path crates vendored under vendor/.
   # It's installed from a copy outside the checkout into an empty GEM_HOME, which compiles it
   # as a user's `gem install` would, so a file the vendored crates need but don't carry fails
-  # here, not on a user's machine (ai1249's P2 on #697: keep this job required).
+  # here, not on a user's machine (ai1249's P2 on #697; the merge job waits for it).
   source:
     name: source gem (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
