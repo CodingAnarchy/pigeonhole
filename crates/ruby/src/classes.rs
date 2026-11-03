@@ -149,3 +149,7 @@ pub(crate) struct PagesState {
 /// `Pigeonhole::Pages`: a wide row's pages, each read when it is asked for.
 #[magnus::wrap(class = "Pigeonhole::Pages", free_immediately, size)]
 pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);
+
+/// `Pigeonhole::Feed`: a change feed subscription (its state is `crate::feed::FeedState`).
+#[magnus::wrap(class = "Pigeonhole::Feed", free_immediately, size)]
+pub(crate) struct Feed(pub(crate) ForkSafe<crate::feed::FeedState>);

@@ -151,6 +151,38 @@ Pigeonhole.open(path, create: true) do |db|
 end
 ```
 
+## The change feed
+Open the database with `change_feed:` (the history to keep, in bytes; `feed_age:` bounds it in time too). Later opens that don't mention the feed keep it, and `change_feed_off: true` turns it off. Then `table.feed` subscribes to a table's committed changes: whole commits, once each, in commit order.
+- **Delivery:** a commit arrives once it is durable at its level, so nothing delivered is ever undone (`visible: true` for sooner).
+- **What arrives:** each `Commit` has `seqno`, `timestamp` and `changes`. Each `Change` has `table`, `family`, `kind` (`:put`, `:merge`, `:delete_cell`, `:delete_column`, `:delete_family`), `row`, `qualifier`, `timestamp` and `value` (typed as reads type it, `nil` for deletes). Both are frozen `Data`.
+- **Waiting:** `feed.next(timeout: s)` waits for the next commit with the GVL released, and returns `nil` if none came in time. `try_next` never waits. `each` (and so `first(n)`) waits for each commit in turn; `each(timeout: s)` stops once one doesn't come in time.
+- **A feed has no end.** Like `Pages`, a feed is a cursor, and `Enumerable` methods that read to the end (`to_a`, `map`, `count`, `select`) wait for ever on a live feed. `first(n)`, `take(n)` and `find` return. To drain what's there now, use `feed.each(timeout: 1).to_a`.
+- **Kinds:** a change's `kind` is `:put`, `:merge`, `:delete_cell`, `:delete_column` or `:delete_family`, or `:unknown` for a kind a later engine adds. Give a `case` on kinds an `else`.
+  - A wait runs in 100 ms slices with an interrupt check between them, so `Thread#raise`, `Timeout.timeout` and Ctrl-C reach a consumer blocked in `next`.
+- **Resuming:** store `feed.token` with what the commits fed. `table.feed(resume: token)` continues there, after a reopen too.
+- **Choosing changes:** `tables: [...]` adds tables to the same feed, `prefix:` keeps only rows under it, and `from_snapshot:` starts after what a snapshot saw. So a consumer can load a snapshot and then follow the changes without missing or repeating any.
+- **Expiry:** when the history a feed needs is gone (retention passed it, or an open with `change_feed_off: true` ended it), the feed raises `FeedExpired` from then on. Rebuild from a snapshot and start again.
+- **Readers:** a reader process's table (`Pigeonhole.open_reader(path).table(...)`) subscribes too, following the running writer's feed. If that writer restarts, the feed follows it. While no writer runs, `next` raises `NoWriter` (or `SnapshotExpired` while a new one starts): call `next` again on the same feed.
+- **Blocks:** with a block, `table.feed` yields the feed and closes it afterwards. `close` ends a subscription early.
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true, change_feed: 64 << 20) do |db|
+  t = db.table("orders").family("f").create
+  token = t.feed do |feed|
+    t.put("order:1", "f", "status", "paid")
+    change = feed.next(timeout: 5).changes.first
+    raise unless [change.kind, change.row, change.value] == [:put, "order:1", "paid"]
+    feed.token # store it with what the commit fed
+  end
+  t.put("order:1", "f", "status", "shipped")
+  t.feed(resume: token) do |feed|
+    raise unless feed.next(timeout: 5).changes.first.value == "shipped"
+  end
+end
+```
+
 ## Writes, batches and transactions
 - **One-commit writes:** `table.put`, `table.incr` and `table.delete` each commit at once and return the commit's sequence number.
 - **`table.mutate(row)`** collects one row's writes for a single commit: `put`, `put_u64`, `incr`, `aggregate` and `delete`, then `commit`, or `commit_if(Pigeonhole::Condition.absent(family, qualifier))`, which returns `nil` when the condition fails.

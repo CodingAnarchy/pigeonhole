@@ -12,10 +12,17 @@ module Pigeonhole
     # Opens (with `create: true`, creates) the database at `path` as the writer process.
     # With a block, yields the database, closes it when the block exits however it exits,
     # and returns the block's value.
+    #
+    # `change_feed: n` turns the change feed on (`Table#feed`), keeping up to `n` bytes of
+    # history, for at most `feed_age:` seconds if given; `feed_tables:` limits it to those
+    # tables. With neither `change_feed:` nor `change_feed_off: true`, an open inherits the
+    # last open's feed, so a feed's tokens stay valid across an open that doesn't mention
+    # it; `change_feed_off: true` turns it off, which ends its history.
     def open(path, create: false, shards: nil, durability: nil, block_cache: nil, row_cache: nil,
-             memtable_budget: nil, shm_dir: nil, read_only_fallback: nil)
+             memtable_budget: nil, shm_dir: nil, read_only_fallback: nil, change_feed: nil,
+             change_feed_off: false, feed_age: nil, feed_tables: nil)
       db = native_open(path, create, shards, durability, block_cache, row_cache, memtable_budget,
-                       shm_dir, read_only_fallback)
+                       shm_dir, read_only_fallback, change_feed, change_feed_off, feed_age, feed_tables)
       return db unless block_given?
 
       begin
@@ -101,6 +108,23 @@ module Pigeonhole
     # The number of rows.
     def size = rows.size
   end
+
+  # One whole commit from a change feed: its sequence number (the order commits arrive in,
+  # as `Snapshot#seqno` counts), its commit timestamp (microseconds since the Unix epoch)
+  # and its changes in the feed's tables and row prefix, in the order the commit wrote them.
+  Commit = Data.define(:seqno, :timestamp, :changes) do
+    # The number of changes.
+    def size = changes.size
+  end
+
+  # One mutation of a commit: its table and family names, its kind (`:put`, `:merge` for a
+  # merge operand, a counter increment or an aggregate input, `:delete_cell`,
+  # `:delete_column`, or `:delete_family`, which a row delete is one of per family), its row
+  # key and qualifier (empty for `:delete_family`), its timestamp, and the value written or
+  # merged, typed as `Cell#typed` types it (nil for deletes). Its Strings are frozen, as it
+  # is. A kind this build doesn't know (one a later engine adds) arrives as `:unknown`, so a
+  # `case` on kinds should have an `else`.
+  Change = Data.define(:table, :family, :kind, :row, :qualifier, :timestamp, :value)
 
   # A `multi_get_within` page (D308), as `ScanPage` describes; its rows are in key order,
   # not aligned with the keys given.
@@ -311,6 +335,28 @@ module Pigeonhole
       NearestPage.new(found.map { |a| Neighbour.new(*a) }.freeze, size, next_bytes)
     end
 
+    # Subscribes to this table's committed changes (the change feed, D310): a `Feed` of
+    # whole commits, once each, in commit order. The database's change feed must be on, set
+    # with `change_feed:` or inherited from the last open, and follow this table. A reader
+    # process's table feeds too, from the running writer's history. With a block, yields the
+    # feed, closes it afterwards and returns the block's value.
+    #
+    # `tables:` adds more tables to the same feed (a commit across them arrives whole),
+    # `prefix:` keeps only changes to rows under it, and `visible: true` delivers a commit as
+    # soon as reads see it rather than once it is durable. The feed starts after this call,
+    # or after the commits `from_snapshot:` sees, or at the oldest history kept
+    # (`from_oldest: true`), or after a stored `resume:` token (`Feed#token`).
+    def feed(tables: nil, prefix: nil, visible: false, from_snapshot: nil, from_oldest: false, resume: nil)
+      f = native_feed(tables, prefix, visible, from_snapshot, from_oldest, resume)
+      return f unless block_given?
+
+      begin
+        yield f
+      ensure
+        f.close
+      end
+    end
+
     # Puts one cell and commits it; returns the commit's sequence number. A String is bytes,
     # an Integer an i64 and a Float an f64.
     def put(row, family, qualifier, value, ts: nil, durability: nil)
@@ -439,6 +485,49 @@ module Pigeonhole
 
       cells.each(&)
       self
+    end
+  end
+
+  # A subscription to some tables' committed changes (`Table#feed`). Each wait releases the
+  # GVL in short slices with an interrupt check between them, so `Thread#raise`, `Timeout`
+  # and Ctrl-C reach a consumer blocked in `next`. Like `Pages`, it's a cursor: every Enumerable
+  # method consumes the commits it reads. A live feed has no end, so the methods that read to
+  # the end (`to_a`, `map`, `count`, `select`) wait for ever; `first(n)`, `take(n)` and `find`
+  # return. To drain what's there, `feed.each(timeout: 1).to_a`.
+  class Feed
+    include Enumerable
+
+    # The next `Commit`, waiting up to `timeout` seconds (nil waits until one comes); nil if
+    # none came in time. Raises `FeedExpired` once the history the feed needs is gone, and
+    # from then on.
+    def next(timeout: nil)
+      to_commit(native_next(timeout))
+    end
+
+    # The next `Commit` if one is ready, else nil. Never waits.
+    def try_next
+      to_commit(native_try_next)
+    end
+
+    # Yields each commit as it comes; without `timeout:` it never ends (`break` out), and
+    # with it, it stops once a commit doesn't come in time. Without a block, an Enumerator.
+    def each(timeout: nil)
+      return enum_for(:each, timeout: timeout) unless block_given?
+
+      while (c = self.next(timeout: timeout))
+        yield c
+      end
+      self
+    end
+
+    private
+
+    # A commit's Array from the native layer as a `Commit`.
+    def to_commit(a)
+      return nil if a.nil?
+
+      seqno, timestamp, changes = a
+      Commit.new(seqno, timestamp, changes.map { |c| Change.new(*c) }.freeze)
     end
   end
 

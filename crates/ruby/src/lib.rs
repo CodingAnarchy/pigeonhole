@@ -21,6 +21,7 @@ mod classes;
 mod convert;
 mod db;
 mod error;
+mod feed;
 mod fork;
 mod gvl;
 mod read;
@@ -29,9 +30,9 @@ mod vector;
 mod walk;
 
 use classes::{
-    Cell, Condition, Database, FamilyInfo, KeysPosition, Mutation, Pages, Reader, Row, RowPosition,
-    ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder, Transaction, VectorSpec,
-    WriteBatch,
+    Cell, Condition, Database, FamilyInfo, Feed, KeysPosition, Mutation, Pages, Reader, Row,
+    RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder, Transaction,
+    VectorSpec, WriteBatch,
 };
 
 /// Defines `Pigeonhole::<name>` with no allocator: instances come only from the library.
@@ -73,7 +74,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     error::register(ruby, m, native)?;
 
     m.singleton_class()?
-        .define_private_method("native_open", function!(db::open, 9))?;
+        .define_private_method("native_open", function!(db::open, 13))?;
     m.singleton_class()?
         .define_private_method("native_open_reader", function!(db::open_reader, 4))?;
     m.singleton_class()?
@@ -126,6 +127,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_pages", method!(Table::pages, 7))?;
     c.define_private_method("native_nearest", method!(Table::nearest, 11))?;
     c.define_private_method("native_scan_within", method!(Table::scan_within, 11))?;
+    c.define_private_method("native_feed", method!(Table::feed, 6))?;
     c.define_private_method(
         "native_multi_get_within",
         method!(Table::multi_get_within, 8),
@@ -243,6 +245,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     position!("RowPosition", RowPosition);
     position!("ScanPosition", ScanPosition).define_method("row", method!(ScanPosition::row, 0))?;
     position!("KeysPosition", KeysPosition).define_method("key", method!(KeysPosition::key, 0))?;
+
+    let c = class(ruby, m, "Feed")?;
+    c.define_private_method("native_next", method!(Feed::next, 1))?;
+    c.define_private_method("native_try_next", method!(Feed::try_next, 0))?;
+    c.define_method("token", method!(Feed::token, 0))?;
+    c.define_method("oldest_retained", method!(Feed::oldest_retained, 0))?;
+    c.define_method("close", method!(Feed::close, 0))?;
+    c.define_method("closed?", method!(Feed::is_closed, 0))?;
 
     let c = class(ruby, m, "Pages")?;
     c.define_method("position", method!(Pages::position, 0))?;

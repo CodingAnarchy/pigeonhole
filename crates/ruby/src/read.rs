@@ -19,7 +19,7 @@ use crate::table::either;
 /// A cell's value as its Ruby type: a binary String, an Integer (an `i64` cell), a Float
 /// (an `f64` cell) or a vector (an Array, or the packed bits as a String; see
 /// [`crate::vector::to_rb`]); `nil` for a type this build doesn't read.
-fn typed(ruby: &Ruby, v: pigeonhole::Value<'_>) -> Value {
+pub(crate) fn typed(ruby: &Ruby, v: pigeonhole::Value<'_>) -> Value {
     match v {
         pigeonhole::Value::I64(n) | pigeonhole::Value::Varint(n) => n.into_value_with(ruby),
         pigeonhole::Value::F64(x) => x.into_value_with(ruby),
