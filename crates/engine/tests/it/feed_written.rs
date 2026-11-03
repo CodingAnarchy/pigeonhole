@@ -546,6 +546,84 @@ fn an_async_feed_held_back_by_the_synced_hold_is_woken_when_the_shard_lets_it_go
     close_real(&db, &mut shard);
 }
 
+/// #1415 with D310 PR 5a: once a sync is in flight when another record is logged, its
+/// completion raises the synced hold to that record instead of letting it go. An async
+/// durable feed the hold keeps back must be woken by the rise too, not only by a release to
+/// `u64::MAX`, or under steady load it is never woken. On the real VFS: `a` is held, the
+/// feed's waker is left with the hold, `b` is logged while a group sync covering `a` is in
+/// flight (an attempt that misses the window starts over), and the sync's completion must
+/// wake the task. Mutation-checked: waking only on a release to `u64::MAX`, it fails.
+#[test]
+fn an_async_durable_feed_is_woken_when_the_synced_hold_rises() {
+    use pigeonhole_engine::{FeedSpec, FeedStart, Next};
+    let dir = TempDir::new("async-rise");
+    let vfs = real_vfs();
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(Duration::from_secs(600)));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    let mut feed = db
+        .feed(FeedSpec {
+            tables: vec![t.id],
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+        })
+        .unwrap();
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut caught = false;
+    for attempt in 0..50u32 {
+        let a = drive(
+            &db,
+            &mut shard,
+            db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+                .unwrap(),
+        )
+        .seqno;
+        settle(&mut shard);
+        // Everything before `a` delivered; the task then waits on the hold over `a`.
+        loop {
+            match feed.poll_next(&mut cx) {
+                Poll::Pending => break,
+                Poll::Ready(Ok(Next::Commit(c))) => assert!(c.seqno < a, "{} not held", c.seqno),
+                Poll::Ready(other) => panic!("{:?}", other.map(|n| format!("{n:?}"))),
+            }
+        }
+        let g = log_only(&db, &mut shard, batch(&t, b"g"), Durability::GroupSync);
+        let b = log_only(&db, &mut shard, batch(&t, b"b"), Durability::Buffered);
+        if db.feed_frontier(true) >= a {
+            // The sync finished before `b` was logged: not the race. Again.
+            drive(&db, &mut shard, b);
+            drive(&db, &mut shard, g);
+            settle(&mut shard);
+            continue;
+        }
+        let before = count.0.load(std::sync::atomic::Ordering::SeqCst);
+        let b = drive(&db, &mut shard, b).seqno;
+        let g = drive(&db, &mut shard, g).seqno;
+        settle(&mut shard);
+        let f = db.feed_frontier(true);
+        assert!(
+            f >= g && f < b,
+            "the hold rose to `b`, not past it (attempt {attempt}): frontier {f}, a {a}, g {g}, b {b}"
+        );
+        assert!(
+            count.0.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "the hold's rise past `a` woke the task (attempt {attempt})"
+        );
+        match feed.poll_next(&mut cx) {
+            Poll::Ready(Ok(Next::Commit(c))) => assert_eq!(c.seqno, a),
+            other => panic!("{:?}", other.map(|r| r.map(|n| format!("{n:?}")))),
+        }
+        caught = true;
+        break;
+    }
+    assert!(caught, "never logged `b` while a sync was in flight");
+    drop(feed);
+    close_real(&db, &mut shard);
+}
+
 /// Submits `batch` and runs one turn, so its group is logged (and a group sync submitted)
 /// without waiting for it to resolve.
 fn log_only(db: &Engine, shard: &mut EngineShard, wb: WriteBatch, d: Durability) -> PendingCommit {
