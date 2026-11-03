@@ -614,7 +614,7 @@ struct PlainLane {
 /// 2. no delete entries (cell, column or family: `SstMeta::deletes` counts every kind) in
 ///    any of the family's SSTs here;
 /// 3. every entry at or below the read point;
-/// 4. a standard family with no merge operator, known or not (no operands);
+/// 4. a standard or vector family with no merge operator, known or not (no operands);
 /// 5. one version, no time range (the resolver's or the filter's), no column limit and no
 ///    value predicate;
 /// 6. no TTL.
@@ -640,7 +640,9 @@ fn plain_lane(
         && ssts
             .iter()
             .all(|s| s.meta.deletes == 0 && s.meta.seqno_range.1 <= snapshot)
-        && meta.options.kind == FamilyKind::Standard
+        // Plain cells: a standard or a vector family (both resolve as plain puts); every
+        // other kind aggregates, and a kind added later stays out until listed here.
+        && matches!(meta.options.kind, FamilyKind::Standard | FamilyKind::Vector)
         // No operator at all: `merge_op` alone is also `None` for an operator this build
         // doesn't know (`MergeKind::Unknown`), whose operands are still there.
         && meta.merge == MergeKind::None
