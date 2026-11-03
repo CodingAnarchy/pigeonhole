@@ -63,9 +63,9 @@ mod entry {
 /// Defines the `Pigeonhole` module, its classes and their native methods.
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let m = ruby.define_module("Pigeonhole")?;
-    error::register(ruby, m)?;
     m.const_set("NATIVE_VERSION", env!("CARGO_PKG_VERSION"))?;
     let native = m.define_module("Native")?;
+    error::register(ruby, m, native)?;
 
     m.singleton_class()?
         .define_private_method("native_open", function!(db::open, 9))?;

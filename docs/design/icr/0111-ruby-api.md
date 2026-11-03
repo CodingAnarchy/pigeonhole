@@ -8,7 +8,7 @@
 - The design is cli692's comment on #697 (c6595164923), its O3 amendment, and simp724's G1 and R1–R4, all adopted.
 
 ## The change
-A new workspace crate, `crates/ruby` (`pigeonhole-ruby`, `publish = false` on crates.io), builds the native extension `pigeonhole/pigeonhole_native` with magnus 0.9 and rb-sys. The gem's files sit beside it:
+A new crate, `crates/ruby` (`pigeonhole-ruby`, `publish = false` on crates.io), builds the native extension `pigeonhole/pigeonhole_native` with magnus 0.9 and rb-sys. The gem's files sit beside it:
 - `pigeonhole.gemspec`, `Gemfile` and `Rakefile` (rake-compiler);
 - `extconf.rb` (rb_sys's `create_rust_makefile`);
 - `lib/pigeonhole.rb` (the pure-Ruby parts);
@@ -16,6 +16,8 @@ A new workspace crate, `crates/ruby` (`pigeonhole-ruby`, `publish = false` on cr
 - `test/` (Minitest).
 
 The gem's version is the crate's.
+
+**A Cargo workspace of its own.** The root workspace excludes `crates/ruby` (`exclude`), since building it needs a Ruby with headers (rb-sys) and `cargo --workspace` mustn't require one. It depends on `pigeonhole` by path, keeps its own `Cargo.lock`, and copies the root's package fields, lints and release profile. `ruby.yml` runs its clippy (`-D warnings`), rustdoc, fmt and `cargo deny` (its own lockfile, the root's `deny.toml`), which the root's `--workspace` jobs don't reach.
 
 **The snapshot** is `sig/pigeonhole.rbs`. CI validates it (`rbs validate`), and a test checks that every public method of every class has a declaration and the reverse. So a PR that changes the Ruby API shows it in the signatures' diff, as `__init__.pyi` does for Python.
 
@@ -43,7 +45,9 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
 - **Errors:**
   - `Pigeonhole::Error < StandardError`, with one subclass per `ErrorCode`, named as the code. Each carries `code` (the name) and `code_num`.
   - Bad arguments raise Ruby's own `ArgumentError`, `TypeError` and `RangeError`.
-  - A `Mutation`, `WriteBatch` or `Transaction` used after its commit, discard or rollback raises a plain `Pigeonhole::Error` with a `nil` code. Python uses `ValueError` for this.
+  - A `Mutation`, `WriteBatch` or `Transaction` used after its commit, discard or rollback raises `Pigeonhole::SpentError` (an `Error` with a `nil` code; ai1249's P4). Python uses `ValueError` for this.
+  - A panic inside an engine call is a `Pigeonhole::Error` with a `nil` code, not magnus's unrescuable `fatal` (simp724's A2).
+  - `Pigeonhole::Native::ERROR_CODES` is the binding's name → number table, which a test checks against the `ErrorCode` enum (ai1249's P5).
 - **Where Ruby differs from Python's spellings:**
   - `FamilyInfo#counter?` is a predicate.
   - `aggregation`, `compression`, `cache_priority` and `compaction` return Symbols (`:fifo_by_time`).
@@ -59,6 +63,7 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
   - The bounds `F: FnOnce() -> R + Send` and `R: Send` keep every Ruby value (all `!Send` in magnus) out of code that runs without the GVL.
   - It calls `rb_thread_call_without_gvl2`, not the non-`2` form, which could `longjmp` over Rust frames when an interrupt is pending. It uses a `ran` flag: a call that ran returns its result, and an interrupt is handled after the method returns, so a commit's outcome is never lost. An interrupt pending before the call starts is raised through magnus's safe `thread_check_ints`, and nothing runs.
   - No unblocking function is passed, so a long engine call isn't interruptible midway. The guide says so.
+  - A masked interrupt (`Thread.handle_interrupt(... => :never)`) makes the `2` form decline while `thread_check_ints` raises nothing, so after a second try the function runs once with the GVL held, rather than looping (simp724's A1).
   - Panics are caught in the trampoline and resumed after the GVL is back.
 - **Unsafe.** `#![deny(unsafe_code)]`. Besides `gvl.rs`, the only `#[allow(unsafe_code)]` sites are the items magnus's macros expand (`#[magnus::init]`, `#[magnus::wrap]`).
 - **Callbacks into Ruby** (later PRs' consolidators) use a channel, never a GVL re-acquire from Rust (the O3 amendment). The work runs on a Rust thread, and the calling Ruby thread waits through `without_gvl(recv)`, then runs the block with the GVL held.

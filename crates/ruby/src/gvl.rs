@@ -19,12 +19,18 @@
 //! - **No unblocking function** (`NULL`): Ruby never calls into this module while the
 //!   function runs, so an engine call isn't interruptible midway. The calls are bounded
 //!   (waits take timeouts), and the guide says so.
-//! - **Panics** are caught inside the trampoline (`catch_unwind`) and resumed only after
-//!   the GVL is back, so none unwinds through Ruby's C frames.
+//! - **Panics** are caught inside the trampoline (`catch_unwind`), so none unwinds through
+//!   Ruby's C frames, and come back as a rescuable `Pigeonhole::Error` once the GVL is back
+//!   (simp724's A2 on #1399: magnus would turn a resumed panic into Ruby's unrescuable
+//!   `fatal`).
+//! - **A masked interrupt** (`Thread.handle_interrupt(... => :never)`) is pending but not
+//!   raised: `rb_thread_call_without_gvl2` declines to run, and `thread_check_ints` raises
+//!   nothing. Rather than loop (simp724's A1), the function then runs once with the GVL held:
+//!   the caller asked not to be interrupted, so keeping the GVL is the honest trade.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use magnus::{Error, Ruby};
 
@@ -65,7 +71,8 @@ fn try_once<F: FnOnce() -> R + Send, R: Send>(call: &mut Call<F, R>) {
 /// Runs `f` with the GVL released and returns its result. A pending interrupt
 /// (`Thread#raise`, `Thread#kill`, a signal) that arrives before `f` starts is raised as a
 /// Ruby exception and `f` doesn't run; one that arrives while `f` runs is handled after
-/// this returns, so `f`'s result (a commit's outcome, say) is never lost.
+/// this returns, so `f`'s result (a commit's outcome, say) is never lost. A panic in `f` is
+/// a `Pigeonhole::Error`.
 pub(crate) fn without_gvl<F, R>(ruby: &Ruby, f: F) -> Result<R, Error>
 where
     F: FnOnce() -> R + Send,
@@ -75,14 +82,31 @@ where
         f: Some(f),
         out: None,
     };
-    loop {
+    // At most two tries: a pending interrupt is raised between them; one still pending
+    // after that is masked, and `f` runs with the GVL held instead (A1).
+    for _ in 0..2 {
         try_once(&mut call);
         match call.out.take() {
-            Some(Ok(r)) => return Ok(r),
-            Some(Err(panic)) => resume_unwind(panic),
-            // Not run: an interrupt was pending. Raise it (or, if it was consumed
-            // meanwhile, try again).
+            Some(out) => return finish(ruby, out),
             None => ruby.thread_check_ints()?,
         }
     }
+    let f = call.f.take().expect("not run yet");
+    finish(ruby, catch_unwind(AssertUnwindSafe(f)))
+}
+
+/// `f`'s outcome: its result, or its panic as a `Pigeonhole::Error`.
+fn finish<R>(ruby: &Ruby, out: std::thread::Result<R>) -> Result<R, Error> {
+    out.map_err(|panic| {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic".into());
+        crate::error::uncoded(
+            ruby,
+            "Error",
+            &format!("internal error in an engine call (a panic: {what})"),
+        )
+    })
 }

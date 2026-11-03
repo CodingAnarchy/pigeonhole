@@ -15,10 +15,17 @@ macro_rules! codes {
             }
         }
 
-        /// Defines `Pigeonhole::Error` and every code's subclass under `m`.
-        pub(crate) fn register(ruby: &Ruby, m: RModule) -> Result<(), Error> {
+        /// Defines `Pigeonhole::Error`, every code's subclass and `SpentError` under `m`,
+        /// and `Pigeonhole::Native::ERROR_CODES` (each code's name and number) under `native`,
+        /// which a test checks against `ErrorCode` itself (ai1249's P5 on #1399).
+        pub(crate) fn register(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> {
             let base = m.define_error("Error", ruby.exception_standard_error())?;
             $(m.define_error(stringify!($code), base)?;)*
+            m.define_error("SpentError", base)?;
+            let codes = ruby.hash_new();
+            $(codes.aset(stringify!($code), ErrorCode::$code as u32)?;)*
+            codes.freeze();
+            native.const_set("ERROR_CODES", codes)?;
             Ok(())
         }
     };
@@ -97,12 +104,17 @@ where
     crate::gvl::without_gvl(ruby, f)?.or_rb(ruby)
 }
 
-/// A plain `Pigeonhole::Error` (no code): a write handle used after it was committed,
-/// discarded or rolled back (simp724's R4 on #697).
+/// `Pigeonhole::SpentError` (an `Error` with no code): a write handle used after it was
+/// committed, discarded or rolled back (simp724's R4 on #697; named, ai1249's P4 on #1399).
 pub(crate) fn spent(ruby: &Ruby, message: &str) -> Error {
+    uncoded(ruby, "SpentError", message)
+}
+
+/// `Pigeonhole::<class>` with `message` and no code: the binding's own errors.
+pub(crate) fn uncoded(ruby: &Ruby, class: &str, message: &str) -> Error {
     let make = || -> Result<Error, Error> {
         let m: RModule = ruby.class_object().const_get("Pigeonhole")?;
-        let class: ExceptionClass = m.const_get("Error")?;
+        let class: ExceptionClass = m.const_get(class)?;
         Ok(Error::from(class.new_instance((message,))?))
     };
     make().unwrap_or_else(|e| e)

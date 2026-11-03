@@ -53,7 +53,7 @@ class TestBlocks < Minitest::Test
       b = leave(how, ->(&blk) { db.write_batch(&blk) }) { |w| w.put(t, "r", "f", how.to_s, "v") }
       assert_nil t.get("r", "f", how.to_s), "#{how} committed the batch"
       assert_equal 0, b.size, "#{how} left the batch's writes"
-      assert_raises(Pigeonhole::Error, "#{how} left the batch usable") { b.commit }
+      assert_raises(Pigeonhole::SpentError, "#{how} left the batch usable") { b.commit }
     end
   end
 
@@ -69,7 +69,7 @@ class TestBlocks < Minitest::Test
     EXITS.each do |how|
       txn = leave(how, ->(&blk) { db.transaction(&blk) }) { |x| x.put(t, "r", "f", how.to_s, "v") }
       assert_nil t.get("r", "f", how.to_s), "#{how} committed the transaction"
-      assert_raises(Pigeonhole::Error, "#{how} left the transaction open") { txn.get(t, "r", "f", "q") }
+      assert_raises(Pigeonhole::SpentError, "#{how} left the transaction open") { txn.get(t, "r", "f", "q") }
     end
     db.transaction do |x|
       x.put(t, "r", "f", "next", "v")
@@ -87,7 +87,7 @@ class TestBlocks < Minitest::Test
       end
       assert_equal 1, runs, "#{how} retried"
       assert_nil t.get("r", "f", how.to_s), "#{how} committed the attempt"
-      assert_raises(Pigeonhole::Error) { txn.commit }
+      assert_raises(Pigeonhole::SpentError) { txn.commit }
     end
     out = db.transact do |x|
       x.put(t, "r", "f", "next", "v")

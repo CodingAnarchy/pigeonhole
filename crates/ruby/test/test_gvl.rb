@@ -82,7 +82,7 @@ class TestGvl < Minitest::Test
     assert_equal rows, t.scan("a").count
     # Nothing is left locked: the batch is spent, and the database still commits and
     # closes.
-    assert_raises(Pigeonhole::Error) { b.commit }
+    assert_raises(Pigeonhole::SpentError) { b.commit }
     t.put("after", "f", "q", "v", durability: :sync)
     assert_equal "v", t.get("after", "f", "q").value
   end
@@ -125,4 +125,30 @@ class TestGvl < Minitest::Test
     db.close
     Pigeonhole.open(@path, shards: 1) { |d| assert_equal 8_000, d.table("t").open.scan("c").count }
   end
+
+  # simp724's A1 on #1399: with an interrupt pending but masked (`handle_interrupt :never`),
+  # rb_thread_call_without_gvl2 may decline to run while thread_check_ints raises nothing;
+  # the call must still run (with the GVL held) rather than spin, and the interrupt land
+  # when the mask lifts.
+  def test_a_masked_interrupt_never_spins_an_engine_call
+    t = db.table("masked").family("f").create
+    ready = Queue.new
+    go = Queue.new
+    th = Thread.new do
+      Thread.handle_interrupt(Object => :never) do
+        ready << true
+        go.pop                       # the main thread raises into us now: pending, masked
+        t.put("r", "f", "q", "v")    # an engine call with a masked interrupt pending
+      end
+    end
+    ready.pop
+    th.raise(RuntimeError, "masked")
+    go << true
+    e = assert_raises(RuntimeError, "the engine call spun with a masked interrupt pending") do
+      th.join(10) or flunk("the engine call spun with a masked interrupt pending")
+    end
+    assert_equal "masked", e.message
+    assert_equal "v", t.get("r", "f", "q").value
+  end
+
 end

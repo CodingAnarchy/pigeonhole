@@ -118,7 +118,7 @@ end
   - Open the database in each worker (`on_worker_boot`, or `before_fork` closing it in the parent if the workers need to write), and remember only one process can be the writer.
 
 ## Errors
-Every engine error is a `Pigeonhole::Error`, of a subclass named after its [`ErrorCode`](errors.md) (`Pigeonhole::TableNotFound`, `Pigeonhole::Conflict`, `Pigeonhole::ReadOnly`, `Pigeonhole::Closed`, ...), with `code` (the name, a String) and `code_num` (the stable number). Bad arguments raise Ruby's own `ArgumentError`, `TypeError` and `RangeError`. Using a mutation, batch or transaction after its commit or rollback raises a plain `Pigeonhole::Error` with no code.
+Every engine error is a `Pigeonhole::Error`, of a subclass named after its [`ErrorCode`](errors.md) (`Pigeonhole::TableNotFound`, `Pigeonhole::Conflict`, `Pigeonhole::ReadOnly`, `Pigeonhole::Closed`, ...), with `code` (the name, a String) and `code_num` (the stable number). Bad arguments raise Ruby's own `ArgumentError`, `TypeError` and `RangeError`. Using a mutation, batch or transaction after its commit or rollback raises `Pigeonhole::SpentError` (an `Error` with no code).
 
 ```ruby
 require "pigeonhole"

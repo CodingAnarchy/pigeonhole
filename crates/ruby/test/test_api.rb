@@ -251,8 +251,8 @@ class TestApi < Minitest::Test
     assert_equal 2, wb.length
     assert_kind_of Integer, wb.commit
     assert_equal %w[1 2], [a.get("r", "f", "q").value, b.get("r", "f", "q").value]
-    assert_raises(Pigeonhole::Error) { wb.commit }
-    assert_raises(Pigeonhole::Error) { wb.put(a, "r", "f", "q", "3") }
+    assert_raises(Pigeonhole::SpentError) { wb.commit }
+    assert_raises(Pigeonhole::SpentError) { wb.put(a, "r", "f", "q", "3") }
     # An exception in the block discards the batch.
     assert_raises(RuntimeError) do
       db.write_batch do |w|
@@ -316,9 +316,9 @@ class TestApi < Minitest::Test
     t = db.table("t").family("f").create
     m = t.mutate("r").put("f", "q", "v")
     m.commit
-    e = assert_raises(Pigeonhole::Error) { m.commit }
+    e = assert_raises(Pigeonhole::SpentError) { m.commit }
     assert_nil e.code
-    assert_raises(Pigeonhole::Error) { m.put("f", "q", "w") }
+    assert_raises(Pigeonhole::SpentError) { m.put("f", "q", "w") }
   end
 
   # The binding's own rule: keys, qualifiers and values are a String's bytes, whatever its

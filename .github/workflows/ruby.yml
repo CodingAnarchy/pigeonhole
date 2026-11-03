@@ -21,6 +21,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # rake compile builds into crates/ruby/target (not under tmp/), which rust-cache keeps.
+  RB_SYS_CARGO_TARGET_DIR: ${{ github.workspace }}/crates/ruby/target
 
 permissions:
   contents: read
@@ -37,7 +39,8 @@ jobs:
           # on Linux and macOS.
           - { os: ubuntu-latest, ruby: '3.3' }
           - { os: macos-latest, ruby: '3.3' }
-          - { os: windows-latest, ruby: '3.3' }
+          # RubyInstaller's Ruby is built with MinGW, so rb-sys needs Rust's GNU toolchain.
+          - { os: windows-latest, ruby: '3.3', rust: stable-x86_64-pc-windows-gnu }
           - { os: ubuntu-latest, ruby: '4.0' }
           - { os: macos-latest, ruby: '4.0' }
     defaults:
@@ -45,14 +48,13 @@ jobs:
         working-directory: crates/ruby
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust || 'stable' }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            crates/ruby
-            crates/ruby/tmp -> target
+          workspaces: crates/ruby
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}

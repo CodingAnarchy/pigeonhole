@@ -2,16 +2,20 @@ name: Ruby gems
 
 # Precompiled native gems for every platform the bindings support, as artifacts (#697, ICR
 # 0111). Nothing is pushed to RubyGems: the first publish is the owner's call, and gets its
-# own workflow. The source-gem fallback follows in its own PR: a source gem needs a
-# standalone Cargo.toml (this crate inherits the workspace's).
+# own workflow. The source-gem fallback follows in its own PR: a source gem can't carry the
+# crate's `pigeonhole = { path = "../pigeonhole" }` dependency, so `gem build` refuses until
+# then (pigeonhole.gemspec).
 
 on:
+  # Seven cross-compiles: on changes to the gem itself, weekly for everything under it (the
+  # engine), and on demand, rather than on every push to main (ai1249's P1 on #1399).
   push:
     branches: [main]
     paths:
-      - 'crates/**'
-      - 'Cargo.lock'
+      - 'crates/ruby/**'
       - '.github/workflows/ruby-gems.yml'
+  schedule:
+    - cron: '17 5 * * 1'
   pull_request:
     paths:
       - 'crates/ruby/Cargo.toml'

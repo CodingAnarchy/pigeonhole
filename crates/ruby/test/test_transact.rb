@@ -22,12 +22,12 @@ class TestTransact < Minitest::Test
     assert_kind_of Integer, first.commit
     assert_raises(Pigeonhole::Conflict) { second.commit }
     assert_equal 2, t.get("a", "f", "v").as_int
-    # R4: a call after commit (or a failed commit) raises the binding's Pigeonhole::Error.
-    e = assert_raises(Pigeonhole::Error) { second.commit }
+    # R4: a call after commit (or a failed commit) raises the binding's Pigeonhole::SpentError.
+    e = assert_raises(Pigeonhole::SpentError) { second.commit }
     assert_nil e.code
-    assert_raises(Pigeonhole::Error) { first.get(t, "a", "f", "v") }
-    assert_raises(Pigeonhole::Error) { first.put(t, "a", "f", "v", 0) }
-    assert_raises(Pigeonhole::Error) { first.rollback }
+    assert_raises(Pigeonhole::SpentError) { first.get(t, "a", "f", "v") }
+    assert_raises(Pigeonhole::SpentError) { first.put(t, "a", "f", "v", 0) }
+    assert_raises(Pigeonhole::SpentError) { first.rollback }
   end
 
   # The binding's block form: commit on a normal return, nothing on an exception.

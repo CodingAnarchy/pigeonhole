@@ -29,13 +29,17 @@ module Pigeonhole
   def self.open_reader: (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) -> Reader
                       | [T] (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) { (Reader) -> T } -> T
 
-  # A Pigeonhole error. A code's subclass carries the code's name and number; a plain
-  # `Error` (no code) is a mutation, batch or transaction used after it was spent.
+  # A Pigeonhole error. A code's subclass carries the code's name and number; `SpentError`
+  # (no code) is a mutation, batch or transaction used after it was spent.
   class Error < StandardError
     attr_reader code: String?
     attr_reader code_num: Integer?
 
     def initialize: (?String? message, ?String? code, ?Integer? code_num) -> void
+  end
+
+  # A mutation, batch or transaction used after its commit, discard or rollback (no code).
+  class SpentError < Error
   end
 
   class Io < Error
