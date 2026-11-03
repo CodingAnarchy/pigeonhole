@@ -189,3 +189,29 @@ fn a_share_writing_a_waiting_returning_row_comes_after_it() {
     assert_eq!(*cells[0].value.as_ref().unwrap(), Some(1006));
     assert_eq!(db.value(), 21_006);
 }
+
+/// A returning batch is one row (simp724's B1 on #1453): its cells come back by family,
+/// qualifier and timestamp, which don't say which row. Two rows on one shard are refused
+/// before anything is sent, by the blocking and the async form alike.
+#[test]
+fn a_returning_batch_of_two_rows_is_refused() {
+    let db = open(1442);
+    let (t, c) = db.tables[1];
+    let two = || {
+        let mut b = WriteBatch::new();
+        b.merge(t, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+        b.merge(t, c, b"r2", b"n", ValueRef::I64(1)).unwrap();
+        b
+    };
+    let e = db.engine.submit_returning(two(), None).unwrap_err();
+    assert!(
+        matches!(e, pigeonhole_engine::Error::InvalidArgument(_)),
+        "{e:?}"
+    );
+    let e = db.engine.commit_returning(two(), None).unwrap_err();
+    assert!(
+        matches!(e, pigeonhole_engine::Error::InvalidArgument(_)),
+        "{e:?}"
+    );
+    assert!(db.engine.get_latest(t, c, b"r", b"n").unwrap().is_none());
+}

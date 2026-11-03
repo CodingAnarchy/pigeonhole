@@ -525,7 +525,10 @@ impl Engine {
     pub fn release_held_decides(&self, max: usize) -> usize {
         let hooks = &self.inner.shared.hooks;
         let held: Vec<_> = {
-            let mut h = hooks.held_decides.lock().unwrap();
+            let mut h = hooks
+                .held_decides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let n = max.min(h.len());
             h.drain(..n).collect()
         };

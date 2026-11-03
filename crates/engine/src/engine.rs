@@ -1927,6 +1927,7 @@ impl Engine {
         durability: Option<Durability>,
     ) -> Result<(CommitInfo, Vec<Returned>)> {
         self.inner.shared.refuse_blocking_on_driver("commit")?;
+        one_row(&batch)?;
         let out = crate::shard::ReturnSlot::default();
         let inner = &self.inner;
         let info = match inner.route_and_send_with(
@@ -1953,6 +1954,7 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingReturning> {
+        one_row(&batch)?;
         let out = crate::shard::ReturnSlot::default();
         let pending = self.submit_async_with(batch, durability, Some(Arc::clone(&out)))?;
         Ok(PendingReturning { pending, out })
@@ -5999,6 +6001,36 @@ pub struct Returned {
     /// Its value after the commit (`None`: absent, as a bucket past its TTL is), or the error
     /// that kept the shard from reading it once the commit had applied.
     pub value: Result<Option<i64>>,
+}
+
+/// A returning commit's batch touches one row (D314; simp724's B1 on #1453): the shard
+/// returns its cells by family, qualifier and timestamp, which say nothing of the row.
+fn one_row(batch: &WriteBatch) -> Result<()> {
+    let mut first: Option<(TableId, &[u8])> = None;
+    let rows = batch
+        .builder
+        .batch()
+        .iter()
+        .flatten()
+        .map(|m| (m.table, m.row))
+        .chain(
+            batch
+                .row_deletes
+                .iter()
+                .map(|d| (d.table, d.row.as_slice())),
+        );
+    for (t, r) in rows {
+        match first {
+            None => first = Some((t, r)),
+            Some((ft, fr)) if ft == t && fr == r => {}
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "a returning commit touches one row".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The cells the shard left in `out` (set before the commit's reply, which orders it).

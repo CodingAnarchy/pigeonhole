@@ -6208,7 +6208,9 @@ impl ShardState {
         };
         let mut out: Vec<crate::engine::Returned> = Vec::new();
         for c in return_cells(batch, &view) {
-            // Each cell once, in the order the batch first writes it.
+            // Each cell once, in the order the batch first writes it. The scan is bounded by
+            // one row's mutations: a returning batch is one row (`Engine::commit_returning`
+            // refuses any other), so family, qualifier and timestamp name a cell.
             if out
                 .iter()
                 .any(|r| r.family == c.family && r.ts == c.ts && r.qualifier == c.qualifier)
@@ -6234,60 +6236,57 @@ impl ShardState {
         seqno: Seqno,
         commit_ts: Timestamp,
     ) -> Result<Option<i64>> {
-        {
-            let (ttl, max_versions) = (c.ttl, c.max_versions);
-            if ttl != 0 && c.ts.saturating_add(ttl) <= commit_ts {
-                // Expired at the commit's own time: what a read then returns.
-                return Ok(None);
-            }
-            // A family that keeps `max_versions` hides this version once that many newer
-            // ones exist, as a read does: only the full read counts them.
-            let fast = if max_versions == 0 {
-                let mut key = std::mem::take(&mut self.return_key);
-                let fast = self.fold_fast(c, seqno, &mut key);
-                self.return_key = key;
-                fast
-            } else {
-                None
-            };
-            let metrics = &self.shared.metrics[usize::from(self.id.0)];
-            if fast.is_some() {
-                metrics.returning_fast.fetch_add(1, Ordering::Relaxed);
-            } else {
-                metrics.returning_full.fetch_add(1, Ordering::Relaxed);
-            }
-            let (value, steps, slow) = match fast {
-                Some((v, steps)) => (Ok(v), steps, false),
-                None => (
-                    self.read_cell(c, seqno, ttl, max_versions, commit_ts),
-                    0,
-                    true,
-                ),
-            };
-            if let Ok(Some(v)) = value
-                && (slow || steps >= RETURN_CHECKPOINT_STEPS)
-                && let Some((tablet, _)) = self.tablets.route(c.table, c.row)
-            {
-                let mut stored = Vec::with_capacity(9);
-                pigeonhole_format::value::encode_value(
-                    &mut stored,
-                    pigeonhole_format::value::ValueRef::I64(v),
-                );
-                let cp = crate::read::CounterCheckpoint {
-                    shard: self.id,
-                    table: c.table,
-                    tablet,
-                    family: c.family,
-                    row: c.row.to_vec(),
-                    qualifier: c.qualifier.to_vec(),
-                    ts: c.ts,
-                    seqno,
-                    stored,
-                };
-                self.counter_checkpoint(&cp);
-            }
-            value
+        if c.ttl != 0 && c.ts.saturating_add(c.ttl) <= commit_ts {
+            // Expired at the commit's own time: what a read then returns.
+            return Ok(None);
         }
+        // A family that keeps `max_versions` hides this version once that many newer
+        // ones exist, as a read does: only the full read counts them.
+        let fast = if c.max_versions == 0 {
+            let mut key = std::mem::take(&mut self.return_key);
+            let fast = self.fold_fast(c, seqno, &mut key);
+            self.return_key = key;
+            fast
+        } else {
+            None
+        };
+        let metrics = &self.shared.metrics[usize::from(self.id.0)];
+        if fast.is_some() {
+            metrics.returning_fast.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.returning_full.fetch_add(1, Ordering::Relaxed);
+        }
+        let (value, steps, slow) = match fast {
+            Some((v, steps)) => (Ok(v), steps, false),
+            None => (
+                self.read_cell(c, seqno, c.ttl, c.max_versions, commit_ts),
+                0,
+                true,
+            ),
+        };
+        if let Ok(Some(v)) = value
+            && (slow || steps >= RETURN_CHECKPOINT_STEPS)
+            && let Some((tablet, _)) = self.tablets.route(c.table, c.row)
+        {
+            let mut stored = Vec::with_capacity(9);
+            pigeonhole_format::value::encode_value(
+                &mut stored,
+                pigeonhole_format::value::ValueRef::I64(v),
+            );
+            let cp = crate::read::CounterCheckpoint {
+                shard: self.id,
+                table: c.table,
+                tablet,
+                family: c.family,
+                row: c.row.to_vec(),
+                qualifier: c.qualifier.to_vec(),
+                ts: c.ts,
+                seqno,
+                stored,
+            };
+            self.counter_checkpoint(&cp);
+        }
+        value
     }
 
     /// The slow path: `c`'s value at `seqno` through the view (its memtables and SSTs), for
@@ -6415,6 +6414,7 @@ impl ShardState {
         // this timestamp too (a delete takes its commit's timestamp, and covers every version
         // at or below it), which the walk of this timestamp alone would miss.
         let mut col_delete: Option<Seqno> = None;
+        let mut newer = 0u64;
         let (value, low) = loop {
             if !it.valid() {
                 return None;
@@ -6425,6 +6425,12 @@ impl ShardState {
             }
             let (_, ts, s, kind) = split_suffix(k).ok()?;
             if ts > c.ts {
+                // The newer timestamps' entries (buckets above a ts-0 counter, say) are stepped
+                // over, not folded: past a few K of them the full read is cheaper (simp724).
+                newer += 1;
+                if newer > 4 * RETURN_CHECKPOINT_STEPS {
+                    return None;
+                }
                 if kind == Kind::ColumnDelete && s <= seqno {
                     col_delete = col_delete.max(Some(s));
                 }
@@ -8924,7 +8930,7 @@ impl ShardState {
                 .hooks
                 .held_decides
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .push((shard, msg));
             return;
         }
