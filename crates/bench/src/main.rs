@@ -33,6 +33,9 @@ USAGE:
     phdb-bench reader --path DB --records N [--seed S]
               (internal: one reader process for --reader-processes; reads whole ycsb
               rows through open_reader until stdin closes, then prints its report)
+    phdb-bench reader --feed --path DB
+              (internal: one reader process for --reader-feed-processes; follows the
+              bench table's change feed until stdin closes, then prints its report)
 
 WORKLOADS:
     ycsb-a ycsb-b ycsb-c ycsb-d ycsb-e ycsb-f sparse-wide time-series-ttl
@@ -112,7 +115,10 @@ OPTIONS:
                            connections), so every store caches the same bytes (#759)
     --sync                 fsync every commit on every engine, the load too
                            [default: buffered]
-    --durability MODE      buffered, sync, group-sync or default [default: buffered].
+    --durability MODE      buffered, none, sync, group-sync or default [default: buffered].
+                           none: Pigeonhole commits Durability::None after a buffered
+                           load, the others stay buffered (the change feed's lazy-flush
+                           row, D310);
                            sync: every engine fsyncs every commit (Pigeonhole commits
                            Sync, group-commit included, no shared fsyncs);
                            group-sync: Pigeonhole commits GroupSync, the others fsync
@@ -143,6 +149,17 @@ OPTIONS:
                            durable backup and a compaction, beside the measured
                            phase (D247, reported in the record's riders); RocksDB: a
                            checkpoint, then a BackupEngine backup (D280, #715)
+    --feed MIB             Pigeonhole: open with the change feed on, keeping MIB of
+                           history (Options::change_feed, D310) [default: off]
+    --feed-subscribers N   Pigeonhole, with --feed: N threads following the bench table's
+                           durable feed through the measured phase, reported in the
+                           record's feed with the feed's syncs [default: 0]
+    --feed-visible-subscribers N
+                           the same, following the visible frontier [default: 0]
+    --reader-feed-processes N
+                           Pigeonhole, with --feed: N reader processes following the
+                           durable feed (ReadTable::feed), with their CPU and wakeups on
+                           Linux [default: 0]
     --reader-processes N   Pigeonhole: N reader processes (open_reader) doing ycsb-c
                            row reads beside the measured phase (#683, D247 item K,
                            reported in the record's reader_processes) [default: 0]
@@ -228,6 +245,16 @@ struct Args {
     riders: bool,
     /// `--reader-processes`: reader processes beside the measured phase (#683).
     reader_processes: Option<usize>,
+    /// `--durability none`: Pigeonhole commits `None` (D310 PR 5b's lazy-flush row).
+    none_durability: bool,
+    /// `--feed`: the change feed's retention in MiB (D310 PR 5b).
+    feed: Option<u64>,
+    /// `--feed-subscribers`, `--feed-visible-subscribers`, `--reader-feed-processes`.
+    feed_subscribers: usize,
+    feed_visible_subscribers: usize,
+    reader_feed_processes: usize,
+    /// `reader --feed`: the child follows the feed instead of reading rows.
+    reader_feed: bool,
     /// `reader`: the database a reader process attaches to.
     path: Option<PathBuf>,
     /// `app-owned`: every other cross-shard batch reads its rows first (D267's mixed row).
@@ -303,6 +330,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--sync" => a.sync = true,
             "--durability" => match it.next().as_deref() {
                 Some("buffered") => a.durability = None,
+                Some("none") => {
+                    a.durability = None;
+                    a.none_durability = true;
+                }
                 Some("sync") => {
                     a.sync = true;
                     a.durability = Some(Durability::Sync);
@@ -340,6 +371,13 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--tablet-changes" => a.no_tablet_changes = false,
             "--dir" => a.dir = Some(parse(&arg, it.next())?),
             "--reader-processes" => a.reader_processes = Some(parse(&arg, it.next())?),
+            "--feed" if a.command == "reader" => a.reader_feed = true,
+            "--feed" => a.feed = Some(parse(&arg, it.next())?),
+            "--feed-subscribers" => a.feed_subscribers = parse(&arg, it.next())?,
+            "--feed-visible-subscribers" => {
+                a.feed_visible_subscribers = parse(&arg, it.next())?;
+            }
+            "--reader-feed-processes" => a.reader_feed_processes = parse(&arg, it.next())?,
             "--path" => a.path = Some(parse(&arg, it.next())?),
             "--json" => a.json = Some(parse(&arg, it.next())?),
             "--markdown" => a.markdown = Some(parse(&arg, it.next())?),
@@ -407,9 +445,16 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
         .sync(a.sync)
         .group_sync(a.durability == Some(Durability::GroupSync))
         .default_durability(a.durability == Some(Durability::Default))
-        .load_buffered(a.durability.is_some())
+        .load_buffered(a.durability.is_some() || a.none_durability)
+        .none_durability(a.none_durability)
         .riders(a.riders)
         .reader_processes(a.reader_processes.unwrap_or(0))
+        .feed(a.feed.map(|mib| mib << 20))
+        .feed_subscribers(
+            a.feed_subscribers,
+            a.feed_visible_subscribers,
+            a.reader_feed_processes,
+        )
         .async_in_flight(a.async_in_flight.unwrap_or(0))
         .memory(memory(a))
         .tablet_changes(!a.no_tablet_changes)
@@ -787,6 +832,11 @@ fn main_inner() -> Result<ExitCode, String> {
     match a.command.as_str() {
         "help" => {
             print!("{HELP}");
+            Ok(ExitCode::SUCCESS)
+        }
+        "reader" if a.reader_feed => {
+            let path = a.path.as_deref().ok_or("reader --feed needs --path")?;
+            pigeonhole_bench::reader_feed_child(path)?;
             Ok(ExitCode::SUCCESS)
         }
         "reader" => {

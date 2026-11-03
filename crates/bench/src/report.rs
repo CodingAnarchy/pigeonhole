@@ -450,6 +450,10 @@ pub struct RunDetail {
     /// Pigeonhole, #683); `None` elsewhere and in results written before it.
     #[serde(default)]
     pub reader_processes: Option<ReaderProcesses>,
+    /// Change-feed subscribers and the feed's cost over the measured phase (`--feed`,
+    /// Pigeonhole, D310 PR 5b); `None` elsewhere and in results written before it.
+    #[serde(default)]
+    pub feed: Option<FeedReport>,
     /// Whether the measured phase stopped at its bound (`RunOptions::max_measured`, D247)
     /// before its operations were done; `None` for runs without a bound and in results
     /// written before it.
@@ -537,6 +541,50 @@ pub struct ReaderProcesses {
     /// once they attached.
     #[serde(default)]
     pub max_slots_active: u64,
+}
+
+/// Change-feed subscribers beside a measured phase, and what the feed cost (D310 PR 5b,
+/// `--feed`). Delivery latency is the wall clock at delivery minus the commit's timestamp
+/// (`Commit::timestamp`, wall-clock microseconds): it includes the commit's own time before
+/// its seqno is visible, and for a durable subscriber the wait for its sync (mostly the
+/// feed's *T_sync* on `Buffered` commits). A commit clock running ahead of the wall clock
+/// (more than one commit per microsecond) reads as 0. The counters are the measured phase's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FeedReport {
+    /// Writer-process subscribers following the durable frontier (the default).
+    pub durable_subscribers: u32,
+    /// Their deliveries' latency, over every subscriber.
+    pub durable_delivery: LatencyStats,
+    /// Writer-process subscribers following the visible frontier (`FeedBuilder::visible`).
+    pub visible_subscribers: u32,
+    /// See [`FeedReport::durable_delivery`].
+    pub visible_delivery: LatencyStats,
+    /// Reader processes following the feed (`ReadTable::feed`, durable).
+    pub reader_subscribers: u32,
+    /// Their deliveries' latency.
+    pub reader_delivery: LatencyStats,
+    /// The reader processes' CPU seconds (user + system, Linux `/proc/self/stat`) per
+    /// second of the phase, summed; `None` where it isn't read.
+    pub reader_cpu_per_sec: Option<f64>,
+    /// The reader processes' voluntary context switches per second (Linux
+    /// `/proc/self/status`): each park of the feed's backoff and the wake after it.
+    pub reader_wakeups_per_sec: Option<f64>,
+    /// Feeds that expired, every subscriber counted. A latency row with any is void.
+    pub expired: u64,
+    /// Other errors subscribers saw.
+    pub errors: u64,
+    /// The feed's own syncs (`EngineMetrics::feed_background_syncs`).
+    pub background_syncs: u64,
+    /// Group syncs (`EngineMetrics::group_syncs`), feed or not.
+    pub group_syncs: u64,
+    /// Sidecar syncs (`EngineMetrics::feed_sidecar_syncs`).
+    pub sidecar_syncs: u64,
+    /// Rollovers that took a retained segment early (`ShardStats::feed_retained_taken`).
+    pub retained_taken: u64,
+    /// The most WAL bytes kept as history, sampled every 100 ms (`FeedInfo`).
+    pub retained_wal_peak: u64,
+    /// The most blob bytes held for the history, sampled with it.
+    pub held_blob_peak: u64,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run

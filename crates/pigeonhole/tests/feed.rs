@@ -425,6 +425,9 @@ fn the_feed_s_syncs_are_counted_beside_the_group_syncs() {
     }
     let m = db.engine_metrics();
     assert!(m.group_syncs >= 1);
-    assert!(m.feed_sidecar_syncs >= 1, "the table creations' sidecar entries");
+    assert!(
+        m.feed_sidecar_syncs >= 1,
+        "the table creations' sidecar entries"
+    );
     db.close().unwrap();
 }
