@@ -1578,7 +1578,7 @@ impl Cursor for MemIter {
         Ok(())
     }
 
-    /// Steps up to 64 entries, as most rows end within them, then finger-searches past the
+    /// Steps up to `ROW_SKIP_STEPS` entries, as most rows end within them, then finger-searches past the
     /// row: `escaped row ++ 00 02` sorts after every key of the row and before every later
     /// row, as the SST's row skip seeks (#1426). The default steps through the whole row, so
     /// a filter's `SkipRow` in a wide row (a qualifier prefix in the middle of 100,000
