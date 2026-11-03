@@ -3026,10 +3026,18 @@ pub(crate) struct ShardState {
     /// with the feed off), and the end of the last such record.
     feed_low: std::cell::Cell<Seqno>,
     feed_end: std::cell::Cell<Lsn>,
-    /// As `feed_low` / `feed_end`, for records not yet synced (shm `SYNCED`): a durable feed
-    /// stays below them until a sync covers them.
+    /// The synced hold (shm `SYNCED`): the lowest seqno whose fed record this shard holds
+    /// unsynced, `u64::MAX` for none. A durable feed stays below it until a sync covers it.
     feed_sync_low: std::cell::Cell<Seqno>,
+    /// The records held since the shard last submitted a sync (#1415): their lowest seqno
+    /// (`u64::MAX` for none) and the end of the last. A sync submission closes this bucket
+    /// into `feed_sync_closed`, since that sync covers it.
+    feed_sync_open_low: std::cell::Cell<Seqno>,
     feed_sync_end: std::cell::Cell<Lsn>,
+    /// Closed buckets, oldest first, as `(lowest seqno, end)`: at most one per sync in
+    /// flight. A completion drops those whose end it passed, and the hold moves up to the
+    /// lowest seqno left, so it never waits for records that arrived during the sync.
+    feed_sync_closed: std::cell::RefCell<std::collections::VecDeque<(Seqno, Lsn)>>,
     /// The lazy flush's timer (D310), armed only while `feed_low` holds something.
     feed_timer: Option<Arc<TimerState>>,
     /// The feed's background sync's timer (D310, *T_sync*), armed only while
@@ -3518,7 +3526,9 @@ impl ShardState {
             feed_low: std::cell::Cell::new(u64::MAX),
             feed_end: std::cell::Cell::new(Lsn::default()),
             feed_sync_low: std::cell::Cell::new(u64::MAX),
+            feed_sync_open_low: std::cell::Cell::new(u64::MAX),
             feed_sync_end: std::cell::Cell::new(Lsn::default()),
+            feed_sync_closed: std::cell::RefCell::default(),
             feed_timer: None,
             feed_sync_timer: None,
             feed_sync_inflight: false,
@@ -5264,6 +5274,9 @@ impl ShardState {
             self.feed_sync_low.set(seqno);
             self.shared.shm.publish_synced(shard, seqno);
         }
+        if seqno < self.feed_sync_open_low.get() {
+            self.feed_sync_open_low.set(seqno);
+        }
         self.feed_sync_end.set(self.feed_sync_end.get().max(end));
         if sync_low == u64::MAX {
             self.arm_feed_sync(ctx);
@@ -5320,6 +5333,7 @@ impl ShardState {
         match wal.submit_sync() {
             Ok(c) => {
                 self.feed_sync_inflight = true;
+                self.close_feed_sync_bucket();
                 self.shared.metrics[usize::from(self.id.0)]
                     .feed_syncs
                     .fetch_add(1, Ordering::Relaxed);
@@ -5330,6 +5344,19 @@ impl ShardState {
                 }));
             }
             Err(_) => self.poison(crate::health::FailureCause::Io),
+        }
+    }
+
+    /// A sync was just submitted: it covers the synced hold's records held so far, so they
+    /// close into a bucket of their own, and the hold can move past them once it completes
+    /// even if more records arrive meanwhile (#1415). Out of line: the group-sync paths call
+    /// it only when the feed holds something.
+    #[inline(never)]
+    fn close_feed_sync_bucket(&self) {
+        let low = self.feed_sync_open_low.replace(u64::MAX);
+        if low != u64::MAX {
+            let end = self.feed_sync_end.replace(Lsn::default());
+            self.feed_sync_closed.borrow_mut().push_back((low, end));
         }
     }
 
@@ -5385,10 +5412,27 @@ impl ShardState {
             self.shared.shm.publish_written(shard, u64::MAX);
             released = true;
         }
-        if durable >= self.feed_sync_end.get() {
-            released |= self.feed_sync_low.get() != u64::MAX;
-            self.feed_sync_low.set(u64::MAX);
-            self.shared.shm.publish_synced(shard, u64::MAX);
+        let held = self.feed_sync_low.get();
+        if held != u64::MAX {
+            // Drop what the syncs so far covered; the hold moves up to what's left (#1415).
+            let mut closed = self.feed_sync_closed.borrow_mut();
+            while closed.front().is_some_and(|&(_, end)| end <= durable) {
+                closed.pop_front();
+            }
+            if self.feed_sync_end.get() <= durable {
+                self.feed_sync_open_low.set(u64::MAX);
+            }
+            let low = closed
+                .iter()
+                .map(|&(low, _)| low)
+                .fold(self.feed_sync_open_low.get(), Seqno::min);
+            debug_assert!(low >= held, "a settle never lowers the synced hold");
+            if low != held {
+                self.feed_sync_low.set(low);
+                self.shared.shm.publish_synced(shard, low);
+                // Any rise, not just a release to MAX, can let a hold waiter through.
+                released = true;
+            }
         }
         // An async feed waiting on one of these holds (D310 PR 5a): after the publish.
         if released && let Some(feed) = &self.shared.feed {
@@ -7235,6 +7279,10 @@ impl ShardState {
                 let id = group.id;
                 self.unresolved.push_back(group);
                 self.publish_watermark();
+                // The sync covers the feed's records held so far (#1415).
+                if self.feed_sync_open_low.get() != u64::MAX {
+                    self.close_feed_sync_bucket();
+                }
                 if group_sync {
                     self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight += 1;
@@ -7877,6 +7925,9 @@ impl ShardState {
         };
         match wal.submit_sync() {
             Ok(c) => {
+                if self.feed_sync_open_low.get() != u64::MAX {
+                    self.close_feed_sync_bucket();
+                }
                 self.syncs_in_flight_change(ctx.now_nanos());
                 self.group_syncs_in_flight += 1;
                 self.on_sync_done(c, through, true, ctx);

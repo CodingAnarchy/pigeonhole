@@ -545,3 +545,110 @@ fn an_async_feed_held_back_by_the_synced_hold_is_woken_when_the_shard_lets_it_go
     drop(feed);
     close_real(&db, &mut shard);
 }
+
+/// Submits `batch` and runs one turn, so its group is logged (and a group sync submitted)
+/// without waiting for it to resolve.
+fn log_only(db: &Engine, shard: &mut EngineShard, wb: WriteBatch, d: Durability) -> PendingCommit {
+    let pending = db.submit(wb, Some(d)).unwrap();
+    shard.run_once(u64::MAX);
+    pending
+}
+
+/// #1415: a sync covers what was logged when it was submitted. A fed `Buffered` record
+/// logged while that sync is in flight must not keep the synced hold below what it covered,
+/// or under steady load the durable frontier never moves. On the real VFS, whose syncs run
+/// on the I/O pool: `b` is logged while a sync covering `a` is in flight (an attempt that
+/// misses that window, the sync done first, starts over), for a group sync and for the
+/// feed's background sync. Mutation-checked: with the hold one pair again, both fail.
+#[test]
+fn a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered() {
+    for group in [true, false] {
+        let dir = TempDir::new(if group { "race-group" } else { "race-bg" });
+        let vfs = real_vfs();
+        // The group case keeps the background sync out of it.
+        let t_sync = if group {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_millis(20)
+        };
+        let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(t_sync));
+        let t = table(&db, "t");
+        settle(&mut shard);
+        let mut caught = false;
+        for attempt in 0..50u32 {
+            let a = drive(
+                &db,
+                &mut shard,
+                db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+                    .unwrap(),
+            )
+            .seqno;
+            let syncs = db.feed_background_syncs();
+            // A sync covering `a`, then `b` logged at once, while it is (usually) in flight.
+            let g = if group {
+                Some(log_only(
+                    &db,
+                    &mut shard,
+                    batch(&t, b"g"),
+                    Durability::GroupSync,
+                ))
+            } else {
+                let start = Instant::now();
+                while db.feed_background_syncs() == syncs {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "no background sync"
+                    );
+                    shard.run_once(u64::MAX);
+                }
+                None
+            };
+            let b = log_only(&db, &mut shard, batch(&t, b"b"), Durability::Buffered);
+            if db.feed_frontier(true) >= a {
+                // The sync finished before `b` was logged: not the race. Again.
+                drive(&db, &mut shard, b);
+                if let Some(g) = g {
+                    drive(&db, &mut shard, g);
+                }
+                settle(&mut shard);
+                continue;
+            }
+            let b = drive(&db, &mut shard, b).seqno;
+            if let Some(g) = g {
+                // Its resolution means its sync's completion was handled.
+                let g = drive(&db, &mut shard, g).seqno;
+                settle(&mut shard);
+                let f = db.feed_frontier(true);
+                assert!(
+                    f >= g && f < b,
+                    "the group sync covered `a` and `g`, not `b` (attempt {attempt}): \
+                     frontier {f}, a {a}, g {g}, b {b}"
+                );
+            } else {
+                // The first sync's completion moves the frontier past `a` but not `b`; the
+                // next background sync covers `b`. With the hold one pair, it would jump.
+                let (start, mut between) = (Instant::now(), false);
+                loop {
+                    let f = db.feed_frontier(true);
+                    between |= f >= a && f < b;
+                    if f >= b {
+                        break;
+                    }
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "never synced: {f}"
+                    );
+                    shard.run_once(u64::MAX);
+                }
+                assert!(
+                    between,
+                    "the frontier passed `a` only with `b` (attempt {attempt}): a {a}, b {b}"
+                );
+            }
+            caught = true;
+            break;
+        }
+        assert!(caught, "never logged `b` while a sync was in flight");
+        close_real(&db, &mut shard);
+    }
+}
