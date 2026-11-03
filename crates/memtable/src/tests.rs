@@ -92,6 +92,68 @@ fn insert_and_scan_in_key_order() {
     assert_eq!(it.key(), &expected[1].0[..]);
 }
 
+/// #1426: `skip_row` lands where stepping to the row's end lands, from every entry: rows
+/// narrower than, as wide as and wider than its steps before it seeks, rows with an escaped
+/// `0x00` and one with a row prefix longer than its stack buffer, and the last row.
+#[test]
+fn skip_row_lands_where_stepping_does() {
+    let mut arena = ShardArena::new(ArenaRegion::heap(4 << 20), 64 * 1024);
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let long = vec![b'L'; 80];
+    let rows: Vec<(Vec<u8>, usize)> = vec![
+        (b"a".to_vec(), 1),
+        (b"b".to_vec(), ROW_SKIP_STEPS),
+        (b"c".to_vec(), ROW_SKIP_STEPS + 1),
+        (b"d\x00e".to_vec(), 3),
+        (b"d".to_vec(), 40),
+        (long, 20),
+        (b"w".to_vec(), 300),
+        (b"z".to_vec(), 12),
+    ];
+    let mut seqno = 0;
+    for (row, width) in &rows {
+        for q in 0..*width {
+            seqno += 1;
+            let mut k = Vec::new();
+            encode_key(
+                &mut k,
+                row,
+                format!("q{q:04}").as_bytes(),
+                0,
+                seqno,
+                Kind::Put,
+            )
+            .unwrap();
+            mt.insert(&mut arena, &k, b"\x00v").unwrap();
+        }
+    }
+    let reader = mt.reader();
+    let keys: Vec<Vec<u8>> = scan(&reader).into_iter().map(|(k, _)| k).collect();
+    let row_of = |k: &[u8]| k[..pigeonhole_format::key::row_prefix_len(k).unwrap()].to_vec();
+    let mut it = reader.iter();
+    for (i, k) in keys.iter().enumerate() {
+        let want = keys[i + 1..].iter().find(|n| row_of(n) != row_of(k));
+        it.seek(k).unwrap();
+        it.skip_row().unwrap();
+        assert_eq!(
+            it.valid().then(|| it.key().to_vec()).as_ref(),
+            want,
+            "from entry {i}"
+        );
+        // And after stepping to it, as a filter's `SkipRow` does mid-row (a finger search).
+        if i > 0 {
+            it.seek(&keys[i - 1]).unwrap();
+            it.next().unwrap();
+            it.skip_row().unwrap();
+            assert_eq!(
+                it.valid().then(|| it.key().to_vec()).as_ref(),
+                want,
+                "stepped to {i}"
+            );
+        }
+    }
+}
+
 #[test]
 fn header_follows_format() {
     let mut arena = small();
