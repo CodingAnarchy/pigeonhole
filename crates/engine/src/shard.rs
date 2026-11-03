@@ -2599,7 +2599,8 @@ struct ArenaNeed {
     run_chunks: usize,
     /// Chunks its smallest entry larger than a chunk takes (0 without one).
     min_large: usize,
-    /// Chunks its allocations can take in all.
+    /// Chunks its allocations can take in all, for the run check (#141, #1403): 0 when no
+    /// entry spans chunks (`run_chunks` 1), the only case where it isn't read.
     alloc_chunks: usize,
 }
 
@@ -4176,8 +4177,10 @@ impl ShardState {
         let mut total = 0usize;
         let mut waste = 0usize;
         let mut largest = 0usize;
-        let (mut large_chunks, mut large_entries, mut min_large) = (0usize, 0usize, usize::MAX);
-        let (mut small_entries, mut small_bytes) = (0usize, 0usize);
+        // Entries spanning chunks: rare, so only they are counted here, and the small ones'
+        // count and bytes follow from the totals (the commit shapes pay no more per entry).
+        let (mut large_chunks, mut large_entries, mut large_bytes) = (0usize, 0usize, 0usize);
+        let mut min_large = usize::MAX;
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
@@ -4200,11 +4203,8 @@ impl ShardState {
             if chunks > 1 {
                 large_chunks += chunks;
                 large_entries += 1;
+                large_bytes += entry;
                 min_large = min_large.min(chunks);
-            } else {
-                // Its bytes and the most it can waste (a tail shorter than it).
-                small_entries += 1;
-                small_bytes += 2 * entry;
             }
             let tablet = match last {
                 Some((run, tablet)) if run == k.run => tablet,
@@ -4229,8 +4229,17 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
-        let small_chunks = small_entries
-            .min(small_bytes / self.chunk_size + touched.len() + unrouted + large_entries + 1);
+        // Read only by the run check, which only an entry spanning chunks needs: a batch of
+        // small entries skips the arithmetic.
+        let alloc_chunks = if large_entries == 0 {
+            0
+        } else {
+            // The small entries' bytes and the most they can waste (a tail shorter than each).
+            let small_bytes = 2 * (total - large_bytes);
+            let small_chunks = (keys.len() - large_entries)
+                .min(small_bytes / self.chunk_size + touched.len() + unrouted + large_entries + 1);
+            large_chunks + small_chunks + new_slots
+        };
         ArenaNeed {
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
@@ -4239,7 +4248,7 @@ impl ShardState {
             } else {
                 min_large
             },
-            alloc_chunks: large_chunks + small_chunks + new_slots,
+            alloc_chunks,
         }
     }
 
