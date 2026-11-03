@@ -799,7 +799,7 @@ impl VectorIndex {
         let (tx, rx) = mpsc::sync_channel::<Vec<(Vec<u8>, Vector)>>(2);
         let worker = std::thread::Builder::new()
             .name("pigeonhole-bulk-load".into())
-            .spawn(move || load(&i, expected, rx))
+            .spawn(move || load(&i, spec, expected, rx))
             .map_err(|e| arg_error(ruby, format!("can't start the bulk load thread: {e}")))?;
         Ok(VectorBulkLoad(ForkSafe::new(Mutex::new(Some(BulkState {
             spec,
@@ -813,17 +813,15 @@ impl VectorIndex {
 /// it closes the channel.
 fn load(
     i: &vidx::Index,
+    spec: pigeonhole::VectorSpec,
     expected: u64,
     rx: Receiver<Vec<(Vec<u8>, Vector)>>,
 ) -> vidx::Result<vidx::BulkStats> {
-    let mut batches = rx.into_iter().flatten().peekable();
-    // The index's element decides the form; every pair the Ruby side sent has it.
-    match batches.peek().map(|(_, v)| match v {
-        Vector::F32(_) => 0,
-        Vector::I8(_) => 1,
-        Vector::Bits(_) => 2,
-    }) {
-        Some(1) => i.bulk_load_i8(
+    let batches = rx.into_iter().flatten();
+    // The index's element decides the form (perf2's N4 on #1434): `push` converted every
+    // pair by it, and an empty input still reaches the matching load.
+    match spec.element() {
+        pigeonhole::Element::I8 => i.bulk_load_i8(
             expected,
             batches.filter_map(|(id, v)| match v {
                 Vector::I8(v) => Some((id, v)),
@@ -834,7 +832,7 @@ fn load(
                 }
             }),
         ),
-        Some(2) => i.bulk_load_bits(
+        pigeonhole::Element::Bit => i.bulk_load_bits(
             expected,
             batches.filter_map(|(id, v)| match v {
                 Vector::Bits(v) => Some((id, v)),
@@ -894,22 +892,51 @@ impl VectorBulkLoad {
         loop {
             let b = batch.take().expect("sent once");
             let t = tx.clone();
-            match without_gvl(ruby, move || match t.try_send(b) {
-                Ok(()) => Ok(()),
-                Err(mpsc::TrySendError::Full(b)) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    Err(Some(b))
+            // Up to a slice of tries with the GVL released, not a GVL round trip per
+            // millisecond while k-means keeps the channel full (perf2's N3 on #1434).
+            match without_gvl(ruby, move || {
+                let start = Instant::now();
+                let mut b = b;
+                loop {
+                    match t.try_send(b) {
+                        Ok(()) => return Ok(()),
+                        Err(mpsc::TrySendError::Disconnected(_)) => return Err(None),
+                        Err(mpsc::TrySendError::Full(back)) => {
+                            if start.elapsed() >= SLICE {
+                                return Err(Some(back));
+                            }
+                            b = back;
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => Err(None),
             })? {
                 Ok(()) => return Ok(()),
-                // The loader stopped (an error): `finish` reports it.
-                Err(None) => return Ok(()),
+                // The loader stopped, so it failed (its input never ended): raise its error
+                // now rather than convert the rest of the input for nothing (perf2's S1 on
+                // #1434). It has returned, so the join is immediate.
+                Err(None) => return Self::fail(ruby, m),
                 Err(Some(b)) => {
                     ruby.thread_check_ints()?;
                     batch = Some(b);
                 }
             }
+        }
+    }
+
+    /// The loader's error, once it has stopped early; the load is then finished.
+    fn fail(ruby: &Ruby, m: &Mutex<Option<BulkState>>) -> Result<(), Error> {
+        let Some(BulkState { tx, worker, .. }) = lock(m).take() else {
+            return Err(spent(ruby, LOAD_SPENT));
+        };
+        drop(tx);
+        match join_sliced(ruby, worker)? {
+            Err(e) => Err(vec_err(ruby, e)),
+            Ok(_) => Err(crate::error::uncoded(
+                ruby,
+                "Error",
+                "the bulk load thread ended before its input did",
+            )),
         }
     }
 
@@ -1023,16 +1050,30 @@ impl Rebalancer {
     /// interruptible midway.
     pub(crate) fn run_once(ruby: &Ruby, rb_self: &Self, budget: Secs) -> Result<bool, Error> {
         let m = rb_self.0.get(ruby)?;
-        vcall(ruby, move || lock(m).run_once(budget.0))
+        // In slices of at most `SLICE`, with an interrupt check between them, so Ctrl-C or
+        // `Thread#raise` waits at most a slice (and one split) rather than the whole budget
+        // (perf2's S3 on #1434). Each call is whole, so stopping between them is safe.
+        let deadline = Instant::now().checked_add(budget.0);
+        loop {
+            let left = deadline.map_or(SLICE, |d| {
+                d.saturating_duration_since(Instant::now()).min(SLICE)
+            });
+            let more = vcall(ruby, move || lock(m).run_once(left))?;
+            if !more || deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(more);
+            }
+            ruby.thread_check_ints()?;
+        }
     }
 
     /// `wait(timeout)`: until a write marks a list, the index's last handle drops, or
     /// `timeout` seconds pass; in slices with an interrupt check between them.
     pub(crate) fn wait(ruby: &Ruby, rb_self: &Self, timeout: Secs) -> Result<(), Error> {
         let m = rb_self.0.get(ruby)?;
-        let deadline = Instant::now() + timeout.0;
+        // A timeout too large for an `Instant` waits without end (perf2's N2 on #1434).
+        let deadline = Instant::now().checked_add(timeout.0);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.map_or(SLICE, |d| d.saturating_duration_since(Instant::now()));
             if left.is_zero() {
                 return Ok(());
             }
@@ -1051,7 +1092,14 @@ impl Rebalancer {
         }
     }
 
+    /// Whether every index handle is gone. A `run_once` or `wait` on another thread holds
+    /// the rebalancer for up to a slice, so the lock is taken with the GVL released (perf2's
+    /// S3 on #1434: holding the GVL there stalled every Ruby thread).
     pub(crate) fn is_closed(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        Ok(lock(rb_self.0.get(ruby)?).closed())
+        let m = rb_self.0.get(ruby)?;
+        if let Ok(r) = m.try_lock() {
+            return Ok(r.closed());
+        }
+        without_gvl(ruby, move || lock(m).closed())
     }
 }

@@ -152,6 +152,46 @@ class TestVectorIndex < Minitest::Test
     end
   end
 
+  # perf2's S1 on #1434: a loader that failed (here, the index isn't empty) stops the load at
+  # the next push, rather than after the whole input is read and converted.
+  def test_a_failed_load_stops_reading_its_input
+    idx = V::Index.create(db, "full", spec(4))
+    idx.insert("x", [1, 2, 3, 4])
+    read = 0
+    pairs = (0...200_000).lazy.map do |i|
+      read += 1
+      ["v#{i}", [i, 0, 0, 0]]
+    end
+    assert_raises(Pigeonhole::InvalidArgument) { idx.bulk_load(pairs, expected: 200_000, batch: 1_000) }
+    assert_operator read, :<, 20_000
+  end
+
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  # perf2's S3 on #1434: while a run_once works, closed? from another thread doesn't hold
+  # the GVL waiting for it, and the run_once itself stops promptly on an interrupt.
+  def test_a_busy_rebalancer_stays_responsive
+    rng = Random.new(3)
+    idx, reb = V::Index.create(db, "busy", spec(8), target_list_len: 4, rebalance: :background, rebalancer: true)
+    # Few lists for many vectors: the load leaves them far past their bound, marked to split.
+    idx.bulk_load(Array.new(20_000) { |i| ["v#{i}", Array.new(8) { rng.rand }] }, expected: 40)
+    worker = Thread.new { reb.run_once(3.0) }
+    sleep 0.1
+    ticks = 0
+    ticker = Thread.new { 20.times { ticks += 1; sleep 0.01 } } # rubocop:disable Style/Semicolon
+    t0 = monotonic
+    refute_predicate reb, :closed?
+    ticker.join
+    assert_operator monotonic - t0, :<, 1.0, "closed? waited out the run_once with the GVL held"
+    assert_equal 20, ticks
+    worker.kill
+    worker.join
+    t0 = monotonic
+    assert_raises(Timeout::Error) { Timeout.timeout(0.2) { reb.run_once(5.0) } }
+    assert_operator monotonic - t0, :<, 1.5, "run_once ran past the interrupt"
+    assert_equal 20_000, idx.verify.vectors
+  end
+
   def test_a_reader_searches
     idx = V::Index.create(db, "rd", spec(2))
     idx.insert("a", [1.0, 0.0])
