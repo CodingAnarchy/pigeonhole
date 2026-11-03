@@ -90,5 +90,10 @@
 - **pigeonhole-shm:** `publish_feed_floor`, `publish_feed_checkpoint`, `publish_feed_bound`, `feed_marks` (returns `FeedMarksView`).
 - **pigeonhole-format:** shm layout 8 (`watermark::FEED_FLOOR`, `FEED_CKPT`, `FEED_BOUND`).
 
+## PR 5a: async feeds (writer process)
+- **pigeonhole** (additive, `async` feature for the stream): `Feed::poll_next(&mut Context) -> Poll<Result<&Commit>>`, and `nonblocking::FeedStream` (`new(Feed)`, `token()`, `into_inner()`; a `futures_core::Stream` of `Result<Commit>` that yields an error once and then ends).
+- **pigeonhole-engine:** `FeedReader::poll_next(&mut Context) -> Poll<Result<Next<'_>>>`. In a reader process it returns `Unsupported` (the coordinator's option (b); the process-wide feed-tick thread is #1407, Post-1.0).
+- **Internal:** `Feed::{hold_waiters, has_hold_waiters}` and the shard's wake when it lets a WRITTEN or SYNCED hold go (concurrency.md).
+
 ## Later PRs
-- PR 5: `poll_next`.
+- PR 5b: the bench rows (reader-process delivery latency among them) and mirror-on-rise; no API change planned.
