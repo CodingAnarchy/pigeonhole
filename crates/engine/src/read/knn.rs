@@ -181,6 +181,9 @@ impl Drop for KnnVisitor {
 
 impl CellVisitor for KnnVisitor {
     type Item = Score;
+    // The score is the value's alone: a cell's qualifier is unescaped only once its score
+    // could make the top k (#1283 lever 1).
+    const QUALIFIER: bool = false;
 
     fn visit(
         &mut self,
