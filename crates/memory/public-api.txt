@@ -182,7 +182,7 @@ pub pigeonhole_memory::LoopStep::events: usize
 pub pigeonhole_memory::LoopStep::failed: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::Error)>
 pub pigeonhole_memory::LoopStep::next_due: core::option::Option<u64>
 pub pigeonhole_memory::LoopStep::passes: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
-pub pigeonhole_memory::LoopStep::stopped: alloc::vec::Vec<alloc::string::String>
+pub pigeonhole_memory::LoopStep::stopped: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
 pub pigeonhole_memory::LoopStep::token: pigeonhole_memory::WatchToken
 #[non_exhaustive] pub struct pigeonhole_memory::Marked
 pub pigeonhole_memory::Marked::marked: usize

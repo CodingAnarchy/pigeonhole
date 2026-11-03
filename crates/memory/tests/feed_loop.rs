@@ -372,7 +372,9 @@ fn a_stopped_consolidator_keeps_the_namespace_due() {
     l.run_once(Duration::from_secs(2)).unwrap();
     clock.fetch_add(11 * SEC, Ordering::SeqCst);
     let step = l.run_once(Duration::ZERO).unwrap();
-    assert_eq!(step.stopped, vec!["n".to_owned()], "{step:?}");
+    let ns: Vec<&str> = step.stopped.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(ns, vec!["n"], "{step:?}");
+    assert_eq!(step.stopped[0].1.committed, 0, "stopped at its first group");
     assert!(step.failed.is_empty() && step.passes.is_empty(), "{step:?}");
     // Same clock: still due, so the next step runs the pass (a failure would wait 10 s).
     let step = l.run_once(Duration::ZERO).unwrap();

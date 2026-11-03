@@ -43,10 +43,11 @@ pub struct LoopStep {
     /// The passes that failed, by namespace: the consolidator's error (`Error::Consolidate`,
     /// with the pass so far). The namespace stays pending, retried after `min_age`.
     pub failed: Vec<(String, Error)>,
-    /// The namespaces whose pass the consolidator stopped
-    /// ([`ConsolidateStopped`](crate::ConsolidateStopped)): they keep their pending time, so
-    /// they're due again at the next step, not after `min_age`.
-    pub stopped: Vec<String>,
+    /// The passes the consolidator stopped ([`ConsolidateStopped`](crate::ConsolidateStopped)),
+    /// by namespace, each with the pass so far (the groups before the stop are committed).
+    /// The namespaces keep their pending time, so they're due again at the next step, not
+    /// after `min_age`.
+    pub stopped: Vec<(String, ConsolidatePass)>,
     /// When the next pass is due, µs since the Unix epoch, if any namespace is pending.
     pub next_due: Option<u64>,
     /// Where the loop is, as saved: the watch's position, for callers that checkpoint
@@ -286,10 +287,10 @@ impl ConsolidateLoop {
                 // The consolidator stopped rather than failed (an interrupted binding, say):
                 // the namespace keeps its pending time, so it's due again at the next step
                 // (cli692 on #1441).
-                Err(Error::Consolidate { ref error, .. })
+                Err(Error::Consolidate { error, pass })
                     if error.is::<crate::consolidate::ConsolidateStopped>() =>
                 {
-                    stopped.push(ns);
+                    stopped.push((ns, pass));
                     continue;
                 }
                 Err(e @ Error::Consolidate { .. }) => {
