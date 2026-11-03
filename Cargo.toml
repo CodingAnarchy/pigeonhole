@@ -23,6 +23,9 @@ members = [
     "crates/text",
     "crates/memory",
 ]
+# The Ruby bindings are a workspace of their own: building them needs a Ruby with headers
+# (rb-sys), which `cargo build --workspace` mustn't require (#697, ICR 0111).
+exclude = ["crates/ruby"]
 
 [workspace.package]
 # The public version line (D295): `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli`,
