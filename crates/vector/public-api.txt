@@ -74,6 +74,9 @@ pub pigeonhole_vector::IndexStats::vectors: u64
 pub struct pigeonhole_vector::Placed
 impl pigeonhole_vector::Placed
 pub fn pigeonhole_vector::Placed::new() -> Self
+impl core::cmp::Eq for pigeonhole_vector::Placed
+impl core::cmp::PartialEq for pigeonhole_vector::Placed
+pub fn pigeonhole_vector::Placed::eq(&self, &Self) -> bool
 pub struct pigeonhole_vector::ReadIndex
 impl pigeonhole_vector::ReadIndex
 pub fn pigeonhole_vector::ReadIndex::options(&self) -> pigeonhole_vector::IndexOptions

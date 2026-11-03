@@ -191,7 +191,7 @@ pub struct Hit {
 /// starts with a fresh one: one made outside would carry an aborted attempt's record into
 /// the retry. A `Placed` belongs to the index its first write used; using it with another
 /// index is [`Error::InvalidArgument`] (cli692's C1 and C2).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 #[must_use = "pass it to Index::after_commit once the transaction commits; dropping it only delays a split or merge until the next write to its lists"]
 pub struct Placed {
     lists: Vec<u32>,
@@ -199,9 +199,32 @@ pub struct Placed {
     ids: HashMap<Vec<u8>, Option<u32>>,
     /// This transaction created list 0 (the index was empty at its snapshot).
     bootstrapped: bool,
-    /// The index it belongs to: its shared state's address, set by its first write.
-    index: Option<usize>,
+    /// The index it belongs to, set by its first write. A `Weak` keeps the shared state's
+    /// allocation reserved, so another index can't reuse its address while this lives
+    /// (cli692 on #1412).
+    index: Option<std::sync::Weak<Inner>>,
 }
+
+impl PartialEq for Placed {
+    fn eq(&self, other: &Self) -> bool {
+        self.lists == other.lists
+            && self.ids == other.ids
+            && self.bootstrapped == other.bootstrapped
+            && match (&self.index, &other.index) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.ptr_eq(b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Placed {}
+
+// A `Placed` crosses threads with the transaction it records (cli692 on #1412).
+const _: fn() = || {
+    fn send<T: Send + Sync>() {}
+    send::<Placed>();
+};
 
 impl Placed {
     /// No writes yet.
@@ -211,13 +234,12 @@ impl Placed {
 
     /// Binds this record to `index` on first use; another index is `InvalidArgument`.
     fn bind(&mut self, index: &Index) -> Result<()> {
-        let at = Arc::as_ptr(&index.inner) as usize;
-        match self.index {
+        match &self.index {
             None => {
-                self.index = Some(at);
+                self.index = Some(Arc::downgrade(&index.inner));
                 Ok(())
             }
-            Some(i) if i == at => Ok(()),
+            Some(i) if std::ptr::eq(i.as_ptr(), Arc::as_ptr(&index.inner)) => Ok(()),
             Some(_) => Err(Error::InvalidArgument(
                 "a Placed records one index's writes: make one per index and transaction".into(),
             )),
