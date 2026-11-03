@@ -500,8 +500,14 @@ pub(crate) fn top_k(
     let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
-    // The last document decided: a walk that starts being walked again steps past it.
-    let mut last: Option<Vec<u8>> = None;
+    // The last document decided: a walk that starts being walked again steps past it. One
+    // buffer, reused, so a candidate costs no allocation for it.
+    let mut last: Vec<u8> = Vec::new();
+    let mut decided = false;
+    // Whether an essential fuzzy clause has unwalked expansions: only then does a candidate
+    // pay for the gains below (single fuzzy clauses never do, since #1333's cut already drops
+    // what they'd leave unwalked).
+    let mut unwalked = false;
     loop {
         let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
         // Only when the threshold has risen since the last pass: nothing else moves the
@@ -524,9 +530,12 @@ pub(crate) fn top_k(
             // fuzzy clause, scores below their largest bounds summed plus the non-essential
             // bounds, and that sum stays below the threshold.
             let mut budget = th - prefix[skip];
+            unwalked = false;
             for &c in &by_bound[skip..] {
-                clauses[c].set_solo(bm, budget, last.as_deref())?;
-                budget -= clauses[c].unwalked();
+                clauses[c].set_solo(bm, budget, decided.then_some(last.as_slice()))?;
+                let up = clauses[c].unwalked();
+                budget -= up;
+                unwalked |= up > 0.0;
             }
         }
         let essential = &by_bound[skip..];
@@ -550,12 +559,16 @@ pub(crate) fn top_k(
         }
         // The essential fuzzy clauses' unwalked expansions (#1363): each can raise its
         // clause's contribution to at most their largest bound.
-        let mut gains: f64 = essential
-            .iter()
-            .map(|&c| (clauses[c].unwalked() - if has[c] { contrib[c] } else { 0.0 }).max(0.0))
-            .sum();
         let mut pruned = false;
-        for &c in essential {
+        let mut gains: f64 = if unwalked {
+            essential
+                .iter()
+                .map(|&c| (clauses[c].unwalked() - if has[c] { contrib[c] } else { 0.0 }).max(0.0))
+                .sum()
+        } else {
+            0.0
+        };
+        for &c in essential.iter().filter(|_| unwalked) {
             let up = clauses[c].unwalked();
             let here = if has[c] { contrib[c] } else { 0.0 };
             if up <= here {
@@ -574,7 +587,9 @@ pub(crate) fn top_k(
                 partial += v - here;
             }
         }
-        last = Some(doc.clone());
+        last.clear();
+        last.extend_from_slice(&doc);
+        decided = true;
         if pruned {
             continue;
         }
