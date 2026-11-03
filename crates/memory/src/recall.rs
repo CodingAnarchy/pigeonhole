@@ -35,7 +35,8 @@ pub enum Fusion {
 }
 
 /// Each signal's weight in the fusion (D311 §10a). Plain data, so bindings can build it:
-/// start from `Weights::default()` (every weight 1) and set the fields. Under
+/// start from `Weights::default()` (`recency` at 0.25, `graph` and `consolidated` at 0.5, the
+/// rest at 1) and set the fields. Under
 /// [`Fusion::Rrf`] a weight multiplies the signal's `1 / (60 + rank)`; under
 /// [`Fusion::Linear`], its min-max-normalised value. A weight of 0 leaves the signal out.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,7 +46,9 @@ pub struct Weights {
     pub vector: f64,
     /// BM25, for keyword hits.
     pub keyword: f64,
-    /// `exp(−age / half_life)`.
+    /// `exp(−age / half_life)`: 0.25 by default. At 1, as before 1.1.0, recency outweighed
+    /// what a query asked for on both of T5's benchmarks (the agent memory guide's "How well
+    /// it recalls").
     pub recency: f64,
     /// The memory's importance.
     pub importance: f64,
@@ -65,7 +68,7 @@ impl Default for Weights {
         Weights {
             vector: 1.0,
             keyword: 1.0,
-            recency: 1.0,
+            recency: 0.25,
             importance: 1.0,
             uses: 1.0,
             graph: 0.5,

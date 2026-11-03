@@ -215,18 +215,19 @@ Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks
 | vector | 0.955 / 0.974 / 0.853 | 0.545 / 0.658 / 0.426 |
 | keyword | 0.957 / 0.974 / 0.864 | 0.511 / 0.587 / 0.409 |
 | recency | 0.047 / 0.109 / 0.045 | 0.003 / 0.011 / 0.004 |
-| fused, default weights | 0.964 / 0.979 / 0.789 | 0.553 / 0.642 / 0.409 |
+| **fused, default weights** (`recency` 0.25) | 0.964 / 0.981 / 0.871 | 0.583 / 0.658 / 0.454 |
+| fused, `recency` at 1 (the default before 1.1.0) | 0.964 / 0.979 / 0.789 | 0.553 / 0.642 / 0.409 |
 | fused, `recency` at 0.5 | 0.968 / 0.981 / 0.855 | 0.581 / 0.655 / 0.444 |
-| fused, `recency` at 0.25 | 0.964 / 0.981 / 0.871 | 0.583 / 0.658 / 0.454 |
 | fused, `recency` at 0 | 0.960 / 0.987 / 0.883 | 0.583 / 0.658 / 0.457 |
-| fused, `expand(Expand::hops(1))` | 0.951 / 0.977 / 0.751 | 0.541 / 0.666 / 0.400 |
+| fused, `recency` at 1, `expand(Expand::hops(1))` | 0.951 / 0.977 / 0.751 | 0.541 / 0.666 / 0.400 |
 
-- **Fused beats any one signal** once recency's weight comes down. Neither benchmark asks about recent events, so recency there is noise. An agent whose questions do lean on what happened lately should keep a higher weight. `Weights` sets it per call.
-- **The graph signal** here follows only each turn's link to the previous turn of its session, the one link every application can write. Recall is about level (+0.008 recall@10 on LoCoMo, about 12 of 1,531 questions), and ranking quality drops on both. Links that carry meaning (entities, `derived_from`) are what it's for.
+- **Fused beats any one signal** at the default weights, on both benchmarks. That's why recency's default is 0.25 and not 1. At 1, recency outweighed what was asked, and ranking quality fell below keyword alone (NDCG 0.789 against 0.864 on LongMemEval-S). Neither benchmark asks about recent events, so recency there is noise, and 0 does slightly better still. But agents' questions often do lean on what happened lately, so the default keeps some pull. Raise it with `Weights` (per call) for an agent that asks mostly about recent events.
+- **These runs set `uses` with `recency`,** but neither dataset marks memories used, so the use signal is empty and only recency's weight matters.
+- **The graph signal** (measured with `recency` at 1) here follows only each turn's link to the previous turn of its session, the one link every application can write. Recall is about level (+0.008 recall@10 on LoCoMo, about 12 of 1,531 questions), and ranking quality drops on both. Links that carry meaning (entities, `derived_from`) are what it's for.
 - **`f16` and `bf16` embeddings** recall the same as `f32`, to within 0.001 on every LongMemEval-S row.
 - **Fuzzy keyword terms** (`Fuzziness::Auto` on words of 5 or more letters) don't help. Recall@10 changes by under a point either way, and the keyword search takes 18 to 100 times as long. Recall doesn't take a fuzziness option for that reason.
 
-**Latency,** fused, `k = 10`, warm, one thread. The last two rows have 50 questions, so their "p99" is the slowest of 50:
+**Latency,** fused, `k = 10`, warm, one thread, measured with `recency` at 1 (weights don't change the work a recall does). The last two rows have 50 questions, so their "p99" is the slowest of 50:
 
 | namespace size | p50 | p99 | with `expand(hops(1))`, p50 / p99 |
 |---|---|---|---|

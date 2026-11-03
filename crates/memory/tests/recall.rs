@@ -170,11 +170,17 @@ fn check_rrf(
     }
     for h in hits {
         let s = h.signals.unwrap();
-        let want: f64 = [s.vector, s.keyword, s.recency, s.importance, s.uses]
-            .iter()
-            .flatten()
-            .map(|x| 1.0 / (60.0 + f64::from(x.rank)))
-            .sum();
+        let w = Weights::default();
+        let want: f64 = [
+            (s.vector, w.vector),
+            (s.keyword, w.keyword),
+            (s.recency, w.recency),
+            (s.importance, w.importance),
+            (s.uses, w.uses),
+        ]
+        .iter()
+        .filter_map(|(x, w)| x.map(|x| w / (60.0 + f64::from(x.rank))))
+        .sum();
         assert!(
             close(h.score, want, 1e-12),
             "{ctx}: score {} vs {want}",

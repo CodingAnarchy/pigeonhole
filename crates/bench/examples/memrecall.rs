@@ -15,8 +15,9 @@
 //!   weight 1), which the graph expansion walks. Then every question runs under each
 //!   configuration:
 //!   - `vector`, `keyword` and `recency`: that signal alone (its weight 1, the others' 0);
-//!   - `fused`: the default weights, and `fused-no-recency`, `fused-recency-0.25` and
-//!     `fused-recency-0.5`: those with recency's (and use's) at 0, 0.25 or 0.5;
+//!   - `fused`: the default weights (recency 0.25), and `fused-no-recency`, `fused-recency-1`
+//!     and `fused-recency-0.5`: those with recency's (and use's) at 0, 1 (the default before
+//!     1.1.0) or 0.5;
 //!   - `fused+graph`: the default weights with `expand(Expand::hops(1))`;
 //!   - `keyword-fuzzy`: the text index directly, terms of 5 or more characters as
 //!     `Fuzziness::Auto` fuzzy terms, against `keyword-index`, the same search without them.
@@ -301,7 +302,7 @@ impl Tally {
 fn weights(only: Option<usize>) -> Weights {
     let mut w = Weights::default();
     if let Some(i @ 10..=12) = only {
-        w.recency = [0.0, 0.25, 0.5][i - 10];
+        w.recency = [0.0, 1.0, 0.5][i - 10];
         w.uses = w.recency;
         return w;
     }
@@ -351,9 +352,9 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
         ("recency", Some(2), false),
         ("fused", None, false),
         // The default weights with recency's (and use's, which these datasets don't have)
-        // at 0, 0.25 and 0.5.
+        // at 0, 1 (the default before 1.1.0) and 0.5.
         ("fused-no-recency", Some(10), false),
-        ("fused-recency-0.25", Some(11), false),
+        ("fused-recency-1", Some(11), false),
         ("fused-recency-0.5", Some(12), false),
         ("fused+graph", None, true),
     ];

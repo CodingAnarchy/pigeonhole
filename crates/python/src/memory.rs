@@ -250,7 +250,7 @@ impl EmbeddingModel {
     }
 }
 
-/// Recall's signal weights (every one 1 by default; `graph` and `consolidated` 0.5).
+/// Recall's signal weights (1 by default; `recency` 0.25, `graph` and `consolidated` 0.5).
 #[pyclass(module = "pigeonhole.memory", frozen)]
 #[derive(Clone)]
 pub(crate) struct Weights(mem::Weights);
