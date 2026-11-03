@@ -158,6 +158,11 @@ pub struct LoopInterrupter(Arc<AtomicBool>);
 
 impl LoopInterrupter {
     /// Ends the current or next step's wait (within about 50 ms).
+    ///
+    /// The flag stays set until a step sees it, so an interrupt sent just as a step ends makes
+    /// the next step return at once, after running what's due and saving. That's one short step,
+    /// and it keeps an interrupt sent just before a step from being lost. There's no `clear()`
+    /// for that reason: clearing at the start of a step would race with that interrupt.
     pub fn interrupt(&self) {
         self.0.store(true, Ordering::Release);
     }
