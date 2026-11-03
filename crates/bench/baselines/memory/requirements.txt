@@ -1,4 +1,4 @@
 # D311 T5 (#1339): the fixture's embedding model, on CPU. Install into a venv:
 #   python3 -m venv .venv && .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 && .venv/bin/pip install -r requirements.txt
-sentence-transformers==3.3.1
+sentence-transformers==5.6.0
 numpy==2.1.3
