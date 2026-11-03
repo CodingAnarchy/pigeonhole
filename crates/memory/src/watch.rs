@@ -281,3 +281,12 @@ fn events(c: &Commit, prefixes: &[Vec<u8>]) -> Option<MemoryCommit> {
         events,
     })
 }
+
+// A watch crosses threads (a reader's runs on a thread of its own; the bindings move it):
+// cli692 on #1430.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Watch>();
+    send::<WatchToken>();
+    send::<MemoryCommit>();
+};

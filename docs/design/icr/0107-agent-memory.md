@@ -255,7 +255,7 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
   - `Superseded { id, by }` (a `meta:superseded_by` put; `by`, an existing memory, sees `Updated` for the link);
   - `Updated` (anything else on the row).
   - Dedup rows, counter rows and `G` are never events.
-- **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it.
+- **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it. `StoredMemory::summary` reads it (cli692 on #1430).
 - **Async:** `next_async` in the writer, once #1408 (D310 PR 5a) is merged. A reader calls the sync `next` on a thread of its own.
 
 ## T9, part 2: the feed-driven consolidation loop (#1343)
