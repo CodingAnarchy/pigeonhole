@@ -297,6 +297,14 @@ impl<'a> Forget<'a> {
     /// A pass goes in id order, which is newest first within a namespace, so a resumed pass
     /// doesn't see memories created behind its position until the next pass from the start.
     pub fn run(self) -> Result<ForgetPass> {
+        let store = self.store;
+        let r = self.run_inner();
+        // The pass's IVF writes, after its transactions (D311 T8).
+        store.ivf_settle();
+        r
+    }
+
+    fn run_inner(self) -> Result<ForgetPass> {
         let persisted;
         let policy = match self.policy {
             Some(p) => p,
