@@ -50,7 +50,7 @@ pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
     Source, Store, StoreOptions, StoreStats, StoredMemory,
 };
-pub use watch::{MemoryCommit, MemoryEvent, Watch, WatchBuilder, WatchToken};
+pub use watch::{MemoryCommit, MemoryEvent, PASS_OVER_PER_POLL, Watch, WatchBuilder, WatchToken};
 
 #[cfg(doctest)]
 mod guide {

@@ -1008,7 +1008,7 @@ fn join_sliced<T: Send + 'static>(
 /// starves the others. On Linux, `closed?` waited out a whole 3 s `run_once` that way, where
 /// macOS happened to let it in (#1434's CI).
 pub(crate) struct Fair<T> {
-    pub(crate) m: Mutex<T>,
+    m: Mutex<T>,
     wanted: std::sync::atomic::AtomicUsize,
 }
 

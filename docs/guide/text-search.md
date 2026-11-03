@@ -1,6 +1,6 @@
 # Full-text search
 
-> **Status:** this guide describes `main`. The current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `pigeonhole-text` (D309) is new in 1.1.0. Code samples run as doctests of the `pigeonhole-text` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`. The current release on crates.io is 1.0.1, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `pigeonhole-text` (D309) is new in 1.1.0. Code samples run as doctests of the `pigeonhole-text` crate (lines starting with `#` are hidden setup).
 
 `pigeonhole-text` ranks documents by BM25 for keyword queries: terms, phrases, and phrases within a slop of position moves. An index is one table of ordinary rows over a **source column**, and you write that column through the index, inside your own transaction. The text, its postings and the statistics then commit together, so a search at a snapshot sees exactly the documents committed by then.
 

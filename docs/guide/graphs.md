@@ -1,6 +1,6 @@
 # Graphs
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Wide-row walks (D297), multi-get (D299) and traversal (D304) are new in 1.1.0. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.1, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Wide-row walks (D297), multi-get (D299) and traversal (D304) are new in 1.1.0. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole stores a graph as adjacency rows: one row per node, one column per edge. Four reads cover the usual access patterns:
 - a node's neighbours: one row read;
@@ -193,9 +193,31 @@ assert_eq!(t.hops().len(), 1);
 ```
 
 ## Adjacency sets
-> **TODO (#488 PR 5):** placeholder. This section documents the `Set` family once #488 PR 5 lands it; nothing named here exists yet.
+A node's edges can also be kept as one set-valued cell: a `Family::aggregate(Aggregation::Set)` family (D298, #1295), a roaring bitmap of `u32` node ids. Membership is one lookup, degree is the set's length, and the common neighbours of two nodes are one intersection of two gets:
 
-A hub's edges can also be kept as one set-valued cell: the `Set` aggregate family of #488, a compressed bitmap of `u32` node ids. With it, membership is one lookup, degree is the set's cardinality, and common neighbours of two hubs are one intersection. Until it lands, adjacency rows (above) and a degree counter cover the same needs.
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let t = db
+    .table("social")?
+    .family("follows", Family::aggregate(Aggregation::Set))
+    .create_if_missing()?;
+t.mutate(b"user:1").set_add("follows", b"", 7).set_add("follows", b"", 9).commit()?;
+t.mutate(b"user:2").set_add("follows", b"", 9).set_add("follows", b"", 11).commit()?;
+let a = t.get(b"user:1", "follows", b"")?.unwrap();
+let b = t.get(b"user:2", "follows", b"")?.unwrap();
+let (a, b) = (a.as_set().unwrap(), b.as_set().unwrap());
+assert!(a.contains(7));
+assert_eq!(a.len(), 2); // degree
+assert_eq!(a.intersection_len(&b), 1); // common neighbours: user 9
+assert_eq!(a.intersection(&b).collect::<Vec<_>>(), vec![9]);
+# Ok::<(), pigeonhole::Error>(())
+```
+
+- **When to use it:** node ids that fit in `u32`, and questions about the whole neighbourhood (degree, membership, overlap). Adjacency rows (above) suit edges with per-edge values (a weight, a timestamp) or keys that aren't small integers, and `traverse` walks them.
+- **Writes:** `set_add` and `set_remove` are aggregate inputs, applied in commit order, with no read before the write.
+- **More:** reading, storage and large sets are in [Data modeling](data-modeling.md#sets-of-integers).
 
 ## Choosing a read
 | Need | Read |
