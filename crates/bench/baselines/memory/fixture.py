@@ -38,7 +38,7 @@ QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 SOURCES = {
     "lme_s": (
         "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json",
-        None,
+        "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
     ),
     "lme_m": (
         "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_m_cleaned.json",
@@ -46,7 +46,7 @@ SOURCES = {
     ),
     "locomo": (
         "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
-        None,
+        "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
     ),
 }
 
@@ -152,8 +152,12 @@ def locomo(path):
                 )
             last = t + len(conv[f"session_{n}"])
             n += 1
+        units = {m["unit"] for m in mems if m["ns"] == ns}
         for qa in c["qa"]:
-            if qa.get("category") == 5 or not qa.get("evidence"):
+            # A few evidence ids don't name a turn (malformed in the dataset): kept only if
+            # one does.
+            evidence = [e for e in qa.get("evidence") or [] if e in units]
+            if qa.get("category") == 5 or not evidence:
                 continue
             qs.append(
                 {
@@ -161,7 +165,7 @@ def locomo(path):
                     "question": qa["question"],
                     "date": last + 1,
                     "type": str(qa.get("category")),
-                    "evidence": qa["evidence"],
+                    "evidence": evidence,
                 }
             )
     return mems, qs

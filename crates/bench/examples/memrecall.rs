@@ -25,8 +25,10 @@
 //!   configuration (recall@5, recall@10, NDCG@10 over evidence sessions or turns, and the
 //!   recall latency's p50/p99 in µs, single-threaded and warm), then the latency by namespace
 //!   size for `fused` and `fused+graph`.
-//! - **`size`** writes the first `N` (100,000 by default) of `lme_m`'s memories into one
-//!   namespace for each element type, compacts, and prints the file size in bytes.
+//! - **`size`** writes the first `N` (100,000 by default, or as many unique ones as there
+//!   are) of `lme_m`'s memories into one namespace for each element type, compacts, and
+//!   prints the file size in bytes. With `f32`, it then times `lme_m`'s questions as fused
+//!   recalls over that one large namespace: the latency end the IVF question (T8) turns on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -384,7 +386,7 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         .filter(|&i| seen.insert(f.mems[i].text.as_str()))
         .take(n)
         .collect();
-    assert_eq!(picked.len(), n, "lme_m has fewer unique memories than {n}");
+    let n = picked.len();
     for el in ["f32", "f16", "bf16"] {
         let dir = db_dir.join(format!("size-{el}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -406,6 +408,36 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         db.compact().unwrap();
         db.close().unwrap();
         let bytes = dir_bytes(&dir);
+        if el == "f32" {
+            let db = open(&dir);
+            let store = Store::open(&db, STORE, &f.model).unwrap();
+            let mut us = Vec::new();
+            for pass in 0..2 {
+                for (q, v) in f.qs.iter().zip(&f.q_vecs) {
+                    let start = Instant::now();
+                    let hits = store
+                        .recall(&["size"])
+                        .text(q.text.clone())
+                        .embedding(v.clone())
+                        .k(10)
+                        .run()
+                        .unwrap();
+                    assert!(!hits.is_empty());
+                    if pass == 1 {
+                        us.push(start.elapsed().as_micros() as u64);
+                    }
+                }
+            }
+            println!(
+                "{}",
+                json!({
+                    "mode": "size-latency", "memories": n, "questions": us.len(),
+                    "p50_us": percentile(&mut us, 0.5), "p99_us": percentile(&mut us, 0.99),
+                })
+            );
+            drop(store);
+            db.close().unwrap();
+        }
         let text: u64 = picked.iter().map(|&i| f.mems[i].text.len() as u64).sum();
         println!(
             "{}",
