@@ -218,7 +218,8 @@ impl Runner for RocksDbTxnRunner {
         }
     }
 
-    /// The optimistic baseline's background work (D233), as [`super::rocksdb`] reads it.
+    /// The optimistic baseline's background work (D233), read as the plain-`DB` runner reads it
+    /// (`rocksdb::background`, private to the crate, so not linked from this public method).
     /// The pessimistic store reports none: this RocksDB crate exposes properties on a
     /// `TransactionDB` only in its multi-threaded mode.
     fn background(&self) -> Option<crate::Background> {
