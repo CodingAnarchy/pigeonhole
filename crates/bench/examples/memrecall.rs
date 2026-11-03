@@ -408,7 +408,9 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         .take(n)
         .collect();
     let n = picked.len();
-    for el in ["f32", "f16", "bf16"] {
+    // `MEMRECALL_ELEMENTS` (comma-separated) narrows the element types.
+    let elements = std::env::var("MEMRECALL_ELEMENTS").unwrap_or_else(|_| "f32,f16,bf16".into());
+    for el in elements.split(',') {
         let dir = db_dir.join(format!("size-{el}"));
         std::fs::create_dir_all(&dir).unwrap();
         let db = open(&dir);
