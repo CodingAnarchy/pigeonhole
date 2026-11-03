@@ -158,6 +158,10 @@ impl WatchBuilder {
     }
 }
 
+/// The most commits without memory events one [`Watch::poll_next`] passes over before it
+/// yields (wakes its task and returns `Pending`).
+pub const PASS_OVER_PER_POLL: usize = 64;
+
 /// A subscription to a store's memory events (D311 T9): each commit that touched a memory,
 /// once, in commit order, as a [`MemoryCommit`]. Commits that touched no memory (another
 /// table's, the store's own bookkeeping rows) are passed over.
@@ -208,8 +212,13 @@ impl Watch {
     ///
     /// The writer process only: in a reader process it's `Unsupported`; call
     /// [`next`](Self::next) on a thread of its own there.
+    ///
+    /// A call passes over at most [`PASS_OVER_PER_POLL`] such commits, then wakes its task
+    /// and returns `Pending`, so a burst of commits it doesn't want (other namespaces', for a
+    /// watch of several) doesn't keep one poll (and its executor thread) busy (cli692 on
+    /// #1438).
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemoryCommit>> {
-        loop {
+        for _ in 0..PASS_OVER_PER_POLL {
             match self.feed.poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
@@ -220,6 +229,8 @@ impl Watch {
                 }
             }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     /// [`poll_next`](Self::poll_next) as a future: the next commit with memory events,

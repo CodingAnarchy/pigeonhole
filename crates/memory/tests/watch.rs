@@ -321,3 +321,57 @@ fn next_async_in_the_writer_and_unsupported_in_a_reader() {
     drop(reader);
     db.close().unwrap();
 }
+
+/// cli692 on #1438: a burst of commits the watch passes over (another namespace's, for a
+/// watch of several, which reads every commit of the store) makes `poll_next` yield after
+/// `PASS_OVER_PER_POLL` of them (waking its task), rather than run through them all in one
+/// call; the memory event after the burst still arrives.
+#[test]
+fn poll_next_yields_during_a_burst_of_other_commits() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let mut w = store.watch(&["a", "b"]).open().unwrap();
+    let burst = 3 * pigeonhole_memory::PASS_OVER_PER_POLL + 5;
+    for i in 0..burst {
+        store
+            .remember("other", Memory::new(format!("not watched {i}")))
+            .unwrap();
+    }
+    let m = store
+        .remember("a", Memory::new("after the burst"))
+        .unwrap()
+        .id()
+        .clone();
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut pendings = 0;
+    let got = loop {
+        match w.poll_next(&mut cx) {
+            Poll::Ready(r) => break r.unwrap(),
+            Poll::Pending => {
+                pendings += 1;
+                assert!(pendings < 1000, "never became ready");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    assert_eq!(got.events, vec![MemoryEvent::Remembered(m)]);
+    // At least the burst's yields, each with a wake of its own.
+    assert!(pendings >= 3, "{pendings} pendings");
+    assert!(count.0.load(Ordering::SeqCst) >= 3);
+    db.close().unwrap();
+}
