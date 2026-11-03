@@ -458,6 +458,24 @@ impl ShardArena {
         blocks.saturating_sub(broken)
     }
 
+    /// [`blocks_left`](Self::blocks_left) as if every chunk were free: whether a batch could
+    /// ever find its run, judged on an empty arena (one run of all its chunks). A commit
+    /// for which this is 0 can never be admitted, so it fails at once rather than waiting
+    /// for room that freeing everything still wouldn't give (#1403).
+    pub fn blocks_left_when_empty(&self, chunks: usize, removed: usize) -> usize {
+        let chunks = chunks.max(1);
+        let n = self.free.len();
+        if n < chunks {
+            return 0;
+        }
+        let blocks = n / chunks;
+        let first_cost = n % chunks + 1;
+        if removed < first_cost {
+            return blocks;
+        }
+        blocks.saturating_sub(1 + (removed - first_cost) / chunks)
+    }
+
     /// Calls `f(first, count)` for each run of free chunks.
     fn free_runs_each(&self, mut f: impl FnMut(usize, usize)) {
         let n = self.free.len();

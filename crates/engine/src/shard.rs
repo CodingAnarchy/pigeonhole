@@ -4154,8 +4154,17 @@ impl ShardState {
     ///
     /// An entry larger than a chunk needs contiguous free chunks, which free bytes scattered
     /// across the arena do not provide. So this also returns the largest and smallest such
-    /// entry's size in chunks, and how many chunks the batch's allocations can take in all
-    /// (each entry at most its own, each slot it creates one).
+    /// entry's size in chunks, and how many chunks the batch's allocations can take in all:
+    /// each large entry its own run, each slot it creates one, and the small entries (within
+    /// a chunk) at most one each, but also at most what their bytes can fill (#1403). Small
+    /// entries pack into a memtable's current run, and one takes a new chunk only when it
+    /// doesn't fit the rest, losing a tail shorter than itself. So in each memtable every
+    /// chunk small entries took but its last is filled by their bytes and tails, or was left
+    /// by a large entry starting a run of its own. That bounds their chunks by `⌊(their bytes
+    /// + their waste) / chunk⌋`, plus one per slot touched and one per large entry, plus one
+    /// for the arena's first chunk (its 64-byte prefix). Charging them one chunk each made a
+    /// batch of thousands of small entries (a long memory's postings) need more chunks than
+    /// the arena has, so it was refused room even on an empty arena.
     /// Also leaves in `rows` the hash of each row the batch writes (once per run of writes
     /// to one row), which `touch_rows` records if the member is admitted.
     ///
@@ -4167,7 +4176,8 @@ impl ShardState {
         let mut total = 0usize;
         let mut waste = 0usize;
         let mut largest = 0usize;
-        let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
+        let (mut large_chunks, mut large_entries, mut min_large) = (0usize, 0usize, usize::MAX);
+        let (mut small_entries, mut small_bytes) = (0usize, 0usize);
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
@@ -4187,9 +4197,14 @@ impl ShardState {
             largest = largest.max(entry);
             // The arena's first chunk loses a 64-byte prefix.
             let chunks = (entry + 64).div_ceil(self.chunk_size);
-            alloc_chunks += chunks;
             if chunks > 1 {
+                large_chunks += chunks;
+                large_entries += 1;
                 min_large = min_large.min(chunks);
+            } else {
+                // Its bytes and the most it can waste (a tail shorter than it).
+                small_entries += 1;
+                small_bytes += 2 * entry;
             }
             let tablet = match last {
                 Some((run, tablet)) if run == k.run => tablet,
@@ -4214,6 +4229,8 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
+        let small_chunks = small_entries
+            .min(small_bytes / self.chunk_size + touched.len() + unrouted + large_entries + 1);
         ArenaNeed {
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
@@ -4222,7 +4239,7 @@ impl ShardState {
             } else {
                 min_large
             },
-            alloc_chunks: alloc_chunks + new_slots,
+            alloc_chunks: large_chunks + small_chunks + new_slots,
         }
     }
 
@@ -4405,8 +4422,16 @@ impl ShardState {
             if let (Some(g), Some(mark)) = (group, mark) {
                 g.slots.truncate(mark);
             }
-            // Whether it could ever fit is judged on its own, as if first in its group.
-            return Err(if need.bytes + 2 * self.chunk_size > total {
+            // Whether it could ever fit is judged on its own, as if first in its group, and
+            // on both counts: its bytes, and its largest entry's run in an empty arena. One
+            // that only the run check refuses would otherwise wait for room that freeing
+            // everything wouldn't give, and fail `Busy` at every stall timeout (#1403).
+            let never_run = need.run_chunks > 1
+                && self
+                    .arena
+                    .blocks_left_when_empty(need.run_chunks, need.alloc_chunks - need.min_large)
+                    == 0;
+            return Err(if need.bytes + 2 * self.chunk_size > total || never_run {
                 Room::Never
             } else {
                 Room::Wait

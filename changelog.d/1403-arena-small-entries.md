@@ -1,0 +1,2 @@
+### Fixed
+- A commit of many small cells (more than a shard's arena has chunks, such as a long memory's text postings in `pigeonhole-memory`) with one cell larger than an arena chunk is admitted. Admission charged each small cell a whole chunk, so such a commit was refused room even on an empty arena and failed `Busy` after every write-stall timeout (#1403). A commit that could never fit an empty arena now fails `BatchTooLarge` at once.
