@@ -491,7 +491,6 @@ impl KeyCursor {
                     pinned: None,
                     pending: false,
                     done: true,
-                    plain: None,
                 },
                 filter,
                 opts,
