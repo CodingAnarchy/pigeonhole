@@ -286,3 +286,25 @@ fn a_condition_that_fails_keeps_the_resolver() {
     db.compact();
     db.check(&one(), false, "a counter family");
 }
+
+/// simp724's last case on #1283: after a split, both tablets read the one compacted SST,
+/// which holds rows past the left tablet's end. Each tablet's plain lane stops at its own
+/// end, and the reduction still equals the scan.
+#[test]
+fn a_shared_sst_after_a_split_reads_plain_within_each_tablet() {
+    let mut db = Db::open(FamilyOptions::default());
+    db.write_versions();
+    db.flush();
+    db.compact();
+    for at in [row(ROWS / 3), row(2 * ROWS / 3)] {
+        let split = db.engine.split_tablet_pending(db.table, &at).unwrap();
+        drive(&mut db.shards, split).unwrap();
+    }
+    let snap = db.engine.snapshot().unwrap();
+    let (reduced, plain_lanes, scanned) = db.both(&snap, &one());
+    assert_eq!(reduced, scanned, "the reduction differs from the scan");
+    assert!(plain_lanes >= 3, "a plain lane per tablet: {plain_lanes}");
+    // No row twice, none missing.
+    let rows: std::collections::BTreeSet<_> = reduced.iter().map(|c| c.0.clone()).collect();
+    assert_eq!(rows.len(), ROWS as usize);
+}
