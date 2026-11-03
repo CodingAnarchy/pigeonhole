@@ -1,0 +1,42 @@
+[package]
+name = "pigeonhole-ruby"
+description = "Ruby bindings for Pigeonhole (the `pigeonhole` gem), over magnus and rb-sys (#697, ICR 0111)."
+# A workspace of its own (the root workspace excludes it: building it needs a Ruby with headers).
+# These follow the root's `[workspace.package]`; the version is the public line's (D295).
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/CodingAnarchy/pigeonhole"
+authors = ["Matt Tanous <matt.tanous@hey.com>"]
+publish = false
+
+[lib]
+name = "pigeonhole_native"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+pigeonhole = { path = "../pigeonhole", version = "1.0.0" }
+# `bytes`: `RString::to_bytes`, the safe copy of a String's bytes.
+magnus = { version = "0.9", features = ["bytes"] }
+# `gvl.rs` only: `rb_thread_call_without_gvl2`, which magnus doesn't wrap (ICR 0111, O3).
+rb-sys = "0.9"
+
+# The root workspace's lints.
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+
+[workspace]
+
+# As the root workspace's release profile, which the shipped extension is built with.
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,299 @@
+# The Ruby API's snapshot (ICR 0111): every public class and method of the `pigeonhole` gem.
+# test/test_signatures.rb fails if a class's public methods and these declarations differ,
+# and the suite runs under `rbs test`'s runtime checking.
+module Pigeonhole
+  VERSION: String
+  NATIVE_VERSION: String
+
+  # `:none`, `:buffered`, `:group_sync` or `:sync`.
+  type durability = :none | :buffered | :group_sync | :sync
+
+  # A family, table or kind name.
+  type name = String | Symbol
+
+  # A cell value: a String is bytes, an Integer an i64, a Float an f64.
+  type value = String | Integer | Float
+
+  type path = String | ::_ToPath
+
+  # One cell of a row: its family, qualifier and version.
+  type entry = [String, String, Cell]
+
+  def self.open: (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
+                  ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
+                  ?shm_dir: path?, ?read_only_fallback: bool?) -> Database
+               | [T] (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
+                      ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
+                      ?shm_dir: path?, ?read_only_fallback: bool?) { (Database) -> T } -> T
+
+  def self.open_reader: (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) -> Reader
+                      | [T] (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) { (Reader) -> T } -> T
+
+  # A Pigeonhole error. A code's subclass carries the code's name and number; a plain
+  # `Error` (no code) is a mutation, batch or transaction used after it was spent.
+  class Error < StandardError
+    attr_reader code: String?
+    attr_reader code_num: Integer?
+
+    def initialize: (?String? message, ?String? code, ?Integer? code_num) -> void
+  end
+
+  class Io < Error
+  end
+
+  class Corruption < Error
+  end
+
+  class WriterLocked < Error
+  end
+
+  class ShmVersionMismatch < Error
+  end
+
+  class ShmUnavailable < Error
+  end
+
+  class UnsupportedFormat < Error
+  end
+
+  class NetworkFilesystem < Error
+  end
+
+  class TableNotFound < Error
+  end
+
+  class TableExists < Error
+  end
+
+  class FamilyNotFound < Error
+  end
+
+  class FamilyExists < Error
+  end
+
+  class UnknownMergeOperator < Error
+  end
+
+  class MergeFailed < Error
+  end
+
+  class Conflict < Error
+  end
+
+  class ReadOnly < Error
+  end
+
+  class KeyTooLarge < Error
+  end
+
+  class ValueTooLarge < Error
+  end
+
+  class NoSpace < Error
+  end
+
+  class InvalidArgument < Error
+  end
+
+  class Unsupported < Error
+  end
+
+  class Closed < Error
+  end
+
+  class NoReaderSlot < Error
+  end
+
+  class RecordTooLarge < Error
+  end
+
+  class Busy < Error
+  end
+
+  class SnapshotExpired < Error
+  end
+
+  class WouldDeadlock < Error
+  end
+
+  class BatchTooLarge < Error
+  end
+
+  class OutcomeUnknown < Error
+  end
+
+  class NoWriter < Error
+  end
+
+  class UnsupportedFeature < Error
+  end
+
+  class FeedExpired < Error
+  end
+
+  # The open database, as the writer process.
+  class Database
+    def table: (name name) -> TableBuilder
+    def tables: () -> Array[String]
+    def drop_table: (name name) -> nil
+    def snapshot: (?durable: bool) -> Snapshot
+                | [T] (?durable: bool) { (Snapshot) -> T } -> T
+    def write_batch: () -> WriteBatch
+                   | [T] () { (WriteBatch) -> T } -> T
+    def transaction: () -> Transaction
+                   | [T] () { (Transaction) -> T } -> T
+    def transact: [T] (?max_attempts: Integer?, ?deadline: Numeric?, ?durability: durability?) { (Transaction) -> T } -> T
+    def flush: () -> nil
+    def compact: () -> nil
+    def close: () -> nil
+    def closed?: () -> bool
+  end
+
+  # A database opened as a reader process.
+  class Reader
+    def table: (name name) -> Table
+    def tables: () -> Array[String]
+    def snapshot: (?durable: bool) -> Snapshot
+                | [T] (?durable: bool) { (Snapshot) -> T } -> T
+    def close: () -> nil
+    def closed?: () -> bool
+  end
+
+  class TableBuilder
+    def family: (name name, ?Family? options) -> self
+    def create: () -> Table
+    def create_if_missing: () -> Table
+    def open: () -> Table
+  end
+
+  class Table
+    def name: () -> String
+    def families: () -> Array[String]
+    def family_info: (name family) -> FamilyInfo?
+    def get: (String row, name family, String qualifier, ?snapshot: Snapshot?) -> Cell?
+    def row: (String row, ?families: Array[name]?, ?qualifier_prefix: String?, ?versions: Integer,
+              ?column_limit: Integer?, ?snapshot: Snapshot?) -> Row?
+    def scan: (?String? prefix, ?start: String?, ?end: String?, ?families: Array[name]?,
+               ?qualifier_prefix: String?, ?versions: Integer, ?limit: Integer?,
+               ?column_limit: Integer?, ?snapshot: Snapshot?, ?chunk: Integer) -> Enumerator[Row, void]
+    def mutate: (String row) -> Mutation
+    def put: (String row, name family, String qualifier, value value, ?ts: Integer?,
+              ?durability: durability?) -> Integer
+    def incr: (String row, name family, String qualifier, Integer delta, ?ts: Integer?,
+               ?durability: durability?) -> Integer
+    def delete: (String row, ?name? family, ?String? qualifier, ?ts: Integer?,
+                 ?durability: durability?) -> Integer
+    def inspect: () -> String
+  end
+
+  # Writes to one row, committed atomically.
+  class Mutation
+    def put: (name family, String qualifier, value value, ?ts: Integer?) -> self
+    def put_u64: (name family, String qualifier, Integer value, ?ts: Integer?) -> self
+    def incr: (name family, String qualifier, Integer delta, ?ts: Integer?) -> self
+    def aggregate: (name family, String qualifier, Integer | Float | String value, ?ts: Integer?) -> self
+    def delete: (?name? family, ?String? qualifier, ?ts: Integer?) -> self
+    def durability: (durability durability) -> self
+    def commit: () -> Integer
+    def commit_if: (Condition condition) -> Integer?
+  end
+
+  # Writes to any rows and tables, committed atomically.
+  class WriteBatch
+    def put: (Table table, String row, name family, String qualifier, value value, ?ts: Integer?) -> self
+    def put_u64: (Table table, String row, name family, String qualifier, Integer value, ?ts: Integer?) -> self
+    def incr: (Table table, String row, name family, String qualifier, Integer delta, ?ts: Integer?) -> self
+    def aggregate: (Table table, String row, name family, String qualifier, Integer | Float | String value,
+                    ?ts: Integer?) -> self
+    def delete: (Table table, String row, ?name? family, ?String? qualifier, ?ts: Integer?) -> self
+    def commit: (?durability: durability?) -> Integer
+    def size: () -> Integer
+    def length: () -> Integer
+  end
+
+  # An optimistic transaction.
+  class Transaction
+    def put: (Table table, String row, name family, String qualifier, value value, ?ts: Integer?) -> self
+    def put_u64: (Table table, String row, name family, String qualifier, Integer value, ?ts: Integer?) -> self
+    def incr: (Table table, String row, name family, String qualifier, Integer delta, ?ts: Integer?) -> self
+    def aggregate: (Table table, String row, name family, String qualifier, Integer | Float | String value,
+                    ?ts: Integer?) -> self
+    def delete: (Table table, String row, ?name? family, ?String? qualifier, ?ts: Integer?) -> self
+    def get: (Table table, String row, name family, String qualifier) -> Cell?
+    def get_row: (Table table, String row, Array[name] families) -> Row?
+    def commit: (?durability: durability?) -> Integer
+    def rollback: () -> nil
+  end
+
+  class Snapshot
+    def seqno: () -> Integer
+    def release: () -> nil
+  end
+
+  # One version of a cell.
+  class Cell
+    def value: () -> String
+    def ts: () -> Integer
+    def typed: () -> (String | Integer | Float | nil)
+    def as_int: () -> Integer?
+    def as_u64: () -> Integer?
+    def as_float: () -> Float?
+    def hll_estimate: () -> Integer?
+    def sum_f64: () -> Float?
+    def mean_var: () -> [Integer, Float, Float]?
+    def histogram_counts: () -> Array[Integer]?
+    def quantile: (Numeric q) -> Float?
+    def bloom_contains: (Integer | String element) -> bool?
+    def ==: (untyped other) -> bool
+    def inspect: () -> String
+  end
+
+  # A row's key and cells; Enumerable over `[family, qualifier, cell]`.
+  class Row
+    include Enumerable[entry]
+
+    def key: () -> String
+    def get: (name family, String qualifier) -> Cell?
+    def cells: () -> Array[entry]
+    def size: () -> Integer
+    def length: () -> Integer
+    def each: () { (entry) -> void } -> self
+            | () -> Enumerator[entry, self]
+    def inspect: () -> String
+  end
+
+  # A column family's options.
+  class Family
+    def self.new: (?max_versions: Integer?, ?ttl: Numeric?, ?bloom_bits: Integer?, ?block_size: Integer?,
+                   ?blob_threshold: Integer?, ?compression: name?, ?zstd_level: Integer?) -> Family
+    def self.counter: (?max_versions: Integer?, ?ttl: Numeric?) -> Family
+    def self.aggregate: (name kind, ?bounds: Array[Numeric]?, ?mantissa_bits: Integer?, ?max_buckets: Integer?,
+                         ?bits: Integer?, ?hashes: Integer?, ?max_versions: Integer?, ?ttl: Numeric?) -> Family
+  end
+
+  # A family's stored options.
+  class FamilyInfo
+    def name: () -> String
+    def counter?: () -> bool
+    def aggregation: () -> Symbol?
+    def max_versions: () -> Integer
+    def ttl: () -> Float?
+    def bloom_bits: () -> Integer
+    def blob_threshold: () -> Integer
+    def block_size: () -> Integer
+    def compression: () -> Symbol
+    def zstd_level: () -> Integer?
+    def merge_operator: () -> String?
+    def cache_priority: () -> Symbol
+    def compaction: () -> Symbol
+    def family: () -> Family
+    def inspect: () -> String
+  end
+
+  # A condition a row must meet for `Mutation#commit_if` to apply.
+  class Condition
+    def self.absent: (name family, String qualifier) -> Condition
+    def self.exists: (name family, String qualifier) -> Condition
+    def self.equals: (name family, String qualifier, String value) -> Condition
+  end
+end

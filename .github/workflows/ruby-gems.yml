@@ -1,0 +1,60 @@
+name: Ruby gems
+
+# Precompiled native gems for every platform the bindings support, as artifacts (#697, ICR
+# 0111). Nothing is pushed to RubyGems: the first publish is the owner's call, and gets its
+# own workflow. The source-gem fallback follows in its own PR: a source gem needs a
+# standalone Cargo.toml (this crate inherits the workspace's).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.lock'
+      - '.github/workflows/ruby-gems.yml'
+  pull_request:
+    paths:
+      - 'crates/ruby/Cargo.toml'
+      - 'crates/ruby/pigeonhole.gemspec'
+      - 'crates/ruby/Rakefile'
+      - 'crates/ruby/extconf.rb'
+      - '.github/workflows/ruby-gems.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native gem (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux
+          - aarch64-linux
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-darwin
+          - arm64-darwin
+          - x64-mingw-ucrt
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+          working-directory: crates/ruby
+      - uses: oxidize-rb/actions/cross-gem@v1
+        id: cross-gem
+        with:
+          platform: ${{ matrix.platform }}
+          ruby-versions: '3.3,3.4,4.0'
+          working-directory: crates/ruby
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: ${{ steps.cross-gem.outputs.gem-path }}
+          if-no-files-found: error
+

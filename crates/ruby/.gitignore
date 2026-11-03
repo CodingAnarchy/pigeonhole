@@ -1,0 +1,7 @@
+# rake-compiler build output and the compiled extension.
+/tmp/
+/pkg/
+/lib/pigeonhole/*.bundle
+/lib/pigeonhole/*.so
+/lib/pigeonhole/*.dll
+/lib/pigeonhole/[0-9]*/

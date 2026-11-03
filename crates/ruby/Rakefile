@@ -1,0 +1,45 @@
+# frozen_string_literal: true
+
+require "rake/testtask"
+require "rake/extensiontask"
+
+GEMSPEC = Gem::Specification.load("pigeonhole.gemspec")
+
+# rake-compiler drives extconf.rb (beside Cargo.toml), whose `create_rust_makefile` builds
+# this crate (`pigeonhole-ruby`; its library target is `pigeonhole_native`).
+Rake::ExtensionTask.new("pigeonhole_native", GEMSPEC) do |ext|
+  ext.lib_dir = "lib/pigeonhole"
+  ext.ext_dir = "."
+  # Native gems (ruby-gems.yml, oxidize-rb's cross-gem over rb-sys-dock): `rake native:<platform> gem`.
+  ext.cross_compile = true
+  ext.cross_platform = %w[
+    x86_64-linux aarch64-linux x86_64-linux-musl aarch64-linux-musl
+    x86_64-darwin arm64-darwin x64-mingw-ucrt
+  ]
+end
+
+Rake::TestTask.new(:test) do |t|
+  t.libs << "test" << "lib"
+  t.test_files = FileList["test/**/test_*.rb"]
+end
+
+# The suite under `rbs test`'s runtime checking: every call into `Pigeonhole::*` the tests
+# make is checked against sig/pigeonhole.rbs.
+Rake::TestTask.new("test:rbs") do |t|
+  t.libs << "test" << "lib"
+  t.test_files = FileList["test/**/test_*.rb"]
+  t.ruby_opts << "-rrbs/test/setup"
+end
+task "test:rbs:env" do
+  ENV["RBS_TEST_TARGET"] = "Pigeonhole::*"
+  ENV["RBS_TEST_OPT"] = "-I sig"
+  ENV["RBS_TEST_LOGLEVEL"] ||= "error"
+end
+task "test:rbs" => "test:rbs:env"
+
+desc "Validate sig/pigeonhole.rbs"
+task "rbs:validate" do
+  sh "rbs", "-I", "sig", "validate"
+end
+
+task default: %i[compile test]
