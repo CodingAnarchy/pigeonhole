@@ -243,12 +243,18 @@ fn check(
             let above = graphed.iter().filter(|v| **v > g.value).count();
             assert_eq!(g.rank as usize, above + 1, "{ctx}: graph rank");
         }
-        let want: f64 = [s.vector, s.keyword, s.recency, s.importance, s.uses]
-            .iter()
-            .flatten()
-            .map(|x| 1.0 / (60.0 + f64::from(x.rank)))
-            .sum::<f64>()
-            + s.graph.map_or(0.0, |g| 0.5 / (60.0 + f64::from(g.rank)));
+        let w = Weights::default();
+        let want: f64 = [
+            (s.vector, w.vector),
+            (s.keyword, w.keyword),
+            (s.recency, w.recency),
+            (s.importance, w.importance),
+            (s.uses, w.uses),
+            (s.graph, w.graph),
+        ]
+        .iter()
+        .filter_map(|(x, w)| x.map(|x| w / (60.0 + f64::from(x.rank))))
+        .sum();
         assert!(
             (h.score - want).abs() <= 1e-12,
             "{ctx}: score {} vs {want}",

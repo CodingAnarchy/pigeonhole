@@ -61,7 +61,7 @@
   - **What a hit carries:** `.with_signals(bool)` and `.with_embeddings(bool)`.
   - **Running it:** `run() -> Result<Vec<RecallHit>>` and `run_with_stats() -> Result<(Vec<RecallHit>, RecallStats)>`.
 - **`Fusion`** (`#[non_exhaustive]`, default `Rrf`): `Rrf` or `Linear`.
-- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph` (default 0.5).
+- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1 but `recency`, 0.25 since T5: D311's call 4 amendment): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph` (default 0.5).
 - **`RecallHit`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `created_us`, `superseded_by: Option<MemoryId>` (set only under `include_superseded`; cli692's S1 on #1374), `score`, `signals: Option<Signals>` and `embedding: Option<Vec<f32>>`.
 - **The signal types** are `#[non_exhaustive]`:
   - `Signals` has `vector`, `keyword`, `recency`, `importance` and `uses`, each an `Option<Signal>`;

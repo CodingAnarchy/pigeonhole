@@ -202,3 +202,50 @@ With an embedding model, a store can catch near duplicates as well as exact ones
 
 ## Reader processes
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
+
+## How well it recalls
+These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX102 (D311 T5, #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision.
+- **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
+- **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
+
+Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks the memory hits as returned, and counts each evidence session or turn once, at its first hit. So it's over memories, and may differ from LongMemEval's own session-level NDCG:
+
+| | LongMemEval-S | LoCoMo |
+|---|---|---|
+| vector | 0.955 / 0.974 / 0.853 | 0.545 / 0.658 / 0.426 |
+| keyword | 0.957 / 0.974 / 0.864 | 0.511 / 0.587 / 0.409 |
+| recency | 0.047 / 0.109 / 0.045 | 0.003 / 0.011 / 0.004 |
+| **fused, default weights** (`recency` 0.25) | 0.964 / 0.981 / 0.871 | 0.583 / 0.658 / 0.454 |
+| fused, `recency` at 1 (the default before 1.1.0) | 0.964 / 0.979 / 0.789 | 0.553 / 0.642 / 0.409 |
+| fused, `recency` at 0.5 | 0.968 / 0.981 / 0.855 | 0.581 / 0.655 / 0.444 |
+| fused, `recency` at 0 | 0.960 / 0.987 / 0.883 | 0.583 / 0.658 / 0.457 |
+| fused, `recency` at 1, `expand(Expand::hops(1))` | 0.951 / 0.977 / 0.751 | 0.541 / 0.666 / 0.400 |
+
+- **Fused beats any one signal** at the default weights, on both benchmarks. That's why recency's default is 0.25 and not 1. At 1, recency outweighed what was asked, and ranking quality fell below keyword alone (NDCG 0.789 against 0.864 on LongMemEval-S). Neither benchmark asks about recent events, so recency there is noise, and 0 does slightly better still. But agents' questions often do lean on what happened lately, so the default keeps some pull. Raise it with `Weights` (per call) for an agent that asks mostly about recent events.
+- **These runs set `uses` with `recency`,** but neither dataset marks memories used, so the use signal is empty and only recency's weight matters.
+- **The graph signal** (measured with `recency` at 1) here follows only each turn's link to the previous turn of its session, the one link every application can write. Recall is about level (+0.008 recall@10 on LoCoMo, about 12 of 1,531 questions), and ranking quality drops on both. Links that carry meaning (entities, `derived_from`) are what it's for.
+- **`f16` and `bf16` embeddings** recall the same as `f32`, to within 0.001 on every LongMemEval-S row.
+- **Fuzzy keyword terms** (`Fuzziness::Auto` on words of 5 or more letters) don't help. Recall@10 changes by under a point either way, and the keyword search takes 18 to 100 times as long. Recall doesn't take a fuzziness option for that reason.
+
+**Latency,** fused, `k = 10`, warm, one thread, measured with `recency` at 1 (weights don't change the work a recall does). The last two rows have 50 questions, so their "p99" is the slowest of 50:
+
+| namespace size | p50 | p99 | with `expand(hops(1))`, p50 / p99 |
+|---|---|---|---|
+| ~250 memories (LongMemEval-S) | 2.0 ms | 3.7 ms | 9.9 / 33 ms |
+| ~590 (LoCoMo) | 1.3 ms | 4.3 ms | 2.8 / 5.7 ms |
+| ~2,400 (LongMemEval-M) | 7.9 ms | 14.6 ms | 15.9 / 37 ms |
+| 94,000 in one namespace | 68 ms | 107 ms | |
+
+At 94,000 memories, the exact vector search is 37 ms of that (p50) and the keyword search 28 ms (slowest 66 ms). Both grow with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. In a single namespace of 100,000, an approximate vector index (IVF, D311 T8) would take the vector part off, but not the keyword part.
+
+**Size,** per 100,000 LongMemEval memories (about 2 KB of text each, 1.1 KB once compressed), in use after a full compaction:
+
+| embeddings | the store | embeddings | the keyword index | the text | other |
+|---|---|---|---|---|---|
+| `f32` | 962 MB | 159 MB | 637 MB | 116 MB | 50 MB |
+| `f16` | 882 MB | 82 MB | 637 MB | 116 MB | 47 MB |
+| `bf16` | 879 MB | 82 MB | 637 MB | 116 MB | 44 MB |
+
+- **The keyword index is most of the store** with text this long, about 5.5 times the compressed text. It keeps a posting for every distinct term of every memory (the memory's id, with the term's frequency and the memory's length), plus each memory's own terms so a delete can find its postings.
+- **"Other"** is the memories' metadata and use counts, the dedup rows, and what the file's extents hold beyond their data.
+- **Half-precision embeddings** save 8%.
