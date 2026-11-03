@@ -48,6 +48,9 @@ pub struct LoopStep {
     /// The namespaces keep their pending time, so they're due again at the next step, not
     /// after `min_age`.
     pub stopped: Vec<(String, ConsolidatePass)>,
+    /// Whether a [`LoopInterrupter`] ended this step's wait early (the step then ran the
+    /// passes due and saved, as at the end of its timeout).
+    pub interrupted: bool,
     /// When the next pass is due, µs since the Unix epoch, if any namespace is pending.
     pub next_due: Option<u64>,
     /// Where the loop is, as saved: the watch's position, for callers that checkpoint
@@ -137,6 +140,27 @@ pub struct ConsolidateLoop {
     namespaces: Vec<String>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     state: Option<(Watch, Saved)>,
+    /// Set by a [`LoopInterrupter`]; taken by the step whose wait it ends.
+    interrupt: Arc<AtomicBool>,
+}
+
+/// How often a step's wait checks for an interrupt.
+const INTERRUPT_SLICE: Duration = Duration::from_millis(50);
+
+/// Ends a [`ConsolidateLoop`]'s current wait early, from another thread
+/// ([`ConsolidateLoop::interrupter`]): the step stops waiting for new memories, runs the
+/// passes that are due, saves its position and returns, with
+/// [`LoopStep::interrupted`] set. If no step is waiting, the next one returns at once. It
+/// can't cut a pass short: a consolidator call runs to its end. For a binding whose caller
+/// was interrupted, or a shutdown (perf2 on #1441).
+#[derive(Debug, Clone)]
+pub struct LoopInterrupter(Arc<AtomicBool>);
+
+impl LoopInterrupter {
+    /// Ends the current or next step's wait (within about 50 ms).
+    pub fn interrupt(&self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 // Owned and `Send`, so a binding can keep one across calls or move it to a worker thread
@@ -169,6 +193,7 @@ impl ConsolidateLoop {
             namespaces: Vec::new(),
             clock: Box::new(now_us),
             state: None,
+            interrupt: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -216,8 +241,9 @@ impl ConsolidateLoop {
         }
         let min_age = self.min_age_us();
         let mut events = 0usize;
-        // 1. Read events until `timeout` (real time), or until the first pending namespace
-        //    falls due (on the loop's clock).
+        let mut interrupted = false;
+        // 1. Read events until `timeout` (real time), until the first pending namespace
+        //    falls due (on the loop's clock), or until an interrupt.
         let started = std::time::Instant::now();
         loop {
             let (_, saved) = self.state.as_ref().expect("started");
@@ -231,8 +257,14 @@ impl ConsolidateLoop {
             {
                 wait = wait.min(Duration::from_micros(due.saturating_sub(now)));
             }
+            // In slices, so an interrupt (`LoopInterrupter`) ends the wait within one.
+            if self.interrupt.swap(false, Ordering::AcqRel) {
+                interrupted = true;
+                break;
+            }
+            let sliced = wait > INTERRUPT_SLICE;
             let (watch, _) = self.state.as_mut().expect("started");
-            let commit = match watch.next(wait) {
+            let commit = match watch.next(wait.min(INTERRUPT_SLICE)) {
                 Ok(c) => c,
                 Err(Error::Db(e)) if e.code() == ErrorCode::FeedExpired => {
                     // Its history is gone: catch up by a scan, keeping the generation.
@@ -244,7 +276,12 @@ impl ConsolidateLoop {
                 }
                 Err(e) => return Err(e),
             };
-            let Some(commit) = commit else { break };
+            let Some(commit) = commit else {
+                if sliced {
+                    continue;
+                }
+                break;
+            };
             events += commit.events.len();
             let (_, saved) = self.state.as_mut().expect("started");
             for e in &commit.events {
@@ -318,6 +355,7 @@ impl ConsolidateLoop {
             passes,
             failed,
             stopped,
+            interrupted,
             next_due: saved
                 .pending
                 .values()
@@ -325,6 +363,12 @@ impl ConsolidateLoop {
                 .min(),
             token,
         })
+    }
+
+    /// A handle that ends this loop's waits early, from another thread: see
+    /// [`LoopInterrupter`].
+    pub fn interrupter(&self) -> LoopInterrupter {
+        LoopInterrupter(Arc::clone(&self.interrupt))
     }
 
     /// When the next pass is due (µs since the Unix epoch), as of the last step; `None`

@@ -3,3 +3,4 @@
 - `pigeonhole-memory`: `Store::consolidate_loop` runs consolidation passes as new memories arrive, through the change feed (D311 T9, #1343): a namespace's pass once its oldest new memory is the policy's `min_age` old, with the loop's position kept in the store so it resumes after a restart.
 - `pigeonhole-memory`: `Watch::next_async` and `Watch::poll_next` wait for memory events without holding a thread, in the writer process (D311 T9, on D310's async feeds).
 - `pigeonhole-memory`: a consolidator can return `ConsolidateStopped` to say it stopped rather than failed: a `ConsolidateLoop` then keeps the namespace due at its next step instead of postponing it by `min_age`, and lists it in `LoopStep::stopped`.
+- `pigeonhole-memory`: `ConsolidateLoop::interrupter` gives a handle that ends a step's wait early from another thread; the step then runs what's due, saves and returns with `LoopStep::interrupted` set.
