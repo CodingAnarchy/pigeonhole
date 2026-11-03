@@ -430,6 +430,19 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         }
         drop(store);
         db.compact().unwrap();
+        // What the data takes: the file less the space no extent holds (a full compaction
+        // rewrites and frees, and the file doesn't shrink), split by table and family.
+        let info = db.info().unwrap();
+        let used = info.file_bytes - info.free_bytes.unwrap_or(0);
+        let mut parts = serde_json::Map::new();
+        for t in &info.tables {
+            for st in &t.storage {
+                let b = st.sst_bytes() + st.blob_live_bytes;
+                if b > 0 {
+                    parts.insert(format!("{}/{}", t.name, st.family), json!(b));
+                }
+            }
+        }
         db.close().unwrap();
         let bytes = dir_bytes(&dir);
         if el == "f32" {
@@ -466,8 +479,9 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
         println!(
             "{}",
             json!({
-                "mode": "size", "element": el, "memories": n, "bytes": bytes, "busy_retries": busy,
-                "bytes_per_100k": bytes as f64 * 100_000.0 / n as f64,
+                "mode": "size", "element": el, "memories": n, "file_bytes": bytes, "busy_retries": busy,
+                "used_bytes": used, "used_per_100k": used as f64 * 100_000.0 / n as f64,
+                "by_family": parts,
                 "text_bytes": text, "embedding_bytes_raw": n as u64 * f.dim as u64 * match el { "f32" => 4, _ => 2 },
             })
         );
