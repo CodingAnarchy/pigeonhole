@@ -351,8 +351,8 @@ fn index_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
 /// `Pigeonhole::Memory`'s native classes (PR 3a); `lib/pigeonhole/memory.rb` adds the rest.
 fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     use classes::{
-        ConsolidatePolicy, EmbeddingModel, Expand, ForgetPolicy, Memory, MemoryId, NearDedup,
-        ReadStore, Store, Weights,
+        ConsolidatePolicy, EmbeddingModel, Expand, ForgetPolicy, IvfOptions, Memory, MemoryId,
+        NearDedup, ReadStore, Store, Weights,
     };
     let mm = m.define_module("Memory")?;
     // `ConsolidateError`'s code number (memory.rb builds it).
@@ -443,15 +443,28 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_method("text", method!(Memory::text, 0))?;
     c.define_method("inspect", method!(Memory::inspect, 0))?;
 
+    let c = class(ruby, mm, "IvfOptions")?;
+    let s = c.singleton_class()?;
+    s.define_private_method("native_new", function!(IvfOptions::native_new, 3))?;
+    c.define_method(
+        "min_namespace_len",
+        method!(IvfOptions::min_namespace_len, 0),
+    )?;
+    c.define_method("nprobe", method!(IvfOptions::nprobe, 0))?;
+    c.define_method("target_list_len", method!(IvfOptions::target_list_len, 0))?;
+    c.define_method("==", method!(IvfOptions::eq, 1))?;
+    c.define_method("inspect", method!(IvfOptions::inspect, 0))?;
+
     let c = class(ruby, mm, "Store")?;
     let s = c.singleton_class()?;
-    s.define_private_method("native_create", function!(Store::create, 7))?;
+    s.define_private_method("native_create", function!(Store::create, 8))?;
     s.define_private_method("native_open", function!(Store::open, 3))?;
     s.define_private_method("native_open_reader", function!(Store::open_reader, 3))?;
     c.define_method("close", method!(Store::close, 0))?;
     c.define_method("closed?", method!(Store::is_closed, 0))?;
     c.define_method("embedding_model", method!(Store::embedding_model, 0))?;
     c.define_method("normalization", method!(Store::normalization, 0))?;
+    c.define_method("ivf", method!(Store::ivf, 0))?;
     c.define_private_method("native_remember", method!(Store::remember, 9))?;
     c.define_private_method("native_remember_in", method!(Store::remember_in, 10))?;
     c.define_method("delete", method!(Store::delete, 1))?;
@@ -476,6 +489,7 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_method("closed?", method!(ReadStore::is_closed, 0))?;
     c.define_method("embedding_model", method!(ReadStore::embedding_model, 0))?;
     c.define_method("normalization", method!(ReadStore::normalization, 0))?;
+    c.define_method("ivf", method!(ReadStore::ivf, 0))?;
     c.define_private_method("native_get", method!(ReadStore::get, 1))?;
     c.define_private_method("native_verify", method!(ReadStore::verify, 0))?;
     c.define_private_method("native_recall", method!(ReadStore::recall, 1))?;

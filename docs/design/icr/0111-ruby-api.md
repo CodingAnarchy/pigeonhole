@@ -136,6 +136,11 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - `insert` and `search` take `put_vector`'s forms for the index's element. A half index takes `f32` values, which it rounds.
   - `insert_in`/`delete_in` take a `Placed`, made inside the transaction's block (P1), and `after_commit` uses it up.
   - **`bulk_load(pairs, expected:)`** streams (P2). `pairs.each_slice(batch)` feeds a `BulkLoad`, whose `push` converts a batch and sends it over a bounded channel to a loader thread running the crate's one `bulk_load_*` call. `push` waits with the GVL released while the loader is two batches behind, and `finish` joins the loader in interruptible slices.
+- **T8 (#1424) in `Pigeonhole::Memory`:**
+  - `IvfOptions` and `Store.create(ivf:)`, with `Store#ivf`/`ReadStore#ivf`;
+  - `recall(exact:, nprobe:)`;
+  - `RecallStats#ivf_namespaces`/`#ivf_fallbacks`;
+  - `StoreStats#ivf_mismatched`/`#ivf_counter_drift`, which `consistent?` leaves out, as the crate does (ai1249's N3 on #1425).
 - **Rebalancing (Q3).** `rebalance: :background` uses the crate's own thread. With `rebalancer: true`, `create`/`open` return `[index, rebalancer]` for a Ruby thread to drive. `run_once(budget)` and `wait(timeout)` release the GVL, and `wait` runs in 100 ms slices with interrupt checks. `set_wakeup` isn't bound, for Q2's reason.
 ## Callers changed
 None. It's a new crate.

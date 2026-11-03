@@ -445,6 +445,7 @@ dependencies = [
  "getrandom 0.3.4",
  "pigeonhole",
  "pigeonhole-text",
+ "pigeonhole-vector",
  "twox-hash",
 ]
 

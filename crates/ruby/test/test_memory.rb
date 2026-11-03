@@ -195,6 +195,34 @@ class TestMemory < Minitest::Test
     assert_raises(Pigeonhole::InvalidArgument) { store("bad", normalization: :nfd) }
   end
 
+  # D311 T8 (#1424): a store with an IVF index recalls a large namespace through it and a
+  # small one exactly; exact: and nprobe: adjust a recall, and RecallStats says which path ran.
+  def test_ivf_recall
+    ivf = M::IvfOptions.new(min_namespace_len: 20)
+    assert_equal [20, nil, nil], [ivf.min_namespace_len, ivf.nprobe, ivf.target_list_len]
+    assert_equal ivf, M::IvfOptions.new(min_namespace_len: 20)
+    assert_raises(Pigeonhole::InvalidArgument) { store("noemb", ivf: ivf) } # needs a model
+    rng = Random.new(1424)
+    store(embedding: model, ivf: ivf) do |s|
+      assert_equal ivf, s.ivf
+      30.times { |i| s.remember("big", "big note #{i}", embedding: Array.new(4) { rng.rand }) }
+      3.times { |i| s.remember("small", "small note #{i}", embedding: Array.new(4) { rng.rand }) }
+      q = [0.5, 0.5, 0.5, 0.5]
+      _, st = s.recall_with_stats("big", embedding: q)
+      assert_equal [1, 0], [st.ivf_namespaces, st.ivf_fallbacks]
+      _, st = s.recall_with_stats("small", embedding: q)
+      assert_equal 0, st.ivf_namespaces
+      _, st = s.recall_with_stats("big", embedding: q, exact: true)
+      assert_equal 0, st.ivf_namespaces
+      wide = s.recall("big", embedding: q, nprobe: 1_000, k: 5)
+      assert_equal s.recall("big", embedding: q, exact: true, k: 5).map(&:id), wide.map(&:id)
+      v = s.verify
+      assert_predicate v, :consistent?
+      assert_equal [0, 0], [v.ivf_mismatched, v.ivf_counter_drift]
+    end
+    store("plain2") { |s| assert_nil s.ivf }
+  end
+
   # remember_in / delete_in commit with the transaction; remember_in skips near dedup; inside
   # Database#transact, a retry re-reads.
   def test_in_transactions

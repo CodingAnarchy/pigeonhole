@@ -28,8 +28,8 @@ use pigeonhole::ErrorCode;
 use pigeonhole_memory as mem;
 
 use crate::classes::{
-    ConsolidatePolicy, Database, EmbeddingModel, Expand, ForgetPolicy, Memory, MemoryId, NearDedup,
-    ReadStore, Reader, Snapshot, Store, Transaction, Weights,
+    ConsolidatePolicy, Database, EmbeddingModel, Expand, ForgetPolicy, IvfOptions, Memory,
+    MemoryId, NearDedup, ReadStore, Reader, Snapshot, Store, Transaction, Weights,
 };
 use crate::convert::{Secs, arg_error, class_name, lock, type_error};
 use crate::error::{spent, to_rb, with_code};
@@ -675,6 +675,48 @@ impl NearDedup {
     }
 }
 
+impl IvfOptions {
+    /// `native_new(min_namespace_len, nprobe, target_list_len)`, each nil for the crate's
+    /// default (D311 T8).
+    pub(crate) fn native_new(
+        min_namespace_len: Option<u64>,
+        nprobe: Option<u32>,
+        target_list_len: Option<u32>,
+    ) -> Self {
+        let mut o = mem::IvfOptions::new();
+        if let Some(n) = min_namespace_len {
+            o = o.min_namespace_len(n);
+        }
+        if let Some(n) = nprobe {
+            o = o.nprobe(n);
+        }
+        if let Some(n) = target_list_len {
+            o = o.target_list_len(n);
+        }
+        Self(o)
+    }
+
+    pub(crate) fn min_namespace_len(&self) -> u64 {
+        self.0.get_min_namespace_len()
+    }
+
+    pub(crate) fn nprobe(&self) -> Option<u32> {
+        self.0.get_nprobe()
+    }
+
+    pub(crate) fn target_list_len(&self) -> Option<u32> {
+        self.0.get_target_list_len()
+    }
+
+    pub(crate) fn eq(&self, other: Value) -> bool {
+        <&IvfOptions>::try_convert(other).is_ok_and(|o| o.0 == self.0)
+    }
+
+    pub(crate) fn inspect(&self) -> String {
+        format!("#<Pigeonhole::Memory::IvfOptions {:?}>", self.0)
+    }
+}
+
 /// A memory from `remember`'s arguments; `links` is an Array of `[id, link type, weight]`.
 #[allow(clippy::too_many_arguments)]
 fn build(
@@ -842,6 +884,8 @@ fn hits(
         stats.truncated,
         stats.expanded,
         stats.expansion_truncated,
+        stats.ivf_namespaces,
+        stats.ivf_fallbacks,
     );
     let r = ruby.ary_new_capa(2);
     r.push(out)?;
@@ -860,6 +904,8 @@ fn stats(ruby: &Ruby, s: &mem::StoreStats) -> Result<RArray, Error> {
     a.push(s.missing_embeddings)?;
     a.push(s.dangling_superseded)?;
     a.push(s.text_index_inconsistent)?;
+    a.push(s.ivf_mismatched)?;
+    a.push(s.ivf_counter_drift)?;
     Ok(a)
 }
 
@@ -896,6 +942,8 @@ struct RecallArgs {
     with_signals: bool,
     with_embeddings: bool,
     expand: Option<mem::Expand>,
+    exact: bool,
+    nprobe: Option<u32>,
 }
 
 impl RecallArgs {
@@ -932,6 +980,12 @@ impl RecallArgs {
         if let Some(x) = self.expand {
             r = r.expand(x);
         }
+        if self.exact {
+            r = r.exact(true);
+        }
+        if let Some(n) = self.nprobe {
+            r = r.nprobe(n);
+        }
         if let Some(s) = self.session {
             r = r.session(s);
         }
@@ -945,8 +999,8 @@ impl RecallArgs {
 /// `recall`'s 16 arguments, given as one Array (more than a method takes), converted
 /// while the GVL is held.
 fn recall_args(ruby: &Ruby, a: RArray) -> Result<RecallArgs, Error> {
-    if a.len() != 16 {
-        return Err(arg_error(ruby, "native_recall takes 16 arguments"));
+    if a.len() != 18 {
+        return Err(arg_error(ruby, "native_recall takes 18 arguments"));
     }
     let namespaces: Value = a.entry(0)?;
     let namespaces = match RArray::from_value(namespaces) {
@@ -990,6 +1044,8 @@ fn recall_args(ruby: &Ruby, a: RArray) -> Result<RecallArgs, Error> {
         with_signals: a.entry(13)?,
         with_embeddings: a.entry(14)?,
         expand,
+        exact: a.entry(16)?,
+        nprobe: a.entry(17)?,
     })
 }
 
@@ -1105,6 +1161,7 @@ impl Store {
         episodic_ttl: Option<Secs>,
         near_dedup: Option<&NearDedup>,
         normalization: Option<Value>,
+        ivf: Option<&IvfOptions>,
     ) -> Result<Self, Error> {
         let mut o = mem::StoreOptions::new();
         if let Some(m) = embedding {
@@ -1121,6 +1178,9 @@ impl Store {
         }
         if let Some(n) = normalization {
             o = o.normalization(normalization_arg(ruby, n)?);
+        }
+        if let Some(i) = ivf {
+            o = o.ivf(i.0);
         }
         let p = db.db(ruby)?;
         let s = call(ruby, move || mem::Store::create(&p, &name, o))?;
@@ -1182,6 +1242,11 @@ impl Store {
             .embedding_model()
             .cloned()
             .map(EmbeddingModel))
+    }
+
+    /// The store's IVF index options, if it has one (D311 T8).
+    pub(crate) fn ivf(ruby: &Ruby, rb_self: &Self) -> Result<Option<IvfOptions>, Error> {
+        Ok(rb_self.handle(ruby)?.ivf().map(IvfOptions))
     }
 
     pub(crate) fn normalization(ruby: &Ruby, rb_self: &Self) -> Result<magnus::Symbol, Error> {
@@ -1630,6 +1695,11 @@ impl ReadStore {
             .embedding_model()
             .cloned()
             .map(EmbeddingModel))
+    }
+
+    /// The store's IVF index options, if it has one (D311 T8).
+    pub(crate) fn ivf(ruby: &Ruby, rb_self: &Self) -> Result<Option<IvfOptions>, Error> {
+        Ok(rb_self.store(ruby)?.ivf().map(IvfOptions))
     }
 
     pub(crate) fn normalization(ruby: &Ruby, rb_self: &Self) -> Result<magnus::Symbol, Error> {

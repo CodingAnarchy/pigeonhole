@@ -62,9 +62,12 @@ module Pigeonhole
     end
 
     # `verify`'s counts.
+    # `ivf_mismatched` (how far an IVF index's vector count is from the memories with an
+    # embedding) and `ivf_counter_drift` (namespaces whose counter is off) are for a quiet
+    # store, and `consistent?` leaves them out, as the crate does.
     StoreStats = Data.define(:memories, :no_content, :stale_dedup, :broken_links,
                              :missing_embeddings, :dangling_superseded,
-                             :text_index_inconsistent) do
+                             :text_index_inconsistent, :ivf_mismatched, :ivf_counter_drift) do
       # Whether every count of a problem is zero.
       def consistent?
         [no_content, stale_dedup, broken_links, missing_embeddings, dangling_superseded].all?(&:zero?) &&
@@ -82,9 +85,12 @@ module Pigeonhole
     RecallHit = Data.define(:id, :text, :kind, :importance, :created_us, :superseded_by, :score,
                             :signals, :embedding)
 
-    # What a recall did: `candidates` scored, whether the byte budget cut the hits, and the
-    # graph expansion's `expanded` count and whether its budget cut it.
-    RecallStats = Data.define(:candidates, :truncated, :expanded, :expansion_truncated)
+    # What a recall did: `candidates` scored, whether the byte budget cut the hits, the graph
+    # expansion's `expanded` count and whether its budget cut it, and for a store with an IVF
+    # index, the namespaces its vector signal searched by IVF (`ivf_namespaces`) and those
+    # that fell back to the exact scan (`ivf_fallbacks`).
+    RecallStats = Data.define(:candidates, :truncated, :expanded, :expansion_truncated, :ivf_namespaces,
+                              :ivf_fallbacks)
 
     # A forget pass's counts, and where to resume (`forget(after:)`).
     ForgetPass = Data.define(:examined, :deleted, :protected, :resume)
@@ -155,6 +161,18 @@ module Pigeonhole
       end
     end
 
+    # A store's IVF index (D311 T8), set at create: a namespace with at least
+    # `min_namespace_len` memories with an embedding (10,000 by default) recalls through the
+    # index, a smaller one by the exact scan. `nprobe` and `target_list_len` default to the
+    # vector index's.
+    class IvfOptions
+      class << self
+        def new(min_namespace_len: nil, nprobe: nil, target_list_len: nil)
+          native_new(min_namespace_len, nprobe, target_list_len)
+        end
+      end
+    end
+
     # A memory to write: what a consolidator block returns. `Store#remember` takes the same
     # keywords. `links` is an Array of `[id, link type, weight]`.
     class Memory
@@ -191,9 +209,9 @@ module Pigeonhole
 
       def recall_args(namespaces, text:, embedding:, k:, candidates:, byte_budget:, snapshot:, now_us:,
                       half_life:, fusion:, weights:, include_superseded:, session:, with_signals:,
-                      with_embeddings:, expand:)
+                      with_embeddings:, expand:, exact:, nprobe:)
         [namespaces, text, embedding, k, candidates, byte_budget, snapshot, now_us, half_life, fusion,
-         weights, include_superseded, session, with_signals, with_embeddings, expand]
+         weights, include_superseded, session, with_signals, with_embeddings, expand, exact, nprobe]
       end
     end
     private_constant :Build
@@ -201,24 +219,27 @@ module Pigeonhole
     # The recall methods `Store` and `ReadStore` share.
     module Recalls
       # The memories best matching `text` and/or `embedding` in `namespaces` (an Array, or
-      # one String), best first, at one snapshot. See the guide for each keyword.
+      # one String), best first, at one snapshot. On a store with an IVF index, `exact: true`
+      # forces the exact scan, and `nprobe` overrides the lists the index probes. See the
+      # guide for each keyword.
       def recall(namespaces, text: nil, embedding: nil, k: nil, candidates: nil, byte_budget: nil,
                  snapshot: nil, now_us: nil, half_life: nil, fusion: :rrf, weights: nil,
                  include_superseded: false, session: nil, with_signals: false, with_embeddings: false,
-                 expand: nil)
+                 expand: nil, exact: false, nprobe: nil)
         recall_with_stats(namespaces, text:, embedding:, k:, candidates:, byte_budget:, snapshot:, now_us:,
                                       half_life:, fusion:, weights:, include_superseded:, session:,
-                                      with_signals:, with_embeddings:, expand:)[0]
+                                      with_signals:, with_embeddings:, expand:, exact:, nprobe:)[0]
       end
 
       # `recall`, with its `RecallStats`: `[hits, stats]`.
       def recall_with_stats(namespaces, text: nil, embedding: nil, k: nil, candidates: nil, byte_budget: nil,
                             snapshot: nil, now_us: nil, half_life: nil, fusion: :rrf, weights: nil,
                             include_superseded: false, session: nil, with_signals: false,
-                            with_embeddings: false, expand: nil)
+                            with_embeddings: false, expand: nil, exact: false, nprobe: nil)
         args = Build.recall_args(namespaces, text:, embedding:, k:, candidates:, byte_budget:, snapshot:,
                                              now_us:, half_life:, fusion:, weights:, include_superseded:,
-                                             session:, with_signals:, with_embeddings:, expand:)
+                                             session:, with_signals:, with_embeddings:, expand:, exact:,
+                                             nprobe:)
         Build.hits(native_recall(args))
       end
 
@@ -243,10 +264,12 @@ module Pigeonhole
         # `forget` (or the `episodic_ttl` shorthand, in seconds) is its forget policy, run on
         # a thread of the crate's own; `near_dedup` its near-duplicate dedup; `normalization`
         # how its text index compares terms (`:nfc`, the default, `:nfkc` or `:none`), fixed
-        # at create (#1381). With a block, yields the store and closes it afterwards.
+        # at create (#1381); `ivf` an `IvfOptions`, for an IVF index of its embeddings (D311
+        # T8; it needs `embedding`), fixed at create too. With a block, yields the store and
+        # closes it afterwards.
         def create(db, name, embedding: nil, forget: nil, episodic_ttl: nil, near_dedup: nil,
-                   normalization: nil, &)
-          s = native_create(db, name, embedding, forget, episodic_ttl, near_dedup, normalization)
+                   normalization: nil, ivf: nil, &)
+          s = native_create(db, name, embedding, forget, episodic_ttl, near_dedup, normalization, ivf)
           block_given? ? scoped(s, &) : s
         end
 

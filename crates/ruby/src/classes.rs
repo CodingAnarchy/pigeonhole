@@ -176,6 +176,11 @@ pub(crate) struct MemoryId(pub(crate) pigeonhole_memory::MemoryId);
 #[derive(Clone)]
 pub(crate) struct EmbeddingModel(pub(crate) pigeonhole_memory::EmbeddingModel);
 
+/// `Pigeonhole::Memory::IvfOptions`: a store's IVF index options (D311 T8).
+#[magnus::wrap(class = "Pigeonhole::Memory::IvfOptions", free_immediately, size)]
+#[derive(Clone, Copy)]
+pub(crate) struct IvfOptions(pub(crate) pigeonhole_memory::IvfOptions);
+
 /// `Pigeonhole::Memory::Weights`: recall's signal weights (1 by default; `recency` 0.25,
 /// `graph` and `consolidated` 0.5).
 #[magnus::wrap(class = "Pigeonhole::Memory::Weights", free_immediately, size)]
