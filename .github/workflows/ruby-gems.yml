@@ -1,10 +1,8 @@
 name: Ruby gems
 
-# Precompiled native gems for every platform the bindings support, as artifacts (#697, ICR
-# 0111). Nothing is pushed to RubyGems: the first publish is the owner's call, and gets its
-# own workflow. The source-gem fallback follows in its own PR: a source gem can't carry the
-# crate's `pigeonhole = { path = "../pigeonhole" }` dependency, so `gem build` refuses until
-# then (pigeonhole.gemspec).
+# Precompiled native gems for every platform the bindings support, and the source gem that
+# compiles on any other, as artifacts (#697, ICR 0111). Nothing is pushed to RubyGems: the
+# first publish is the owner's call, and gets its own workflow.
 
 on:
   # Seven cross-compiles: on changes to the gem itself, weekly for everything under it (the
@@ -22,6 +20,9 @@ on:
       - 'crates/ruby/pigeonhole.gemspec'
       - 'crates/ruby/Rakefile'
       - 'crates/ruby/extconf.rb'
+      - 'crates/ruby/Gemfile*'
+      - 'crates/ruby/rakelib/**'
+      - 'crates/ruby/script/**'
       - '.github/workflows/ruby-gems.yml'
   workflow_dispatch:
 
@@ -62,3 +63,40 @@ jobs:
           path: ${{ steps.cross-gem.outputs.gem-path }}
           if-no-files-found: error
 
+  # The source gem (rakelib/source_gem.rake): the engine's path crates vendored under vendor/.
+  # It's installed from a copy outside the checkout into an empty GEM_HOME, which compiles it
+  # as a user's `gem install` would, so a file the vendored crates need but don't carry fails
+  # here, not on a user's machine (ai1249's P2 on #697; the merge job waits for it).
+  source:
+    name: source gem (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+          working-directory: crates/ruby
+      - name: Build the source gem
+        working-directory: crates/ruby
+        run: bundle exec rake gem:source
+      - name: Install it outside the checkout and smoke-test it
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/source-gem"
+          mkdir -p "$out/home"
+          cp crates/ruby/pkg/source/pigeonhole-*.gem crates/ruby/script/source_gem_smoke.rb "$out/"
+          cd "$out"
+          export GEM_HOME="$out/home" GEM_PATH="$out/home"
+          gem install --no-document ./pigeonhole-*.gem
+          ruby source_gem_smoke.rb
+      - if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gem-source
+          path: crates/ruby/pkg/source/pigeonhole-*.gem
+          if-no-files-found: error

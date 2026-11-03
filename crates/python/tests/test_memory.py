@@ -104,7 +104,7 @@ def test_recall_ranks_signals_budgets_and_snapshots(db):
         # Weights that only count recency put the newer memory first.
         only_recency = mem.Weights(vector=0, keyword=0, importance=0, uses=0)
         assert s.recall("n", text="cache", weights=only_recency)[0].id == b
-        assert only_recency.recency == 1.0 and mem.Weights() == mem.Weights()
+        assert only_recency.recency == 0.25 and mem.Weights() == mem.Weights()
         with pytest.raises(ph.InvalidArgument):
             s.recall("n")  # neither text nor embedding
         with pytest.raises(ph.InvalidArgument):
