@@ -14,6 +14,8 @@ bundle exec rake compile
 ruby -Ilib -e 'require "pigeonhole"; p Pigeonhole::VERSION'
 ```
 
+`bundle exec rake gem:source` builds the source gem, `pkg/source/pigeonhole-<version>.gem`. It carries the engine's crates, so it installs anywhere with Rust 1.96 or later and network access to crates.io: `gem install pkg/source/pigeonhole-*.gem` compiles the extension, with the versions `Cargo.lock` pins. The build is an optimised release build, about a minute on a recent laptop.
+
 ## A tour
 ```ruby
 require "pigeonhole"

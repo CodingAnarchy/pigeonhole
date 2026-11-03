@@ -8,3 +8,5 @@ gem "minitest", "~> 6.0"
 gem "rake", "~> 13.0"
 gem "rake-compiler", "~> 1.2"
 gem "rbs", "~> 4.0"
+# `rake gem:source` only: it rewrites the vendored crates' manifests (rakelib/source_gem.rake).
+gem "toml-rb", "~> 6.0"
