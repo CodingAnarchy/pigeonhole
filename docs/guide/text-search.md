@@ -172,7 +172,7 @@ The write rate stays flat from the first document to the millionth. A full compa
 | two terms, top 1,000 | 28 ms | 188 ms |
 | a fuzzy term, 1 edit (41 expansions) | 16 ms | 138 ms |
 | a fuzzy term, 2 edits (44 expansions) | 19 ms | 136 ms |
-| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 14 ms | 101 ms |
+| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 14 ms | 102 ms |
 | a fuzzy term, 1 edit, and a term drawn by frequency | 13 ms | 438 ms |
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.

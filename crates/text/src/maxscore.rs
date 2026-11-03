@@ -40,10 +40,14 @@ use crate::error::{Result, corrupt};
 use crate::layout::*;
 
 /// A point read's cost in posting steps (perf287's ski-rental rule, #1368): measured at
-/// 100,000 documents on a laptop, on one hub term's posting row, a `get_at` of a posting
-/// takes about 860 ns and a step through the row about 60 ns. That's with the index in the
-/// block cache, the conservative end: a cold read costs more steps, so a real index switches
-/// to advancing a little late, never early. A wrong value costs a constant factor at most.
+/// 100,000 documents on a laptop, on one hub term's posting row (67,972 postings), a
+/// `get_at` of a posting takes about 870 ns, and a step about 60 ns: 14.4 steps. Since #1378
+/// an advancing walk's step past a posting is a key compare, about 52 ns (16.6 steps), but
+/// 16 measured no faster than 14 on the fuzzy kinds, so the constant stays. That's with
+/// the index in the block cache, the conservative end: a cold read costs more steps, so a
+/// real index switches to advancing a little late, never early. A modestly wrong value
+/// costs a constant factor (ski-rental's bound assumes the price is right; one off by a
+/// factor `f` costs up to about `f` times more, perf287 on #1377).
 const LOOKUP_IN_STEPS: u64 = 14;
 
 /// A relative slack on every bound (above), so float rounding never prunes a document that
@@ -139,29 +143,42 @@ impl<'t> Walk<'t> {
     }
 
     fn step(&mut self, bm: &Bm25) -> Result<()> {
-        self.stepped += 1;
-        self.cur = match self.cells.next()? {
-            Some(e) => {
-                let (tf, len) = unposting(
-                    e.cell
-                        .as_u64()
-                        .ok_or_else(|| corrupt("a posting isn't a u64"))?,
-                );
-                Some((
-                    e.qualifier.to_vec(),
-                    self.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
-                ))
+        self.skip_while(bm, |_| false)
+    }
+
+    /// Steps to the first posting after the current one whose document `skip` doesn't
+    /// accept, and stands there. A skipped posting costs a key compare: only the posting
+    /// stood on is copied and decoded (#1378). So a corrupt value in a skipped posting
+    /// doesn't fail the search, as with the postings a point lookup never reads.
+    /// [`Index::verify`](crate::Index::verify) decodes every posting (perf287 on #1398).
+    fn skip_while(&mut self, bm: &Bm25, skip: impl Fn(&[u8]) -> bool) -> Result<()> {
+        loop {
+            self.stepped += 1;
+            let Some(e) = self.cells.next()? else {
+                self.cur = None;
+                return Ok(());
+            };
+            if skip(e.qualifier) {
+                continue;
             }
-            None => None,
-        };
-        Ok(())
+            let (tf, len) = unposting(
+                e.cell
+                    .as_u64()
+                    .ok_or_else(|| corrupt("a posting isn't a u64"))?,
+            );
+            self.cur = Some((
+                e.qualifier.to_vec(),
+                self.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
+            ));
+            return Ok(());
+        }
     }
 
     /// Steps past `doc`: a walk that starts being walked again (#1363) stands after the
     /// documents already decided.
     fn pass(&mut self, bm: &Bm25, doc: &[u8]) -> Result<()> {
-        while self.doc().is_some_and(|d| d <= doc) {
-            self.step(bm)?;
+        if self.doc().is_some_and(|d| d <= doc) {
+            self.skip_while(bm, |d| d <= doc)?;
         }
         Ok(())
     }
@@ -179,8 +196,8 @@ impl<'t> Walk<'t> {
             self.advancing = self.lookups.saturating_mul(LOOKUP_IN_STEPS) > left;
         }
         if self.advancing {
-            while self.doc().is_some_and(|d| d < doc) {
-                self.step(bm)?;
+            if self.doc().is_some_and(|d| d < doc) {
+                self.skip_while(bm, |d| d < doc)?;
             }
             return Ok(match &self.cur {
                 Some((d, c)) if d.as_slice() == doc => *c,
