@@ -178,6 +178,26 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
   - **`remember_in` doesn't check:** the check reads outside a transaction. `Store::near_duplicate(ns, &Memory) -> Result<Option<(MemoryId, f32)>>` runs it for a caller first, and is `InvalidArgument` without a setting.
   - **The race (S2):** two concurrent near duplicates can both insert, and consolidation folds them.
 
+## T7: `phdb mcp` memory tools (#1341)
+The design is on #1341 (cli692, c6593086022), plus the owner's three-part decision there. The flags and tools are `phdb`'s interface. They're not part of `pigeonhole-memory`'s API, which T7 doesn't change.
+- **`phdb mcp --memory NAME`** serves the store `NAME`. A writable server creates it when it's missing.
+- **The model:**
+  - `--memory-model ID --memory-dim N [--memory-element f32|f16|bf16]` pins a new store to a client's model.
+  - `--embed-url URL --embed-model NAME [--embed-key-env VAR]` pins it to `NAME`, with the dimension of one probe embedding at startup.
+  - Neither gives a store without a model.
+  - A model flag that disagrees with an existing store's pin fails at startup.
+- **The six tools** (the owner's instructions need `mark_used` and `supersede`, so six instead of the issue's four):
+  - `memory_recall` (also on a reader);
+  - `memory_remember`, `memory_mark_used`, `memory_supersede`, `memory_link` and `memory_forget`. `memory_forget` deletes by id; policy forgetting is the crate's thread (T2).
+- **A client embedding must name `embedding_model`,** equal to the pinned id. That catches another model's vectors of the right dimension, which every other check passes. With `--embed-url`, a client embedding is refused.
+- **`memory_remember`'s `supersedes`** remembers through `remember_in`, so near dedup never stops a correction (exact dedup still merges), then runs `supersede` in a second transaction. A failed supersede returns the stored id with `superseded: false` and `supersede_error` (simp724's S1/S2, ai1249's M1 on #1389). A public `supersede_in` can't see `remember_in`'s write in the same transaction (reads are at the snapshot), so it's a follow-up of its own (ai1249).
+- **The instructions:** a memory paragraph in the server's `instructions`, guidance in each tool's description, and the `memory://guide` resource (`resources/list`, `resources/read`).
+- **`--embed-url`:**
+  - an OpenAI `/embeddings` request (`{"model", "input"}` → `data[0].embedding`) through `ureq` 3 with rustls (ring) and the OS trust store (`rustls-native-certs`, which replaced the approved `rustls-platform-verifier`: that crate pulls in a CDLA-licensed crate for wasm32, which `cargo deny` refuses);
+  - only in `phdb`, behind its default `embed` feature (coordinator's E1);
+  - the key comes from the environment and is never logged, and goes only over `https://` or plain `http://` to a loopback host (simp724's E1 on #1389);
+  - no redirects, a 30 s timeout, and a 16 MiB response cap.
+
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
