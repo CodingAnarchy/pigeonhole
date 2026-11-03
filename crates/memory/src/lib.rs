@@ -34,7 +34,7 @@ mod store;
 mod watch;
 
 pub use consolidate::{
-    Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
+    Consolidate, ConsolidatePass, ConsolidatePolicy, ConsolidateStopped, Consolidator, SourcePolicy,
 };
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};

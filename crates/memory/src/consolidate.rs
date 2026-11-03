@@ -29,6 +29,23 @@ pub trait Consolidator: Send + Sync {
     ) -> std::result::Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// A [`Consolidator`] error that means "stopped before answering", not "failed": return it
+/// (boxed) when the consolidator can't answer for a reason that isn't the group's, such as
+/// a binding whose caller was interrupted. A pass ends on it as on any consolidator error
+/// ([`Error::Consolidate`](crate::Error::Consolidate)), but a
+/// [`ConsolidateLoop`](crate::ConsolidateLoop) keeps the namespace due at its next step
+/// instead of postponing it by `min_age` ([`LoopStep::stopped`](crate::LoopStep::stopped)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsolidateStopped;
+
+impl std::fmt::Display for ConsolidateStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the consolidator stopped before answering")
+    }
+}
+
+impl std::error::Error for ConsolidateStopped {}
+
 /// What a consolidation does with a group's memories once it commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
