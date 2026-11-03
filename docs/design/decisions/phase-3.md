@@ -4223,6 +4223,14 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **T8 (#1342, IVF) stays in 1.1.0,** after #1403. At ~94k memories in one namespace a fused recall takes 68 ms p50, 37 ms of it the exact vector scan.
 - **Fuzzy keyword recall stays off** (revision 2 §8): it doesn't help recall and costs 18–100× the plain search.
 
+**T8 (#1342).** IVF recall for large namespaces, opt-in at create (`StoreOptions::ivf`). The design is on #1342 (c6605838140), reviewed by cli692 (API), perf287 (R1–R3) and simp724. #1412 added the vector half.
+- **Vector half (#1412):** `insert_*_in`/`delete_in` in a caller's transaction, with a per-transaction `Placed` record and `after_commit`, plus `Search::id_prefix`/`max_probe`.
+- **Index shape:** one per store, keyed by the memory's row key; a namespace is its row-key prefix. A prefixed search seeks in each list: R1 measured 0.01 ms for 100 of 100,000 cells against 5.14 ms for the whole row.
+- **Namespace counter:** `{ns}\0c:stats:embedded`, a blind increment in each write. It's advisory, and is read at the recall's snapshot to pick exact or IVF (at least `min_namespace_len`, 10,000).
+- **Fallback:** a search that would widen past `max(nprobe, count / 64)` lists searches exactly instead (perf287's per-list rule).
+- **`after_commit` never fails a write** (simp724).
+- **`verify`** reports index mismatch and counter drift separately.
+
 <a id="d312"></a>
 ## D312 — REJECTED: mapped `Buffered` WAL writes, with a group's frames stored through a shared mapping of the segment instead of `pwrite` (ctr274 / simp724, prototype approved 2026-11-02; owner shelved it 2026-11-03, call 4; io, wal; #1206 lever 4 B2, #1369)
 **Status: tried and rejected.** #1369 was closed unmerged, and WAL writes stay `pwrite`. Three box rounds showed that the `Buffered` throughput gain always comes with worse put tails, and pre-faulting made the tails worse still. This record is here so the idea isn't tried again without this data.

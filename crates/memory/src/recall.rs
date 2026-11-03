@@ -194,6 +194,12 @@ pub struct RecallStats {
     pub expanded: usize,
     /// Whether [`Expand::max`] or the byte budget stopped the graph expansion.
     pub expansion_truncated: bool,
+    /// Namespaces whose vector signal came from the store's IVF index (D311 T8,
+    /// [`StoreOptions::ivf`](crate::StoreOptions::ivf)), counted once per namespace.
+    pub ivf_namespaces: usize,
+    /// Namespaces large enough for the IVF index that were searched exactly anyway: the
+    /// namespace was sparse among the lists nearest the query, so widening hit its cap.
+    pub ivf_fallbacks: usize,
 }
 
 /// The table behind a recall: the writer's or a reader process's.
@@ -222,6 +228,9 @@ pub(crate) enum Idx<'a> {
 pub struct Recall<'a> {
     rows: Rows<'a>,
     index: Idx<'a>,
+    ivf: Option<&'a crate::ivf::Ivf>,
+    exact: bool,
+    nprobe: Option<u32>,
     model: Option<&'a EmbeddingModel>,
     namespaces: Vec<String>,
     text: Option<String>,
@@ -256,6 +265,7 @@ impl<'a> Recall<'a> {
     pub(crate) fn new(
         rows: Rows<'a>,
         index: Idx<'a>,
+        ivf: Option<&'a crate::ivf::Ivf>,
         model: Option<&'a EmbeddingModel>,
         db: Snap<'a>,
         namespaces: &[&str],
@@ -263,6 +273,9 @@ impl<'a> Recall<'a> {
         Recall {
             rows,
             index,
+            ivf,
+            exact: false,
+            nprobe: None,
             model,
             namespaces: namespaces.iter().map(|s| (*s).to_owned()).collect(),
             text: None,
@@ -382,6 +395,22 @@ impl<'a> Recall<'a> {
         self
     }
 
+    /// Searches embeddings exactly in every namespace, even where the store's IVF index
+    /// would serve ([`StoreOptions::ivf`](crate::StoreOptions::ivf)): the ground truth an
+    /// IVF recall can be checked against. No effect on a store without the index.
+    pub fn exact(mut self, on: bool) -> Self {
+        self.exact = on;
+        self
+    }
+
+    /// The lists an IVF search probes first, for this recall (the store's
+    /// [`IvfOptions::nprobe`](crate::IvfOptions::nprobe) by default). No effect on a store
+    /// without the index, or on a namespace recalled exactly.
+    pub fn nprobe(mut self, n: u32) -> Self {
+        self.nprobe = Some(n);
+        self
+    }
+
     /// Expands the candidates through the memories' links ([`Expand`]): none by default.
     /// `InvalidArgument` from the run for hops outside 1 to [`Expand::MAX_HOPS`].
     pub fn expand(mut self, x: Expand) -> Self {
@@ -458,13 +487,40 @@ impl<'a> Recall<'a> {
         // filtered recall still gets each signal's best `per_signal` eligible memories
         // (simp724's N1 on #1374).
         let mut n = self.per_signal.max(1);
+        // Each namespace's path for the vector signal: the IVF index once its counter (read
+        // at the recall's snapshot, as the search and the memories are) reaches the store's
+        // `min_namespace_len`. `None`: exact.
+        let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
+        if let (Some(ivf), Some(_), false) = (self.ivf, &self.embedding, self.exact) {
+            let min = ivf.options().get_min_namespace_len();
+            for ns in &self.namespaces {
+                let c = crate::ivf::count(&self.rows, s, ns)?;
+                if c >= min {
+                    ivf_counts.insert(ns.as_str(), c);
+                }
+            }
+        }
+        let mut fell_back: BTreeSet<&str> = BTreeSet::new();
         let (lists, eligible) = loop {
             let mut lists: Vec<(usize, Vec<Vec<u8>>, bool)> = Vec::new();
             let mut scores: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
             for ns in &self.namespaces {
                 let prefix = [ns.as_bytes(), MEMORY_TAG].concat();
                 if let Some(e) = &self.embedding {
-                    let l = self.rows.nearest(s, &prefix, e, n)?;
+                    let via_ivf = match (self.ivf, ivf_counts.get(ns.as_str())) {
+                        (Some(ivf), Some(&c)) if !fell_back.contains(ns.as_str()) => {
+                            let found = ivf.nearest(s, &prefix, e, n, c, self.nprobe)?;
+                            if found.is_none() {
+                                fell_back.insert(ns.as_str());
+                            }
+                            found
+                        }
+                        _ => None,
+                    };
+                    let l = match via_ivf {
+                        Some(l) => l,
+                        None => self.rows.nearest(s, &prefix, e, n)?,
+                    };
                     let full = l.len() == n;
                     lists.push((0, l, full));
                 }
@@ -552,6 +608,8 @@ impl<'a> Recall<'a> {
             }
         }
         stats.candidates = cands.len();
+        stats.ivf_fallbacks = fell_back.len();
+        stats.ivf_namespaces = ivf_counts.len() - fell_back.len();
         // 3. Fusion.
         fuse(&mut cands, &self.signal_weights(), self.fusion);
         // 4. In fused order, within k and the byte budget.
@@ -904,6 +962,20 @@ fn similarity_distance(spec: &VectorSpec, q: &[f32], v: pigeonhole::VectorRef<'_
 }
 
 impl Rows<'_> {
+    /// A counter cell's value at `s`.
+    pub(crate) fn counter_at(
+        &self,
+        s: &Snapshot,
+        row: &[u8],
+        family: &str,
+        q: &[u8],
+    ) -> Result<Option<i64>> {
+        Ok(match self {
+            Rows::W(t) => t.get_at(s, row, family, q)?.and_then(|c| c.as_i64()),
+            Rows::R(t) => t.get_at(s, row, family, q)?.and_then(|c| c.as_i64()),
+        })
+    }
+
     pub(crate) fn name(&self) -> &str {
         match self {
             Rows::W(t) => t.name(),

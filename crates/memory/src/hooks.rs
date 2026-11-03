@@ -101,3 +101,9 @@ pub(crate) fn take_fail_loop_save(name: &str) -> bool {
     }
     false
 }
+
+/// The IVF write records a store has waiting to settle (D311 T8): an inspection helper for
+/// the bounded-growth test (simp724's R1 on #1424).
+pub fn ivf_pending(store: &crate::Store) -> usize {
+    store.ivf_pending_len()
+}

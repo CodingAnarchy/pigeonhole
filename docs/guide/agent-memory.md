@@ -200,6 +200,53 @@ With an embedding model, a store can catch near duplicates as well as exact ones
 - **Summaries skip it:** what a consolidator returns is meant to sit near its sources.
 - **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
 
+## Large namespaces: IVF recall
+Recall searches a namespace's embeddings exactly. That stays fast up to a few thousand memories per namespace. For larger ones, create the store with an IVF index (`pigeonhole-vector`):
+
+```rust
+# use pigeonhole::*;
+use pigeonhole_memory::{EmbeddingModel, IvfOptions, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let model = EmbeddingModel::new("my-embedder-v1", 4, Element::F32)?;
+let store = Store::create(
+    &db,
+    "agents",
+    StoreOptions::new().embedding(model).ivf(IvfOptions::new().min_namespace_len(10_000)),
+)?;
+store.remember("shared:docs", Memory::new("Deploys run at noon.").embedding(vec![0.9, 0.1, 0.0, 0.2]))?;
+let (hits, stats) = store
+    .recall(&["shared:docs"])
+    .embedding(vec![0.8, 0.2, 0.0, 0.1])
+    .run_with_stats()?;
+assert_eq!(hits.len(), 1);
+// One memory is far below min_namespace_len: this recall searched exactly.
+assert_eq!(stats.ivf_namespaces, 0);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Per namespace:** a namespace with at least `min_namespace_len` memories with an embedding (10,000 by default) is searched through the index, and a smaller one exactly. A namespace counter, kept in each write, decides at the recall's snapshot.
+- **Every write keeps the index in step:** a memory's vector goes into the index in the memory's own transaction, and leaves it when the memory is deleted, forgotten or consolidated away. `verify` checks both (`ivf_mismatched`, and `ivf_counter_drift`, which is advisory).
+- **Exactness:** an IVF search probes the lists nearest the query, so it can miss a memory an exact search finds. `Recall::nprobe(n)` probes more for one recall, and `Recall::exact(true)` searches exactly, for checking. A namespace that's sparse among the lists nearest the query (a small one in a big store) falls back to an exact search on its own. `RecallStats::ivf_namespaces` and `ivf_fallbacks` say which path ran.
+- **Cost:** a second copy of each embedding (about 159 MB per 100k memories at `f32`, 82 MB at `f16`), and the index's lists to maintain as memories arrive. The index rebalances in the background.
+- **It's fixed at create.** To add an index to an existing store, create a new store with it and remember the memories into it.
+
+On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157 memories in one namespace and 10,000 in another, remembered interleaved so the second is spread thinly over the index's lists. The latency is warm and single-threaded at the default `nprobe`, p50 over LongMemEval-M's 50 questions:
+
+| | exact | IVF | IVF's recall@10 of the exact vector ranking |
+|---|---|---|---|
+| 89k namespace, vector only | 31.8 ms | 19.2 ms | 0.99 |
+| 89k namespace, fused | 65.1 ms | 49.9 ms | |
+| 10k namespace, vector only | 3.4 ms | 2.3 ms | 0.97 |
+| 10k namespace, fused | 15.3 ms | 13.7 ms | |
+
+- **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (T5's split).
+- **Writes don't contend through it:** 1, 4 and 8 threads remembering into the large namespace committed 1,540, 5,100 and 5,940 memories/s with no conflicts or retries. A list's version only changes when it splits.
+- **Building it:** the 99k memories took 60 s, about the same rate as T5's builds without the index.
+
 ## Watching for new memories
 `store.watch(&[namespaces])` follows the store's memory events through the database's change feed, so another part of the application, or another process, learns that a memory arrived without polling. The database must be opened with the change feed on (`Options::change_feed`), following the store's table `mem_{name}` (every table by default):
 
@@ -277,7 +324,7 @@ assert!(step.passes.is_empty()); // nothing is an hour old yet
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
 
 ## How well it recalls
-These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX102 (D311 T5, #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision.
+These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX102 (D311 T5, #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision. The published vectors were embedded with sentence-transformers 3.3.1 on transformers 4.57.6. The script now pins 5.6.1 on transformers 5.22.1 (security fixes, #1422), which embeds the same texts to within 3e-7 per component and leaves every query's top 10 unchanged on a 2,000-memory sample, so the numbers below weren't re-run.
 - **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
 - **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
 
