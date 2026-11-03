@@ -83,6 +83,26 @@
 - **The crate's thread starts once per index,** at the first `open` in background mode. `open_with_rebalancer` hands out a rebalancer on the shared queue; several take turns list by list (each list is claimed by one at a time), and they share one `set_wakeup`.
 - **Internal:** a process-wide `Mutex<Vec<Entry>>` of `(name, Weak<Inner>, Weak<user token>)`. The lock is held across a fresh open (a few reads), so concurrent first opens get one index, and across the stale-entry read. Nothing under it takes it again, and no `Inner` drops under it.
 
+## Writes in a caller's transaction, and prefixed searches (D311 T8, #1342)
+For the agent memory store's IVF recall (D311 §8), which writes a memory's vector in the memory's own transaction and searches one namespace of a store-wide index.
+- **`Index::insert_f32_in(&mut Transaction, id, &[f32]) -> Result<Placed>`,** with `insert_i8_in`, `insert_bits_in`, `insert_f16_in` and `insert_bf16_in`. The vector commits or rolls back with the caller's other writes.
+  - **Placement:** against the shared centroid cache. When the list's version, read in the transaction, differs, the layout is reloaded once and placed against.
+  - **If it still differs,** the transaction's snapshot predates a split or merge (the reload's snapshot is newer). The vector is written anyway, and the commit fails with `Conflict`, which `transact` retries, because a version the transaction read was rewritten after its snapshot. The body never loops.
+  - **`Error::Conflict`** only when the snapshot shows the id mapped to a list mid-merge; the caller retries the transaction.
+  - **It doesn't retry, split or merge.**
+- **`Index::delete_in(&mut Transaction, id) -> Result<Option<Placed>>`:** `None`, writing nothing, when the transaction sees no vector for `id`.
+- **`Index::after_commit(Placed) -> Result<()>`:** after the caller's commit, it splits or merges (or, in background mode, marks) the lists the write left out of bounds, as `insert_f32` and `delete` do after theirs. It reads the lists' current lengths, so calling it after a rollback, twice or late is harmless, and never calling it only delays the rebalance until the next write to those lists.
+  - **Why it's separate:** checking the bounds inside the caller's transaction would read the count row, so concurrent inserts into one list would conflict.
+- **`Placed`** (`Debug`, `Clone`, `PartialEq`, `Eq`, `#[must_use]`): opaque, owned and `Send`.
+- **`Search::id_prefix(&[u8])`:** only ids with that prefix (a qualifier prefix on the probed lists' read).
+  - **Widening:** a search with a prefix probes `nprobe` lists, then doubles the lists it probes, nearest first, until `k` hits pass, every list is probed, or `max_probe` lists are. Each widening re-reads the lists so far, so the result equals one search over that many lists, at no more than twice its reads.
+  - **Exactness:** a prefixed search that probes every list is exact for the prefix.
+- **`Search::max_probe(u32)`:** the widening's cap (default: every list), never below `nprobe`. It has no effect without a prefix.
+- **`Search::run_with_stats() -> Result<(Vec<Hit>, SearchStats)>`:** `run` with what it read.
+  - `SearchStats` (`#[non_exhaustive]`, `Copy`) holds `lists_probed` and `lists` (the index's lists at the snapshot).
+  - `run_async` widens the same way.
+- **Test seam:** `hooks::Hold::MergeBeforeReload`, between a merge's commit and its cache reload, where the shared cache names a merged-away list.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);
