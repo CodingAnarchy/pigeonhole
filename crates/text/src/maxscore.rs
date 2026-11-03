@@ -10,6 +10,12 @@
 //!   lookups (#1333);
 //! - a phrase clause, scored up front: its largest actual score.
 //!
+//! **Solo expansions** (#1363). An essential fuzzy clause walks only the expansions that
+//! could carry a document into the top `k` with nothing but the non-essential clauses beside
+//! them: bound plus the non-essential bounds reaching the `k`-th score. The others can't
+//! bring a document in alone, so their postings aren't walked. Where another essential clause
+//! has made a document a candidate, they're looked up, if it can still make it.
+//!
 //! Clauses are taken in ascending order of bound. While fewer than `k` documents are held,
 //! every clause is essential. After that, the longest prefix of clauses whose bounds sum
 //! strictly below the `k`-th score is non-essential: a document matching only those can't
@@ -151,7 +157,17 @@ impl<'t> Walk<'t> {
         Ok(())
     }
 
-    /// The walk's contribution to `doc`, for a non-essential clause; `doc`s come in
+    /// Steps past `doc`: a walk that starts being walked again (#1363) stands after the
+    /// documents already decided.
+    fn pass(&mut self, bm: &Bm25, doc: &[u8]) -> Result<()> {
+        while self.doc().is_some_and(|d| d <= doc) {
+            self.step(bm)?;
+        }
+        Ok(())
+    }
+
+    /// The walk's contribution to `doc`, for a non-essential clause or an essential fuzzy
+    /// clause's unwalked expansion (#1363); `doc`s come in
     /// ascending order. Point reads first, then, once their cost passes stepping through
     /// the rest of the row (lookups × [`LOOKUP_IN_STEPS`] > the postings left), advancing
     /// to `doc` for good: the ski-rental rule (perf287 on #1355), never much more than twice
@@ -189,10 +205,14 @@ pub(crate) enum Clause<'t> {
     /// A fuzzy term's expansions (D309 §4.4): a document's contribution is the largest of
     /// theirs, not their sum.
     Fuzzy {
-        /// The expansions still walked. One whose bound falls below what a document would
-        /// need from it is dropped ([`Scored::drop_below`], #1333).
+        /// The expansions still in play, largest bound first. One whose bound falls below
+        /// what a document would need from it is dropped ([`Scored::drop_below`], #1333).
         walks: Vec<Walk<'t>>,
-        /// The document the clause stands on (the walks' smallest) and its contribution.
+        /// How many of `walks` are walked (#1363): the rest can't bring a document in on
+        /// their own, and are only looked up ([`Scored::set_solo`]).
+        solo: usize,
+        /// The document the clause stands on (the walked ones' smallest) and its
+        /// contribution there.
         cur: Option<(Vec<u8>, f64)>,
     },
     /// A phrase, scored up front: its documents and their scores, in document order.
@@ -242,17 +262,25 @@ impl<'t> Scored<'t> {
             walks.push(walk);
             bound = bound.max(b);
         }
+        walks.sort_by(|a, b| b.bound.total_cmp(&a.bound));
+        let solo = walks.len();
         let mut c = Scored {
-            clause: Clause::Fuzzy { walks, cur: None },
+            clause: Clause::Fuzzy {
+                walks,
+                solo,
+                cur: None,
+            },
             bound: bound * (1.0 + SLACK),
         };
         c.settle();
         Ok(c)
     }
 
-    /// A fuzzy clause's document: its walks' smallest, with the largest contribution there.
+    /// A fuzzy clause's document: its walked expansions' smallest, with the largest
+    /// contribution there.
     fn settle(&mut self) {
-        if let Clause::Fuzzy { walks, cur, .. } = &mut self.clause {
+        if let Clause::Fuzzy { walks, solo, cur } = &mut self.clause {
+            let walks = &walks[..*solo];
             *cur = walks.iter().filter_map(|w| w.doc()).min().map(|doc| {
                 let best = walks
                     .iter()
@@ -300,11 +328,11 @@ impl<'t> Scored<'t> {
     fn step(&mut self, bm: &Bm25) -> Result<()> {
         match &mut self.clause {
             Clause::Term(w) => w.step(bm)?,
-            Clause::Fuzzy { walks, cur, .. } => {
+            Clause::Fuzzy { walks, solo, cur } => {
                 let Some((doc, _)) = cur.take() else {
                     return Ok(());
                 };
-                for w in walks.iter_mut() {
+                for w in walks[..*solo].iter_mut() {
                     if w.doc() == Some(doc.as_slice()) {
                         w.step(bm)?;
                     }
@@ -336,6 +364,63 @@ impl<'t> Scored<'t> {
 }
 
 impl Scored<'_> {
+    /// For an essential fuzzy clause, walks only the expansions whose bound reaches `need`:
+    /// the `k`-th held score less the non-essential clauses' bounds, and less the other
+    /// essential fuzzy clauses' unwalked bounds (#1363).
+    ///
+    /// **Exact.** A document that only unwalked expansions match, among the essential
+    /// clauses, scores at most their largest bounds summed over the clauses plus the
+    /// non-essential bounds, below the threshold, so it can't enter the top `k` and needn't
+    /// be a candidate. A candidate gets their
+    /// contribution by lookup ([`unwalked`](Self::unwalked)), so its score is the same.
+    /// `need` can fall as well as rise (a clause turning non-essential adds its bound), so
+    /// an expansion can be walked again. It then steps past `last`, the last document
+    /// decided, which every candidate from now on follows.
+    fn set_solo(&mut self, bm: &Bm25, need: f64, last: Option<&[u8]>) -> Result<()> {
+        let Clause::Fuzzy { walks, solo, .. } = &mut self.clause else {
+            return Ok(());
+        };
+        let n = walks
+            .iter()
+            .take_while(|w| w.bound * (1.0 + SLACK) >= need * (1.0 - SLACK))
+            .count();
+        if n == *solo {
+            return Ok(());
+        }
+        if let Some(last) = last {
+            for w in &mut walks[*solo..n.max(*solo)] {
+                w.pass(bm, last)?;
+            }
+        }
+        *solo = n;
+        self.settle();
+        Ok(())
+    }
+
+    /// The most an essential fuzzy clause's looked-up expansions add to a document: their
+    /// largest bound, or 0 when every expansion is walked.
+    fn unwalked(&self) -> f64 {
+        match &self.clause {
+            Clause::Fuzzy { walks, solo, .. } => {
+                walks.get(*solo).map_or(0.0, |w| w.bound * (1.0 + SLACK))
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// An essential fuzzy clause's looked-up expansions' contribution to `doc` (#1363): the
+    /// largest of theirs.
+    fn lookup_unwalked(&mut self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+        let Clause::Fuzzy { walks, solo, .. } = &mut self.clause else {
+            return Ok(0.0);
+        };
+        let mut best = 0.0f64;
+        for w in walks[*solo..].iter_mut() {
+            best = best.max(w.lookup(t, s, bm, doc)?);
+        }
+        Ok(best)
+    }
+
     /// Drops a fuzzy clause's expansions whose bound is below `cut`: the `k`-th held score
     /// less every other clause's bound (#1333). That's MaxScore for a clause that takes the
     /// largest of its expansions rather than their sum.
@@ -351,8 +436,12 @@ impl Scored<'_> {
             return;
         };
         let before = walks.len();
+        // Largest bound first, so the dropped ones are the last.
         walks.retain(|w| w.bound * (1.0 + SLACK) >= cut);
         if walks.len() != before {
+            if let Clause::Fuzzy { walks, solo, .. } = &mut self.clause {
+                *solo = (*solo).min(walks.len());
+            }
             self.settle();
         }
     }
@@ -411,6 +500,14 @@ pub(crate) fn top_k(
     let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
+    // The last document decided: a walk that starts being walked again steps past it. It's
+    // the candidate's own buffer, reused.
+    let mut last: Vec<u8> = Vec::new();
+    let mut decided = false;
+    // Whether an essential fuzzy clause has unwalked expansions: only then does a candidate
+    // pay for the gains below (single fuzzy clauses never do, since #1333's cut already drops
+    // what they'd leave unwalked).
+    let mut unwalked = false;
     loop {
         let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
         // Only when the threshold has risen since the last pass: nothing else moves the
@@ -428,28 +525,74 @@ pub(crate) fn top_k(
                 let cut = th - (total - c.bound);
                 c.drop_below(cut);
             }
+            // Inside every essential fuzzy clause, the expansions walked (#1363). They share
+            // one budget: a document only unwalked expansions match, across every essential
+            // fuzzy clause, scores below their largest bounds summed plus the non-essential
+            // bounds, and that sum stays below the threshold.
+            let mut budget = th - prefix[skip];
+            unwalked = false;
+            for &c in &by_bound[skip..] {
+                clauses[c].set_solo(bm, budget, decided.then_some(last.as_slice()))?;
+                let up = clauses[c].unwalked();
+                budget -= up;
+                unwalked |= up > 0.0;
+            }
         }
         let essential = &by_bound[skip..];
-        let Some(doc) = essential
-            .iter()
-            .filter_map(|&c| clauses[c].doc())
-            .min()
-            .map(<[u8]>::to_vec)
-        else {
+        let Some(next) = essential.iter().filter_map(|&c| clauses[c].doc()).min() else {
             break;
         };
+        // The candidate, in `last`'s buffer: once it's decided, it's the last document
+        // decided, which the next pass's re-walk steps past. No allocation per candidate; a
+        // document that enters the top `k` is copied.
+        last.clear();
+        last.extend_from_slice(next);
+        decided = true;
+        let doc: &[u8] = &last;
         has.iter_mut().for_each(|h| *h = false);
         let mut partial = 0.0;
         for &c in essential {
-            if clauses[c].doc() == Some(doc.as_slice()) {
+            if clauses[c].doc() == Some(doc) {
                 contrib[c] = clauses[c].here();
                 has[c] = true;
                 partial += contrib[c];
                 clauses[c].step(bm)?;
             }
         }
-        // The non-essential clauses, largest bound first, while the document can still make it.
+        // The essential fuzzy clauses' unwalked expansions (#1363): each can raise its
+        // clause's contribution to at most their largest bound.
         let mut pruned = false;
+        let mut gains: f64 = if unwalked {
+            essential
+                .iter()
+                .map(|&c| (clauses[c].unwalked() - if has[c] { contrib[c] } else { 0.0 }).max(0.0))
+                .sum()
+        } else {
+            0.0
+        };
+        for &c in essential.iter().filter(|_| unwalked) {
+            let up = clauses[c].unwalked();
+            let here = if has[c] { contrib[c] } else { 0.0 };
+            if up <= here {
+                continue;
+            }
+            let th = threshold.expect("expansions are unwalked only with k held");
+            if partial + gains + prefix[skip] < th * (1.0 - SLACK) {
+                pruned = true;
+                break;
+            }
+            gains -= up - here;
+            let v = clauses[c].lookup_unwalked(t, s, bm, doc)?;
+            if v > here {
+                contrib[c] = v;
+                has[c] = true;
+                partial += v - here;
+            }
+        }
+        if pruned {
+            continue;
+        }
+        // The non-essential clauses, largest bound first, while the document can still make it.
         for i in (0..skip).rev() {
             let th = threshold.expect("clauses are non-essential only with k held");
             if partial + prefix[i + 1] < th * (1.0 - SLACK) {
@@ -457,7 +600,7 @@ pub(crate) fn top_k(
                 break;
             }
             let c = by_bound[i];
-            let v = clauses[c].lookup(t, s, bm, &doc)?;
+            let v = clauses[c].lookup(t, s, bm, doc)?;
             if v != 0.0 {
                 contrib[c] = v;
                 has[c] = true;
@@ -474,13 +617,21 @@ pub(crate) fn top_k(
                 score += contrib[c];
             }
         }
-        let entry = Held(score, doc);
         if held.len() < k {
-            held.push(entry);
-        } else if entry < *held.peek().expect("k > 0 held") {
-            // Better than the worst held: it takes the worst one's place.
-            held.pop();
-            held.push(entry);
+            held.push(Held(score, doc.to_vec()));
+        } else {
+            // Better than the worst held (`Held`'s order: a higher score, or an equal score
+            // and a smaller id): it takes the worst one's place.
+            let worst = held.peek().expect("k > 0 held");
+            let better = match score.total_cmp(&worst.0) {
+                Ordering::Greater => true,
+                Ordering::Equal => doc < worst.1.as_slice(),
+                Ordering::Less => false,
+            };
+            if better {
+                held.pop();
+                held.push(Held(score, doc.to_vec()));
+            }
         }
     }
     // Best first: score descending, then id ascending (`Held` orders the worst greatest).
