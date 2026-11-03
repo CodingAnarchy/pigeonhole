@@ -308,7 +308,9 @@ module Pigeonhole
       # runs the passes that are due, and saves the position. `timeout` bounds the wait, not
       # the passes, which run the block. A `StandardError` from the block fails that
       # namespace's pass (it's in `failed`, retried after `min_age`). `throw`, another
-      # exception (`Interrupt`) or an interrupt stops the step and takes effect. (`break` in
+      # exception (`Interrupt`) or an interrupt stops the step and takes effect; the groups
+      # the step still had are refused, and the loop treats their namespaces as failed too,
+      # so it retries them after `min_age` (the crate can't tell a refusal from a failure). (`break` in
       # the block raises `LocalJumpError`, a `StandardError`: the block outlives the
       # `consolidate_loop` call that took it.)
       def run_once(timeout = 1.0)

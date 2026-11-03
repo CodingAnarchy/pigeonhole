@@ -1149,7 +1149,16 @@ fn drive<R: Send + 'static>(
     let (to_ruby, groups) = mpsc::channel::<Vec<mem::StoredMemory>>();
     let (answer_tx, answers) = mpsc::channel::<Option<Vec<mem::Memory>>>();
     *lock(&slot.slot) = Some((to_ruby, answers));
-    let worker = match std::thread::Builder::new().name(name.into()).spawn(work) {
+    // The worker empties the slot as soon as its work returns, dropping the sender, so the
+    // wait below sees `Disconnected` at once rather than at the end of a slice (ai1249's
+    // N1 on #1441).
+    let worker_slot = Arc::clone(slot);
+    let run = move || {
+        let out = work();
+        lock(&worker_slot.slot).take();
+        out
+    };
+    let worker = match std::thread::Builder::new().name(name.into()).spawn(run) {
         Ok(w) => w,
         Err(e) => {
             lock(&slot.slot).take();

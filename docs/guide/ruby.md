@@ -219,7 +219,7 @@ end
   - Like `Feed`, a watch is a cursor: a live watch has no end.
 - **A consolidation loop** (T9). `store.consolidate_loop(name, policy:) { |group| ... }` returns a `ConsolidateLoop`, whose `run_once(timeout)` reads new memories and runs a pass with the block for each namespace once its memories are `min_age` old. It returns a `LoopStep`.
   - **Position:** the loop saves where it is in the store under `name`, so a restart resumes it.
-  - **Failures:** a `StandardError` from the block fails that namespace's pass. It's reported in `LoopStep#failed` and retried after `min_age`.
+  - **Failures:** a `StandardError` from the block fails that namespace's pass. It's reported in `LoopStep#failed` and retried after `min_age`. An interrupt (`Timeout`, Ctrl-C) or another exception during a step stops it. The groups the step still had are refused, and their namespaces are retried after `min_age` too, since the loop counts a refused group as a failed one.
   - **One loop per name:** a newer loop takes the name over, and the older one's next step raises `LoopTakenOver` (a `Conflict`). Stop the older loop then: don't retry it or recreate it.
   - **Clock:** `clock_offset:` shifts the loop's clock for tests.
 - **Closing.** Close a store when you're done with it (`store.close`, or a block form). Its forgetter thread stops once every handle to the store is closed. `db.close` closes the stores opened on it first. After either, store calls raise `Closed`, and a call already running ends with `Closed`.
