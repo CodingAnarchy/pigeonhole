@@ -48,6 +48,20 @@ fn bulk(index: &Index, expected: u64, items: &[(Vec<u8>, V)]) -> pigeonhole_vect
                 _ => unreachable!(),
             }),
         ),
+        Some(V::F16(_)) => index.bulk_load_f16(
+            expected,
+            items.iter().map(|(k, v)| match v {
+                V::F16(x) => (k, x.clone()),
+                _ => unreachable!(),
+            }),
+        ),
+        Some(V::BF16(_)) => index.bulk_load_bf16(
+            expected,
+            items.iter().map(|(k, v)| match v {
+                V::BF16(x) => (k, x.clone()),
+                _ => unreachable!(),
+            }),
+        ),
         _ => index.bulk_load_f32(
             expected,
             items.iter().map(|(k, v)| match v {

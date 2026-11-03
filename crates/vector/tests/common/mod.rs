@@ -164,7 +164,7 @@ impl V {
     }
 }
 
-/// The specs the model runs over: one of each element, every metric.
+/// The specs the model runs over: every element, every metric.
 pub fn specs() -> Vec<VectorSpec> {
     vec![
         VectorSpec::new(8, Element::F32, Metric::L2).unwrap(),
@@ -172,13 +172,7 @@ pub fn specs() -> Vec<VectorSpec> {
         VectorSpec::new(6, Element::I8, Metric::InnerProduct).unwrap(),
         VectorSpec::new(6, Element::I8, Metric::Cosine).unwrap(),
         VectorSpec::new(32, Element::Bit, Metric::Hamming).unwrap(),
-    ]
-}
-
-/// Half-precision specs (#1268 item 7): the model and reader tests run over these too. Not
-/// in [`specs`] while `bulk_load` has no half forms.
-pub fn half_specs() -> Vec<VectorSpec> {
-    vec![
+        // Half precision (#1268 item 7).
         VectorSpec::new(8, Element::F16, Metric::L2).unwrap(),
         VectorSpec::new(8, Element::F16, Metric::Cosine).unwrap(),
         VectorSpec::new(8, Element::BF16, Metric::InnerProduct).unwrap(),

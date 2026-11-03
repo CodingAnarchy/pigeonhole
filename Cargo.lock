@@ -1292,6 +1292,7 @@ version = "1.0.0"
 dependencies = [
  "futures-core",
  "pigeonhole",
+ "pigeonhole-format",
  "pigeonhole-vector",
 ]
 
