@@ -382,3 +382,36 @@ fn a_stopped_consolidator_keeps_the_namespace_due() {
     assert_eq!(step.passes[0].1.committed, 1);
     db.close().unwrap();
 }
+
+/// perf2 on #1441: a `LoopInterrupter` ends a step's wait early (from another thread, as a
+/// binding whose caller was interrupted does): the step returns well before its timeout,
+/// with `interrupted` set, having saved. One set before a step makes it return at once.
+#[test]
+fn an_interrupter_ends_a_steps_wait_early() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let c = Arc::new(Concat::new());
+    let mut l = store.consolidate_loop("main", c.clone());
+    l.run_once(Duration::ZERO).unwrap();
+    let stop = l.interrupter();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        stop.interrupt();
+    });
+    let started = std::time::Instant::now();
+    let step = l.run_once(Duration::from_secs(5)).unwrap();
+    let took = started.elapsed();
+    t.join().unwrap();
+    assert!(step.interrupted, "{step:?}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Not interrupted: a short step runs to its timeout.
+    let step = l.run_once(Duration::from_millis(100)).unwrap();
+    assert!(!step.interrupted);
+    // Set before a step: it returns at once.
+    l.interrupter().interrupt();
+    let started = std::time::Instant::now();
+    let step = l.run_once(Duration::from_secs(5)).unwrap();
+    assert!(step.interrupted && started.elapsed() < Duration::from_secs(1));
+    db.close().unwrap();
+}
