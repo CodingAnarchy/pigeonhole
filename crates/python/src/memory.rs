@@ -175,7 +175,26 @@ fn kind_name(k: mem::Kind) -> &'static str {
     }
 }
 
-fn link_type(n: u8) -> PyResult<mem::LinkType> {
+/// A link type argument: an int (a `LinkType` is one). Out of range, a huge int included, is
+/// `InvalidArgument`; a non-int is `TypeError`.
+fn link_type_arg(ob: &Bound<'_, PyAny>) -> PyResult<mem::LinkType> {
+    if !ob.is_instance_of::<pyo3::types::PyInt>() || ob.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyTypeError::new_err("a link type is an int"));
+    }
+    match ob.extract::<i64>() {
+        Ok(n) => link_type(n),
+        Err(_) => Err(invalid(format!(
+            "link type {ob}: 1 to 3, or an application's from 16 to 255"
+        ))),
+    }
+}
+
+fn link_type(n: i64) -> PyResult<mem::LinkType> {
+    let n = u8::try_from(n).map_err(|_| {
+        invalid(format!(
+            "link type {n}: 1 to 3, or an application's from 16 to 255"
+        ))
+    })?;
     match n {
         1 => Ok(mem::LinkType::DERIVED_FROM),
         2 => Ok(mem::LinkType::SUPERSEDES),
@@ -560,10 +579,11 @@ fn build(
     if let Some(ls) = links {
         for l in ls.try_iter()? {
             let l = l?;
-            let (to, ty, w): (Bound<'_, PyAny>, u8, f32) = l.extract().map_err(|_| {
-                PyTypeError::new_err("links: a list of (id, link type, weight) tuples")
-            })?;
-            m = m.link(id_arg(&to)?, link_type(ty)?, w);
+            let (to, ty, w): (Bound<'_, PyAny>, Bound<'_, PyAny>, f32) =
+                l.extract().map_err(|_| {
+                    PyTypeError::new_err("links: a list of (id, link type, weight) tuples")
+                })?;
+            m = m.link(id_arg(&to)?, link_type_arg(&ty)?, w);
         }
     }
     Ok(m.pinned(pinned))
@@ -1115,10 +1135,12 @@ impl Store {
             .ok_or_else(closed)
     }
 
-    fn adopt(db: &Database, s: mem::Store) -> Self {
+    /// Registers `s` with its database; a database closed meanwhile refuses it, and the
+    /// store is dropped here, which stops its forgetter.
+    fn adopt(db: &Database, s: mem::Store) -> PyResult<Self> {
         let slot = Arc::new(RwLock::new(Some(s)));
-        db.adopt_store(&slot);
-        Self(slot)
+        db.adopt_store(&slot)?;
+        Ok(Self(slot))
     }
 }
 
@@ -1156,7 +1178,7 @@ impl Store {
         let s = py
             .detach(move || mem::Store::create(&p, &name, o))
             .or_mem()?;
-        Ok(Self::adopt(db.get(), s))
+        Self::adopt(db.get(), s)
     }
 
     /// Opens the store `name` for a caller embedding with `model` (`ModelMismatch` for
@@ -1177,7 +1199,7 @@ impl Store {
                 None => mem::Store::open_without_embeddings(&p, &name),
             })
             .or_mem()?;
-        Ok(Self::adopt(db.get(), s))
+        Self::adopt(db.get(), s)
     }
 
     /// Opens the store `name` from a reader process: recall, `get` and `verify` only.
@@ -1197,7 +1219,7 @@ impl Store {
             })
             .or_mem()?;
         let slot = Arc::new(RwLock::new(Some(Arc::new(s))));
-        reader.get().adopt_store(&slot);
+        reader.get().adopt_store(&slot)?;
         Ok(ReadStore(slot))
     }
 
@@ -1259,7 +1281,10 @@ impl Store {
 
     /// `remember` inside `txn`, committed with it. It skips near dedup, whose check reads
     /// outside a transaction: call `near_duplicate` first if you need it. It reads in the
-    /// transaction, so it's safe inside `Database.transact`, whose retry re-reads.
+    /// transaction, so it's safe inside `Database.transact`, whose retry re-reads. Its reads
+    /// are at the transaction's snapshot, which doesn't see the transaction's own writes:
+    /// two `remember_in` of the same text in one transaction both write (exact dedup sees
+    /// only what was committed before).
     #[pyo3(signature = (txn, ns, text, *, embedding=None, kind=None, importance=None, source=None, session=None, links=None, pinned=false))]
     #[allow(clippy::too_many_arguments)]
     fn remember_in(
@@ -1316,10 +1341,10 @@ impl Store {
         py: Python<'_>,
         from_: &Bound<'_, PyAny>,
         to: &Bound<'_, PyAny>,
-        link_type: u8,
+        link_type: &Bound<'_, PyAny>,
         weight: f32,
     ) -> PyResult<()> {
-        let (a, b, ty) = (id_arg(from_)?, id_arg(to)?, self::link_type(link_type)?);
+        let (a, b, ty) = (id_arg(from_)?, id_arg(to)?, link_type_arg(link_type)?);
         let s = self.handle()?;
         py.detach(move || s.link(&a, &b, ty, weight)).or_mem()
     }
@@ -1581,7 +1606,9 @@ impl Store {
     /// again). An exception from it, `KeyboardInterrupt` and `SystemExit` included, or a
     /// return that isn't a list of `Memory`, stops the pass with `ConsolidateError`: its
     /// `consolidated` is the pass so far, whose groups stay committed, and its `__cause__` the
-    /// exception.
+    /// exception. Python sees Ctrl-C only while it runs Python code, so during a pass it
+    /// arrives at the consolidator's next call (stopping the pass as above) or when the pass
+    /// returns.
     #[pyo3(signature = (ns, consolidator, *, policy=None, after=None, now_us=None))]
     fn consolidate(
         &self,

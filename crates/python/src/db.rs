@@ -188,11 +188,24 @@ pub(crate) struct Database(
 );
 
 impl Database {
-    /// Registers a memory store opened on this database, for `close` to close first.
-    pub(crate) fn adopt_store(&self, slot: &std::sync::Arc<crate::memory::StoreSlot>) {
+    /// Registers a memory store opened on this database, for `close` to close first. Under
+    /// the stores lock, which `close` holds while it takes the list and the handle, so a
+    /// store opened during a close is either closed by it or refused here (simp724's L1 on
+    /// #1395): `Closed` once the database is gone.
+    pub(crate) fn adopt_store(
+        &self,
+        slot: &std::sync::Arc<crate::memory::StoreSlot>,
+    ) -> PyResult<()> {
         let mut stores = self.1.lock().expect("not poisoned");
+        if self.0.read().expect("not poisoned").is_none() {
+            return Err(with_code(
+                pigeonhole::ErrorCode::Closed,
+                "the database is closed",
+            ));
+        }
         stores.retain(|w| w.strong_count() > 0);
         stores.push(std::sync::Arc::downgrade(slot));
+        Ok(())
     }
 
     pub(crate) fn db(&self) -> PyResult<pigeonhole::Pigeonhole> {
@@ -411,12 +424,16 @@ impl Database {
     /// its tables, afterwards raises `Closed`. Closing twice does nothing.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         // The memory stores first: dropping their handles stops their forgetters (a slice in
-        // flight fails with `Closed`, its deletion dropped whole).
-        let stores = std::mem::take(&mut *self.1.lock().expect("not poisoned"));
+        // flight fails with `Closed`, its deletion dropped whole). The list and the handle are
+        // taken under the stores lock, so a store opened meanwhile is in the list or refused.
+        let (stores, db) = {
+            let mut stores = self.1.lock().expect("not poisoned");
+            let db = self.0.write().expect("not poisoned").take();
+            (std::mem::take(&mut *stores), db)
+        };
         for s in stores.iter().filter_map(std::sync::Weak::upgrade) {
             crate::memory::close_slot(&s);
         }
-        let db = self.0.write().expect("not poisoned").take();
         match db {
             Some(db) => py.detach(move || db.close()).or_py(),
             None => Ok(()),
@@ -449,11 +466,22 @@ pub(crate) struct Reader(
 );
 
 impl Reader {
-    /// Registers a memory store opened on this reader, for `close` to close first.
-    pub(crate) fn adopt_store(&self, slot: &std::sync::Arc<crate::memory::ReadSlot>) {
+    /// Registers a memory store opened on this reader, for `close` to close first; `Closed`
+    /// once the reader is gone (as `Database::adopt_store`).
+    pub(crate) fn adopt_store(
+        &self,
+        slot: &std::sync::Arc<crate::memory::ReadSlot>,
+    ) -> PyResult<()> {
         let mut stores = self.1.lock().expect("not poisoned");
+        if self.0.read().expect("not poisoned").is_none() {
+            return Err(with_code(
+                pigeonhole::ErrorCode::Closed,
+                "the reader is closed",
+            ));
+        }
         stores.retain(|w| w.strong_count() > 0);
         stores.push(std::sync::Arc::downgrade(slot));
+        Ok(())
     }
 
     pub(crate) fn db(&self) -> PyResult<pigeonhole::PigeonholeReader> {
@@ -525,11 +553,14 @@ impl Reader {
 
     /// Closes the reader. Closing twice does nothing.
     fn close(&self) {
-        let stores = std::mem::take(&mut *self.1.lock().expect("not poisoned"));
+        let stores = {
+            let mut stores = self.1.lock().expect("not poisoned");
+            self.0.write().expect("not poisoned").take();
+            std::mem::take(&mut *stores)
+        };
         for s in stores.iter().filter_map(std::sync::Weak::upgrade) {
             s.write().expect("not poisoned").take();
         }
-        self.0.write().expect("not poisoned").take();
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {

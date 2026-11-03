@@ -60,8 +60,9 @@ def test_links_supersede_and_mark_used(db):
         got = s.get(b)
         assert [(l.id, l.type, l.weight) for l in got.links] == [(a, 1, 0.5)]
         assert [(l.id, l.type) for l in got.backlinks] == [(a, 20)]
-        with pytest.raises(ph.InvalidArgument):
-            s.link(a, b, 5)  # below the first custom type
+        for bad in (5, 256, -1, 1 << 70):  # below the first custom type, or not a u8
+            with pytest.raises(ph.InvalidArgument):
+                s.link(a, b, bad)
         with pytest.raises(ph.InvalidArgument):
             s.link(a, c, mem.LinkType.SIMILAR_TO)  # across namespaces
         s.supersede(a, b)
@@ -371,3 +372,31 @@ def test_keyboard_interrupt_in_a_consolidator_stops_the_pass(db):
         assert isinstance(e.value.__cause__, KeyboardInterrupt)
         assert e.value.consolidated.committed == 1
         assert s.recall("n", text="summary")[0].text == f"summary {calls[0]}"
+
+
+def test_stores_opened_while_the_database_closes_never_outlive_it(path):
+    """simp724's L1 on #1395: a store opened during Database.close is either closed by it or
+    refused with Closed; none is left working on a closed database."""
+    for _ in range(20):
+        db = ph.open(path, create=True, shards=1)
+        mem.Store.create(db, "agents").close() if "mem_agents" not in db.tables() else None
+        opened, errors = [], []
+        go = threading.Event()
+
+        def opener():
+            go.wait()
+            for _ in range(50):
+                try:
+                    opened.append(mem.Store.open(db, "agents", model=None))
+                except ph.Closed:
+                    errors.append(1)
+                    return
+
+        t = threading.Thread(target=opener)
+        t.start()
+        go.set()
+        db.close()
+        t.join()
+        for s in opened:
+            with pytest.raises(ph.Closed):
+                s.recall("n", text="x")
