@@ -43,6 +43,10 @@ pub struct LoopStep {
     /// The passes that failed, by namespace: the consolidator's error (`Error::Consolidate`,
     /// with the pass so far). The namespace stays pending, retried after `min_age`.
     pub failed: Vec<(String, Error)>,
+    /// The namespaces whose pass the consolidator stopped
+    /// ([`ConsolidateStopped`](crate::ConsolidateStopped)): they keep their pending time, so
+    /// they're due again at the next step, not after `min_age`.
+    pub stopped: Vec<String>,
     /// When the next pass is due, µs since the Unix epoch, if any namespace is pending.
     pub next_due: Option<u64>,
     /// Where the loop is, as saved: the watch's position, for callers that checkpoint
@@ -266,7 +270,7 @@ impl ConsolidateLoop {
                 .map(|(ns, _)| ns.clone())
                 .collect()
         };
-        let (mut passes, mut failed) = (Vec::new(), Vec::new());
+        let (mut passes, mut failed, mut stopped) = (Vec::new(), Vec::new(), Vec::new());
         for ns in due {
             let r = self
                 .store
@@ -278,6 +282,15 @@ impl ConsolidateLoop {
                 Ok(pass) => {
                     passes.push((ns.clone(), pass));
                     self.oldest_pending(&ns, now)?
+                }
+                // The consolidator stopped rather than failed (an interrupted binding, say):
+                // the namespace keeps its pending time, so it's due again at the next step
+                // (cli692 on #1441).
+                Err(Error::Consolidate { ref error, .. })
+                    if error.is::<crate::consolidate::ConsolidateStopped>() =>
+                {
+                    stopped.push(ns);
+                    continue;
                 }
                 Err(e @ Error::Consolidate { .. }) => {
                     failed.push((ns.clone(), e));
@@ -303,6 +316,7 @@ impl ConsolidateLoop {
             events,
             passes,
             failed,
+            stopped,
             next_due: saved
                 .pending
                 .values()

@@ -289,6 +289,7 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
   - Only `Remembered` marks a namespace, from its memory's `created_us` (cli692's A1, simp724's R3). `Summarized` and `Updated` (merges, `mark_used`, links) never do.
   - A namespace is due at its oldest pending memory plus `min_age`. After a pass at `now`, the next pending time comes from a newest-first scan of its memory rows, stopping at the first older than `now − min_age`.
   - A failed pass (`Error::Consolidate`) leaves the namespace pending from `now`, so it's retried after `min_age`. A database error ends the step.
+  - **`ConsolidateStopped`** (a unit struct, `std::error::Error`) is a consolidator's way to say it stopped rather than failed, as an interrupted binding does. Its namespace keeps its pending time, so it's due again at the next step, and is listed in **`LoopStep::stopped`** rather than `failed` (cli692 on #1441). `Store::consolidate` still ends with `Error::Consolidate` on it.
   - `run_once`'s wait is the smaller of its timeout and the next due time (A5: it bounds the wait, not the passes).
 - **Position:** `G:meta:loop:{name}` holds a version byte (1), a generation (u64), the watch token, and the pending map ((namespace, µs) pairs), little endian.
   - **Saving:** each step ends with a transaction that reads the cell, requires the generation it last saved, and writes it plus one.
