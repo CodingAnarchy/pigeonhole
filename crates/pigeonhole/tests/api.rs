@@ -125,6 +125,26 @@ fn table_builder_create_open_and_families() {
     assert_eq!(db.tables(), ["t"]);
 }
 
+/// ICR 0110: clones of one open are the same database; another database, and another open
+/// of the same file after a close, are not.
+#[test]
+fn same_database_is_one_open() {
+    let vfs = SimVfs::new(8);
+    let db = Pigeonhole::open("/db/same.phdb", sim_options(&vfs)).unwrap();
+    let clone = db.clone();
+    assert!(db.same_database(&clone) && clone.same_database(&db));
+    drop(clone);
+    db.close().unwrap();
+    let again = Pigeonhole::open("/db/same.phdb", sim_options(&vfs)).unwrap();
+    let old = again.clone();
+    assert!(again.same_database(&old));
+    let other = Pigeonhole::open("/db/other.phdb", sim_options(&vfs)).unwrap();
+    assert!(!again.same_database(&other));
+    other.close().unwrap();
+    drop(old);
+    again.close().unwrap();
+}
+
 #[test]
 fn drop_table_removes_it_and_its_data() {
     let db = db();

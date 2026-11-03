@@ -124,3 +124,9 @@ pub(crate) fn failing_after_split() -> bool {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
+
+/// Whether two handles share one index's state (its centroid cache, queue and rebalancer):
+/// clones of one open, or opens the process registry joined (#1268 item 8). Inspection only.
+pub fn shares_state(a: &crate::Index, b: &crate::Index) -> bool {
+    Arc::ptr_eq(a.inner(), b.inner())
+}

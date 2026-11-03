@@ -588,6 +588,7 @@ pub fn pigeonhole::Pigeonhole::open_reader(impl core::convert::AsRef<std::path::
 pub fn pigeonhole::Pigeonhole::pinned_shard_cpus(&self) -> alloc::vec::Vec<usize>
 pub fn pigeonhole::Pigeonhole::recovery_stats(&self) -> pigeonhole::RecoveryStats
 pub fn pigeonhole::Pigeonhole::row_cache_stats(&self) -> pigeonhole::RowCacheStats
+pub fn pigeonhole::Pigeonhole::same_database(&self, &pigeonhole::Pigeonhole) -> bool
 pub fn pigeonhole::Pigeonhole::set_default_durability(&self, pigeonhole::Durability)
 pub fn pigeonhole::Pigeonhole::shrink(&self) -> pigeonhole::Result<u64>
 pub fn pigeonhole::Pigeonhole::snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>

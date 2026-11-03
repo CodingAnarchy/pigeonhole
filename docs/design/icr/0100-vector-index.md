@@ -77,6 +77,12 @@
 - **`Index::bulk_load_f16(expected, vectors)`, `bulk_load_bf16`:** `bulk_load_f32` for half bit patterns, stored bit for bit. The k-means sample and each vector's placement widen into `f32`; the streaming pass refills one buffer per vector. `bulk_load_f32` loads a half index too, rounding as `insert_f32` does.
 - **Internal:** a crate-private `half` module widens patterns into a caller's buffer (`Input::widen_into`), checked against `VectorRef::widen_into` over all 65,536 patterns, and rounds `f32` to a half (`half::narrow`), checked against the format's rounding that `put_vector_f32` uses.
 
+## A per-process registry (#1268 item 8, ICR 0110)
+- **`Index::open`, `open_with_rebalancer` and the `create` forms share an index already open in the process.** They return a clone of the open handle, sharing its centroid cache, its queue of lists to rebalance and its one rebalancing thread. Before, each open had its own, which was correct but duplicated the work.
+- **"Already open" means three things.** An application handle to it is still alive. It's in the same open database, by `Pigeonhole::same_database` (ICR 0110): not another file, a copy of one, or the same file reopened after a close. And its table is still the one opened: the options row still reads through the entry's own table handle, which a dropped (and perhaps recreated) table or a closed database refuses.
+- **The crate's thread starts once per index,** at the first `open` in background mode. `open_with_rebalancer` hands out a rebalancer on the shared queue; several take turns list by list (each list is claimed by one at a time), and they share one `set_wakeup`.
+- **Internal:** a process-wide `Mutex<Vec<Entry>>` of `(name, Weak<Inner>, Weak<user token>)`. The lock is held across a fresh open (a few reads), so concurrent first opens get one index, and across the stale-entry read. Nothing under it takes it again, and no `Inner` drops under it.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);
