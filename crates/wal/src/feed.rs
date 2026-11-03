@@ -119,6 +119,17 @@ pub struct FeedCursor {
     cur: Option<Cursor>,
     /// Whether the last call stopped (the next one reads the headers again first).
     stopped: bool,
+    /// Whether the headers were read in this call and no frame was decoded since: a stop
+    /// found then is where the cursor resumed, so it needs no second read (an idle stream
+    /// reads its headers once per stop, not twice).
+    fresh: bool,
+    /// Whether the next `load` follows a header read: it reads one frame, not a chunk. An
+    /// idle stream's resume needs only the frame it stopped in; a busy one reads full
+    /// chunks after it.
+    short_load: bool,
+    /// Header reads and bytes of frames read (an inspection count for tests).
+    #[cfg(test)]
+    reads: (u64, u64),
     chunk: Vec<u8>,
     chunk_slot: usize,
     /// Segment offset of `chunk[0]`.
@@ -171,6 +182,10 @@ impl FeedCursor {
             grid,
             cur: None,
             stopped: false,
+            fresh: false,
+            short_load: false,
+            #[cfg(test)]
+            reads: (0, 0),
             chunk: Vec::new(),
             chunk_slot: usize::MAX,
             chunk_start: 0,
@@ -225,10 +240,19 @@ impl FeedCursor {
             return Ok(());
         }
         let segment_size = self.segment_size();
-        let len = (CHUNK_FRAMES * FRAME).min(segment_size - frame) as usize;
+        let frames = if std::mem::take(&mut self.short_load) {
+            1
+        } else {
+            CHUNK_FRAMES
+        };
+        let len = (frames * FRAME).min(segment_size - frame) as usize;
         self.chunk.resize(len, 0);
         self.file
             .read_at(&mut self.chunk, slot as u64 * segment_size + frame)?;
+        #[cfg(test)]
+        {
+            self.reads.1 += len as u64;
+        }
         self.chunk_slot = slot;
         self.chunk_start = frame;
         Ok(())
@@ -242,8 +266,13 @@ impl FeedCursor {
         };
         let (slot, epoch) = (cur.slot, cur.epoch);
         self.grid = Grid::read(&self.file, self.stream, self.db_id)?;
+        #[cfg(test)]
+        {
+            self.reads.0 += 1;
+        }
         // Cached frames may predate a rewrite of the slot.
         self.chunk_slot = usize::MAX;
+        self.short_load = true;
         let here = self
             .grid
             .as_ref()
@@ -313,6 +342,7 @@ impl FeedCursor {
             if !self.refresh()? {
                 return Ok(Step::Gone);
             }
+            self.fresh = true;
         }
         loop {
             let Some(cur) = &self.cur else {
@@ -343,6 +373,7 @@ impl FeedCursor {
                         return Ok(Step::Cut);
                     }
                     Some(Decoded::Record { offset }) => {
+                        self.fresh = false;
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
                         cur.last_end = end;
@@ -367,8 +398,12 @@ impl FeedCursor {
             let Some(stop) = stop else { continue };
             // The segment's valid data ends at `stop` for now: a successor on disk takes
             // over, else this is the readable end. Read the headers first: the successor
-            // may have been written since they were read, or the slot recycled.
-            if !self.refresh()? {
+            // may have been written since they were read, or the slot recycled. Unless this
+            // call read them and decoded nothing since (`fresh`, an idle stream): chaining
+            // then goes by headers read just before these frames, as a poll a moment earlier
+            // would have, a short stop is deferred once as below (#1370), and the next call
+            // reads the headers again before reading on.
+            if !std::mem::take(&mut self.fresh) && !self.refresh()? {
                 return Ok(Step::Gone);
             }
             match self.chain(epoch, stop)? {
@@ -386,5 +421,84 @@ impl FeedCursor {
             self.stopped = true;
             return Ok(Step::End);
         }
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use crate::{Wal, WalOptions, WalStream};
+    use pigeonhole_format::wal::BatchBuilder;
+    use pigeonhole_format::{Durability, FamilyId, Kind, TableId};
+    use pigeonhole_io::sim::SimVfs;
+
+    const DB_ID: [u8; 16] = [0xAB; 16];
+
+    fn append(wal: &mut WalStream, seqno: u64) {
+        let mut b = BatchBuilder::new();
+        b.push(
+            TableId(1),
+            FamilyId(2),
+            Kind::Put,
+            b"row",
+            b"q",
+            Some(seqno),
+            b"v",
+        )
+        .unwrap();
+        let record = WalRecord::Batch {
+            seqno,
+            commit_ts: seqno,
+            batch: b.batch(),
+        };
+        wal.append(&record, Durability::GroupSync).unwrap();
+        wal.sync().unwrap();
+    }
+
+    fn drain(c: &mut FeedCursor) -> usize {
+        let mut n = 0;
+        loop {
+            match c.step().unwrap() {
+                Step::Record { .. } => n += 1,
+                Step::End => return n,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// D310 PR 5b (the subscriber cost on the AX102): an idle stream's poll reads its
+    /// headers once and one frame, not twice and a 1 MiB chunk; a stream with new records
+    /// still reads them all, its headers again at its stop.
+    #[test]
+    fn an_idle_stop_reads_the_headers_once_and_one_frame() {
+        let vfs: VfsRef = SimVfs::new(5);
+        let db = Path::new("/db/data.phdb");
+        let o = WalOptions {
+            segment_size: 64 * FRAME,
+            retain_segments: 4,
+            feed_session: 0xfeed,
+            ..WalOptions::default()
+        };
+        let mut wal = WalStream::create(&vfs, db, StreamId(0), DB_ID, o).unwrap();
+        append(&mut wal, 1);
+        let mut c = FeedCursor::open(&vfs, db, StreamId(0), DB_ID, Lsn::default()).unwrap();
+        assert_eq!(drain(&mut c), 1);
+        for _ in 0..10 {
+            let before = c.reads;
+            assert_eq!(drain(&mut c), 0);
+            assert_eq!(c.reads.0 - before.0, 1, "one header read per idle stop");
+            assert_eq!(c.reads.1 - before.1, FRAME, "one frame per idle stop");
+        }
+        // New records: delivered, with the headers read at the resume and again at the stop.
+        for s in 2..=4 {
+            append(&mut wal, s);
+        }
+        let before = c.reads;
+        assert_eq!(drain(&mut c), 3);
+        assert_eq!(
+            c.reads.0 - before.0,
+            2,
+            "a stop after records reads the headers"
+        );
     }
 }
