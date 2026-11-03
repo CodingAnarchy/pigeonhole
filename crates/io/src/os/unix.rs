@@ -339,16 +339,16 @@ pub(crate) fn map_range(file: &fs::File, offset: u64, len: usize) -> Result<Opti
 
 /// Faults `len` bytes at `at` within `mapping` in writable (`MADV_POPULATE_WRITE`, Linux
 /// 5.14), so later stores there take no fault (D312, owner call 3). The contents don't change.
-/// `Err(true)` when the kernel doesn't know the advice (the caller stops populating for
-/// good); `Err(false)` for another failure.
+/// `at` must be page-aligned, as `madvise` requires (the populate window keeps its ranges so).
 #[cfg(target_os = "linux")]
-pub(crate) fn populate_write(
-    mapping: &Mapping,
-    at: usize,
-    len: usize,
-) -> std::result::Result<(), bool> {
-    if at.checked_add(len).is_none_or(|end| end > mapping.len) {
-        return Err(false);
+pub(crate) fn populate_write(mapping: &Mapping, at: usize, len: usize) -> Result<()> {
+    if at.checked_add(len).is_none_or(|end| end > mapping.len)
+        || !at.is_multiple_of(system_page_size())
+    {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "a populate range outside the mapping",
+        ));
     }
     // SAFETY: `[at, at + len)` lies inside `mapping`, which is live while borrowed. The advice
     // only installs page-table entries for the range: no byte of it is read or written, so it
@@ -361,9 +361,19 @@ pub(crate) fn populate_write(
         )
     };
     if r == 0 {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(last_error("madvise(MADV_POPULATE_WRITE)"))
     }
-    Err(std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL))
+}
+
+/// Whether the kernel knows `MADV_POPULATE_WRITE` (Linux 5.14): asked with an empty range,
+/// which a kernel that knows the advice accepts and one that doesn't refuses (`EINVAL`).
+#[cfg(target_os = "linux")]
+pub(crate) fn populate_supported() -> bool {
+    // SAFETY: an empty range at address 0 (page-aligned): `madvise` checks the advice and
+    // returns without touching any page.
+    unsafe { libc::madvise(std::ptr::null_mut(), 0, libc::MADV_POPULATE_WRITE) == 0 }
 }
 
 /// Creates or opens `path` for a file-backed region and sizes it on creation.

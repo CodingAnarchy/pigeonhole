@@ -47,9 +47,31 @@ unsafe impl Sync for Shared {}
 /// 3, perf287's S1 on #1369): a window, not the whole segment. Populating dirties a page, and a
 /// WAL sync covers the whole file (a rollover, the feed's interval, a flush barrier), so every
 /// sync writes back the window's pages not yet stored and write-protects them again: at most
-/// this much per stream per sync, not the rest of a 64 MiB segment.
-#[cfg(target_os = "linux")]
+/// this much (plus a step's rounding) per stream per sync, not the rest of a 64 MiB segment.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const POPULATE_WINDOW: usize = 4 << 20;
+
+/// The populate helper's step, and what each range's end rounds up to: every range starts
+/// where the last one ended, so every `madvise` starts page-aligned (perf287's B1 on #1369).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const POPULATE_STEP: usize = 2 << 20;
+
+/// The next range to populate once a store ends at `end`, the ranges so far ending at
+/// `queued_to`, in a mapping of `len` bytes: `None` until `end` comes within half a window of
+/// `queued_to`. The range starts at `queued_to` and ends a window past `end`, rounded up to a
+/// step (or at `len`), so with `queued_to` starting at 0 every range starts step-aligned.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn next_window(queued_to: usize, end: usize, len: usize) -> Option<(usize, usize)> {
+    if queued_to >= len || end.saturating_add(POPULATE_WINDOW / 2) < queued_to {
+        return None;
+    }
+    let to = end
+        .saturating_add(POPULATE_WINDOW)
+        .div_ceil(POPULATE_STEP)
+        .saturating_mul(POPULATE_STEP)
+        .min(len);
+    (to > queued_to).then_some((queued_to, to))
+}
 
 /// A real file's shared mapping ([`crate::os::map_range`]). The populate helper faults its
 /// pages in writable in the background, [`POPULATE_WINDOW`] ahead of the stores (D312, owner
@@ -75,13 +97,11 @@ impl FileWriteMap {
     }
 
     /// Asks the helper for the pages up to a window past `end` (a store's end), once `end` is
-    /// within half a window of what was asked for already.
+    /// within half a window of what was asked for already ([`next_window`]).
     #[inline]
     fn populate_to(&mut self, end: usize) {
-        let len = self.mapping.0.len();
-        if self.queued_to < len && end + POPULATE_WINDOW / 2 >= self.queued_to {
-            let to = len.min(end + POPULATE_WINDOW);
-            populate::queue(&self.mapping, self.queued_to, to);
+        if let Some((from, to)) = next_window(self.queued_to, end, self.mapping.0.len()) {
+            populate::queue(&self.mapping, from, to);
             self.queued_to = to;
         }
     }
@@ -109,32 +129,35 @@ impl crate::WriteMap for FileWriteMap {
 /// (`MADV_POPULATE_WRITE`), [`POPULATE_WINDOW`] ahead of the stream's stores. Off the stream's
 /// thread, which would otherwise pay those faults page by page in its tail. It holds the
 /// mapping while it works, so a rollover can't unmap it underneath; it skips a range whose
-/// stream has already dropped the mapping. On a kernel without the advice (before 5.14) it
-/// stops for good, and the stores fault as before.
+/// stream has already dropped the mapping. Whether the kernel knows the advice (5.14 on) is
+/// decided once, by a probe; without it nothing is queued, and the stores fault as before. A
+/// failed `madvise` only ends its own range.
 #[cfg(target_os = "linux")]
 mod populate {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use super::Shared;
-
-    /// Bytes per `madvise`: short steps, so a dropped mapping is let go soon.
-    const STEP: usize = 2 << 20;
+    use super::{POPULATE_STEP as STEP, Shared};
 
     /// A range of a mapping to populate.
     type Job = (Arc<Shared>, usize, usize);
 
     static HELPER: OnceLock<Option<Mutex<Sender<Job>>>> = OnceLock::new();
-    /// The kernel refused the advice: populating is off for the process.
-    static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+    /// Whether the kernel knows `MADV_POPULATE_WRITE`, probed once (perf287's B1: a failed
+    /// call never decides it).
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+
+    pub(super) fn supported() -> bool {
+        *SUPPORTED.get_or_init(crate::os::populate_supported)
+    }
     /// Bytes populated, for tests (an inspection counter).
     pub(super) static POPULATED: AtomicU64 = AtomicU64::new(0);
 
     /// Hands `[from, to)` of `mapping` to the helper, starting it the first time. A helper
     /// that couldn't start leaves the mapping as it is.
     pub(super) fn queue(mapping: &Arc<Shared>, from: usize, to: usize) {
-        if UNSUPPORTED.load(Ordering::Relaxed) {
+        if !supported() {
             return;
         }
         let helper = HELPER.get_or_init(|| {
@@ -157,30 +180,18 @@ mod populate {
         }
     }
 
-    /// Whether the kernel refused the advice (tests skip their check then).
-    #[cfg(test)]
-    pub(super) fn unsupported() -> bool {
-        UNSUPPORTED.load(Ordering::Relaxed)
-    }
-
     fn run(m: &Arc<Shared>, from: usize, to: usize) {
         let mut at = from;
         // Only while the stream still holds it: once it rolled over, the rest is never stored.
         // (The queue holds clones too, so "still held" is counted loosely: at worst a step
         // more of a range nobody will store into.)
-        while at < to && Arc::strong_count(m) > 1 && !UNSUPPORTED.load(Ordering::Relaxed) {
+        while at < to && Arc::strong_count(m) > 1 {
             let n = STEP.min(to - at);
-            match crate::os::populate_write(&m.0, at, n) {
-                Ok(()) => {
-                    POPULATED.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                Err(unsupported) => {
-                    if unsupported {
-                        UNSUPPORTED.store(true, Ordering::Relaxed);
-                    }
-                    return;
-                }
+            if crate::os::populate_write(&m.0, at, n).is_err() {
+                // This range only: the stores fault as they would have.
+                return;
             }
+            POPULATED.fetch_add(n as u64, Ordering::Relaxed);
             at += n;
         }
     }
@@ -216,9 +227,49 @@ mod tests {
         assert!(buf[4..60].iter().all(|&b| b == 0));
     }
 
-    /// D312 owner call 3: a held mapping is populated in the background a window ahead of its
-    /// stores, not the whole range (perf287's S1), and stores made meanwhile land in the file. A
-    /// kernel without `MADV_POPULATE_WRITE` (before 5.14) populates nothing: the fallback.
+    /// perf287's B1 on #1369: every range starts where the last ended, step-aligned (so
+    /// page-aligned for `madvise`), however unaligned the stores' ends; ranges never pass the
+    /// mapping; and a store always has at least half a window populated ahead of it.
+    #[test]
+    fn populate_windows_are_contiguous_and_step_aligned() {
+        use super::{POPULATE_STEP as S, POPULATE_WINDOW as W, next_window};
+        for len in [3 * W + 4096, 16 * W, W / 2] {
+            let mut queued = 0;
+            let mut ranges = 0;
+            let mut end = 0;
+            while end <= len {
+                if let Some((from, to)) = next_window(queued, end, len) {
+                    assert_eq!(from, queued, "contiguous");
+                    assert!(from % S == 0, "step-aligned start {from}");
+                    assert!(to == len || to % S == 0, "step-aligned end {to}");
+                    assert!(to <= len && to > from);
+                    queued = to;
+                    ranges += 1;
+                }
+                assert!(
+                    queued == len || queued >= end + W / 2,
+                    "half a window ahead of {end}"
+                );
+                // Unaligned store ends, as a WAL's groups have.
+                end += 4096 * 37 + 123;
+            }
+            assert_eq!(queued, len);
+            assert!(
+                ranges >= len.div_ceil(W).min(3),
+                "{ranges} ranges over {len}"
+            );
+        }
+        assert_eq!(
+            next_window(W, W / 2 - 1, 16 * W),
+            None,
+            "not yet within half a window"
+        );
+    }
+
+    /// D312 owner call 3: a held mapping is populated in the background a window at a time as
+    /// its stores advance, across many refills at unaligned store ends (perf287's B1), and
+    /// stores made meanwhile land in the file. A kernel without `MADV_POPULATE_WRITE` (before
+    /// 5.14) populates nothing: the fallback.
     #[cfg(target_os = "linux")]
     #[test]
     #[cfg_attr(
@@ -226,13 +277,13 @@ mod tests {
         ignore = "a real file's mapping and madvise: foreign calls Miri can't run"
     )]
     fn a_held_mapping_is_populated_a_window_ahead_of_its_stores() {
-        use super::POPULATE_WINDOW as W;
+        use super::{POPULATE_WINDOW as W, next_window};
         use crate::WriteMap;
         use std::io::{Read, Seek};
         let dir = std::env::temp_dir().join(format!("phio-populate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seg");
-        let len = 4 * W;
+        let len = 8 * W;
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -241,50 +292,60 @@ mod tests {
             .open(&path)
             .unwrap();
         f.set_len(len as u64).unwrap();
-        let wait_for = |n: u64| {
+        let supported = super::populate::supported();
+        let before = super::populated_bytes();
+        let wait_for = |n: usize| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while super::populated_bytes() < n
+            while super::populated_bytes() < before + n as u64
                 && std::time::Instant::now() < deadline
-                && !super::populate::unsupported()
             {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if supported {
+                assert_eq!(super::populated_bytes() - before, n as u64, "populated");
             }
         };
-        let before = super::populated_bytes();
         let mapping = crate::os::map_range(&f, 0, len).unwrap().unwrap();
         let mut map = super::FileWriteMap::new(mapping);
-        // The first window only.
-        wait_for(before + W as u64);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let supported = !super::populate::unsupported();
-        if supported {
-            assert_eq!(super::populated_bytes() - before, W as u64, "one window");
+        // The first window only, then each refill as the stores move on.
+        let mut queued = next_window(0, 0, len).unwrap().1;
+        wait_for(queued);
+        let mut refills = 0;
+        let mut at = 0;
+        let rec = b"record";
+        while at + rec.len() <= len {
+            map.write(at, rec).unwrap();
+            if let Some((_, to)) = next_window(queued, at + rec.len(), len) {
+                queued = to;
+                refills += 1;
+                wait_for(queued);
+            }
+            // Unaligned ends, about 1 MiB apart.
+            at += (1 << 20) + 4096 * 3 + 77;
         }
-        // A store within half a window of its edge asks for the next one.
-        map.write(0, b"first").unwrap();
-        map.write(W / 2 + 1, b"middle").unwrap();
-        let asked = (W / 2 + 1 + 6 + W) as u64;
-        wait_for(before + asked);
+        assert!(refills >= 5, "{refills} refills");
         if supported {
-            assert_eq!(
-                super::populated_bytes() - before,
-                asked,
-                "a window past the store"
-            );
+            assert_eq!(queued, len, "populating stayed on to the end");
         }
-        map.write(len - 4, b"last").unwrap();
         drop(map);
         let mut got = vec![0u8; len];
         f.rewind().unwrap();
         f.read_exact(&mut got).unwrap();
-        assert_eq!(&got[..5], b"first");
-        assert_eq!(&got[W / 2 + 1..W / 2 + 7], b"middle");
-        assert_eq!(&got[len - 4..], b"last");
-        let zero = |r: std::ops::Range<usize>| got[r].iter().all(|&b| b == 0);
-        assert!(
-            zero(5..W / 2 + 1) && zero(W / 2 + 7..len - 4),
-            "populating writes nothing"
-        );
+        let mut at = 0;
+        let mut zeros = 0usize;
+        while at < len {
+            let n = rec.len().min(len - at);
+            if at + rec.len() <= len {
+                assert_eq!(&got[at..at + n], rec, "a store at {at}");
+            }
+            let next = (at + (1 << 20) + 4096 * 3 + 77).min(len);
+            zeros += got[(at + n).min(len)..next]
+                .iter()
+                .filter(|&&b| b != 0)
+                .count();
+            at = next;
+        }
+        assert_eq!(zeros, 0, "populating writes nothing");
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
