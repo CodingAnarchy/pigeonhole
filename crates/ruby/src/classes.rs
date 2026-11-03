@@ -150,6 +150,6 @@ pub(crate) struct PagesState {
 #[magnus::wrap(class = "Pigeonhole::Pages", free_immediately, size)]
 pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);
 
-/// `Pigeonhole::Feed`: a change feed subscription; `None` once closed.
+/// `Pigeonhole::Feed`: a change feed subscription (its state is `crate::feed::FeedState`).
 #[magnus::wrap(class = "Pigeonhole::Feed", free_immediately, size)]
-pub(crate) struct Feed(pub(crate) ForkSafe<Mutex<Option<pigeonhole::Feed>>>);
+pub(crate) struct Feed(pub(crate) ForkSafe<crate::feed::FeedState>);

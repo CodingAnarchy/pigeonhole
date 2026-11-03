@@ -167,6 +167,36 @@ class TestFeed < Minitest::Test
     assert_equal "after", feed.next(timeout: 5).changes[0].row
   end
 
+  def elapsed
+    start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    yield
+    Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+  end
+
+  # perf2's S1 on #1411: a consumer looping in `next` gives way between its 100 ms slices,
+  # so a supervisor's `token` and `close` wait about one slice, not many (1.46 s measured
+  # before the fix).
+  def test_a_supervisor_reaches_a_feed_behind_a_looping_next
+    feed = t.feed
+    waiter = Thread.new { feed.next }
+    sleep 0.15
+    waits = Array.new(10) { elapsed { feed.token } + elapsed { feed.closed? } }
+    assert_operator waits.max, :<, 0.35, "token + closed? waits: #{waits.map { |w| w.round(3) }}"
+    assert_operator elapsed { feed.close }, :<, 0.25
+    assert_raises(Pigeonhole::Closed) { waiter.join(5) }
+  end
+
+  # perf2 on #1411: closing the database ends a consumer blocked in a live `each`, with
+  # `Closed`, the way out besides `break`.
+  def test_closing_the_database_ends_a_live_each
+    feed = t.feed
+    waiter = Thread.new { feed.each { nil } }
+    sleep 0.15
+    db.close
+    @db = nil
+    assert_raises(Pigeonhole::Closed) { waiter.join(5) }
+  end
+
   def test_iterating_waits_for_each_commit
     feed = t.feed
     writer = Thread.new do
