@@ -374,7 +374,8 @@ module Pigeonhole
     def hash: () -> Integer
   end
 
-  # A wide row's pages, each read when it is asked for.
+  # A wide row's pages, each read when it is asked for. A cursor: every Enumerable method
+  # consumes the pages it reads (`first` then `to_a` loses the first page).
   class Pages
     include Enumerable[Row]
 

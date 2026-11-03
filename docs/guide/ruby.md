@@ -51,7 +51,7 @@ With a block, `Pigeonhole.open` closes the database however the block exits. Wit
 - **Many rows:** `table.multi_get(keys, families:, qualifier_prefix:, versions:, column_limit:, snapshot:)` reads the rows of many keys in one read. The result is aligned with `keys`: one entry per key, in the order given, with `nil` for a key with no row. `keys` is an Array, or another Enumerable such as a `Set`.
 - **A wide row in pages:** `table.pages(row, size, ...)` returns a `Pages`, `Enumerable` over pages of at most `size` cells each (a column's versions are never split). Each page is read when it's asked for, and no read stays open between pages.
   - `position` is where the last page ended. Its `to_bytes` resumes the walk later, also in another process: `table.pages(row, size, after: Pigeonhole::RowPosition.from_bytes(token))`.
-  - A walk continues from where it stopped, so a second `each` yields only the pages that are left.
+  - **A walk is a cursor, not a collection:** every Enumerable method consumes the pages it reads. After `walk.first`, `walk.to_a` holds only the pages after the first, and a second `each` yields only what's left. Call `table.pages` again to read the row again.
 - **Snapshots:** `db.snapshot { |s| ... }` releases the snapshot when the block exits. Pass it as `snapshot:` to read several things at one point in time.
 
 ```ruby

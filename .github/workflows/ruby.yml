@@ -16,6 +16,8 @@ on:
     paths:
       - 'crates/ruby/**'
       - 'crates/pigeonhole/src/**'
+      # An engine dependency change can leave crates/ruby/Cargo.lock stale.
+      - 'Cargo.lock'
       - '.github/workflows/ruby.yml'
   workflow_dispatch:
 
@@ -56,6 +58,12 @@ jobs:
           bundler-cache: true
           working-directory: crates/ruby
           rustup-components: clippy, rustfmt
+      # crates/ruby keeps its own Cargo.lock, which an engine dependency change elsewhere can
+      # leave stale. `rake compile` doesn't pass --locked and would quietly rewrite it, so
+      # check it first (#1366's crc-fast drifted it unnoticed).
+      - name: Cargo.lock is current
+        working-directory: crates/ruby
+        run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Compile the extension
         run: bundle exec rake compile
       # crates/ruby is a workspace of its own (the root's `cargo --workspace` jobs don't see it):

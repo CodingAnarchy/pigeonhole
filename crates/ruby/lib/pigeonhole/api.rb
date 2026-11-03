@@ -443,8 +443,12 @@ module Pigeonhole
   end
 
   # A wide row's pages (`Table#pages`), each read when it is asked for: the walk holds no
-  # read open between pages. Enumerable over the pages (each a `Row`); a walk continues from
-  # where it stopped, so a second `each` yields only the pages the first didn't.
+  # read open between pages. Enumerable over the pages (each a `Row`).
+  #
+  # **A walk is a cursor, not a collection.** Every Enumerable method consumes the pages it
+  # reads: after `first`, a `to_a` returns only the pages after the first one, and a second
+  # `each` yields only what's left. To read the row again, call `Table#pages` again (with
+  # `after: position` to resume from where a walk stopped).
   class Pages
     include Enumerable
 
