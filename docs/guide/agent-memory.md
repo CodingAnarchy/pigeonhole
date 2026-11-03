@@ -207,7 +207,7 @@ These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX
 - **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
 - **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
 
-Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks the memory hits as returned, and counts each evidence session or turn once, at its first hit. So it's over memories, not LongMemEval's session-level variant, which collapses a session's turns first:
+Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks the memory hits as returned, and counts each evidence session or turn once, at its first hit. So it's over memories, and may differ from LongMemEval's own session-level NDCG:
 
 | | LongMemEval-S | LoCoMo |
 |---|---|---|
