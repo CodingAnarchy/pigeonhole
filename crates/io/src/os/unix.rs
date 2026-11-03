@@ -342,12 +342,16 @@ pub(crate) fn map_range(file: &fs::File, offset: u64, len: usize) -> Result<Opti
 /// `at` must be page-aligned, as `madvise` requires (the populate window keeps its ranges so).
 #[cfg(target_os = "linux")]
 pub(crate) fn populate_write(mapping: &Mapping, at: usize, len: usize) -> Result<()> {
-    if at.checked_add(len).is_none_or(|end| end > mapping.len)
-        || !at.is_multiple_of(system_page_size())
-    {
+    if at.checked_add(len).is_none_or(|end| end > mapping.len) {
         return Err(Error::new(
             ErrorKind::Other,
             "a populate range outside the mapping",
+        ));
+    }
+    if !at.is_multiple_of(system_page_size()) {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "a populate range starting off a page boundary",
         ));
     }
     // SAFETY: `[at, at + len)` lies inside `mapping`, which is live while borrowed. The advice
