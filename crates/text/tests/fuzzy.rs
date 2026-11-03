@@ -300,6 +300,91 @@ fn fuzzy_terms_equal_a_brute_force_scan_of_every_term() {
     }
 }
 
+/// #1363: with the top `k` held, an essential fuzzy clause walks only the expansions that
+/// could bring a document in alone, and looks the others up. Two fuzzy clauses share that
+/// budget (a document only their unwalked expansions match must still fall short), and a term
+/// clause beside them makes candidates the unwalked expansions are looked up for. Small `k`
+/// against a skewed corpus puts the common words' expansions below the threshold.
+#[test]
+fn two_fuzzy_clauses_and_a_term_equal_a_brute_force() {
+    for seed in seeds(&[41, 42, 43]) {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let (_docs, index) = create(&db, IndexOptions::new());
+        let mut rng = Rng::new(seed);
+        let mut corpus: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for i in 0..200 {
+            let doc = format!("d{i:03}").into_bytes();
+            let t = text(&mut rng);
+            index.put(&doc, &t).unwrap();
+            corpus.insert(doc, t);
+        }
+        let m = Model::new(&corpus);
+        for q in 0..120 {
+            let (a, b) = (misspell(&mut rng), misspell(&mut rng));
+            let fa = [Fuzziness::Auto, Fuzziness::One, Fuzziness::Two][rng.below(3) as usize];
+            let fb = [Fuzziness::Auto, Fuzziness::One, Fuzziness::Two][rng.below(3) as usize];
+            let mut want = m.fuzzy(&m.expansions(&a, fa, 0, 50).0);
+            add(&mut want, m.fuzzy(&m.expansions(&b, fb, 0, 50).0));
+            let mut query = Query::new().fuzzy(a.clone(), fa).fuzzy(b.clone(), fb);
+            let term = (rng.below(2) == 0).then(|| VOCAB[rng.below(VOCAB.len() as u64) as usize]);
+            if let Some(t) = term {
+                query = query.term(t);
+                add(&mut want, m.term(t));
+            }
+            let ctx = format!("seed {seed}, query {q}: {a:?} {fa:?}, {b:?} {fb:?}, {term:?}");
+            for k in [1, 2, 3, 5, 10] {
+                let got = index
+                    .search(query.clone(), k)
+                    .max_expansions(50)
+                    .run()
+                    .unwrap();
+                same_top_k(&got, &want, k, &format!("{ctx}, k {k}"));
+            }
+        }
+        db.close().unwrap();
+    }
+}
+
+/// simp724's T1 on #1383: a fuzzy clause that turns non-essential while some of its
+/// expansions are unwalked is looked up over every expansion, walked or not. The fillers
+/// hold the top `k` on the exact expansion alone, so `wb` (boost 0.5) goes unwalked; two
+/// `zeta wa` documents then lift the threshold past the fuzzy clause's bound, and
+/// `zeta zeta wb`'s fuzzy contribution comes only from a lookup of the unwalked `wb`.
+#[test]
+fn a_non_essential_fuzzy_clause_looks_up_its_unwalked_expansions() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    let mut corpus: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    let mut put = |id: String, text: &str| {
+        index.put(id.as_bytes(), text).unwrap();
+        corpus.insert(id.into_bytes(), text.to_owned());
+    };
+    for i in 0..30 {
+        put(format!("d{i:02}"), "wa filler words here");
+    }
+    put("d30".into(), "zeta wa");
+    put("d31".into(), "zeta wa");
+    // Twice `zeta`: it outscores the two above, so it's in the top 2, with a score that
+    // needs the lookup of `wb`.
+    put("d32".into(), "zeta zeta wb");
+    for i in 33..40 {
+        put(format!("d{i:02}"), "wb filler words here");
+    }
+    let m = Model::new(&corpus);
+    let (exps, _) = m.expansions("wa", Fuzziness::One, 0, 50);
+    assert!(exps.iter().any(|e| e.0 == "wb"), "{exps:?}");
+    let mut want = m.fuzzy(&exps);
+    add(&mut want, m.term("zeta"));
+    let q = Query::new().fuzzy("wa", Fuzziness::One).term("zeta");
+    for k in [2, 3, 4] {
+        let got = index.search(q.clone(), k).run().unwrap();
+        same_top_k(&got, &want, k, &format!("k {k}"));
+    }
+    db.close().unwrap();
+}
+
 #[test]
 fn a_document_with_three_misspellings_does_not_outrank_one_with_the_term() {
     let dir = pigeonhole::doc_support::temp_dir();

@@ -1,0 +1,2 @@
+### Changed
+- `pigeonhole-text`: an essential fuzzy clause walks only the expansions that could bring a document into the top `k` on their own, and looks the others up for the candidates other clauses find. A fuzzy term over common words beside a rare term (`w3~1 w28886`) no longer walks every hub expansion's postings: about 2x faster at p50 and p99 on the laptop bench, with the same results (#1363).
