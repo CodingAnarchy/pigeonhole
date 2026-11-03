@@ -4222,3 +4222,42 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **Call 4, amended: `Weights::recency` defaults to 0.25, not 1.** At 1, fusion ranked below keyword alone on both benchmarks (NDCG@10 0.789 against 0.864 on LongMemEval-S). At 0.25 it beats every single signal on both (0.871 and 0.454). 0 is slightly better on these datasets, which ask nothing recency-shaped, but agents' questions do, so the default keeps some pull. The other weights are unchanged.
 - **T8 (#1342, IVF) stays in 1.1.0,** after #1403. At ~94k memories in one namespace a fused recall takes 68 ms p50, 37 ms of it the exact vector scan.
 - **Fuzzy keyword recall stays off** (revision 2 §8): it doesn't help recall and costs 18–100× the plain search.
+
+<a id="d312"></a>
+## D312 — REJECTED: mapped `Buffered` WAL writes, with a group's frames stored through a shared mapping of the segment instead of `pwrite` (ctr274 / simp724, prototype approved 2026-11-02; owner shelved it 2026-11-03, call 4; io, wal; #1206 lever 4 B2, #1369)
+**Status: tried and rejected.** #1369 was closed unmerged, and WAL writes stay `pwrite`. Three box rounds showed that the `Buffered` throughput gain always comes with worse put tails, and pre-faulting made the tails worse still. This record is here so the idea isn't tried again without this data.
+
+**What it tried.**
+- **The target:** #1206's awake-path decomposition put the WAL stage at p50 2.0 µs and p99 5.25 µs per `Buffered` commit on sparse-wide. A bpftrace of every shard driver's `pwrite64` showed that the stage *is* the `pwrite`: on sparse-wide, p50 2.0 µs, p99 5.5–5.75 µs, p99.9 8.0 µs. Its instructions are about 0.25 µs.
+- **The idea:**
+  - A stream maps its current segment's slot (`MAP_SHARED`, read ahead with `MADV_WILLNEED`) and stores each group's frames through the mapping, Linux only and off by default.
+  - A store into a shared mapping is in the page cache at once, as after a `pwrite`, which is all `Buffered` and `None` promise (D227).
+  - Nothing on disk changed: the same frames at the same offsets.
+- **Owner call 2:** a stream stops mapping at its first `GroupSync` or `Sync` record, for good.
+- **Owner call 3:** a helper thread pre-faults each segment's mapping writable (`MADV_POPULATE_WRITE`) in a 4 MiB window ahead of the stores.
+
+**The three box rounds** (AX102: io_uring, xfs on NVMe, kernel 6.8; one build, mapped writes off against on, 16 clients):
+1. **The gate rows ×3 at `Buffered` and `Default`** ([#1369 c6591557831](https://github.com/CodingAnarchy/pigeonhole/pull/1369#issuecomment-6591557831)):
+   - **`Default` collapsed.** Every row that writes lost 5–25× in throughput, with put and commit p99 at 2–4.4 ms, about one sync per group.
+   - **`Buffered` was mixed:**
+     - gains: counters +18%, transfer +9.5%, ycsb-a +4%, ycsb-f +3%;
+     - losses: sparse-wide −3.5% (put p99.9 2.85×) and time-series-ttl −4%;
+     - ycsb-b and ycsb-e put p99.9 about 1.5×.
+2. **After owner call 2** ([c6595309039](https://github.com/CodingAnarchy/pigeonhole/pull/1369#issuecomment-6595309039)):
+   - **`Default` was at parity** (0.98–1.07×), since every stream stopped mapping at its first durable record.
+   - **`Buffered` still cost tail.** ycsb-e throughput was +6–8% in every rep, but put p99.9 was 1.4–1.7× and page faults were 1.55×. sparse-wide was mixed.
+3. **After owner call 3, with the populate window** ([c6597545627](https://github.com/CodingAnarchy/pigeonhole/pull/1369#issuecomment-6597545627); ×3, then ×2 with the change feed's periodic sync on):
+   - **ycsb-e put p99** went from about 33 µs to 0.3–1.1 ms in four of five runs, and p99.9 was 1.6–2.3×.
+   - **sparse-wide** p50 and p99 improved, but its p99.9 was 1.3–2.8×.
+   - **Throughput was level, and device bytes written rose 15–40%.**
+
+**What was learned.**
+- **A sync re-arms a write fault on every mapped page.** Writeback write-protects the pages it cleans, so the next store into a page synced since its last store takes a write fault (and on xfs, `page_mkwrite` probably updates the file times too; unconfirmed). At `Default`, that's one fault per group on the tail page, which is the collapse in round 1. The device doesn't require stable pages (`stable_writes` = 0), so it isn't the stable-page wait. The fault's own cost wasn't profiled.
+- **First-touch faults move cost into the tail.** `MADV_WILLNEED` reads pages ahead but doesn't map them writable. So the writer takes a minor fault on the first store to each page, about one per 15–25 frames. That's 55% more faults on ycsb-e, and a cost that lands on whichever put meets it. `pwrite` pays for the page-cache lookup in every call instead, which evens it out.
+- **Pre-faulting amplifies writeback and doesn't remove the faults.** Populating a page dirties it, and every WAL sync covers the whole file (a rollover, the change feed's interval, a flush barrier). So each sync writes back populated pages that hold no frames yet and write-protects them again. The bounded window (perf287's S1 on #1369) capped that at one window per stream per sync. Device bytes still rose 15–40%, faults were still +15–30%, and p99 rose 10–30×. The likely cause, not profiled, is the writer's stores meeting pages that the helper or writeback held locked or write-protected.
+- **`madvise` ranges must be page-aligned.** An unaligned start is `EINVAL`, which the prototype took for "kernel too old" until perf287's B1 caught it. Code that probes `MADV_POPULATE_WRITE` support should probe it once (an empty range) and not infer it from a failed call.
+
+**What it leaves.**
+- The `pwrite` is still the WAL stage of a `Buffered` commit. #1206 lever 4 continues with what merged: CRC32C through `crc-fast` (#1366).
+- A future attempt would need a way to store into the WAL without the per-page fault after each sync, for example a slot that is never synced while it's being written. None was found that keeps `Buffered`'s and `Default`'s shared WAL.
+- The D310 cursor fix that D312's review prompted (#1370, above) stands on its own: any torn read past the frontier is handled the same way.
