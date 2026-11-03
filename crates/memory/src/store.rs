@@ -736,11 +736,14 @@ impl Store {
     /// A feed-driven consolidation loop named `name` (D311 T9): see
     /// [`ConsolidateLoop`](crate::ConsolidateLoop). The name keys its saved position in the
     /// store: non-empty, without `:`.
-    pub fn consolidate_loop<'a>(
-        &'a self,
+    ///
+    /// The loop owns what it needs (a handle on the store, the consolidator, its clock), so
+    /// it can be kept across calls or moved to a thread of its own.
+    pub fn consolidate_loop(
+        &self,
         name: &str,
-        consolidator: &'a dyn crate::Consolidator,
-    ) -> crate::ConsolidateLoop<'a> {
+        consolidator: std::sync::Arc<dyn crate::Consolidator>,
+    ) -> crate::ConsolidateLoop {
         crate::feed_loop::ConsolidateLoop::new(self, name, consolidator)
     }
 

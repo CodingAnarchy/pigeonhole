@@ -109,12 +109,12 @@ fn a_namespace_is_consolidated_once_its_memories_are_old_enough() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
-    let c = Concat::new();
+    let c = Arc::new(Concat::new());
     let clock = Arc::new(AtomicU64::new(now()));
     let t = Arc::clone(&clock);
     let p = policy(Duration::from_secs(10));
     let mut l = store
-        .consolidate_loop("main", &c)
+        .consolidate_loop("main", c.clone())
         .policy(&p)
         .clock(move || t.load(Ordering::SeqCst));
     // The first step catches up on an empty store and starts watching.
@@ -156,12 +156,12 @@ fn a_loop_resumes_its_pending_namespaces_after_a_restart() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
-    let c = Concat::new();
+    let c = Arc::new(Concat::new());
     let p = policy(Duration::from_secs(10));
     let start = now();
     {
         let mut l = store
-            .consolidate_loop("main", &c)
+            .consolidate_loop("main", c.clone())
             .policy(&p)
             .clock(move || start);
         l.run_once(Duration::ZERO).unwrap();
@@ -172,7 +172,7 @@ fn a_loop_resumes_its_pending_namespaces_after_a_restart() {
     // Restarted later: the saved position still has `n` pending, so its pass runs, though
     // the memories' events were read before the restart.
     let mut l = store
-        .consolidate_loop("main", &c)
+        .consolidate_loop("main", c.clone())
         .policy(&p)
         .clock(move || start + 20 * SEC);
     let step = l.run_once(Duration::ZERO).unwrap();
@@ -186,26 +186,29 @@ fn a_second_loop_of_the_same_name_takes_over_and_the_first_fails() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
-    let c = Concat::new();
-    let mut one = store.consolidate_loop("main", &c);
-    let mut two = store.consolidate_loop("main", &c);
+    let c = Arc::new(Concat::new());
+    let mut one = store.consolidate_loop("main", c.clone());
+    let mut two = store.consolidate_loop("main", c.clone());
     one.run_once(Duration::ZERO).unwrap();
     // `two` starts from `one`'s saved position and takes the name over...
     two.run_once(Duration::ZERO).unwrap();
     // ...so `one`'s next save finds a newer one, and fails.
     let r = one.run_once(Duration::ZERO);
     assert!(
-        matches!(&r, Err(Error::InvalidArgument(m)) if m.contains("another consolidation loop")),
+        matches!(&r, Err(Error::LoopTakenOver(n)) if n == "main"),
         "{r:?}"
     );
+    assert_eq!(r.unwrap_err().code(), pigeonhole::ErrorCode::Conflict);
     two.run_once(Duration::ZERO).unwrap();
     // A differently named loop is independent.
     store
-        .consolidate_loop("other", &c)
+        .consolidate_loop("other", c.clone())
         .run_once(Duration::ZERO)
         .unwrap();
     for bad in ["", "a:b"] {
-        let r = store.consolidate_loop(bad, &c).run_once(Duration::ZERO);
+        let r = store
+            .consolidate_loop(bad, c.clone())
+            .run_once(Duration::ZERO);
         assert!(
             matches!(r, Err(Error::InvalidArgument(_))),
             "{bad:?}: {r:?}"
@@ -219,13 +222,15 @@ fn a_failure_partway_leaves_committed_groups_and_the_retry_folds_the_rest() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
-    let mut c = Concat::new();
-    c.fail_at = 2;
+    let c = Arc::new(Concat {
+        calls: AtomicUsize::new(0),
+        fail_at: 2,
+    });
     let clock = Arc::new(AtomicU64::new(now()));
     let t = Arc::clone(&clock);
     let p = policy(Duration::from_secs(1));
     let mut l = store
-        .consolidate_loop("main", &c)
+        .consolidate_loop("main", c.clone())
         .policy(&p)
         .clock(move || t.load(Ordering::SeqCst));
     l.run_once(Duration::ZERO).unwrap();
@@ -260,18 +265,76 @@ fn the_first_start_catches_up_where_memories_are_unconsolidated() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
-    let c = Concat::new();
+    let c = Arc::new(Concat::new());
     // Before any loop: `done` is consolidated by hand, `todo` isn't.
     pair(&store, "done", "s1");
     pair(&store, "todo", "s1");
     let p = policy(Duration::ZERO);
-    let pass = store.consolidate("done", &c).policy(&p).run().unwrap();
+    let pass = store.consolidate("done", &*c).policy(&p).run().unwrap();
     assert_eq!(pass.committed, 1);
-    let mut l = store.consolidate_loop("main", &c).policy(&p);
+    let mut l = store.consolidate_loop("main", c.clone()).policy(&p);
     let step = l.run_once(Duration::ZERO).unwrap();
     let ns: Vec<&str> = step.passes.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(ns, vec!["todo"], "{step:?}");
     assert_eq!(summaries(&store, "todo"), 1);
     assert_eq!(summaries(&store, "done"), 1);
+    db.close().unwrap();
+}
+
+/// simp724's L1 on #1432: a save that fails other than by a conflict leaves the loop's
+/// generation where the store's is, so the next save works (it isn't fenced out).
+#[cfg(feature = "__unstable-hooks")]
+#[test]
+fn a_failed_save_doesnt_fence_the_loop_out() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let c = Arc::new(Concat::new());
+    let mut l = store.consolidate_loop("fenced", c.clone());
+    l.run_once(Duration::ZERO).unwrap();
+    pigeonhole_memory::hooks::fail_next_loop_save("fenced");
+    let r = l.run_once(Duration::ZERO);
+    assert!(matches!(r, Err(Error::Corruption(_))), "{r:?}");
+    l.run_once(Duration::ZERO).unwrap();
+    l.run_once(Duration::ZERO).unwrap();
+    db.close().unwrap();
+}
+
+/// cli692's B3 on #1432: a saved position whose feed history is gone (here, the feed was
+/// turned off and on between opens, which ends its history) catches up instead.
+#[test]
+fn a_saved_position_whose_history_is_gone_catches_up() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let c = Arc::new(Concat::new());
+    let p = policy(Duration::ZERO);
+    {
+        let db = open(&dir);
+        let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+        store
+            .consolidate_loop("main", c.clone())
+            .policy(&p)
+            .run_once(Duration::ZERO)
+            .unwrap();
+        drop(store);
+        db.close().unwrap();
+    }
+    {
+        let db =
+            Pigeonhole::open(dir.join("mem.phdb"), Options::default().change_feed_off()).unwrap();
+        let store = Store::open_without_embeddings(&db, "notes").unwrap();
+        pair(&store, "n", "s1");
+        drop(store);
+        db.close().unwrap();
+    }
+    let db = open(&dir);
+    let store = Store::open_without_embeddings(&db, "notes").unwrap();
+    let mut l = store.consolidate_loop("main", c.clone()).policy(&p);
+    // The memories made while the feed was off are found by the catch-up.
+    let mut passes = 0;
+    for _ in 0..3 {
+        passes += l.run_once(Duration::from_millis(200)).unwrap().passes.len();
+    }
+    assert_eq!(passes, 1);
+    assert_eq!(summaries(&store, "n"), 1);
     db.close().unwrap();
 }

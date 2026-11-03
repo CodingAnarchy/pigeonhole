@@ -259,8 +259,8 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
 - **Async:** `next_async` in the writer, once #1408 (D310 PR 5a) is merged. A reader calls the sync `next` on a thread of its own.
 
 ## T9, part 2: the feed-driven consolidation loop (#1343)
-- **`Store::consolidate_loop(name, &dyn Consolidator) -> ConsolidateLoop`:**
-  - builders `policy(&ConsolidatePolicy)`, `namespaces(&[&str])` (empty means all) and `clock(Fn() -> u64)` (cli692's A3);
+- **`Store::consolidate_loop(name, Arc<dyn Consolidator>) -> ConsolidateLoop`:** owned and `Send + 'static`, holding a `Store` clone, so a binding can keep it across calls or move it to a thread (cli692's B2 on #1432).
+  - builders `policy(&ConsolidatePolicy)`, `namespaces(&[&str])` (empty means all) and `clock(Fn() -> u64 + Send + Sync + 'static)` (cli692's A3). The clock is used for `min_age` and the due times only; the step's timeout is real time (simp724's L4 on #1432);
   - `run_once(Duration) -> Result<LoopStep>`, `next_due() -> Option<u64>` and `run(&AtomicBool)`;
   - the name is non-empty without `:` (`InvalidArgument` at the first step).
 - **`LoopStep`** (`#[non_exhaustive]`): `events`, `passes: Vec<(String, ConsolidatePass)>`, `failed: Vec<(String, Error)>`, `next_due` and `token: WatchToken`.
@@ -271,10 +271,11 @@ The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The f
   - `run_once`'s wait is the smaller of its timeout and the next due time (A5: it bounds the wait, not the passes).
 - **Position:** `G:meta:loop:{name}` holds a version byte (1), a generation (u64), the watch token, and the pending map ((namespace, µs) pairs), little endian.
   - **Saving:** each step ends with a transaction that reads the cell, requires the generation it last saved, and writes it plus one.
-  - **Claiming:** a loop claims the name at its first step (a save). So the newest loop of a name owns it, and an older one fails its next step with `InvalidArgument` ("another consolidation loop named …").
+  - **Claiming:** a loop claims the name at its first step (a save). So the newest loop of a name owns it, and an older one fails its next step with **`Error::LoopTakenOver(name)`** (code `Conflict`; cli692's B1 on #1432). A conflicting commit of the save means the same: the read is of that one cell, which only another loop of the name writes (D275 per-cell reads; simp724's L2).
+  - **The generation moves only after the commit succeeds** (simp724's L1 on #1432), so a save that fails otherwise (`Busy`, I/O) doesn't fence the loop out. `hooks::fail_next_loop_save` (a fault seam) tests it.
 - **Racing passes** conflict group by group: each group's transaction reads its sources' `meta:consolidated` (and content, supersede, pin), and a conflicting group is skipped (simp724's R1).
 - **A group's summary, the sources' marks and any deletes commit in one transaction** (R2). A failure between groups leaves the earlier groups committed, and the retry folds only the rest (tested).
-- **Catch-up** (no saved position, or `FeedExpired`): at a snapshot, every watched namespace with a live, unconsolidated, non-summary memory is pending from its oldest one (R4). The watch then starts `from_snapshot`.
+- **Catch-up** (no saved position, or `FeedExpired` at the resume's open or at a later `next`; cli692's B3 on #1432): at a snapshot, every watched namespace with an unconsolidated, non-summary memory is pending from its oldest one (R4). The watch then starts `from_snapshot`. The scan reads `meta` only, since a memory row that exists is live (simp724's L3).
 
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:

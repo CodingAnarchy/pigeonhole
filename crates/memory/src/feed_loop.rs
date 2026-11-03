@@ -13,6 +13,7 @@
 //! - The catch-up scan marks only namespaces with unconsolidated memories (R4).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -21,8 +22,7 @@ use pigeonhole::{ErrorCode, Snapshot};
 use crate::consolidate::{ConsolidatePass, ConsolidatePolicy, Consolidator};
 use crate::error::{Error, Result, corrupt};
 use crate::layout::{
-    CONSOLIDATED, CONTENT, GLOBAL, MEMORY_TAG, META, MemoryId, SUMMARY, TEXT, check_namespace,
-    now_us,
+    CONSOLIDATED, GLOBAL, MEMORY_TAG, META, MemoryId, SUMMARY, check_namespace, now_us,
 };
 use crate::store::Store;
 use crate::watch::{MemoryEvent, Watch, WatchToken};
@@ -63,9 +63,9 @@ struct Saved {
 impl Saved {
     /// Version 1: a version byte, the generation (8), the token (len u32 + bytes), the count
     /// (u32), then each (len u16 + namespace, µs u64). Little endian.
-    fn encode(&self) -> Vec<u8> {
+    fn encode_at(&self, generation: u64) -> Vec<u8> {
         let mut b = vec![1u8];
-        b.extend_from_slice(&self.generation.to_le_bytes());
+        b.extend_from_slice(&generation.to_le_bytes());
         b.extend_from_slice(&(self.token.len() as u32).to_le_bytes());
         b.extend_from_slice(&self.token);
         b.extend_from_slice(&(self.pending.len() as u32).to_le_bytes());
@@ -117,24 +117,31 @@ impl Saved {
 ///
 /// **One loop per name.** A loop that starts takes the name over (a restarted process must,
 /// from one that died), and a loop whose name was taken over fails its next step with
-/// `InvalidArgument`. While two run, a pass they race on conflicts group by group, so no
+/// [`Error::LoopTakenOver`] (code `Conflict`). While two run, a pass they race on conflicts group by group, so no
 /// group is consolidated twice (each group's transaction reads its sources'
 /// `meta:consolidated`; simp724's R1 on #1343). It's at least once: a stop between a pass and
 /// the save re-runs the pass, which skips what's already consolidated.
 ///
 /// The database's change feed must be on and follow the store's table (as for
 /// [`Store::watch`]).
-pub struct ConsolidateLoop<'a> {
-    store: &'a Store,
+pub struct ConsolidateLoop {
+    store: Store,
     name: String,
-    consolidator: &'a dyn Consolidator,
+    consolidator: Arc<dyn Consolidator>,
     policy: ConsolidatePolicy,
     namespaces: Vec<String>,
-    clock: Box<dyn Fn() -> u64 + Send + Sync + 'a>,
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
     state: Option<(Watch, Saved)>,
 }
 
-impl std::fmt::Debug for ConsolidateLoop<'_> {
+// Owned and `Send`, so a binding can keep one across calls or move it to a worker thread
+// (cli692's B2 on #1432).
+const _: fn() = || {
+    fn send<T: Send + 'static>() {}
+    send::<ConsolidateLoop>();
+};
+
+impl std::fmt::Debug for ConsolidateLoop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsolidateLoop")
             .field("name", &self.name)
@@ -143,14 +150,14 @@ impl std::fmt::Debug for ConsolidateLoop<'_> {
     }
 }
 
-impl<'a> ConsolidateLoop<'a> {
+impl ConsolidateLoop {
     pub(crate) fn new(
-        store: &'a Store,
+        store: &Store,
         name: &str,
-        consolidator: &'a dyn Consolidator,
-    ) -> ConsolidateLoop<'a> {
+        consolidator: Arc<dyn Consolidator>,
+    ) -> ConsolidateLoop {
         ConsolidateLoop {
-            store,
+            store: store.clone(),
             name: name.to_owned(),
             consolidator,
             policy: ConsolidatePolicy::default(),
@@ -175,7 +182,10 @@ impl<'a> ConsolidateLoop<'a> {
 
     /// The clock `min_age` is measured on, µs since the Unix epoch: the system's by default
     /// (cli692's A3 on #1343; for tests and simulations).
-    pub fn clock(mut self, now_us: impl Fn() -> u64 + Send + Sync + 'a) -> Self {
+    ///
+    /// Only for `min_age` and when a pass is due: `run_once`'s timeout is real time, since
+    /// it bounds a real wait for the feed (simp724's L4 on #1432).
+    pub fn clock(mut self, now_us: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(now_us);
         self
     }
@@ -198,13 +208,13 @@ impl<'a> ConsolidateLoop<'a> {
         }
         let min_age = self.min_age_us();
         let mut events = 0usize;
-        // 1. Read events until `timeout`, or until the first pending namespace falls due.
-        let started = (self.clock)();
+        // 1. Read events until `timeout` (real time), or until the first pending namespace
+        //    falls due (on the loop's clock).
+        let started = std::time::Instant::now();
         loop {
             let (_, saved) = self.state.as_ref().expect("started");
             let now = (self.clock)();
-            let elapsed = Duration::from_micros(now.saturating_sub(started));
-            let mut wait = timeout.saturating_sub(elapsed);
+            let mut wait = timeout.saturating_sub(started.elapsed());
             if let Some(due) = saved
                 .pending
                 .values()
@@ -238,7 +248,7 @@ impl<'a> ConsolidateLoop<'a> {
                     *at = (*at).min(id.created_us());
                 }
             }
-            if (self.clock)().saturating_sub(started) >= timeout.as_micros() as u64 {
+            if started.elapsed() >= timeout {
                 break;
             }
         }
@@ -257,7 +267,7 @@ impl<'a> ConsolidateLoop<'a> {
         for ns in due {
             let r = self
                 .store
-                .consolidate(&ns, self.consolidator)
+                .consolidate(&ns, &*self.consolidator)
                 .policy(&self.policy)
                 .now_us(now)
                 .run();
@@ -343,12 +353,22 @@ impl<'a> ConsolidateLoop<'a> {
         match t.get(GLOBAL, META, &state_key(&self.name))? {
             Some(c) => {
                 let saved = Saved::decode(c.value())?;
-                let watch = self
+                let opened = self
                     .store
                     .watch(&self.namespace_refs())
                     .resume(&WatchToken::from_bytes(saved.token.clone()))
-                    .open()?;
-                Ok((watch, saved))
+                    .open();
+                match opened {
+                    Ok(watch) => Ok((watch, saved)),
+                    // The saved position's history is gone (cli692's B3 on #1432; the first
+                    // `next` reports it too, which `run_once` handles).
+                    Err(Error::Db(e)) if e.code() == ErrorCode::FeedExpired => {
+                        let (w, mut s) = self.catch_up()?;
+                        s.generation = saved.generation;
+                        Ok((w, s))
+                    }
+                    Err(e) => Err(e),
+                }
             }
             None => self.catch_up(),
         }
@@ -363,7 +383,7 @@ impl<'a> ConsolidateLoop<'a> {
             .store
             .table()
             .scan_prefix(b"")
-            .families([CONTENT, META])
+            .family(META)
             .snapshot(&s)
             .iter()?;
         while let Some(r) = it.next_ref()? {
@@ -416,7 +436,7 @@ impl<'a> ConsolidateLoop<'a> {
             .store
             .table()
             .scan_prefix(&prefix)
-            .families([CONTENT, META])
+            .family(META)
             .snapshot(&s)
             .iter()?;
         let mut oldest = None;
@@ -447,27 +467,39 @@ impl<'a> ConsolidateLoop<'a> {
             None => 0,
         };
         if theirs != saved.generation {
-            return Err(Error::InvalidArgument(format!(
-                "another consolidation loop named {:?} is running on this store",
-                self.name
-            )));
+            return Err(Error::LoopTakenOver(self.name.clone()));
         }
-        saved.generation += 1;
-        txn.put(t, GLOBAL, META, &key, &saved.encode());
+        // The generation moves only once the commit is in (simp724's L1 on #1432): a save
+        // that fails otherwise leaves the loop and the store agreeing, and the next save
+        // works.
+        let next = saved.generation + 1;
+        txn.put(t, GLOBAL, META, &key, &saved.encode_at(next));
+        #[cfg(feature = "__unstable-hooks")]
+        if crate::hooks::take_fail_loop_save(&self.name) {
+            drop(txn);
+            return Err(corrupt(
+                "an injected save failure (hooks::fail_next_loop_save)",
+            ));
+        }
         match txn.commit() {
-            Ok(_) => Ok(token),
-            Err(e) if e.code() == ErrorCode::Conflict => Err(Error::InvalidArgument(format!(
-                "another consolidation loop named {:?} is running on this store",
-                self.name
-            ))),
+            Ok(_) => {
+                saved.generation = next;
+                Ok(token)
+            }
+            // The read above is of this one cell (D275: a transaction's `get` conflicts only
+            // with a write to that cell, not to the rest of `G`), so a conflict is another
+            // loop of this name saving meanwhile (simp724's L2).
+            Err(e) if e.code() == ErrorCode::Conflict => {
+                Err(Error::LoopTakenOver(self.name.clone()))
+            }
             Err(e) => Err(e.into()),
         }
     }
 }
 
-/// A memory a pass could still fold: live, not consolidated, not a summary.
+/// A memory a pass could still fold: not consolidated, not a summary. Read from `meta`
+/// alone (simp724's L3 on #1432): a memory row that's there is live, since a delete removes
+/// the whole row, and every memory has `meta:kind`.
 fn unconsolidated(r: &pigeonhole::RowRef<'_>) -> bool {
-    r.get(CONTENT, TEXT).is_some()
-        && r.get(META, CONSOLIDATED).is_none()
-        && r.get(META, SUMMARY).is_none()
+    r.get(META, CONSOLIDATED).is_none() && r.get(META, SUMMARY).is_none()
 }
