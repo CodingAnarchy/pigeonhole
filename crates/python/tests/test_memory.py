@@ -353,6 +353,34 @@ def test_a_reader_recalls(db, path):
             rs2.get(rid)
 
 
+def test_normalization_is_set_at_create(db, path):
+    # #1405: an NFKC store's keyword recall matches ligatures and full-width forms; an NFC
+    # one (the default) doesn't. Recency still returns the memory, so check the signal.
+    def keyword(s, q):
+        hit = s.recall("n", text=q, with_signals=True)[0]
+        return hit.signals.keyword
+
+    with mem.Store.create(db, "nfkc", normalization="nfkc") as s:
+        s.remember("n", "the deploy configuration file")
+        assert s.normalization == "nfkc"
+        assert keyword(s, "\ufb01le") is not None  # the "fi" ligature
+        assert keyword(s, "\uff46\uff49\uff4c\uff45") is not None  # full-width "file"
+    with mem.Store.create(db, "nfc") as s:
+        s.remember("n", "the deploy configuration file")
+        assert s.normalization == "nfc"
+        assert keyword(s, "\ufb01le") is None
+    with mem.Store.create(db, "plain", normalization="none") as s:
+        assert s.normalization == "none"
+    with pytest.raises(ph.InvalidArgument):
+        mem.Store.create(db, "bad", normalization="nfd")
+    # It reads back after an open, and in a reader process.
+    with mem.Store.open(db, "nfkc", model=None) as s:
+        assert s.normalization == "nfkc"
+    with ph.open_reader(path) as reader:
+        with mem.Store.open_reader(reader, "nfkc", model=None) as rs:
+            assert rs.normalization == "nfkc"
+
+
 def test_near_dedup_settings(db):
     with mem.Store.create(db, "agents", embedding=model()) as s:
         assert s.near_dedup() is None
