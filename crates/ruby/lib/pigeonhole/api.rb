@@ -57,6 +57,58 @@ module Pigeonhole
   end
   private_class_method :scoped
 
+  # `v` as an Array of keys: an Array as it is, any other Enumerable (a Set) as its `to_a`.
+  def self.key_list(v)
+    v.is_a?(Enumerable) && !v.is_a?(Array) ? v.to_a : v
+  end
+  private_class_method :key_list
+
+  # One of a nearest-neighbour search's results: the cell's row and qualifier, its distance
+  # from the query (by the family's metric) and its timestamp.
+  Neighbour = Data.define(:row, :qualifier, :distance, :ts)
+
+  # A `nearest_within` page (D308): the nearest neighbours that fit the byte budget, nearest
+  # first. `bytes` counts each neighbour's row key, qualifier and 16 bytes; `next_bytes`,
+  # when the budget left a neighbour out, is that neighbour's size. There's no resume
+  # position: ask again with a larger budget or `k`.
+  NearestPage = Data.define(:neighbours, :bytes, :next_bytes) do
+    # Whether the budget left out a neighbour the search found.
+    def cut_by_budget = !next_bytes.nil?
+
+    # The number of neighbours.
+    def size = neighbours.size
+  end
+
+  # One hop of a traversal: its new nodes, sorted, and with `parents: true` each node's
+  # parent as an index into the previous hop's nodes (the traversal's `seeds` for hop 1).
+  Hop = Data.define(:nodes, :parents) do
+    # The number of nodes.
+    def size = nodes.size
+  end
+
+  # A traversal's result (D304): its hops in order, the seeds as the engine sorted and
+  # deduplicated them (what hop 1's parents index), the frontier rows that had an edge the
+  # selection keeps, the edges read, the hops `hop_limit:` or `max_nodes:` cut short, and
+  # whether `max_nodes:` or `byte_budget:` stopped it.
+  Traversal = Data.define(:seeds, :hops, :rows, :edges, :hops_cut, :cut_by_max_nodes, :cut_by_budget)
+
+  # A `scan_within` page (D308): its rows in key order (a row the budget cut holds the
+  # columns that fit); its size (each cell's qualifier, value and 16 bytes, and each row's
+  # key once; never more than the budget); whether the budget stopped the read; the size of
+  # the first column that didn't fit; and where to resume (`after:`), nil once the scan is
+  # exhausted.
+  ScanPage = Data.define(:rows, :bytes, :cut_by_budget, :next_bytes, :resume) do
+    # The number of rows.
+    def size = rows.size
+  end
+
+  # A `multi_get_within` page (D308), as `ScanPage` describes; its rows are in key order,
+  # not aligned with the keys given.
+  KeysPage = Data.define(:rows, :bytes, :cut_by_budget, :next_bytes, :resume) do
+    # The number of rows.
+    def size = rows.size
+  end
+
   # The open database, as the writer process.
   class Database
     # A consistent view of everything committed (with `durable: true`, of what is durable
@@ -189,6 +241,76 @@ module Pigeonhole
       end
     end
 
+    # The rows of `keys` (D299), aligned with `keys`: one entry per key given, in that
+    # order, nil for a key whose row has no cell the read keeps, a repeated key repeated.
+    # The read itself is one multi-get in key order, with the GVL released.
+    def multi_get(keys, families: nil, qualifier_prefix: nil, versions: 1, column_limit: nil,
+                  snapshot: nil)
+      native_multi_get(Pigeonhole.__send__(:key_list, keys), families, qualifier_prefix, versions,
+                       column_limit, snapshot)
+    end
+
+    # A page of `multi_get`'s cells, at most `bytes` long (D308), as a `KeysPage`; `after:`
+    # resumes where an earlier page stopped (its `resume`). The page's position names the
+    # last key returned, so keys added or removed between pages resume at the right key.
+    def multi_get_within(keys, bytes:, families: nil, qualifier_prefix: nil, versions: 1,
+                         column_limit: nil, snapshot: nil, after: nil)
+      rows, *rest = native_multi_get_within(Pigeonhole.__send__(:key_list, keys), bytes, families,
+                                            qualifier_prefix, versions, column_limit, snapshot, after)
+      KeysPage.new(rows.freeze, *rest)
+    end
+
+    # A page of `scan`'s rows, at most `bytes` long (D308), as a `ScanPage`; `after:` resumes
+    # where an earlier page stopped (its `resume`). Without a `snapshot:`, each page of a
+    # chain reads the latest data.
+    def scan_within(prefix = nil, bytes:, start: nil, end: nil, families: nil, qualifier_prefix: nil,
+                    versions: 1, limit: nil, column_limit: nil, snapshot: nil, after: nil)
+      rows, *rest = native_scan_within(bytes, prefix, start, binding.local_variable_get(:end), families,
+                                       qualifier_prefix, versions, limit, column_limit, snapshot, after)
+      ScanPage.new(rows.freeze, *rest)
+    end
+
+    # A breadth-first traversal (D304) over `family`'s edges (each qualifier names a
+    # neighbour row) from `seeds`, `hops` deep, as a `Traversal`. `per_node_limit:` caps the
+    # edges read per node, `hop_limit:` the nodes per hop, `max_nodes:` the nodes in all and
+    # `byte_budget:` the bytes read; `parents: true` records each node's parent.
+    def traverse(seeds, family, hops: 1, per_node_limit: nil, hop_limit: nil, max_nodes: nil,
+                 byte_budget: nil, parents: false, qualifier_prefix: nil, snapshot: nil, parallel: nil)
+      s, hs, *rest = native_traverse(Pigeonhole.__send__(:key_list, seeds), family, hops,
+                                     per_node_limit, hop_limit, max_nodes, byte_budget, parents,
+                                     qualifier_prefix, snapshot, parallel)
+      Traversal.new(s.freeze, hs.map { |n, p| Hop.new(n.freeze, p&.freeze) }.freeze, *rest)
+    end
+
+    # A wide row's pages (D297), at most `size` cells each (a column's versions never split),
+    # as a `Pages` that reads each page when it is asked for; `after:` resumes after an
+    # earlier walk's `position`.
+    def pages(row, size, families: nil, qualifier_prefix: nil, versions: 1, snapshot: nil, after: nil)
+      native_pages(row, size, families, qualifier_prefix, versions, snapshot, after)
+    end
+
+    # The `k` cells of vector family `family` nearest `query` (D296), as `Neighbour`s in
+    # (distance, row, qualifier) order: over `prefix:`, or `start:` to `end:`, or the rows of
+    # `keys:`, or the whole table. `query` is read by the family's element type, as
+    # `put_vector` reads a vector.
+    def nearest(family, query, k, prefix: nil, start: nil, end: nil, keys: nil, qualifier_prefix: nil,
+                snapshot: nil, parallel: nil)
+      native_nearest(family, query, k, prefix, start, binding.local_variable_get(:end),
+                     keys && Pigeonhole.__send__(:key_list, keys), qualifier_prefix, snapshot,
+                     parallel, nil).map { |a| Neighbour.new(*a) }
+    end
+
+    # `nearest`'s neighbours, nearest first, that fit `bytes` (D308), as a `NearestPage`. The
+    # budget bounds the result, not the work: the search reads and ranks as `nearest` does.
+    def nearest_within(family, query, k, bytes:, prefix: nil, start: nil, end: nil, keys: nil,
+                       qualifier_prefix: nil, snapshot: nil, parallel: nil)
+      found, size, next_bytes = native_nearest(family, query, k, prefix, start,
+                                               binding.local_variable_get(:end),
+                                               keys && Pigeonhole.__send__(:key_list, keys),
+                                               qualifier_prefix, snapshot, parallel, bytes)
+      NearestPage.new(found.map { |a| Neighbour.new(*a) }.freeze, size, next_bytes)
+    end
+
     # Puts one cell and commits it; returns the commit's sequence number. A String is bytes,
     # an Integer an i64 and a Float an f64.
     def put(row, family, qualifier, value, ts: nil, durability: nil)
@@ -234,6 +356,14 @@ module Pigeonhole
       self
     end
 
+    # Puts a vector in a vector family, read by the family's element type: an Array of
+    # Numerics (`:f32`, `:f16`, `:bf16`), an Array of Integers (`:i8`), or the packed bits as
+    # a String (`:bit`).
+    def put_vector(family, qualifier, vector, ts: nil)
+      native_put_vector(family, qualifier, vector, ts)
+      self
+    end
+
     # Deletes the row; with `family`, that family; with `qualifier` too, the column; with
     # `ts:` too, that one version.
     def delete(family = nil, qualifier = nil, ts: nil)
@@ -276,6 +406,13 @@ module Pigeonhole
         self
       end
 
+      # Puts a vector in a vector family, read by the family's element type (as
+      # `Mutation#put_vector` reads it).
+      def put_vector(table, row, family, qualifier, vector, ts: nil)
+        native_put_vector(table, row, family, qualifier, vector, ts)
+        self
+      end
+
       # Deletes `row`; with `family`, that family; with `qualifier` too, the column; with
       # `ts:` too, that one version.
       def delete(table, row, family = nil, qualifier = nil, ts: nil)
@@ -305,6 +442,23 @@ module Pigeonhole
     end
   end
 
+  # A wide row's pages (`Table#pages`), each read when it is asked for: the walk holds no
+  # read open between pages. Enumerable over the pages (each a `Row`); a walk continues from
+  # where it stopped, so a second `each` yields only the pages the first didn't.
+  class Pages
+    include Enumerable
+
+    # Yields each page that is left; without a block, an Enumerator.
+    def each
+      return enum_for(:each) unless block_given?
+
+      while (page = native_next)
+        yield page
+      end
+      self
+    end
+  end
+
   # A column family's options.
   class Family
     class << self
@@ -319,6 +473,13 @@ module Pigeonhole
       # A counter family: `incr` adds to its cells.
       def counter(max_versions: nil, ttl: nil)
         native_counter(max_versions, ttl)
+      end
+
+      # A vector family (D303): `dim` elements of `element` (`:f32`, `:i8`, `:bit`, `:f16` or
+      # `:bf16`), compared by `metric` (`:l2`, `:cosine`, `:inner_product` or `:hamming`).
+      # Its cells are written with `put_vector`.
+      def vector(dim, element, metric, max_versions: nil, ttl: nil)
+        native_vector(dim, element, metric, max_versions, ttl)
       end
 
       # An aggregate family of `kind`: `:sum`, `:min`, `:max`, `:hll`, `:bit_or`, `:bit_and`,
