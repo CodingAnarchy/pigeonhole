@@ -342,7 +342,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 Some("default") => a.durability = Some(Durability::Default),
                 other => {
                     return Err(format!(
-                        "--durability takes buffered, sync, group-sync or default, not {other:?}"
+                        "--durability takes buffered, none, sync, group-sync or default, not {other:?}"
                     ));
                 }
             },
