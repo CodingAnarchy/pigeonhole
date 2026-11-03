@@ -21,8 +21,6 @@ const ITEM_OVERHEAD: u64 = 16;
 const SIGNALS_BYTES: u64 = 6 * (4 + 8);
 /// How many of the fused candidates seed a graph expansion (D311 §3, `M`).
 const GRAPH_SEEDS: usize = 10;
-/// The most hops an [`Expand`] takes.
-pub const MAX_EXPAND_HOPS: u32 = 4;
 
 /// How the signals are combined (D311 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -131,20 +129,24 @@ pub struct Signals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Expand {
-    /// Hops to take, 1 to [`MAX_EXPAND_HOPS`].
+    /// Hops to take, 1 to [`MAX_HOPS`](Self::MAX_HOPS).
     pub hops: u32,
-    /// At most this many memories get a graph signal: 20 by default.
+    /// At most this many memories get a graph signal: 20 by default. 0 gives none (the walk
+    /// doesn't run), as [`Recall::k`] of 0 returns no hits.
     pub max: usize,
 }
 
 impl Expand {
-    /// An expansion `n` hops deep (1 to [`MAX_EXPAND_HOPS`]; the recall checks it), scoring
+    /// The most hops an expansion takes.
+    pub const MAX_HOPS: u32 = 4;
+
+    /// An expansion `n` hops deep (1 to [`MAX_HOPS`](Self::MAX_HOPS); the recall checks it), scoring
     /// at most 20 memories.
     pub fn hops(n: u32) -> Self {
         Expand { hops: n, max: 20 }
     }
 
-    /// At most `m` memories get a graph signal.
+    /// At most `m` memories get a graph signal (0: none).
     pub fn max(mut self, m: usize) -> Self {
         self.max = m;
         self
@@ -378,7 +380,7 @@ impl<'a> Recall<'a> {
     }
 
     /// Expands the candidates through the memories' links ([`Expand`]): none by default.
-    /// `InvalidArgument` from the run for hops outside 1 to [`MAX_EXPAND_HOPS`].
+    /// `InvalidArgument` from the run for hops outside 1 to [`Expand::MAX_HOPS`].
     pub fn expand(mut self, x: Expand) -> Self {
         self.expand = Some(x);
         self
@@ -423,10 +425,11 @@ impl<'a> Recall<'a> {
             (None, _) => None,
         };
         if let Some(x) = self.expand
-            && !(1..=MAX_EXPAND_HOPS).contains(&x.hops)
+            && !(1..=Expand::MAX_HOPS).contains(&x.hops)
         {
             return Err(Error::InvalidArgument(format!(
-                "an expansion takes 1 to {MAX_EXPAND_HOPS} hops, not {}",
+                "an expansion takes 1 to {} hops, not {}",
+                Expand::MAX_HOPS,
                 x.hops
             )));
         }

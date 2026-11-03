@@ -181,7 +181,7 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
 ## T4: graph expansion in recall (#1338)
 - **`Recall::expand(Expand)`:** none by default.
   - `Expand` is `#[non_exhaustive]`, `Copy` and plain data: `Expand::hops(n).max(m)`, with `pub hops: u32` and `pub max: usize` (default 20). A value rather than `expand(hops, max)`, so the two integers can't be swapped and seeds, directions or link types can come later (cli692 on #1338).
-  - `MAX_EXPAND_HOPS` is 4. Hops outside 1 to 4 are `InvalidArgument` from the run.
+  - `Expand::MAX_HOPS` is 4, an associated const (cli692). Hops outside 1 to 4 are `InvalidArgument` from the run. `max(0)` gives no memory a graph signal, as `k(0)` returns no hits.
 - **`Weights::graph`** (default 0.5) and **`Signals::graph`**. Neither has an effect, nor a value, without `expand`.
 - **`RecallStats`** gains `expanded` (the memories given a graph signal) and `expansion_truncated` (cli692's name).
 
