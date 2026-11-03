@@ -64,7 +64,7 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
   - It calls `rb_thread_call_without_gvl2`, not the non-`2` form, which could `longjmp` over Rust frames when an interrupt is pending. It uses a `ran` flag: a call that ran returns its result, and an interrupt is handled after the method returns, so a commit's outcome is never lost. An interrupt pending before the call starts is raised through magnus's safe `thread_check_ints`, and nothing runs.
   - No unblocking function is passed, so a long engine call isn't interruptible midway. The guide says so.
   - A masked interrupt (`Thread.handle_interrupt(... => :never)`) makes the `2` form decline while `thread_check_ints` raises nothing, so after a second try the function runs once with the GVL held, rather than looping (simp724's A1).
-  - Panics are caught in the trampoline and resumed after the GVL is back.
+  - Panics are caught in the trampoline, so none unwinds through Ruby's C frames, and come back as an uncoded `Pigeonhole::Error` once the GVL is back (simp724's A2: resuming one would make magnus raise the unrescuable `fatal`).
 - **Unsafe.** `#![deny(unsafe_code)]`. Besides `gvl.rs`, the only `#[allow(unsafe_code)]` sites are the items magnus's macros expand (`#[magnus::init]`, `#[magnus::wrap]`).
 - **Callbacks into Ruby** (later PRs' consolidators) use a channel, never a GVL re-acquire from Rust (the O3 amendment). The work runs on a Rust thread, and the calling Ruby thread waits through `without_gvl(recv)`, then runs the block with the GVL held.
 - **Fork (R1).** A forked child can't use inherited handles (the engine's `Unsupported`). A handle records its creating process, and dropping or closing it in another process neither closes the database nor releases the parent's writer lock.

@@ -499,9 +499,10 @@ impl WriteBatch {
 
 const TXN_SPENT: &str = "the transaction was already committed or rolled back";
 
-// The transaction's mutex is only ever taken inside `without_gvl`: a thread holding it may
-// be inside an engine call without the GVL, and must not wait for a thread that waits on
-// the mutex while holding the GVL.
+// The transaction's mutex is taken only inside `without_gvl` closures, and no guard outlives
+// the closure that took it (simp724 on #1399). So a thread never waits on the mutex while
+// holding the GVL, and a thread holding the mutex never needs the GVL: the two locks can't
+// be held in opposite orders.
 
 impl Record for Transaction {
     fn record(
