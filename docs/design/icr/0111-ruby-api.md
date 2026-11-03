@@ -58,6 +58,27 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
   - Block forms return the block's value.
   - `Database#closed?` and `Reader#closed?` exist.
 
+### PR 2: vectors and the 1.1 reads
+ICR 0102's PR 2 and PR 3 (Python's `nearest`) and D308's byte budgets, in Ruby's idioms:
+- **Vectors (D303):**
+  - `VectorSpec.new(dim, element, metric)`, with `dim`, `element`, `metric`, `==`/`eql?`/`hash`; `Family.vector(dim, element, metric, max_versions:, ttl:)`; `FamilyInfo#vector`.
+  - Elements are `:f32`, `:i8`, `:bit`, `:f16` and `:bf16`, and metrics `:l2`, `:cosine`, `:inner_product` and `:hamming` (a Symbol or a String).
+  - `put_vector(family, qualifier, vector, ts:)` on `Mutation`, and with the table and row first on `WriteBatch` and `Transaction`. The family's element type decides the form: an Array of Numerics for `:f32`, `:f16` and `:bf16` (narrowed to `f32`; a half family rounds at the write), an Array of Integers in -128..127 for `:i8`, the packed bits as a String for `:bit`. A String for a numeric family, or an Array for a bit family, is a `TypeError`: Ruby has no typed-buffer protocol that would tell bytes and numbers apart, so neither form is read as the other (ICR 0102's S2, in Ruby).
+  - `Cell#as_vector`, and `Cell#typed` for a vector cell: an Array of Floats (`:f16` and `:bf16` widened exactly), an Array of Integers, or a binary String of bits.
+- **Reads:**
+  - `Table#multi_get(keys, families:, qualifier_prefix:, versions:, column_limit:, snapshot:)` returns an Array aligned with `keys`: one entry per key given, in that order, `nil` for a miss, a repeated key repeated. The read itself is one sorted multi-get (D299).
+  - `Table#traverse(seeds, family, hops:, per_node_limit:, hop_limit:, max_nodes:, byte_budget:, parents:, qualifier_prefix:, snapshot:, parallel:)` returns a `Traversal` (D304): `seeds` (sorted and deduplicated: hop 1's parents index them), `hops` (each a `Hop` with `nodes`, `parents` and `size`), `rows`, `edges`, `hops_cut`, `cut_by_max_nodes` and `cut_by_budget`.
+  - `Table#pages(row, size, families:, qualifier_prefix:, versions:, snapshot:, after:)` returns a `Pages` (D297): `Enumerable` over `Row` pages, each read with the GVL released when it is asked for and no read held open between pages, with `position`. A walk is one cursor: a second `each` continues where the first stopped. `RowPosition` has `to_bytes`, `.from_bytes`, `==`, `eql?` and `hash`.
+  - `Table#nearest(family, query, k, prefix:, start:, end:, keys:, qualifier_prefix:, snapshot:, parallel:)` returns `Neighbour`s (`row`, `qualifier`, `distance`, `ts`) nearest first (D296). `query` is read as `put_vector` reads a vector.
+- **Byte budgets (D308):**
+  - `Table#scan_within(prefix, bytes:, ...)` (the scan's arguments plus `after:`) returns a `ScanPage`; `Table#multi_get_within(keys, bytes:, ...)` (`multi_get`'s plus `after:`) returns a `KeysPage`. A page has `rows`, `bytes`, `cut_by_budget`, `next_bytes`, `resume` and `size`.
+  - `ScanPosition` (with `row`) and `KeysPosition` (with `key`) have `to_bytes`, `.from_bytes`, `==`, `eql?` and `hash`. A position of the other kind, or from another table, raises `InvalidArgument`.
+  - `Table#nearest_within(family, query, k, bytes:, ...)` returns a `NearestPage` (`neighbours`, `bytes`, `next_bytes`, `cut_by_budget`, `size`); `traverse(byte_budget:)` sets `cut_by_budget`, and 0 is an `ArgumentError`.
+- **Where Ruby differs from Python's spellings:**
+  - The result objects with no engine object behind them (`Neighbour`, `NearestPage`, `Hop`, `Traversal`, `ScanPage`, `KeysPage`) are frozen `Data` classes, so they compare by value and have `to_h` and `with`. The native side returns Arrays that the Ruby layer wraps, so no wrapped Rust struct holds a Ruby value (and none needs a GC mark function).
+  - `keys` and `seeds` take an Array or any other `Enumerable` (a `Set`), where Python takes any sequence.
+  - The positions and `Pages` are native classes: they hold engine values.
+
 ## The rules
 - **The GVL (O3, G1).** Every engine call runs through `gvl::without_gvl`, the crate's only hand-written `unsafe`:
   - The bounds `F: FnOnce() -> R + Send` and `R: Send` keep every Ruby value (all `!Send` in magnus) out of code that runs without the GVL.
@@ -83,7 +104,7 @@ ICR 0102's PR 1, one to one, in Ruby's idioms:
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
 ## Later PRs
-- **PR 2:** vectors, `multi_get`, `traverse`, `pages`, byte-budgeted reads and the change feed.
+- **PR 2b:** the change feed (`Table#feed`, `Feed`, `Commit`, `Change`) and the open options it needs, split from PR 2 for review size.
 - **PR 3:** `pigeonhole-memory`, `pigeonhole-text` and `pigeonhole-vector`.
 
 ## Callers changed

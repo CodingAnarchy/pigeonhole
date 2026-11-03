@@ -19,6 +19,17 @@ module Pigeonhole
   # One cell of a row: its family, qualifier and version.
   type entry = [String, String, Cell]
 
+  # A vector as written, by the family's element type: an Array of Numerics (`:f32`, `:f16`,
+  # `:bf16`), an Array of Integers (`:i8`), or the packed bits as a String (`:bit`).
+  type vector_in = Array[Numeric] | String
+
+  # A vector as read: an Array of Floats (`:f32`, and `:f16`/`:bf16` widened), an Array of
+  # Integers (`:i8`), or the packed bits as a String (`:bit`).
+  type vector_out = Array[Float] | Array[Integer] | String
+
+  # Keys or seeds: an Array of Strings, or another Enumerable of them (a Set).
+  type keys = Array[String] | Enumerable[String]
+
   def self.open: (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
                   ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
                   ?shm_dir: path?, ?read_only_fallback: bool?) -> Database
@@ -187,6 +198,26 @@ module Pigeonhole
                ?durability: durability?) -> Integer
     def delete: (String row, ?name? family, ?String? qualifier, ?ts: Integer?,
                  ?durability: durability?) -> Integer
+    def multi_get: (keys keys, ?families: Array[name]?, ?qualifier_prefix: String?, ?versions: Integer,
+                    ?column_limit: Integer?, ?snapshot: Snapshot?) -> Array[Row?]
+    def multi_get_within: (keys keys, bytes: Integer, ?families: Array[name]?, ?qualifier_prefix: String?,
+                           ?versions: Integer, ?column_limit: Integer?, ?snapshot: Snapshot?,
+                           ?after: KeysPosition?) -> KeysPage
+    def scan_within: (?String? prefix, bytes: Integer, ?start: String?, ?end: String?,
+                      ?families: Array[name]?, ?qualifier_prefix: String?, ?versions: Integer,
+                      ?limit: Integer?, ?column_limit: Integer?, ?snapshot: Snapshot?,
+                      ?after: ScanPosition?) -> ScanPage
+    def traverse: (keys seeds, name family, ?hops: Integer, ?per_node_limit: Integer?, ?hop_limit: Integer?,
+                   ?max_nodes: Integer?, ?byte_budget: Integer?, ?parents: bool, ?qualifier_prefix: String?,
+                   ?snapshot: Snapshot?, ?parallel: Integer?) -> Traversal
+    def pages: (String row, Integer size, ?families: Array[name]?, ?qualifier_prefix: String?,
+                ?versions: Integer, ?snapshot: Snapshot?, ?after: RowPosition?) -> Pages
+    def nearest: (name family, vector_in query, Integer k, ?prefix: String?, ?start: String?, ?end: String?,
+                  ?keys: keys?, ?qualifier_prefix: String?, ?snapshot: Snapshot?,
+                  ?parallel: Integer?) -> Array[Neighbour]
+    def nearest_within: (name family, vector_in query, Integer k, bytes: Integer, ?prefix: String?,
+                         ?start: String?, ?end: String?, ?keys: keys?, ?qualifier_prefix: String?,
+                         ?snapshot: Snapshot?, ?parallel: Integer?) -> NearestPage
     def inspect: () -> String
   end
 
@@ -196,6 +227,7 @@ module Pigeonhole
     def put_u64: (name family, String qualifier, Integer value, ?ts: Integer?) -> self
     def incr: (name family, String qualifier, Integer delta, ?ts: Integer?) -> self
     def aggregate: (name family, String qualifier, Integer | Float | String value, ?ts: Integer?) -> self
+    def put_vector: (name family, String qualifier, vector_in vector, ?ts: Integer?) -> self
     def delete: (?name? family, ?String? qualifier, ?ts: Integer?) -> self
     def durability: (durability durability) -> self
     def commit: () -> Integer
@@ -209,6 +241,8 @@ module Pigeonhole
     def incr: (Table table, String row, name family, String qualifier, Integer delta, ?ts: Integer?) -> self
     def aggregate: (Table table, String row, name family, String qualifier, Integer | Float | String value,
                     ?ts: Integer?) -> self
+    def put_vector: (Table table, String row, name family, String qualifier, vector_in vector,
+                     ?ts: Integer?) -> self
     def delete: (Table table, String row, ?name? family, ?String? qualifier, ?ts: Integer?) -> self
     def commit: (?durability: durability?) -> Integer
     def size: () -> Integer
@@ -222,6 +256,8 @@ module Pigeonhole
     def incr: (Table table, String row, name family, String qualifier, Integer delta, ?ts: Integer?) -> self
     def aggregate: (Table table, String row, name family, String qualifier, Integer | Float | String value,
                     ?ts: Integer?) -> self
+    def put_vector: (Table table, String row, name family, String qualifier, vector_in vector,
+                     ?ts: Integer?) -> self
     def delete: (Table table, String row, ?name? family, ?String? qualifier, ?ts: Integer?) -> self
     def get: (Table table, String row, name family, String qualifier) -> Cell?
     def get_row: (Table table, String row, Array[name] families) -> Row?
@@ -238,7 +274,8 @@ module Pigeonhole
   class Cell
     def value: () -> String
     def ts: () -> Integer
-    def typed: () -> (String | Integer | Float | nil)
+    def typed: () -> (String | Integer | Float | Array[Float] | Array[Integer] | nil)
+    def as_vector: () -> vector_out?
     def as_int: () -> Integer?
     def as_u64: () -> Integer?
     def as_float: () -> Float?
@@ -271,6 +308,7 @@ module Pigeonhole
     def self.new: (?max_versions: Integer?, ?ttl: Numeric?, ?bloom_bits: Integer?, ?block_size: Integer?,
                    ?blob_threshold: Integer?, ?compression: name?, ?zstd_level: Integer?) -> Family
     def self.counter: (?max_versions: Integer?, ?ttl: Numeric?) -> Family
+    def self.vector: (Integer dim, name element, name metric, ?max_versions: Integer?, ?ttl: Numeric?) -> Family
     def self.aggregate: (name kind, ?bounds: Array[Numeric]?, ?mantissa_bits: Integer?, ?max_buckets: Integer?,
                          ?bits: Integer?, ?hashes: Integer?, ?max_versions: Integer?, ?ttl: Numeric?) -> Family
   end
@@ -290,8 +328,178 @@ module Pigeonhole
     def merge_operator: () -> String?
     def cache_priority: () -> Symbol
     def compaction: () -> Symbol
+    def vector: () -> VectorSpec?
     def family: () -> Family
     def inspect: () -> String
+  end
+
+  # A vector family's dimension, element type and metric.
+  class VectorSpec
+    def self.new: (Integer dim, name element, name metric) -> VectorSpec
+    def dim: () -> Integer
+    def element: () -> Symbol
+    def metric: () -> Symbol
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+    def inspect: () -> String
+  end
+
+  # Where a walk of a row's pages stopped: stable bytes, naming no row.
+  class RowPosition
+    def self.from_bytes: (String bytes) -> RowPosition
+    def to_bytes: () -> String
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+  end
+
+  # Where a `scan_within` page stopped; it names its table.
+  class ScanPosition
+    def self.from_bytes: (String bytes) -> ScanPosition
+    def to_bytes: () -> String
+    def row: () -> String
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+  end
+
+  # Where a `multi_get_within` page stopped; it names its table.
+  class KeysPosition
+    def self.from_bytes: (String bytes) -> KeysPosition
+    def to_bytes: () -> String
+    def key: () -> String
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+  end
+
+  # A wide row's pages, each read when it is asked for. A cursor: every Enumerable method
+  # consumes the pages it reads (`first` then `to_a` loses the first page).
+  class Pages
+    include Enumerable[Row]
+
+    def each: () { (Row) -> void } -> self
+            | () -> Enumerator[Row, self]
+    def position: () -> RowPosition?
+  end
+
+  # One of a nearest-neighbour search's results.
+  class Neighbour < Data
+    attr_reader row: String
+    attr_reader qualifier: String
+    attr_reader distance: Float
+    attr_reader ts: Integer
+
+    def self.new: (String row, String qualifier, Float distance, Integer ts) -> instance
+                | (row: String, qualifier: String, distance: Float, ts: Integer) -> instance
+    def self.[]: (String row, String qualifier, Float distance, Integer ts) -> instance
+               | (row: String, qualifier: String, distance: Float, ts: Integer) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (row: String, qualifier: String, distance: Float, ts: Integer) -> void
+  end
+
+  # A `nearest_within` page.
+  class NearestPage < Data
+    attr_reader neighbours: Array[Neighbour]
+    attr_reader bytes: Integer
+    attr_reader next_bytes: Integer?
+
+    def self.new: (Array[Neighbour] neighbours, Integer bytes, Integer? next_bytes) -> instance
+                | (neighbours: Array[Neighbour], bytes: Integer, next_bytes: Integer?) -> instance
+    def self.[]: (Array[Neighbour] neighbours, Integer bytes, Integer? next_bytes) -> instance
+               | (neighbours: Array[Neighbour], bytes: Integer, next_bytes: Integer?) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (neighbours: Array[Neighbour], bytes: Integer, next_bytes: Integer?) -> void
+    def cut_by_budget: () -> bool
+    def size: () -> Integer
+  end
+
+  # One hop of a traversal.
+  class Hop < Data
+    attr_reader nodes: Array[String]
+    attr_reader parents: Array[Integer]?
+
+    def self.new: (Array[String] nodes, Array[Integer]? parents) -> instance
+                | (nodes: Array[String], parents: Array[Integer]?) -> instance
+    def self.[]: (Array[String] nodes, Array[Integer]? parents) -> instance
+               | (nodes: Array[String], parents: Array[Integer]?) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (nodes: Array[String], parents: Array[Integer]?) -> void
+    def size: () -> Integer
+  end
+
+  # A traversal's result.
+  class Traversal < Data
+    attr_reader seeds: Array[String]
+    attr_reader hops: Array[Hop]
+    attr_reader rows: Integer
+    attr_reader edges: Integer
+    attr_reader hops_cut: Integer
+    attr_reader cut_by_max_nodes: bool
+    attr_reader cut_by_budget: bool
+
+    def self.new: (Array[String] seeds, Array[Hop] hops, Integer rows, Integer edges, Integer hops_cut,
+                   bool cut_by_max_nodes, bool cut_by_budget) -> instance
+                | (seeds: Array[String], hops: Array[Hop], rows: Integer, edges: Integer, hops_cut: Integer,
+                   cut_by_max_nodes: bool, cut_by_budget: bool) -> instance
+    def self.[]: (Array[String] seeds, Array[Hop] hops, Integer rows, Integer edges, Integer hops_cut,
+                  bool cut_by_max_nodes, bool cut_by_budget) -> instance
+               | (seeds: Array[String], hops: Array[Hop], rows: Integer, edges: Integer, hops_cut: Integer,
+                  cut_by_max_nodes: bool, cut_by_budget: bool) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (seeds: Array[String], hops: Array[Hop], rows: Integer, edges: Integer, hops_cut: Integer,
+                     cut_by_max_nodes: bool, cut_by_budget: bool) -> void
+  end
+
+  # A `scan_within` page.
+  class ScanPage < Data
+    attr_reader rows: Array[Row]
+    attr_reader bytes: Integer
+    attr_reader cut_by_budget: bool
+    attr_reader next_bytes: Integer?
+    attr_reader resume: ScanPosition?
+
+    def self.new: (Array[Row] rows, Integer bytes, bool cut_by_budget, Integer? next_bytes,
+                   ScanPosition? resume) -> instance
+                | (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                   resume: ScanPosition?) -> instance
+    def self.[]: (Array[Row] rows, Integer bytes, bool cut_by_budget, Integer? next_bytes,
+                  ScanPosition? resume) -> instance
+               | (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                  resume: ScanPosition?) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                     resume: ScanPosition?) -> void
+    def size: () -> Integer
+  end
+
+  # A `multi_get_within` page.
+  class KeysPage < Data
+    attr_reader rows: Array[Row]
+    attr_reader bytes: Integer
+    attr_reader cut_by_budget: bool
+    attr_reader next_bytes: Integer?
+    attr_reader resume: KeysPosition?
+
+    def self.new: (Array[Row] rows, Integer bytes, bool cut_by_budget, Integer? next_bytes,
+                   KeysPosition? resume) -> instance
+                | (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                   resume: KeysPosition?) -> instance
+    def self.[]: (Array[Row] rows, Integer bytes, bool cut_by_budget, Integer? next_bytes,
+                  KeysPosition? resume) -> instance
+               | (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                  resume: KeysPosition?) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (rows: Array[Row], bytes: Integer, cut_by_budget: bool, next_bytes: Integer?,
+                     resume: KeysPosition?) -> void
+    def size: () -> Integer
   end
 
   # A condition a row must meet for `Mutation#commit_if` to apply.
