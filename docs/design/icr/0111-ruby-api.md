@@ -125,8 +125,17 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - **Whichever way the pass stops,** no thread outlives the call, the committed groups stand, and a rerun is safe (C5).
 - **`test_signatures`** now walks nested modules, so `Pigeonhole::Memory::*` is held to the RBS like the rest.
 
-## Later PRs
-- **PR 3b:** `pigeonhole-text` (`Pigeonhole::Text`) and `pigeonhole-vector` (`Pigeonhole::Vector`), as the #697 design note and its reviews set out: no custom tokenizers in v1, and the `Rebalancer` driven from Ruby.
-
+### PR 3b: full-text search and the vector index
+`pigeonhole-text` and `pigeonhole-vector`, which no other binding has yet. The design note and both reviews are on #697.
+- **Names.** `Pigeonhole::Text` holds `Query`, `Index` and `ReadIndex`. `Pigeonhole::Vector` holds `Index`, `ReadIndex`, `Placed`, `Rebalancer` and `BulkLoad`. Their results (`Hit`, `Match`, the stats and options) are frozen `Data` built in `index.rb`, with ids as frozen binary Strings.
+- **Text.**
+  - A query is a `Query` (immutable: each builder method returns a new one) or a String in the query syntax, parsed when the search runs.
+  - `Match#range` is a byte `Range` of `Hit#text`, and the docs say to use `byteslice` (ai1249's P3).
+  - Custom tokenizers aren't bound (Q2): the engine calls a tokenizer inside its own calls, where a block can't run.
+- **Vector.**
+  - `insert` and `search` take `put_vector`'s forms for the index's element. A half index takes `f32` values, which it rounds.
+  - `insert_in`/`delete_in` take a `Placed`, made inside the transaction's block (P1), and `after_commit` uses it up.
+  - **`bulk_load(pairs, expected:)`** streams (P2). `pairs.each_slice(batch)` feeds a `BulkLoad`, whose `push` converts a batch and sends it over a bounded channel to a loader thread running the crate's one `bulk_load_*` call. `push` waits with the GVL released while the loader is two batches behind, and `finish` joins the loader in interruptible slices.
+- **Rebalancing (Q3).** `rebalance: :background` uses the crate's own thread. With `rebalancer: true`, `create`/`open` return `[index, rebalancer]` for a Ruby thread to drive. `run_once(budget)` and `wait(timeout)` release the GVL, and `wait` runs in 100 ms slices with interrupt checks. `set_wakeup` isn't bound, for Q2's reason.
 ## Callers changed
 None. It's a new crate.

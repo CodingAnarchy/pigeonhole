@@ -181,10 +181,16 @@ class TestMemory < Minitest::Test
   # #1381: the text index's normalization is fixed at create.
   def test_normalization_is_set_at_create
     store("plain", normalization: :none) { |s| assert_equal :none, s.normalization }
+    # The keyword signal, not just the top hit: recency returns the only memory anyway (as
+    # ai1249's #1429 checks it).
     store("compat", normalization: :nfkc) do |s|
       assert_equal :nfkc, s.normalization
-      id = s.remember("n", "ﬁle formats").id # "ﬁle" with the fi ligature
-      assert_equal id, s.recall("n", text: "file")[0]&.id
+      s.remember("n", "ﬁle formats") # "ﬁle" with the fi ligature
+      refute_nil s.recall("n", text: "file", with_signals: true)[0].signals.keyword
+    end
+    store("nfc") do |s|
+      s.remember("n", "ﬁle formats")
+      assert_nil s.recall("n", text: "file", with_signals: true)[0].signals.keyword
     end
     assert_raises(Pigeonhole::InvalidArgument) { store("bad", normalization: :nfd) }
   end

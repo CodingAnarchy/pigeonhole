@@ -11,8 +11,8 @@
 //!
 //! Results come back as Arrays, which `lib/pigeonhole/index.rb` turns into frozen `Data`.
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use magnus::{Error, RArray, RString, Ruby, TryConvert, Value, prelude::*};
@@ -924,7 +924,9 @@ fn join_sliced<T: Send + 'static>(
         let done = without_gvl(ruby, move || {
             let start = Instant::now();
             loop {
-                let finished = lock(w).as_ref().is_none_or(std::thread::JoinHandle::is_finished);
+                let finished = lock(w)
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished);
                 if finished || start.elapsed() >= SLICE {
                     return finished;
                 }
@@ -933,9 +935,9 @@ fn join_sliced<T: Send + 'static>(
         })?;
         if done {
             let h = lock(&worker).take().expect("present until joined");
-            return h
-                .join()
-                .map_err(|_| crate::error::uncoded(ruby, "Error", "the bulk load thread panicked"));
+            return h.join().map_err(|_| {
+                crate::error::uncoded(ruby, "Error", "the bulk load thread panicked")
+            });
         }
         ruby.thread_check_ints()?;
     }
