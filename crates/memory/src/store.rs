@@ -7,7 +7,7 @@ use pigeonhole::{
     Aggregation, Element, Family, Metric, Pigeonhole, PigeonholeReader, ReadTable, RetryPolicy,
     Table, Transaction, VectorSpec,
 };
-use pigeonhole_text::{Index, IndexOptions, ReadIndex};
+use pigeonhole_text::{Index, IndexOptions, Normalization, ReadIndex};
 
 use crate::dedup::{DedupPolicy, Near, NearDedup};
 use crate::forget::{ForgetPolicy, Forgetter, Signal, UserToken};
@@ -75,6 +75,7 @@ pub struct StoreOptions {
     embedding: Option<EmbeddingModel>,
     forget: Option<ForgetPolicy>,
     near_dedup: Option<NearDedup>,
+    normalization: Normalization,
 }
 
 impl StoreOptions {
@@ -102,6 +103,18 @@ impl StoreOptions {
     /// ([`Store::set_near_dedup`]).
     pub fn near_dedup(mut self, n: NearDedup) -> Self {
         self.near_dedup = Some(n);
+        self
+    }
+
+    /// The Unicode normalisation of the store's text index, which keyword recall matches by:
+    /// [`Normalization::Nfc`] by default. [`Normalization::Nfkc`] also folds ligatures and
+    /// full-width forms into their plain ones, which suits memories gathered from mixed
+    /// sources (PDF and OCR text, East Asian content). Fixed at create: the store reads it
+    /// back from the index ([`Store::normalization`]). To change it, create a new store with
+    /// the other setting and remember the old store's memories into it. The full-text
+    /// guide's "Which normalisation to pick" has the trade-offs (#1291).
+    pub fn normalization(mut self, n: Normalization) -> Self {
+        self.normalization = n;
         self
     }
 
@@ -532,7 +545,9 @@ impl Store {
             db,
             &index_name(name),
             pigeonhole_text::Source::new(&table, CONTENT, TEXT),
-            IndexOptions::new().positions(false),
+            IndexOptions::new()
+                .positions(false)
+                .normalization(store.normalization),
         )?;
         Self::open_with(db, name, open)
     }
@@ -701,6 +716,12 @@ impl Store {
     /// The model the store is pinned to, if any.
     pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
         self.model.as_ref()
+    }
+
+    /// The Unicode normalisation of the store's text index, set at create
+    /// ([`StoreOptions::normalization`]).
+    pub fn normalization(&self) -> Normalization {
+        self.index.options().get_normalization()
     }
 
     /// Remembers `memory` in namespace `ns`, in one transaction (D311 §4): the memory row,
@@ -1183,6 +1204,11 @@ impl ReadStore {
     /// The model the store is pinned to, if any.
     pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
         self.model.as_ref()
+    }
+
+    /// The Unicode normalisation of the store's text index ([`Store::normalization`]).
+    pub fn normalization(&self) -> Normalization {
+        self.index.options().get_normalization()
     }
 
     /// Recalls memories, as [`Store::recall`] does, at the reader's snapshots. A search

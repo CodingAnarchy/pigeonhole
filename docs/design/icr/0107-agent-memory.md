@@ -231,6 +231,12 @@ The design is on #1341 (cli692, c6593086022), plus the owner's three-part decisi
   - the key comes from the environment and is never logged, and goes only over `https://` or plain `http://` to a loopback host (simp724's E1 on #1389);
   - no redirects, a 30 s timeout, and a 16 MiB response cap.
 
+## The text index's normalisation (#1381)
+- **`StoreOptions::normalization(Normalization)`** sets the Unicode normalisation of the store's text index at create. The default is `Nfc`, so existing stores and every call that doesn't set it behave as before.
+- **`Store::normalization()` and `ReadStore::normalization()`** read it back from the index. The index fixes it at create, so nothing at open can disagree.
+- **`pigeonhole_memory::Normalization`** re-exports `pigeonhole_text::Normalization` (`#[non_exhaustive]`), so callers don't need the text crate.
+- **It's a keyword-recall setting only:** exact dedup's text normalisation (trim, collapse whitespace, no case folding) is unchanged.
+
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
