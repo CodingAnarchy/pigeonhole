@@ -4,13 +4,14 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pigeonhole_format::wal::{Decoded, FRAME_SIZE, FrameDecoder, FrameEncoder, WalRecord};
 use pigeonhole_format::{Lsn, StreamId};
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
 
 use crate::stream::{FRAME, Grid};
-use crate::{Result, stream_path};
+use crate::{FeedMarks, Result, stream_path};
 
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
@@ -117,12 +118,11 @@ pub struct FeedCursor {
     grid: Option<Grid>,
     /// The segment being read; `None` once it is gone.
     cur: Option<Cursor>,
-    /// Whether the last call stopped (the next one reads the headers again first).
+    /// Whether the last call stopped: the next one re-reads the frame it stopped in.
     stopped: bool,
-    /// Whether the headers were read in this call and no frame was decoded since: a stop
-    /// found then is where the cursor resumed, so it needs no second read (an idle stream
-    /// reads its headers once per stop, not twice).
-    fresh: bool,
+    /// The writer's marks for this stream, in the writer's process
+    /// ([`FeedCursor::follow_head`]): a stop in the head segment needs no header read.
+    marks: Option<Arc<FeedMarks>>,
     /// Whether the next `load` follows a header read: it reads one frame, not a chunk. An
     /// idle stream's resume needs only the frame it stopped in; a busy one reads full
     /// chunks after it.
@@ -182,7 +182,7 @@ impl FeedCursor {
             grid,
             cur: None,
             stopped: false,
-            fresh: false,
+            marks: None,
             short_load: false,
             #[cfg(test)]
             reads: (0, 0),
@@ -208,6 +208,20 @@ impl FeedCursor {
             frame: offset - offset % FRAME,
             last_end: offset,
         })
+    }
+
+    /// Follows the writer's head mark for this stream (`marks`, from the [`WalStream`]
+    /// writing it, so in the writer's process only). A stop in the segment the head names
+    /// then reads no segment headers: the head segment has no successor and isn't
+    /// recyclable, and the writer moves the head ([`FeedMarks::head`], Release) before the
+    /// successor's header or any record in it is written. So a cursor that loads the head
+    /// after reading to a stop and finds its own epoch has read every record in the stream
+    /// that was written before it loaded the frontier (M1). A reader process, with no
+    /// marks, reads the headers at every stop.
+    ///
+    /// [`WalStream`]: crate::WalStream
+    pub fn follow_head(&mut self, marks: Arc<FeedMarks>) {
+        self.marks = Some(marks);
     }
 
     /// The epoch of the segment the cursor is in (0 once it is gone).
@@ -338,11 +352,13 @@ impl FeedCursor {
     /// ([`Step::Gone`]).
     pub fn step(&mut self) -> Result<Step<'_>> {
         if self.stopped {
+            // Resuming: the frame stopped in is read again, from the file, since the
+            // writer may have added to it. The headers are not: a recycled slot's frames
+            // carry another epoch and read as a stop, which reads them (below), and a
+            // successor is looked for at the stop too.
             self.stopped = false;
-            if !self.refresh()? {
-                return Ok(Step::Gone);
-            }
-            self.fresh = true;
+            self.chunk_slot = usize::MAX;
+            self.short_load = true;
         }
         loop {
             let Some(cur) = &self.cur else {
@@ -373,7 +389,6 @@ impl FeedCursor {
                         return Ok(Step::Cut);
                     }
                     Some(Decoded::Record { offset }) => {
-                        self.fresh = false;
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
                         cur.last_end = end;
@@ -398,12 +413,11 @@ impl FeedCursor {
             let Some(stop) = stop else { continue };
             // The segment's valid data ends at `stop` for now: a successor on disk takes
             // over, else this is the readable end. Read the headers first: the successor
-            // may have been written since they were read, or the slot recycled. Unless this
-            // call read them and decoded nothing since (`fresh`, an idle stream): chaining
-            // then goes by headers read just before these frames, as a poll a moment earlier
-            // would have, a short stop is deferred once as below (#1370), and the next call
-            // reads the headers again before reading on.
-            if !std::mem::take(&mut self.fresh) && !self.refresh()? {
+            // may have been written since they were read, or the slot recycled. Not in the
+            // head segment, in the writer's process (`follow_head`): loaded after the
+            // frames, a head still at this epoch means no successor had been started.
+            let at_head = self.marks.as_ref().is_some_and(|m| m.head() == epoch);
+            if !at_head && !self.refresh()? {
                 return Ok(Step::Gone);
             }
             match self.chain(epoch, stop)? {
@@ -434,7 +448,25 @@ mod read_tests {
 
     const DB_ID: [u8; 16] = [0xAB; 16];
 
-    fn append(wal: &mut WalStream, seqno: u64) {
+    fn db() -> &'static Path {
+        Path::new("/db/data.phdb")
+    }
+
+    /// A segment of `frames` frames, and 8 retained so the cursor's segments stay.
+    fn stream(vfs: &VfsRef, frames: u64) -> WalStream {
+        let o = WalOptions {
+            segment_size: frames * FRAME,
+            spare_segments: 2,
+            retain_segments: 8,
+            feed_session: 0xfeed,
+            ..WalOptions::default()
+        };
+        WalStream::create(vfs, db(), StreamId(0), DB_ID, o).unwrap()
+    }
+
+    /// Appends seqno `seqno` with a `value_len`-byte value, synced.
+    fn append(wal: &mut WalStream, seqno: u64, value_len: usize) {
+        let value = vec![seqno as u8; value_len];
         let mut b = BatchBuilder::new();
         b.push(
             TableId(1),
@@ -443,7 +475,7 @@ mod read_tests {
             b"row",
             b"q",
             Some(seqno),
-            b"v",
+            &value,
         )
         .unwrap();
         let record = WalRecord::Batch {
@@ -455,50 +487,109 @@ mod read_tests {
         wal.sync().unwrap();
     }
 
-    fn drain(c: &mut FeedCursor) -> usize {
-        let mut n = 0;
+    /// The seqnos up to the readable end.
+    fn drain(c: &mut FeedCursor) -> Vec<u64> {
+        let mut got = Vec::new();
         loop {
             match c.step().unwrap() {
-                Step::Record { .. } => n += 1,
-                Step::End => return n,
+                Step::Record {
+                    record: WalRecord::Batch { seqno, .. },
+                    ..
+                } => got.push(seqno),
+                Step::End => return got,
                 other => panic!("{other:?}"),
             }
         }
     }
 
-    /// D310 PR 5b (the subscriber cost on the AX102): an idle stream's poll reads its
-    /// headers once and one frame, not twice and a 1 MiB chunk; a stream with new records
-    /// still reads them all, its headers again at its stop.
+    /// D310 PR 5b (the subscriber cost on the AX102): a stop reads the segment headers once,
+    /// not on resuming and again at the stop, and a resume reads one frame, not a 1 MiB
+    /// chunk. Without the writer's marks (a reader process) every stop reads the headers.
     #[test]
-    fn an_idle_stop_reads_the_headers_once_and_one_frame() {
+    fn a_stop_reads_the_headers_once_and_a_resume_one_frame() {
         let vfs: VfsRef = SimVfs::new(5);
-        let db = Path::new("/db/data.phdb");
-        let o = WalOptions {
-            segment_size: 64 * FRAME,
-            retain_segments: 4,
-            feed_session: 0xfeed,
-            ..WalOptions::default()
-        };
-        let mut wal = WalStream::create(&vfs, db, StreamId(0), DB_ID, o).unwrap();
-        append(&mut wal, 1);
-        let mut c = FeedCursor::open(&vfs, db, StreamId(0), DB_ID, Lsn::default()).unwrap();
-        assert_eq!(drain(&mut c), 1);
+        let mut wal = stream(&vfs, 64);
+        append(&mut wal, 1, 8);
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        assert_eq!(drain(&mut c), [1]);
         for _ in 0..10 {
             let before = c.reads;
-            assert_eq!(drain(&mut c), 0);
+            assert!(drain(&mut c).is_empty());
             assert_eq!(c.reads.0 - before.0, 1, "one header read per idle stop");
-            assert_eq!(c.reads.1 - before.1, FRAME, "one frame per idle stop");
+            assert_eq!(c.reads.1 - before.1, FRAME, "one frame per resume");
         }
-        // New records: delivered, with the headers read at the resume and again at the stop.
         for s in 2..=4 {
-            append(&mut wal, s);
+            append(&mut wal, s, 8);
         }
         let before = c.reads;
-        assert_eq!(drain(&mut c), 3);
+        assert_eq!(drain(&mut c), [2, 3, 4]);
         assert_eq!(
             c.reads.0 - before.0,
-            2,
-            "a stop after records reads the headers"
+            1,
+            "one header read at the stop after records"
         );
+    }
+
+    /// With the writer's marks (`follow_head`), a stop in the head segment reads no headers,
+    /// idle or with new records.
+    #[test]
+    fn a_cursor_following_the_head_reads_no_headers_in_the_head_segment() {
+        let vfs: VfsRef = SimVfs::new(6);
+        let mut wal = stream(&vfs, 64);
+        append(&mut wal, 1, 8);
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        c.follow_head(wal.feed_marks().unwrap());
+        assert_eq!(drain(&mut c), [1]);
+        let before = c.reads;
+        for _ in 0..10 {
+            assert!(drain(&mut c).is_empty());
+        }
+        for s in 2..=4 {
+            append(&mut wal, s, 8);
+        }
+        assert_eq!(drain(&mut c), [2, 3, 4]);
+        assert_eq!(c.reads.0, before.0, "no header read in the head segment");
+    }
+
+    /// perf287's S2 on #1450: a cursor following the head across rollovers (a 20 KB record
+    /// per 32 KB frame, 4 frames a segment) reads every record once, in order, and reads
+    /// the headers only at the stops where the writer had moved on: never more than once
+    /// per stop, and not at all at the stops in the head segment.
+    #[test]
+    fn a_cursor_following_the_head_chains_across_rollovers() {
+        let vfs: VfsRef = SimVfs::new(7);
+        let mut wal = stream(&vfs, 4);
+        wal.spares().prepare(2).unwrap();
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        c.follow_head(wal.feed_marks().unwrap());
+        let (mut seen, mut seqno) = (Vec::new(), 1);
+        for round in 0..10 {
+            for _ in 0..3 {
+                append(&mut wal, seqno, 20_000);
+                seqno += 1;
+            }
+            let before = c.reads.0;
+            seen.extend(drain(&mut c));
+            assert_eq!(seen, (1..seqno).collect::<Vec<_>>(), "round {round}");
+            assert_eq!(
+                c.epoch(),
+                wal.written().epoch(),
+                "round {round}: at the head"
+            );
+            // Each segment passed is one stop that read the headers (and chained).
+            assert!(
+                c.reads.0 - before <= 3,
+                "round {round}: {}",
+                c.reads.0 - before
+            );
+            let before = c.reads.0;
+            assert!(drain(&mut c).is_empty());
+            assert_eq!(
+                c.reads.0, before,
+                "round {round}: idle at the head reads none"
+            );
+            wal.spares().prepare(2).unwrap();
+        }
+        assert!(wal.written().epoch() > 5, "the stream rolled over");
     }
 }
