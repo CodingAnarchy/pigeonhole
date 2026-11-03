@@ -176,6 +176,11 @@ pub(crate) struct MemoryId(pub(crate) pigeonhole_memory::MemoryId);
 #[derive(Clone)]
 pub(crate) struct EmbeddingModel(pub(crate) pigeonhole_memory::EmbeddingModel);
 
+/// `Pigeonhole::Memory::IvfOptions`: a store's IVF index options (D311 T8).
+#[magnus::wrap(class = "Pigeonhole::Memory::IvfOptions", free_immediately, size)]
+#[derive(Clone, Copy)]
+pub(crate) struct IvfOptions(pub(crate) pigeonhole_memory::IvfOptions);
+
 /// `Pigeonhole::Memory::Weights`: recall's signal weights (1 by default; `recency` 0.25,
 /// `graph` and `consolidated` 0.5).
 #[magnus::wrap(class = "Pigeonhole::Memory::Weights", free_immediately, size)]
@@ -221,3 +226,41 @@ pub(crate) struct Store(pub(crate) ForkSafe<std::sync::Arc<crate::memory::StoreS
 /// `Pigeonhole::Memory::ReadStore`: a memory store in a reader process.
 #[magnus::wrap(class = "Pigeonhole::Memory::ReadStore", free_immediately, size)]
 pub(crate) struct ReadStore(pub(crate) ForkSafe<std::sync::Arc<crate::memory::ReadSlot>>);
+
+// ---- Pigeonhole::Text and Pigeonhole::Vector (PR 3b; methods in index.rs) ----------------
+
+/// `Pigeonhole::Text::Query`: a full-text query.
+#[magnus::wrap(class = "Pigeonhole::Text::Query", free_immediately, size)]
+pub(crate) struct TextQuery(pub(crate) pigeonhole_text::Query);
+
+/// `Pigeonhole::Text::Index`: a full-text index in the writer process.
+#[magnus::wrap(class = "Pigeonhole::Text::Index", free_immediately, size)]
+pub(crate) struct TextIndex(pub(crate) ForkSafe<pigeonhole_text::Index>);
+
+/// `Pigeonhole::Text::ReadIndex`: a full-text index in a reader process.
+#[magnus::wrap(class = "Pigeonhole::Text::ReadIndex", free_immediately, size)]
+pub(crate) struct TextReadIndex(pub(crate) ForkSafe<pigeonhole_text::ReadIndex>);
+
+/// `Pigeonhole::Vector::Index`: a vector index in the writer process.
+#[magnus::wrap(class = "Pigeonhole::Vector::Index", free_immediately, size)]
+pub(crate) struct VectorIndex(pub(crate) ForkSafe<pigeonhole_vector::Index>);
+
+/// `Pigeonhole::Vector::ReadIndex`: a vector index in a reader process.
+#[magnus::wrap(class = "Pigeonhole::Vector::ReadIndex", free_immediately, size)]
+pub(crate) struct VectorReadIndex(pub(crate) ForkSafe<pigeonhole_vector::ReadIndex>);
+
+/// `Pigeonhole::Vector::Placed`: one transaction's writes to one index; `None` once passed
+/// to `after_commit`.
+#[magnus::wrap(class = "Pigeonhole::Vector::Placed", free_immediately, size)]
+pub(crate) struct Placed(pub(crate) ForkSafe<Mutex<Option<pigeonhole_vector::Placed>>>);
+
+/// `Pigeonhole::Vector::Rebalancer`: a background-mode index's rebalancing, for a Ruby
+/// thread to drive.
+#[magnus::wrap(class = "Pigeonhole::Vector::Rebalancer", free_immediately, size)]
+pub(crate) struct Rebalancer(
+    pub(crate) ForkSafe<crate::index::Fair<pigeonhole_vector::Rebalancer>>,
+);
+
+/// `Pigeonhole::Vector::BulkLoad`: a bulk load in progress; `None` once finished.
+#[magnus::wrap(class = "Pigeonhole::Vector::BulkLoad", free_immediately, size)]
+pub(crate) struct VectorBulkLoad(pub(crate) ForkSafe<Mutex<Option<crate::index::BulkState>>>);

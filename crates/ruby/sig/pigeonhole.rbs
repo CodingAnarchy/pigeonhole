@@ -704,6 +704,16 @@ module Pigeonhole
       def inspect: () -> String
     end
 
+    # A store's IVF index options.
+    class IvfOptions
+      def self.new: (?min_namespace_len: Integer?, ?nprobe: Integer?, ?target_list_len: Integer?) -> IvfOptions
+      def min_namespace_len: () -> Integer
+      def nprobe: () -> Integer?
+      def target_list_len: () -> Integer?
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
     # A memory to write.
     class Memory
       def self.new: (String text, ?embedding: Array[Numeric]?, ?kind: name?, ?importance: Numeric?,
@@ -821,24 +831,29 @@ module Pigeonhole
       attr_reader missing_embeddings: Integer
       attr_reader dangling_superseded: Integer
       attr_reader text_index_inconsistent: bool
+      attr_reader ivf_mismatched: Integer
+      attr_reader ivf_counter_drift: Integer
 
       def self.new: (Integer memories, Integer no_content, Integer stale_dedup,
                      Integer broken_links, Integer missing_embeddings, Integer dangling_superseded,
-                     bool text_index_inconsistent) -> instance
+                     bool text_index_inconsistent, Integer ivf_mismatched, Integer ivf_counter_drift) -> instance
                   | (memories: Integer, no_content: Integer, stale_dedup: Integer,
                      broken_links: Integer, missing_embeddings: Integer,
-                     dangling_superseded: Integer, text_index_inconsistent: bool) -> instance
+                     dangling_superseded: Integer, text_index_inconsistent: bool,
+                     ivf_mismatched: Integer, ivf_counter_drift: Integer) -> instance
       def self.[]: (Integer memories, Integer no_content, Integer stale_dedup,
                     Integer broken_links, Integer missing_embeddings, Integer dangling_superseded,
-                    bool text_index_inconsistent) -> instance
+                    bool text_index_inconsistent, Integer ivf_mismatched, Integer ivf_counter_drift) -> instance
                  | (memories: Integer, no_content: Integer, stale_dedup: Integer,
                     broken_links: Integer, missing_embeddings: Integer,
-                    dangling_superseded: Integer, text_index_inconsistent: bool) -> instance
+                    dangling_superseded: Integer, text_index_inconsistent: bool,
+                    ivf_mismatched: Integer, ivf_counter_drift: Integer) -> instance
       def self.members: () -> Array[Symbol]
       def self.inspect: () -> String
       def initialize: (memories: Integer, no_content: Integer, stale_dedup: Integer,
                        broken_links: Integer, missing_embeddings: Integer,
-                       dangling_superseded: Integer, text_index_inconsistent: bool) -> void
+                       dangling_superseded: Integer, text_index_inconsistent: bool,
+                       ivf_mismatched: Integer, ivf_counter_drift: Integer) -> void
       def consistent?: () -> bool
     end
 
@@ -914,17 +929,21 @@ module Pigeonhole
       attr_reader truncated: bool
       attr_reader expanded: Integer
       attr_reader expansion_truncated: bool
+      attr_reader ivf_namespaces: Integer
+      attr_reader ivf_fallbacks: Integer
 
-      def self.new: (Integer candidates, bool truncated, Integer expanded, bool expansion_truncated) -> instance
+      def self.new: (Integer candidates, bool truncated, Integer expanded,
+                     bool expansion_truncated, Integer ivf_namespaces, Integer ivf_fallbacks) -> instance
                   | (candidates: Integer, truncated: bool, expanded: Integer,
-                     expansion_truncated: bool) -> instance
-      def self.[]: (Integer candidates, bool truncated, Integer expanded, bool expansion_truncated) -> instance
+                     expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> instance
+      def self.[]: (Integer candidates, bool truncated, Integer expanded, bool expansion_truncated,
+                    Integer ivf_namespaces, Integer ivf_fallbacks) -> instance
                  | (candidates: Integer, truncated: bool, expanded: Integer,
-                    expansion_truncated: bool) -> instance
+                    expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> instance
       def self.members: () -> Array[Symbol]
       def self.inspect: () -> String
       def initialize: (candidates: Integer, truncated: bool, expanded: Integer,
-                       expansion_truncated: bool) -> void
+                       expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> void
     end
 
     # A forget pass's counts.
@@ -973,12 +992,13 @@ module Pigeonhole
                    ?candidates: Integer?, ?byte_budget: Integer?, ?snapshot: Snapshot?, ?now_us: Integer?,
                    ?half_life: Numeric?, ?fusion: name, ?weights: Weights?, ?include_superseded: bool,
                    ?session: String?, ?with_signals: bool, ?with_embeddings: bool,
-                   ?expand: Expand?) -> Array[RecallHit]
+                   ?expand: Expand?, ?exact: bool, ?nprobe: Integer?) -> Array[RecallHit]
       def recall_with_stats: (String | Array[String] namespaces, ?text: String?, ?embedding: Array[Numeric]?,
                               ?k: Integer?, ?candidates: Integer?, ?byte_budget: Integer?, ?snapshot: Snapshot?,
                               ?now_us: Integer?, ?half_life: Numeric?, ?fusion: name, ?weights: Weights?,
                               ?include_superseded: bool, ?session: String?, ?with_signals: bool,
-                              ?with_embeddings: bool, ?expand: Expand?) -> [Array[RecallHit], RecallStats]
+                              ?with_embeddings: bool, ?expand: Expand?, ?exact: bool,
+                              ?nprobe: Integer?) -> [Array[RecallHit], RecallStats]
       def get: (id id) -> StoredMemory?
       def verify: () -> StoreStats
     end
@@ -988,9 +1008,11 @@ module Pigeonhole
       include Recalls
 
       def self.create: (Database db, String name, ?embedding: EmbeddingModel?, ?forget: ForgetPolicy?,
-                        ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?) -> Store
+                        ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?,
+                        ?ivf: IvfOptions?) -> Store
                      | [T] (Database db, String name, ?embedding: EmbeddingModel?, ?forget: ForgetPolicy?,
-                            ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?) { (Store) -> T } -> T
+                            ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?,
+                        ?ivf: IvfOptions?) { (Store) -> T } -> T
       def self.open: (Database db, String name, model: String?) -> Store
                    | [T] (Database db, String name, model: String?) { (Store) -> T } -> T
       def self.open_reader: (Reader reader, String name, model: String?) -> ReadStore
@@ -999,6 +1021,7 @@ module Pigeonhole
       def closed?: () -> bool
       def embedding_model: () -> EmbeddingModel?
       def normalization: () -> Symbol
+      def ivf: () -> IvfOptions?
       def remember: (String ns, String text, ?embedding: Array[Numeric]?, ?kind: name?, ?importance: Numeric?,
                      ?source: String?, ?session: String?, ?links: Array[link_spec]?, ?pinned: bool) -> Remembered
       def remember_in: (Transaction txn, String ns, String text, ?embedding: Array[Numeric]?, ?kind: name?,
@@ -1027,6 +1050,316 @@ module Pigeonhole
       def closed?: () -> bool
       def embedding_model: () -> EmbeddingModel?
       def normalization: () -> Symbol
+      def ivf: () -> IvfOptions?
+    end
+  end
+
+  # Full-text search (D309, ICR 0105; #697 PR 3b).
+  module Text
+    # A query: a Query, or a String in the query syntax.
+    type query = Query | String
+
+    # A search hit.
+    class Hit < Data
+      attr_reader id: String
+      attr_reader score: Float
+      attr_reader text: String?
+      attr_reader matches: Array[Match]
+
+      def self.new: (String id, Float score, String? text, Array[Match] matches) -> instance
+                  | (id: String, score: Float, text: String?, matches: Array[Match]) -> instance
+      def self.[]: (String id, Float score, String? text, Array[Match] matches) -> instance
+                 | (id: String, score: Float, text: String?, matches: Array[Match]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: String, score: Float, text: String?, matches: Array[Match]) -> void
+    end
+
+    # Where a clause matched: a byte range of the hit's text.
+    class Match < Data
+      attr_reader clause: Integer
+      attr_reader occurrence: Integer
+      attr_reader range: Range[Integer]
+
+      def self.new: (Integer clause, Integer occurrence, Range[Integer] range) -> instance
+                  | (clause: Integer, occurrence: Integer, range: Range[Integer]) -> instance
+      def self.[]: (Integer clause, Integer occurrence, Range[Integer] range) -> instance
+                 | (clause: Integer, occurrence: Integer, range: Range[Integer]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (clause: Integer, occurrence: Integer, range: Range[Integer]) -> void
+    end
+
+    # How a fuzzy clause expanded.
+    class FuzzyStats < Data
+      attr_reader clause: Integer
+      attr_reader term: String
+      attr_reader expansions: Integer
+      attr_reader cut: bool
+
+      def self.new: (Integer clause, String term, Integer expansions, bool cut) -> instance
+                  | (clause: Integer, term: String, expansions: Integer, cut: bool) -> instance
+      def self.[]: (Integer clause, String term, Integer expansions, bool cut) -> instance
+                 | (clause: Integer, term: String, expansions: Integer, cut: bool) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (clause: Integer, term: String, expansions: Integer, cut: bool) -> void
+    end
+
+    # What a search read.
+    class SearchStats < Data
+      attr_reader fuzzy: Array[FuzzyStats]
+      attr_reader stale: Integer
+
+      def self.new: (Array[FuzzyStats] fuzzy, Integer stale) -> instance
+                  | (fuzzy: Array[FuzzyStats], stale: Integer) -> instance
+      def self.[]: (Array[FuzzyStats] fuzzy, Integer stale) -> instance
+                 | (fuzzy: Array[FuzzyStats], stale: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (fuzzy: Array[FuzzyStats], stale: Integer) -> void
+    end
+
+    # An index's options.
+    class IndexOptions < Data
+      attr_reader k1: Float
+      attr_reader b: Float
+      attr_reader positions: bool
+      attr_reader stop_words: bool
+      attr_reader normalization: Symbol
+      attr_reader max_terms: Integer
+      attr_reader max_term_bytes: Integer
+
+      def self.new: (Float k1, Float b, bool positions, bool stop_words, Symbol normalization,
+                     Integer max_terms, Integer max_term_bytes) -> instance
+                  | (k1: Float, b: Float, positions: bool, stop_words: bool, normalization: Symbol,
+                     max_terms: Integer, max_term_bytes: Integer) -> instance
+      def self.[]: (Float k1, Float b, bool positions, bool stop_words, Symbol normalization,
+                    Integer max_terms, Integer max_term_bytes) -> instance
+                 | (k1: Float, b: Float, positions: bool, stop_words: bool, normalization: Symbol,
+                    max_terms: Integer, max_term_bytes: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (k1: Float, b: Float, positions: bool, stop_words: bool,
+                       normalization: Symbol, max_terms: Integer, max_term_bytes: Integer) -> void
+    end
+
+    # The cell an index covers.
+    class Source < Data
+      attr_reader table: String
+      attr_reader family: String
+      attr_reader qualifier: String
+
+      def self.new: (String table, String family, String qualifier) -> instance
+                  | (table: String, family: String, qualifier: String) -> instance
+      def self.[]: (String table, String family, String qualifier) -> instance
+                 | (table: String, family: String, qualifier: String) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (table: String, family: String, qualifier: String) -> void
+    end
+
+    # `verify`'s counts.
+    class IndexStats < Data
+      attr_reader documents: Integer
+      attr_reader terms: Integer
+      attr_reader postings: Integer
+      attr_reader forward_mismatch: Integer
+      attr_reader source_mismatch: Integer
+      attr_reader counter_drift: Integer
+      attr_reader invalid_utf8: Integer
+      attr_reader consistent: bool
+
+      def self.new: (Integer documents, Integer terms, Integer postings, Integer forward_mismatch,
+                     Integer source_mismatch, Integer counter_drift, Integer invalid_utf8,
+                     bool consistent) -> instance
+                  | (documents: Integer, terms: Integer, postings: Integer,
+                     forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                     invalid_utf8: Integer, consistent: bool) -> instance
+      def self.[]: (Integer documents, Integer terms, Integer postings, Integer forward_mismatch,
+                    Integer source_mismatch, Integer counter_drift, Integer invalid_utf8,
+                    bool consistent) -> instance
+                 | (documents: Integer, terms: Integer, postings: Integer,
+                    forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                    invalid_utf8: Integer, consistent: bool) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (documents: Integer, terms: Integer, postings: Integer,
+                       forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                       invalid_utf8: Integer, consistent: bool) -> void
+      def consistent?: () -> bool
+    end
+
+    # What `rebuild` or `repair` did.
+    class RebuildStats < Data
+      attr_reader documents: Integer
+      attr_reader changed: Integer
+      attr_reader invalid_utf8: Integer
+
+      def self.new: (Integer documents, Integer changed, Integer invalid_utf8) -> instance
+                  | (documents: Integer, changed: Integer, invalid_utf8: Integer) -> instance
+      def self.[]: (Integer documents, Integer changed, Integer invalid_utf8) -> instance
+                 | (documents: Integer, changed: Integer, invalid_utf8: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (documents: Integer, changed: Integer, invalid_utf8: Integer) -> void
+    end
+
+    # A full-text query.
+    class Query
+      def self.new: () -> Query
+      def self.parse: (String text) -> Query
+      def term: (String term) -> Query
+      def text: (String text) -> Query
+      def phrase: (Array[String] words, ?slop: Integer) -> Query
+      def fuzzy: (String term, ?(Symbol | Integer) fuzziness) -> Query
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # The search methods Index and ReadIndex share.
+    module Searches
+      def search: (query query, Integer k, ?id_prefix: String?, ?snapshot: Snapshot?, ?highlight: bool,
+                   ?prefix_length: Integer?, ?max_expansions: Integer?) -> Array[Hit]
+      def search_with_stats: (query query, Integer k, ?id_prefix: String?, ?snapshot: Snapshot?, ?highlight: bool,
+                              ?prefix_length: Integer?, ?max_expansions: Integer?) -> [Array[Hit], SearchStats]
+      def verify: () -> IndexStats
+      def options: () -> IndexOptions
+      def source: () -> Source
+    end
+
+    # A full-text index in the writer process.
+    class Index
+      include Searches
+
+      def self.create: (Database db, String name, table: Table, family: name, qualifier: String, ?k1: Numeric?,
+                        ?b: Numeric?, ?positions: bool?, ?stop_words: bool?, ?normalization: name?,
+                        ?max_terms: Integer?, ?max_term_bytes: Integer?) -> Index
+      def self.open: (Database db, String name) -> Index
+      def self.open_reader: (Reader reader, String name) -> ReadIndex
+      def put: (String id, String text) -> nil
+      def put_in: (Transaction txn, String id, String text) -> nil
+      def delete: (String id) -> bool
+      def delete_in: (Transaction txn, String id) -> bool
+      def rebuild: () -> RebuildStats
+      def repair: () -> RebuildStats
+    end
+
+    # A full-text index in a reader process.
+    class ReadIndex
+      include Searches
+    end
+  end
+
+  # The vector index (D306, ICR 0100; #697 PR 3b).
+  module Vector
+    # A search hit.
+    class Hit < Data
+      attr_reader id: String
+      attr_reader distance: Float
+
+      def self.new: (String id, Float distance) -> instance
+                  | (id: String, distance: Float) -> instance
+      def self.[]: (String id, Float distance) -> instance
+                 | (id: String, distance: Float) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: String, distance: Float) -> void
+    end
+
+    # What a search read.
+    class SearchStats < Data
+      attr_reader lists_probed: Integer
+      attr_reader lists: Integer
+
+      def self.new: (Integer lists_probed, Integer lists) -> instance
+                  | (lists_probed: Integer, lists: Integer) -> instance
+      def self.[]: (Integer lists_probed, Integer lists) -> instance
+                 | (lists_probed: Integer, lists: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (lists_probed: Integer, lists: Integer) -> void
+    end
+
+    # `verify`'s counts.
+    class IndexStats < Data
+      attr_reader vectors: Integer
+      attr_reader list_lens: Array[Integer]
+
+      def self.new: (Integer vectors, Array[Integer] list_lens) -> instance
+                  | (vectors: Integer, list_lens: Array[Integer]) -> instance
+      def self.[]: (Integer vectors, Array[Integer] list_lens) -> instance
+                 | (vectors: Integer, list_lens: Array[Integer]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (vectors: Integer, list_lens: Array[Integer]) -> void
+    end
+
+    # What a bulk load did.
+    class BulkStats < Data
+      attr_reader vectors: Integer
+      attr_reader lists: Integer
+
+      def self.new: (Integer vectors, Integer lists) -> instance
+                  | (vectors: Integer, lists: Integer) -> instance
+      def self.[]: (Integer vectors, Integer lists) -> instance
+                 | (vectors: Integer, lists: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (vectors: Integer, lists: Integer) -> void
+    end
+
+    # The search methods Index and ReadIndex share.
+    module Searches
+      def search: (vector_in query, Integer k, ?nprobe: Integer?, ?parallel: Integer?, ?snapshot: Snapshot?,
+                   ?id_prefix: String?, ?max_probe: Integer?) -> Array[Hit]
+      def search_with_stats: (vector_in query, Integer k, ?nprobe: Integer?, ?parallel: Integer?,
+                              ?snapshot: Snapshot?, ?id_prefix: String?, ?max_probe: Integer?) -> [Array[Hit], SearchStats]
+    end
+
+    # A vector index in the writer process.
+    class Index
+      include Searches
+
+      def self.create: (Database db, String name, VectorSpec spec, ?nprobe: Integer?, ?target_list_len: Integer?,
+                        ?reassign_neighbours: Integer?, ?rebalance: name?, ?rebalancer: bool) -> (Index | [Index, Rebalancer])
+      def self.open: (Database db, String name, ?rebalancer: bool) -> (Index | [Index, Rebalancer])
+      def self.open_reader: (Reader reader, String name) -> ReadIndex
+      def spec: () -> VectorSpec
+      def rebalance: () -> Symbol
+      def max_list_len: () -> Integer
+      def min_list_len: () -> Integer
+      def insert: (String id, vector_in vector) -> nil
+      def delete: (String id) -> bool
+      def insert_in: (Transaction txn, Placed placed, String id, vector_in vector) -> nil
+      def delete_in: (Transaction txn, Placed placed, String id) -> bool
+      def after_commit: (Placed placed) -> nil
+      def verify: () -> IndexStats
+      def bulk_load: (Enumerable[[String, vector_in]] pairs, expected: Integer, ?batch: Integer) -> BulkStats
+    end
+
+    # A vector index in a reader process.
+    class ReadIndex
+      include Searches
+
+      def spec: () -> VectorSpec
+    end
+
+    # One transaction's writes to one index.
+    class Placed
+      def self.new: () -> Placed
+    end
+
+    # A background-mode index's rebalancing, driven by a Ruby thread.
+    class Rebalancer
+      def run_once: (Numeric budget) -> bool
+      def wait: (Numeric timeout) -> nil
+      def closed?: () -> bool
+    end
+
+    # A bulk load in progress (Index#bulk_load's).
+    class BulkLoad
+      def push: (Array[[String, vector_in]] pairs) -> nil
     end
   end
 end
