@@ -336,6 +336,41 @@ class TestMemory < Minitest::Test
     end
   end
 
+  # The pass's threads alive now, by name; nil where the platform doesn't show them (only
+  # Linux's /proc does, which CI runs).
+  def consolidation_threads
+    return nil unless File.directory?("/proc/self/task")
+
+    Dir["/proc/self/task/*/comm"].count { |f| File.read(f).start_with?("pigeonhole-cons") }
+  rescue SystemCallError
+    nil
+  end
+
+  # ai1249's B1 and perf2's S1 on #1425: an interrupt arriving at any point (inside the
+  # block, between waits, at the final join) never returns while the pass's thread still
+  # runs. Many passes under tiny random timeouts land interrupts all over the pass.
+  def test_an_interrupt_anywhere_leaves_no_thread_behind
+    rng = Random.new(1425)
+    store do |s|
+      60.times { |i| s.remember("n", "note #{i}", session: "s#{i % 20}") }
+      200.times do
+        begin
+          Timeout.timeout(rng.rand * 0.004) do
+            s.consolidate("n", policy: min_age0) do |g|
+              sleep(rng.rand * 0.002)
+              [M::Memory.new("summary #{g[0].session}")]
+            end
+          end
+        rescue Timeout::Error
+          nil
+        end
+        left = consolidation_threads
+        assert_equal 0, left, "a consolidation thread outlived its call" if left
+      end
+      assert_predicate s.verify, :consistent?
+    end
+  end
+
   # Python's KeyboardInterrupt case, in Ruby's terms: a StandardError from the block becomes
   # ConsolidateError with the pass so far; Interrupt (not a StandardError) stops the pass and
   # propagates as itself. The groups before either stay committed.

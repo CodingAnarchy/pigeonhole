@@ -1456,7 +1456,17 @@ impl Store {
         let mut early: Option<Early> = None;
         let done = loop {
             let rx = Arc::clone(&from_worker);
-            let msg = without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE))?;
+            // `without_gvl` raises an interrupt already pending instead of waiting. That
+            // must not end the loop: the worker would be left running, detached and holding
+            // the store (ai1249's B1 and perf2's S1 on #1425). It's recorded, and the loop
+            // keeps draining until the worker says it's done.
+            let msg = match without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE)) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    early.get_or_insert(Early::Jump(e));
+                    continue;
+                }
+            };
             match msg {
                 Ok(ToRuby::Group(group)) => {
                     let reply = if early.is_some() {
@@ -1486,8 +1496,19 @@ impl Store {
                 Err(RecvTimeoutError::Disconnected) => break None,
             }
         };
-        // `Done` was the worker's last act, so this join doesn't wait on the engine.
-        let panicked = without_gvl(ruby, move || worker.join().is_err())?;
+        // `Done` was the worker's last act, so this join doesn't wait on the engine. If an
+        // interrupt is pending, `without_gvl` raises it without running the join; the join
+        // then runs with the GVL held (it's at most the worker's exit), and the interrupt is
+        // what the call raises.
+        let worker = Mutex::new(Some(worker));
+        let joined = without_gvl(ruby, || lock(&worker).take().map(|w| w.join().is_err()));
+        let panicked = match joined {
+            Ok(p) => p.unwrap_or(false),
+            Err(e) => {
+                early.get_or_insert(Early::Jump(e));
+                lock(&worker).take().is_some_and(|w| w.join().is_err())
+            }
+        };
         match early {
             Some(Early::Jump(e)) => Err(e),
             Some(Early::Raised(e)) => {
@@ -1566,9 +1587,11 @@ fn normalization_arg(ruby: &Ruby, v: Value) -> Result<mem::Normalization, Error>
 
 fn normalization_name(n: mem::Normalization) -> &'static str {
     match n {
+        mem::Normalization::Nfc => "nfc",
         mem::Normalization::Nfkc => "nfkc",
         mem::Normalization::None => "none",
-        _ => "nfc",
+        // A setting a later engine adds (ai1249's N2 on #1425).
+        _ => "unknown",
     }
 }
 
