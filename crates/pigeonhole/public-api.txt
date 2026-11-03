@@ -9,6 +9,14 @@ pub struct pigeonhole::nonblocking::CommitFuture
 impl core::future::future::Future for pigeonhole::nonblocking::CommitFuture
 pub type pigeonhole::nonblocking::CommitFuture::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
 pub fn pigeonhole::nonblocking::CommitFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::FeedStream
+impl pigeonhole::nonblocking::FeedStream
+pub fn pigeonhole::nonblocking::FeedStream::into_inner(self) -> pigeonhole::Feed
+pub fn pigeonhole::nonblocking::FeedStream::new(pigeonhole::Feed) -> Self
+pub fn pigeonhole::nonblocking::FeedStream::token(&self) -> pigeonhole::FeedToken
+impl futures_core::stream::Stream for pigeonhole::nonblocking::FeedStream
+pub type pigeonhole::nonblocking::FeedStream::Item = core::result::Result<pigeonhole::Commit, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::FeedStream::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
 pub struct pigeonhole::nonblocking::GetFuture
 impl core::future::future::Future for pigeonhole::nonblocking::GetFuture
 pub type pigeonhole::nonblocking::GetFuture::Output = core::result::Result<core::option::Option<pigeonhole::Cell>, pigeonhole::Error>
@@ -409,6 +417,7 @@ pub struct pigeonhole::Feed
 impl pigeonhole::Feed
 pub fn pigeonhole::Feed::next(&mut self, core::time::Duration) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
 pub fn pigeonhole::Feed::oldest_retained(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Feed::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<&pigeonhole::Commit>>
 pub fn pigeonhole::Feed::token(&self) -> pigeonhole::FeedToken
 pub fn pigeonhole::Feed::try_next(&mut self) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
 pub struct pigeonhole::FeedBuilder
