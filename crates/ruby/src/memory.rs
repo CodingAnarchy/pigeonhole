@@ -2070,12 +2070,21 @@ impl ConsolidateLoop {
             }
         };
         let (lp, step) = d.out;
-        {
+        let state = Box::new(LoopState { lp, slot });
+        let closed = {
             let mut g = lock(m);
-            // A `close` while the step ran leaves the loop closed.
             if matches!(*g, LoopSlot::Running) {
-                *g = LoopSlot::Idle(Box::new(LoopState { lp, slot }));
+                *g = LoopSlot::Idle(state);
+                None
+            } else {
+                // A `close` while the step ran leaves the loop closed. The loop (its watch
+                // and store handle) is dropped with the GVL released, as `close` drops it
+                // (perf2's nit on #1441).
+                Some(state)
             }
+        };
+        if closed.is_some() {
+            without_gvl(ruby, move || drop(closed))?;
         }
         if let Some(e) = d.jump {
             return Err(e);
