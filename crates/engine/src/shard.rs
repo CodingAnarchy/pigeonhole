@@ -189,6 +189,9 @@ pub(crate) struct ShardMetrics {
     pub checkpoints_dropped: AtomicU64,
     /// The change feed's background syncs submitted (D310, *T_sync*).
     pub feed_syncs: AtomicU64,
+    /// Group syncs completed (D310 PR 5b): what the feed's background syncs are measured
+    /// against.
+    pub group_syncs: AtomicU64,
     /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
     pub pacing_stalls: AtomicU64,
     pub pacing_stall_nanos: AtomicU64,
@@ -244,6 +247,7 @@ impl Default for ShardMetrics {
             checkpoints: AtomicU64::new(0),
             checkpoints_dropped: AtomicU64::new(0),
             feed_syncs: AtomicU64::new(0),
+            group_syncs: AtomicU64::new(0),
             pacing_stalls: AtomicU64::new(0),
             pacing_stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
@@ -11012,6 +11016,9 @@ impl ShardState {
                 if group_sync {
                     self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight = self.group_syncs_in_flight.saturating_sub(1);
+                    self.shared.metrics[usize::from(self.id.0)]
+                        .group_syncs
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 self.resolve_through(group, result, ctx);
                 if group_sync && self.sync_wanted {
