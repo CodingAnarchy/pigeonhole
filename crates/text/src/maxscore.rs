@@ -148,7 +148,9 @@ impl<'t> Walk<'t> {
 
     /// Steps to the first posting after the current one whose document `skip` doesn't
     /// accept, and stands there. A skipped posting costs a key compare: only the posting
-    /// stood on is copied and decoded (#1378).
+    /// stood on is copied and decoded (#1378). So a corrupt value in a skipped posting
+    /// doesn't fail the search, as with the postings a point lookup never reads.
+    /// [`Index::verify`](crate::Index::verify) decodes every posting (perf287 on #1398).
     fn skip_while(&mut self, bm: &Bm25, skip: impl Fn(&[u8]) -> bool) -> Result<()> {
         loop {
             self.stepped += 1;
