@@ -80,6 +80,9 @@ Several agents often build and test on one machine, so local runs stay small:
   - engine `feed_model` plain;
   - engine `feed_model` with `PIGEONHOLE_DEFERRED_IO=1`. It's the only sweep where syncs, rollovers and power losses land between a feed's polls, and it found a resumed token past recovery's cut that failed as corruption instead of expiring (#1248).
 
+  **Returning-counter PRs** (#1440's, and any PR touching counter writes on the apply path, the returning fold, or the D291/D314 checkpoints) add one more, six in all:
+  - engine `returning` plain. Its runs set deferred I/O themselves. It's the only sweep with returning commits (D314): returning increments beside blind cross-shard writers, each value checked against the model's fold at its seqno. It is the only one that fails with either half of D314's ordering rule removed.
+
   The `tablets` sweep is the only standard sweep that crashes around tablet changes and new streams with the device's completion order shuffled. It found #520 (D211), which the others missed. The `counters` sweep is the only one with counter-kind families, the only families D186/D287 combining and D291 checkpoints touch. Nobody ran it until perf287's long sweeps of 2026-10-28 found a live-read failure there.
 - **Long sweeps for proptests with a small per-PR case count.** CI runs each property at its own case count (`ProptestConfig::with_cases`, or 256 by default). A few costly ones ask for fewer, and get more cases here, with fresh random inputs in each chunk (6 chunks of 2,000 cases each; these targets don't read `PIGEONHOLE_SEED`):
   ```sh
@@ -100,7 +103,7 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, `feed_model`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
+| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, `feed_model`, `returning`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
 | `PIGEONHOLE_SEED` alone | shm `protocol` and `multiprocess`, memtable and pager `tests/common` | The one seed to run. |
 | `PIGEONHOLE_TABLET_CHANGES` | engine harness (`tests/common`), pigeonhole `model` | Engine: `1` adds the fast balancer so tablets change during a run, `0` turns tablet changes off. Pigeonhole: `0` turns them off. |
 | `PIGEONHOLE_DEFERRED_IO` | engine harness, engine `feed_model`, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |

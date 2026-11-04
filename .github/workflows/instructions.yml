@@ -60,7 +60,7 @@ env:
   # checked for regressions on every PR.
   SHAPES: >-
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
-    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
+    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,flush,compact
     ycsb:ycsb-c,ycsb-a
     scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
   # The largest increase (percent of the base) a state or shape may show before the job fails,
@@ -126,8 +126,20 @@ jobs:
           cp "${srcs[@]}" /tmp/base/crates/bench/examples/
           # Shared example modules (the `Measured` guard), also at the head's version.
           cp -R crates/bench/examples/support /tmp/base/crates/bench/examples/
-          (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
-            --target-dir "$GITHUB_WORKSPACE/target")
+          # A PR whose new shapes use an API it adds (D314's commit_returning) can't build the
+          # head's examples against base: base then builds its own, and runs only the shapes it
+          # has a ceiling for. The new shapes show as new, with no base count.
+          if ! (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
+            --target-dir "$GITHUB_WORKSPACE/target"); then
+            # Shapes whose example code differs from base's are then compared across different
+            # code: name the files, and the count step marks their shapes not comparable.
+            git diff --name-only "$base" HEAD -- crates/bench/examples > /tmp/examples-differ
+            echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples; files that differ: $(tr '\n' ' ' < /tmp/examples-differ)"
+            git -C /tmp/base checkout -q -- crates/bench/examples
+            (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
+              --target-dir "$GITHUB_WORKSPACE/target")
+            touch /tmp/base-own-examples
+          fi
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
       - name: count
         shell: bash
@@ -135,9 +147,52 @@ jobs:
           set -euo pipefail
           for side in base head; do
             groups=()
-            for g in $SHAPES; do groups+=("/tmp/bin-$side/$g"); done
+            for g in $SHAPES; do
+              # Base on its own examples: only the shapes base has a ceiling for.
+              if [ "$side" = base ] && [ -e /tmp/base-own-examples ]; then
+                keep=()
+                IFS=, read -ra list <<< "${g#*:}"
+                for s in "${list[@]}"; do
+                  if awk -v s="$s" '$1 == s { f = 1 } END { exit !f }' \
+                    /tmp/base/crates/bench/baselines/instruction-ceilings.txt; then
+                    keep+=("$s")
+                  fi
+                done
+                [ "${#keep[@]}" -gt 0 ] || continue
+                g="${g%%:*}:$(IFS=,; echo "${keep[*]}")"
+              fi
+              groups+=("/tmp/bin-$side/$g")
+            done
             scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
           done
+          if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
+            echo "a side counted nothing: base $(wc -l < /tmp/base.txt) lines, head $(wc -l < /tmp/head.txt)"
+            exit 1
+          fi
+          # With base on its own examples: the binaries whose example files differ (every
+          # binary if a shared module under support/ does). Their shapes, and hotrow's states
+          # for hotrow, are compared across different code, so they are marked, not checked.
+          : > /tmp/differ-bins
+          if [ -e /tmp/base-own-examples ]; then
+            if grep -q '^crates/bench/examples/support/' /tmp/examples-differ; then
+              echo ALL > /tmp/differ-bins
+            else
+              sed -n 's|^crates/bench/examples/\([^/]*\)\.rs$|\1|p' /tmp/examples-differ > /tmp/differ-bins
+            fi
+          fi
+          : > /tmp/shape-bins
+          for g in $SHAPES; do
+            IFS=, read -ra list <<< "${g#*:}"
+            for s in "${list[@]}"; do echo "$s ${g%%:*}" >> /tmp/shape-bins; done
+          done
+          # Base and head by name: `name base head flag`, base `-` for a shape new in the head,
+          # flag `x` for one whose example code differs from base's.
+          awk 'FILENAME == ARGV[1] { d[$1] = 1; next }
+               FILENAME == ARGV[2] { bin[$1] = $2; next }
+               FILENAME == ARGV[3] { b[$1] = $2; next }
+               { e = ($1 in bin) ? bin[$1] : "hotrow"
+                 print $1, (($1 in b) ? b[$1] : "-"), $2, (("ALL" in d) || (e in d)) ? "x" : "-" }' \
+            /tmp/differ-bins /tmp/shape-bins /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
           {
             echo "### Instructions per unit (callgrind)"
             echo
@@ -145,9 +200,19 @@ jobs:
             echo
             echo "| State or shape | base | head | change |"
             echo "|---|--:|--:|--:|"
-            paste -d' ' /tmp/base.txt /tmp/head.txt | awk '{ print $1, $2, $4 }' | while read -r state b h; do
-              echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
-            done
+            if [ -s /tmp/differ-bins ]; then
+              echo "Base ran its own examples (the head's use an API this PR adds). Example files that differ from base: $(tr '\n' ' ' < /tmp/examples-differ). Their existing shapes are compared across different example code: marked, not checked."
+              echo
+            fi
+            while read -r state b h flag; do
+              if [ "$b" = - ]; then
+                echo "| $state | (new) | $h | new |"
+              elif [ "$flag" = x ]; then
+                echo "| $state | $b | $h | not comparable (example changed) |"
+              else
+                echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
+              fi
+            done < /tmp/pairs.txt
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # The head must also stay at or below every shape's absolute ceiling (D193): the
           # Phase 2 floors may not regress, not even in steps below the per-PR thresholds.
@@ -158,19 +223,22 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           ceilings=0
           python3 scripts/instruction-ceilings.py check /tmp/head.txt | tee -a "$GITHUB_STEP_SUMMARY" || ceilings=1
-          paste -d' ' /tmp/base.txt /tmp/head.txt | awk -v thresholds="$THRESHOLDS" '
+          awk -v thresholds="$THRESHOLDS" '
             BEGIN {
               n = split(thresholds, kv, " ")
               for (i = 1; i <= n; i++) { split(kv[i], p, "="); limit[p[1]] = p[2] }
             }
+            # A shape new in the head has no base to compare, and one whose example code
+            # differs from base's isn't like for like; their absolute ceilings still hold.
+            $2 == "-" || $4 == "x" { next }
             {
               t = ($1 in limit) ? limit[$1] : limit["default"]
-              if ($4 > $2 * (1 + t / 100)) {
-                printf "regression: %s %s -> %s (%+.2f%%, threshold %s%%)\n", $1, $2, $4, 100 * ($4 - $2) / $2, t
+              if ($3 > $2 * (1 + t / 100)) {
+                printf "regression: %s %s -> %s (%+.2f%%, threshold %s%%)\n", $1, $2, $3, 100 * ($3 - $2) / $2, t
                 bad = 1
               }
             }
-            END { exit bad }'
+            END { exit bad }' /tmp/pairs.txt
           if [ "$ceilings" != 0 ]; then
             echo "a shape is above its absolute ceiling, or has none (D193)"
             exit 1

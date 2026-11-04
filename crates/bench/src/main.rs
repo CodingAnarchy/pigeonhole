@@ -40,7 +40,9 @@ USAGE:
 WORKLOADS:
     ycsb-a ycsb-b ycsb-c ycsb-d ycsb-e ycsb-f sparse-wide time-series-ttl
     adjacency skewed-multi-shard group-commit cross-shard-contention
-    counters  (not in all: 16 clients incrementing Zipfian counters, D247)
+    counters  (not in all: 16 clients incrementing Zipfian counters, D247;
+              PHDB_RETURNING_SHARE=P sends that share of the increments through
+              commit_returning on Pigeonhole, D314, reported as 'incr returning')
     transfer  (not in all: 16 clients moving units between Zipfian accounts in
               transactions, D247)
     sparse-wide-deletes  (not in all: sparse-wide with 5% column and row deletes, D247)

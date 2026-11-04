@@ -482,7 +482,7 @@ impl Handle {
                     "{op:?} runs on RocksDB's transactions (D274, RocksDbTxnRunner)"
                 ));
             }
-            BenchOp::Incr { row, delta } => {
+            BenchOp::Incr { row, delta, .. } => {
                 let cf = self.counter_cf()?;
                 self.db
                     .merge_cf_opt(cf, row, delta.to_le_bytes(), &self.write)

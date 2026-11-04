@@ -1705,16 +1705,30 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 Ok(())
             })?;
         }
-        BenchOp::Incr { row, delta } => {
+        BenchOp::Incr {
+            row,
+            delta,
+            returning,
+        } => {
             let table = target
                 .counters
                 .as_ref()
                 .ok_or("no counters table: the load creates it")?;
-            retry_busy(busy, || {
-                level(buffered, table.mutate(row))
-                    .incr(COUNTER_FAMILY, COUNTER, *delta)
-                    .commit()
-            })?;
+            if *returning {
+                let r = retry_busy(busy, || {
+                    level(buffered, table.mutate(row))
+                        .incr(COUNTER_FAMILY, COUNTER, *delta)
+                        .commit_returning()
+                })?;
+                let n = r.value(COUNTER_FAMILY, COUNTER).map_err(err)?;
+                t.cell(&n.unwrap_or(0).to_le_bytes());
+            } else {
+                retry_busy(busy, || {
+                    level(buffered, table.mutate(row))
+                        .incr(COUNTER_FAMILY, COUNTER, *delta)
+                        .commit()
+                })?;
+            }
         }
         BenchOp::ReadCounter { row } => {
             let table = target

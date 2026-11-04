@@ -609,6 +609,12 @@ impl ShardState {
         if let Some((table, row, _)) = m.predicate.as_deref() {
             rows.push(hash_row(*table, row));
         }
+        // D314: a returning member reads its row at apply (simp724's Q2 on #1440).
+        if let Reply::Returning(_) = &m.reply
+            && let Ok(batch) = m.bytes.batch()
+        {
+            rows.extend(batch.iter().flatten().map(|mu| hash_row(mu.table, mu.row)));
+        }
         rows.sort_unstable();
         rows.dedup();
         rows

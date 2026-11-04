@@ -148,6 +148,16 @@ pub fn families() -> Vec<ModelFamily> {
             f("sum", 2, 0, false),
             f("sum_ttl", 0, 40, false),
         ]
+    } else if env!("CARGO_CRATE_NAME") == "returning" {
+        // D314's returning commits (tests/returning.rs): a plain `sum`, whose folds can take
+        // the fast path, one keeping 2 versions (a hidden version returns `None`), one with
+        // a TTL (buckets), and `f`.
+        vec![
+            f("f", 0, 0, false),
+            f("sum", 0, 0, false),
+            f("sum_v2", 2, 0, false),
+            f("sum_ttl", 0, 40, false),
+        ]
     } else if env!("CARGO_CRATE_NAME") == "counters" {
         // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
         // nineteen families, 76 slots on a shard with tablet changes off. The tables are
@@ -375,6 +385,10 @@ pub struct Config {
     /// How often (ppm) a commit runs as a `check_and_mutate` / a transaction.
     pub cas_ppm: u32,
     pub txn_ppm: u32,
+    /// How often (ppm) a commit that increments a sum counter runs as a returning commit
+    /// (D314), its values checked against the model. 0 draws nothing, so other suites'
+    /// seeds replay unchanged; the `returning` target turns it on.
+    pub returning_ppm: u32,
     /// `final_dump` only: a process crash and reopen every this many ops.
     pub crash_every: Option<usize>,
     /// `final_dump` only: a flush and full compaction every this many ops (with background
@@ -456,6 +470,11 @@ impl Config {
             tasks: 4,
             cas_ppm: 80_000,
             txn_ppm: 80_000,
+            returning_ppm: if env!("CARGO_CRATE_NAME") == "returning" {
+                150_000
+            } else {
+                0
+            },
             crash_every: None,
             compact_every: None,
             memtable_freeze_bytes: 16 << 10,
@@ -487,6 +506,11 @@ impl Config {
 pub struct Stats {
     pub ops: usize,
     pub submitted: usize,
+    /// Returning commits submitted (D314), and their cells the last engine folded from the
+    /// active memtable and by the full read (`Engine::returning_folds`; a crash resets them).
+    pub returning: usize,
+    pub returning_fast: u64,
+    pub returning_full: u64,
     pub commits: usize,
     pub cross_shard: usize,
     pub batched: usize,
@@ -1420,7 +1444,20 @@ enum Kind {
         snapshot: Seqno,
         reads: Vec<TxnRead>,
     },
+    /// A returning commit (D314) of `(table, row)`: the sum cells its ops increment, as
+    /// `(family, qualifier, ts)`, and what the engine returned, by family id (errors as
+    /// text).
+    Returning {
+        table: String,
+        row: Vec<u8>,
+        cells: Vec<(String, Vec<u8>, Timestamp)>,
+        values: Option<Vec<ReturnedCell>>,
+    },
 }
+
+/// One cell a returning commit returned (D314): family, qualifier, timestamp, value (an
+/// error as text).
+type ReturnedCell = (FamilyId, Vec<u8>, Timestamp, Result<Option<i64>, String>);
 
 /// A transaction's read, as [`Kind::Txn`] records it.
 type TxnRead = (String, Vec<u8>, String, Option<Vec<u8>>);
@@ -1595,6 +1632,8 @@ enum Resolved {
 /// replays exactly (#590).
 enum Pending {
     Poll(PendingCommit),
+    /// A returning commit (D314): resolves as a plain commit, its values kept on the kind.
+    Returning(pigeonhole_engine::PendingReturning),
     Check(pigeonhole_engine::PendingCheck),
     /// Refused at submission: the outcome is known.
     Ready(Option<Outcome>),
@@ -3921,6 +3960,7 @@ impl World {
                 );
             }
             self.engine_seqnos.push(seqno);
+            self.check_returned(&c, m, ts)?;
             c.seqno = Some(seqno);
             c.commit_ts = Some(ts);
             c.acked = true;
@@ -4414,11 +4454,34 @@ impl World {
         let mut resolved: Vec<(InFlight, Outcome)> = Vec::new();
         let mut still = Vec::new();
         for mut inf in self.in_flight.drain(..) {
+            let mut returned = None;
             let outcome = match &mut inf.pending {
                 Pending::Poll(pc) => match poll_commit(pc) {
                     Poll::Ready(r) => Some(Outcome::Commit(r)),
                     Poll::Pending => None,
                 },
+                Pending::Returning(pr) => {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    match Pin::new(pr).poll(&mut cx) {
+                        Poll::Ready(r) => Some(Outcome::Commit(r.map(|(info, cells)| {
+                            returned = Some(
+                                cells
+                                    .into_iter()
+                                    .map(|c| {
+                                        (
+                                            c.family,
+                                            c.qualifier,
+                                            c.ts,
+                                            c.value.map_err(|e| e.to_string()),
+                                        )
+                                    })
+                                    .collect(),
+                            );
+                            info
+                        }))),
+                        Poll::Pending => None,
+                    }
+                }
                 Pending::Check(pc) => {
                     let mut cx = Context::from_waker(Waker::noop());
                     match Pin::new(pc).poll(&mut cx) {
@@ -4428,6 +4491,9 @@ impl World {
                 }
                 Pending::Ready(o) => o.take(),
             };
+            if let (Some(v), Kind::Returning { values, .. }) = (returned, &mut inf.commit.kind) {
+                *values = Some(v);
+            }
             match outcome {
                 Some(o) => resolved.push((inf, o)),
                 None => still.push(inf),
@@ -4623,6 +4689,175 @@ impl World {
     }
 
     /// Submits a `check_and_mutate` (alone) without waiting (`submit_check_and_mutate`).
+    /// Submits the first row's part of `ops` as a returning commit (D314): the values it
+    /// returns are checked against the model's fold at its seqno once it is applied
+    /// (`check_returned`).
+    fn submit_returning(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        alone: bool,
+        rng: &mut Rng,
+    ) -> Result<(), Fail> {
+        let now = self.now();
+        let (table, row) = (op_table(&ops[0]).to_owned(), op_row(&ops[0]).to_vec());
+        let ops: Vec<ModelOp> = ops
+            .into_iter()
+            .filter(|o| op_table(o) == table && op_row(o) == row)
+            .collect();
+        let cells = returning_cells(&ops).unwrap_or_default();
+        let armed = self.arm(rng);
+        let shards = self.shards_of(&ops);
+        self.stats.submitted += 1;
+        self.stats.returning += 1;
+        self.trace.push(format!(
+            "returning {durability:?} ts={now} {}{} [{}]{}",
+            text(&row),
+            if alone { "" } else { " (batched)" },
+            ops.iter().map(show).collect::<Vec<_>>().join("; "),
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let batch = match self.store().batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        let engine = Arc::clone(&self.store().engine);
+        let pending = match engine.submit_returning(batch, Some(durability)) {
+            Ok(p) => Pending::Returning(p),
+            Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
+        };
+        self.in_flight.push(InFlight {
+            pending,
+            commit: Committed {
+                seqno: None,
+                ops,
+                commit_ts: alone.then_some(now),
+                durability,
+                streams: streams_of(&shards, &[]),
+                shards,
+                acked: false,
+                observed: false,
+                kind: Kind::Returning {
+                    table,
+                    row,
+                    cells,
+                    values: None,
+                },
+            },
+            armed,
+            alone,
+        });
+        if alone {
+            self.pending_advance = 2;
+        }
+        Ok(())
+    }
+
+    /// D314: a returning commit's values, against the model's read of each cell at the
+    /// commit's model seqno `m`, with the TTL judged at its timestamp `ts`; and every cell its
+    /// ops increment is among them, unless the commit's last write of it was a `delete_cell`.
+    fn check_returned(&self, c: &Committed, m: Seqno, ts: Timestamp) -> Result<(), Fail> {
+        let Kind::Returning {
+            table,
+            row,
+            cells,
+            values: Some(values),
+        } = &c.kind
+        else {
+            return Ok(());
+        };
+        let name_of = |id: FamilyId| {
+            self.store()
+                .family_ids
+                .iter()
+                .find(|((t, _), f)| t == table && **f == id)
+                .map(|((_, n), _)| n.clone())
+        };
+        let mut got: Vec<(String, &ReturnedCell)> = Vec::new();
+        for cell in values {
+            let Some(family) = name_of(cell.0) else {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("returned family {:?} unknown", cell.0),
+                );
+            };
+            got.push((family, cell));
+        }
+        for (family, (_, qualifier, cts, v)) in &got {
+            let want = match self
+                .model
+                .try_read_row(table, row, &[family.as_str()], 0, m, ts)
+            {
+                Ok(cs) => cs
+                    .into_iter()
+                    .find(|x| &x.qualifier == qualifier && x.ts == *cts)
+                    .map(|x| model_i64(&x.value)),
+                Err(e) => return fail(FailureClass::Protocol, format!("model: {e:?}")),
+            };
+            let ok = match (v, &want) {
+                (Ok(g), None) => g.is_none(),
+                (Ok(g), Some(w)) => g.is_some() && *g == *w,
+                // An injected read failure after the apply is reported, not hidden.
+                (Err(_), _) => self.cfg.faults.io_error_ppm > 0,
+            };
+            if !ok {
+                return fail(
+                    FailureClass::LiveReadMismatch,
+                    format!(
+                        "returning commit at model seqno {m}: {}/{family}:{}@{cts} returned \
+                         {v:?}, the model's fold is {want:?}",
+                        text(row),
+                        text(qualifier)
+                    ),
+                );
+            }
+        }
+        // The cell's writes as the store logs them (D186's combining, then D34's last write
+        // of a cell): a cell the commit still writes, by a put, an increment or a cell
+        // delete, must be returned (simp724 on #1440).
+        let combined =
+            pigeonhole_sim::combine_counter_writes(&c.ops, |_, f| aggregation_of_name(f));
+        for (family, qualifier, cts) in cells {
+            let written = combined.iter().any(|o| match o {
+                ModelOp::DeleteCell {
+                    family: f,
+                    qualifier: q,
+                    ts: t,
+                    ..
+                } => f == family && q == qualifier && t == cts,
+                ModelOp::Incr {
+                    family: f,
+                    qualifier: q,
+                    ts: t,
+                    ..
+                }
+                | ModelOp::Put {
+                    family: f,
+                    qualifier: q,
+                    ts: t,
+                    ..
+                } => f == family && q == qualifier && t.unwrap_or(0) == *cts,
+                _ => false,
+            });
+            let deleted_last = !written;
+            let found = got
+                .iter()
+                .any(|(f, (_, q, t, _))| f == family && q == qualifier && t == cts);
+            if !found && !deleted_last {
+                return fail(
+                    FailureClass::LiveReadMismatch,
+                    format!(
+                        "returning commit at model seqno {m}: {}/{family}:{}@{cts} was \
+                         incremented but not returned",
+                        text(row),
+                        text(qualifier)
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn submit_cas(
         &mut self,
         ops: Vec<ModelOp>,
@@ -5153,6 +5388,12 @@ impl World {
                 if rng.chance(self.cfg.txn_ppm) {
                     return self.submit_txn(ops, durability, rng);
                 }
+                if self.cfg.returning_ppm > 0
+                    && returning_cells(&ops).is_some()
+                    && rng.chance(self.cfg.returning_ppm)
+                {
+                    return self.submit_returning(ops, durability, true, rng);
+                }
                 // A batch of concurrent commits: this one plus following logged commits of
                 // the workload (a `None` commit leaves no record to read its timestamp from).
                 let want = if durability != Durability::None {
@@ -5185,6 +5426,16 @@ impl World {
                     let n = batch.len();
                     self.stats.batched += n;
                     for (ops, d) in batch {
+                        // D314: a batch member may be a returning commit, so one can wait
+                        // beside an undecided share on its row (only batched commits are in
+                        // flight together).
+                        if self.cfg.returning_ppm > 0
+                            && returning_cells(&ops).is_some()
+                            && rng.chance(self.cfg.returning_ppm)
+                        {
+                            self.submit_returning(ops, d, false, rng)?;
+                            continue;
+                        }
                         if !self.submit_plain(ops, d, false, rng)? {
                             break;
                         }
@@ -5591,9 +5842,11 @@ fn run_with(
                             Kind::Plain => "commit",
                             Kind::Cas { .. } => "cas",
                             Kind::Txn { .. } => "txn",
+                            Kind::Returning { .. } => "returning",
                         };
                         let pending = match &i.pending {
                             Pending::Poll(_) => "pending",
+                            Pending::Returning(_) => "pending returning",
                             Pending::Check(_) => "pending check",
                             Pending::Ready(_) => "ready",
                         };
@@ -5613,6 +5866,9 @@ fn run_with(
         });
     }
     w.stats.mutating_ops = vfs.mutating_ops();
+    if let Some(store) = w.store.as_ref() {
+        (w.stats.returning_fast, w.stats.returning_full) = store.engine.returning_folds();
+    }
     if w.failure.is_none() {
         // Finish with one more crash so the tail of every run is checked.
         let mut rng = sim.rng().fork();
@@ -6232,4 +6488,37 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
     }
     drop(sim);
     dump
+}
+
+/// The sum-counter cells `ops` increment on the first op's row, each once in first-increment
+/// order (what `Engine::submit_returning` returns), or `None` if there are none (D314).
+fn returning_cells(ops: &[ModelOp]) -> Option<Vec<(String, Vec<u8>, Timestamp)>> {
+    let first = ops.first()?;
+    let (table, row) = (op_table(first), op_row(first));
+    let mut cells: Vec<(String, Vec<u8>, Timestamp)> = Vec::new();
+    for o in ops {
+        if let ModelOp::Incr {
+            table: t,
+            row: r,
+            family,
+            qualifier,
+            ts,
+            ..
+        } = o
+            && t == table
+            && r == row
+            && pigeonhole_sim::aggregation_of_name(family) == Some(ModelAggregation::Sum)
+        {
+            let cell = (family.clone(), qualifier.clone(), ts.unwrap_or(0));
+            if !cells.contains(&cell) {
+                cells.push(cell);
+            }
+        }
+    }
+    (!cells.is_empty()).then_some(cells)
+}
+
+/// A model sum cell's `i64` (the model keeps it as 8 little-endian bytes).
+fn model_i64(v: &[u8]) -> Option<i64> {
+    v.try_into().ok().map(i64::from_le_bytes)
 }

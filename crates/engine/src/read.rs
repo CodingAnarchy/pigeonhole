@@ -1340,7 +1340,7 @@ const SCAN_RESOLVERS_KEPT: usize = 4;
 
 /// A resolver for a scan lane: one of the thread's, or a new one. The pool is sized here,
 /// when a scan starts, so giving a resolver back (at its end) never allocates.
-fn take_scan_resolver() -> Resolver {
+pub(crate) fn take_scan_resolver() -> Resolver {
     SCAN_RESOLVERS
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -1355,7 +1355,7 @@ fn take_scan_resolver() -> Resolver {
 /// Returns a lane's resolver to the thread's pool: its sources (each pins its memtable or
 /// SST) and options (merge operator, blob reader) go now, its allocations stay. Past
 /// [`SCAN_RESOLVERS_KEPT`] it is dropped.
-fn give_back(mut resolver: Resolver) {
+pub(crate) fn give_back(mut resolver: Resolver) {
     let cursor = resolver.cursor_mut();
     cursor.sources_mut().clear();
     cursor.reset();

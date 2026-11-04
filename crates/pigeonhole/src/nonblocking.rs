@@ -153,6 +153,77 @@ impl RowMutation<'_> {
 }
 
 impl RowMutation<'_> {
+    /// [`commit_returning`](RowMutation::commit_returning), as a future (D314): submits when
+    /// its shard has room (D210) and resolves to the incremented cells once the commit is
+    /// durable at its level and visible. **Dropped while it still waits for room, it writes
+    /// nothing**; dropped after it was submitted, the commit lands and its values are lost (a
+    /// gap in a sequence, never a repeat).
+    pub fn commit_returning_async(self) -> ReturningFuture {
+        ReturningFuture {
+            state: match self.submit_returning_async() {
+                Ok((pending, table, largest, max)) => ReturningState::Pending {
+                    pending,
+                    table,
+                    largest,
+                    max,
+                },
+                Err(e) => ReturningState::Ready(Some(Err(e))),
+            },
+        }
+    }
+}
+
+/// [`RowMutation::commit_returning_async`]'s future.
+#[derive(Debug)]
+#[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
+pub struct ReturningFuture {
+    state: ReturningState,
+}
+
+#[derive(Debug)]
+enum ReturningState {
+    Pending {
+        pending: pigeonhole_engine::PendingReturning,
+        table: std::sync::Arc<pigeonhole_engine::TableInfo>,
+        largest: usize,
+        max: usize,
+    },
+    Ready(Option<Result<crate::Incremented>>),
+}
+
+impl Future for ReturningFuture {
+    type Output = Result<crate::Incremented>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            ReturningState::Pending {
+                pending,
+                table,
+                largest,
+                max,
+            } => match Pin::new(pending).poll(cx) {
+                Poll::Ready(r) => {
+                    let out = r
+                        .map(|(info, cells)| {
+                            crate::Incremented::new(CommitInfo::from_engine(info), table, cells)
+                        })
+                        .map_err(|e| crate::write::commit_error(e, *largest, *max));
+                    self.state = ReturningState::Ready(None);
+                    Poll::Ready(out)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            ReturningState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "commit future polled after it resolved",
+                ))
+            })),
+        }
+    }
+}
+
+impl RowMutation<'_> {
     /// [`commit_if`](RowMutation::commit_if), as a future: submits when its shard has room
     /// (D210), resolves to `None` if the condition failed, or to the commit once it is
     /// durable at its level and visible. Dropped once submitted, the future does not roll

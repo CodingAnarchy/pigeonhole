@@ -453,6 +453,9 @@ pub enum BenchOp {
         row: Vec<u8>,
         /// The amount added.
         delta: i64,
+        /// Through `commit_returning` on Pigeonhole (D314, `PHDB_RETURNING_SHARE`): its latency
+        /// is reported as "incr returning". The other engines increment blindly either way.
+        returning: bool,
     },
     /// Read a row's counter ([`WorkloadKind::Counters`]).
     ReadCounter {
@@ -527,6 +530,9 @@ impl BenchOp {
         match self {
             Self::Commit { rows, .. } if rows.len() > 1 => CROSS_SHARD_COMMIT,
             Self::Commit { .. } => "put",
+            Self::Incr {
+                returning: true, ..
+            } => "incr returning",
             Self::Incr { .. } => "incr",
             Self::ReadCounter { .. } => "counter read",
             Self::Transfer { .. } => "transfer",
