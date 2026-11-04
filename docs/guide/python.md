@@ -1,11 +1,11 @@
 # Python
 
-> **Status:** this guide describes `main`. The bindings (`pigeonhole-db` on PyPI, `import pigeonhole`; D307, ICR 0102, #696) are new in 1.1.0 and aren't on PyPI yet. Every code block on this page runs as a test (`crates/python/tests/test_guide.py`).
+> **Status:** this guide describes `main`. The bindings (`pigeonhole-db` on PyPI, `import pigeonhole`; D307, ICR 0102, #696) are new in 1.1.0. Every code block on this page runs as a test (`crates/python/tests/test_guide.py`).
 
 The Python bindings are built with PyO3 directly over the Rust `pigeonhole` crate, so Python gets the same engine, file format and guarantees as Rust. Every engine call releases the GIL.
 
 ## Install
-- **From PyPI, once published:** `pip install pigeonhole-db`, for CPython 3.11 or later. One abi3 wheel per platform covers every Python version: Linux (manylinux and musllinux, x86_64 and aarch64), macOS (universal2) and Windows (x86_64).
+- **From PyPI:** `pip install pigeonhole-db`, for CPython 3.11 or later. One abi3 wheel per platform covers every Python version: Linux (manylinux and musllinux, x86_64 and aarch64), macOS (universal2) and Windows (x86_64).
 - **From a checkout:** `pip install ./crates/python` builds the extension, which needs a Rust toolchain. For development, run `maturin develop` in `crates/python` inside a virtualenv.
 
 The package ships typed stubs (`py.typed`), so editors and type checkers see the whole API.

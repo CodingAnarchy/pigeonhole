@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status:** describes `main`; crates.io has 1.0.1 (what `main` adds after it: [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes `main`; crates.io has 1.1.0 (what `main` adds after it: [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 

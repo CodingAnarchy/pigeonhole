@@ -1,8 +1,113 @@
 # Changelog
 
-All notable changes to Pigeonhole are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). From 1.0, `pigeonhole`, `pigeonhole-arrow` and `phdb`'s interface follow semver (D282), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise)). Before 1.0, the format and the API could change in any release.
+All notable changes to Pigeonhole are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). From 1.0, the public crates (`pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text` and `pigeonhole-memory`) and `phdb`'s interface follow semver (D282), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise)). Before 1.0, the format and the API could change in any release.
 
 ## [Unreleased]
+
+## [1.1.0] - 2026-11-04
+
+Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in format 4, and the public API only grows (`cargo semver-checks` against 1.0.1 finds no breaking change). It adds:
+- **Aggregations:** min, max, HyperLogLog, bitwise, `f64`, exact sum, mean and variance, histograms, quantiles, bloom filters and roaring sets, each kept by the engine as counters are.
+- **Vectors:** vector families with exact nearest-neighbour search in the engine, and `pigeonhole-vector`, an IVF index on the public API.
+- **Graphs and wide rows:** wide rows read cell by cell or in pages, frontier multi-gets, traversal pushdown, and reads cut to a byte budget.
+- **The change feed:** every commit, once and in order, to the writer process and to reader processes.
+- **Full-text search:** `pigeonhole-text`, BM25 with phrases, fuzzy terms and highlighting.
+- **Agent memory:** `pigeonhole-memory`, long-term memory with hybrid recall, forgetting and consolidation, and `phdb mcp`, a Model Context Protocol server for AI agents.
+- **Bindings:** Python (`pigeonhole-db` on PyPI) and Ruby (the `pigeonhole` gem).
+
+### Upgrading from 1.0.x
+- **A file that uses a 1.1 family kind can't go back to 1.0.x.** Creating the first aggregate family of a new kind (anything but a counter) or the first vector family sets the file's `incompat` feature bit 0 (D294, D298, D303). 1.0.x then refuses to open the file with `UnsupportedFeature`, even after the family is dropped. Until then, files move freely between 1.0.x and 1.1.0. Back up before creating such a family if you may roll back. The change feed sets no feature bit.
+- **Upgrade reader processes together with the writer.** The shared-memory layout is now version 8 (1.0.x used version 6). It adds each shard's written and synced watermarks and its change-feed state (D310). A reader process against a writer from a build on another layout fails with `ShmVersionMismatch`, never misreading: restart the readers after the writer.
+- **The internal crates are on a version line of their own** (D295). `pigeonhole-format`, `-io`, `-sim`, `-pager`, `-wal`, `-memtable`, `-cache`, `-runtime`, `-shm`, `-sst`, `-compaction` and `-engine` are 2.0.0, and the public crates stay 1.x under semver. `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected.
+- **Behaviour changes to know:**
+  - **Shard polling:** `CpuProfile::Embedded`, the default, sizes each shard thread's poll for the next commit from its recent gaps between commits, from 200 µs up to 1 ms when commits come steadily (#1176). Under full load that's about one more core of polling. `CpuProfile::Server` keeps its fixed 1 ms, and an idle database still never polls.
+  - **`phdb` read-only commands:** `phdb info`, `dump`, `backup` and `shell --read-only` open read-only when no writer runs, leaving the database exactly as they found it. A crashed writer's log is replayed into memory and left for the application's next open.
+  - **Impossible commits:** a commit that could never fit an empty arena now fails with `BatchTooLarge` at once, instead of `Busy` after the write-stall timeout (#1403).
+
+### Added
+- **Aggregate families** (D294, D298, ICR 0094, ICR 0096). `Family::aggregate(Aggregation::…)` keeps a cell's inputs folded, as a counter family keeps the sum (`Family::counter()` is `Family::aggregate(Aggregation::Sum)`). Inputs are written with `aggregate`, `aggregate_u64`, `aggregate_f64` and `aggregate_bytes` (and `_at` forms) on `RowMutation`, `WriteBatch` and `Transaction`. `FamilyInfo::aggregation` names a family's aggregation and its parameters, and an input of the wrong type is refused with a message naming the method to use.
+  - **Min and max:** `Min` and `Max` keep the smallest or largest `i64`; `MinF64` and `MaxF64` keep the smallest or largest `f64` by `f64::total_cmp`, refusing NaN. `put_i64` and `put_f64` set a cell.
+  - **Distinct counts:** `Hll` counts distinct `i64` or byte inputs (4096 registers, about 1.6% standard error), read with `CellRef::hll_estimate`.
+  - **Bitwise:** `BitOr`, `BitAnd` and `BitXor` fold `u64` inputs, read with `as_u64`.
+  - **Exact sums:** `SumF64` keeps the exact sum of its `f64` inputs, read rounded once with `CellRef::sum_f64`, so the same inputs read the same total in any order. `MeanVar` keeps the count, exact sum and exact sum of squares, read with `CellRef::mean_var()`.
+  - **Distributions:** `Histogram(HistogramParams)` counts inputs in buckets between fixed bounds (`CellRef::histogram_counts`). `Quantiles(QuantileParams)` keeps a log-linear sketch, read with `CellRef::quantile(q)` within a relative error of 2^-p (0.8% by default).
+  - **Bloom filters:** `Bloom(BloomParams)` answers `CellRef::bloom_contains` and `bloom_contains_bytes` with no false negatives, at the configured false-positive rate.
+  - **Sets:** `Set` holds a set of `u32`s as a standard roaring bitmap (FORMAT §3.8), which CRoaring and roaring-rs read as stored. Write with `set_add` and `set_remove`, and read in place with `Cell::as_set()` and `SetRef` (`len`, `contains`, `iter`, `intersection_len`, `intersection`, `union_len`).
+  - **Storage:** a compaction folds a cell's pending inputs into its stored value when no snapshot separates them, and a read keeps the value it folded for later reads once the inputs it folded add up to a quarter of the value's size. Bloom filter and set values can go to blob files like any large value, with reads and compactions folding new inputs onto them. Other aggregate values stay inline.
+  - **`phdb`:** `aggregation` and `aggregation_params` in `info`, `dump` and `load`, the shell's `create … name:<kind>[=params]`, and its `aggregate` command.
+- **Vector families** (D296, D303, ICR 0098, ICR 0104). `Family::vector(VectorSpec::new(dim, Element, Metric)?)` fixes every value's element (`F32`, `F16`, `BF16`, `I8` or `Bit`), dimension (1 to 4096) and metric (L2, inner product, cosine or Hamming).
+  - **Writes:** `put_vector_f32`, `put_vector_f16`, `put_vector_bf16`, `put_vector_i8` and `put_vector_bits` (and `_at` forms). A vector of the wrong shape, a non-finite component, or a cosine vector with a zero norm is refused when the write is built. Half-precision families take `f32` vectors rounded to nearest-even.
+  - **Reads:** `Value::Vector` and `CellRef::as_vector`. `VectorRef::to_f32_vec` and `widen_into` widen exactly. `VectorSpec::distance_*` scores vectors exactly as the engine ranks them.
+  - **Exact search:** `nearest_f32`, `nearest_i8` and `nearest_bits` on a scan or a multi-get give the `k` nearest vectors as `Neighbour`s, in the engine and without materialising rows, under the read's selection. `parallel(n)` spreads a search over tablets with the same result. `Nearest::run_async` reads asynchronously, and `Nearest::run_within(bytes)` cuts the result to a byte budget.
+  - **Export:** `phdb dump` and `load` carry vector cells exactly, and `ArrowOptions::vector_dim(n)` adds a `value_vector: FixedSizeList<Float32, n>` column.
+- **`pigeonhole-vector`, an IVF index** (D306, ICR 0100), built on the public API.
+  - **The index:** `Index::create` and `open` over a vector family, `insert_*`, `delete` and `search_*(q, k).nprobe(n).run()`. Every list move is a transaction, so the index stays consistent across crashes and concurrent writers, and a search with every list probed equals an exact `nearest_*`. `nprobe` defaults to 24 lists. On SIFT1M that's 95.8% recall@10 at 3.4 ms per query, single-threaded.
+  - **Loading and rebalancing:** `Index::bulk_load_*` loads an empty index from a stream. Lists split and merge inside the writes that cause them, or, with `Rebalance::Background`, on the crate's thread or a `Rebalancer` the application runs.
+  - **More:** `f16` and `bf16` indexes, `Search::run_async`, `Index::open_reader` for reader processes, writes inside the caller's transaction (`insert_*_in`, `delete_in`, then `after_commit`), and `Search::id_prefix` with `max_probe` and `run_with_stats`. A second `Index::open` in a process shares the open handle.
+- **Graphs and wide rows.**
+  - **Wide rows** (D297): `RowRead::cells()` lends a row a cell at a time, `RowRead::pages(n)` in pages of whole columns from one reused buffer, and `RowRead::resume_after(&RowPosition)` continues a walk. `Scan::cells()` walks a scan the same way.
+  - **Frontier multi-get** (D299): `Table::keys(&KeySet)` reads many rows in key order under one snapshot, setting up each tablet's read once for all its keys. `KeyRows::next_async`, `poll_next` and `into_owned_stream()` read them asynchronously, fetching the next keys' blocks together.
+  - **Traversal pushdown** (D304): `Table::traverse(&KeySet)` runs a breadth-first traversal over adjacency rows inside the engine, under one snapshot, with per-node and per-hop limits, a bound on the visited set, edge filters and `parallel(n)`. `Traverse::run_async()` runs it asynchronously.
+  - **Byte budgets** (D308): `Scan::read_within(bytes)` and `KeysRead::read_within(bytes)` return the longest prefix of a read's cells that fits a budget, with a resumable `ScanPosition` or `KeysPosition`. `Traverse::byte_budget` bounds a traversal. For filling a context window or an API page without over-reading.
+- **The change feed** (D310, ICR 0106).
+  - **History:** `Options::change_feed(FeedRetention)` and `Options::feed_tables` keep committed history in the WAL past the checkpoint, ring-recycled and never stalling a writer. A clean close keeps it for the next open, and `DatabaseInfo::feed` reports its retention and disk cost.
+  - **Opens inherit it:** an open that doesn't mention the feed inherits the last open's feed (retention, age and fed tables, recorded in the `<db>-feed` sidecar) and, with `Options::shards` unset, its shard count. So a tool that opens the file between two runs of an application keeps the application's history and tokens. `Options::change_feed_off()` turns the feed off.
+  - **Subscribing:** `Table::feed()` delivers whole commits, once each and in commit order, over tables or a row prefix, durable by default or `visible()` for sooner. A feed starts after now, after a snapshot, at the oldest retained history, or from a stored `FeedToken`, in this open or a later one. Each `Commit` carries its `Change`s with names, kinds and typed values. When the history a feed needs is gone, it fails with `ErrorCode::FeedExpired` (31).
+  - **Reader processes and async:** `ReadTable::feed()` follows the writer through shared memory, with no per-commit work for the writer, and continues across a writer restart. `Feed::poll_next` and `nonblocking::FeedStream` wait without holding a thread, in the writer process.
+  - **The guide:** a [change feed](docs/guide/change-feed.md) page.
+- **`pigeonhole-text`, full-text search** (D309), built on the public API.
+  - **Writes:** `Index::create` and `open` over a source column, with `put_in` and `delete_in` in the caller's transaction, so the text, its postings and the statistics commit together. Positions are an option, and normalisation is NFC by default, NFKC as an option.
+  - **Search:** BM25 at one snapshot over terms, exact phrases, sloppy phrases (`"a phrase"~N`) and fuzzy terms (`word~1`, `word~2`), with a small query syntax or a built `Query`. MaxScore reads only the postings that can still change the top `k`. `Search::id_prefix` restricts a search to a namespace, and `Search::highlight(true)` fills each hit's matched byte ranges, with `snippet()`.
+  - **More:** `Index::open_reader` gives a `ReadIndex` for reader processes, and `rebuild`, `repair` and `verify` keep the index honest after writes that went around it.
+- **`pigeonhole-memory`, agent memory** (D311, ICR 0107).
+  - **The store:** memories with text, an embedding from the store's pinned model, a kind, an importance, sources and typed links, in exact namespaces. Each write is a transaction, with exact and near-duplicate dedup. `link`, `supersede`, `mark_used` and `verify`.
+  - **Recall:** vector, keyword and recency candidates fused by reciprocal rank fusion within a byte budget, with graph expansion along links (`Recall::expand`), and optional IVF recall for large namespaces (`StoreOptions::ivf`). Recency's default weight is 0.25. `Store::open_reader` gives a `ReadStore`.
+  - **Lifecycle:** a `ForgetPolicy` forgets by retention and by age per kind, never forgetting pinned memories or a summary's sources, on the crate's thread or the application's. A `Consolidator` the application supplies folds groups of episodic memories into semantic ones.
+  - **Events:** `Store::watch` follows the store's memory events through the change feed, and `Store::consolidate_loop` runs consolidation as memories arrive, resuming after a restart. `ConsolidateLoop::interrupter` ends a step's wait from another thread.
+  - **Measured:** `phdb-bench memrecall` measures recall on LongMemEval and LoCoMo, and the results are in the [agent memory](docs/guide/agent-memory.md) guide.
+- **`phdb mcp`, a Model Context Protocol server** (#1249), so AI agents can use a database as a tool.
+  - **Tools:** list tables, read a row, scan, traverse, `nearest`, write in one atomic batch, create tables, and `feed_poll`. Each tool has a JSON schema and an agent-oriented description.
+  - **Limits:** results past `--max-result-bytes` are cut, with a cursor that continues them. `--read-only` serves a live database as a reader process.
+  - **Memory tools:** `--memory NAME` adds tools over a `pigeonhole-memory` store, with embeddings supplied by the client or computed by an OpenAI-compatible endpoint (the default `embed` feature).
+  - **The guide:** [Using Pigeonhole from AI agents](docs/guide/ai-agents.md).
+- **Python bindings**, `pigeonhole-db` on PyPI (`import pigeonhole`; D307, ICR 0102), over PyO3, with the GIL released during engine calls. The bindings cover:
+  - the core API, vector families with NumPy, multi-get, traversal, pages, byte budgets and the change feed;
+  - `pigeonhole.memory`.
+
+  abi3 wheels for CPython 3.11 and later cover Linux, macOS and Windows, with typed stubs. See the [Python guide](docs/guide/python.md).
+- **Ruby bindings**, the `pigeonhole` gem (Ruby 3.3 and later; #697, ICR 0111), over magnus and rb-sys, with the GVL released during engine calls. The bindings cover:
+  - the core API, vectors, multi-get, traversal, pages, byte budgets and the change feed;
+  - `Pigeonhole::Memory`, `Pigeonhole::Text` and `Pigeonhole::Vector`.
+
+  Native gems cover seven platforms, and a source gem builds on any other. See the [Ruby guide](docs/guide/ruby.md).
+- **Smaller additions:**
+  - `Options::read_only(true)` opens a database without writing anything to its files (ICR 0109).
+  - `Pigeonhole::same_database(&other)` says whether two handles come from one open database (ICR 0110).
+  - `Pigeonhole::pinned_shard_cpus()` lists the CPUs the shard threads are pinned to (ICR 0101).
+  - `PIGEONHOLE_BALANCE_LOG` logs the balancer's decisions to stderr, for measurement (#1188).
+  - The guide gains pages on vectors, full-text search, the change feed, agent memory, Python and Ruby.
+
+### Changed
+- Filtered scans and multi-version reads decode keys with fewer instructions, finding a row's terminator eight bytes at a time (#1167): 0.6–1.6% fewer instructions per cell on the filtered-scan shapes.
+- A read that skips the rest of a wide row still in the memtable seeks past it instead of stepping through it (#1426). A prefixed read in the middle of a 100,000-cell memtable row went from 171 µs to 7 µs.
+- The WAL's CRC32C uses the `crc-fast` crate: about a third of the instructions for a small frame on x86, with the same checksums and file format (#1366).
+
+### Fixed
+- **A snapshot no longer sees fewer commits than an earlier one** (#1208, D300; also in 1.0.1). While two shards reserved seqnos at once, a later snapshot could miss a commit an earlier snapshot had shown, including a writer's own acknowledged commit. No uncommitted data was ever visible.
+- **A cross-shard commit refused for memtable room no longer waits forever on a stopped clock** (#1205, D301). It now fails with `Busy` at once, as a single-shard commit already did. Stopped clocks come only from custom `Vfs` clocks.
+- Snapshots held across flushes no longer stall writes (D302, #1212). Arenas are now cut into 1024 chunks (64 KiB at the default budget), so 8 held snapshots no longer take a shard's whole arena.
+- A commit waiting for memtable room is never refused with `Busy` before `write_stall_timeout_nanos` (#1235). It could be refused up to 1 ms early, or 2 ms where the millisecond count wrapped.
+- A full compaction (`compact()`) could rewrite one SST into itself for ever (#1313), or rewrite an SST just over one output piece on every call (#1324). Compaction now cuts its output by the SST's whole length, and a full compaction rewrites each slot at most once.
+- After a cross-shard commit fails with `OutcomeUnknown`, a commit made right after the error is refused with `Closed`, as documented, instead of being admitted and then failing (#1358).
+- A commit of many small cells with one cell larger than an arena chunk is admitted. Admission charged each small cell a whole chunk, so such a commit failed `Busy` even on an empty arena (#1403).
+- A commit held back while its shard's WAL segment was nearly full could wait for ever when no other commit came (#1409).
+
+## [1.0.1] - 2026-10-31
+
+A correctness fix: snapshots are monotonic again. Upgrade recommended. The file format and the shared-memory layout are unchanged, so a 1.0.1 writer and 1.0.0 reader processes work together, and files move freely between 1.0.0 and 1.0.1.
+
+### Fixed
+- **A snapshot no longer sees fewer commits than an earlier one** (#1208, D300). While two shards reserved seqnos at once, the visible seqno could briefly go backwards: a later snapshot, in the writer process or in a reader process, could miss a commit an earlier snapshot had shown, including a writer's own acknowledged commit. No uncommitted data was ever visible. A shard's hold is now published under the seqno allocator's lock. Readers and the shared-memory layout are unchanged.
 
 ## [1.0.0] - 2026-10-30
 
@@ -635,7 +740,9 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
+[1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v1.0.0
 [0.3.4]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.3...v0.3.4
 [0.2.6]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.5...v0.2.6

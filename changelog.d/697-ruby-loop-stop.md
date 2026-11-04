@@ -1,2 +1,0 @@
-### Changed
-- Ruby: a `ConsolidateLoop` step that's interrupted (`Timeout`, `Thread#raise`, Ctrl-C) now ends its wait within about 50 ms (#1447's `LoopInterrupter`) instead of at its timeout. The groups it refused keep their namespaces due at the next step (#1442's `ConsolidateStopped`), and `LoopStep` gains `stopped` and `interrupted`. A loop closed during a step is dropped with the GVL released.

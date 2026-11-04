@@ -34,7 +34,7 @@ exclude = ["crates/ruby"]
 # the public line's version too. The 12 internal crates set their own `version`: one shared
 # internal line, which takes a new major for any incompatible change to any of them.
 # `scripts/versions.py check` (CI) keeps each line and every pin below in step.
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -60,14 +60,14 @@ pigeonhole-shm = { path = "crates/shm", version = "=2.0.0" }
 pigeonhole-sst = { path = "crates/sst", version = "=2.0.0" }
 pigeonhole-compaction = { path = "crates/compaction", version = "=2.0.0" }
 pigeonhole-engine = { path = "crates/engine", version = "=2.0.0" }
-pigeonhole = { path = "crates/pigeonhole", version = "1.0.0" }
-pigeonhole-bench = { path = "crates/bench", version = "1.0.0" }
-pigeonhole-arrow = { path = "crates/arrow", version = "1.0.0" }
-pigeonhole-cli = { path = "crates/cli", version = "1.0.0" }
-pigeonhole-vector = { path = "crates/vector", version = "1.0.0" }
-pigeonhole-text = { path = "crates/text", version = "1.0.0" }
-pigeonhole-memory = { path = "crates/memory", version = "1.0.0" }
-pigeonhole-capi = { path = "crates/capi", version = "1.0.0" }
+pigeonhole = { path = "crates/pigeonhole", version = "1.1.0" }
+pigeonhole-bench = { path = "crates/bench", version = "1.1.0" }
+pigeonhole-arrow = { path = "crates/arrow", version = "1.1.0" }
+pigeonhole-cli = { path = "crates/cli", version = "1.1.0" }
+pigeonhole-vector = { path = "crates/vector", version = "1.1.0" }
+pigeonhole-text = { path = "crates/text", version = "1.1.0" }
+pigeonhole-memory = { path = "crates/memory", version = "1.1.0" }
+pigeonhole-capi = { path = "crates/capi", version = "1.1.0" }
 
 # External dependencies. Each one is justified in docs/design/interfaces.md.
 # `std` (which needs `alloc`): without it the crate is `no_std` and wants a panic handler.
