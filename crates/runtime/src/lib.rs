@@ -1613,6 +1613,20 @@ impl<H: ShardHandler> ShardDriver<H> {
         self.core.run_once(deadline_nanos)
     }
 
+    /// Caller-runs' sim seam (#1176 rev 3.1 §7): runs one committing client's turn of this
+    /// shard on the calling thread, the same `caller_turn` an engine-owned client runs (the
+    /// handler's allow-list, `caller_may_run` per batch, at most [`CALLER_BATCH`] messages,
+    /// refused messages to the stash), under `inline_io`, so a single-threaded seeded
+    /// harness reaches the caller's path deterministically. Returns whether it handled a
+    /// message. A test seam: the engine-owned path wraps the same call in the run token.
+    #[doc(hidden)]
+    pub fn run_caller_turn(&mut self) -> bool {
+        let wants = std::sync::atomic::AtomicBool::new(false);
+        let core = &mut self.core;
+        let (_, handled) = pigeonhole_io::inline_io(|| core.caller_turn(&mut || false, &wants));
+        handled > 0
+    }
+
     /// How many messages this shard has handled and background slices it has run, in all.
     /// For tests that drive shards by hand: `run_once` returning `false` says no work
     /// *remains* on this shard, not that it did none, and a message it sent another shard is

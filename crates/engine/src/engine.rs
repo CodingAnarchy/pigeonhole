@@ -5803,6 +5803,21 @@ impl EngineShard {
         d.run_once(deadline_nanos)
     }
 
+    /// Caller-runs' sim seam (#1176): one committing client's turn of this shard, the same
+    /// turn an engine-owned client runs, for a seeded harness to reach that path on one
+    /// thread (`PIGEONHOLE_CALLER_TURNS`). Returns whether it handled a message (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn run_caller_turn(&mut self) -> bool {
+        if self.forked() {
+            return false;
+        }
+        let Some(d) = self.driver.as_mut() else {
+            return false;
+        };
+        d.run_caller_turn()
+    }
+
     /// Whether this shard's WAL segment header is held back behind its predecessor's sync
     /// (an inspection helper for tests, D310 PR 4: a change feed polled in that window must
     /// wait for the segment, not take the stream's readable end for its head).
