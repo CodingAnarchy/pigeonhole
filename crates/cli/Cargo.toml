@@ -21,6 +21,9 @@ default = ["embed"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,
 # the memory tools take client-supplied embeddings or recall by keyword.
 embed = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
+# `phdb serve` (D313, #1397), off by default (owner, 2026-11-04). This build has only the
+# network API's generated types (ICR 0112); the server follows.
+serve = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde"]
 
 [dependencies]
 # The public crates only: phdb uses no engine internals (#692).
@@ -37,6 +40,13 @@ serde_json = { workspace = true }
 # dump --format arrow (#691): the export and its IPC stream.
 pigeonhole-arrow = { workspace = true }
 arrow-ipc = { workspace = true }
+# `serve`: the network API's messages (prost), services (tonic, codegen only) and proto3 JSON
+# mapping (pbjson), generated into src/serve/proto/ by tools/protogen.
+prost = { version = "0.14", optional = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
+pbjson = { version = "0.9", optional = true }
+serde = { version = "1", optional = true }
 
 [dev-dependencies]
 # The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).

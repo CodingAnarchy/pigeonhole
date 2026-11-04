@@ -1,0 +1,162 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): `pigeonhole-memory`'s agent memory (D311,
+// ICR 0107), for the one store a server opens. With a namespace-scoped token (D313 Q6),
+// every call is limited to the token's namespaces.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+service Memory {
+  rpc Remember(RememberRequest) returns (RememberResponse);
+  rpc Recall(RecallRequest) returns (RecallResponse);
+  rpc MarkUsed(MarkUsedRequest) returns (MarkUsedResponse);
+  // `new` replaces `old`: `old` stops being recalled unless asked for.
+  rpc Supersede(SupersedeRequest) returns (Empty);
+  rpc Link(LinkRequest) returns (Empty);
+  // Deletes memories now (the store's own forgetting runs on its policy).
+  rpc Forget(ForgetRequest) returns (ForgetResponse);
+  // New memories in some namespaces as they're written, until the client goes away.
+  rpc Watch(MemoryWatchRequest) returns (stream MemoryEvent);
+}
+
+enum MemoryKind {
+  MEMORY_KIND_UNSPECIFIED = 0;
+  MEMORY_KIND_EPISODIC = 1;
+  MEMORY_KIND_SEMANTIC = 2;
+  MEMORY_KIND_PROCEDURAL = 3;
+}
+
+// A link's type: the built-in ones by name, or a custom number at or above the library's
+// first custom value.
+message LinkType {
+  oneof kind {
+    BuiltinLink builtin = 1;
+    uint32 custom = 2;
+  }
+}
+
+enum BuiltinLink {
+  BUILTIN_LINK_UNSPECIFIED = 0;
+  BUILTIN_LINK_DERIVED_FROM = 1;
+  BUILTIN_LINK_SIMILAR_TO = 2;
+  BUILTIN_LINK_SUPERSEDES = 3;
+}
+
+message MemoryLink {
+  bytes to = 1;
+  LinkType link_type = 2;
+  float weight = 3;
+}
+
+// A memory to write.
+message NewMemory {
+  string text = 1;
+  // Unset: the server embeds the text with its configured model, if any.
+  repeated float embedding = 2;
+  MemoryKind kind = 3;
+  optional double importance = 4;
+  string source = 5;
+  string session = 6;
+  bool pinned = 7;
+  repeated MemoryLink links = 8;
+}
+
+message RememberRequest {
+  string namespace = 1;
+  NewMemory memory = 2;
+}
+
+message RememberResponse {
+  bytes id = 1;
+  RememberOutcome outcome = 2;
+}
+
+enum RememberOutcome {
+  REMEMBER_OUTCOME_UNSPECIFIED = 0;
+  // Written as a new memory.
+  REMEMBER_OUTCOME_NEW = 1;
+  // An exact duplicate: `id` is the existing memory.
+  REMEMBER_OUTCOME_MERGED = 2;
+  // A near duplicate the store's dedup skipped: `id` is the match, not a new memory.
+  REMEMBER_OUTCOME_SIMILAR = 3;
+}
+
+message RecallRequest {
+  repeated string namespaces = 1;
+  string text = 2;
+  repeated float embedding = 3;
+  uint32 k = 4;
+  // Cut the hits to this many bytes (0: no budget).
+  uint64 byte_budget = 5;
+  // Graph expansion through links: this many hops (0: none).
+  uint32 expand_hops = 6;
+  bool exact = 7;
+  bool include_superseded = 8;
+  string session = 9;
+  bool with_embeddings = 10;
+  bool with_signals = 11;
+}
+
+message RecallResponse {
+  repeated MemoryHit hits = 1;
+}
+
+message MemoryHit {
+  bytes id = 1;
+  string text = 2;
+  MemoryKind kind = 3;
+  double importance = 4;
+  uint64 created = 5;
+  bool superseded = 6;
+  double score = 7;
+  // With `with_embeddings`.
+  repeated float embedding = 8;
+  // With `with_signals`: each ranking signal's score, by name (`vector`, `keyword`,
+  // `recency`, `graph`).
+  map<string, double> signals = 9;
+}
+
+message MarkUsedRequest {
+  repeated bytes ids = 1;
+}
+
+message MarkUsedResponse {
+  uint64 marked = 1;
+}
+
+message SupersedeRequest {
+  bytes old = 1;
+  bytes new = 2;
+}
+
+message LinkRequest {
+  bytes from = 1;
+  bytes to = 2;
+  LinkType link_type = 3;
+  float weight = 4;
+}
+
+message ForgetRequest {
+  repeated bytes ids = 1;
+}
+
+message ForgetResponse {
+  uint64 forgotten = 1;
+}
+
+message MemoryWatchRequest {
+  repeated string namespaces = 1;
+  // After an earlier event's `token`; unset: from now.
+  bytes resume = 2;
+}
+
+message MemoryEvent {
+  // Where to resume after this event. Opaque.
+  bytes token = 1;
+  string namespace = 2;
+  bytes id = 3;
+  string text = 4;
+  MemoryKind kind = 5;
+  uint64 created = 6;
+}

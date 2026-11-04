@@ -1,0 +1,60 @@
+name: Proto
+
+# The network API's contract (D313, ICR 0112): proto/pigeonhole/v1/*.proto is the source,
+# and crates/cli/src/serve/proto/ is generated from it by tools/protogen and checked in. This
+# regenerates the code and fails if it differs from what's committed, so the protos and the
+# Rust can't drift apart. The generated code's own build and tests run in ci.yml
+# (`--all-features` includes `serve`).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'proto/**'
+      - 'tools/protogen/**'
+      - 'crates/cli/src/serve/proto/**'
+      - '.github/workflows/proto.yml'
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'tools/protogen/**'
+      - 'crates/cli/src/serve/proto/**'
+      - '.github/workflows/proto.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its superseded run; main's runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  generated:
+    name: generated code matches the protos
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/protogen
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Regenerate
+        run: cargo run --locked --manifest-path tools/protogen/Cargo.toml
+      - name: The checked-in code is what the protos generate
+        run: |
+          git status --porcelain crates/cli/src/serve/proto
+          test -z "$(git status --porcelain crates/cli/src/serve/proto)" || {
+            echo "crates/cli/src/serve/proto differs from proto/: run"
+            echo "  cargo run --locked --manifest-path tools/protogen/Cargo.toml"
+            echo "and commit the result."
+            git diff --stat crates/cli/src/serve/proto
+            exit 1
+          }
+      - name: The generator's own dependencies (licenses and advisories)
+        run: cargo deny --manifest-path tools/protogen/Cargo.toml check licenses advisories

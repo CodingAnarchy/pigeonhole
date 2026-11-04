@@ -1,0 +1,166 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): reads and writes of rows.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+// Reads, scans and writes. Every write commits once: its outcome is committed or not,
+// and a reply lost in transit leaves it unknown (ICR 0112, "When a write is retry-safe").
+service Data {
+  // The newest version of one cell (or, with `snapshot_id`, as of a snapshot).
+  rpc Get(GetRequest) returns (GetResponse);
+  // Several rows in key order at one point in time (the Rust `Table::keys`), cut to a byte
+  // budget, with the position to continue from.
+  rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
+  // One row's selected cells, optionally paged through a wide row.
+  rpc ReadRow(ReadRowRequest) returns (ReadRowResponse);
+  // A key range or prefix, as a stream of pages each cut to a byte budget. Each page ends
+  // with its position; a client that disconnects resumes with `after`.
+  rpc Scan(ScanRequest) returns (stream ScanPage);
+  // Commits writes to one row atomically.
+  rpc Mutate(MutateRequest) returns (MutateResponse);
+  // Commits writes to one row only if a condition on that row holds (`commit_if`).
+  rpc CheckAndMutate(CheckAndMutateRequest) returns (CheckAndMutateResponse);
+  // Commits writes to any rows and tables atomically (a `WriteBatch`).
+  rpc Batch(BatchRequest) returns (MutateResponse);
+  // Commits writes to one row and returns its counter cells' values after the commit (D314,
+  // `commit_returning`).
+  rpc MutateReturning(MutateRequest) returns (MutateReturningResponse);
+}
+
+message GetRequest {
+  string table = 1;
+  bytes row = 2;
+  string family = 3;
+  bytes qualifier = 4;
+  string snapshot_id = 5;
+  AggregateQuery aggregate = 6;
+}
+
+message GetResponse {
+  // Absent when the cell has no visible version.
+  Cell cell = 1;
+}
+
+message MultiGetRequest {
+  string table = 1;
+  // The rows to read, in any order; the response is in key order, duplicates once.
+  repeated bytes keys = 2;
+  Selection selection = 3;
+  // The page's size by D308's measure; 0 is the server's default.
+  uint64 page_bytes = 4;
+  // A previous page's `next`, to continue it.
+  bytes after = 5;
+}
+
+message MultiGetResponse {
+  // Rows with at least one selected cell; a requested key with none is absent.
+  repeated Row rows = 1;
+  // Where to continue, or empty once the read is done.
+  bytes next = 2;
+  // The page's size by D308's measure.
+  uint64 bytes = 3;
+}
+
+message ReadRowRequest {
+  string table = 1;
+  bytes row = 2;
+  Selection selection = 3;
+  // Page a wide row: at most this many cells per response (0: the whole row, within the
+  // server's request limits).
+  uint32 page_cells = 4;
+  // A previous page's `next` (a `RowPosition`), to continue the walk.
+  bytes after = 5;
+}
+
+message ReadRowResponse {
+  // Absent when the row has no selected cell.
+  Row row = 1;
+  // Where the next page starts, or empty after the last.
+  bytes next = 2;
+}
+
+// A scan's key range: a prefix, or bounds (either may be absent: unbounded).
+message KeyRange {
+  oneof range {
+    bytes prefix = 1;
+    Bounds bounds = 2;
+  }
+}
+
+message Bounds {
+  Bound start = 1;
+  Bound end = 2;
+}
+
+message ScanRequest {
+  string table = 1;
+  KeyRange range = 2;
+  Selection selection = 3;
+  // At most this many rows in all (0: no limit).
+  uint64 limit = 4;
+  // Each page's size by D308's measure; 0 is the server's default (1 MiB). The server caps
+  // it.
+  uint64 page_bytes = 5;
+  // A previous page's `next` (a `ScanPosition`), to continue the scan.
+  bytes after = 6;
+}
+
+message ScanPage {
+  // The page's rows in key order. A page cut by its budget can end inside a row; the next
+  // page then starts with the rest of that row.
+  repeated Row rows = 1;
+  // Where the next page starts, or empty after the last page.
+  bytes next = 2;
+  uint64 bytes = 3;
+}
+
+message MutateRequest {
+  RowWrites writes = 1;
+  Durability durability = 2;
+}
+
+message MutateResponse {
+  CommitInfo commit = 1;
+}
+
+message CheckAndMutateRequest {
+  RowWrites writes = 1;
+  Condition condition = 2;
+  Durability durability = 3;
+}
+
+message CheckAndMutateResponse {
+  // Whether the condition held and the writes committed.
+  bool applied = 1;
+  // Set when `applied`.
+  CommitInfo commit = 2;
+}
+
+message BatchRequest {
+  repeated RowWrites rows = 1;
+  Durability durability = 2;
+}
+
+message MutateReturningResponse {
+  CommitInfo commit = 1;
+  // Every counter cell the mutation incremented or set, in the order it first wrote each.
+  repeated ReturnedCell cells = 2;
+}
+
+// One counter cell after the commit. The commit succeeded whatever `value` holds: an
+// `error` here means only that the value couldn't be read afterwards, so don't retry the
+// mutation (D314; the bindings' `ReturnedValueError`).
+message ReturnedCell {
+  string family = 1;
+  bytes qualifier = 2;
+  // 0 for a plain counter, the bucket's timestamp for a bucket.
+  uint64 timestamp = 3;
+  oneof value {
+    sint64 i64 = 4;
+    // No visible cell at the commit (deleted, or a bucket past its TTL).
+    Empty absent = 5;
+    ErrorDetail error = 6;
+  }
+}

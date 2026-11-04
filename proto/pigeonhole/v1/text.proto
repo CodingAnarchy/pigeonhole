@@ -1,0 +1,136 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): `pigeonhole-text`'s BM25 full-text index
+// (D309, ICR 0105).
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+service Text {
+  rpc CreateIndex(CreateTextIndexRequest) returns (Empty);
+  // Indexes a document's text (written through the index, in one transaction).
+  rpc Put(TextPutRequest) returns (Empty);
+  rpc Delete(TextDeleteRequest) returns (Empty);
+  rpc Search(TextSearchRequest) returns (TextSearchResponse);
+  // Rebuilds the index from its source column.
+  rpc Rebuild(TextIndexRequest) returns (TextRebuildResponse);
+  rpc Verify(TextIndexRequest) returns (TextVerifyResponse);
+}
+
+message CreateTextIndexRequest {
+  string name = 1;
+  // The column the index follows.
+  string source_table = 2;
+  string source_family = 3;
+  bytes source_qualifier = 4;
+  // Unset options take the library's defaults.
+  optional double k1 = 5;
+  optional double b = 6;
+  optional bool positions = 7;
+  optional bool stop_words = 8;
+  Normalization normalization = 9;
+  optional uint32 max_terms = 10;
+  optional uint32 max_term_bytes = 11;
+  bool if_missing = 12;
+}
+
+enum Normalization {
+  NORMALIZATION_UNSPECIFIED = 0;
+  NORMALIZATION_NFC = 1;
+  NORMALIZATION_NFKC = 2;
+  NORMALIZATION_NONE = 3;
+}
+
+message TextPutRequest {
+  string index = 1;
+  bytes id = 2;
+  string text = 3;
+}
+
+message TextDeleteRequest {
+  string index = 1;
+  bytes id = 2;
+}
+
+message TextSearchRequest {
+  string index = 1;
+  oneof query {
+    // The query syntax (`Query::parse`): terms, "phrases", ~fuzzy terms.
+    string syntax = 2;
+    TextQuery clauses = 3;
+  }
+  uint32 k = 4;
+  bytes id_prefix = 5;
+  // Return each hit's text with the matches' ranges.
+  bool highlight = 6;
+}
+
+message TextQuery {
+  repeated TextClause clauses = 1;
+}
+
+message TextClause {
+  oneof clause {
+    string term = 1;
+    Phrase phrase = 2;
+    Fuzzy fuzzy = 3;
+    // Free text, tokenized as a document is.
+    string text = 4;
+  }
+}
+
+message Phrase {
+  string text = 1;
+  uint32 slop = 2;
+}
+
+message Fuzzy {
+  string term = 1;
+  Fuzziness fuzziness = 2;
+}
+
+enum Fuzziness {
+  FUZZINESS_UNSPECIFIED = 0;
+  FUZZINESS_AUTO = 1;
+  FUZZINESS_ONE = 2;
+  FUZZINESS_TWO = 3;
+}
+
+message TextSearchResponse {
+  repeated TextHit hits = 1;
+}
+
+message TextHit {
+  bytes id = 1;
+  double score = 2;
+  // With `highlight`.
+  string text = 3;
+  repeated TextMatch matches = 4;
+}
+
+message TextMatch {
+  // The query clause it matched, by index.
+  uint32 clause = 1;
+  uint32 occurrence = 2;
+  // The match's byte range in `text`.
+  uint64 start = 3;
+  uint64 end = 4;
+}
+
+message TextIndexRequest {
+  string index = 1;
+}
+
+message TextRebuildResponse {
+  uint64 documents = 1;
+  uint64 changed = 2;
+  uint64 invalid_utf8 = 3;
+}
+
+message TextVerifyResponse {
+  uint64 documents = 1;
+  uint64 terms = 2;
+  uint64 postings = 3;
+  uint64 forward_mismatch = 4;
+  uint64 source_mismatch = 5;
+}

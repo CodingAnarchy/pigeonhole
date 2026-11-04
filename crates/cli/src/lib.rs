@@ -17,6 +17,8 @@ mod exit;
 mod mcp;
 mod open;
 mod output;
+#[cfg(feature = "serve")]
+mod serve;
 mod shell;
 
 #[doc(hidden)]
