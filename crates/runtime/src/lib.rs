@@ -349,12 +349,18 @@ struct Inbox<M> {
     /// driver, whose wakeup the submit's own notify already guarantees.
     sent: std::sync::atomic::AtomicU64,
     drained: std::sync::atomic::AtomicU64,
+    /// `RuntimeConfig::caller_runs`: whether the hint is kept at all. Off, submits and
+    /// turns skip it for one branch, so the default pays nothing else (D193's ceilings).
+    caller_runs: bool,
 }
 
 impl<M> Inbox<M> {
     /// Takes the next queued message, noting the queue empty for the work hint.
     fn recv_noting(&self, rx: &Receiver<M>) -> Option<M> {
         use std::sync::atomic::Ordering::Relaxed;
+        if !self.caller_runs {
+            return rx.try_recv().ok();
+        }
         let seen = self.sent.load(Relaxed);
         match rx.try_recv() {
             Ok(m) => Some(m),
@@ -459,7 +465,7 @@ impl<M: Send + 'static> Submitter<M> {
         let sent = inbox.tx.send(msg);
         inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
-        if inbox.caller.get().is_some() {
+        if inbox.caller_runs {
             inbox
                 .sent
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -983,6 +989,7 @@ fn build<H: ShardHandler>(
                     caller: std::sync::OnceLock::new(),
                     sent: std::sync::atomic::AtomicU64::new(0),
                     drained: std::sync::atomic::AtomicU64::new(0),
+                    caller_runs: config.caller_runs,
                 }),
             }
         })

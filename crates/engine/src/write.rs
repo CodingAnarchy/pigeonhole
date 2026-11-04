@@ -9,7 +9,7 @@ use pigeonhole_format::Kind;
 use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
 use pigeonhole_format::wal::{BatchBuilder, BatchRef};
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
-use pigeonhole_runtime::{Notifier, ShardId, SlotCache, Waiter, completion, completion_from};
+use pigeonhole_runtime::{Notifier, SlotCache, Waiter, completion, completion_from};
 
 use crate::engine::Inner;
 use crate::{CellData, CommitInfo, Error, Snapshot};
@@ -54,11 +54,6 @@ pub struct WriteBatch {
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
 const INITIAL_BATCH_BYTES: usize = 256;
-
-/// Caller-runs (#1176 rev 3.1, C3): a waiting committer tries its shard's run token once
-/// every this many polls, about a microsecond apart, so polling clients load the run word
-/// rarely enough to stay off the lines its holder writes.
-const CALLER_POLLS: u32 = 32;
 
 /// The largest batch whose buffer a thread keeps for its next batch (#320): a thread that
 /// once committed a large batch does not hold that much memory for good.
@@ -531,7 +526,7 @@ impl Submission {
         if forked(&self.shared) {
             return Err(crate::engine::forked());
         }
-        wait_body(&self.shared, &mut self.waiter, self.spins, None)
+        wait_body(&self.shared, &mut self.waiter, self.spins)
     }
 }
 
@@ -564,9 +559,8 @@ pub(crate) fn wait_blocking(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
-    caller: Option<ShardId>,
 ) -> crate::Result<CommitInfo> {
-    let r = wait_body(shared, waiter, spins, caller);
+    let r = wait_body(shared, waiter, spins);
     let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
     r
 }
@@ -578,7 +572,6 @@ fn wait_body(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
-    caller: Option<ShardId>,
 ) -> crate::Result<CommitInfo> {
     let window = if spins { shared.commit_spin_nanos } else { 0 };
     if window == 0 {
@@ -589,7 +582,7 @@ fn wait_body(
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
-    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin, caller)?;
+    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
     Ok(info)
@@ -762,7 +755,6 @@ fn wait_reply_spinning<T: Send>(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<T>>,
     spin: &mut SpinWait,
-    caller: Option<ShardId>,
 ) -> crate::Result<T> {
     if shared.drivers.current_drives() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -773,63 +765,16 @@ fn wait_reply_spinning<T: Send>(
         };
     }
     let mut polled = None;
-    // Caller-runs (#1176): the shard of a commit queued there, which this thread may run
-    // itself every `CALLER_POLLS` polls (about a microsecond) while no thread runs it.
-    let submitter = caller.map(|s| shared.submitter(s));
-    let mut polls = 0u32;
     spin.poll(|| {
-        let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            match Pin::new(&mut *waiter).poll(&mut cx) {
-                Poll::Pending => false,
-                ready => {
-                    *polled = Some(ready);
-                    true
-                }
-            }
-        };
-        if ready_now(waiter, &mut polled) {
-            return true;
-        }
-        polls = polls.wrapping_add(1);
-        if let Some(sub) = submitter
-            && polls.is_multiple_of(CALLER_POLLS)
-        {
-            sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
-            return polled.is_some();
-        }
-        false
-    });
-    // Caller-runs' C1 arm (#1176 rev 3.1): past the window, keep polling while the shard's
-    // token is free (a turn to take), up to `caller_spin_extend_nanos`, rather than park.
-    if polled.is_none()
-        && let Some(sub) = submitter
-        && shared.caller_spin_extend_nanos > 0
-    {
-        let end = std::time::Instant::now()
-            + std::time::Duration::from_nanos(shared.caller_spin_extend_nanos);
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut n = 0u32;
-        while polled.is_none() && sub.caller_token_free() && std::time::Instant::now() < end {
-            // As in the spin: the token only every `CALLER_POLLS` polls (C3).
-            n = n.wrapping_add(1);
-            if n.is_multiple_of(CALLER_POLLS) {
-                sub.try_caller_turn(&mut || match Pin::new(&mut *waiter).poll(&mut cx) {
-                    Poll::Pending => false,
-                    ready => {
-                        polled = Some(ready);
-                        true
-                    }
-                });
-            }
-            if polled.is_none()
-                && let ready @ Poll::Ready(_) = Pin::new(&mut *waiter).poll(&mut cx)
-            {
+        match Pin::new(&mut *waiter).poll(&mut cx) {
+            Poll::Pending => false,
+            ready => {
                 polled = Some(ready);
+                true
             }
-            std::hint::spin_loop();
         }
-    }
+    });
     match polled {
         Some(Poll::Ready(Some(r))) => return r,
         Some(Poll::Ready(None)) => return Err(dropped_reply(shared)),
@@ -1372,5 +1317,95 @@ impl Txn {
                 None,
             )?
             .wait()
+    }
+}
+
+// ---- caller-runs (#1176) -----------------------------------------------------------------
+//
+// Kept apart from the waits above, which run exactly as without it: with caller-runs off a
+// blocking commit pays one branch for it (`Inner::commit_blocking`), so the instruction
+// ceilings (D193) hold.
+
+/// Caller-runs (#1176 rev 3.1, C3): a waiting committer tries its shard's run token once
+/// every this many polls, about a microsecond apart, so polling clients load the run word
+/// rarely enough to stay off the lines its holder writes.
+const CALLER_POLLS: u32 = 32;
+
+/// [`wait_blocking`] for a non-durable single-shard commit with caller-runs on: while it
+/// waits, this thread may run its shard's turn itself whenever no thread is running it.
+pub(crate) fn wait_blocking_as_caller(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    shard: pigeonhole_runtime::ShardId,
+) -> crate::Result<CommitInfo> {
+    let r = (|| {
+        let mut spin = SpinWait::new(shared.commit_spin_nanos);
+        let Settled { info, batch } = wait_reply_as_caller(shared, waiter, &mut spin, shard)?;
+        recycle(batch);
+        wait_visible_spinning(shared, info.seqno, &mut spin)?;
+        Ok(info)
+    })();
+    let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
+    r
+}
+
+/// [`wait_reply_spinning`], trying the shard's run token every [`CALLER_POLLS`] polls, and
+/// with `caller_spin_extend_nanos` (C1's arm) polling on past the window while the token is
+/// free.
+fn wait_reply_as_caller<T: Send>(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<T>>,
+    spin: &mut SpinWait,
+    shard: pigeonhole_runtime::ShardId,
+) -> crate::Result<T> {
+    if shared.drivers.current_drives() {
+        // A thread that drives a shard never blocks here (D88): as `wait_reply_spinning`.
+        return wait_reply_spinning(shared, waiter, spin);
+    }
+    let sub = shared.submitter(shard);
+    let mut polled = None;
+    let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(&mut *waiter).poll(&mut cx) {
+            Poll::Pending => false,
+            ready => {
+                *polled = Some(ready);
+                true
+            }
+        }
+    };
+    let mut polls = 0u32;
+    spin.poll(|| {
+        if ready_now(waiter, &mut polled) {
+            return true;
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(CALLER_POLLS) {
+            sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+            return polled.is_some();
+        }
+        false
+    });
+    // C1's arm: past the window, keep polling while the shard's token is free (a turn to
+    // take), up to `caller_spin_extend_nanos`, rather than park.
+    if polled.is_none() && shared.caller_spin_extend_nanos > 0 {
+        let end = std::time::Instant::now()
+            + std::time::Duration::from_nanos(shared.caller_spin_extend_nanos);
+        let mut n = 0u32;
+        while polled.is_none() && sub.caller_token_free() && std::time::Instant::now() < end {
+            n = n.wrapping_add(1);
+            if n.is_multiple_of(CALLER_POLLS) {
+                sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+            }
+            if polled.is_none() {
+                ready_now(waiter, &mut polled);
+            }
+            std::hint::spin_loop();
+        }
+    }
+    match polled {
+        Some(Poll::Ready(Some(r))) => r,
+        Some(Poll::Ready(None)) => Err(dropped_reply(shared)),
+        _ => park_for_reply(shared, waiter),
     }
 }

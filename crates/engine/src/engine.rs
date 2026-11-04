@@ -1960,7 +1960,7 @@ impl Engine {
         )? {
             Routed::Sent {
                 mut waiter, spins, ..
-            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins, None),
+            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
             Routed::Held(p) => inner.send(p)?.wait(),
         }?;
         Ok((info, returned(&out)))
@@ -4505,8 +4505,11 @@ impl Inner {
                 // Caller-runs (#1176): the commit's shard, which this thread may run itself
                 // while it waits. A cross-shard commit's coordinator refuses it (only
                 // single-shard commits are a caller's to run).
-                let caller = (spins && self.shared.caller_runs).then_some(target);
-                crate::write::wait_blocking(&self.shared, &mut waiter, spins, caller)
+                if spins && self.shared.caller_runs {
+                    crate::write::wait_blocking_as_caller(&self.shared, &mut waiter, target)
+                } else {
+                    crate::write::wait_blocking(&self.shared, &mut waiter, spins)
+                }
             }
             Routed::Held(p) => self.send(p)?.wait(),
         }
