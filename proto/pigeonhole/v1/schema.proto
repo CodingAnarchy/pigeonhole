@@ -1,0 +1,132 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): tables and families.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+service Schema {
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  // Creates a table, or with `if_missing` opens it and adds the families it lacks (existing
+  // families keep their stored options, as with `TableBuilder::family`).
+  rpc CreateTable(CreateTableRequest) returns (TableResponse);
+  // Admin scope.
+  rpc DropTable(DropTableRequest) returns (Empty);
+  rpc DescribeTable(DescribeTableRequest) returns (TableResponse);
+}
+
+message ListTablesRequest {}
+
+message ListTablesResponse {
+  repeated string tables = 1;
+}
+
+message CreateTableRequest {
+  string name = 1;
+  repeated FamilySpec families = 2;
+  bool if_missing = 3;
+}
+
+message DropTableRequest {
+  string name = 1;
+}
+
+message DescribeTableRequest {
+  string name = 1;
+}
+
+message TableResponse {
+  string name = 1;
+  // Each family's stored options.
+  repeated FamilySpec families = 2;
+}
+
+// A family and its options (`Family`, read back as `FamilyInfo`). Unset options take the
+// library's defaults when creating, and are always set when the server describes a family.
+// D317's cluster map reuses this message for its placements' schema.
+message FamilySpec {
+  string name = 1;
+  // What the family holds; unset: an ordinary family.
+  oneof kind {
+    Aggregation aggregate = 2;
+    VectorSpec vector = 3;
+    // An ordinary family whose `merge` operands go to this registered operator.
+    string merge_operator = 4;
+  }
+  // Versions kept per column (0: all).
+  optional uint32 max_versions = 5;
+  // Cells older than this by timestamp expire.
+  optional uint64 ttl_micros = 6;
+  optional uint32 bloom_bits = 7;
+  optional uint32 blob_threshold = 8;
+  Compression compression = 9;
+  optional uint32 block_size = 10;
+  Priority cache_priority = 11;
+  CompactionStyle compaction = 12;
+}
+
+// An aggregate family's kind (D294, D298). A counter is `AGGREGATION_KIND_SUM`.
+message Aggregation {
+  AggregationKind kind = 1;
+  // `HISTOGRAM`: the bucket bounds, ascending.
+  repeated double histogram_bounds = 2;
+  // `QUANTILES`: the sketch's resolution and size (unset: the library's defaults).
+  optional uint32 quantile_mantissa_bits = 3;
+  optional uint32 quantile_max_buckets = 4;
+  // `BLOOM`: the filter's size and hash count.
+  uint32 bloom_bits = 5;
+  uint32 bloom_hashes = 6;
+}
+
+enum AggregationKind {
+  AGGREGATION_KIND_UNSPECIFIED = 0;
+  AGGREGATION_KIND_SUM = 1;
+  AGGREGATION_KIND_MIN = 2;
+  AGGREGATION_KIND_MAX = 3;
+  AGGREGATION_KIND_HLL = 4;
+  AGGREGATION_KIND_BIT_OR = 5;
+  AGGREGATION_KIND_BIT_AND = 6;
+  AGGREGATION_KIND_BIT_XOR = 7;
+  AGGREGATION_KIND_MIN_F64 = 8;
+  AGGREGATION_KIND_MAX_F64 = 9;
+  AGGREGATION_KIND_SUM_F64 = 10;
+  AGGREGATION_KIND_MEAN_VAR = 11;
+  AGGREGATION_KIND_HISTOGRAM = 12;
+  AGGREGATION_KIND_QUANTILES = 13;
+  AGGREGATION_KIND_BLOOM = 14;
+  AGGREGATION_KIND_SET = 15;
+}
+
+message VectorSpec {
+  uint32 dim = 1;
+  Element element = 2;
+  Metric metric = 3;
+}
+
+message Compression {
+  CompressionCodec codec = 1;
+  // `ZSTD`: libzstd's level, 1 to 22 (0: 3).
+  int32 zstd_level = 2;
+}
+
+enum CompressionCodec {
+  // The library's default (LZ4).
+  COMPRESSION_CODEC_UNSPECIFIED = 0;
+  COMPRESSION_CODEC_NONE = 1;
+  COMPRESSION_CODEC_LZ4 = 2;
+  COMPRESSION_CODEC_ZSTD = 3;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+}
+
+enum CompactionStyle {
+  COMPACTION_STYLE_UNSPECIFIED = 0;
+  COMPACTION_STYLE_LEVELED = 1;
+  COMPACTION_STYLE_TIERED = 2;
+  COMPACTION_STYLE_FIFO_BY_TIME = 3;
+}
