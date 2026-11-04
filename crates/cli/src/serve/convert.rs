@@ -40,7 +40,7 @@ pub(crate) fn commit_info(c: pigeonhole::CommitInfo) -> proto::CommitInfo {
 }
 
 /// A vector's elements, decoded from the packed little-endian bytes.
-enum Elements {
+pub(crate) enum Elements {
     F32(Vec<f32>),
     I8(Vec<i8>),
     Bits(Vec<u8>),
@@ -101,11 +101,6 @@ fn elements(v: &proto::Vector) -> Result<Elements> {
             }
         },
     )
-}
-
-/// Whether `v`'s data fits its element type and dimension.
-pub(crate) fn check_vector(v: &proto::Vector) -> Result<()> {
-    elements(v).map(|_| ())
 }
 
 fn value_of(v: Option<&proto::Value>) -> Result<&value::Kind> {
@@ -241,96 +236,230 @@ pub(crate) fn batch(
     Ok(())
 }
 
-/// Buffers one row's `writes` in a transaction: the same ops as a row mutation.
-pub(crate) fn txn_writes(
+/// A typed value, decoded from its proto form.
+pub(crate) enum Typed<'w> {
+    Bytes(&'w [u8]),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Vector(Elements),
+}
+
+/// One transaction write, checked and decoded (simp724's T1 on #1511): a request's writes are
+/// all prepared before any is buffered, so a malformed one fails the call with nothing in
+/// the transaction, and buffering what was prepared can't fail on the server's side.
+pub(crate) enum TxnOp<'w> {
+    Put {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        value: Typed<'w>,
+    },
+    Incr {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        delta: i64,
+    },
+    Aggregate {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        input: Typed<'w>,
+    },
+    Merge {
+        family: &'w str,
+        qualifier: &'w [u8],
+        operand: &'w [u8],
+    },
+    DeleteCell {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: u64,
+    },
+    DeleteColumn {
+        family: &'w str,
+        qualifier: &'w [u8],
+    },
+    DeleteFamily {
+        family: &'w str,
+    },
+    DeleteRow,
+}
+
+fn typed(kind: &value::Kind) -> Result<Typed<'_>> {
+    Ok(match kind {
+        value::Kind::Bytes(b) => Typed::Bytes(b),
+        value::Kind::I64(n) => Typed::I64(*n),
+        value::Kind::U64(n) => Typed::U64(*n),
+        value::Kind::F64(x) => Typed::F64(*x),
+        value::Kind::Vector(v) => Typed::Vector(elements(v)?),
+    })
+}
+
+/// Checks and decodes a row's `writes` for a transaction, buffering nothing.
+pub(crate) fn txn_ops(writes: &[proto::Write]) -> Result<Vec<TxnOp<'_>>> {
+    writes
+        .iter()
+        .map(|w| {
+            Ok(
+                match w
+                    .op
+                    .as_ref()
+                    .ok_or_else(|| ApiError::invalid("a write needs an op"))?
+                {
+                    write::Op::Put(p) => TxnOp::Put {
+                        family: &p.family,
+                        qualifier: &p.qualifier,
+                        ts: p.timestamp,
+                        value: typed(value_of(p.value.as_ref())?)?,
+                    },
+                    write::Op::Incr(i) => TxnOp::Incr {
+                        family: &i.family,
+                        qualifier: &i.qualifier,
+                        ts: i.timestamp,
+                        delta: i.delta,
+                    },
+                    write::Op::Aggregate(a) => {
+                        let input = typed(value_of(a.input.as_ref())?)?;
+                        if matches!(input, Typed::Vector(_)) {
+                            return Err(ApiError::invalid(
+                                "an aggregate input is an i64, u64, f64 or bytes",
+                            ));
+                        }
+                        TxnOp::Aggregate {
+                            family: &a.family,
+                            qualifier: &a.qualifier,
+                            ts: a.timestamp,
+                            input,
+                        }
+                    }
+                    write::Op::Merge(g) => TxnOp::Merge {
+                        family: &g.family,
+                        qualifier: &g.qualifier,
+                        operand: &g.operand,
+                    },
+                    write::Op::DeleteCell(d) => TxnOp::DeleteCell {
+                        family: &d.family,
+                        qualifier: &d.qualifier,
+                        ts: d.timestamp,
+                    },
+                    write::Op::DeleteColumn(d) => TxnOp::DeleteColumn {
+                        family: &d.family,
+                        qualifier: &d.qualifier,
+                    },
+                    write::Op::DeleteFamily(d) => TxnOp::DeleteFamily { family: &d.family },
+                    write::Op::DeleteRow(_) => TxnOp::DeleteRow,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Buffers prepared ops in a transaction. Nothing here fails: what only the engine can check
+/// (a family, a size) is recorded in the transaction and fails its commit, as in-process.
+pub(crate) fn txn_apply(
     t: &mut pigeonhole::Transaction,
     table: &Table,
     row: &[u8],
-    writes: &[proto::Write],
-) -> Result<()> {
-    for w in writes {
-        match w
-            .op
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
-        {
-            write::Op::Put(p) => {
-                let (f, q) = (p.family.as_str(), &p.qualifier[..]);
-                match (value_of(p.value.as_ref())?, p.timestamp) {
-                    (value::Kind::Bytes(b), None) => t.put(table, row, f, q, b),
-                    (value::Kind::Bytes(b), Some(ts)) => t.put_at(table, row, f, q, ts, b),
-                    (value::Kind::I64(n), None) => t.put_i64(table, row, f, q, *n),
-                    (value::Kind::I64(n), Some(ts)) => t.put_i64_at(table, row, f, q, ts, *n),
-                    (value::Kind::F64(x), None) => t.put_f64(table, row, f, q, *x),
-                    (value::Kind::F64(x), Some(ts)) => t.put_f64_at(table, row, f, q, ts, *x),
-                    (value::Kind::U64(n), None) => t.put_u64(table, row, f, q, *n),
-                    (value::Kind::U64(n), Some(ts)) => t.put_u64_at(table, row, f, q, ts, *n),
-                    (value::Kind::Vector(v), ts) => match (elements(v)?, ts) {
-                        (Elements::F32(x), None) => t.put_vector_f32(table, row, f, q, &x),
+    ops: &[TxnOp<'_>],
+) {
+    for op in ops {
+        match op {
+            TxnOp::Put {
+                family: f,
+                qualifier: q,
+                ts,
+                value,
+            } => {
+                let (f, q) = (*f, *q);
+                match (value, *ts) {
+                    (Typed::Bytes(b), None) => t.put(table, row, f, q, b),
+                    (Typed::Bytes(b), Some(ts)) => t.put_at(table, row, f, q, ts, b),
+                    (Typed::I64(n), None) => t.put_i64(table, row, f, q, *n),
+                    (Typed::I64(n), Some(ts)) => t.put_i64_at(table, row, f, q, ts, *n),
+                    (Typed::F64(x), None) => t.put_f64(table, row, f, q, *x),
+                    (Typed::F64(x), Some(ts)) => t.put_f64_at(table, row, f, q, ts, *x),
+                    (Typed::U64(n), None) => t.put_u64(table, row, f, q, *n),
+                    (Typed::U64(n), Some(ts)) => t.put_u64_at(table, row, f, q, ts, *n),
+                    (Typed::Vector(v), ts) => match (v, ts) {
+                        (Elements::F32(x), None) => t.put_vector_f32(table, row, f, q, x),
                         (Elements::F32(x), Some(ts)) => {
-                            t.put_vector_f32_at(table, row, f, q, ts, &x)
+                            t.put_vector_f32_at(table, row, f, q, ts, x)
                         }
-                        (Elements::I8(x), None) => t.put_vector_i8(table, row, f, q, &x),
-                        (Elements::I8(x), Some(ts)) => t.put_vector_i8_at(table, row, f, q, ts, &x),
-                        (Elements::Bits(x), None) => t.put_vector_bits(table, row, f, q, &x),
+                        (Elements::I8(x), None) => t.put_vector_i8(table, row, f, q, x),
+                        (Elements::I8(x), Some(ts)) => t.put_vector_i8_at(table, row, f, q, ts, x),
+                        (Elements::Bits(x), None) => t.put_vector_bits(table, row, f, q, x),
                         (Elements::Bits(x), Some(ts)) => {
-                            t.put_vector_bits_at(table, row, f, q, ts, &x)
+                            t.put_vector_bits_at(table, row, f, q, ts, x)
                         }
-                        (Elements::F16(x), None) => t.put_vector_f16(table, row, f, q, &x),
+                        (Elements::F16(x), None) => t.put_vector_f16(table, row, f, q, x),
                         (Elements::F16(x), Some(ts)) => {
-                            t.put_vector_f16_at(table, row, f, q, ts, &x)
+                            t.put_vector_f16_at(table, row, f, q, ts, x)
                         }
-                        (Elements::Bf16(x), None) => t.put_vector_bf16(table, row, f, q, &x),
+                        (Elements::Bf16(x), None) => t.put_vector_bf16(table, row, f, q, x),
                         (Elements::Bf16(x), Some(ts)) => {
-                            t.put_vector_bf16_at(table, row, f, q, ts, &x)
+                            t.put_vector_bf16_at(table, row, f, q, ts, x)
                         }
                     },
                 };
             }
-            write::Op::Incr(i) => {
-                match i.timestamp {
-                    None => t.incr(table, row, &i.family, &i.qualifier, i.delta),
-                    Some(ts) => t.incr_at(table, row, &i.family, &i.qualifier, ts, i.delta),
+            TxnOp::Incr {
+                family,
+                qualifier,
+                ts,
+                delta,
+            } => {
+                match ts {
+                    None => t.incr(table, row, family, qualifier, *delta),
+                    Some(ts) => t.incr_at(table, row, family, qualifier, *ts, *delta),
                 };
             }
-            write::Op::Aggregate(a) => {
-                let (f, q) = (a.family.as_str(), &a.qualifier[..]);
-                match (value_of(a.input.as_ref())?, a.timestamp) {
-                    (value::Kind::I64(n), None) => t.aggregate(table, row, f, q, *n),
-                    (value::Kind::I64(n), Some(ts)) => t.aggregate_at(table, row, f, q, ts, *n),
-                    (value::Kind::U64(n), None) => t.aggregate_u64(table, row, f, q, *n),
-                    (value::Kind::U64(n), Some(ts)) => t.aggregate_u64_at(table, row, f, q, ts, *n),
-                    (value::Kind::F64(x), None) => t.aggregate_f64(table, row, f, q, *x),
-                    (value::Kind::F64(x), Some(ts)) => t.aggregate_f64_at(table, row, f, q, ts, *x),
-                    (value::Kind::Bytes(b), None) => t.aggregate_bytes(table, row, f, q, b),
-                    (value::Kind::Bytes(b), Some(ts)) => {
-                        t.aggregate_bytes_at(table, row, f, q, ts, b)
-                    }
-                    (value::Kind::Vector(_), _) => {
-                        return Err(ApiError::invalid(
-                            "an aggregate input is an i64, u64, f64 or bytes",
-                        ));
-                    }
+            TxnOp::Aggregate {
+                family: f,
+                qualifier: q,
+                ts,
+                input,
+            } => {
+                let (f, q) = (*f, *q);
+                match (input, *ts) {
+                    (Typed::I64(n), None) => t.aggregate(table, row, f, q, *n),
+                    (Typed::I64(n), Some(ts)) => t.aggregate_at(table, row, f, q, ts, *n),
+                    (Typed::U64(n), None) => t.aggregate_u64(table, row, f, q, *n),
+                    (Typed::U64(n), Some(ts)) => t.aggregate_u64_at(table, row, f, q, ts, *n),
+                    (Typed::F64(x), None) => t.aggregate_f64(table, row, f, q, *x),
+                    (Typed::F64(x), Some(ts)) => t.aggregate_f64_at(table, row, f, q, ts, *x),
+                    (Typed::Bytes(b), None) => t.aggregate_bytes(table, row, f, q, b),
+                    (Typed::Bytes(b), Some(ts)) => t.aggregate_bytes_at(table, row, f, q, ts, b),
+                    // `txn_ops` refuses a vector input.
+                    (Typed::Vector(_), _) => t,
                 };
             }
-            write::Op::Merge(g) => {
-                t.merge(table, row, &g.family, &g.qualifier, &g.operand);
+            TxnOp::Merge {
+                family,
+                qualifier,
+                operand,
+            } => {
+                t.merge(table, row, family, qualifier, operand);
             }
-            write::Op::DeleteCell(d) => {
-                t.delete_cell(table, row, &d.family, &d.qualifier, d.timestamp);
+            TxnOp::DeleteCell {
+                family,
+                qualifier,
+                ts,
+            } => {
+                t.delete_cell(table, row, family, qualifier, *ts);
             }
-            write::Op::DeleteColumn(d) => {
-                t.delete_column(table, row, &d.family, &d.qualifier);
+            TxnOp::DeleteColumn { family, qualifier } => {
+                t.delete_column(table, row, family, qualifier);
             }
-            write::Op::DeleteFamily(d) => {
-                t.delete_family(table, row, &d.family);
+            TxnOp::DeleteFamily { family } => {
+                t.delete_family(table, row, family);
             }
-            write::Op::DeleteRow(_) => {
+            TxnOp::DeleteRow => {
                 t.delete_row(table, row);
             }
         }
     }
-    Ok(())
 }
 
 pub(crate) fn condition(c: Option<&proto::Condition>) -> Result<pigeonhole::Condition> {

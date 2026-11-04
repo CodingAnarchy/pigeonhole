@@ -890,20 +890,22 @@ impl Service {
         }
     }
 
-    /// The tables `rows` name, opened before the transaction is taken out, so a missing table
-    /// fails the call without touching the session.
-    async fn row_tables<'r>(
+    /// A request's rows, ready to buffer: each row's table opened and every write checked
+    /// and decoded (`convert::txn_ops`), all before the transaction is taken out. So a missing
+    /// table or a malformed write fails the call with nothing buffered (simp724's T1 on
+    /// #1511), and buffering the rest can't fail on the server's side.
+    async fn txn_rows<'r>(
         &self,
         rows: &'r [proto::RowWrites],
-    ) -> Result<Vec<(Table, &'r [u8], &'r [proto::Write])>, ApiError> {
+    ) -> Result<Vec<(Table, &'r [u8], Vec<convert::TxnOp<'r>>)>, ApiError> {
         let mut out = Vec::with_capacity(rows.len());
         for rw in rows {
             let key = rw
                 .row
                 .as_ref()
                 .ok_or_else(|| ApiError::invalid("each row's writes name its table and row"))?;
-            check_writes(&rw.writes)?;
-            out.push((self.table(&key.table).await?, &key.row[..], &rw.writes[..]));
+            let ops = convert::txn_ops(&rw.writes)?;
+            out.push((self.table(&key.table).await?, &key.row[..], ops));
         }
         Ok(out)
     }
@@ -955,18 +957,17 @@ impl Service {
         })
     }
 
-    /// `Transactions.Write`: buffers the writes. They're checked before any is buffered, so a
-    /// malformed request buffers nothing; what only the engine can check (a family, a size)
-    /// fails the `Commit`, as in-process.
+    /// `Transactions.Write`: buffers the writes, all or none (`txn_rows`). What only the
+    /// engine can check (a family, a size) fails the `Commit`, as in-process.
     async fn txn_write(
         &self,
         r: proto::TxnWriteRequest,
         caller: &Caller,
     ) -> Result<proto::Empty, ApiError> {
-        let rows = self.row_tables(&r.rows).await?;
+        let rows = self.txn_rows(&r.rows).await?;
         let mut g = self.open_txn(&r.txn_id, caller)?;
-        for (table, row, writes) in &rows {
-            convert::txn_writes(g.txn(), table, row, writes)?;
+        for (table, row, ops) in &rows {
+            convert::txn_apply(g.txn(), table, row, ops);
         }
         Ok(proto::Empty {})
     }
@@ -983,7 +984,7 @@ impl Service {
         if !r.rows.is_empty() && caller.scope < Scope::Write {
             return Err(ApiError::permission_denied("commit writes"));
         }
-        let rows = self.row_tables(&r.rows).await?;
+        let rows = self.txn_rows(&r.rows).await?;
         let mut g = match self.sessions.take(&r.txn_id, caller.token)? {
             Taken::Open(g) => g,
             Taken::Done(outcome) => {
@@ -992,8 +993,8 @@ impl Service {
                 });
             }
         };
-        for (table, row, writes) in &rows {
-            convert::txn_writes(g.txn(), table, row, writes)?;
+        for (table, row, ops) in &rows {
+            convert::txn_apply(g.txn(), table, row, ops);
         }
         drop(rows);
         let (txn, durability, ticket) = g.commit();
@@ -1373,41 +1374,6 @@ async fn room<'a>(
             )))
         }
     }
-}
-
-/// The checks `convert::txn_writes` makes, without buffering anything, so a transaction's
-/// `Write` or `Commit` is all or nothing on the server's side.
-fn check_writes(writes: &[proto::Write]) -> Result<(), ApiError> {
-    use proto::write::Op;
-    for w in writes {
-        match w
-            .op
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
-        {
-            Op::Put(p) => {
-                let kind = p
-                    .value
-                    .as_ref()
-                    .and_then(|v| v.kind.as_ref())
-                    .ok_or_else(|| ApiError::invalid("a put needs a value"))?;
-                if let proto::value::Kind::Vector(v) = kind {
-                    convert::check_vector(v)?;
-                }
-            }
-            Op::Aggregate(a) => match a.input.as_ref().and_then(|v| v.kind.as_ref()) {
-                None => return Err(ApiError::invalid("a put needs a value")),
-                Some(proto::value::Kind::Vector(_)) => {
-                    return Err(ApiError::invalid(
-                        "an aggregate input is an i64, u64, f64 or bytes",
-                    ));
-                }
-                Some(_) => {}
-            },
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// A row's size by D308's measure as the converted cells give it: its key and its cells.

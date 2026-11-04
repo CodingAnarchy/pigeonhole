@@ -1444,3 +1444,33 @@ fn reads_at_a_pinned_snapshot_agree_until_it_is_released() {
         "{text}"
     );
 }
+
+#[test]
+fn a_write_list_that_fails_partway_buffers_none_of_it() {
+    // simp724's T1 on #1511: two good writes, then a vector whose data doesn't fit its
+    // dimension. The client gets InvalidArgument ("not applied"), so nothing may be buffered.
+    let s = Server::start("", limits());
+    let mut rows = txn_rows("p1", b"1");
+    rows.as_array_mut()
+        .unwrap()
+        .extend(txn_rows("p2", b"2").as_array().unwrap().iter().cloned());
+    rows.as_array_mut().unwrap().push(json!({
+        "row": {"table": "t", "row": b64(b"p3")},
+        "writes": [{"put": {"family": "f", "qualifier": b64(b"q"),
+            "value": {"vector": {"element": "ELEMENT_F32", "dim": 2, "data": b64(&[0; 3])}}}}]
+    }));
+    for rpc in ["Transactions/Write", "Transactions/Commit"] {
+        let id = begin(&s, None);
+        let (status, e) = s.rpc(rpc, &json!({"txn_id": id, "rows": rows}), None);
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (400, Some("InvalidArgument")),
+            "{rpc}: {e}"
+        );
+        // The session is still open, and a Commit with no rows commits nothing of it.
+        let (status, body) = s.rpc("Transactions/Commit", &json!({"txn_id": id}), None);
+        assert_eq!(status, 200, "{rpc}: {body}");
+        assert_eq!(cell(&s, "p1", None), None, "{rpc}");
+        assert_eq!(cell(&s, "p2", None), None, "{rpc}");
+    }
+}
