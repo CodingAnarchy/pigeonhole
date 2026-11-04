@@ -39,6 +39,11 @@ use pigeonhole_shm::ShmRegion;
 
 /// The token's format version.
 const TOKEN_VERSION: u8 = 1;
+/// A token from a feed of every table (D315; simp724's S1 on #1487). Only it resumes such a
+/// feed: a feed of some tables' token sits past commits of the others it never followed, so
+/// resuming every table from it would skip them. A build that doesn't know this version
+/// refuses the token as not one (`InvalidArgument`), never misreading it.
+const TOKEN_VERSION_ALL: u8 = 2;
 
 /// How long a waiting reader sleeps when the frontier is held by the change feed's own
 /// holds (a lazy flush or background sync to come) or a stream's next segment header is not
@@ -64,8 +69,9 @@ pub enum FeedStart {
 #[derive(Debug, Clone)]
 pub struct FeedSpec {
     /// The tables, each fed by the session. Empty: every table (D315), including tables
-    /// created after the feed opened; the session must feed every table (the change feed
-    /// on without a table list), and so must every session of its history.
+    /// created after the feed opened. An empty list is accepted only when the session feeds
+    /// every table (the change feed on without a table list); every session of its history
+    /// must have too, and it resumes only from a token of a feed of every table.
     pub tables: Vec<TableId>,
     /// Only mutations of rows starting with these bytes (empty: every row).
     pub prefix: Vec<u8>,
@@ -646,7 +652,11 @@ impl FeedReader {
     /// commit [`FeedReader::try_next`] returned, never inside one (§2.5).
     pub fn token(&self) -> Vec<u8> {
         let mut t = Vec::with_capacity(1 + 16 + 4 + 8 + 8 + 16 * self.streams.len());
-        t.push(TOKEN_VERSION);
+        t.push(if self.tables.is_empty() {
+            TOKEN_VERSION_ALL
+        } else {
+            TOKEN_VERSION
+        });
         t.extend_from_slice(&self.shared.pager.db_id());
         t.extend_from_slice(&(self.streams.len() as u32).to_le_bytes());
         t.extend_from_slice(&self.delivered.to_le_bytes());
@@ -691,8 +701,18 @@ impl FeedReader {
     ) -> Result<std::result::Result<Vec<(Lsn, Option<Lsn>)>, Expiry>> {
         let bad = || Error::InvalidArgument("not a change feed token".into());
         let (&version, rest) = bytes.split_first().ok_or_else(bad)?;
-        if version != TOKEN_VERSION || rest.len() < 16 + 4 + 8 + 8 {
+        if !matches!(version, TOKEN_VERSION | TOKEN_VERSION_ALL) || rest.len() < 16 + 4 + 8 + 8 {
             return Err(bad());
+        }
+        // A feed of every table resumes only from a token of one (simp724's S1 on #1487). A
+        // feed of some tables may resume from an all-tables token: it follows a subset of
+        // what that feed did, from the same position.
+        if self.tables.is_empty() && version != TOKEN_VERSION_ALL {
+            return Err(Error::InvalidArgument(
+                "a feed of every table can't resume from a token of a feed of some tables: \
+                 the other tables' commits before it would be skipped"
+                    .into(),
+            ));
         }
         let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
         if rest[..16] != db_id {
