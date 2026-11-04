@@ -1,2 +1,0 @@
-### Added
-- Ruby bindings: the source gem, for platforms without a precompiled native gem (#697, ICR 0111). `rake gem:source` builds it with the engine's crates vendored, so `gem install` compiles the extension anywhere with Rust 1.96 or later, using the versions `Cargo.lock` pins (the extension now builds with `--locked`). CI builds the gem and installs it from outside the checkout on Linux and macOS. Nothing is published to RubyGems yet.

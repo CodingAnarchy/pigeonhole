@@ -1,13 +1,19 @@
 # Ruby
 
-> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111): the core API, vectors, graphs, byte budgets, the change feed, agent memory, full-text search and the vector index. Nothing has been published to RubyGems yet.
+> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111): the core API, vectors, graphs, byte budgets, the change feed, agent memory, full-text search and the vector index.
 
 The `pigeonhole-db` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
 ## Install
-The gem is **`pigeonhole-db`** (`gem install pigeonhole-db`, or `gem "pigeonhole-db"` in a Gemfile), the same name as the Python package. You still `require "pigeonhole"`, and the module is `Pigeonhole`. `require "pigeonhole-db"` works too, so `Bundler.require` (Rails) loads it from the plain Gemfile line.
+The gem is **`pigeonhole-db`**, the same name as the Python package. You still `require "pigeonhole"`, and the module is `Pigeonhole`. `require "pigeonhole-db"` works too, so `Bundler.require` (Rails) loads it from a plain `gem "pigeonhole-db"` Gemfile line.
 
-Until the gem is published, build it from a checkout (Rust and Bundler needed):
+```sh
+gem install pigeonhole-db
+```
+
+Native gems cover Linux (glibc and musl, x86_64 and aarch64), macOS (x86_64 and arm64) and Windows (x64, UCRT). On any other platform, `gem install` picks the source gem and compiles the extension (below).
+
+To build from a checkout instead (Rust and Bundler needed):
 
 ```sh
 cd crates/ruby

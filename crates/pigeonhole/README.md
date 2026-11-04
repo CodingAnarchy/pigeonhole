@@ -4,8 +4,8 @@
 column families, sparse qualifiers, timestamped versions, TTLs, prefix and range scans) with
 SQLite's deployment model (one file, a library, no server).
 
-> **Maturity: 1.0.** The public API of `pigeonhole`, `pigeonhole-arrow` and `phdb` follows
-> semver from 1.0.0 (D282), and every 1.x release reads and writes file format 4 (the
+> **Maturity: 1.x.** The public API of `pigeonhole`, its companion crates and `phdb` follows
+> semver, from 1.0.0 or a crate's first release (D282), and every 1.x release reads and writes file format 4 (the
 > [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)).
 > All four phases are complete, each with its performance gate on the reference machine:
 > the core engine, the wide-column model, the latency engine and hardening.
@@ -39,7 +39,7 @@ cargo add pigeonhole
 or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
 [docs.rs](https://docs.rs/pigeonhole). See the
 [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md) and the
-[1.0.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0).
+[1.1.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0).
 
 ## Quickstart
 

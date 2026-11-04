@@ -1,2 +1,0 @@
-### Added
-- Reader processes follow the change feed in Python and `phdb mcp` (#1361, D310 PR 4): `Table.feed(...)` on a reader's table (`open_reader(path).table(...)`), and `phdb mcp --read-only`'s `feed_poll` beside a running application. A feed follows a writer restart. While no writer runs, `next` raises `NoWriter` (or `SnapshotExpired` while a new one starts), and calling it again on the same feed continues.

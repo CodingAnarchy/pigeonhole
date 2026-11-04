@@ -30,4 +30,4 @@ with ph.open("app.phdb", create=True) as db:
 - **Processes:** one writer process per database, and any number of readers through `ph.open_reader(path)`.
 - **`fork`:** a forked child can't use handles it inherited. Open databases inside each `multiprocessing` worker, or use the `spawn` or `forkserver` start method.
 
-**Status:** pre-release (#696). It isn't on PyPI yet.
+**Status:** new in 1.1.0 (#696). The package's version is the `pigeonhole` crate's.

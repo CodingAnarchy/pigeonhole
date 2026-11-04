@@ -1,2 +1,0 @@
-### Added
-- `pigeonhole-vector`: writes inside a caller's transaction, and prefixed searches (D311 T8, #1342, ICR 0100). `Index::insert_f32_in` (with the other elements) and `Index::delete_in` write the index in the caller's `Transaction`, so a vector commits or rolls back with the rest. `Index::after_commit` then splits or merges what the write left out of bounds. `Search::id_prefix` keeps only ids with a prefix, widening the lists it probes until it finds `k` hits (capped by `Search::max_probe`), and `Search::run_with_stats` reports the lists probed.
