@@ -197,6 +197,13 @@ pub struct Metrics {
     /// interval, divided by the interval, is how many threads' worth of polling the store
     /// did: awake time its clients caused without work behind it.
     pub shard_spin_time_nanos: u64,
+    /// Caller-runs (#1176): turns committing clients ran on the shards that handled a
+    /// message, summed over shards; 0 with it off.
+    pub caller_turns: u64,
+    /// Caller-runs' evaluation split (the `caller-stats` feature; zeros without it):
+    /// caller-run commits resolved in the client's own turn, another client's, and the
+    /// driver's.
+    pub caller_resolved: [u64; 3],
     /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
     /// commits every shard completed (D257), plus each cross-shard commit's time from
     /// submit to the decision at every participant (D262). Its rise over an interval,
@@ -1783,6 +1790,22 @@ impl Engine {
             .map_or(0, |subs| subs.iter().map(|s| s.caller_turns()).sum())
     }
 
+    /// Caller-run commits by who resolved them, `[own client's turn, another client's, the
+    /// driver's]` (the caller-runs evaluation's split, #1176 rev 3.1 C1; `caller-stats`).
+    #[cfg(feature = "caller-stats")]
+    #[doc(hidden)]
+    pub fn caller_resolutions(&self) -> [u64; 3] {
+        self.inner.shared.caller_stats.counts()
+    }
+
+    /// The calling thread's last caller-run commit: 0 resolved in its own turn, 1 in another
+    /// client's, 2 by the driver; 3 none yet (`caller-stats`, #1176).
+    #[cfg(feature = "caller-stats")]
+    #[doc(hidden)]
+    pub fn last_caller_class() -> u8 {
+        crate::write::last_caller_class()
+    }
+
     /// Creates a table with its families (a manifest commit).
     pub fn create_table(
         &self,
@@ -3256,6 +3279,10 @@ impl Engine {
                 m.reader_pin_lag = (views, seqnos);
             }
         }
+        #[cfg(feature = "caller-stats")]
+        {
+            m.caller_resolved = shared.caller_stats.counts();
+        }
         m.shard_commit_inflight_nanos = shared
             .metrics
             .iter()
@@ -3269,6 +3296,7 @@ impl Engine {
                 m.shard_busy_nanos += sub.busy_nanos();
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
                 m.shard_spin_time_nanos += sub.spin_nanos();
+                m.caller_turns += sub.caller_turns();
                 let (fallbacks, room) = sub.background_take_backs();
                 m.background_take_backs.0 += fallbacks;
                 m.background_take_backs.1 += room;
@@ -5985,6 +6013,8 @@ impl Shared {
             commit_spin_nanos: options.commit_spin_nanos,
             caller_runs: options.caller_runs,
             caller_spin_extend_nanos: options.caller_spin_extend_nanos,
+            #[cfg(feature = "caller-stats")]
+            caller_stats: Default::default(),
             tail_index: false,
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),

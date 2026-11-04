@@ -83,11 +83,26 @@ fn recycle(batch: Option<BatchBuilder>) {
 pub(crate) struct Settled {
     pub(crate) info: CommitInfo,
     pub(crate) batch: Option<BatchBuilder>,
+    /// Caller-runs' evaluation (#1176, the `caller-stats` feature): a committing client's
+    /// turn resolved it, not the shard's driver.
+    #[cfg(feature = "caller-stats")]
+    pub(crate) by_caller: bool,
+}
+
+impl Settled {
+    pub(crate) fn new(info: CommitInfo, batch: Option<BatchBuilder>) -> Self {
+        Self {
+            info,
+            batch,
+            #[cfg(feature = "caller-stats")]
+            by_caller: pigeonhole_runtime::in_caller_turn(),
+        }
+    }
 }
 
 impl From<CommitInfo> for Settled {
     fn from(info: CommitInfo) -> Self {
-        Self { info, batch: None }
+        Self::new(info, None)
     }
 }
 
@@ -576,13 +591,13 @@ fn wait_body(
     let window = if spins { shared.commit_spin_nanos } else { 0 };
     if window == 0 {
         // No spin: exactly the parking wait.
-        let Settled { info, batch } = wait_reply(shared, waiter)?;
+        let Settled { info, batch, .. } = wait_reply(shared, waiter)?;
         recycle(batch);
         wait_visible(shared, info.seqno)?;
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
-    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    let Settled { info, batch, .. } = wait_reply_spinning(shared, waiter, &mut spin)?;
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
     Ok(info)
@@ -897,7 +912,7 @@ impl Future for PendingCommit {
                 Poll::Pending => return pending_or_forked(&this.sub.shared),
                 Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.sub.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                Poll::Ready(Some(Ok(Settled { info, batch }))) => {
+                Poll::Ready(Some(Ok(Settled { info, batch, .. }))) => {
                     recycle(batch);
                     this.resolved = Some(info);
                     info
@@ -1340,7 +1355,16 @@ pub(crate) fn wait_blocking_as_caller(
 ) -> crate::Result<CommitInfo> {
     let r = (|| {
         let mut spin = SpinWait::new(shared.commit_spin_nanos);
-        let Settled { info, batch } = wait_reply_as_caller(shared, waiter, &mut spin, shard)?;
+        let (settled, _own) = wait_reply_as_caller(shared, waiter, &mut spin, shard)?;
+        #[cfg(feature = "caller-stats")]
+        shared.caller_stats.record(if _own {
+            0
+        } else if settled.by_caller {
+            1
+        } else {
+            2
+        });
+        let Settled { info, batch, .. } = settled;
         recycle(batch);
         wait_visible_spinning(shared, info.seqno, &mut spin)?;
         Ok(info)
@@ -1357,11 +1381,13 @@ fn wait_reply_as_caller<T: Send>(
     waiter: &mut Waiter<crate::Result<T>>,
     spin: &mut SpinWait,
     shard: pigeonhole_runtime::ShardId,
-) -> crate::Result<T> {
+) -> crate::Result<(T, bool)> {
     if shared.drivers.current_drives() {
         // A thread that drives a shard never blocks here (D88): as `wait_reply_spinning`.
-        return wait_reply_spinning(shared, waiter, spin);
+        return wait_reply_spinning(shared, waiter, spin).map(|t| (t, false));
     }
+    // Whether the reply resolved inside this thread's own turn (the evaluation's "own").
+    let mut own = false;
     let sub = shared.submitter(shard);
     let mut polled = None;
     let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
@@ -1382,6 +1408,7 @@ fn wait_reply_as_caller<T: Send>(
         polls = polls.wrapping_add(1);
         if polls.is_multiple_of(CALLER_POLLS) {
             sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+            own |= polled.is_some();
             return polled.is_some();
         }
         false
@@ -1396,6 +1423,7 @@ fn wait_reply_as_caller<T: Send>(
             n = n.wrapping_add(1);
             if n.is_multiple_of(CALLER_POLLS) {
                 sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+                own |= polled.is_some();
             }
             if polled.is_none() {
                 ready_now(waiter, &mut polled);
@@ -1404,8 +1432,40 @@ fn wait_reply_as_caller<T: Send>(
         }
     }
     match polled {
-        Some(Poll::Ready(Some(r))) => r,
+        Some(Poll::Ready(Some(r))) => r.map(|t| (t, own)),
         Some(Poll::Ready(None)) => Err(dropped_reply(shared)),
-        _ => park_for_reply(shared, waiter),
+        _ => park_for_reply(shared, waiter).map(|t| (t, false)),
     }
+}
+
+/// Caller-runs' evaluation counts (#1176, the `caller-stats` feature): caller-run commits by
+/// who resolved them, `[own client, another client, the driver]`, and this thread's last.
+#[cfg(feature = "caller-stats")]
+#[derive(Debug, Default)]
+pub(crate) struct CallerStats([std::sync::atomic::AtomicU64; 3]);
+
+#[cfg(feature = "caller-stats")]
+thread_local! {
+    /// The class of this thread's last caller-run commit (0 own, 1 other, 2 driver; 3 none).
+    static LAST_CLASS: std::cell::Cell<u8> = const { std::cell::Cell::new(3) };
+}
+
+#[cfg(feature = "caller-stats")]
+impl CallerStats {
+    fn record(&self, class: u8) {
+        self.0[usize::from(class)].fetch_add(1, Ordering::Relaxed);
+        LAST_CLASS.with(|c| c.set(class));
+    }
+
+    /// `[own, other, driver]` so far.
+    pub(crate) fn counts(&self) -> [u64; 3] {
+        std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed))
+    }
+}
+
+/// The class of the calling thread's last caller-run commit: 0 its own turn, 1 another
+/// client's, 2 the driver's; 3 none yet (`caller-stats`).
+#[cfg(feature = "caller-stats")]
+pub(crate) fn last_caller_class() -> u8 {
+    LAST_CLASS.with(std::cell::Cell::get)
 }

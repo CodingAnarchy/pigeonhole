@@ -189,6 +189,12 @@ fn run(spin_extend_nanos: u64) {
     let turns = db.caller_turns();
     assert!(turns > 0, "no client ran its shard's turn");
     eprintln!("caller turns: {turns} for {} ops", ops * CLIENTS as u64);
+    #[cfg(feature = "caller-stats")]
+    {
+        let [own, other, driver] = db.caller_resolutions();
+        eprintln!("caller-run commits resolved: own {own}, other {other}, driver {driver}");
+        assert!(own + other + driver > 0, "no caller-run commit was counted");
+    }
     let snap = db.snapshot().unwrap();
     for ((t, r), want) in &writes {
         let got = db

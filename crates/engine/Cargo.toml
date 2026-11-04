@@ -29,6 +29,10 @@ smallvec = { workspace = true }
 # Test-only hooks (`src/engine/hooks.rs`), enabled by the dev-dependency below for the
 # engine's own tests and benches; never by the public crate.
 test-hooks = ["pigeonhole-wal/sim-hooks"]
+# Caller-runs' evaluation counters (#1176 rev 3.1, C1): who resolved each caller-run
+# commit (its own client, another client, or the driver). Off by default, so the commit path
+# carries nothing of it; the box evaluation's builds turn it on.
+caller-stats = []
 
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }

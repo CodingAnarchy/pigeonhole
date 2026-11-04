@@ -498,6 +498,31 @@ pub const CALLER_BATCH: usize = 8;
 
 thread_local! {
     static CURRENT_SHARD: Cell<Option<ShardId>> = const { Cell::new(None) };
+    /// The calling thread is in a committing client's turn (caller-runs, #1176).
+    static IN_CALLER_TURN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the calling thread is running a committing client's turn of a shard
+/// (caller-runs, #1176): for the evaluation's count of who resolved a commit.
+#[doc(hidden)]
+pub fn in_caller_turn() -> bool {
+    IN_CALLER_TURN.with(Cell::get)
+}
+
+/// Marks the calling thread as in a caller's turn until dropped.
+struct InCallerTurn;
+
+impl InCallerTurn {
+    fn new() -> Self {
+        IN_CALLER_TURN.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for InCallerTurn {
+    fn drop(&mut self) {
+        IN_CALLER_TURN.with(|c| c.set(false));
+    }
 }
 
 /// Marks the calling thread as running `shard` until dropped.
@@ -703,6 +728,7 @@ impl<H: ShardHandler> ShardCore<H> {
         wants: &std::sync::atomic::AtomicBool,
     ) -> (bool, usize) {
         let _shard = EnterShard::new(self.id);
+        let _caller = InCallerTurn::new();
         let deadline_before = self.next_deadline();
         let ShardCore {
             id,

@@ -25,6 +25,9 @@ async = ["dep:futures-core"]
 # bench use, and the `PIGEONHOLE_IO` / `PIGEONHOLE_DIRECT` test variables. Not part of the
 # API and outside the semver promise; never turn it on in an application.
 __unstable-hooks = []
+# Caller-runs' evaluation split (#1176, `pigeonhole-engine/caller-stats`): the internal
+# metrics `caller_resolved_*` count who resolved each caller-run commit. Off by default.
+caller-stats = ["pigeonhole-engine/caller-stats"]
 
 [dependencies]
 pigeonhole-engine = { workspace = true }
