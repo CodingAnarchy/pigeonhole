@@ -1067,9 +1067,10 @@ fn feed_extra(db: &Pigeonhole) -> String {
 
 /// D314: `commit_returning` increments on a hot counter whose base is an older SST's `Put`.
 /// The first returning commit reads through to that base and leaves a D291 checkpoint at its
-/// own seqno; later ones checkpoint every eight folded operands. Flushed, so the SSTs hold
-/// write-time checkpoints from both paths just below their commits' operands (perf2 on
-/// #1466). Each returned value is the count so far.
+/// own seqno; later ones checkpoint every eight folded operands. The flush's combining may
+/// drop the older checkpoints, so what's sure to be on disk is the newest write-time
+/// checkpoint as the counter's base, at its commit's seqno, with the later operands above it
+/// (perf2 on #1466 and #1472). Each returned value is the count so far.
 fn write_returning(db: &Pigeonhole) {
     let t = db
         .table("returning")
