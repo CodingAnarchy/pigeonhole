@@ -509,6 +509,8 @@ pub(crate) struct Shared {
     pub commit_spin_nanos: u64,
     /// `EngineOptions::caller_runs` (#1176): a waiting committer may run its shard's turn.
     pub caller_runs: bool,
+    /// `EngineOptions::caller_spin_extend_nanos` (#1176 rev 3.1, C1).
+    pub caller_spin_extend_nanos: u64,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
     pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,

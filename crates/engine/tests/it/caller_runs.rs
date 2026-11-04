@@ -24,7 +24,7 @@ const CLIENTS: usize = 16;
 const ROWS_PER_CLIENT: u64 = 16;
 const STALL: Duration = Duration::from_secs(60);
 
-fn options() -> EngineOptions {
+fn options(spin_extend_nanos: u64) -> EngineOptions {
     let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
     o.create_if_missing = true;
     o.shards = SHARDS;
@@ -32,6 +32,7 @@ fn options() -> EngineOptions {
     // Table `t` lands on shard `t % SHARDS`: the two-table commits below cross shards.
     o.tablet_changes = false;
     o.caller_runs = true;
+    o.caller_spin_extend_nanos = spin_extend_nanos;
     o
 }
 
@@ -118,13 +119,27 @@ fn client(
 
 #[test]
 fn callers_running_their_shards_lose_no_write_and_hang_nothing() {
+    run(0);
+}
+
+/// The same with rev 3.1's C1 arm: a waiting committer keeps polling past its spin while
+/// its shard's token is free.
+#[test]
+fn callers_that_keep_polling_while_the_token_is_free_lose_and_hang_nothing() {
+    run(500_000);
+}
+
+fn run(spin_extend_nanos: u64) {
     let ops: u64 = std::env::var("PIGEONHOLE_STRESS_OPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
-    let dir = std::env::temp_dir().join(format!("phdb-caller-runs-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "phdb-caller-runs-{}-{spin_extend_nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    let db = Engine::open(&dir.join("callers.phdb"), options()).unwrap();
+    let db = Engine::open(&dir.join("callers.phdb"), options(spin_extend_nanos)).unwrap();
     let tables: Vec<(TableId, FamilyId)> = (0..TABLES)
         .map(|t| {
             let info = db

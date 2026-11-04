@@ -800,6 +800,36 @@ fn wait_reply_spinning<T: Send>(
         }
         false
     });
+    // Caller-runs' C1 arm (#1176 rev 3.1): past the window, keep polling while the shard's
+    // token is free (a turn to take), up to `caller_spin_extend_nanos`, rather than park.
+    if polled.is_none()
+        && let Some(sub) = submitter
+        && shared.caller_spin_extend_nanos > 0
+    {
+        let end = std::time::Instant::now()
+            + std::time::Duration::from_nanos(shared.caller_spin_extend_nanos);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut n = 0u32;
+        while polled.is_none() && sub.caller_token_free() && std::time::Instant::now() < end {
+            // As in the spin: the token only every `CALLER_POLLS` polls (C3).
+            n = n.wrapping_add(1);
+            if n.is_multiple_of(CALLER_POLLS) {
+                sub.try_caller_turn(&mut || match Pin::new(&mut *waiter).poll(&mut cx) {
+                    Poll::Pending => false,
+                    ready => {
+                        polled = Some(ready);
+                        true
+                    }
+                });
+            }
+            if polled.is_none()
+                && let ready @ Poll::Ready(_) = Pin::new(&mut *waiter).poll(&mut cx)
+            {
+                polled = Some(ready);
+            }
+            std::hint::spin_loop();
+        }
+    }
     match polled {
         Some(Poll::Ready(Some(r))) => return r,
         Some(Poll::Ready(None)) => return Err(dropped_reply(shared)),

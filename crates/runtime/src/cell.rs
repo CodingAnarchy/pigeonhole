@@ -65,6 +65,11 @@ pub(crate) trait CallerTurn: Send + Sync {
     /// Runs a caller's turn if the token is free and the driver doesn't want it. Returns
     /// whether a turn ran.
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool;
+
+    /// Whether a caller could take the token now: no thread holds it and the driver
+    /// doesn't want it (a relaxed look, for a waiting client deciding whether to keep
+    /// polling: rev 3.1, C1).
+    fn is_free(&self) -> bool;
 }
 
 /// An engine-owned shard: its loop state behind the run token.
@@ -182,6 +187,11 @@ impl<H: ShardHandler> ShardCell<H> {
 }
 
 impl<H: ShardHandler> CallerTurn for ShardCell<H> {
+    fn is_free(&self) -> bool {
+        self.run.state.load(Ordering::Relaxed) == FREE
+            && !self.run.driver_wants.load(Ordering::Relaxed)
+    }
+
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         let run = &self.run;
         if run.state.load(Ordering::Relaxed) != FREE || run.driver_wants.load(Ordering::Relaxed) {
@@ -193,10 +203,13 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
         let vfs = Arc::clone(&turn.vfs);
         let start = vfs.monotonic_nanos();
         // No ring: any I/O the turn starts completes inline (#1176 rev 3, §4).
-        let notify = pigeonhole_io::inline_io(|| turn.caller_turn(own_done, &run.driver_wants));
+        let (notify, handled) =
+            pigeonhole_io::inline_io(|| turn.caller_turn(own_done, &run.driver_wants));
         let spent = vfs.monotonic_nanos().saturating_sub(start);
         self.signal.add_busy(spent);
-        self.signal.add_caller_turn();
+        if handled > 0 {
+            self.signal.add_caller_turn();
+        }
         run.caller_busy.fetch_add(spent, Ordering::Relaxed);
         // Release, then the re-check: whatever the driver must see (work left, a task woken,
         // a deadline moved, a driver that skipped the shard meanwhile) wakes it.
@@ -232,13 +245,133 @@ impl<H: ShardHandler> DerefMut for Turn<'_, H> {
 
 impl<H: ShardHandler> Drop for Turn<'_, H> {
     fn drop(&mut self) {
-        // The advisory word first, then the unlock (the guard's own drop, after this). A
-        // turn that unwinds poisons the token for good; the word says so.
-        let state = if std::thread::panicking() {
-            FAILED
+        // The advisory word first, then the unlock (the guard's own drop, after this).
+        if std::thread::panicking() {
+            // A turn that unwinds poisons the token for good, and the core goes with it,
+            // here, while the thread still unwinds: its handler reports the panic as it
+            // drops (the engine's failure record), and the replies it held drop with it,
+            // so their waiters resolve rather than wait on a core no thread may run again.
+            // Before the token, a shard thread's panic dropped its core the same way; the
+            // cell, which the inbox's caller-run entry keeps alive, must not hold it.
+            self.cell.run.state.store(FAILED, Ordering::Release);
+            drop(self.guard.take());
         } else {
-            FREE
-        };
-        self.cell.run.state.store(state, Ordering::Release);
+            self.cell.run.state.store(FREE, Ordering::Release);
+        }
+    }
+}
+
+/// The skip-then-notify handshake (#1176 rev 3.1, §4) under loom. Loom can't run a whole
+/// shard (its queue is std's channel), so this models the cell's exact operations and
+/// orderings around the shipped `Signal`: the token as the CAS `try_lock` is (Acquire on
+/// take, Release on release), `skipped`, and the driver's order on a failed take (announce
+/// sleep, then mark skipped, fence and retry) against the caller's release (Free, fence, load
+/// `skipped`, notify). A message submitted while the caller holds the token, after its last
+/// look at the queue, must be taken by the driver's retry or wake the driver; never neither.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, Ordering, fence};
+    use loom::thread;
+
+    use crate::signal::{Signal, WakeTarget};
+
+    struct Model {
+        token: AtomicBool,
+        skipped: AtomicBool,
+        queued: AtomicBool,
+        handled: AtomicBool,
+        woken: Arc<AtomicBool>,
+        signal: Signal,
+    }
+
+    impl Model {
+        fn try_take(&self) -> bool {
+            self.token
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        }
+
+        fn release(&self) {
+            self.token.store(false, Ordering::Release);
+        }
+
+        /// The driver's look at the queue with the token held (`check_before_sleep`).
+        fn drain(&self) {
+            if self.queued.swap(false, Ordering::Relaxed) {
+                self.handled.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn loom_a_message_queued_during_a_callers_turn_reaches_the_driver() {
+        loom::model(|| {
+            let woken = Arc::new(AtomicBool::new(false));
+            let m = Arc::new(Model {
+                // The caller holds the token, past its last look at the queue.
+                token: AtomicBool::new(true),
+                skipped: AtomicBool::new(false),
+                queued: AtomicBool::new(false),
+                handled: AtomicBool::new(false),
+                woken: Arc::clone(&woken),
+                signal: Signal::new(),
+            });
+            {
+                let woken = Arc::clone(&woken);
+                m.signal
+                    .set_target(WakeTarget::Callback(std::sync::Arc::new(move || {
+                        woken.store(true, Ordering::SeqCst);
+                    })));
+            }
+            // A submitter: publishes, then notifies (`Submitter::submit`).
+            let submitter = {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.queued.store(true, Ordering::Release);
+                    m.signal.notify();
+                })
+            };
+            // The caller's release, with nothing left of its own (`CallerTurn::try_run`).
+            let caller = {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.release();
+                    fence(Ordering::SeqCst);
+                    if m.skipped.load(Ordering::Relaxed) {
+                        m.signal.notify();
+                    }
+                })
+            };
+            // The driver, awake, looks once: a failed take announces sleep, then marks the
+            // shard skipped, fences and retries (`ShardCell::driver`).
+            let mut asleep = false;
+            if m.try_take() {
+                m.drain();
+                m.release();
+            } else {
+                m.signal.prepare_sleep();
+                m.skipped.store(true, Ordering::Relaxed);
+                fence(Ordering::SeqCst);
+                if m.try_take() {
+                    m.drain();
+                    m.release();
+                } else {
+                    asleep = true;
+                }
+            }
+            submitter.join().unwrap();
+            caller.join().unwrap();
+            // A driver that went to sleep must have been woken, or the message must have
+            // been taken already: then its next turn takes what is queued.
+            let pending = m.queued.load(Ordering::Relaxed);
+            if pending {
+                assert!(
+                    !asleep || m.woken.load(Ordering::SeqCst),
+                    "a message waits with the driver asleep and unwoken"
+                );
+            }
+            let _ = m.handled.load(Ordering::Relaxed);
+        });
     }
 }

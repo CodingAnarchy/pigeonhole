@@ -67,7 +67,8 @@ pub(crate) struct Signal {
     /// Room-freeing tasks of this consumer's a room wait took back from a worker that was not
     /// running them (D284).
     room_take_backs: AtomicU64,
-    /// Turns committing clients ran on this consumer (a shard), caller-runs (#1176).
+    /// Turns committing clients ran on this consumer (a shard) that handled a message,
+    /// caller-runs (#1176).
     caller_turns: AtomicU64,
 }
 

@@ -437,8 +437,8 @@ impl<M: Send + 'static> Submitter<M> {
         Ok(())
     }
 
-    /// Turns committing clients ran on the target shard since the runtime started
-    /// (caller-runs, #1176). Relaxed.
+    /// Turns committing clients ran on the target shard that handled at least one message,
+    /// since the runtime started (caller-runs, #1176). Relaxed.
     #[doc(hidden)]
     pub fn caller_turns(&self) -> u64 {
         self.inbox.signal.caller_turns()
@@ -448,6 +448,11 @@ impl<M: Send + 'static> Submitter<M> {
     /// runs a turn of it on this thread: up to [`CALLER_BATCH`] queued messages the
     /// handler allows, foreground only, ending early once `own_done` says the caller's own
     /// message was answered. Never waits for the shard. Returns whether a turn ran.
+    #[doc(hidden)]
+    pub fn caller_token_free(&self) -> bool {
+        self.inbox.caller.get().is_some_and(|c| c.is_free())
+    }
+
     #[doc(hidden)]
     pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         match self.inbox.caller.get() {
@@ -651,12 +656,12 @@ impl<H: ShardHandler> ShardCore<H> {
     /// in order while the handler allows them, up to [`CALLER_BATCH`], running a batch's
     /// `end_batch` after each round, and stops once `own_done` holds. A refused message goes
     /// to the stash (the driver runs it first, so order holds) and sets `wants`. Returns
-    /// whether the driver has anything to do now.
+    /// whether the driver has anything to do now, and how many messages the turn handled.
     fn caller_turn(
         &mut self,
         own_done: &mut dyn FnMut() -> bool,
         wants: &std::sync::atomic::AtomicBool,
-    ) -> bool {
+    ) -> (bool, usize) {
         let _shard = EnterShard::new(self.id);
         let deadline_before = self.next_deadline();
         let ShardCore {
@@ -713,10 +718,11 @@ impl<H: ShardHandler> ShardCore<H> {
         // work only the driver can finish.
         leftover |= handled == CALLER_BATCH || !handler.caller_may_run();
         self.work_done += handled as u64;
-        leftover
+        let notify = leftover
             || self.spawner.local.has_runnable()
             || self.spawner.has_back()
-            || self.next_deadline() != deadline_before
+            || self.next_deadline() != deadline_before;
+        (notify, handled)
     }
 
     fn run_once(&mut self, deadline: u64) -> bool {

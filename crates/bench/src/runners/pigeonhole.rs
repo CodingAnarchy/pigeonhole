@@ -53,6 +53,8 @@ pub(crate) struct Settings {
     pub(crate) shard_spin_cap_micros: Option<u64>,
     /// Caller-runs, the #1176 prototype (`Options::caller_runs`): off unless set.
     pub(crate) caller_runs: bool,
+    /// Caller-runs' C1 arm (`Options::caller_spin_extend`), in microseconds.
+    pub(crate) caller_spin_extend_micros: Option<u64>,
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     pub(crate) shard_threads: Option<usize>,
@@ -534,6 +536,20 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Caller-runs' C1 arm (`Options::caller_spin_extend`): past its spin, a waiting
+    /// committer keeps polling while its shard's token is free, up to `micros`.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().caller_runs(true).caller_spin_extend_micros(500);
+    /// assert!(r.describe().contains(" caller_spin_extend=500us"));
+    /// ```
+    pub fn caller_spin_extend_micros(mut self, micros: u64) -> Self {
+        self.settings.caller_spin_extend_micros = Some(micros);
+        self
+    }
+
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     ///
@@ -921,6 +937,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.caller_runs {
         options = options.caller_runs(true);
     }
+    if let Some(us) = s.caller_spin_extend_micros {
+        options = options.caller_spin_extend(Duration::from_micros(us));
+    }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
     }
@@ -1285,6 +1304,9 @@ impl Runner for PigeonholeRunner {
         }
         if s.caller_runs {
             d.push_str(" caller_runs");
+        }
+        if let Some(us) = s.caller_spin_extend_micros {
+            _ = write!(d, " caller_spin_extend={us}us");
         }
         if let Some(k) = s.shard_threads {
             _ = write!(d, " shard_threads={k}");
