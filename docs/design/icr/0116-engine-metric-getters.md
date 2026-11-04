@@ -4,8 +4,9 @@
 
 ## The change
 - **A2, memtable bytes** (this ICR's first PR). In pigeonhole (semver, additive), two `EngineMetrics` fields:
-  - `memtable_bytes` (gauge): the arena bytes memtables take now, summed over shards. It counts whole chunks, partly filled ones included, so it reads high by up to one chunk per live memtable.
-  - `memtable_limit_bytes` (gauge): the arenas' size, summed over shards.
+  - `memtable_bytes` (gauge): the arena bytes memtables take now, summed over shards. It counts whole chunks, partly filled ones included, so it reads high by up to one chunk per live memtable. It also counts flushed memtables whose chunks aren't reusable yet, because a snapshot or an in-flight read still holds them (#1477, #1506). That's right for arena pressure, which they add to as surely as live ones (perf287).
+  - `memtable_limit_bytes` (gauge): the arenas' size, summed over shards. That's `Options::memtable_budget`, which is per shard, rounded up to 2 MiB, times the shard count.
+  - **Approximate against stalls (cli692):** a commit can wait for room while `memtable_bytes` reads well under the limit. Reserved room, a share held until its decision, and a too-long contiguous run all do it, so `room_stalls` stays the ground truth.
   - **How it's published:** each shard publishes at the end of every batch, in `ShardState::publish_arena` (perf287's option (a)). It compares the bytes with the last value it published, kept in a plain shard field, and does a relaxed store into its `ShardMetrics::memtable_used` only when they differ. That's one compare per group, never per commit, with no new synchronization; the memtable crate takes no atomic. The limit is stored once, at the shard's first publish.
   - **pigeonhole-engine** (internal, additive): `Metrics::memtable_bytes` and `Metrics::memtable_limit`.
   - **pigeonhole-otel:** `pigeonhole.memtable.size` and `pigeonhole.memtable.limit` (D316).

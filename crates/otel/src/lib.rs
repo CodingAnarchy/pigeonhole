@@ -493,7 +493,7 @@ static SPECS: &[Spec] = &[
         false,
         "By",
         [],
-        "Memtable arena bytes memtables take, summed over shards: whole chunks, so up to one chunk per live memtable high. Near the limit, commits wait for room.",
+        "Memtable arena bytes in use, summed over shards: live memtables in whole chunks, and flushed ones a snapshot or read still holds. Near the limit, commits wait for room.",
         |s, out| one(out, s.m.memtable_bytes)
     ),
     spec!(
@@ -502,7 +502,7 @@ static SPECS: &[Spec] = &[
         false,
         "By",
         [],
-        "The memtable arenas' size, summed over shards (Options::memtable_budget).",
+        "The memtable arenas' size, summed over shards: Options::memtable_budget (per shard, rounded up to 2 MiB) times the shard count.",
         |s, out| one(out, s.m.memtable_limit_bytes)
     ),
     // Caches.

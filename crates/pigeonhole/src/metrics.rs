@@ -112,12 +112,21 @@ pub struct EngineMetrics {
     pub shard_busy_nanos: u64,
     /// Gauge: bytes of the memtable arenas that memtables take now, summed over shards
     /// (ICR 0116). It counts whole chunks, partly filled ones included, so it reads high by
-    /// up to one chunk per live memtable. It's updated at the end of each shard's batch.
-    /// Against [`memtable_limit_bytes`](Self::memtable_limit_bytes), it's how close the
-    /// shards are to waiting for room (`room_stalls`).
+    /// up to one chunk per live memtable. It also counts flushed memtables whose chunks
+    /// aren't reusable yet, because a snapshot or an in-flight read still holds them: what
+    /// matters for room, which they take as surely as live ones (perf287 on #1512). It's
+    /// updated at the end of each shard's batch.
+    ///
+    /// Against [`memtable_limit_bytes`](Self::memtable_limit_bytes), it shows how close the
+    /// shards are to waiting for room, but only approximately. A commit can wait while this
+    /// reads well under the limit: room other commits have reserved but not yet written,
+    /// a cross-shard commit's share held until its decision, or a value too large for the
+    /// free chunks' longest run. Those waits are [`room_stalls`](Self::room_stalls), the
+    /// ground truth (cli692 on #1512).
     pub memtable_bytes: u64,
-    /// Gauge: the memtable arenas' size, summed over shards (`Options::memtable_budget`)
-    /// (ICR 0116).
+    /// Gauge: the memtable arenas' size, summed over shards (ICR 0116):
+    /// `Options::memtable_budget`, which is per shard, rounded up to 2 MiB, times the shard
+    /// count.
     pub memtable_limit_bytes: u64,
     /// Gauge: reader processes attached ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)
     /// handles holding a slot), out of [`reader_slots`](Self::reader_slots).
