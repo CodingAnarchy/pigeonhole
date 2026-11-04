@@ -50,18 +50,18 @@ categories = ["database-implementations", "data-structures"]
 # `pigeonhole` is the stable API, and the internal crates may change incompatibly in any
 # release (the internal line's major then), so a build of one `pigeonhole` release always gets
 # the internal crates it was tested with.
-pigeonhole-format = { path = "crates/format", version = "=2.0.0" }
-pigeonhole-io = { path = "crates/io", version = "=2.0.0" }
-pigeonhole-sim = { path = "crates/sim", version = "=2.0.0" }
-pigeonhole-pager = { path = "crates/pager", version = "=2.0.0" }
-pigeonhole-wal = { path = "crates/wal", version = "=2.0.0" }
-pigeonhole-memtable = { path = "crates/memtable", version = "=2.0.0" }
-pigeonhole-cache = { path = "crates/cache", version = "=2.0.0" }
-pigeonhole-runtime = { path = "crates/runtime", version = "=2.0.0" }
-pigeonhole-shm = { path = "crates/shm", version = "=2.0.0" }
-pigeonhole-sst = { path = "crates/sst", version = "=2.0.0" }
-pigeonhole-compaction = { path = "crates/compaction", version = "=2.0.0" }
-pigeonhole-engine = { path = "crates/engine", version = "=2.0.0" }
+pigeonhole-format = { path = "crates/format", version = "=3.0.0" }
+pigeonhole-io = { path = "crates/io", version = "=3.0.0" }
+pigeonhole-sim = { path = "crates/sim", version = "=3.0.0" }
+pigeonhole-pager = { path = "crates/pager", version = "=3.0.0" }
+pigeonhole-wal = { path = "crates/wal", version = "=3.0.0" }
+pigeonhole-memtable = { path = "crates/memtable", version = "=3.0.0" }
+pigeonhole-cache = { path = "crates/cache", version = "=3.0.0" }
+pigeonhole-runtime = { path = "crates/runtime", version = "=3.0.0" }
+pigeonhole-shm = { path = "crates/shm", version = "=3.0.0" }
+pigeonhole-sst = { path = "crates/sst", version = "=3.0.0" }
+pigeonhole-compaction = { path = "crates/compaction", version = "=3.0.0" }
+pigeonhole-engine = { path = "crates/engine", version = "=3.0.0" }
 pigeonhole = { path = "crates/pigeonhole", version = "1.1.0" }
 pigeonhole-bench = { path = "crates/bench", version = "1.1.0" }
 pigeonhole-arrow = { path = "crates/arrow", version = "1.1.0" }

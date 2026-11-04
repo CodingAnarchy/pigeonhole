@@ -127,6 +127,11 @@ pub mod header {
     /// applied on every participant; `u64::MAX` when none. Snapshots stay below it. At 192,
     /// 8-aligned past D281's row-epoch fields (160..188, then padding).
     pub const CROSS_HELD: usize = 192;
+    /// `u64` atomic (layout version 9, D315): the ceiling of a catalog change (a manifest
+    /// commit with catalog edits) whose `Catalog` sidecar entry isn't appended yet, so the
+    /// change feed's frontier stays below it; `u64::MAX` when none. Stored as the writer's
+    /// written watermark is: the lowest seqno held.
+    pub const CATALOG_HOLD: usize = 200;
 }
 
 /// Byte offsets within a watermark line.

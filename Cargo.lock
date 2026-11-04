@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-cache"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "loom",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-compaction"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "pigeonhole-cache",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-engine"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-format"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "crc-fast",
  "criterion",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-io"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "io-uring",
@@ -1737,7 +1737,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memtable"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "loom",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-pager"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "pigeonhole-format",
@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-runtime"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "loom",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-shm"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "libc",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-sim"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-sst"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "pigeonhole-cache",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-wal"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "pigeonhole-format",

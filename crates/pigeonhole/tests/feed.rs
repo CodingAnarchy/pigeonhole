@@ -666,3 +666,40 @@ fn a_feed_of_every_table_follows_tables_created_later() {
     drop(f);
     db.close().unwrap();
 }
+
+/// simp724's S1 on #1487 (D315): a feed of every table resumes only from a token of one. A
+/// table's feed sits past commits of other tables it never followed, so resuming every
+/// table from its token would skip them: refused. The other way round is harmless, and an
+/// all-tables token resumes an all-tables feed.
+#[test]
+fn a_feed_of_every_table_resumes_only_from_its_own_kind_of_token() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("tok.phdb"), fed()).unwrap();
+    let (a, b) = tables(&db);
+    let mut one = a.feed().open().unwrap();
+    let mut all = db.feed().open().unwrap();
+    let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    let s2 = b.mutate(b"r2").put("f", b"q", b"2").commit().unwrap();
+    assert_eq!(next(&mut one).seqno(), s1.seqno);
+    assert_eq!(next(&mut all).seqno(), s1.seqno);
+    let (table_token, all_token) = (one.token(), all.token());
+
+    let e = db.feed().resume(&table_token).open().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+
+    let mut again = db.feed().resume(&all_token).open().unwrap();
+    assert_eq!(
+        next(&mut again).seqno(),
+        s2.seqno,
+        "every table, from where it was"
+    );
+    let s3 = a.mutate(b"r3").put("f", b"q", b"3").commit().unwrap();
+    let mut sub = a.feed().resume(&all_token).open().unwrap();
+    assert_eq!(
+        next(&mut sub).seqno(),
+        s3.seqno,
+        "a table's feed from an all-tables token"
+    );
+    drop((one, all, again, sub, a, b));
+    db.close().unwrap();
+}

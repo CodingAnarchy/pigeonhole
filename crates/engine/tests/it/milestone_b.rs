@@ -2145,6 +2145,10 @@ fn a_close_flushes_memtables_in_place_when_snapshots_hold_the_arena() {
     o.memtable_freeze_bytes = 1 << 20;
     let rows = |round: u32, family: usize| match (round, family) {
         (0, 0..4) => 190,
+        // One chunk fewer in family 7 than the arena's 64 once held: one chunk stays free
+        // beyond every reservation for a freeze (#1497), so the starved arena is a chunk
+        // smaller.
+        (0, 7) => 138,
         (0, _) => 170,
         _ => 1,
     };
@@ -2287,6 +2291,10 @@ fn a_starved_flush_on_a_frozen_clock_waits_for_an_undecided_share() {
         for (fi, f) in t.families.iter().enumerate() {
             let rows = match (round, fi) {
                 (0, 0..4) => 190,
+                // One chunk fewer in family 7 than the arena's 64 once held: one chunk stays free
+                // beyond every reservation for a freeze (#1497), so the starved arena is a chunk
+                // smaller.
+                (0, 7) => 138,
                 (0, _) => 170,
                 _ => 1,
             };
@@ -2409,6 +2417,10 @@ fn a_later_flush_caller_is_not_refused_at_an_earlier_ones_deadline() {
         for (fi, f) in t.families.iter().enumerate() {
             let rows = match (round, fi) {
                 (0, 0..4) => 190,
+                // One chunk fewer in family 7 than the arena's 64 once held: one chunk stays free
+                // beyond every reservation for a freeze (#1497), so the starved arena is a chunk
+                // smaller.
+                (0, 7) => 138,
                 (0, _) => 170,
                 _ => 1,
             };
@@ -2493,6 +2505,10 @@ fn starved_flush_and_compact(moving_clock: bool) {
     o.write_stall_timeout_nanos = TIMEOUT;
     let rows = |round: u32, family: usize| match (round, family) {
         (0, 0..4) => 190,
+        // One chunk fewer in family 7 than the arena's 64 once held: one chunk stays free
+        // beyond every reservation for a freeze (#1497), so the starved arena is a chunk
+        // smaller.
+        (0, 7) => 138,
         (0, _) => 170,
         _ => 1,
     };
