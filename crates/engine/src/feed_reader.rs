@@ -21,7 +21,7 @@
 //!   read again and how far the delivered records reached.
 //! - **Expiry** ([`Expiry`]) is sticky.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -130,6 +130,26 @@ pub enum Next<'a> {
     Pending,
     /// The feed has expired (and stays so).
     Expired(&'a Expiry),
+    /// A catalog change (D315), in a feed of every table only: between every commit below
+    /// its ceiling and every commit at or above it.
+    Catalog(&'a CatalogEvent),
+}
+
+/// A catalog change a feed of every table delivers (D315): one manifest commit's catalog
+/// edits, from its `Catalog` sidecar entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CatalogEvent {
+    /// The commit's `seqno_ceiling`: every commit below it comes before the change, every
+    /// commit at or above it after.
+    pub seqno_ceiling: Seqno,
+    /// The commit's `ts_floor`: every default timestamp before the change is at most this.
+    pub timestamp: u64,
+    /// The root commit's sequence: it orders catalog changes, and a token records the last
+    /// one delivered.
+    pub sequence: u64,
+    /// Its edits, in the order they applied: `CreateTable`, `PutFamily`, `DropTable`.
+    pub edits: Vec<pigeonhole_format::manifest::Edit>,
 }
 
 /// A mutation as read, before its commit's timestamp is known.
@@ -277,6 +297,15 @@ pub struct FeedReader {
     /// An entry goes once the floor passes its segment.
     dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
+    /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
+    /// delivered, in order; the last one delivered (its root sequence, in the token); how far
+    /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
+    /// are passed over (a commit routed before a drop can be logged after it).
+    catalog: VecDeque<CatalogEvent>,
+    catalog_seq: u64,
+    sidecar_pos: u64,
+    dropped_tables: HashSet<TableId>,
+    out_catalog: CatalogEvent,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -328,8 +357,26 @@ const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
 const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 
 /// What one poll left.
+/// What `emit` delivered.
+enum Emitted {
+    Nothing,
+    Commit,
+    Catalog,
+}
+
+impl Emitted {
+    fn polled(self) -> Option<Polled> {
+        match self {
+            Emitted::Nothing => None,
+            Emitted::Commit => Some(Polled::Commit),
+            Emitted::Catalog => Some(Polled::Catalog),
+        }
+    }
+}
+
 enum Polled {
     Commit,
+    Catalog,
     Pending { held: bool },
     Expired,
 }
@@ -395,7 +442,13 @@ impl FeedReader {
             view: origin.view,
             backoff: READER_BACKOFF_MIN,
             blob_wait: None,
+            catalog: VecDeque::new(),
+            catalog_seq: 0,
+            sidecar_pos: 0,
+            dropped_tables: HashSet::new(),
+            out_catalog: CatalogEvent::default(),
         };
+        let token_start = matches!(spec.start, FeedStart::Token(_));
         // `Oldest` from an earlier session still kept whole (#1465), when there is one.
         let earlier = match spec.start {
             FeedStart::Oldest => this.earlier_start(db_id),
@@ -501,6 +554,12 @@ impl FeedReader {
                 delivered_end: at,
                 must_reach,
             });
+        }
+        // A feed of every table: the catalog changes before its start are passed over, their
+        // drops kept (D315). A token says the last one delivered; another start, its bound.
+        if this.tables.is_empty() && this.expired.is_none() {
+            let bound = (!token_start).then_some(this.delivered);
+            this.load_catalog(bound)?;
         }
         Ok(this)
     }
@@ -625,6 +684,7 @@ impl FeedReader {
     fn lend(&self, polled: Polled) -> Next<'_> {
         match polled {
             Polled::Commit => Next::Commit(&self.out),
+            Polled::Catalog => Next::Catalog(&self.out_catalog),
             Polled::Pending { .. } => Next::Pending,
             Polled::Expired => Next::Expired(self.expired.as_ref().expect("set")),
         }
@@ -664,6 +724,10 @@ impl FeedReader {
         for (s, st) in self.streams.iter().enumerate() {
             t.extend_from_slice(&self.hint(s).0.to_le_bytes());
             t.extend_from_slice(&st.delivered_end.0.to_le_bytes());
+        }
+        // A feed of every table: the last catalog change delivered (D315).
+        if self.tables.is_empty() {
+            t.extend_from_slice(&self.catalog_seq.to_le_bytes());
         }
         t
     }
@@ -723,7 +787,15 @@ impl FeedReader {
         let streams = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
         let delivered = u64_at(rest, 20);
         let session = u64_at(rest, 28);
-        let per = &rest[36..];
+        let mut per = &rest[36..];
+        if version == TOKEN_VERSION_ALL {
+            // The last catalog change delivered, after the streams' positions (D315).
+            let Some(split) = per.len().checked_sub(8) else {
+                return Err(bad());
+            };
+            self.catalog_seq = u64_at(per, split);
+            per = &per[..split];
+        }
         if per.len() != streams * 16 {
             return Err(bad());
         }
@@ -767,9 +839,9 @@ impl FeedReader {
         if self.shm.is_stale() {
             return Err(Error::SnapshotExpired);
         }
-        // A commit already read and below the frontier goes first.
-        if self.emit()? {
-            return Ok(Polled::Commit);
+        // A commit (or catalog change) already read and below the frontier goes first.
+        if let Some(p) = self.emit()?.polled() {
+            return Ok(p);
         }
         if self.expired.is_some() {
             return Ok(Polled::Expired);
@@ -830,8 +902,20 @@ impl FeedReader {
         }
         self.frontier = self.frontier.max(frontier);
         self.read_through = Some(frontier);
-        if self.emit()? {
-            return Ok(Polled::Commit);
+        // A feed of every table (D315): the catalog changes up to the frontier, after it was
+        // loaded. In the writer's process, once the session's sidecar appends stopped no
+        // later change can reach the feed: it expires (simp724 on #1493).
+        if self.tables.is_empty() {
+            if self.writer.as_ref().is_some_and(|f| f.appends_stopped()) {
+                self.expired = Some(expiry(
+                    "the change feed's sidecar can no longer be written: catalog changes after this point can't be delivered",
+                ));
+                return Ok(Polled::Expired);
+            }
+            self.load_catalog(None)?;
+        }
+        if let Some(p) = self.emit()?.polled() {
+            return Ok(p);
         }
         if self.expired.is_some() {
             return Ok(Polled::Expired);
@@ -1067,13 +1151,28 @@ impl FeedReader {
 
     /// Delivers the smallest pending commit at or below the frontier into `out`. Returns
     /// whether it did; a commit with nothing the feed follows is passed over.
-    fn emit(&mut self) -> Result<bool> {
+    fn emit(&mut self) -> Result<Emitted> {
         loop {
+            // A catalog change first, once every commit below its ceiling is delivered: the
+            // frontier is past them (F + 1 >= the ceiling), and none of them is still ready.
+            if let Some(ev) = self.catalog.front()
+                && ev.seqno_ceiling <= self.frontier.saturating_add(1)
+                && self
+                    .ready
+                    .first_key_value()
+                    .is_none_or(|(&k, _)| k >= ev.seqno_ceiling)
+            {
+                let ev = self.catalog.pop_front().expect("checked");
+                self.note_drops(&ev.edits);
+                self.catalog_seq = ev.sequence;
+                self.out_catalog = ev;
+                return Ok(Emitted::Catalog);
+            }
             let Some((&key, _)) = self.ready.first_key_value() else {
-                return Ok(false);
+                return Ok(Emitted::Nothing);
             };
             if key > self.frontier {
-                return Ok(false);
+                return Ok(Emitted::Nothing);
             }
             // Before anything is taken: the view can fail (a reader process's attachment
             // whose writer is gone, or whose view is being republished), and a failure here
@@ -1093,7 +1192,7 @@ impl FeedReader {
                 if !listed {
                     let since = *self.blob_wait.get_or_insert_with(Instant::now);
                     if since.elapsed() < READER_BLOB_WAIT {
-                        return Ok(false);
+                        return Ok(Emitted::Nothing);
                     }
                 }
             }
@@ -1143,7 +1242,7 @@ impl FeedReader {
                     }
                     if !complete || shares.iter().any(|h| h.outside) {
                         self.expired = Some(gap(key));
-                        return Ok(false);
+                        return Ok(Emitted::Nothing);
                     }
                     let mut raws = Vec::new();
                     for h in shares {
@@ -1155,6 +1254,12 @@ impl FeedReader {
                 }
             };
             self.delivered = key;
+            // A dropped table's changes, in a commit routed before its drop and logged after
+            // it (a feed of every table, D315): the drop discarded them.
+            let mut raws = raws;
+            if !self.dropped_tables.is_empty() {
+                raws.retain(|r| !self.dropped_tables.contains(&r.table));
+            }
             if raws.is_empty() {
                 continue;
             }
@@ -1171,7 +1276,7 @@ impl FeedReader {
                         self.expired = Some(expiry(
                             "a blob value the feed was delivering is gone: retention passed the feed",
                         ));
-                        return Ok(false);
+                        return Ok(Emitted::Nothing);
                     }
                     Some(ptr) => match view.ssts.read_pointer(&ptr) {
                         Ok(cell) => cell.to_vec(),
@@ -1193,7 +1298,7 @@ impl FeedReader {
                     value,
                 });
             }
-            return Ok(true);
+            return Ok(Emitted::Commit);
         }
     }
 }
@@ -1367,6 +1472,80 @@ impl FeedReader {
             return Some((first.saturating_sub(1), at));
         }
         None
+    }
+
+    /// A feed of every table (D315): reads the sidecar's new entries and queues the catalog
+    /// changes of the feed's history not yet delivered. Called after the frontier F is
+    /// loaded: the catalog hold keeps F below a change's ceiling until its entry is appended,
+    /// so every change with a ceiling at most F + 1 is in the file by then. At open, `start`
+    /// is a non-token start's bound: the changes with a ceiling at or below it are before the
+    /// feed's start (a token says the last one delivered instead). A passed-over or
+    /// delivered change's drops are kept, so a dropped table's later changes are passed over.
+    fn load_catalog(&mut self, start: Option<Seqno>) -> Result<()> {
+        let path = crate::feed::sidecar_path(&self.shared.path);
+        let file = match self.shared.vfs.open(&path, OpenOptions::read()) {
+            Ok(f) => f,
+            Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.len()?;
+        let from = self.sidecar_pos.max(FeedHeader::LEN as u64);
+        if len <= from {
+            return Ok(());
+        }
+        let mut bytes = vec![0u8; (len - from) as usize];
+        file.read_at(&mut bytes, from)?;
+        if self.sidecar_pos == 0 {
+            let mut head = [0u8; FeedHeader::LEN];
+            file.read_at(&mut head, 0)?;
+            match FeedHeader::decode(&head) {
+                Ok(h) if h.db_id == self.shared.pager.db_id() => {}
+                _ => return Ok(()),
+            }
+        }
+        // Up to the first torn entry: the rest is read again once it's whole.
+        let (entries, used) = decode_entries(&bytes);
+        self.sidecar_pos = from + used as u64;
+        for e in entries {
+            let FeedEntry::Catalog {
+                session,
+                sequence,
+                seqno_ceiling,
+                timestamp,
+                edits,
+            } = e
+            else {
+                continue;
+            };
+            if !self.history.holds(session) {
+                continue;
+            }
+            let before_start = match start {
+                Some(bound) => seqno_ceiling <= bound,
+                None => sequence <= self.catalog_seq,
+            };
+            if before_start {
+                self.note_drops(&edits);
+                self.catalog_seq = self.catalog_seq.max(sequence);
+                continue;
+            }
+            self.catalog.push_back(CatalogEvent {
+                seqno_ceiling,
+                timestamp,
+                sequence,
+                edits,
+            });
+        }
+        Ok(())
+    }
+
+    /// The tables `edits` drop: their later changes are passed over.
+    fn note_drops(&mut self, edits: &[pigeonhole_format::manifest::Edit]) {
+        for e in edits {
+            if let pigeonhole_format::manifest::Edit::DropTable { table } = e {
+                self.dropped_tables.insert(*table);
+            }
+        }
     }
 
     /// Stream `s`'s floor: no segment of a smaller epoch is kept (the writer's shared-memory

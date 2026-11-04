@@ -983,7 +983,21 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         })
         .cloned()
         .collect();
-    let catalog_held = shared.feed.is_some() && !catalog_edits.is_empty();
+    // Once the session's sidecar appends stopped (D315; simp724 on #1493), no catalog change
+    // can get an entry: the hold is frozen, taken once under the allocator's lock and never
+    // released, so no feed passes a change it can't deliver, and later changes take none of
+    // their own (a larger ceiling would let the frontier pass the frozen one).
+    if let Some(feed) = &shared.feed
+        && feed.appends_stopped()
+        && feed.freeze_catalog_hold()
+    {
+        shared.clock.hold_catalog(&shared.shm);
+    }
+    let catalog_held = shared
+        .feed
+        .as_ref()
+        .is_some_and(|f| !f.catalog_hold_frozen())
+        && !catalog_edits.is_empty();
     catalog.counters.seqno_ceiling = if catalog_held {
         shared.clock.hold_catalog(&shared.shm)
     } else {
@@ -1087,6 +1101,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
 fn release_catalog(shared: &Shared) {
     if let Some(feed) = &shared.feed {
         feed.unstage_catalog();
+        // This commit's own append failed (or an earlier one did): the hold, at this change's
+        // ceiling, stays up for the rest of the session, so no feed passes it (simp724).
+        if feed.appends_stopped() {
+            feed.freeze_catalog_hold();
+            return;
+        }
     }
     shared.shm.publish_catalog_hold(u64::MAX);
 }

@@ -368,6 +368,14 @@ pub(crate) struct Feed {
     /// commit's Root entry. Taken by the root-commit observer, or dropped by
     /// `unstage_catalog` if the commit failed. Root commits never overlap, so one slot.
     staged_catalog: Mutex<Option<(u64, u64, Vec<Edit>)>>,
+    /// The session's sidecar appends stopped (D315; simp724 on #1493): an append or a sync
+    /// failed, so no later catalog change can get its `Catalog` entry. Terminal. Feeds of
+    /// every table in this process expire on seeing it; the manifest pump freezes the catalog
+    /// hold (`catalog_hold_frozen`) so no feed's frontier passes a change that has no entry.
+    appends_stopped: std::sync::atomic::AtomicBool,
+    /// The catalog hold is frozen for the rest of the session (set once, by the manifest
+    /// pump, after `appends_stopped`): never released.
+    catalog_hold_frozen: std::sync::atomic::AtomicBool,
     /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
@@ -425,6 +433,8 @@ impl Feed {
             sidecar_syncs: AtomicU64::new(0),
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
             staged_catalog: Mutex::default(),
+            appends_stopped: std::sync::atomic::AtomicBool::new(false),
+            catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
@@ -670,6 +680,7 @@ impl Feed {
             {
                 crate::shard::trace!("feed: sidecar append of catalog {sequence} failed: {e}");
                 *sidecar = None;
+                self.appends_stopped.store(true, Ordering::Release);
                 return;
             }
             if let Err(e) = s.append(&FeedEntry::Root {
@@ -678,6 +689,7 @@ impl Feed {
             }) {
                 crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
                 *sidecar = None;
+                self.appends_stopped.store(true, Ordering::Release);
                 return;
             }
             Arc::clone(&s.file)
@@ -692,6 +704,21 @@ impl Feed {
             .staged_catalog
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, timestamp, edits));
+    }
+
+    /// Whether the session's sidecar appends stopped (D315): see `appends_stopped`.
+    pub(crate) fn appends_stopped(&self) -> bool {
+        self.appends_stopped.load(Ordering::Acquire)
+    }
+
+    /// Marks the catalog hold frozen; `true` the first time (the caller then takes it).
+    pub(crate) fn freeze_catalog_hold(&self) -> bool {
+        !self.catalog_hold_frozen.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether the catalog hold is frozen for the rest of the session.
+    pub(crate) fn catalog_hold_frozen(&self) -> bool {
+        self.catalog_hold_frozen.load(Ordering::Acquire)
     }
 
     /// Drops a staged catalog change whose root commit didn't happen (D315).
@@ -738,6 +765,7 @@ impl Feed {
                 // sequence ahead of the last entry and expires every token.
                 crate::shard::trace!("feed: sidecar sync failed, no more appends: {e}");
                 *this.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                this.appends_stopped.store(true, Ordering::Release);
                 let mut st = this
                     .sidecar_sync
                     .lock()
