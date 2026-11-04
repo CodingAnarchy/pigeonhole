@@ -737,3 +737,49 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
     drop(all);
     db.close().unwrap();
 }
+
+/// simp724's B1 on #1493 (D315): a catalog change whose family needs a new incompat
+/// feature bit (the file's first aggregate family) makes the pager commit the bit's roots
+/// first; its `Catalog` entry still belongs to the root commit that holds its edits, the
+/// last before `create_table` returns, not to one of the bit's. Mutation-checked: staging
+/// before `flag_features` puts it on the bit's root.
+#[test]
+fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
+    use pigeonhole_format::feed::FeedEntry;
+    use pigeonhole_format::manifest::{Edit, FamilyKind};
+    let vfs = SimVfs::new(3152);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let agg = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_min")
+        .kind(FamilyKind::Min);
+    let t = db.create_table("agg", &[("m".into(), agg)]).unwrap();
+    let entries = sidecar_entries(&vfs);
+    let catalog = entries
+        .iter()
+        .filter_map(|e| match e {
+            FeedEntry::Catalog {
+                sequence, edits, ..
+            } if edits
+                .iter()
+                .any(|e| matches!(e, Edit::CreateTable { table, .. } if *table == t.id)) =>
+            {
+                Some(*sequence)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let last_root = entries
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            FeedEntry::Root { sequence, .. } => Some(*sequence),
+            _ => None,
+        })
+        .expect("a Root entry");
+    assert_eq!(
+        catalog,
+        [last_root],
+        "the create's root, not a feature bit's: {entries:?}"
+    );
+    db.close().unwrap();
+}

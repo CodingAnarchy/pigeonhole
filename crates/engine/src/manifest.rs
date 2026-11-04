@@ -991,13 +991,11 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     };
     // D271: every default timestamp comes from the one allocator, at or below its `H`.
     catalog.counters.ts_floor = shared.clock.last_ts().max(catalog.counters.ts_floor);
-    if catalog_held && let Some(feed) = &shared.feed {
-        feed.stage_catalog(
-            catalog.counters.seqno_ceiling,
-            catalog.counters.ts_floor,
-            catalog_edits,
-        );
-    }
+    let staged = catalog_held.then_some((
+        catalog.counters.seqno_ceiling,
+        catalog.counters.ts_floor,
+        catalog_edits,
+    ));
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
@@ -1031,6 +1029,13 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     match prepared {
         Ok(prepared) => {
             drop(writer);
+            // Staged only now, for this commit's own root commit, the next one (simp724's B1
+            // on #1493): `flag_features` may have made root commits of its own above (a new
+            // incompat bit), and their observer calls must not take the entry, nor may a
+            // failed prepare leave one for a change that never committed.
+            if let (Some(feed), Some((ceiling, ts, edits))) = (&shared.feed, staged) {
+                feed.stage_catalog(ceiling, ts, edits);
+            }
             #[cfg(feature = "test-hooks")]
             shared
                 .hooks
