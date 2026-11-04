@@ -728,6 +728,7 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
         "{}",
         json!({"mode": "ivfw-build", "memories": built.len(), "seconds": t.elapsed().as_secs_f64(), "busy": busy})
     );
+    pigeonhole_engine::scratch_freeze_report("build");
     let cursor = AtomicUsize::new(0);
     for threads in phases
         .split(',')
@@ -799,6 +800,7 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
                 "compactions": after.compactions - before.compactions,
             })
         );
+        pigeonhole_engine::scratch_freeze_report(&format!("threads={threads}"));
         println!("PHASE END threads={threads}");
     }
 }

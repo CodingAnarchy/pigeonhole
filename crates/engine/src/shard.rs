@@ -4693,6 +4693,35 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
+            {
+                // SCRATCH #1477: freezes by reason and table/family, with their sizes.
+                let reason = if all {
+                    "all"
+                } else if self.moving.contains(&key.0) {
+                    "moving"
+                } else if self.unpin.contains(&key) {
+                    "unpin"
+                } else if ROOM && self.room_freezes.contains(&key) {
+                    "room"
+                } else {
+                    "big"
+                };
+                let name = view
+                    .catalog
+                    .table(meta.table)
+                    .and_then(|t| {
+                        t.families
+                            .iter()
+                            .find(|f| f.id == key.1)
+                            .map(|f| format!("{}/{}", t.name, f.name))
+                    })
+                    .unwrap_or_else(|| format!("{:?}", key.1));
+                crate::scratch_freezes::record(
+                    reason,
+                    name,
+                    slot.active.table.allocated_bytes() as u64,
+                );
+            }
             let counter = meta.options.kind.is_aggregate();
             // Only a counter family's flush lists the slot's SSTs (D287).
             let fam = counter

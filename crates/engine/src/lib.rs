@@ -57,6 +57,7 @@ mod waker;
 mod watermark_waiters;
 mod write;
 
+mod scratch_freezes;
 pub use admission::Admit;
 pub use check::{
     CheckCounts, CheckOptions, CheckReport, Extent, ExtentKind, Finding, Severity, Structure,
@@ -89,6 +90,7 @@ pub use read::traverse::{
 };
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};
+pub use scratch_freezes::scratch_freeze_report;
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};
