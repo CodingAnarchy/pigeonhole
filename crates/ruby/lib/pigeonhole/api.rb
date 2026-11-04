@@ -368,6 +368,14 @@ module Pigeonhole
       native_incr(row, family, qualifier, delta, ts, durability)
     end
 
+    # Adds `delta` to a counter cell, commits it, and returns the counter's value after the
+    # commit: concurrent callers adding 1 from zero get exactly 1..N (D314). `nil` only for a
+    # bucket (`ts:`) already past the family's TTL. An error raised after the commit applied
+    # (reading the value failed) means the increment landed: don't retry it.
+    def incr_returning(row, family, qualifier, delta, ts: nil, durability: nil)
+      native_incr_returning(row, family, qualifier, delta, ts, durability)
+    end
+
     # Deletes `row`; with `family`, that family; with `qualifier` too, the column; with `ts:`
     # too, that one version. Returns the commit's sequence number.
     def delete(row, family = nil, qualifier = nil, ts: nil, durability: nil)
@@ -421,6 +429,23 @@ module Pigeonhole
     def durability(durability)
       native_durability(durability)
       self
+    end
+
+    # Commits like `commit`, and returns a frozen Incremented: each counter cell the writes
+    # incremented or set, as a read at the commit sees it (D314). Concurrent increments of one
+    # cell each get their own value.
+    def commit_returning = native_commit_returning.freeze
+  end
+
+  # The counter cells a Mutation#commit_returning incremented or set, after its commit.
+  class Incremented
+    # The counter (or with `ts:`, the bucket) in `family` at `qualifier`, after the commit;
+    # nil when a read at the commit sees no cell (one the mutation deleted, or a bucket
+    # already past the family's TTL). Raises InvalidArgument if the
+    # commit didn't write that cell, and the read's error if the value couldn't be read after
+    # the commit applied: the commit succeeded then, so don't retry it.
+    def value(family, qualifier, ts: nil)
+      native_value(family, qualifier, ts)
     end
   end
 

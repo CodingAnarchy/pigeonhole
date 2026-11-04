@@ -315,6 +315,7 @@ end
 ## Writes, batches and transactions
 - **One-commit writes:** `table.put`, `table.incr` and `table.delete` each commit at once and return the commit's sequence number.
 - **`table.mutate(row)`** collects one row's writes for a single commit: `put`, `put_u64`, `incr`, `aggregate` and `delete`, then `commit`, or `commit_if(Pigeonhole::Condition.absent(family, qualifier))`, which returns `nil` when the condition fails.
+- **Increments that return the value (D314):** `table.mutate(row)....commit_returning` commits like `commit` and returns a frozen `Pigeonhole::Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts: nil)`, or all with `to_h` (`{[family, qualifier, ts] => value}`). `table.incr_returning(...)` is the one-cell form and returns the new value, with the GVL released. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `nil` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts: 0)`), or a bucket already past the family's TTL. If reading the value fails after the commit applied, the error is raised but **the commit succeeded**, so don't retry it. Durability and `OutcomeUnknown` work as for the Rust API ([Counters](data-modeling.md#counters)).
 - **`db.write_batch { |batch| ... }`** commits every write in the block at once (the same write methods, with a table and row first). It commits when the block returns normally (`next` included), and discards on an exception, a `break`, a `throw` or an early `return`.
 - **`db.transaction { |txn| ... }`** is an optimistic transaction: `txn.get` and `txn.get_row` read at its snapshot, and the commit checks them. Like `write_batch`, it commits on a normal return and rolls back otherwise. A transaction belongs to one thread of control. It's safe to share between threads (calls serialise), but its reads and writes must make sense in whatever order they land.
 - **`db.transact(max_attempts:, deadline:, durability:) { |txn| ... }`** runs the block in a transaction and commits it, retrying on `Conflict` and `Busy` with backoff, as the Rust `RetryPolicy` does. It returns the block's value. The block may run more than once, so it should have no other effects.
@@ -347,6 +348,18 @@ Pigeonhole.open(path, create: true) do |db|
 
   ok = acct.mutate("dave").put("f", "balance", 3).commit_if(Pigeonhole::Condition.absent("f", "balance"))
   raise unless ok
+end
+```
+
+```ruby
+require "pigeonhole"
+
+Pigeonhole.open(path, create: true) do |db|
+  seq = db.table("seq").family("n", Pigeonhole::Family.counter).create
+  raise "first" unless seq.incr_returning("orders", "n", "next", 1) == 1
+  r = seq.mutate("orders").incr("n", "next", 1).incr("n", "shipped", 1).commit_returning
+  raise "value" unless r.value("n", "next") == 2
+  raise "to_h" unless r.to_h == { ["n", "next", 0] => 2, ["n", "shipped", 0] => 1 }
 end
 ```
 

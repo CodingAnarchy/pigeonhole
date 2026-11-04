@@ -82,6 +82,11 @@ pub(crate) struct Snapshot(pub(crate) ForkSafe<Mutex<Option<pigeonhole::Snapshot
 #[magnus::wrap(class = "Pigeonhole::Cell", free_immediately, size)]
 pub(crate) struct Cell(pub(crate) pigeonhole::Cell);
 
+/// `Pigeonhole::Incremented`: the counter cells a `Mutation#commit_returning` wrote, after
+/// its commit (D314). Plain data: no handle, so nothing to guard across a fork.
+#[magnus::wrap(class = "Pigeonhole::Incremented", free_immediately, size)]
+pub(crate) struct Incremented(pub(crate) pigeonhole::Incremented);
+
 /// `Pigeonhole::Row`.
 #[magnus::wrap(class = "Pigeonhole::Row", free_immediately, size)]
 pub(crate) struct Row(pub(crate) pigeonhole::Row);

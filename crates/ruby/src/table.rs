@@ -6,12 +6,12 @@
 
 use std::sync::Mutex;
 
-use magnus::{Error, Float, Integer, RArray, RString, Ruby, Symbol, Value, prelude::*};
+use magnus::{Error, Float, Integer, RArray, RHash, RString, Ruby, Symbol, Value, prelude::*};
 use pigeonhole::{Aggregation, Compression, ErrorCode};
 
 use crate::classes::{
-    Builder, Cell, Condition, Family, FamilyInfo, Mutation, MutationState, Row, ScanArgs, ScanSpec,
-    Snapshot, Table, TableBuilder, VectorSpec,
+    Builder, Cell, Condition, Family, FamilyInfo, Incremented, Mutation, MutationState, Row,
+    ScanArgs, ScanSpec, Snapshot, Table, TableBuilder, VectorSpec,
 };
 use crate::convert::{
     self, Bytes, CellValue, Name, Secs, Val, arg_error, class_name, lock, type_error,
@@ -515,6 +515,31 @@ pub(crate) fn commit_row(
     durability: Option<Durability>,
     condition: Option<&pigeonhole::Condition>,
 ) -> pigeonhole::Result<Option<u64>> {
+    let m = row_mutation(table, row, ops, durability);
+    match condition {
+        None => m.commit().map(|i| Some(i.seqno)),
+        Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
+    }
+}
+
+/// Commits `ops` like [`commit_row`] and returns every counter cell they incremented or set,
+/// as the commit left it (D314, ICR 0113). Run without the GVL.
+pub(crate) fn commit_row_returning(
+    table: &pigeonhole::Table,
+    row: &[u8],
+    ops: &[Op],
+    durability: Option<Durability>,
+) -> pigeonhole::Result<pigeonhole::Incremented> {
+    row_mutation(table, row, ops, durability).commit_returning()
+}
+
+/// `ops` buffered on a row mutation of `row`, uncommitted.
+fn row_mutation<'t>(
+    table: &'t pigeonhole::Table,
+    row: &[u8],
+    ops: &[Op],
+    durability: Option<Durability>,
+) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
     if let Some(d) = durability {
         m = m.durability(d.into());
@@ -556,10 +581,7 @@ pub(crate) fn commit_row(
             Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
         };
     }
-    match condition {
-        None => m.commit().map(|i| Some(i.seqno)),
-        Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
-    }
+    m
 }
 
 // ---- Table --------------------------------------------------------------------------------
@@ -796,6 +818,30 @@ impl Table {
         Self::commit_one(ruby, rb_self, row.0, op, durability)
     }
 
+    /// `incr_returning(row, family, qualifier, delta, ts, durability)`: the counter's value
+    /// after the commit (D314).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn incr_returning(
+        ruby: &Ruby,
+        rb_self: &Self,
+        row: Bytes,
+        family: Name,
+        qualifier: Bytes,
+        delta: i64,
+        ts: Option<u64>,
+        durability: Option<Durability>,
+    ) -> Result<Option<i64>, Error> {
+        let t = rb_self.writer(ruby)?.clone();
+        engine(ruby, move || {
+            let op = Op::Incr(family.0.clone(), qualifier.0.clone(), ts, delta);
+            commit_row_returning(&t, &row.0, &[op], durability)?.value_at(
+                &family.0,
+                &qualifier.0,
+                ts.unwrap_or(0),
+            )
+        })
+    }
+
     /// `delete(row, family, qualifier, ts, durability)`.
     pub(crate) fn delete(
         ruby: &Ruby,
@@ -935,6 +981,22 @@ impl Mutation {
         Self::finish(ruby, rb_self, Some(condition.0.clone()))
     }
 
+    /// Commits like `commit` and returns each counter cell the writes incremented or set,
+    /// after the commit (D314).
+    pub(crate) fn commit_returning(ruby: &Ruby, rb_self: &Self) -> Result<Incremented, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        // As in `finish`: the writes are taken inside the call.
+        let r = without_gvl(ruby, move || {
+            let ops = lock(&m.ops).take()?;
+            Some(commit_row_returning(&m.table, &m.row, &ops, durability))
+        })?;
+        match r {
+            Some(r) => r.map(Incremented).or_rb(ruby),
+            None => Err(spent(ruby, "the mutation was already committed")),
+        }
+    }
+
     fn finish(
         ruby: &Ruby,
         rb_self: &Self,
@@ -958,6 +1020,61 @@ impl Mutation {
             Some(r) => r.or_rb(ruby),
             None => Err(spent(ruby, "the mutation was already committed")),
         }
+    }
+}
+
+// ---- Incremented --------------------------------------------------------------------------
+
+impl Incremented {
+    /// The commit's sequence number.
+    pub(crate) fn seqno(&self) -> u64 {
+        self.0.info.seqno
+    }
+
+    /// `value(family, qualifier, ts)`: the counter (or bucket) after the commit; `nil` when a
+    /// read at the commit sees no cell. `InvalidArgument` if the commit didn't write it; the
+    /// read's error if it couldn't be read after the commit applied.
+    pub(crate) fn value(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+        ts: Option<u64>,
+    ) -> Result<Option<i64>, Error> {
+        rb_self
+            .0
+            .value_at(&family.0, &qualifier.0, ts.unwrap_or(0))
+            .or_rb(ruby)
+    }
+
+    /// `{[family, qualifier, ts] => value}` in the order the mutation first wrote each cell
+    /// (`ts` 0 for a plain counter); raises the first unreadable value's error.
+    pub(crate) fn to_h(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
+        let h = ruby.hash_new();
+        for (f, q, ts, v) in rb_self.0.iter() {
+            let (family, qualifier) = (ruby.str_new(f), convert::binary(ruby, q));
+            family.freeze();
+            qualifier.freeze();
+            let key = ruby.ary_new_from_values(&[family.as_value(), qualifier.as_value()]);
+            key.push(ts)?;
+            key.freeze();
+            h.aset(key, v.or_rb(ruby)?)?;
+        }
+        Ok(h)
+    }
+
+    /// The number of cells.
+    pub(crate) fn size(&self) -> usize {
+        self.0.iter().count()
+    }
+
+    /// `#<Pigeonhole::Incremented seqno=... cells=...>`.
+    pub(crate) fn inspect(&self) -> String {
+        format!(
+            "#<Pigeonhole::Incremented seqno={} cells={}>",
+            self.0.info.seqno,
+            self.size()
+        )
     }
 }
 

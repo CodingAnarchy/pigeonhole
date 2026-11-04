@@ -199,6 +199,8 @@ module Pigeonhole
               ?durability: durability?) -> Integer
     def incr: (String row, name family, String qualifier, Integer delta, ?ts: Integer?,
                ?durability: durability?) -> Integer
+    def incr_returning: (String row, name family, String qualifier, Integer delta, ?ts: Integer?,
+                         ?durability: durability?) -> Integer?
     def delete: (String row, ?name? family, ?String? qualifier, ?ts: Integer?,
                  ?durability: durability?) -> Integer
     def multi_get: (keys keys, ?families: Array[name]?, ?qualifier_prefix: String?, ?versions: Integer,
@@ -239,6 +241,16 @@ module Pigeonhole
     def durability: (durability durability) -> self
     def commit: () -> Integer
     def commit_if: (Condition condition) -> Integer?
+    def commit_returning: () -> Incremented
+  end
+
+  # The counter cells a Mutation#commit_returning wrote, after its commit.
+  class Incremented
+    def seqno: () -> Integer
+    def value: (name family, String qualifier, ?ts: Integer?) -> Integer?
+    def to_h: () -> Hash[[String, String, Integer], Integer?]
+    def size: () -> Integer
+    def inspect: () -> String
   end
 
   # Writes to any rows and tables, committed atomically.

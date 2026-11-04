@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use pigeonhole::{Aggregation, Compression};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::convert::{self, Val};
 use crate::error::{OrPy, with_code};
@@ -1062,6 +1063,34 @@ impl Table {
         .map(|s| s.expect("unconditional"))
     }
 
+    /// Adds `delta` to a counter cell, commits, and returns the counter's value after the
+    /// commit: concurrent callers adding 1 from zero get exactly `1..=N` (D314). `None` only
+    /// for a bucket (`ts`) already past the family's TTL. An error raised after the commit
+    /// applied (reading the value failed) means **the increment landed**: don't retry it.
+    #[pyo3(signature = (row, family, qualifier, delta, *, ts=None, durability=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn incr_returning(
+        &self,
+        py: Python<'_>,
+        row: &Bound<'_, PyAny>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+        delta: i64,
+        ts: Option<u64>,
+        durability: Option<Durability>,
+    ) -> PyResult<Option<i64>> {
+        let q = convert::bytes(qualifier)?;
+        let op = Op::Incr(family.clone(), q.clone(), ts, delta);
+        let r = commit_row_returning(
+            py,
+            self.writer()?,
+            convert::bytes(row)?,
+            vec![op],
+            durability,
+        )?;
+        r.0.value_at(&family, &q, ts.unwrap_or(0)).or_py()
+    }
+
     /// Deletes and commits: the row; with `family`, that family; with `qualifier` too, the
     /// column; with `ts` too, that one version.
     #[pyo3(signature = (row, family=None, qualifier=None, *, ts=None, durability=None))]
@@ -1141,55 +1170,79 @@ pub(crate) fn commit_row(
 ) -> PyResult<Option<u64>> {
     let table = table.clone();
     py.detach(move || {
-        let mut m = table.mutate(&row);
-        if let Some(d) = durability {
-            m = m.durability(d.into());
-        }
-        for op in &ops {
-            m = match op {
-                Op::Put(f, q, None, Val::Bytes(b)) => m.put(f, q, b),
-                Op::Put(f, q, Some(ts), Val::Bytes(b)) => m.put_at(f, q, *ts, b),
-                Op::Put(f, q, None, Val::I64(n)) => m.put_i64(f, q, *n),
-                Op::Put(f, q, Some(ts), Val::I64(n)) => m.put_i64_at(f, q, *ts, *n),
-                Op::Put(f, q, None, Val::F64(x)) => m.put_f64(f, q, *x),
-                Op::Put(f, q, Some(ts), Val::F64(x)) => m.put_f64_at(f, q, *ts, *x),
-                Op::PutU64(f, q, None, n) => m.put_u64(f, q, *n),
-                Op::PutU64(f, q, Some(ts), n) => m.put_u64_at(f, q, *ts, *n),
-                Op::Incr(f, q, None, d) => m.incr(f, q, *d),
-                Op::Incr(f, q, Some(ts), d) => m.incr_at(f, q, *ts, *d),
-                Op::Aggregate(f, q, None, Input::I64(n)) => m.aggregate(f, q, *n),
-                Op::Aggregate(f, q, Some(ts), Input::I64(n)) => m.aggregate_at(f, q, *ts, *n),
-                Op::Aggregate(f, q, None, Input::U64(n)) => m.aggregate_u64(f, q, *n),
-                Op::Aggregate(f, q, Some(ts), Input::U64(n)) => m.aggregate_u64_at(f, q, *ts, *n),
-                Op::Aggregate(f, q, None, Input::F64(x)) => m.aggregate_f64(f, q, *x),
-                Op::Aggregate(f, q, Some(ts), Input::F64(x)) => m.aggregate_f64_at(f, q, *ts, *x),
-                Op::Aggregate(f, q, None, Input::Bytes(b)) => m.aggregate_bytes(f, q, b),
-                Op::Aggregate(f, q, Some(ts), Input::Bytes(b)) => {
-                    m.aggregate_bytes_at(f, q, *ts, b)
-                }
-                Op::PutVector(f, q, ts, v) => {
-                    use crate::vector::Vector;
-                    match (v, ts) {
-                        (Vector::F32(x), None) => m.put_vector_f32(f, q, x),
-                        (Vector::F32(x), Some(ts)) => m.put_vector_f32_at(f, q, *ts, x),
-                        (Vector::I8(x), None) => m.put_vector_i8(f, q, x),
-                        (Vector::I8(x), Some(ts)) => m.put_vector_i8_at(f, q, *ts, x),
-                        (Vector::Bits(x), None) => m.put_vector_bits(f, q, x),
-                        (Vector::Bits(x), Some(ts)) => m.put_vector_bits_at(f, q, *ts, x),
-                    }
-                }
-                Op::DeleteRow => m.delete_row(),
-                Op::DeleteFamily(f) => m.delete_family(f),
-                Op::DeleteColumn(f, q) => m.delete_column(f, q),
-                Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
-            };
-        }
+        let m = row_mutation(&table, &row, &ops, durability);
         match condition {
             None => m.commit().map(|i| Some(i.seqno)),
             Some(c) => m.commit_if(&c).map(|i| i.map(|i| i.seqno)),
         }
     })
     .or_py()
+}
+
+/// Commits `ops` to `row` of `table` like [`commit_row`], returning every counter cell they
+/// incremented or set, as the commit left it (D314, ICR 0113).
+pub(crate) fn commit_row_returning(
+    py: Python<'_>,
+    table: &pigeonhole::Table,
+    row: Vec<u8>,
+    ops: Vec<Op>,
+    durability: Option<Durability>,
+) -> PyResult<Incremented> {
+    let table = table.clone();
+    py.detach(move || row_mutation(&table, &row, &ops, durability).commit_returning())
+        .map(Incremented)
+        .or_py()
+}
+
+/// `ops` buffered on a row mutation of `row`, uncommitted.
+fn row_mutation<'t>(
+    table: &'t pigeonhole::Table,
+    row: &[u8],
+    ops: &[Op],
+    durability: Option<Durability>,
+) -> pigeonhole::RowMutation<'t> {
+    let mut m = table.mutate(row);
+    if let Some(d) = durability {
+        m = m.durability(d.into());
+    }
+    for op in ops {
+        m = match op {
+            Op::Put(f, q, None, Val::Bytes(b)) => m.put(f, q, b),
+            Op::Put(f, q, Some(ts), Val::Bytes(b)) => m.put_at(f, q, *ts, b),
+            Op::Put(f, q, None, Val::I64(n)) => m.put_i64(f, q, *n),
+            Op::Put(f, q, Some(ts), Val::I64(n)) => m.put_i64_at(f, q, *ts, *n),
+            Op::Put(f, q, None, Val::F64(x)) => m.put_f64(f, q, *x),
+            Op::Put(f, q, Some(ts), Val::F64(x)) => m.put_f64_at(f, q, *ts, *x),
+            Op::PutU64(f, q, None, n) => m.put_u64(f, q, *n),
+            Op::PutU64(f, q, Some(ts), n) => m.put_u64_at(f, q, *ts, *n),
+            Op::Incr(f, q, None, d) => m.incr(f, q, *d),
+            Op::Incr(f, q, Some(ts), d) => m.incr_at(f, q, *ts, *d),
+            Op::Aggregate(f, q, None, Input::I64(n)) => m.aggregate(f, q, *n),
+            Op::Aggregate(f, q, Some(ts), Input::I64(n)) => m.aggregate_at(f, q, *ts, *n),
+            Op::Aggregate(f, q, None, Input::U64(n)) => m.aggregate_u64(f, q, *n),
+            Op::Aggregate(f, q, Some(ts), Input::U64(n)) => m.aggregate_u64_at(f, q, *ts, *n),
+            Op::Aggregate(f, q, None, Input::F64(x)) => m.aggregate_f64(f, q, *x),
+            Op::Aggregate(f, q, Some(ts), Input::F64(x)) => m.aggregate_f64_at(f, q, *ts, *x),
+            Op::Aggregate(f, q, None, Input::Bytes(b)) => m.aggregate_bytes(f, q, b),
+            Op::Aggregate(f, q, Some(ts), Input::Bytes(b)) => m.aggregate_bytes_at(f, q, *ts, b),
+            Op::PutVector(f, q, ts, v) => {
+                use crate::vector::Vector;
+                match (v, ts) {
+                    (Vector::F32(x), None) => m.put_vector_f32(f, q, x),
+                    (Vector::F32(x), Some(ts)) => m.put_vector_f32_at(f, q, *ts, x),
+                    (Vector::I8(x), None) => m.put_vector_i8(f, q, x),
+                    (Vector::I8(x), Some(ts)) => m.put_vector_i8_at(f, q, *ts, x),
+                    (Vector::Bits(x), None) => m.put_vector_bits(f, q, x),
+                    (Vector::Bits(x), Some(ts)) => m.put_vector_bits_at(f, q, *ts, x),
+                }
+            }
+            Op::DeleteRow => m.delete_row(),
+            Op::DeleteFamily(f) => m.delete_family(f),
+            Op::DeleteColumn(f, q) => m.delete_column(f, q),
+            Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
+        };
+    }
+    m
 }
 
 /// Writes to one row, applied atomically by `commit()` (or `commit_if(condition)`).
@@ -1334,6 +1387,15 @@ impl Mutation {
     fn commit_if(&self, py: Python<'_>, condition: &Condition) -> PyResult<Option<u64>> {
         self.finish(py, Some(condition.0.clone()))
     }
+
+    /// Commits every write atomically, like `commit`, and returns each counter cell it
+    /// incremented or set, as a read at the commit sees it (D314). Concurrent increments of
+    /// one cell each get their own value.
+    fn commit_returning(&self, py: Python<'_>) -> PyResult<Incremented> {
+        let ops = self.take()?;
+        let durability = *self.durability.lock().expect("not poisoned");
+        commit_row_returning(py, &self.table, self.row.clone(), ops, durability)
+    }
 }
 
 impl Mutation {
@@ -1342,12 +1404,7 @@ impl Mutation {
         py: Python<'_>,
         condition: Option<pigeonhole::Condition>,
     ) -> PyResult<Option<u64>> {
-        let ops = self
-            .ops
-            .lock()
-            .expect("not poisoned")
-            .take()
-            .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))?;
+        let ops = self.take()?;
         let durability = *self.durability.lock().expect("not poisoned");
         commit_row(
             py,
@@ -1356,6 +1413,128 @@ impl Mutation {
             ops,
             durability,
             condition,
+        )
+    }
+
+    /// The buffered writes, taken for a commit.
+    fn take(&self) -> PyResult<Vec<Op>> {
+        self.ops
+            .lock()
+            .expect("not poisoned")
+            .take()
+            .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))
+    }
+}
+
+/// The counter cells a `Mutation.commit_returning()` incremented or set, after its commit
+/// (D314): `value(family, qualifier, ts=None)`, or index it with `(family, qualifier)` or
+/// `(family, qualifier, ts)`. Iterating gives the keys `(family, qualifier, ts)`, `ts` 0 for
+/// a plain counter, in the order the mutation first wrote each.
+#[pyclass(module = "pigeonhole", frozen)]
+pub(crate) struct Incremented(pigeonhole::Incremented);
+
+/// One of `Incremented.cells()`: family, qualifier, ts, value.
+type IncrementedCell<'py> = (String, Bound<'py, PyBytes>, u64, Option<i64>);
+
+impl Incremented {
+    /// The cell `key` names: `(family, qualifier)` or `(family, qualifier, ts)`.
+    fn key(key: &Bound<'_, PyAny>) -> PyResult<(String, Vec<u8>, u64)> {
+        let t = key.cast::<pyo3::types::PyTuple>().map_err(|_| {
+            PyTypeError::new_err(
+                "an Incremented key is (family, qualifier) or (family, qualifier, ts)",
+            )
+        })?;
+        let ts = match t.len() {
+            2 => 0,
+            3 => t.get_item(2)?.extract()?,
+            _ => {
+                return Err(PyTypeError::new_err(
+                    "an Incremented key is (family, qualifier) or (family, qualifier, ts)",
+                ));
+            }
+        };
+        Ok((
+            t.get_item(0)?.extract()?,
+            convert::bytes(&t.get_item(1)?)?,
+            ts,
+        ))
+    }
+
+    fn contains(&self, family: &str, qualifier: &[u8], ts: u64) -> bool {
+        self.0
+            .iter()
+            .any(|(f, q, t, _)| f == family && q == qualifier && t == ts)
+    }
+}
+
+#[pymethods]
+impl Incremented {
+    /// The commit's sequence number.
+    #[getter]
+    fn seqno(&self) -> u64 {
+        self.0.info.seqno
+    }
+
+    /// The counter (or with `ts`, the bucket) in `family` at `qualifier`, after the commit.
+    /// `None` when a read at the commit sees no cell: one the mutation deleted, or a bucket
+    /// already past the family's TTL. Raises
+    /// `InvalidArgument` if the commit didn't write that cell, and the read's error if the
+    /// value couldn't be read after the commit applied: **the commit succeeded** then, so
+    /// don't retry it.
+    #[pyo3(signature = (family, qualifier, *, ts=None))]
+    fn value(
+        &self,
+        family: &str,
+        qualifier: &Bound<'_, PyAny>,
+        ts: Option<u64>,
+    ) -> PyResult<Option<i64>> {
+        self.0
+            .value_at(family, &convert::bytes(qualifier)?, ts.unwrap_or(0))
+            .or_py()
+    }
+
+    /// Every cell as `(family, qualifier, ts, value)`, in the order the mutation first wrote
+    /// each; raises the first unreadable value's error, as `value` does.
+    fn cells<'py>(&self, py: Python<'py>) -> PyResult<Vec<IncrementedCell<'py>>> {
+        self.0
+            .iter()
+            .map(|(f, q, ts, v)| Ok((f.to_owned(), PyBytes::new(py, q), ts, v.or_py()?)))
+            .collect()
+    }
+
+    fn __getitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+        let (f, q, ts) = Self::key(key)?;
+        if !self.contains(&f, &q, ts) {
+            return Err(pyo3::exceptions::PyKeyError::new_err(key.clone().unbind()));
+        }
+        self.0.value_at(&f, &q, ts).or_py()
+    }
+
+    fn __contains__(&self, key: &Bound<'_, PyAny>) -> bool {
+        Self::key(key).is_ok_and(|(f, q, ts)| self.contains(&f, &q, ts))
+    }
+
+    fn __len__(&self) -> usize {
+        self.0.iter().count()
+    }
+
+    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let keys: Vec<(String, Bound<'py, PyBytes>, u64)> = self
+            .0
+            .iter()
+            .map(|(f, q, ts, _)| (f.to_owned(), PyBytes::new(py, q), ts))
+            .collect();
+        Ok(pyo3::types::PyList::new(py, keys)?
+            .as_any()
+            .try_iter()?
+            .into_any())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Incremented(seqno={}, cells={})",
+            self.0.info.seqno,
+            self.0.iter().count()
         )
     }
 }

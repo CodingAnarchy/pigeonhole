@@ -32,9 +32,9 @@ mod vector;
 mod walk;
 
 use classes::{
-    Cell, Condition, Database, FamilyInfo, Feed, KeysPosition, Mutation, Pages, Reader, Row,
-    RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder, Transaction,
-    VectorSpec, WriteBatch,
+    Cell, Condition, Database, FamilyInfo, Feed, Incremented, KeysPosition, Mutation, Pages,
+    Reader, Row, RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder,
+    Transaction, VectorSpec, WriteBatch,
 };
 
 /// Defines `Pigeonhole::<name>` with no allocator: instances come only from the library.
@@ -123,6 +123,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_scan_spec", method!(Table::scan_spec, 9))?;
     c.define_private_method("native_put", method!(Table::put, 6))?;
     c.define_private_method("native_incr", method!(Table::incr, 6))?;
+    c.define_private_method("native_incr_returning", method!(Table::incr_returning, 6))?;
     c.define_private_method("native_delete", method!(Table::delete, 5))?;
     c.define_private_method("native_multi_get", method!(Table::multi_get, 6))?;
     c.define_private_method("native_traverse", method!(Table::traverse, 11))?;
@@ -145,6 +146,17 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_durability", method!(Mutation::set_durability, 1))?;
     c.define_method("commit", method!(Mutation::commit, 0))?;
     c.define_method("commit_if", method!(Mutation::commit_if, 1))?;
+    c.define_private_method(
+        "native_commit_returning",
+        method!(Mutation::commit_returning, 0),
+    )?;
+
+    let c = class(ruby, m, "Incremented")?;
+    c.define_method("seqno", method!(Incremented::seqno, 0))?;
+    c.define_private_method("native_value", method!(Incremented::value, 3))?;
+    c.define_method("to_h", method!(Incremented::to_h, 0))?;
+    c.define_method("size", method!(Incremented::size, 0))?;
+    c.define_method("inspect", method!(Incremented::inspect, 0))?;
 
     let c = class(ruby, m, "WriteBatch")?;
     writes!(c, WriteBatch);
