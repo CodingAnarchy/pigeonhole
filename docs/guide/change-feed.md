@@ -110,7 +110,7 @@ A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, an
 - retention recycled the history it needs: raise `FeedRetention` if a slow consumer falls behind;
 - the database was opened since with the feed off, without these tables, or with another explicit shard count;
 - a power loss took commits a `visible()` feed had delivered;
-- a short window: a power loss between a flush's or checkpoint's metadata commit and the sync of the feed's record of it.
+- a short window after any metadata commit (a flush's, a checkpoint's or a compaction's) before the feed's record of it is safe: a process crash before the record is written (a single write, microseconds), or a power loss before it is synced.
 
 Once a feed has expired, `Feed::oldest_retained` says how far back the history it needed still goes, when that's known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
 
