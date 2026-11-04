@@ -779,6 +779,25 @@ fn feed_sidecar_catalog_names() {
     let (decoded, end) = decode_entries(&log);
     assert!(decoded.is_empty(), "{decoded:?}");
     assert_eq!(end, 0, "the reader stops at the damaged entry");
+
+    // The trailer is framed by the entry, never read as one more edit (simp724): a decoder
+    // that expects an edit where the names start fails closed. Emulated by claiming one
+    // more edit than the entry holds, with a valid CRC.
+    let mut one = Vec::new();
+    entries[0].encode(&mut one);
+    let mut payload = one[8..].to_vec();
+    let count = 1 + 4 * 8;
+    let edits = u32::from_le_bytes(payload[count..count + 4].try_into().unwrap());
+    payload[count..count + 4].copy_from_slice(&(edits + 1).to_le_bytes());
+    let mut log = Vec::new();
+    log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+    log.extend_from_slice(&payload);
+    let (decoded, _) = decode_entries(&log);
+    assert!(
+        !matches!(decoded.first(), Some(FeedEntry::Catalog { .. })),
+        "names misread as an edit: {decoded:?}"
+    );
 }
 
 #[test]
