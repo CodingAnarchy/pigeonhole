@@ -103,7 +103,7 @@ message AggregateView {
   repeated uint64 histogram_counts = 3;
   QuantileReading quantiles = 4;
   BloomReading bloom = 5;
-  repeated bytes set_members = 6;
+  repeated uint32 set_members = 6;
 }
 
 message MeanVar {

@@ -73,6 +73,10 @@ pub(crate) fn run(
             )
             .map(Outcome::Streamed);
         }
+        #[cfg(feature = "serve")]
+        Command::Serve(args) => {
+            return crate::serve::run(&cli, args, stderr).map(Outcome::Streamed);
+        }
         Command::Load {
             file,
             input,
