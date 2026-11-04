@@ -124,15 +124,9 @@ class TestVectorIndex < Minitest::Test
     assert_bad_call(TypeError) { V::Index.create(db, "bulk3", spec(4)).bulk_load([[1]], expected: 1) }
   end
 
-  # The loader threads alive now, by name; nil where the platform doesn't show them (only
-  # Linux's /proc does, which CI runs).
-  def loader_threads
-    return nil unless File.directory?("/proc/self/task")
-
-    Dir["/proc/self/task/*/comm"].count { |f| File.read(f).start_with?("pigeonhole-bulk") }
-  rescue SystemCallError
-    nil
-  end
+  # The loader threads still listed (`named_threads_left`); nil where the platform doesn't
+  # show threads.
+  def loader_threads = named_threads_left("pigeonhole-bulk")
 
   # ai1249's B1 on #1434: an interrupt during a bulk load (in a push or in the final join)
   # never returns while the loader thread still runs.
@@ -191,14 +185,32 @@ class TestVectorIndex < Minitest::Test
     worker = Thread.new { reb.run_once(3.0) }
     sleep 0.1
     ticks = 0
-    ticker = Thread.new { 20.times { ticks += 1; sleep 0.01 } } # rubocop:disable Style/Semicolon
+    ticker = Thread.new do
+      loop do
+        ticks += 1
+        sleep 0.01
+      end
+    end
+    # What the design guarantees for closed? during a 3 s run_once: the step's current slice
+    # (at most 100 ms) plus the split in progress, which the crate always finishes, and then
+    # the Fair lock lets it in before the next slice. Measured on a Mac under 2x-cores of CPU
+    # load: p90 71 ms, worst 107 ms. The bound is 5 slices, for slow CI runners; without the
+    # slicing and the give-way it took the whole 3 s (perf2's S3 on #1434). The time is
+    # closed?'s own: an earlier version also timed a ticker's sleeps, which a slow macOS
+    # runner stretched past the bound (1.19 s on #1444).
     t0 = monotonic
     refute_predicate reb, :closed?
+    waited = monotonic - t0
+    assert_operator waited, :<, 0.5, "closed? waited out the run_once"
+    # Other Ruby threads ran meanwhile: closed? waited with the GVL released.
+    sleep 0.05
+    assert_operator ticks, :>, 0
+    ticker.kill
     ticker.join
-    assert_operator monotonic - t0, :<, 1.0, "closed? waited out the run_once"
-    assert_equal 20, ticks
     worker.kill
     worker.join
+    # An interrupt ends the run_once at the next slice: the 0.2 s timeout, at most a slice
+    # and a split, and the join. The bound leaves slow runners over a second of room.
     t0 = monotonic
     assert_raises(Timeout::Error) { Timeout.timeout(0.2) { reb.run_once(5.0) } }
     assert_operator monotonic - t0, :<, 1.5, "run_once ran past the interrupt"

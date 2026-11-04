@@ -6,10 +6,13 @@ name: Ruby
 # ruby-gems.yml.
 
 on:
+  # On main only for the bindings themselves (or a dependency change that can leave
+  # crates/ruby/Cargo.lock stale): an engine change runs here on its pull request, and the
+  # weekly ruby-gems.yml build covers the engine under the gem.
   push:
     branches: [main]
     paths:
-      - 'crates/**'
+      - 'crates/ruby/**'
       - 'Cargo.lock'
       - '.github/workflows/ruby.yml'
   pull_request:
@@ -25,6 +28,13 @@ env:
   CARGO_TERM_COLOR: always
   # rake compile builds into crates/ruby/target (not under tmp/), which rust-cache keeps.
   RB_SYS_CARGO_TARGET_DIR: ${{ github.workspace }}/crates/ruby/target
+
+# A newer push to a pull request cancels its superseded run. On main a run is never cancelled
+# (with merges landing faster than a run, main would never finish one); GitHub keeps only the
+# newest queued run per group, so main holds at most one running and one waiting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

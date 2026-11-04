@@ -14,6 +14,12 @@
   (`[workspace.package] version`), under semver from 1.0.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
+- **Publish order:** `list` prints `INTERNAL` then `PUBLIC`, and `check` fails unless each
+  crate comes after every pigeonhole crate it depends on (normal and build dependencies, which
+  must be on crates.io when it publishes).
+- **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
+  itself: `check` fails unless its `version`, its pins and the gem's `Pigeonhole::VERSION`
+  (`lib/pigeonhole/version.rb`) are the workspace version.
 
 **Release check:** `publish.sh` skips a crate already on crates.io at its version, so a line
 whose crates changed since the last release but whose version did not move would ship the
@@ -38,7 +44,7 @@ INTERNAL = [
     "format", "io", "sim", "pager", "wal", "memtable", "cache", "runtime", "shm", "sst",
     "compaction", "engine",
 ]
-PUBLIC = ["pigeonhole", "arrow", "cli", "vector", "text", "memory"]
+PUBLIC = ["pigeonhole", "arrow", "vector", "text", "memory", "cli"]
 UNPUBLISHED = ["capi", "bench"]
 
 
@@ -60,6 +66,56 @@ def versions():
         v = manifest(d)["package"]["version"]
         out[d] = None if isinstance(v, dict) and v.get("workspace") else v
     return root, out
+
+
+def pigeonhole_deps(m):
+    """The pigeonhole crates manifest `m` needs to build: its normal and build dependencies,
+    target-specific ones included, by package name."""
+    tables = [m]
+    tables += list(m.get("target", {}).values())
+    out = set()
+    for t in tables:
+        for section in ("dependencies", "build-dependencies"):
+            for key, spec in t.get(section, {}).items():
+                package = spec.get("package", key) if isinstance(spec, dict) else key
+                if package.startswith("pigeonhole"):
+                    out.add(package)
+    return out
+
+
+def order_errors():
+    """A published crate listed before a pigeonhole crate it depends on would fail to publish:
+    its dependency isn't on crates.io yet."""
+    order = [name(d) for d in INTERNAL + PUBLIC]
+    errors = []
+    for i, d in enumerate(INTERNAL + PUBLIC):
+        for dep in sorted(pigeonhole_deps(manifest(d))):
+            if dep not in order:
+                errors.append(f"{name(d)} depends on {dep}, which isn't published")
+            elif order.index(dep) > i:
+                errors.append(f"{name(d)} is listed before {dep}, which it depends on")
+    return errors
+
+
+RUBY_VERSION_RB = "crates/ruby/lib/pigeonhole/version.rb"
+
+
+def ruby_errors(workspace):
+    """The Ruby gem's crate is outside the workspace, so it repeats the public line."""
+    with open(ROOT / "crates" / "ruby" / "Cargo.toml", "rb") as f:
+        m = tomllib.load(f)
+    errors = []
+    if m["package"]["version"] != workspace:
+        errors.append(f"crates/ruby/Cargo.toml version is {m['package']['version']!r}, not {workspace!r}")
+    for key, spec in sorted(m.get("dependencies", {}).items()):
+        if key.startswith("pigeonhole") and isinstance(spec, dict):
+            if spec.get("version") != workspace:
+                errors.append(f"crates/ruby/Cargo.toml pins {key} at {spec.get('version')!r}, not {workspace!r}")
+    text = (ROOT / RUBY_VERSION_RB).read_text()
+    gem = [l.split("=", 1)[1].strip().strip('"') for l in text.splitlines() if l.strip().startswith("VERSION =")]
+    if gem != [workspace]:
+        errors.append(f"{RUBY_VERSION_RB} sets VERSION {gem!r}, not {workspace!r}")
+    return errors
 
 
 def check():
@@ -86,6 +142,8 @@ def check():
         got = pins.get(name(d), {}).get("version")
         if got != workspace:
             errors.append(f"[workspace.dependencies] {name(d)} is {got!r}, not {workspace!r}")
+    errors += order_errors()
+    errors += ruby_errors(workspace)
     if errors:
         for e in errors:
             print(f"error: {e}", file=sys.stderr)
