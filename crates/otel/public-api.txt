@@ -1,0 +1,30 @@
+pub mod pigeonhole_otel
+#[non_exhaustive] pub enum pigeonhole_otel::InstrumentKind
+pub pigeonhole_otel::InstrumentKind::Counter
+pub pigeonhole_otel::InstrumentKind::Gauge
+pub struct pigeonhole_otel::Config
+impl pigeonhole_otel::Config
+pub fn pigeonhole_otel::Config::db_name(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_otel::Config::latency_window(self, core::time::Duration) -> Self
+pub fn pigeonhole_otel::Config::new() -> Self
+pub fn pigeonhole_otel::Config::register(self, &pigeonhole::db::Pigeonhole, &opentelemetry::metrics::meter::Meter) -> pigeonhole_otel::Registration
+pub fn pigeonhole_otel::Config::storage_by_table(self, bool) -> Self
+impl core::default::Default for pigeonhole_otel::Config
+pub fn pigeonhole_otel::Config::default() -> Self
+#[non_exhaustive] pub struct pigeonhole_otel::MetricInfo
+pub pigeonhole_otel::MetricInfo::attributes: &'static [&'static str]
+pub pigeonhole_otel::MetricInfo::description: &'static str
+pub pigeonhole_otel::MetricInfo::kind: pigeonhole_otel::InstrumentKind
+pub pigeonhole_otel::MetricInfo::name: &'static str
+pub pigeonhole_otel::MetricInfo::unit: &'static str
+impl pigeonhole_otel::MetricInfo
+pub fn pigeonhole_otel::MetricInfo::prometheus_name(&self) -> alloc::string::String
+pub struct pigeonhole_otel::Registration
+impl pigeonhole_otel::Registration
+pub fn pigeonhole_otel::Registration::rebind(&self, &pigeonhole::db::Pigeonhole)
+impl core::fmt::Debug for pigeonhole_otel::Registration
+pub fn pigeonhole_otel::Registration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for pigeonhole_otel::Registration
+pub fn pigeonhole_otel::Registration::drop(&mut self)
+pub fn pigeonhole_otel::metrics() -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = pigeonhole_otel::MetricInfo>
+pub fn pigeonhole_otel::register(&pigeonhole::db::Pigeonhole, &opentelemetry::metrics::meter::Meter) -> pigeonhole_otel::Registration

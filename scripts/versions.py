@@ -12,9 +12,12 @@
 - **The public line:** `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli`, `pigeonhole-vector`,
   `pigeonhole-text`, `pigeonhole-memory` and the unpublished `pigeonhole-capi` and `pigeonhole-bench` take the workspace version
   (`[workspace.package] version`), under semver from 1.0.
+- **Own lines:** `pigeonhole-otel` (`OWN`) sets its own `version`, a 0.N line outside the
+  public one (D316): its API takes `opentelemetry` types, so it follows opentelemetry's minor
+  releases. `check` fails unless its pin is that version; `release-check` checks it on its own.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
-- **Publish order:** `list` prints `INTERNAL` then `PUBLIC`, and `check` fails unless each
+- **Publish order:** `list` prints `INTERNAL`, then `PUBLIC`, then `OWN`, and `check` fails unless each
   crate comes after every pigeonhole crate it depends on (normal and build dependencies, which
   must be on crates.io when it publishes).
 - **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
@@ -47,6 +50,8 @@ INTERNAL = [
     "compaction", "engine",
 ]
 PUBLIC = ["pigeonhole", "arrow", "vector", "text", "memory", "cli"]
+# Published crates on a version line of their own (D316), after the public line's.
+OWN = ["otel"]
 UNPUBLISHED = ["capi", "bench"]
 
 
@@ -64,7 +69,7 @@ def versions():
     with open(ROOT / "Cargo.toml", "rb") as f:
         root = tomllib.load(f)
     out = {}
-    for d in INTERNAL + PUBLIC + UNPUBLISHED:
+    for d in INTERNAL + PUBLIC + OWN + UNPUBLISHED:
         v = manifest(d)["package"]["version"]
         out[d] = None if isinstance(v, dict) and v.get("workspace") else v
     return root, out
@@ -88,9 +93,9 @@ def pigeonhole_deps(m):
 def order_errors():
     """A published crate listed before a pigeonhole crate it depends on would fail to publish:
     its dependency isn't on crates.io yet."""
-    order = [name(d) for d in INTERNAL + PUBLIC]
+    order = [name(d) for d in INTERNAL + PUBLIC + OWN]
     errors = []
-    for i, d in enumerate(INTERNAL + PUBLIC):
+    for i, d in enumerate(INTERNAL + PUBLIC + OWN):
         for dep in sorted(pigeonhole_deps(manifest(d))):
             if dep not in order:
                 errors.append(f"{name(d)} depends on {dep}, which isn't published")
@@ -154,20 +159,27 @@ def check():
         got = pins.get(name(d), {}).get("version")
         if got != workspace:
             errors.append(f"[workspace.dependencies] {name(d)} is {got!r}, not {workspace!r}")
+    for d in OWN:
+        if crates[d] is None:
+            errors.append(f"{name(d)} takes the workspace version: it has a line of its own")
+        got = pins.get(name(d), {}).get("version")
+        if got != crates[d]:
+            errors.append(f"[workspace.dependencies] {name(d)} is {got!r}, not {crates[d]!r}")
     errors += order_errors()
     errors += ruby_errors(workspace)
     if errors:
         for e in errors:
             print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"internal line {line} (12 crates), public line {workspace}")
+    own = ", ".join(f"{name(d)} {crates[d]}" for d in OWN)
+    print(f"internal line {line} (12 crates), public line {workspace}, own lines: {own}")
     return 0
 
 
 def listing():
     root, crates = versions()
     workspace = root["workspace"]["package"]["version"]
-    for d in INTERNAL + PUBLIC:
+    for d in INTERNAL + PUBLIC + OWN:
         print(name(d), crates[d] or workspace)
     return 0
 
@@ -234,6 +246,15 @@ def release_check(tag):
                 + ("the workspace's shared settings changed" if shared else "these changed: ")
                 + ("" if shared else ", ".join(name(d) for d in moved))
                 + f": bump the {line} line (and its pins)"
+            )
+    for d in OWN:
+        try:
+            then = toml_at(tag, f"crates/{d}/Cargo.toml")["package"]["version"]
+        except subprocess.CalledProcessError:
+            continue  # new since the tag: its first release
+        if (changed(tag, d) or shared) and crates[d] == then:
+            errors.append(
+                f"{name(d)} is still {then}, as at {tag}, but it changed: bump its version (and its pin)"
             )
     if errors:
         for e in errors:

@@ -145,6 +145,26 @@ fn same_database_is_one_open() {
     again.close().unwrap();
 }
 
+/// ICR 0115: `path` is the path as given to the open, relative or not, on every clone, and
+/// `is_closed` answers for every clone once one closes.
+#[test]
+fn path_is_the_path_given_to_open() {
+    let vfs = SimVfs::new(8);
+    let db = Pigeonhole::open("/db/./named.phdb", sim_options(&vfs)).unwrap();
+    assert_eq!(db.path(), std::path::Path::new("/db/./named.phdb"));
+    let clone = db.clone();
+    assert_eq!(clone.path(), db.path());
+    assert!(!clone.is_closed());
+    db.close().unwrap();
+    assert!(clone.is_closed());
+    drop(clone);
+    // A relative path stays relative: it is not canonicalised against the working
+    // directory (the simulated filesystem never consults one).
+    let db = Pigeonhole::open("db/rel.phdb", sim_options(&vfs)).unwrap();
+    assert_eq!(db.path(), std::path::Path::new("db/rel.phdb"));
+    db.close().unwrap();
+}
+
 #[test]
 fn drop_table_removes_it_and_its_data() {
     let db = db();

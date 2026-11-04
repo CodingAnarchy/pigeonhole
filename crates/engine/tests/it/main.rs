@@ -36,6 +36,7 @@ mod close_failures;
 mod close_voided_flush;
 mod coarse_clock;
 mod compaction_styles;
+mod compaction_view;
 mod conditional_groups;
 mod counter_checkpoints;
 mod cross_checkpoints;
