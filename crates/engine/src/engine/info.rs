@@ -219,7 +219,7 @@ impl Engine {
             file_bytes,
             free_bytes,
             feed: shared.feed.as_ref().map(|f| FeedStorage {
-                retention_bytes: f.retention_bytes,
+                retention_bytes: f.retention_in_effect(),
                 retained_wal_bytes: f.retained_bytes(),
                 held_blob_bytes: f.held_bytes(),
             }),

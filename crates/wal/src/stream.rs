@@ -449,6 +449,8 @@ pub struct FeedMarks {
     head: AtomicU32,
     floor: AtomicU32,
     retained_bytes: AtomicU64,
+    /// The retention in effect: retained segments times the stream file's own slot size.
+    retention: AtomicU64,
     checkpoint: AtomicU64,
     /// Where the marks are published for other processes (D310 PR 4), once set.
     mirror: std::sync::OnceLock<Box<dyn MarkMirror>>,
@@ -484,6 +486,14 @@ impl FeedMarks {
     /// The bytes of the segments the checkpoint passed and retention keeps.
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The most history the stream keeps: its retained segments
+    /// ([`WalOptions::retain_segments`](crate::WalOptions::retain_segments)) times its file's
+    /// slot size, which an existing file keeps whatever `segment_size` the open asked for
+    /// (#1471). 0 without retention. Set before the stream's first segment, never after.
+    pub fn retention(&self) -> u64 {
+        self.retention.load(Ordering::Relaxed)
     }
 
     /// The stream's checkpoint: replay would start here, so nothing before it is needed
@@ -1615,6 +1625,10 @@ impl WalStream {
     /// before the stream's first segment.
     pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
         self.retain = opts.retain_segments;
+        self.marks.retention.store(
+            u64::from(self.retain) * self.segment_size,
+            Ordering::Relaxed,
+        );
         self.retain_floor = if self.retain == 0 { u32::MAX } else { 0 };
         self.feed_session = opts.feed_session;
     }

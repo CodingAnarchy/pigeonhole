@@ -979,7 +979,10 @@ impl Options {
 
     /// WAL segment size in bytes (default 64 MiB; a multiple of 32 KiB, decision D43). A test
     /// hook (ICR 0005): small segments keep simulated opens fast. It also lowers the largest
-    /// value a commit may carry (decision D16). Applications never need it.
+    /// value a commit may carry (decision D16). Applications never need it. It sizes new WAL
+    /// streams only: an existing database's streams keep the slot size they were made with,
+    /// and the change feed's retention is counted in whole segments of each stream's own
+    /// size (`DatabaseInfo::feed` reports what's in effect; #1471).
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn wal_segment_size(mut self, bytes: u64) -> Self {

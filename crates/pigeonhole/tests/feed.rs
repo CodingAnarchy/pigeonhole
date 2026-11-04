@@ -518,3 +518,88 @@ fn from_oldest_after_a_reopen_starts_at_the_oldest_retained_history() {
         db.close().unwrap();
     }
 }
+
+/// #1471 (ai1249's repro): reopened with another `wal_segment_size`, the feed keeps its
+/// retention in bytes. An existing WAL file keeps its own slot size, so retention counted
+/// in the configured size kept too little (a larger size: `from_oldest` lost the first
+/// session) or far too much (a smaller one). Two sessions on 256 KiB slots, then a third
+/// open with the default size and one with 64 KiB: `from_oldest` still starts at the first
+/// commit, and the retention in effect is the requested 4 MiB.
+#[test]
+fn a_changed_wal_segment_size_keeps_the_feed_s_retention() {
+    for third in [None, Some(64u64 << 10)] {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let path = dir.join("f.phdb");
+        let opts = |size: Option<u64>| {
+            let o = Options::default().shards(2).pin_threads(false);
+            match size {
+                Some(s) => o.wal_segment_size(s),
+                None => o,
+            }
+        };
+        let small = Some(256u64 << 10);
+        let mut first = 0;
+        let mut token = None;
+        for session in 0..2u64 {
+            let o = opts(small);
+            let db = Pigeonhole::open(
+                &path,
+                if session == 0 {
+                    o.change_feed(FeedRetention::bytes(4 << 20))
+                } else {
+                    o
+                },
+            )
+            .unwrap();
+            let t = db
+                .table("events")
+                .unwrap()
+                .family("e", Family::default())
+                .create_if_missing()
+                .unwrap();
+            if session == 0 {
+                token = Some(t.feed().open().unwrap().token());
+            }
+            for i in 0..150u64 {
+                let v = format!("event {i:03} ").repeat(180);
+                let c = t
+                    .mutate(format!("r{:02}", i % 7).as_bytes())
+                    .put("e", b"what", v.as_bytes())
+                    .commit()
+                    .unwrap();
+                if session == 0 && i == 0 {
+                    first = c.seqno;
+                }
+                if i % 50 == 49 {
+                    db.flush().unwrap();
+                }
+            }
+            drop(t);
+            db.close().unwrap();
+        }
+        let db = Pigeonhole::open(&path, opts(third)).unwrap();
+        let info = db.info().unwrap().feed.expect("the feed is inherited");
+        assert_eq!(
+            info.retention_bytes,
+            4 << 20,
+            "{third:?}: the retention in effect, in the files' own slots"
+        );
+        let t = db.table("events").unwrap().open().unwrap();
+        // A token from before the first commit still resumes: its history was kept.
+        let mut f = t.feed().resume(token.as_ref().unwrap()).open().unwrap();
+        let c = f.next(WAIT).unwrap().expect("the token's history");
+        assert_eq!(
+            c.seqno(),
+            first,
+            "{third:?}: the token resumes at the first commit"
+        );
+        drop(f);
+        // And from the oldest (#1465) starts there too.
+        let mut f = t.feed().from_oldest().open().unwrap();
+        let c = f.next(WAIT).unwrap().expect("history");
+        assert_eq!(c.seqno(), first, "{third:?}: from the first session");
+        drop(f);
+        drop(t);
+        db.close().unwrap();
+    }
+}
