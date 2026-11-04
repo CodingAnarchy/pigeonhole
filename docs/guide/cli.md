@@ -340,7 +340,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves `Data`'s single-call RPCs (`Get`, `MultiGet`, `ReadRow`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`) over gRPC and HTTP/JSON. Scans, transactions, the change feed, schema and the other services follow; ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`) over gRPC and HTTP/JSON. Transactions, the change feed, schema and the other services follow; ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
@@ -348,10 +348,17 @@ u1   profile  name       1761030000000000  Ada
   - **TLS:** `--tls-cert` and `--tls-key` take PEM files; every connection is then TLS.
   - **Tokens:** `--token-file`, or the `PHDB_SERVE_TOKENS` environment variable, holds one token per line: `read|write|admin [ns=a,b] <token>`, or `sha256:<hex>` for the token's digest. Requests carry `Authorization: Bearer <token>`. Tokens are never a flag's value.
   - **The bind rule:** an address other hosts can reach needs both TLS and tokens, or the server refuses to start. `--insecure-no-tls-no-auth` overrides that for a trusted private network. A loopback address needs neither.
-- **Limits:** `--max-request-bytes` (16 MiB), `--inflight-bytes` (256 MiB of request bodies held at once), `--max-concurrent` (1,024 requests; more are refused at once with `Overloaded`, never queued) and `--request-timeout-ms` (the longest wait for those limits). A write the server has submitted always answers its real outcome.
+- **Scans** stream pages of up to `page_bytes` each (default 1 MiB). Over gRPC, `Data.Scan` is a server stream. Over HTTP, `POST /v1/Data/Scan` answers one JSON page per line (`application/x-ndjson`), or server-sent events with `Accept: text/event-stream`. A scan that fails partway ends with a final error message: an NDJSON line `{"error": ...}`, or an SSE `event: error`. Each page's `next` resumes the scan later, from any server process.
+- **Limits:**
+  - `--max-request-bytes` (16 MiB): the largest request.
+  - `--inflight-bytes` (256 MiB): request bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC.
+  - `--max-concurrent` (1,024 requests): more are refused at once with `Overloaded`, never queued.
+  - `--max-scans` (64): scans streaming at once, refused past that the same way.
+  - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
+  - A write the server has submitted always answers its real outcome.
 - **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts.
-- **`GET /v1/health`** answers without a token. `GET /metrics` serves the request counters in Prometheus text, with read scope.
-- **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown.
+- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, and each RPC's durations as a histogram (a scan's runs to the end of its stream).
+- **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown. A read may always be retried; one that failed on `Io` or `MergeFailed` says so (`retry_from: REQUEST`).
 
 ## Exit status
 

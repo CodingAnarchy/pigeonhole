@@ -45,6 +45,10 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
+    /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
+    /// outlives its request's slot in `--max-concurrent`, so it has its own cap.
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    pub max_scans: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
     /// server has submitted always answers its real outcome, however long it takes.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
@@ -68,6 +72,7 @@ pub(crate) struct Limits {
     pub max_request_bytes: usize,
     pub inflight_bytes: usize,
     pub max_concurrent: usize,
+    pub max_scans: usize,
     pub request_timeout: Duration,
 }
 
@@ -77,6 +82,7 @@ impl ServeArgs {
             max_request_bytes: self.max_request_bytes,
             inflight_bytes: self.inflight_bytes.max(self.max_request_bytes),
             max_concurrent: self.max_concurrent.max(1),
+            max_scans: self.max_scans.max(1),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
         }
     }

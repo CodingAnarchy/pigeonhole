@@ -83,8 +83,8 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `FeedExpired` | `OUT_OF_RANGE` | 410 | (a read) | no: resubscribe from now |
 | `Unsupported`, `UnsupportedFeature`, `UnsupportedFormat`, `UnknownMergeOperator` | `UNIMPLEMENTED` | 501 | not applied | no |
 | `NoSpace` | `RESOURCE_EXHAUSTED` | 507 | **maybe applied**, for a write; not applied, for a read | no: check the operation id |
-| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no |
-| `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no: check the operation id |
+| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no, for a write; `REQUEST`, for a read |
+| `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no, for a write (check the operation id); `REQUEST`, for a read |
 | `Corruption` | `DATA_LOSS` | 500 | **maybe applied**, for a write; not applied, for a read | no |
 | `WriterLocked`, `ShmVersionMismatch`, `ShmUnavailable`, `NetworkFilesystem`, `NoReaderSlot` | `UNAVAILABLE` | 503 | not applied (the server can't open the database) | no |
 | **Server codes** | | | | |

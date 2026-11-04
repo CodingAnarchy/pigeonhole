@@ -302,6 +302,42 @@ fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
     }
 }
 
+/// Applies a selection to any of the read builders, which share these methods.
+macro_rules! select {
+    ($s:expr, $r:expr) => {{
+        let mut r = $r;
+        if let Some(s) = $s {
+            if !s.families.is_empty() {
+                r = r.families(s.families.iter().map(String::as_str));
+            }
+            if !s.qualifier_prefix.is_empty() {
+                r = r.qualifier_prefix(&s.qualifier_prefix);
+            }
+            if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
+                r = r.qualifier_bounds(
+                    bound(s.qualifier_start.as_ref()),
+                    bound(s.qualifier_end.as_ref()),
+                );
+            }
+            if s.all_versions {
+                r = r.versions(0);
+            } else if s.versions > 0 {
+                r = r.versions(s.versions);
+            }
+            if let Some(t) = &s.time_range {
+                r = r.time_range(t.start..t.end);
+            }
+            if s.column_limit > 0 {
+                r = r.column_limit(s.column_limit);
+            }
+            if s.value_filter.is_some() {
+                r = r.value_filter(value_filter(s.value_filter.as_ref())?);
+            }
+        }
+        Ok(r)
+    }};
+}
+
 /// A selection's parts, checked once and applied to row reads and multi-gets alike.
 pub(crate) struct Select<'s> {
     s: Option<&'s proto::Selection>,
@@ -322,72 +358,29 @@ impl<'s> Select<'s> {
         self.s.and_then(|s| s.aggregate.as_ref())
     }
 
-    pub(crate) fn row<'t>(
-        &self,
-        mut r: pigeonhole::RowRead<'t>,
-    ) -> Result<pigeonhole::RowRead<'t>> {
-        let Some(s) = self.s else { return Ok(r) };
-        if !s.families.is_empty() {
-            r = r.families(s.families.iter().map(String::as_str));
-        }
-        if !s.qualifier_prefix.is_empty() {
-            r = r.qualifier_prefix(&s.qualifier_prefix);
-        }
-        if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
-            r = r.qualifier_bounds(
-                bound(s.qualifier_start.as_ref()),
-                bound(s.qualifier_end.as_ref()),
-            );
-        }
-        if s.all_versions {
-            r = r.versions(0);
-        } else if s.versions > 0 {
-            r = r.versions(s.versions);
-        }
-        if let Some(t) = &s.time_range {
-            r = r.time_range(t.start..t.end);
-        }
-        if s.column_limit > 0 {
-            r = r.column_limit(s.column_limit);
-        }
-        if s.value_filter.is_some() {
-            r = r.value_filter(value_filter(s.value_filter.as_ref())?);
-        }
-        Ok(r)
+    pub(crate) fn row<'t>(&self, r: pigeonhole::RowRead<'t>) -> Result<pigeonhole::RowRead<'t>> {
+        select!(self.s, r)
     }
 
-    pub(crate) fn keys<'t>(
+    pub(crate) fn keys<'t>(&self, r: pigeonhole::KeysRead<'t>) -> Result<pigeonhole::KeysRead<'t>> {
+        select!(self.s, r)
+    }
+
+    /// A scan of `range` in `table` (no range: the whole table) with this selection.
+    pub(crate) fn scan<'t>(
         &self,
-        mut r: pigeonhole::KeysRead<'t>,
-    ) -> Result<pigeonhole::KeysRead<'t>> {
-        let Some(s) = self.s else { return Ok(r) };
-        if !s.families.is_empty() {
-            r = r.families(s.families.iter().map(String::as_str));
-        }
-        if !s.qualifier_prefix.is_empty() {
-            r = r.qualifier_prefix(&s.qualifier_prefix);
-        }
-        if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
-            r = r.qualifier_bounds(
-                bound(s.qualifier_start.as_ref()),
-                bound(s.qualifier_end.as_ref()),
-            );
-        }
-        if s.all_versions {
-            r = r.versions(0);
-        } else if s.versions > 0 {
-            r = r.versions(s.versions);
-        }
-        if let Some(t) = &s.time_range {
-            r = r.time_range(t.start..t.end);
-        }
-        if s.column_limit > 0 {
-            r = r.column_limit(s.column_limit);
-        }
-        if s.value_filter.is_some() {
-            r = r.value_filter(value_filter(s.value_filter.as_ref())?);
-        }
-        Ok(r)
+        table: &'t pigeonhole::Table,
+        range: Option<&proto::KeyRange>,
+    ) -> Result<pigeonhole::Scan<'t>> {
+        use proto::key_range::Range;
+        let r = match range.and_then(|r| r.range.as_ref()) {
+            Some(Range::Prefix(p)) => table.scan_prefix(p),
+            Some(Range::Bounds(b)) => {
+                table.scan_bounds(bound(b.start.as_ref()), bound(b.end.as_ref()))
+            }
+            None => table.scan_bounds(Bound::Unbounded, Bound::Unbounded),
+        };
+        select!(self.s, r)
     }
 }
 

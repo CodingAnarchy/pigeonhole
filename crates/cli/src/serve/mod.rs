@@ -1,7 +1,7 @@
 //! `phdb serve` (D313, #1397): one process serving a database over gRPC and HTTP/JSON on one
-//! port, as ICR 0112 specifies. This is ticket 3a: the skeleton (the listener, TLS, tokens
-//! and scopes, limits, health, shutdown, thread placement, D317's Router seam) and `Data`'s
-//! unary RPCs. `Data.Scan`'s stream is ticket 3b; the other services follow.
+//! port, as ICR 0112 specifies. So far: the skeleton (the listener, TLS, tokens and scopes,
+//! limits, health, metrics, shutdown, thread placement, D317's Router seam) and the `Data`
+//! service, `Scan`'s stream included; the other services follow.
 //!
 //! Startup checks everything it can before opening the database: the tokens, the TLS files
 //! and the bind rule. The database opens on the main thread, so the engine pins its shards
@@ -66,9 +66,22 @@ impl Shared {
             .ok_or_else(errors::ApiError::unauthenticated)
     }
 
-    fn count(&self, rpc: usize, reply: &Result<service::ServiceReply, errors::ApiError>) {
-        self.metrics
-            .count(rpc, reply.as_ref().err().map(|e| e.code.as_str()));
+    /// Counts a reply to RPC `rpc`, decoded at `started`. A scan's stream is counted by its
+    /// task when it ends instead.
+    fn count(
+        &self,
+        rpc: usize,
+        started: std::time::Instant,
+        reply: &Result<service::ServiceReply, errors::ApiError>,
+    ) {
+        if let Ok(service::ServiceReply::Scan(_)) = reply {
+            return;
+        }
+        self.metrics.count(
+            rpc,
+            reply.as_ref().err().map(|e| e.code.as_str()),
+            started.elapsed(),
+        );
     }
 }
 

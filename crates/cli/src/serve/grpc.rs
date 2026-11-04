@@ -1,13 +1,141 @@
 //! gRPC: `Data`'s RPCs, decoded by tonic and answered by the Router. The token comes from the
 //! `authorization` metadata, checked as for HTTP.
+//!
+//! **The in-flight budget is reserved before decoding** (perf287's F2 on #1501): `prepay`
+//! reads a request's 5-byte message header, reserves the message's length, and only then
+//! lets tonic read and decode the body. So a request waiting for the budget holds 5 bytes,
+//! not its message.
 
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
+use axum::body::{Body, BodyDataStream, Bytes};
+use axum::extract::{Request as HttpRequest, State};
+use axum::middleware::Next;
+use axum::response::Response as HttpResponse;
+use futures_core::Stream;
+use tokio::sync::OwnedSemaphorePermit;
 use tonic::{Request, Response, Status};
 
 use super::Shared;
+use super::errors::ApiError;
 use super::proto::{self, data_server::Data};
-use super::service::{ServiceOp, ServiceReply};
+use super::service::{ScanPages, ServiceOp, ServiceReply};
+
+/// The budget `prepay` reserved for a request, for its handler to take. Extensions must be
+/// `Clone`; the permit is taken once.
+#[derive(Clone, Default)]
+struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
+
+impl Prepaid {
+    fn take(&self) -> Option<OwnedSemaphorePermit> {
+        self.0.lock().ok().and_then(|mut p| p.take())
+    }
+}
+
+/// Middleware on the gRPC routes: reserves the in-flight budget from the message header
+/// before tonic decodes the message. The wait is bounded by the request timeout, and by the
+/// client's `grpc-timeout` when that is shorter (`DeadlineExceeded` then). A message longer
+/// than `--max-request-bytes` reserves only that much; tonic refuses it as it decodes.
+pub(crate) async fn prepay(
+    State(shared): State<Arc<Shared>>,
+    req: HttpRequest,
+    next: Next,
+) -> HttpResponse {
+    let (parts, body) = req.into_parts();
+    let mut data = body.into_data_stream();
+    let mut head = Vec::new();
+    while head.len() < 5 {
+        match std::future::poll_fn(|cx| Pin::new(&mut data).poll_next(cx)).await {
+            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+            Some(Err(_)) => {
+                return status(ApiError::invalid("the request body broke off"));
+            }
+            // A body shorter than a header: tonic answers that.
+            None => break,
+        }
+    }
+    let length = head
+        .get(1..5)
+        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let limits = shared.limits;
+    let deadline = grpc_timeout(&parts.headers);
+    let wait = deadline.map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+    let bytes = length.min(limits.max_request_bytes);
+    let permit = match shared.router.service.reserve_within(bytes, wait).await {
+        Ok(p) => p,
+        // The client's own deadline ran out first.
+        Err(_) if deadline.is_some_and(|d| d <= limits.request_timeout) => {
+            return status(ApiError::deadline_exceeded());
+        }
+        Err(e) => return status(e),
+    };
+    let mut req = HttpRequest::from_parts(
+        parts,
+        Body::from_stream(Rest {
+            head: Some(Bytes::from(head)),
+            rest: data,
+        }),
+    );
+    req.extensions_mut()
+        .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
+    next.run(req).await
+}
+
+fn status(e: ApiError) -> HttpResponse {
+    let (parts, body) = e.to_status().into_http::<tonic::body::Body>().into_parts();
+    HttpResponse::from_parts(parts, Body::new(body))
+}
+
+/// A body's bytes after `prepay` read its head: the head, then the rest.
+struct Rest {
+    head: Option<Bytes>,
+    rest: BodyDataStream,
+}
+
+impl Stream for Rest {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(head) = self.head.take()
+            && !head.is_empty()
+        {
+            return Poll::Ready(Some(Ok(head)));
+        }
+        Pin::new(&mut self.rest).poll_next(cx)
+    }
+}
+
+/// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
+fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
+    let v = headers.get("grpc-timeout")?.to_str().ok()?;
+    let (n, unit) = v.split_at(v.len().checked_sub(1)?);
+    let n: u64 = n.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.saturating_mul(3600)),
+        "M" => Duration::from_secs(n.saturating_mul(60)),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
+/// A scan's pages as gRPC messages.
+struct GrpcPages(ScanPages);
+
+impl Stream for GrpcPages {
+    type Item = Result<proto::ScanPage, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
 
 /// `Data` over gRPC.
 #[derive(Debug, Clone)]
@@ -24,10 +152,12 @@ impl DataGrpc {
             .get("authorization")
             .and_then(|v| v.to_str().ok());
         let caller = self.0.caller(header)?;
+        let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+        let started = Instant::now();
         let op = op(req.into_inner());
         let rpc = op.index();
-        let reply = self.0.router.dispatch(op, &caller, None).await;
-        self.0.count(rpc, &reply);
+        let reply = self.0.router.dispatch(op, &caller, prepaid).await;
+        self.0.count(rpc, started, &reply);
         Ok(reply?)
     }
 }
@@ -73,10 +203,12 @@ impl Data for DataGrpc {
 
     async fn scan(
         &self,
-        _req: Request<proto::ScanRequest>,
+        req: Request<proto::ScanRequest>,
     ) -> Result<Response<Self::ScanStream>, Status> {
-        // Ticket 3b.
-        Err(super::errors::ApiError::unimplemented("Data.Scan").to_status())
+        match self.call(req, ServiceOp::Scan).await? {
+            ServiceReply::Scan(pages) => Ok(Response::new(Box::pin(GrpcPages(pages)))),
+            _ => Err(unexpected()),
+        }
     }
 
     async fn mutate(

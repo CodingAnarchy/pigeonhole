@@ -142,6 +142,17 @@ impl ApiError {
         err
     }
 
+    /// The same error for a read: a read that failed with `Io` or `MergeFailed` wrote
+    /// nothing, so it may be sent again (simp724 on #1501). Writes keep "maybe applied".
+    pub(crate) fn for_read(mut self) -> Self {
+        if self.retry_from == RetryFrom::Unspecified
+            && (self.code == "Io" || self.code == "MergeFailed")
+        {
+            self.retry_from = RetryFrom::Request;
+        }
+        self
+    }
+
     // ---- Server codes (ICR 0112's table, below the engine's) ----
 
     pub(crate) fn unauthenticated() -> Self {
@@ -196,10 +207,8 @@ impl ApiError {
         )
     }
 
-    /// The request's deadline passed before anything was submitted. Ticket 3b honours a
-    /// client's own deadline (`grpc-timeout`); 3a bounds waits on the limits with
-    /// `Overloaded` (R3).
-    #[allow(dead_code)]
+    /// The client's own deadline (`grpc-timeout`) passed while the request waited for the
+    /// server's limits, before anything was submitted.
     pub(crate) fn deadline_exceeded() -> Self {
         Self::new(
             "DeadlineExceeded",
@@ -219,16 +228,6 @@ impl ApiError {
             message,
             tonic::Code::InvalidArgument,
             StatusCode::BAD_REQUEST,
-        )
-    }
-
-    pub(crate) fn unimplemented(what: &str) -> Self {
-        Self::new(
-            "Unsupported",
-            ErrorCode::Unsupported as u32,
-            format!("{what} isn't served by this build yet"),
-            tonic::Code::Unimplemented,
-            StatusCode::NOT_IMPLEMENTED,
         )
     }
 
@@ -380,6 +379,28 @@ mod tests {
         assert_eq!(
             ApiError::invalid("x").code_num,
             ErrorCode::InvalidArgument as u32
+        );
+    }
+
+    #[test]
+    fn a_read_that_failed_on_io_may_be_sent_again() {
+        let io = || {
+            ApiError::new(
+                "Io",
+                ErrorCode::Io as u32,
+                "x",
+                tonic::Code::Unavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            )
+        };
+        // A write that failed on Io may have applied; the same failure on a read changed
+        // nothing (ICR 0112).
+        assert_eq!(io().retry_from, RetryFrom::Unspecified);
+        assert_eq!(io().for_read().retry_from, RetryFrom::Request);
+        // Other codes keep their rule.
+        assert_eq!(
+            ApiError::invalid("x").for_read().retry_from,
+            RetryFrom::Unspecified
         );
     }
 
