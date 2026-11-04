@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **4**, shared-memory layout version **6**. Format 4 is the format every 1.x build reads and writes (D269): later 1.x features use the feature bits and reserved room described here, never a new version. §13 states the compatibility promise, which takes effect with 1.0.0. The shared-memory layout (§11) is outside it.
+Format version **4**, shared-memory layout version **9**. Format 4 is the format every 1.x build reads and writes (D269): later 1.x features use the feature bits and reserved room described here, never a new version. §13 states the compatibility promise, which takes effect with 1.0.0. The shared-memory layout (§11) is outside it.
 
 ## 1. Conventions
 
@@ -589,11 +589,12 @@ Header (40 bytes):
 | Session | `1` | `session` u64 (random, nonzero), `opened_at` u64 (the superblock `sequence` the open read, before any root commit of its own), `retention_bytes` u64, `retention_age_secs` u64 (0 = none), `streams` u32 (WAL streams, the shard count), `all_tables` u8 (1 = every table), `count` u32, then `count` × `table` u32 (zero when `all_tables` is 1) |
 | Root | `2` | `session` u64, `sequence` u64 (the new superblock's) |
 | Unfed | `3` | `sequence` u64 (the superblock `sequence` the open read) |
+| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Appended just before that root commit's Root entry, in the same append |
 
 **Torn and unknown entries:**
 - A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
 - A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
-- An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it.
+- An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it. So does a Catalog entry holding an edit the reader can't decode: it isn't torn, and a writer doesn't cut it off.
 
 **What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal.
 
@@ -653,6 +654,7 @@ A writer always builds a new generation: create the new region, store `state = a
 | 184 | 4 | `row_epoch_flags` u32: bit 0, the writer raises the slots (its row cache is on) |
 | 188 | 4 | padding, so `cross_held` is 8-aligned |
 | 192 | 8 | `cross_held` u64, atomic (layout version 6, D278): the lowest decided cross-shard seqno not yet applied on every participant, `u64::MAX` when none (§11.3) |
+| 200 | 8 | `catalog_hold` u64, atomic (layout version 9, D315): the ceiling of a catalog change whose §10.4 Catalog entry isn't appended yet, `u64::MAX` when none. The writer stores it under its seqno allocator's lock, before `next_seqno` passes it, and the change feed's frontier stays below it (§11.3) |
 | 200 | 3896 | reserved |
 
 ### 11.2 Watermarks

@@ -100,8 +100,8 @@ pub struct AggregateView {
     pub quantiles: ::core::option::Option<QuantileReading>,
     #[prost(message, optional, tag = "5")]
     pub bloom: ::core::option::Option<BloomReading>,
-    #[prost(bytes = "bytes", repeated, tag = "6")]
-    pub set_members: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    #[prost(uint32, repeated, tag = "6")]
+    pub set_members: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct MeanVar {

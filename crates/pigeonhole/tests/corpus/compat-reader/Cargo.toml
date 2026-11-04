@@ -1,6 +1,7 @@
 [package]
 name = "compat-reader"
-version = "0.0.0"
+# The release it pins: main.rs reads it as `RELEASE`.
+version = "1.0.0"
 edition = "2024"
 publish = false
 
@@ -11,3 +12,8 @@ publish = false
 
 [dependencies]
 pigeonhole = "=1.0.0"
+
+[features]
+# compat-reader-1.1's: the value types 1.0.0 lacks. Declared here too, so `cfg(feature)`
+# names a known feature in both builds.
+v1_1 = []

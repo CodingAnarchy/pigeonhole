@@ -3778,8 +3778,9 @@ impl ShardState {
         shard
     }
 
-    /// Test hook: the arena's free bytes, largest free run and size, as one snapshot
-    /// (`Engine::arena_free`), from the shard's construction on. Nothing without test hooks.
+    /// Test hook: the arena's free bytes, largest free run, size and reserved room, as one
+    /// snapshot (`Engine::arena_free`, `Engine::arena_reserved`), from the shard's
+    /// construction on. Nothing without test hooks.
     fn publish_arena(&self) {
         #[cfg(feature = "test-hooks")]
         {
@@ -3791,6 +3792,8 @@ impl ShardState {
                 self.arena.free_bytes() as u64,
                 self.arena.largest_free_run() as u64,
                 self.arena.region().len() as u64,
+                self.reserved as u64,
+                self.flush_running || !self.flush_queue.is_empty(),
             );
         }
     }
@@ -4487,7 +4490,17 @@ impl ShardState {
         // that many (`ShardArena::blocks_left`), every large entry finds a run.
         let chunk = self.chunk_size;
         let reserved = self.reserved;
-        let bytes_fit = |arena: &ShardArena| arena.free_bytes() >= reserved.saturating_add(needed);
+        // One chunk beyond every reservation stays free for a freeze's fresh memtable
+        // (#1497): a wait for room freezes open memtables (D124), and a freeze that finds no
+        // chunk keeps writing in place, so with no flush in flight nothing would free room
+        // until the stall timeout. Every chunk a commit or a share takes is reserved here
+        // first (apply's new slots included), and replay keeps its own two chunks
+        // (`replay_fits`), so after any admission one freeze can start. A batch that could
+        // never fit is still refused as `Room::Never` below (more than the arena less two
+        // chunks), so the kept chunk never makes a batch wait for room that can't come.
+        let bytes_fit = |arena: &ShardArena| {
+            arena.free_bytes() >= reserved.saturating_add(needed).saturating_add(chunk)
+        };
         let run_fits = |arena: &ShardArena| {
             need.run_chunks <= 1
                 || arena.blocks_left(

@@ -591,6 +591,9 @@ pub(crate) struct Commit {
     readers: HashMap<SstId, Arc<SstReader>>,
     flushed_roots: Vec<(u16, u32)>,
     changes: Changes,
+    /// Whether it changed the catalog with the change feed on (D315): its edits are staged
+    /// in the feed and the catalog hold is up until `end`.
+    catalog_held: bool,
 }
 
 /// What a commit's edits changed, for what `end` rebuilds and tells the shards.
@@ -967,9 +970,32 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // Counters go with every commit: ids, the seqno ceiling and the timestamp floor.
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.next_blob_file = shared.blob_ids.load(Ordering::Relaxed);
-    catalog.counters.seqno_ceiling = shared.clock.next_seqno();
+    // A catalog change with the change feed on (D315): its ceiling is held from the feed's
+    // frontier, under the allocator's lock, until its `Catalog` sidecar entry is appended
+    // (in the root-commit observer, before the Root entry), and its edits are staged for it.
+    let catalog_edits: Vec<Edit> = edits
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Edit::CreateTable { .. } | Edit::PutFamily { .. } | Edit::DropTable { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    let catalog_held = shared.feed.is_some() && !catalog_edits.is_empty();
+    catalog.counters.seqno_ceiling = if catalog_held {
+        shared.clock.hold_catalog(&shared.shm)
+    } else {
+        shared.clock.next_seqno()
+    };
     // D271: every default timestamp comes from the one allocator, at or below its `H`.
     catalog.counters.ts_floor = shared.clock.last_ts().max(catalog.counters.ts_floor);
+    let staged = catalog_held.then_some((
+        catalog.counters.seqno_ceiling,
+        catalog.counters.ts_floor,
+        catalog_edits,
+    ));
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
@@ -1003,6 +1029,13 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     match prepared {
         Ok(prepared) => {
             drop(writer);
+            // Staged only now, for this commit's own root commit, the next one (simp724's B1
+            // on #1493): `flag_features` may have made root commits of its own above (a new
+            // incompat bit), and their observer calls must not take the entry, nor may a
+            // failed prepare leave one for a change that never committed.
+            if let (Some(feed), Some((ceiling, ts, edits))) = (&shared.feed, staged) {
+                feed.stage_catalog(ceiling, ts, edits);
+            }
             #[cfg(feature = "test-hooks")]
             shared
                 .hooks
@@ -1018,11 +1051,15 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 readers,
                 flushed_roots,
                 changes,
+                catalog_held,
             })
         }
         Err(e) => {
             let poisoned = writer.is_poisoned();
             drop(writer);
+            if catalog_held {
+                release_catalog(shared);
+            }
             if poisoned {
                 shared.pager_poisoned.store(true, Ordering::Release);
                 shared.failure.record(
@@ -1045,6 +1082,15 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     }
 }
 
+/// Drops a catalog change's staged edits, if its root-commit observer didn't append them (a
+/// failed or refused commit), and releases its hold on the change feed (D315).
+fn release_catalog(shared: &Shared) {
+    if let Some(feed) = &shared.feed {
+        feed.unstage_catalog();
+    }
+    shared.shm.publish_catalog_hold(u64::MAX);
+}
+
 /// Finishes a commit whose root commit returned `result`: publishes the view, retires what
 /// the new catalog no longer references, reclaims, and answers every request.
 ///
@@ -1062,7 +1108,13 @@ pub(crate) fn end(
         mut readers,
         flushed_roots,
         changes,
+        catalog_held,
     } = commit;
+    // The catalog change's entry was appended by the root-commit observer if the root
+    // commit succeeded (it runs only then, before this); otherwise its staged edits go.
+    if catalog_held {
+        release_catalog(shared);
+    }
     let version = {
         let mut writer = shared
             .manifest

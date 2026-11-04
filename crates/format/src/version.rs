@@ -72,8 +72,11 @@ impl ShmLayoutVersion {
     /// change feed could pass a record not yet in its stream file. Version 8 adds each
     /// stream's change-feed floor, checkpoint and lost bound (D310 PR 4), so a reader process can follow
     /// the feed: a version 7 writer never stores them, and a version 8 reader's feed would
-    /// drop no aborted round's PREPARE and see no retention.
-    pub const CURRENT: Self = Self(8);
+    /// drop no aborted round's PREPARE and see no retention. Version 9 adds the header's
+    /// `catalog_hold` word (D315): a version 8 writer never stores it, so a version 9
+    /// reader's feed of every table could deliver a commit to a table before that
+    /// table's creation reached the feed's sidecar.
+    pub const CURRENT: Self = Self(9);
 }
 
 /// Magic at offset 0 of each superblock (pages 0 and 1).

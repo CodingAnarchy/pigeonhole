@@ -319,9 +319,11 @@ pub(crate) struct ShardCounters {
     /// Size of the shard's aborted-seqno set (`Engine::aborted_seqnos`).
     pub aborted: AtomicU64,
     /// The arena's free bytes, largest free run and size (`Engine::arena_free`: a test
-    /// checks it built the fragmented arena it means to, issue #141).
-    /// One snapshot, so a reader never pairs values from different batches.
-    pub arena: Mutex<(u64, u64, u64)>,
+    /// checks it built the fragmented arena it means to, issue #141), the room reserved by
+    /// admitted members and undecided shares, and whether a flush is running or queued
+    /// (`Engine::arena_reserved`, #1497). One snapshot, so a reader never pairs values from
+    /// different batches.
+    pub arena: Mutex<(u64, u64, u64, u64, bool)>,
     /// Reservations that found enough free bytes but no run long enough for their largest
     /// entry (`Engine::arena_run_waits`: a test checks it reached that case, issue #141).
     pub run_waits: AtomicU64,
@@ -1340,11 +1342,26 @@ impl Engine {
     /// largest run of free chunks, and its size (issue #141).
     #[doc(hidden)]
     pub fn arena_free(&self, shard: usize) -> (u64, u64, u64) {
-        *self.inner.shared.metrics[shard]
+        let (free, run, size, _, _) = *self.inner.shared.metrics[shard]
             .hooks
             .arena
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner);
+        (free, run, size)
+    }
+
+    /// Shard `shard`'s arena after its last batch: its free bytes, the room admitted
+    /// members and undecided shares hold reserved, and whether a flush is running or queued,
+    /// in one snapshot (#1497: with no flush in flight, one chunk beyond the reservations
+    /// stays free for a freeze).
+    #[doc(hidden)]
+    pub fn arena_reserved(&self, shard: usize) -> (u64, u64, bool) {
+        let (free, _, _, reserved, flushing) = *self.inner.shared.metrics[shard]
+            .hooks
+            .arena
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (free, reserved, flushing)
     }
 
     /// The WAL records appended since the last call (or since recording started), in append
@@ -1388,6 +1405,18 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// Makes each root commit's feed observer wait `delay` before it records the root in the
+    /// sidecar (zero: no wait), widening the window in which a crash leaves a durable root
+    /// without its sidecar entry (#1504). A hold seam: the observer then does what it always
+    /// does. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn delay_root_observer(&self, delay: std::time::Duration) {
+        if let Some(f) = &self.inner.shared.feed {
+            let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+            f.root_observer_delay_nanos.store(nanos, Ordering::Relaxed);
+        }
     }
 
     /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds

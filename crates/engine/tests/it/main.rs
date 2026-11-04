@@ -92,6 +92,7 @@ mod returning_order;
 mod review;
 mod room_freeze;
 mod room_group;
+mod room_starved_freeze;
 mod row_cache_write_through;
 mod scalar_aggregates;
 mod scan_readahead_limit;

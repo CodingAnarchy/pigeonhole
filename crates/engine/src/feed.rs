@@ -186,7 +186,8 @@ pub(crate) fn last_session(
 pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
     for e in entries.iter().rev() {
         match e {
-            FeedEntry::Root { .. } => continue,
+            // A catalog change's entry (D315) is its session's, as its Root entry is.
+            FeedEntry::Root { .. } | FeedEntry::Catalog { .. } => continue,
             FeedEntry::Session {
                 retention_bytes,
                 retention_age_secs,
@@ -201,7 +202,8 @@ pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
                     tables: tables.clone(),
                 });
             }
-            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) => return None,
+            // An entry this build doesn't know may change what the session was: fail closed.
+            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) | _ => return None,
         }
     }
     None
@@ -361,6 +363,11 @@ pub(crate) struct Feed {
     /// Each stream's checkpoint history, for the feed reader's start positions
     /// ([`Feed::start_at`]).
     checkpoints: Vec<Mutex<CheckpointHistory>>,
+    /// A catalog change's ceiling and edits (D315), staged by the manifest commit that made
+    /// it, before its root commit, and appended as a `Catalog` sidecar entry just before that
+    /// commit's Root entry. Taken by the root-commit observer, or dropped by
+    /// `unstage_catalog` if the commit failed. Root commits never overlap, so one slot.
+    staged_catalog: Mutex<Option<(u64, u64, Vec<Edit>)>>,
     /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
@@ -369,6 +376,11 @@ pub(crate) struct Feed {
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,
+    /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
+    /// observer waits before it records the root, widening the window between a durable
+    /// superblock and its sidecar entry. 0 (the default) waits nothing.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) root_observer_delay_nanos: AtomicU64,
 }
 
 /// Whether a sidecar sync is in flight, and whether appends since its submission wait for
@@ -412,8 +424,11 @@ impl Feed {
             sidecar_sync: Mutex::default(),
             sidecar_syncs: AtomicU64::new(0),
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
+            staged_catalog: Mutex::default(),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            root_observer_delay_nanos: AtomicU64::new(0),
         }
     }
 
@@ -624,11 +639,39 @@ impl Feed {
     /// never followed by more, and the next feeding open sees the sequence ahead of the last
     /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
     pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
+        #[cfg(feature = "test-hooks")]
+        {
+            let delay = self.root_observer_delay_nanos.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(delay));
+            }
+        }
+        // A catalog change this root commit made (D315): its entry goes first, in the same
+        // append and the same sync as the Root entry, so a torn tail keeps it only without
+        // the Root (the chain breaks), never the Root without it.
+        let staged = self
+            .staged_catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let file = {
             let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(s) = sidecar.as_mut() else {
                 return;
             };
+            if let Some((seqno_ceiling, timestamp, edits)) = staged
+                && let Err(e) = s.append(&FeedEntry::Catalog {
+                    session: self.session,
+                    sequence,
+                    seqno_ceiling,
+                    timestamp,
+                    edits,
+                })
+            {
+                crate::shard::trace!("feed: sidecar append of catalog {sequence} failed: {e}");
+                *sidecar = None;
+                return;
+            }
             if let Err(e) = s.append(&FeedEntry::Root {
                 session: self.session,
                 sequence,
@@ -640,6 +683,23 @@ impl Feed {
             Arc::clone(&s.file)
         };
         self.request_sidecar_sync(file);
+    }
+
+    /// Stages a catalog change's ceiling, timestamp floor and edits for its root commit's
+    /// `Catalog` entry (D315), before that commit.
+    pub(crate) fn stage_catalog(&self, ceiling: u64, timestamp: u64, edits: Vec<Edit>) {
+        *self
+            .staged_catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, timestamp, edits));
+    }
+
+    /// Drops a staged catalog change whose root commit didn't happen (D315).
+    pub(crate) fn unstage_catalog(&self) {
+        self.staged_catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 
     /// Makes the sidecar's appends durable (D310 call 4, fix A): an entry a power loss

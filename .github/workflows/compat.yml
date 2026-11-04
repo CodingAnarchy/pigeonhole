@@ -1,14 +1,17 @@
 name: Compatibility
 
-# FORMAT.md §13, "newer files": files written by main open with the published 1.0.0.
+# FORMAT.md §13, "newer files": files written by main open with each published release.
 # main writes the corpus entries (tests/corpus.rs's generate_corpus, PIGEONHOLE_CORPUS_OUT),
-# and tests/corpus/compat-reader, pinned to pigeonhole =1.0.0 from crates.io, opens each
-# one on a copy: it reads every cell exactly, writes through a flush and a compaction,
-# passes the offline check, and reads everything again. An entry using a feature 1.0.0 lacks
-# may be refused with UnsupportedFeature, as the promise allows.
+# and a reader pinned to that release from crates.io opens each one on a copy: it reads
+# every cell exactly, writes through a flush and a compaction, passes the offline check, and
+# reads everything again. One arm per release:
+# - 1.0.0 (tests/corpus/compat-reader): an entry marked with refused-by-1.0.0.txt must be
+#   refused for exactly its incompat bits; another using a feature 1.0.0 lacks may be.
+# - 1.1.0 (tests/corpus/compat-reader-1.1, #1489): 1.1.0 reads incompat bit 0, so it must
+#   open those same entries, read-write and exactly; a refusal fails the arm.
 #
-# Until pigeonhole 1.0.0 is on crates.io, the job only checks that and skips the rest, so it
-# enables itself at the release. crates.io answering anything but 200 or 404 fails the job,
+# Until an arm's release is on crates.io, the arm only checks that and skips the rest, so it
+# enables itself at the release. crates.io answering anything but 200 or 404 fails the arm,
 # so an outage never passes as a skip.
 
 on:
@@ -35,22 +38,32 @@ permissions:
 
 jobs:
   newer-files:
-    name: main's files open with 1.0.0
+    name: main's files open with ${{ matrix.release }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: 1.0.0
+            reader: crates/pigeonhole/tests/corpus/compat-reader
+          - release: 1.1.0
+            reader: crates/pigeonhole/tests/corpus/compat-reader-1.1
     steps:
       - uses: actions/checkout@v5
-      - name: Is pigeonhole 1.0.0 on crates.io?
+      - name: Is pigeonhole ${{ matrix.release }} on crates.io?
         id: published
+        env:
+          RELEASE: ${{ matrix.release }}
         run: |
           status=$(curl -s -o /dev/null -w '%{http_code}' \
             -A "pigeonhole-ci (https://github.com/CodingAnarchy/pigeonhole)" \
-            https://crates.io/api/v1/crates/pigeonhole/1.0.0)
+            "https://crates.io/api/v1/crates/pigeonhole/$RELEASE")
           case $status in
             200) echo "yes=true" >> "$GITHUB_OUTPUT" ;;
             404)
               echo "yes=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::pigeonhole 1.0.0 isn't on crates.io yet; skipping (FORMAT.md §13)"
+              echo "::notice::pigeonhole $RELEASE isn't on crates.io yet; skipping (FORMAT.md §13)"
               ;;
             *) echo "::error::crates.io answered $status"; exit 1 ;;
           esac
@@ -61,15 +74,17 @@ jobs:
         with:
           workspaces: |
             . -> target
-            crates/pigeonhole/tests/corpus/compat-reader -> target
+            ${{ matrix.reader }} -> target
       - name: Write main's corpus
         if: steps.published.outputs.yes == 'true'
         env:
           PIGEONHOLE_CORPUS_OUT: ${{ runner.temp }}/main-corpus
         run: cargo test -p pigeonhole --test corpus -- --ignored --exact generate_corpus --nocapture
-      - name: Open it with 1.0.0
+      - name: Open it with ${{ matrix.release }}
         if: steps.published.outputs.yes == 'true'
+        env:
+          READER: ${{ matrix.reader }}
         run: >
           cargo run --release
-          --manifest-path crates/pigeonhole/tests/corpus/compat-reader/Cargo.toml
+          --manifest-path "$READER/Cargo.toml"
           -- "$RUNNER_TEMP/main-corpus"

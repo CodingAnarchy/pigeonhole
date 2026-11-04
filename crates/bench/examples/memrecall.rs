@@ -540,8 +540,10 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
 /// with 5,000 held back for the writers. Per namespace, over `lme_m`'s 50 questions twice
 /// (the second pass timed): fused and vector-only latency, exact and through the index, and
 /// the index's recall@10 of the exact vector-only ranking, with the recalls' IVF counts.
-/// Then simp724's parallel-writer rows (#1342 C1): 1, 4 and 8 threads remembering the held
-/// memories into `big`, with throughput and the transaction retries and conflicts.
+/// Then simp724's parallel-writer rows (#1342 C1, #1477): 1, 4, 8 and 16 threads remembering
+/// into `big` for `MEMRECALL_WRITER_SECS` each (8 by default), with throughput, remember
+/// latency, `Busy` sleeps, transaction retries and conflicts, room and pacing stall time, and
+/// flushes.
 fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
     let f = fixture(fix_dir, "lme_m");
     let mut seen = BTreeSet::new();
@@ -638,39 +640,75 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
             );
         }
     }
-    // Parallel writers into `big` (simp724's C1 on #1342): the held memories, split.
-    let mut off = 0;
-    for threads in [1usize, 4, 8] {
-        let each = held.len() / 13;
-        let chunk = &held[off..off + each * threads];
-        off += each * threads;
+    // Parallel writers into `big` (simp724's C1 on #1342; #1477): each thread count writes for
+    // a fixed time, so a phase is long enough to include the write stalls it causes. The
+    // writers take the held memories in turn, and past them the same ones again under a new
+    // text (the same vectors), so no phase runs short.
+    let secs = std::env::var("MEMRECALL_WRITER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(8.0);
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    for threads in [1usize, 4, 8, 16] {
         let before = db.engine_metrics();
+        let busy_all = std::sync::atomic::AtomicU64::new(0);
+        let lats = std::sync::Mutex::new(Vec::<u64>::new());
         let t = Instant::now();
         std::thread::scope(|sc| {
-            for part in chunk.chunks(each) {
-                let (store, f) = (&store, &f);
+            for _ in 0..threads {
+                let (store, f, cursor, busy_all, lats) = (&store, &f, &cursor, &busy_all, &lats);
                 sc.spawn(move || {
                     let mut busy = 0;
-                    for &i in part {
+                    let mut mine = Vec::new();
+                    while t.elapsed().as_secs_f64() < secs {
+                        let k = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let i = held[k % held.len()];
+                        let text = if k < held.len() {
+                            f.mems[i].text.clone()
+                        } else {
+                            format!("{} #{}", f.mems[i].text, k / held.len())
+                        };
+                        let s = Instant::now();
                         remember(
                             store,
                             "big",
-                            Memory::new(f.mems[i].text.clone()).embedding(f.mem_vecs[i].clone()),
+                            Memory::new(text).embedding(f.mem_vecs[i].clone()),
                             &mut busy,
                         );
+                        mine.push(s.elapsed().as_micros() as u64);
                     }
+                    busy_all.fetch_add(busy, std::sync::atomic::Ordering::Relaxed);
+                    lats.lock().unwrap().extend(mine);
                 });
             }
         });
-        let secs = t.elapsed().as_secs_f64();
+        let elapsed = t.elapsed().as_secs_f64();
         let after = db.engine_metrics();
+        let mut lat = lats.into_inner().unwrap();
+        let n = lat.len();
+        let (p50, p99, max) = if n == 0 {
+            (0, 0, 0)
+        } else {
+            (
+                percentile(&mut lat, 0.5),
+                percentile(&mut lat, 0.99),
+                percentile(&mut lat, 1.0),
+            )
+        };
         println!(
             "{}",
             json!({
-                "mode": "ivf-writers", "threads": threads, "memories": chunk.len(),
-                "per_second": chunk.len() as f64 / secs,
+                "mode": "ivf-writers", "threads": threads, "memories": n, "seconds": elapsed,
+                "per_second": n as f64 / elapsed,
+                "p50_us": p50, "p99_us": p99, "max_us": max,
+                "busy_sleeps": busy_all.load(std::sync::atomic::Ordering::Relaxed),
                 "retries": after.transaction_retries - before.transaction_retries,
                 "conflicts": after.transaction_conflicts - before.transaction_conflicts,
+                "room_stalls": after.room_stalls - before.room_stalls,
+                "room_stall_ms": (after.room_stall_nanos - before.room_stall_nanos) / 1_000_000,
+                "pacing_stalls": after.pacing_stalls - before.pacing_stalls,
+                "pacing_stall_ms": (after.pacing_stall_nanos - before.pacing_stall_nanos) / 1_000_000,
+                "flushes": after.flushes - before.flushes,
             })
         );
     }

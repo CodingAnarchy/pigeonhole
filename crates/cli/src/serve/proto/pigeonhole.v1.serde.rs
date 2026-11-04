@@ -329,7 +329,7 @@ impl serde::Serialize for AggregateView {
             struct_ser.serialize_field("bloom", v)?;
         }
         if !self.set_members.is_empty() {
-            struct_ser.serialize_field("set_members", &self.set_members.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
+            struct_ser.serialize_field("set_members", &self.set_members)?;
         }
         struct_ser.end()
     }
@@ -455,7 +455,7 @@ impl<'de> serde::Deserialize<'de> for AggregateView {
                                 return Err(serde::de::Error::duplicate_field("setMembers"));
                             }
                             set_members__ = 
-                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                Some(map_.next_value::<Vec<::pbjson::private::NumberDeserialize<_>>>()?
                                     .into_iter().map(|x| x.0).collect())
                             ;
                         }
