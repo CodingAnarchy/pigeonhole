@@ -175,14 +175,25 @@ class TestFeed < Minitest::Test
 
   # perf2's S1 on #1411: a consumer looping in `next` gives way between its 100 ms slices,
   # so a supervisor's `token` and `close` wait about one slice, not many (1.46 s measured
-  # before the fix).
+  # before the fix, when the unfair mutex let the consumer win slice after slice).
+  #
+  # What the design guarantees: each call waits out at most the consumer's current slice.
+  # One sample here is two calls, and the consumer takes a new slice between them, so a
+  # sample waits up to two slices (200 ms) and `close` up to one. Measured on a Mac over 300
+  # samples, idle and under 2x-cores of CPU load: token and closed? at most 111 ms each, a
+  # sample at most 220 ms, close at most 110 ms. A slow macOS runner once added 172 ms of
+  # wakeups to one sample (0.392 s against the old 0.35 s bound, run 41767354269). So the
+  # median stays at the design, and the bounds on the worst sample and on close leave each
+  # about 0.4 s for a slow runner's wakeups. They still fail the regression's 1.46 s.
   def test_a_supervisor_reaches_a_feed_behind_a_looping_next
     feed = t.feed
     waiter = Thread.new { feed.next }
     sleep 0.15
     waits = Array.new(10) { elapsed { feed.token } + elapsed { feed.closed? } }
-    assert_operator waits.max, :<, 0.35, "token + closed? waits: #{waits.map { |w| w.round(3) }}"
-    assert_operator elapsed { feed.close }, :<, 0.25
+    shown = "token + closed? waits: #{waits.map { |w| w.round(3) }}"
+    assert_operator waits.sort[waits.size / 2], :<, 0.25, shown
+    assert_operator waits.max, :<, 0.6, shown
+    assert_operator elapsed { feed.close }, :<, 0.5
     assert_raises(Pigeonhole::Closed) { waiter.join(5) }
   end
 
