@@ -40,13 +40,21 @@ The check copies each entry to a temporary directory, opens it with the real fil
 - **Writing it:** at the release, `scripts/release-corpus.sh <version>` runs `generate_corpus` from the release build with `PIGEONHOLE_CORPUS_RELEASE=<version>`. That writes every entry `tests/corpus.rs` has then, plus `frozen.txt` with each file's length and xxh3-64. The generator refuses a version other than the build's own, and refuses to rewrite a corpus that has a `frozen.txt`.
 - **The check:** `release_corpus_entries_open_read_check_and_write` checks every release corpus. Its files must match `frozen.txt` byte for byte, and each entry must pass the same open, read, write and check as `format4/`, with its `expected-extra.txt` where it has one. Entries are never removed from `tests/corpus.rs`, so every release corpus's entries are the current build's. A build that fails it breaks the promise: fix the build, never the corpus.
 
-## Newer files with 1.0.0
+## Newer files with the published releases
 
-`compat-reader/` is a separate cargo project, its own workspace, pinned to `pigeonhole =1.0.0` from crates.io. `cargo run --release -- <dir>` checks a directory of entries that main wrote with `PIGEONHOLE_CORPUS_OUT`. 1.0.0 opens each one on a copy: it reads every cell exactly, writes through a flush and a compaction, passes the offline check, and reads everything again. An entry that uses a feature 1.0.0 lacks may be refused with `UnsupportedFeature`, which FORMAT §13 allows:
+Two separate cargo projects, each its own workspace, check main's files with a published release. `cargo run --release -- <dir>` checks a directory of entries that main wrote with `PIGEONHOLE_CORPUS_OUT`:
+- `compat-reader/` is pinned to `pigeonhole =1.0.0` from crates.io;
+- `compat-reader-1.1/` is pinned to `=1.1.0` (#1489). It builds the same `compat-reader/src/main.rs`, with the `v1_1` feature for the value types 1.0.0 lacks.
+
+Each reader's package version is the release it pins. The release opens each entry on a copy: it reads every cell exactly, writes through a flush and a compaction, passes the offline check, and reads everything again. An entry that uses a feature the release lacks may be refused with `UnsupportedFeature`, which FORMAT §13 allows:
 - if the feature is `ro_compat`, the reader reads the entry read-only instead;
 - if it is `incompat`, the reader reports the entry and skips it.
 
-The `Compatibility` workflow (`.github/workflows/compat.yml`) runs it on main and PRs, and enables itself once 1.0.0 is on crates.io.
+**Marked entries are strict.** An entry with `refused-by-1.0.0.txt` uses the `incompat` bits that file names, and the rule depends on which of them the release reads:
+- **A release missing any of them** must refuse the entry, naming exactly the bits it lacks. 1.0.0 lacks all of them.
+- **A release that reads every one** must open the entry read-write. 1.1.0 reads bit 0, so it must open `aggregates`, `vectors`, `text` and `memory`, and a refusal fails it.
+
+The `Compatibility` workflow (`.github/workflows/compat.yml`) runs one arm per release on main and PRs. Each arm enables itself once its release is on crates.io.
 
 ## Upgrade corpus
 

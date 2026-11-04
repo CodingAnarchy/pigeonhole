@@ -1,0 +1,23 @@
+[package]
+name = "compat-reader-1-1"
+# The release it pins: main.rs reads it as `RELEASE`.
+version = "1.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, like ../compat-reader: CI's "main's files with 1.1.0" job builds it
+# against the published 1.1.0 (FORMAT.md §13, #1489). It builds compat-reader's main.rs;
+# only the pinned release and the `v1_1` feature differ.
+[workspace]
+
+[[bin]]
+name = "compat-reader"
+path = "../compat-reader/src/main.rs"
+
+[dependencies]
+pigeonhole = "=1.1.0"
+
+[features]
+default = ["v1_1"]
+# The value types 1.1.0 added (vector values), which main.rs prints only with it.
+v1_1 = []
