@@ -501,6 +501,11 @@ impl FeedMarks {
         // Mirrored only when it rises (perf287 on #1352): the mirror's bound takes the
         // checkpoint history's lock and scans it. The caller that raised it publishes it, and
         // the mirror's stores never go down, so a call that didn't raise it has nothing new.
+        // That holds for the bound too only because the engine appends a checkpoint-history
+        // entry (`Feed::note_checkpoint`) just before a call that raises the mark, and after a
+        // reopen the `(head, 0)` seed entry already fixes the oldest bound (simp724 on
+        // #1444). A change that appends history entries without raising the mark must
+        // mirror the bound itself.
         if self.checkpoint.fetch_max(at.0, Ordering::AcqRel) < at.0
             && let Some(m) = self.mirror.get()
         {

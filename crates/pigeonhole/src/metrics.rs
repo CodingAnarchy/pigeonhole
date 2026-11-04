@@ -143,7 +143,7 @@ pub struct EngineMetrics {
     pub transaction_retries: u64,
     /// Cross-shard commits: their two-phase rounds and the commits that failed fast.
     pub cross_shard: CrossShardMetrics,
-    /// Group syncs completed: each is one WAL sync covering the
+    /// Group syncs finished, a failed one included: each is one WAL sync covering the
     /// [`Durability::GroupSync`](crate::Durability::GroupSync) commits batched behind it,
     /// however many there were. Counted with the change feed on or off, so it isn't a feed
     /// cost on its own: set the `feed_*` syncs beside it. Its rise over an interval, against

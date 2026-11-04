@@ -2798,10 +2798,10 @@ impl Engine {
             .sum()
     }
 
-    /// Group syncs completed since open (D310 PR 5b): one per sync covering `GroupSync`
-    /// commits, however many groups it covered, with the feed on or off. Set against
-    /// [`Engine::feed_background_syncs`] to see how often the feed's background sync runs
-    /// beside the commits' own.
+    /// Group syncs finished since open, a failed one included (D310 PR 5b): one per sync
+    /// covering `GroupSync` commits, however many groups it covered, with the feed on or
+    /// off. Set against [`Engine::feed_background_syncs`] to see how often the feed's
+    /// background sync runs beside the commits' own.
     pub fn group_syncs(&self) -> u64 {
         self.inner
             .shared

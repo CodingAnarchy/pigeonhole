@@ -189,8 +189,8 @@ pub(crate) struct ShardMetrics {
     pub checkpoints_dropped: AtomicU64,
     /// The change feed's background syncs submitted (D310, *T_sync*).
     pub feed_syncs: AtomicU64,
-    /// Group syncs completed (D310 PR 5b): what the feed's background syncs are measured
-    /// against.
+    /// Group syncs finished, a failed one included (D310 PR 5b): what the feed's background
+    /// syncs are measured against.
     pub group_syncs: AtomicU64,
     /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
     pub pacing_stalls: AtomicU64,
