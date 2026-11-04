@@ -967,6 +967,30 @@ impl View {
         &self.tablets
     }
 
+    /// This view's SSTs alone, for a job that reads only them: the same version, tablets,
+    /// catalog and SST set, with no shard's memtables, and pinned in `live_views` at its
+    /// manifest version so no extent it names is reclaimed while the job reads it. A long
+    /// job must hold this, not the full view: a view lists every shard's memtables, so
+    /// holding it keeps every memtable live at the job's start referenced until the job ends,
+    /// and a flushed one's chunks can't be reused meanwhile (#1477: 48-62 MiB of a 64 MiB
+    /// arena under back-to-back compactions). In a reader process the pin registers in its own
+    /// `live_views`, which nothing there reclaims against: harmless, and not the reader's
+    /// protection (its reader pin is).
+    pub(crate) fn ssts_only(&self, live_views: &Arc<LiveViews>) -> Arc<View> {
+        Arc::new(View {
+            version: self.version,
+            manifest_version: self.manifest_version,
+            tablets: Arc::clone(&self.tablets),
+            catalog: Arc::clone(&self.catalog),
+            mems: (0..self.mems.len())
+                .map(|_| Arc::new(ShardMems::default()))
+                .collect(),
+            ssts: Arc::clone(&self.ssts),
+            _pin: Some(ViewPin::new(live_views, self.manifest_version)),
+            released: false,
+        })
+    }
+
     /// Where a counter get through this view sends its checkpoint (D291): a writer's views,
     /// in the process that opened it, with checkpoints on.
     pub(crate) fn checkpoint_sink(&self) -> Option<&CheckpointSink> {
