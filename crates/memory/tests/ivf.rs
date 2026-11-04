@@ -473,7 +473,10 @@ fn verify_checks_the_index_s_membership_at_its_own_snapshot() {
     // with no memory added. The count is unchanged, which the old count-only check passed.
     let index = pigeonhole_vector::Index::open(&db, "mem_notes_ivf").unwrap();
     let before = store.verify().unwrap();
-    let held = index.ids_at(&db.snapshot().unwrap()).unwrap();
+    let mut held = Vec::new();
+    index
+        .ids_at(&db.snapshot().unwrap(), |id| held.push(id.to_vec()))
+        .unwrap();
     assert!(index.delete(&held[0]).unwrap());
     index.insert_f32(b"\xffstale", &emb(&mut rng)).unwrap();
     let st = store.verify().unwrap();

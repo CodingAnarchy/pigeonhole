@@ -1499,7 +1499,9 @@ impl Index {
     }
 
     /// [`verify`](Self::verify) at `snapshot`, a snapshot of the index's database: so a
-    /// caller can check the index against its own rows at one point in time (#1427).
+    /// caller can check the index against its own rows at one point in time (#1427). A
+    /// snapshot of another database is refused (`InvalidArgument`, as any read at a foreign
+    /// snapshot is).
     pub fn verify_at(&self, snapshot: &Snapshot) -> Result<IndexStats> {
         let inn = &*self.inner;
         let t = &inn.table;
@@ -1564,24 +1566,28 @@ impl Index {
         })
     }
 
-    /// The ids of every vector in the index at `snapshot` (a snapshot of the index's
-    /// database), sorted: for checking the index's membership against the rows it indexes,
-    /// as a memory store's `verify` does (#1427). Reads every list; for tests and repair
-    /// tooling. Doesn't check the index's own rows: [`verify_at`](Self::verify_at) does.
-    pub fn ids_at(&self, snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
-        let mut ids = Vec::new();
-        let mut cells = self
+    /// Calls `each` with the id of every vector in the index at `snapshot` (a snapshot of the
+    /// index's database), in ascending byte order, once each: for checking the index's
+    /// membership against the rows it indexes, as a memory store's `verify` does (#1427).
+    ///
+    /// It reads the index's id mappings, not the vectors, so it costs a scan of the ids
+    /// alone. [`verify_at`](Self::verify_at) checks that the mappings and the lists agree
+    /// (every vector mapped once, at the list that holds it): run it too for the lists'
+    /// own membership. A snapshot of another database is refused (`InvalidArgument`, as any
+    /// read at a foreign snapshot is).
+    pub fn ids_at(&self, snapshot: &Snapshot, mut each: impl FnMut(&[u8])) -> Result<()> {
+        for row in self
             .inner
             .table
-            .scan_prefix(b"L")
-            .family(VEC)
+            .scan_prefix(b"M")
+            .family(MAP)
             .snapshot(snapshot)
-            .cells()?;
-        while let Some((_, e)) = cells.next()? {
-            ids.push(e.qualifier.to_vec());
+            .iter()?
+        {
+            let row = row?;
+            each(&row.key()[1..]);
         }
-        ids.sort_unstable();
-        Ok(ids)
+        Ok(())
     }
 
     fn insert(&self, id: &[u8], v: Input<'_>) -> Result<()> {

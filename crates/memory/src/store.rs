@@ -1347,11 +1347,11 @@ impl Store {
     pub fn verify(&self) -> Result<StoreStats> {
         let s = self.db.snapshot()?;
         let text_ok = self.index.verify()?.is_consistent();
-        // The index's own rows, then its ids, at `verify`'s snapshot (#1427).
-        let ivf_ids = match &self.ivf {
+        // The index's own rows at `verify`'s snapshot; its ids are compared there too (#1427).
+        let ivf_index = match &self.ivf {
             Some(Ivf::W(index, _)) => {
                 index.verify_at(&s)?;
-                Some(index.ids_at(&s)?)
+                Some(index)
             }
             _ => None,
         };
@@ -1362,7 +1362,7 @@ impl Store {
             self.model.as_ref(),
             text_ok,
             ivf,
-            ivf_ids,
+            ivf_index,
         )
     }
 }
@@ -1544,7 +1544,7 @@ fn verify(
     model: Option<&EmbeddingModel>,
     text_ok: bool,
     ivf: bool,
-    ivf_ids: Option<Vec<Vec<u8>>>,
+    ivf_index: Option<&pigeonhole_vector::Index>,
 ) -> Result<StoreStats> {
     let mut st = StoreStats::default();
     // Per namespace: memories with an embedding, and the counter's value (D311 T8).
@@ -1596,7 +1596,7 @@ fn verify(
             if model.is_some() && !has_emb {
                 st.missing_embeddings += 1;
             }
-            if has_emb && ivf_ids.is_some() {
+            if has_emb && ivf_index.is_some() {
                 embedded_rows.insert(key.to_vec());
             }
             if has_emb && let Some(id) = MemoryId::from_row(key) {
@@ -1650,36 +1650,21 @@ fn verify(
                 embedded.get(*ns).copied().unwrap_or(0) != counters.get(*ns).copied().unwrap_or(0)
             })
             .count() as u64;
-        if let Some(ids) = &ivf_ids {
-            // Both sorted: a merge walk counts each side's ids the other lacks.
-            let (mut a, mut b) = (embedded_rows.iter().peekable(), ids.iter().peekable());
-            loop {
-                match (a.peek(), b.peek()) {
-                    (Some(x), Some(y)) => match x.as_slice().cmp(y.as_slice()) {
-                        std::cmp::Ordering::Less => {
-                            st.ivf_missing += 1;
-                            a.next();
-                        }
-                        std::cmp::Ordering::Greater => {
-                            st.ivf_stale += 1;
-                            b.next();
-                        }
-                        std::cmp::Ordering::Equal => {
-                            a.next();
-                            b.next();
-                        }
-                    },
-                    (Some(_), None) => {
-                        st.ivf_missing += 1;
-                        a.next();
-                    }
-                    (None, Some(_)) => {
-                        st.ivf_stale += 1;
-                        b.next();
-                    }
-                    (None, None) => break,
+        if let Some(index) = ivf_index {
+            // Both sides in ascending byte order: a merge walk counts each side's ids the
+            // other lacks, streaming the index's ids against the embedded memories' rows.
+            let mut rows = embedded_rows.iter().peekable();
+            let (mut missing, mut stale) = (0u64, 0u64);
+            index.ids_at(s, |id| {
+                while rows.next_if(|r| r.as_slice() < id).is_some() {
+                    missing += 1;
                 }
-            }
+                if rows.next_if(|r| r.as_slice() == id).is_none() {
+                    stale += 1;
+                }
+            })?;
+            st.ivf_missing = missing + rows.count() as u64;
+            st.ivf_stale = stale;
             st.ivf_mismatched = st.ivf_missing + st.ivf_stale;
         }
     }
