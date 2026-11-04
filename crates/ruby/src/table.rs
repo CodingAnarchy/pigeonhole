@@ -6,17 +6,17 @@
 
 use std::sync::Mutex;
 
-use magnus::{Error, Float, Integer, RArray, RString, Ruby, Symbol, Value, prelude::*};
+use magnus::{Error, Float, Integer, RArray, RHash, RString, Ruby, Symbol, Value, prelude::*};
 use pigeonhole::{Aggregation, Compression, ErrorCode};
 
 use crate::classes::{
-    Builder, Cell, Condition, Family, FamilyInfo, Mutation, MutationState, Row, ScanArgs, ScanSpec,
-    Snapshot, Table, TableBuilder, VectorSpec,
+    Builder, Cell, Condition, Family, FamilyInfo, Incremented, Mutation, MutationState, Row,
+    ScanArgs, ScanSpec, Snapshot, Table, TableBuilder, VectorSpec,
 };
 use crate::convert::{
     self, Bytes, CellValue, Name, Secs, Val, arg_error, class_name, lock, type_error,
 };
-use crate::error::{OrRb, engine, spent, with_code};
+use crate::error::{OrRb, engine, returned_value, spent, with_code};
 use crate::fork::ForkSafe;
 use crate::gvl::without_gvl;
 use crate::read::snapshot_arg;
@@ -515,6 +515,31 @@ pub(crate) fn commit_row(
     durability: Option<Durability>,
     condition: Option<&pigeonhole::Condition>,
 ) -> pigeonhole::Result<Option<u64>> {
+    let m = row_mutation(table, row, ops, durability);
+    match condition {
+        None => m.commit().map(|i| Some(i.seqno)),
+        Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
+    }
+}
+
+/// Commits `ops` like [`commit_row`] and returns every counter cell they incremented or set,
+/// as the commit left it (D314, ICR 0113). Run without the GVL.
+pub(crate) fn commit_row_returning(
+    table: &pigeonhole::Table,
+    row: &[u8],
+    ops: &[Op],
+    durability: Option<Durability>,
+) -> pigeonhole::Result<pigeonhole::Incremented> {
+    row_mutation(table, row, ops, durability).commit_returning()
+}
+
+/// `ops` buffered on a row mutation of `row`, uncommitted.
+fn row_mutation<'t>(
+    table: &'t pigeonhole::Table,
+    row: &[u8],
+    ops: &[Op],
+    durability: Option<Durability>,
+) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
     if let Some(d) = durability {
         m = m.durability(d.into());
@@ -556,10 +581,7 @@ pub(crate) fn commit_row(
             Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
         };
     }
-    match condition {
-        None => m.commit().map(|i| Some(i.seqno)),
-        Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
-    }
+    m
 }
 
 // ---- Table --------------------------------------------------------------------------------
@@ -796,6 +818,33 @@ impl Table {
         Self::commit_one(ruby, rb_self, row.0, op, durability)
     }
 
+    /// `incr_returning(row, family, qualifier, delta, ts, durability)`: the counter's value
+    /// after the commit (D314); `ReturnedValueError` if the commit applied but the read failed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn incr_returning(
+        ruby: &Ruby,
+        rb_self: &Self,
+        row: Bytes,
+        family: Name,
+        qualifier: Bytes,
+        delta: i64,
+        ts: Option<u64>,
+        durability: Option<Durability>,
+    ) -> Result<Option<i64>, Error> {
+        let t = rb_self.writer(ruby)?.clone();
+        // A failed commit raises its own exception; a failed read after it, a
+        // `ReturnedValueError` (perf2's S1 on #1473).
+        let (seqno, value) = engine(ruby, move || {
+            let op = Op::Incr(family.0.clone(), qualifier.0.clone(), ts, delta);
+            let r = commit_row_returning(&t, &row.0, &[op], durability)?;
+            Ok((
+                r.info.seqno,
+                r.value_at(&family.0, &qualifier.0, ts.unwrap_or(0)),
+            ))
+        })?;
+        value.map_err(|e| returned_value(ruby, seqno, &e))
+    }
+
     /// `delete(row, family, qualifier, ts, durability)`.
     pub(crate) fn delete(
         ruby: &Ruby,
@@ -935,6 +984,22 @@ impl Mutation {
         Self::finish(ruby, rb_self, Some(condition.0.clone()))
     }
 
+    /// Commits like `commit` and returns each counter cell the writes incremented or set,
+    /// after the commit (D314).
+    pub(crate) fn commit_returning(ruby: &Ruby, rb_self: &Self) -> Result<Incremented, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        // As in `finish`: the writes are taken inside the call.
+        let r = without_gvl(ruby, move || {
+            let ops = lock(&m.ops).take()?;
+            Some(commit_row_returning(&m.table, &m.row, &ops, durability))
+        })?;
+        match r {
+            Some(r) => r.map(Incremented).or_rb(ruby),
+            None => Err(spent(ruby, "the mutation was already committed")),
+        }
+    }
+
     fn finish(
         ruby: &Ruby,
         rb_self: &Self,
@@ -958,6 +1023,70 @@ impl Mutation {
             Some(r) => r.or_rb(ruby),
             None => Err(spent(ruby, "the mutation was already committed")),
         }
+    }
+}
+
+// ---- Incremented --------------------------------------------------------------------------
+
+impl Incremented {
+    /// The commit's sequence number.
+    pub(crate) fn seqno(&self) -> u64 {
+        self.0.info.seqno
+    }
+
+    /// `value(family, qualifier, ts)`: the counter (or bucket) after the commit; `nil` when a
+    /// read at the commit sees no cell. `InvalidArgument` if the commit didn't write it;
+    /// `ReturnedValueError` if it couldn't be read after the commit applied.
+    pub(crate) fn value(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+        ts: Option<u64>,
+    ) -> Result<Option<i64>, Error> {
+        let ts = ts.unwrap_or(0);
+        let wrote = rb_self
+            .0
+            .iter()
+            .any(|(f, q, t, _)| f == family.0 && q == qualifier.0.as_slice() && t == ts);
+        let v = rb_self.0.value_at(&family.0, &qualifier.0, ts);
+        if wrote {
+            v.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))
+        } else {
+            // `InvalidArgument`, naming the cell.
+            v.or_rb(ruby)
+        }
+    }
+
+    /// `{[family, qualifier, ts] => value}` in the order the mutation first wrote each cell
+    /// (`ts` 0 for a plain counter); raises `ReturnedValueError` for the first unreadable value.
+    pub(crate) fn to_h(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
+        let h = ruby.hash_new();
+        for (f, q, ts, v) in rb_self.0.iter() {
+            let (family, qualifier) = (ruby.str_new(f), convert::binary(ruby, q));
+            family.freeze();
+            qualifier.freeze();
+            let key = ruby.ary_new_from_values(&[family.as_value(), qualifier.as_value()]);
+            key.push(ts)?;
+            key.freeze();
+            let v = v.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))?;
+            h.aset(key, v)?;
+        }
+        Ok(h)
+    }
+
+    /// The number of cells.
+    pub(crate) fn size(&self) -> usize {
+        self.0.iter().count()
+    }
+
+    /// `#<Pigeonhole::Incremented seqno=... cells=...>`.
+    pub(crate) fn inspect(&self) -> String {
+        format!(
+            "#<Pigeonhole::Incremented seqno={} cells={}>",
+            self.0.info.seqno,
+            self.size()
+        )
     }
 }
 
