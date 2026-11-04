@@ -28,6 +28,7 @@ mod blocking_waits;
 mod bloom_aggregates;
 mod bucket_aggregates;
 mod busy_nanos;
+mod caller_runs;
 mod check;
 mod checkpoint_budget;
 mod checkpoint_creation;

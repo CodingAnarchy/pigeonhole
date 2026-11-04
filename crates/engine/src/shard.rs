@@ -507,6 +507,13 @@ pub(crate) struct Shared {
     pub flush_backoff_nanos: u64,
     /// `EngineOptions::commit_spin_nanos` (D198).
     pub commit_spin_nanos: u64,
+    /// `EngineOptions::caller_runs` (#1176): a waiting committer may run its shard's turn.
+    pub caller_runs: bool,
+    /// `EngineOptions::caller_spin_extend_nanos` (#1176 rev 3.1, C1).
+    pub caller_spin_extend_nanos: u64,
+    /// Caller-runs' evaluation counts (`caller-stats`, #1176).
+    #[cfg(feature = "caller-stats")]
+    pub caller_stats: crate::write::CallerStats,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
     pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,
@@ -1280,10 +1287,10 @@ impl Reply {
     /// freed here, it would be freed on another thread than the one that allocated it.
     fn resolve_returning(self, outcome: Result<CommitInfo>, batch: Option<BatchBuilder>) {
         match self {
-            Reply::Commit(n) => n.notify(outcome.map(|info| Settled { info, batch })),
+            Reply::Commit(n) => n.notify(outcome.map(|info| Settled::new(info, batch))),
             Reply::Returning(r) => r
                 .notifier
-                .notify(outcome.map(|info| Settled { info, batch })),
+                .notify(outcome.map(|info| Settled::new(info, batch))),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
@@ -11853,6 +11860,34 @@ impl ShardHandler for ShardState {
 
     fn handle(&mut self, ctx: &mut ShardContext<'_, Self::Msg>, msg: Self::Msg) {
         self.handle_msg(msg, ctx);
+    }
+
+    /// Caller-runs (#1176): a client's turn takes a single-shard commit that waits for no
+    /// sync and reads nothing at apply (no `check_and_mutate` predicate, no transaction's
+    /// validation, no `commit_returning`), and kicks. Everything else (cross-shard rounds,
+    /// flushes, maintenance, durable commits) stays the driver's.
+    fn caller_may_take(&self, msg: &ShardMsg) -> bool {
+        match msg {
+            ShardMsg::Commit(req) => {
+                matches!(req.durability, Durability::None | Durability::Buffered)
+                    && req.predicate.is_none()
+                    && req.validate.is_none()
+                    && req.retry.is_none()
+                    && matches!(req.reply, Reply::Commit(_))
+            }
+            ShardMsg::Kick => true,
+            _ => false,
+        }
+    }
+
+    /// Caller-runs: a batch runs on a client's thread only while nothing in it can wait
+    /// there: no close, no room wait or stall (their timers are the driver's), and a WAL
+    /// stream that can take the append without waiting for a rollover sync.
+    fn caller_may_run(&self) -> bool {
+        !self.closing
+            && !self.wait_room
+            && !self.stall_open()
+            && !self.wal.as_ref().is_some_and(|w| w.blocked())
     }
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {

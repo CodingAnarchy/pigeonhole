@@ -924,6 +924,7 @@ impl Store {
             self.woke.store(false, Ordering::Release);
             let mut more = false;
             for s in &mut self.shards {
+                more |= caller_turn(s);
                 more |= s.run_once(u64::MAX);
             }
             more |= self.run_workers(u64::MAX);
@@ -1011,6 +1012,7 @@ impl Store {
     /// Runs every shard once, then completes one deferred I/O operation if any is in flight.
     pub fn step_shards(&mut self, now: u64) {
         for s in &mut self.shards {
+            caller_turn(s);
             s.run_once(now + 1_000);
         }
         self.run_workers(now + 1_000);
@@ -6521,4 +6523,15 @@ fn returning_cells(ops: &[ModelOp]) -> Option<Vec<(String, Vec<u8>, Timestamp)>>
 /// A model sum cell's `i64` (the model keeps it as 8 little-endian bytes).
 fn model_i64(v: &[u8]) -> Option<i64> {
     v.try_into().ok().map(i64::from_le_bytes)
+}
+
+/// Caller-runs' sim seam (#1176 rev 3.1 §7): with `PIGEONHOLE_CALLER_TURNS=1`, every step
+/// first runs a committing client's turn of the shard (`EngineShard::run_caller_turn`, the
+/// production caller's turn), then its normal turn, so the seeded harnesses (model_check,
+/// tablets, counters, the pigeonhole model) exercise the caller's path deterministically.
+/// Off (the default), nothing changes. Returns whether the caller's turn handled a message.
+pub fn caller_turn(s: &mut EngineShard) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PIGEONHOLE_CALLER_TURNS").is_ok_and(|v| v == "1"))
+        && s.run_caller_turn()
 }

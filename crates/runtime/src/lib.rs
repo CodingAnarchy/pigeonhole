@@ -58,6 +58,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod cell;
 mod completion;
 mod drivers;
 mod pool;
@@ -179,6 +180,12 @@ pub struct RuntimeConfig {
     /// a sparse one polls no longer per message than under `idle_spin`. Zero (the default),
     /// or at most `idle_spin`: the window is `idle_spin`, fixed.
     pub idle_spin_cap: Duration,
+    /// Engine-owned mode, a prototype behind a hidden option (#1176, D198's C2): a client
+    /// waiting on a message it queued may run the shard's turn itself when no thread is
+    /// running it ([`Submitter::try_caller_turn`]), taking only what
+    /// [`ShardHandler::caller_may_take`] allows. Off by default.
+    #[doc(hidden)]
+    pub caller_runs: bool,
     /// Clock source (simulated under test).
     pub vfs: VfsRef,
 }
@@ -196,6 +203,7 @@ impl RuntimeConfig {
             time_slice: Duration::from_micros(500),
             idle_spin: Duration::ZERO,
             idle_spin_cap: Duration::ZERO,
+            caller_runs: false,
             vfs,
         }
     }
@@ -221,6 +229,22 @@ pub trait ShardHandler: Send + 'static {
     /// Called after each drained batch of messages (the group-commit point: write the WAL
     /// once, sync once, publish, wake committers).
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>);
+
+    /// Caller-runs (#1176, [`RuntimeConfig::caller_runs`]): whether a committing client's
+    /// turn may handle `msg`. A refused message, and everything after it, waits for the
+    /// shard's driver. The default refuses everything.
+    #[doc(hidden)]
+    fn caller_may_take(&self, _msg: &Self::Msg) -> bool {
+        false
+    }
+
+    /// Caller-runs: whether a client's turn may run a batch now (nothing would make it wait
+    /// on this thread: a held WAL header, a stall, a room wait, a close). Checked before each
+    /// batch. The default refuses.
+    #[doc(hidden)]
+    fn caller_may_run(&self) -> bool {
+        false
+    }
 }
 
 /// The handler's view of the runtime while it runs on its shard.
@@ -316,9 +340,36 @@ struct Inbox<M> {
     /// Submits against shutdown (`submit_gate`).
     gate: submit_gate::SubmitGate,
     signal: Arc<Signal>,
+    /// The shard's caller-run entry (#1176), set at start when caller-runs is on.
+    caller: std::sync::OnceLock<Arc<dyn cell::CallerTurn>>,
+    /// Caller-runs' work hint (#1176 rev 3.1, C3): messages submitted (counted only with
+    /// caller-runs on), and the count the token's holder last read before finding the queue
+    /// empty. A client takes the token only while `sent > drained`. It's a hint: a stale
+    /// value costs a turn that finds nothing, or a client that leaves a message to the
+    /// driver, whose wakeup the submit's own notify already guarantees.
+    sent: std::sync::atomic::AtomicU64,
+    drained: std::sync::atomic::AtomicU64,
+    /// `RuntimeConfig::caller_runs`: whether the hint is kept at all. Off, submits and
+    /// turns skip it for one branch, so the default pays nothing else (D193's ceilings).
+    caller_runs: bool,
 }
 
 impl<M> Inbox<M> {
+    /// Notes the queue found empty, for the work hint (caller-runs only). Read after the
+    /// empty look: a message that came in between is then counted drained, which only keeps
+    /// a client from trying; the driver's wake for it is the submit's notify.
+    #[cold]
+    fn note_drained(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.drained.store(self.sent.load(Relaxed), Relaxed);
+    }
+
+    /// Whether the work hint says something may be queued.
+    fn maybe_queued(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sent.load(Relaxed) > self.drained.load(Relaxed)
+    }
+
     fn close(&self) {
         self.gate.close();
         self.signal.force_wake();
@@ -407,13 +458,71 @@ impl<M: Send + 'static> Submitter<M> {
         let sent = inbox.tx.send(msg);
         inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
+        if inbox.caller_runs {
+            inbox
+                .sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         inbox.signal.notify();
         Ok(())
     }
+
+    /// Turns committing clients ran on the target shard that handled at least one message,
+    /// since the runtime started (caller-runs, #1176). Relaxed.
+    #[doc(hidden)]
+    pub fn caller_turns(&self) -> u64 {
+        self.inbox.signal.caller_turns()
+    }
+
+    /// Caller-runs (#1176): if no thread is running the target shard and caller-runs is on,
+    /// runs a turn of it on this thread: up to [`CALLER_BATCH`] queued messages the
+    /// handler allows, foreground only, ending early once `own_done` says the caller's own
+    /// message was answered. Never waits for the shard. Returns whether a turn ran.
+    #[doc(hidden)]
+    pub fn caller_token_free(&self) -> bool {
+        self.inbox.caller.get().is_some_and(|c| c.is_free())
+    }
+
+    #[doc(hidden)]
+    pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
+        match self.inbox.caller.get() {
+            Some(c) if self.inbox.maybe_queued() => c.try_run(own_done),
+            _ => false,
+        }
+    }
 }
+
+/// The most messages a caller's turn handles (#1176): its own and whatever is queued ahead
+/// of it, so the client that wins the token carries a few other commits but no backlog.
+pub const CALLER_BATCH: usize = 8;
 
 thread_local! {
     static CURRENT_SHARD: Cell<Option<ShardId>> = const { Cell::new(None) };
+    /// The calling thread is in a committing client's turn (caller-runs, #1176).
+    static IN_CALLER_TURN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the calling thread is running a committing client's turn of a shard
+/// (caller-runs, #1176): for the evaluation's count of who resolved a commit.
+#[doc(hidden)]
+pub fn in_caller_turn() -> bool {
+    IN_CALLER_TURN.with(Cell::get)
+}
+
+/// Marks the calling thread as in a caller's turn until dropped.
+struct InCallerTurn;
+
+impl InCallerTurn {
+    fn new() -> Self {
+        IN_CALLER_TURN.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for InCallerTurn {
+    fn drop(&mut self) {
+        IN_CALLER_TURN.with(|c| c.set(false));
+    }
 }
 
 /// Marks the calling thread as running `shard` until dropped.
@@ -478,6 +587,10 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
+    /// `RuntimeConfig::caller_runs` (#1176): whether a look that finds the queue empty
+    /// notes it for the work hint. Off, the look is main's exactly, plus this branch on the
+    /// empty path only.
+    caller_runs: bool,
     /// Messages handled and background slices run, in all (`ShardDriver::work_count`).
     work_done: u64,
     /// Turns in a row that ended before their background slices because a future of the
@@ -566,6 +679,7 @@ impl<H: ShardHandler> ShardCore<H> {
             submitters,
             spawner,
             vfs,
+            caller_runs,
             ..
         } = self;
         let mut ctx = ShardContext {
@@ -585,7 +699,12 @@ impl<H: ShardHandler> ShardCore<H> {
                     handler.handle(&mut ctx, msg);
                     n += 1;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if *caller_runs {
+                        submitters[usize::from(id.0)].inbox.note_drained();
+                    }
+                    break;
+                }
             }
         }
         if n > 0 {
@@ -594,6 +713,85 @@ impl<H: ShardHandler> ShardCore<H> {
             self.work_done += n as u64;
         }
         n
+    }
+
+    /// A committing client's turn (#1176, caller-runs). Foreground only: no background
+    /// slices, timers, take-backs or spin, and no I/O ring (the caller runs it under
+    /// `inline_io`); the driver's sleep announcement is left alone. Handles queued messages
+    /// in order while the handler allows them, up to [`CALLER_BATCH`], running a batch's
+    /// `end_batch` after each round, and stops once `own_done` holds. A refused message goes
+    /// to the stash (the driver runs it first, so order holds) and sets `wants`. Returns
+    /// whether the driver has anything to do now, and how many messages the turn handled.
+    fn caller_turn(
+        &mut self,
+        own_done: &mut dyn FnMut() -> bool,
+        wants: &std::sync::atomic::AtomicBool,
+    ) -> (bool, usize) {
+        let _shard = EnterShard::new(self.id);
+        let _caller = InCallerTurn::new();
+        let deadline_before = self.next_deadline();
+        let ShardCore {
+            id,
+            handler,
+            rx,
+            stash,
+            submitters,
+            spawner,
+            vfs,
+            ..
+        } = self;
+        let mut ctx = ShardContext {
+            shard: *id,
+            submitters,
+            spawner,
+            vfs: &**vfs,
+        };
+        let mut handled = 0;
+        let mut leftover = false;
+        while handled < CALLER_BATCH {
+            if !handler.caller_may_run() {
+                leftover = true;
+                break;
+            }
+            let mut n = 0;
+            while handled < CALLER_BATCH {
+                let msg = match stash.take() {
+                    Some(m) => m,
+                    None => match rx.try_recv() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            submitters[usize::from(id.0)].inbox.note_drained();
+                            break;
+                        }
+                    },
+                };
+                if !handler.caller_may_take(&msg) {
+                    *stash = Some(msg);
+                    wants.store(true, std::sync::atomic::Ordering::Relaxed);
+                    leftover = true;
+                    break;
+                }
+                handler.handle(&mut ctx, msg);
+                n += 1;
+                handled += 1;
+            }
+            if n == 0 {
+                break;
+            }
+            handler.end_batch(&mut ctx);
+            if leftover || own_done() {
+                break;
+            }
+        }
+        // A full batch may have left more queued; a handler that can't run a batch now has
+        // work only the driver can finish.
+        leftover |= handled == CALLER_BATCH || !handler.caller_may_run();
+        self.work_done += handled as u64;
+        let notify = leftover
+            || self.spawner.local.has_runnable()
+            || self.spawner.has_back()
+            || self.next_deadline() != deadline_before;
+        (notify, handled)
     }
 
     fn run_once(&mut self, deadline: u64) -> bool {
@@ -738,6 +936,9 @@ impl<H: ShardHandler> ShardCore<H> {
         self.signal().prepare_sleep();
         if self.stash.is_none() {
             self.stash = self.rx.try_recv().ok();
+            if self.caller_runs && self.stash.is_none() {
+                self.inbox().note_drained();
+            }
         }
         if self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back() {
             self.signal().awake();
@@ -819,6 +1020,10 @@ fn build<H: ShardHandler>(
                     tx,
                     gate: submit_gate::SubmitGate::new(),
                     signal: Arc::new(Signal::new()),
+                    caller: std::sync::OnceLock::new(),
+                    sent: std::sync::atomic::AtomicU64::new(0),
+                    drained: std::sync::atomic::AtomicU64::new(0),
+                    caller_runs: config.caller_runs,
                 }),
             }
         })
@@ -850,6 +1055,7 @@ fn build<H: ShardHandler>(
             released: false,
             own_ring: false,
             spin: IdleSpin::new(config.idle_spin, config.idle_spin_cap),
+            caller_runs: config.caller_runs,
         })
         .collect();
     (submitters, cores)
@@ -1001,9 +1207,16 @@ impl<H: ShardHandler> Runtime<H> {
             rt.workers.push(handle);
             acks.push(ack);
         }
-        let mut held: Vec<Vec<ShardCore<H>>> = (0..k).map(|_| Vec::new()).collect();
+        let mut held: Vec<Vec<Arc<cell::ShardCell<H>>>> = (0..k).map(|_| Vec::new()).collect();
         for core in cores {
-            held[drivers::Drivers::<H>::owner(core.id, k)].push(core);
+            let cell = Arc::new(cell::ShardCell::new(core));
+            if config.caller_runs {
+                let entry: Arc<dyn cell::CallerTurn> = Arc::clone(&cell) as _;
+                cell.with_inbox(|inbox| {
+                    let _ = inbox.caller.set(entry);
+                });
+            }
+            held[drivers::Drivers::<H>::owner(cell.id(), k)].push(cell);
         }
         for (d, cores) in held.into_iter().enumerate() {
             // A fixed thread per shard keeps the shard's name, as before D289; drivers whose
@@ -1398,6 +1611,20 @@ impl<H: ShardHandler> ShardDriver<H> {
     /// by [`next_deadline`](ShardDriver::next_deadline) even if no wakeup arrives.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
         self.core.run_once(deadline_nanos)
+    }
+
+    /// Caller-runs' sim seam (#1176 rev 3.1 §7): runs one committing client's turn of this
+    /// shard on the calling thread, the same `caller_turn` an engine-owned client runs (the
+    /// handler's allow-list, `caller_may_run` per batch, at most [`CALLER_BATCH`] messages,
+    /// refused messages to the stash), under `inline_io`, so a single-threaded seeded
+    /// harness reaches the caller's path deterministically. Returns whether it handled a
+    /// message. A test seam: the engine-owned path wraps the same call in the run token.
+    #[doc(hidden)]
+    pub fn run_caller_turn(&mut self) -> bool {
+        let wants = std::sync::atomic::AtomicBool::new(false);
+        let core = &mut self.core;
+        let (_, handled) = pigeonhole_io::inline_io(|| core.caller_turn(&mut || false, &wants));
+        handled > 0
     }
 
     /// How many messages this shard has handled and background slices it has run, in all.

@@ -214,6 +214,13 @@ pub struct Metrics {
     /// interval, divided by the interval, is how many threads' worth of polling the store
     /// did: awake time its clients caused without work behind it.
     pub shard_spin_time_nanos: u64,
+    /// Caller-runs (#1176): turns committing clients ran on the shards that handled a
+    /// message, summed over shards; 0 with it off.
+    pub caller_turns: u64,
+    /// Caller-runs' evaluation split (the `caller-stats` feature; zeros without it):
+    /// caller-run commits resolved in the client's own turn, another client's, and the
+    /// driver's.
+    pub caller_resolved: [u64; 3],
     /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
     /// commits every shard completed (D257), plus each cross-shard commit's time from
     /// submit to the decision at every participant (D262). Its rise over an interval,
@@ -1628,6 +1635,7 @@ impl Engine {
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
         config.idle_spin_cap = std::time::Duration::from_nanos(options.shard_spin_cap_nanos);
+        config.caller_runs = options.caller_runs;
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
             b => b,
@@ -1787,6 +1795,33 @@ impl Engine {
     }
 
     // ---- catalog ----
+
+    /// Turns committing threads ran on the shards themselves, summed over shards (the
+    /// caller-runs prototype, #1176; 0 with it off). Relaxed.
+    #[doc(hidden)]
+    pub fn caller_turns(&self) -> u64 {
+        self.inner
+            .shared
+            .submitters
+            .get()
+            .map_or(0, |subs| subs.iter().map(|s| s.caller_turns()).sum())
+    }
+
+    /// Caller-run commits by who resolved them, `[own client's turn, another client's, the
+    /// driver's]` (the caller-runs evaluation's split, #1176 rev 3.1 C1; `caller-stats`).
+    #[cfg(feature = "caller-stats")]
+    #[doc(hidden)]
+    pub fn caller_resolutions(&self) -> [u64; 3] {
+        self.inner.shared.caller_stats.counts()
+    }
+
+    /// The calling thread's last caller-run commit: 0 resolved in its own turn, 1 in another
+    /// client's, 2 by the driver; 3 none yet (`caller-stats`, #1176).
+    #[cfg(feature = "caller-stats")]
+    #[doc(hidden)]
+    pub fn last_caller_class() -> u8 {
+        crate::write::last_caller_class()
+    }
 
     /// Creates a table with its families (a manifest commit).
     pub fn create_table(
@@ -3262,6 +3297,10 @@ impl Engine {
                 m.reader_pin_lag = (views, seqnos);
             }
         }
+        #[cfg(feature = "caller-stats")]
+        {
+            m.caller_resolved = shared.caller_stats.counts();
+        }
         m.shard_commit_inflight_nanos = shared
             .metrics
             .iter()
@@ -3275,6 +3314,7 @@ impl Engine {
                 m.shard_busy_nanos += sub.busy_nanos();
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
                 m.shard_spin_time_nanos += sub.spin_nanos();
+                m.caller_turns += sub.caller_turns();
                 let (fallbacks, room) = sub.background_take_backs();
                 m.background_take_backs.0 += fallbacks;
                 m.background_take_backs.1 += room;
@@ -4503,8 +4543,20 @@ impl Inner {
     ) -> Result<CommitInfo> {
         match self.route_and_send(batch, durability, None, None, NoAdmission)? {
             Routed::Sent {
-                mut waiter, spins, ..
-            } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
+                mut waiter,
+                spins,
+                target,
+                ..
+            } => {
+                // Caller-runs (#1176): the commit's shard, which this thread may run itself
+                // while it waits. A cross-shard commit's coordinator refuses it (only
+                // single-shard commits are a caller's to run).
+                if spins && self.shared.caller_runs {
+                    crate::write::wait_blocking_as_caller(&self.shared, &mut waiter, target)
+                } else {
+                    crate::write::wait_blocking(&self.shared, &mut waiter, spins)
+                }
+            }
             Routed::Held(p) => self.send(p)?.wait(),
         }
     }
@@ -5769,6 +5821,21 @@ impl EngineShard {
         d.run_once(deadline_nanos)
     }
 
+    /// Caller-runs' sim seam (#1176): one committing client's turn of this shard, the same
+    /// turn an engine-owned client runs, for a seeded harness to reach that path on one
+    /// thread (`PIGEONHOLE_CALLER_TURNS`). Returns whether it handled a message (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn run_caller_turn(&mut self) -> bool {
+        if self.forked() {
+            return false;
+        }
+        let Some(d) = self.driver.as_mut() else {
+            return false;
+        };
+        d.run_caller_turn()
+    }
+
     /// Whether this shard's WAL segment header is held back behind its predecessor's sync
     /// (an inspection helper for tests, D310 PR 4: a change feed polled in that window must
     /// wait for the segment, not take the stream's readable end for its head).
@@ -5977,6 +6044,10 @@ impl Shared {
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
+            caller_runs: options.caller_runs,
+            caller_spin_extend_nanos: options.caller_spin_extend_nanos,
+            #[cfg(feature = "caller-stats")]
+            caller_stats: Default::default(),
             tail_index: false,
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),

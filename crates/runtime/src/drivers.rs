@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use pigeonhole_io::VfsRef;
 
+use crate::cell::ShardCell;
 use crate::signal::WakeTarget;
-use crate::{EnterShard, RING_IDLE_WAIT, ShardCore, ShardHandler, ShardId, Submitter, sched};
+use crate::{EnterShard, RING_IDLE_WAIT, ShardHandler, ShardId, Submitter, sched};
 
 /// A pass longer than this kept a message waiting too long behind its siblings' turns (#997's
 /// A/B: heavy rows at one driver had pass p99s of 128-256 µs, light ones far under). More
@@ -126,7 +127,7 @@ impl DriverStats {
 }
 
 struct Handoff<H: ShardHandler> {
-    cores: Vec<ShardCore<H>>,
+    cores: Vec<Arc<ShardCell<H>>>,
     /// The driver returned (shutdown): nothing may be handed to it.
     exited: bool,
 }
@@ -281,12 +282,14 @@ impl<H: ShardHandler> Drivers<H> {
     }
 
     /// Hands `core` to driver `to`, or gives it back when `to` exited or shutdown began.
-    fn hand_off(&self, mut core: ShardCore<H>, to: usize) -> Option<ShardCore<H>> {
+    fn hand_off(&self, core: Arc<ShardCell<H>>, to: usize) -> Option<Arc<ShardCell<H>>> {
         let mut h = lock(&self.slots[to].handoff);
         if h.exited || self.closing.load(Ordering::Acquire) {
             return Some(core);
         }
-        core.mark_released();
+        if let Some(mut t) = core.driver_wait() {
+            t.mark_released();
+        }
         h.cores.push(core);
         drop(h);
         self.moves.fetch_add(1, Ordering::Relaxed);
@@ -568,21 +571,31 @@ impl Controller {
 pub(crate) fn driver_main<H: ShardHandler>(
     drivers: Arc<Drivers<H>>,
     d: usize,
-    mut cores: Vec<ShardCore<H>>,
+    mut cores: Vec<Arc<ShardCell<H>>>,
 ) -> Vec<(ShardId, H)> {
     let mut idle_park = sched::IdlePark::default();
     let mut done = Vec::new();
     let vfs = Arc::clone(&drivers.vfs);
     // The driver reads the spin window from its first shard: every shard of a runtime
     // shares it.
-    debug_assert!(cores.iter().all(|c| Arc::ptr_eq(&c.vfs, &vfs)
-        && (c.spin.window, c.spin.cap) == (cores[0].spin.window, cores[0].spin.cap)));
+    debug_assert!({
+        let spin = |c: &ShardCell<H>| {
+            c.driver_wait()
+                .map(|t| (Arc::ptr_eq(&t.vfs, &vfs), t.spin.window, t.spin.cap))
+        };
+        let first = cores.first().and_then(|c| spin(c));
+        cores
+            .iter()
+            .all(|c| spin(c) == first && first.is_none_or(|f| f.0))
+    });
     // Sized from this thread's idle gaps (#1176); made at the first spin, from a shard's
     // settings (a driver may start with none).
     let mut gaps: Option<GapWindow> = None;
     vfs.attach_thread();
-    for core in &mut cores {
-        core.attach();
+    for cell in &cores {
+        if let Some(mut t) = cell.driver_wait() {
+            t.attach();
+        }
     }
     // Every shard this driver holds wakes this thread: its park, or its wait in its ring.
     let waker = pigeonhole_io::own_io_waker();
@@ -591,8 +604,8 @@ pub(crate) fn driver_main<H: ShardHandler>(
         None => WakeTarget::Thread(thread::current()),
     };
     *lock(&drivers.slots[d].thread) = Some((thread::current(), waker.clone()));
-    for core in &cores {
-        core.signal().set_target(target());
+    for cell in &cores {
+        cell.signal().set_target(target());
     }
     let stats = &drivers.slots[d].stats;
     loop {
@@ -600,9 +613,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
         // their turns run in this pass, before any park.
         {
             let mut h = lock(&drivers.slots[d].handoff);
-            for core in h.cores.drain(..) {
-                core.signal().set_target(target());
-                cores.push(core);
+            for cell in h.cores.drain(..) {
+                cell.signal().set_target(target());
+                cores.push(cell);
             }
         }
         let pass_start = vfs.monotonic_nanos();
@@ -610,27 +623,55 @@ pub(crate) fn driver_main<H: ShardHandler>(
         let mut sibling_wait = 0;
         let mut i = 0;
         while i < cores.len() {
-            let core = &mut cores[i];
-            let start = vfs.monotonic_nanos();
-            let deadline = start.saturating_add(core.time_slice);
-            let work = core.work_done;
-            more |= core.run_once(deadline);
-            let turn = vfs.monotonic_nanos().saturating_sub(start);
-            // The turn's time, for the balancer's view of how busy this shard is (D217) and
-            // the controller's of this driver.
-            core.signal().add_busy(turn);
-            stats.busy.fetch_add(turn, Ordering::Relaxed);
+            let cell = &cores[i];
+            // Callers' turns on this shard count as this driver's busy time (#1176 rev 3.1).
             stats
-                .ops
-                .fetch_add(core.work_done.saturating_sub(work), Ordering::Relaxed);
-            if core.work_done > work {
-                sibling_wait += start.saturating_sub(pass_start);
-            }
-            if core.inbox().is_closed() {
-                let mut core = cores.swap_remove(i);
-                let _shard = EnterShard::new(core.id);
-                core.finish();
-                done.push((core.id, core.handler));
+                .busy
+                .fetch_add(cell.take_caller_busy(), Ordering::Relaxed);
+            let Some(mut core) = cell.driver() else {
+                // A caller runs it now. Announce sleep for the shard, as the turn's end would
+                // have, then try once more (`driver`: skipped, fence, retry). Either this
+                // thread gets the token after the caller released it, or the caller's release
+                // (Free, fence, load `skipped`) sees the shard skipped and announced asleep
+                // and wakes this thread: never neither.
+                cell.signal().prepare_sleep();
+                if cell.driver().is_some() {
+                    more = true;
+                }
+                i += 1;
+                continue;
+            };
+            let closed = {
+                let start = vfs.monotonic_nanos();
+                let deadline = start.saturating_add(core.time_slice);
+                let work = core.work_done;
+                let left = core.run_once(deadline);
+                if left {
+                    // Work only the driver runs (background slices, the rest of a batch):
+                    // callers leave the token to it until it takes it (rev 3.1, C2).
+                    cell.want();
+                }
+                more |= left;
+                let turn = vfs.monotonic_nanos().saturating_sub(start);
+                // The turn's time, for the balancer's view of how busy this shard is (D217)
+                // and the controller's of this driver.
+                cell.signal().add_busy(turn);
+                stats.busy.fetch_add(turn, Ordering::Relaxed);
+                let worked = core.work_done.saturating_sub(work);
+                stats.ops.fetch_add(worked, Ordering::Relaxed);
+                if worked > 0 {
+                    sibling_wait += start.saturating_sub(pass_start);
+                }
+                core.inbox().is_closed()
+            };
+            drop(core);
+            if closed {
+                let cell = cores.swap_remove(i);
+                if let Some(mut core) = cell.close() {
+                    let _shard = EnterShard::new(core.id);
+                    core.finish();
+                    done.push((core.id, core.handler));
+                }
                 continue;
             }
             i += 1;
@@ -654,12 +695,12 @@ pub(crate) fn driver_main<H: ShardHandler>(
         let k = drivers.target();
         let misplaced = cores
             .iter()
-            .filter(|c| Drivers::<H>::owner(c.id, k) != d)
+            .filter(|c| Drivers::<H>::owner(c.id(), k) != d)
             .count();
         if misplaced > 0 && !pigeonhole_io::own_io_in_flight() {
             let mut kept = Vec::with_capacity(cores.len());
             for core in cores.drain(..) {
-                let to = Drivers::<H>::owner(core.id, k);
+                let to = Drivers::<H>::owner(core.id(), k);
                 if to == d {
                     kept.push(core);
                 } else if let Some(core) = drivers.hand_off(core, to) {
@@ -671,7 +712,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
         stats.misplaced.store(
             cores
                 .iter()
-                .filter(|c| Drivers::<H>::owner(c.id, k) != d)
+                .filter(|c| Drivers::<H>::owner(c.id(), k) != d)
                 .count(),
             Ordering::Relaxed,
         );
@@ -691,9 +732,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
         // (the ring's eventfd) or the earliest deadline.
         let idle_from = Instant::now();
         if gaps.is_none()
-            && let Some(c) = cores.first()
+            && let Some(core) = cores.first().and_then(|c| c.driver_wait())
         {
-            gaps = Some(GapWindow::new(c.spin.window, c.spin.cap));
+            gaps = Some(GapWindow::new(core.spin.window, core.spin.cap));
         }
         let window = gaps.as_ref().map_or(Duration::ZERO, GapWindow::window);
         if pigeonhole_io::own_io_in_flight() {
@@ -722,8 +763,8 @@ pub(crate) fn driver_main<H: ShardHandler>(
         if !lock(&drivers.slots[d].handoff).cores.is_empty() {
             continue;
         }
-        for core in &cores {
-            core.signal().parked();
+        for cell in &cores {
+            cell.signal().parked();
         }
         match next_deadline(&cores) {
             None => {
@@ -856,8 +897,11 @@ impl GapWindow {
 }
 
 /// The earliest deadline of a sleeping background task on any of `cores`.
-fn next_deadline<H: ShardHandler>(cores: &[ShardCore<H>]) -> Option<u64> {
-    cores.iter().filter_map(ShardCore::next_deadline).min()
+fn next_deadline<H: ShardHandler>(cores: &[Arc<ShardCell<H>>]) -> Option<u64> {
+    cores
+        .iter()
+        .filter_map(|c| c.driver().and_then(|t| t.next_deadline()))
+        .min()
 }
 
 /// Before parking (engine-owned mode, D198): if any of a driver's shards handled a message
@@ -868,7 +912,7 @@ fn next_deadline<H: ShardHandler>(cores: &[ShardCore<H>]) -> Option<u64> {
 /// arrived (the loop runs again at once). The window is measured on the real clock: a
 /// simulated clock may not move while polling.
 fn spin_before_park<H: ShardHandler>(
-    cores: &mut [ShardCore<H>],
+    cores: &mut [Arc<ShardCell<H>>],
     window: Duration,
     reap: bool,
 ) -> bool {
@@ -876,7 +920,10 @@ fn spin_before_park<H: ShardHandler>(
         return false;
     }
     // `due` consumes each shard's "handled a message" mark and its backoff.
-    let due: Vec<bool> = cores.iter_mut().map(|c| c.spin.due()).collect();
+    let due: Vec<bool> = cores
+        .iter()
+        .map(|c| c.driver().is_some_and(|mut t| t.spin.due()))
+        .collect();
     let n_due = due.iter().filter(|&&d| d).count() as u64;
     if n_due == 0 {
         return false;
@@ -887,31 +934,46 @@ fn spin_before_park<H: ShardHandler>(
     // A skipped poll (the window is zero, no message since the last park, or the backoff)
     // adds nothing: timing the skip counted two clock reads' worth on Linux and macOS and
     // nothing on Windows, where consecutive reads of the clock can be equal.
-    let spun_from = cores[0].vfs.monotonic_nanos();
+    let Some(vfs) = cores
+        .iter()
+        .find_map(|c| c.driver().map(|t| Arc::clone(&t.vfs)))
+    else {
+        return false;
+    };
+    let spun_from = vfs.monotonic_nanos();
     let hit = spin_poll(cores, window, reap);
-    let spun = cores[0].vfs.monotonic_nanos().saturating_sub(spun_from);
+    let spun = vfs.monotonic_nanos().saturating_sub(spun_from);
     let share = spun / n_due;
-    for (core, _) in cores.iter_mut().zip(&due).filter(|(_, d)| **d) {
-        core.spin.record(hit);
-        core.signal().add_spin(share);
+    for (cell, _) in cores.iter().zip(&due).filter(|(_, d)| **d) {
+        if let Some(mut t) = cell.driver() {
+            t.spin.record(hit);
+        }
+        cell.signal().add_spin(share);
     }
     hit
 }
 
 /// The poll itself: every shard's queue for up to the spin window, then the sleep
 /// handshake on a miss. Returns whether work arrived.
-fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap: bool) -> bool {
+fn spin_poll<H: ShardHandler>(cores: &[Arc<ShardCell<H>>], window: Duration, reap: bool) -> bool {
     // Awake while polling, so a producer does not wake the thread (on a ring backend that
     // is a syscall); sleep is announced again, and checked once more, on a miss.
-    for core in cores.iter() {
-        core.signal().awake();
+    for cell in cores {
+        cell.signal().awake();
     }
     let end = std::time::Instant::now() + window;
     let mut polls = 0u32;
     let mut hit = 'poll: loop {
-        for core in cores.iter_mut() {
+        for cell in cores {
+            let Some(mut core) = cell.driver() else {
+                // A caller runs it now: it takes what is queued.
+                continue;
+            };
             if core.stash.is_none() {
                 core.stash = core.rx.try_recv().ok();
+                if core.caller_runs && core.stash.is_none() {
+                    core.inbox().note_drained();
+                }
             }
             if core.stash.is_some() || core.signal().task_woken() || core.inbox().is_closed() {
                 break 'poll true;
@@ -936,13 +998,22 @@ fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap
     if !hit {
         // The sleep handshake again, for every shard: whatever a producer published
         // before it read the flag is found here, and anything later wakes the thread.
-        for core in cores.iter_mut() {
-            hit |= core.check_before_sleep();
+        for cell in cores {
+            // A caller holding the token sees `skipped` at its release and wakes the thread:
+            // announce sleep for the shard all the same, so that wake reaches it.
+            hit |= match cell.driver() {
+                Some(mut t) => t.check_before_sleep(),
+                // Announce sleep first, then retry (as in the turns above).
+                None => {
+                    cell.signal().prepare_sleep();
+                    cell.driver().is_some_and(|mut t| t.check_before_sleep())
+                }
+            };
         }
     }
     if hit {
-        for core in cores.iter() {
-            core.signal().awake();
+        for cell in cores {
+            cell.signal().awake();
         }
     }
     hit

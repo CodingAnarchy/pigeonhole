@@ -29,6 +29,9 @@ __unstable-hooks = []
 # methods for this crate's tests (#1504): hold and fault seams only. Only this crate's
 # dev-dependency on itself turns it on; the bench's `__unstable-hooks` builds don't get it.
 __engine-hooks = ["__unstable-hooks", "pigeonhole-engine/test-hooks"]
+# Caller-runs' evaluation split (#1176, `pigeonhole-engine/caller-stats`): the internal
+# metrics `caller_resolved_*` count who resolved each caller-run commit. Off by default.
+caller-stats = ["pigeonhole-engine/caller-stats"]
 
 [dependencies]
 pigeonhole-engine = { workspace = true }

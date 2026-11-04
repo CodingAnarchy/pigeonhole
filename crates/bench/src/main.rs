@@ -174,6 +174,10 @@ OPTIONS:
                            window (#1176) [default: the library's: 1 ms under the
                            Embedded profile; none, a fixed window, with --shard-spin
                            or --server-profile]
+    --caller-runs          Pigeonhole: the #1176 prototype, a committing client runs its
+                           idle shard's turn itself [default: off]
+    --caller-spin-extend US  with --caller-runs: keep polling up to US µs past the spin
+                           while the shard's token is free (#1176's C1 arm) [default: 0]
     --shard-threads K      Pigeonhole: run the shards on K threads (D289)
                            [default: the library's CPU budget]
     --background-workers N Pigeonhole, application-owned (app-owned, scaling): N background
@@ -267,6 +271,8 @@ struct Args {
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
     shard_spin_cap: Option<u64>,
+    caller_runs: bool,
+    caller_spin_extend: Option<u64>,
     shard_threads: Option<usize>,
     background_workers: usize,
     compaction_cores: Option<usize>,
@@ -360,6 +366,8 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
             "--shard-spin-cap" => a.shard_spin_cap = Some(parse(&arg, it.next())?),
+            "--caller-runs" => a.caller_runs = true,
+            "--caller-spin-extend" => a.caller_spin_extend = Some(parse(&arg, it.next())?),
             "--shard-threads" => a.shard_threads = Some(parse(&arg, it.next())?),
             "--background-workers" => a.background_workers = parse(&arg, it.next())?,
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
@@ -474,6 +482,12 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if let Some(us) = a.shard_spin_cap {
         r = r.shard_spin_cap_micros(us);
+    }
+    if a.caller_runs {
+        r = r.caller_runs(true);
+    }
+    if let Some(us) = a.caller_spin_extend {
+        r = r.caller_spin_extend_micros(us);
     }
     if let Some(k) = a.shard_threads {
         r = r.shard_threads(k);

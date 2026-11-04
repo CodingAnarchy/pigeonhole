@@ -67,6 +67,9 @@ pub(crate) struct Signal {
     /// Room-freeing tasks of this consumer's a room wait took back from a worker that was not
     /// running them (D284).
     room_take_backs: AtomicU64,
+    /// Turns committing clients ran on this consumer (a shard) that handled a message,
+    /// caller-runs (#1176).
+    caller_turns: AtomicU64,
 }
 
 impl fmt::Debug for Signal {
@@ -93,6 +96,7 @@ impl Signal {
             spin: AtomicU64::new(0),
             take_backs: AtomicU64::new(0),
             room_take_backs: AtomicU64::new(0),
+            caller_turns: AtomicU64::new(0),
         }
     }
 
@@ -218,6 +222,16 @@ impl Signal {
     /// Nanoseconds counted by [`Signal::add_spin`].
     pub(crate) fn spin_nanos(&self) -> u64 {
         self.spin.load(Ordering::Relaxed)
+    }
+
+    /// Counts a turn a committing client ran (#1176).
+    pub(crate) fn add_caller_turn(&self) {
+        self.caller_turns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Turns counted by [`Signal::add_caller_turn`].
+    pub(crate) fn caller_turns(&self) -> u64 {
+        self.caller_turns.load(Ordering::Relaxed)
     }
 
     /// Counts tasks taken back from the workers' queue (D284).
