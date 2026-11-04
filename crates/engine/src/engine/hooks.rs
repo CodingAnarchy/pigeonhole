@@ -1407,6 +1407,18 @@ impl Engine {
         )
     }
 
+    /// Makes each root commit's feed observer wait `delay` before it records the root in the
+    /// sidecar (zero: no wait), widening the window in which a crash leaves a durable root
+    /// without its sidecar entry (#1504). A hold seam: the observer then does what it always
+    /// does. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn delay_root_observer(&self, delay: std::time::Duration) {
+        if let Some(f) = &self.inner.shared.feed {
+            let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+            f.root_observer_delay_nanos.store(nanos, Ordering::Relaxed);
+        }
+    }
+
     /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
     /// it: shards' manifest requests queue up (their pumps find it held and leave) until
     /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).

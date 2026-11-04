@@ -1210,6 +1210,35 @@ impl Pigeonhole {
         m
     }
 
+    /// Waits until no root commit is in progress, then keeps any from starting until the
+    /// returned hold drops (the manifest writer's exclusion, as a commit holds it): so no
+    /// root's superblock is durable without its sidecar entry while the hold lasts. `None`
+    /// if a commit still held the exclusion after `timeout`. A test hold seam (#1504): the
+    /// corpus generator takes it before it crashes a fed database, so a background
+    /// compaction's root commit can't straddle the crash.
+    #[cfg(feature = "__engine-hooks")]
+    #[doc(hidden)]
+    pub fn hold_root_commits(&self, timeout: Duration) -> Option<RootCommitHold> {
+        let engine = self.db.engine_arc();
+        let start = std::time::Instant::now();
+        while !engine.hold_manifest() {
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Some(RootCommitHold { engine })
+    }
+
+    /// Makes each root commit's feed observer wait `delay` before it records the root (zero:
+    /// none), widening the window between a durable superblock and its sidecar entry. A test
+    /// hold seam (#1504).
+    #[cfg(feature = "__engine-hooks")]
+    #[doc(hidden)]
+    pub fn delay_root_observer(&self, delay: Duration) {
+        self.engine().delay_root_observer(delay);
+    }
+
     /// Commit latency histograms per durability level since open, summed over shards: a
     /// bench hook (D213). Bucket `b` starts at
     /// [`commit_latency_floor(b)`](Self::commit_latency_floor) nanoseconds; subtract two readings for a phase.
@@ -2140,6 +2169,22 @@ fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
         .saturating_sub(64 * 1024)
         .min(64 << 20)
         .min((o.memtable_budget / 2) as usize)
+}
+
+/// The hold [`Pigeonhole::hold_root_commits`] returns: no root commit starts while it lives,
+/// and dropping it commits what queued meanwhile and lets them run again (test hook, #1504).
+#[cfg(feature = "__engine-hooks")]
+#[doc(hidden)]
+#[must_use = "dropping the hold lets root commits run again"]
+pub struct RootCommitHold {
+    engine: Arc<Engine>,
+}
+
+#[cfg(feature = "__engine-hooks")]
+impl Drop for RootCommitHold {
+    fn drop(&mut self) {
+        self.engine.release_manifest();
+    }
 }
 
 #[cfg(test)]
