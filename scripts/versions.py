@@ -18,8 +18,10 @@
   crate comes after every pigeonhole crate it depends on (normal and build dependencies, which
   must be on crates.io when it publishes).
 - **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
-  itself: `check` fails unless its `version`, its pins and the gem's `Pigeonhole::VERSION`
-  (`lib/pigeonhole/version.rb`) are the workspace version.
+  itself: `check` fails unless its `version`, its pins, the gem's `Pigeonhole::VERSION`
+  (`lib/pigeonhole/version.rb`) and the gem's own entries in `Gemfile.lock` are the
+  workspace version. Bundler refuses a frozen install when the lockfile's version of the
+  gem differs from its gemspec's, so every Ruby CI job fails on a stale one.
 
 **Release check:** `publish.sh` skips a crate already on crates.io at its version, so a line
 whose crates changed since the last release but whose version did not move would ship the
@@ -98,6 +100,7 @@ def order_errors():
 
 
 RUBY_VERSION_RB = "crates/ruby/lib/pigeonhole/version.rb"
+RUBY_GEMFILE_LOCK = "crates/ruby/Gemfile.lock"
 
 
 def ruby_errors(workspace):
@@ -115,6 +118,15 @@ def ruby_errors(workspace):
     gem = [l.split("=", 1)[1].strip().strip('"') for l in text.splitlines() if l.strip().startswith("VERSION =")]
     if gem != [workspace]:
         errors.append(f"{RUBY_VERSION_RB} sets VERSION {gem!r}, not {workspace!r}")
+    # The path gem's own lines: `    pigeonhole (X)` under its specs, `  pigeonhole (X)` under
+    # CHECKSUMS. Other gems' names only start with `pigeonhole` if they're ours.
+    locked = [
+        l.strip()[len("pigeonhole ("):-1]
+        for l in (ROOT / RUBY_GEMFILE_LOCK).read_text().splitlines()
+        if l.strip().startswith("pigeonhole (") and l.strip().endswith(")")
+    ]
+    if not locked or any(v != workspace for v in locked):
+        errors.append(f"{RUBY_GEMFILE_LOCK} locks the gem at {locked!r}, not {workspace!r}")
     return errors
 
 
