@@ -4321,6 +4321,35 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 
 **Testing.** `tests/returning.rs` is a model-check target of its own. Its families are a plain `sum`, `sum_v2` (2 versions), `sum_ttl` and `f`. Returning commits there include members of concurrent batches beside blind cross-shard writers, with and without deletes. Each value is compared with the model's fold at *Y*, and the run asserts the fast path is taken. Its sweep is conditional: it runs on #1440's PRs and on any PR touching counter or returning apply code (REQUIRE_SWEEPS=6).
 
+<a id="d315"></a>
+## D315: the change feed's read-replica prerequisites: a feed of every table, catalog events, replication apply (#1436, ICR 0114)
+
+**Status:** design agreed with simp724 on #1436 (2026-11-04). The numbers are from the coordinator: D315, ICR 0114, FORMAT §10.4 sidecar entry type 4 (`Catalog`) and shm layout 9 (`CATALOG_HOLD`). The owner is feed1248, with simp724 reviewing. The server wiring is #1397's (cli692).
+
+**Why.** A `phdb serve` read replica (#1436) copies its primary by following the change feed. The feed lacked three things: a whole-database stream, catalog changes as events, and a way to apply a commit as it was, with its own timestamps.
+
+**1. A feed of every table (PR 1).** `Pigeonhole::feed()` (engine `FeedSpec::tables` empty) follows every table, including tables created later.
+- Its session must feed every table. So must every session of its history: `chain` asks "fed every table" and not "fed these ids", since an open with a table list may have left out a table created since.
+- Everything else is as for a table's feed: tokens, expiry, durable or visible, and reader processes.
+
+**2. Catalog events (PR 2).** Catalog changes are manifest commits: `CreateTable` and `PutFamily` (with the family's options, so TTLs too) and `DropTable`. Family options are fixed once a family exists. Each manifest commit records `seqno_ceiling`, and every seqno assigned so far is below it.
+- **The record:** each commit with catalog edits gets a sidecar entry, `Catalog { session, sequence, seqno_ceiling, edits }`, using the manifest's own edit encodings. It's appended before that commit's Root entry, in the same append, covered by the same sync. A loss or a torn tail then breaks the session chain and fails closed, as fix A.
+- **The hold:** `CATALOG_HOLD` keeps the frontier from passing the ceiling until the entry is appended. It's taken under `Shared::clock`'s lock, which reads C, stores the hold and uses C as the ceiling (D300's rule), with WRITTEN's encoding. It's taken only for a batch with accepted catalog edits, and released after the appends or on a failed root.
+- **Delivery:** a feed of every table delivers a catalog event after every commit below its ceiling and before any at or above it. It skips changes to a table after that table's drop: a commit routed before a drop can be allocated after it.
+- **Rejected:**
+  - in-memory catalog diffs, which don't survive a resume;
+  - a WAL record type, which older builds can't replay without an incompat bit.
+
+**3. Replication apply (PR 3).** `apply_replicated(commit)` applies each change's kind, ids, row, qualifier, timestamp and value as given, atomically, in the feed's order. `apply_catalog(edits)` applies catalog events with the primary's ids.
+- **Exactly once:** the primary's feed token is written in the same replica commit. Commits apply at `GroupSync`, with commit k+1 submitted only after k is acknowledged, so a power loss can't keep k+1's token without k (D227).
+- **The clock:** the replica's timestamp floor follows the highest applied `Commit::timestamp`, which is the primary's allocator stamp, never an explicit cell timestamp.
+
+**Testing.** PR 1:
+- `pigeonhole` `a_feed_of_every_table_follows_tables_created_later`: tables created later, the prefix, refusals, and expiry across an open with a table list (mutation-checked);
+- `readers` `a_reader_process_s_feed_of_every_table_follows_a_table_created_later`.
+
+PR 3 adds an in-process two-database replication test with process and power-loss crashes on both sides.
+
 <a id="d316"></a>
 ## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
 

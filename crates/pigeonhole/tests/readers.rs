@@ -237,3 +237,61 @@ fn a_reader_process_follows_the_change_feed_across_a_writer_restart() {
     drop(t);
     db.close().unwrap();
 }
+
+/// D315 PR 1: a reader process's feed of every table (`PigeonholeReader::feed`) follows a
+/// table the writer creates after the feed opened, with its names.
+#[test]
+fn a_reader_process_s_feed_of_every_table_follows_a_table_created_later() {
+    let vfs = SimVfs::new(1315);
+    let fed = || {
+        Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(1)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .change_feed(pigeonhole::FeedRetention::bytes(4 << 20))
+    };
+    vfs.enter_process(WRITER);
+    let db = Pigeonhole::open(DB, fed()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let r = reader(&vfs, 2).unwrap();
+    vfs.enter_process(reader_process(2));
+    let mut feed = r.feed().open().unwrap();
+    vfs.enter_process(WRITER);
+    let one = t.mutate(b"one").put("f", b"q", b"1").commit().unwrap();
+    let late = db
+        .table("late")
+        .unwrap()
+        .family("g", Family::default())
+        .create()
+        .unwrap();
+    let two = late.mutate(b"two").put("g", b"q", b"2").commit().unwrap();
+    vfs.enter_process(reader_process(2));
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let c = feed
+            .next(Duration::from_secs(10))
+            .unwrap()
+            .expect("the commit")
+            .clone();
+        let ch = &c.changes()[0];
+        got.push((c.seqno(), ch.table().to_string(), ch.family().to_string()));
+    }
+    assert_eq!(
+        got,
+        [
+            (one.seqno, "t".to_string(), "f".to_string()),
+            (two.seqno, "late".to_string(), "g".to_string())
+        ]
+    );
+    drop(feed);
+    drop(r);
+    vfs.enter_process(WRITER);
+    drop((t, late));
+    db.close().unwrap();
+}
