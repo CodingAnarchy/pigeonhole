@@ -2604,7 +2604,8 @@ struct ArenaNeed {
     run_chunks: usize,
     /// Chunks its smallest entry larger than a chunk takes (0 without one).
     min_large: usize,
-    /// Chunks its allocations can take in all.
+    /// Chunks its allocations can take in all, for the run check (#141, #1403): 0 when no
+    /// entry spans chunks (`run_chunks` 1), the only case where it isn't read.
     alloc_chunks: usize,
 }
 
@@ -2968,9 +2969,12 @@ pub(crate) struct ShardState {
     pub(crate) id: ShardId,
     shared: Arc<Shared>,
     pub(crate) wal: Option<Box<dyn Wal>>,
-    /// The WAL stream reported itself blocked and will kick the shard when it is not (#19):
-    /// groups wait meanwhile.
-    wal_blocked: bool,
+    /// A wake is registered with the WAL stream for a hold-back (#19): it kicks the shard
+    /// when the stream's wait ends, and clears this first. A stream can be blocked for two
+    /// reasons (its header waits for a sync, or no spare is ready), and its wake covers the
+    /// one it found. So a shard still held back once the wake has run registers again,
+    /// and never waits on a wake already spent (#1403).
+    wal_wake_armed: Arc<AtomicBool>,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
     /// End of the newest PREPARE or COMMIT record given a ticket since open. Other shards' flushes
@@ -3026,10 +3030,18 @@ pub(crate) struct ShardState {
     /// with the feed off), and the end of the last such record.
     feed_low: std::cell::Cell<Seqno>,
     feed_end: std::cell::Cell<Lsn>,
-    /// As `feed_low` / `feed_end`, for records not yet synced (shm `SYNCED`): a durable feed
-    /// stays below them until a sync covers them.
+    /// The synced hold (shm `SYNCED`): the lowest seqno whose fed record this shard holds
+    /// unsynced, `u64::MAX` for none. A durable feed stays below it until a sync covers it.
     feed_sync_low: std::cell::Cell<Seqno>,
+    /// The records held since the shard last submitted a sync (#1415): their lowest seqno
+    /// (`u64::MAX` for none) and the end of the last. A sync submission closes this bucket
+    /// into `feed_sync_closed`, since that sync covers it.
+    feed_sync_open_low: std::cell::Cell<Seqno>,
     feed_sync_end: std::cell::Cell<Lsn>,
+    /// Closed buckets, oldest first, as `(lowest seqno, end)`: at most one per sync in
+    /// flight. A completion drops those whose end it passed, and the hold moves up to the
+    /// lowest seqno left, so it never waits for records that arrived during the sync.
+    feed_sync_closed: std::cell::RefCell<std::collections::VecDeque<(Seqno, Lsn)>>,
     /// The lazy flush's timer (D310), armed only while `feed_low` holds something.
     feed_timer: Option<Arc<TimerState>>,
     /// The feed's background sync's timer (D310, *T_sync*), armed only while
@@ -3493,7 +3505,7 @@ impl ShardState {
             id,
             shared,
             wal: None,
-            wal_blocked: false,
+            wal_wake_armed: Arc::new(AtomicBool::new(false)),
             poisoned: false,
             cross_end: Lsn::default(),
             cross_durable_at_close: false,
@@ -3518,7 +3530,9 @@ impl ShardState {
             feed_low: std::cell::Cell::new(u64::MAX),
             feed_end: std::cell::Cell::new(Lsn::default()),
             feed_sync_low: std::cell::Cell::new(u64::MAX),
+            feed_sync_open_low: std::cell::Cell::new(u64::MAX),
             feed_sync_end: std::cell::Cell::new(Lsn::default()),
+            feed_sync_closed: std::cell::RefCell::default(),
             feed_timer: None,
             feed_sync_timer: None,
             feed_sync_inflight: false,
@@ -4159,8 +4173,17 @@ impl ShardState {
     ///
     /// An entry larger than a chunk needs contiguous free chunks, which free bytes scattered
     /// across the arena do not provide. So this also returns the largest and smallest such
-    /// entry's size in chunks, and how many chunks the batch's allocations can take in all
-    /// (each entry at most its own, each slot it creates one).
+    /// entry's size in chunks, and how many chunks the batch's allocations can take in all:
+    /// each large entry its own run, each slot it creates one, and the small entries (within
+    /// a chunk) at most one each, but also at most what their bytes can fill (#1403). Small
+    /// entries pack into a memtable's current run, and one takes a new chunk only when it
+    /// doesn't fit the rest, losing a tail shorter than itself. So in each memtable every
+    /// chunk small entries took but its last is filled by their bytes and tails, or was left
+    /// by a large entry starting a run of its own. That bounds their chunks by `⌊(their bytes
+    /// + their waste) / chunk⌋`, plus one per slot touched and one per large entry, plus one
+    /// for the arena's first chunk (its 64-byte prefix). Charging them one chunk each made a
+    /// batch of thousands of small entries (a long memory's postings) need more chunks than
+    /// the arena has, so it was refused room even on an empty arena.
     /// Also leaves in `rows` the hash of each row the batch writes (once per run of writes
     /// to one row), which `touch_rows` records if the member is admitted.
     ///
@@ -4172,7 +4195,10 @@ impl ShardState {
         let mut total = 0usize;
         let mut waste = 0usize;
         let mut largest = 0usize;
-        let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
+        // Entries spanning chunks: rare, so only they are counted here, and the small ones'
+        // count and bytes follow from the totals (the commit shapes pay no more per entry).
+        let (mut large_chunks, mut large_entries, mut large_bytes) = (0usize, 0usize, 0usize);
+        let mut min_large = usize::MAX;
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
@@ -4192,8 +4218,10 @@ impl ShardState {
             largest = largest.max(entry);
             // The arena's first chunk loses a 64-byte prefix.
             let chunks = (entry + 64).div_ceil(self.chunk_size);
-            alloc_chunks += chunks;
             if chunks > 1 {
+                large_chunks += chunks;
+                large_entries += 1;
+                large_bytes += entry;
                 min_large = min_large.min(chunks);
             }
             let tablet = match last {
@@ -4219,6 +4247,17 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
+        // Read only by the run check, which only an entry spanning chunks needs: a batch of
+        // small entries skips the arithmetic.
+        let alloc_chunks = if large_entries == 0 {
+            0
+        } else {
+            // The small entries' bytes and the most they can waste (a tail shorter than each).
+            let small_bytes = 2 * (total - large_bytes);
+            let small_chunks = (keys.len() - large_entries)
+                .min(small_bytes / self.chunk_size + touched.len() + unrouted + large_entries + 1);
+            large_chunks + small_chunks + new_slots
+        };
         ArenaNeed {
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
@@ -4227,7 +4266,7 @@ impl ShardState {
             } else {
                 min_large
             },
-            alloc_chunks: alloc_chunks + new_slots,
+            alloc_chunks,
         }
     }
 
@@ -4410,8 +4449,16 @@ impl ShardState {
             if let (Some(g), Some(mark)) = (group, mark) {
                 g.slots.truncate(mark);
             }
-            // Whether it could ever fit is judged on its own, as if first in its group.
-            return Err(if need.bytes + 2 * self.chunk_size > total {
+            // Whether it could ever fit is judged on its own, as if first in its group, and
+            // on both counts: its bytes, and its largest entry's run in an empty arena. One
+            // that only the run check refuses would otherwise wait for room that freeing
+            // everything wouldn't give, and fail `Busy` at every stall timeout (#1403).
+            let never_run = need.run_chunks > 1
+                && self
+                    .arena
+                    .blocks_left_when_empty(need.run_chunks, need.alloc_chunks - need.min_large)
+                    == 0;
+            return Err(if need.bytes + 2 * self.chunk_size > total || never_run {
                 Room::Never
             } else {
                 Room::Wait
@@ -5264,6 +5311,9 @@ impl ShardState {
             self.feed_sync_low.set(seqno);
             self.shared.shm.publish_synced(shard, seqno);
         }
+        if seqno < self.feed_sync_open_low.get() {
+            self.feed_sync_open_low.set(seqno);
+        }
         self.feed_sync_end.set(self.feed_sync_end.get().max(end));
         if sync_low == u64::MAX {
             self.arm_feed_sync(ctx);
@@ -5320,6 +5370,7 @@ impl ShardState {
         match wal.submit_sync() {
             Ok(c) => {
                 self.feed_sync_inflight = true;
+                self.close_feed_sync_bucket();
                 self.shared.metrics[usize::from(self.id.0)]
                     .feed_syncs
                     .fetch_add(1, Ordering::Relaxed);
@@ -5330,6 +5381,19 @@ impl ShardState {
                 }));
             }
             Err(_) => self.poison(crate::health::FailureCause::Io),
+        }
+    }
+
+    /// A sync was just submitted: it covers the synced hold's records held so far, so they
+    /// close into a bucket of their own, and the hold can move past them once it completes
+    /// even if more records arrive meanwhile (#1415). Out of line: the group-sync paths call
+    /// it only when the feed holds something.
+    #[inline(never)]
+    fn close_feed_sync_bucket(&self) {
+        let low = self.feed_sync_open_low.replace(u64::MAX);
+        if low != u64::MAX {
+            let end = self.feed_sync_end.replace(Lsn::default());
+            self.feed_sync_closed.borrow_mut().push_back((low, end));
         }
     }
 
@@ -5385,10 +5449,27 @@ impl ShardState {
             self.shared.shm.publish_written(shard, u64::MAX);
             released = true;
         }
-        if durable >= self.feed_sync_end.get() {
-            released |= self.feed_sync_low.get() != u64::MAX;
-            self.feed_sync_low.set(u64::MAX);
-            self.shared.shm.publish_synced(shard, u64::MAX);
+        let held = self.feed_sync_low.get();
+        if held != u64::MAX {
+            // Drop what the syncs so far covered; the hold moves up to what's left (#1415).
+            let mut closed = self.feed_sync_closed.borrow_mut();
+            while closed.front().is_some_and(|&(_, end)| end <= durable) {
+                closed.pop_front();
+            }
+            if self.feed_sync_end.get() <= durable {
+                self.feed_sync_open_low.set(u64::MAX);
+            }
+            let low = closed
+                .iter()
+                .map(|&(low, _)| low)
+                .fold(self.feed_sync_open_low.get(), Seqno::min);
+            debug_assert!(low >= held, "a settle never lowers the synced hold");
+            if low != held {
+                self.feed_sync_low.set(low);
+                self.shared.shm.publish_synced(shard, low);
+                // Any rise, not just a release to MAX, can let a hold waiter through.
+                released = true;
+            }
         }
         // An async feed waiting on one of these holds (D310 PR 5a): after the publish.
         if released && let Some(feed) = &self.shared.feed {
@@ -6196,13 +6277,17 @@ impl ShardState {
             return false;
         };
         if !wal.blocked() {
-            self.wal_blocked = false;
             return false;
         }
-        if !self.wal_blocked {
-            self.wal_blocked = true;
+        // Not once per hold: the wake registered for a header's sync can run while no spare
+        // is ready yet, and the kick it sends finds the stream still blocked. Nothing would
+        // kick the shard again (#1403), so register a new wake whenever none is pending.
+        if !self.wal_wake_armed.swap(true, Ordering::AcqRel) {
             let submitter = ctx.submitter(self.id).clone();
+            let armed = Arc::clone(&self.wal_wake_armed);
             wal.notify_unblocked(Box::new(move || {
+                // Cleared before the kick, so the turn it starts can register again.
+                armed.store(false, Ordering::Release);
                 let _ = submitter.submit(ShardMsg::Kick);
             }));
             // Held back for want of a spare: prepare one now.
@@ -7235,6 +7320,13 @@ impl ShardState {
                 let id = group.id;
                 self.unresolved.push_back(group);
                 self.publish_watermark();
+                // The sync covers the feed's records held so far (#1415). A `Sync` member's
+                // own sync covers only the records before it in its group, yet this closes
+                // after the whole group: safe, since a bucket goes only once `durable`
+                // passes its end, so a later sync drops it.
+                if self.feed_sync_open_low.get() != u64::MAX {
+                    self.close_feed_sync_bucket();
+                }
                 if group_sync {
                     self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight += 1;
@@ -7877,6 +7969,9 @@ impl ShardState {
         };
         match wal.submit_sync() {
             Ok(c) => {
+                if self.feed_sync_open_low.get() != u64::MAX {
+                    self.close_feed_sync_bucket();
+                }
                 self.syncs_in_flight_change(ctx.now_nanos());
                 self.group_syncs_in_flight += 1;
                 self.on_sync_done(c, through, true, ctx);
@@ -10886,6 +10981,11 @@ impl ShardState {
         match self.wal.as_mut() {
             Some(wal) => match wal.submit_sync() {
                 Ok(c) => {
+                    // A flush's or checkpoint's barrier sync covers the feed's held records
+                    // too: the next settle drops them (#1415, simp724's C1).
+                    if self.feed_sync_open_low.get() != u64::MAX {
+                        self.close_feed_sync_bucket();
+                    }
                     drop(c.map(move |r| {
                         reply.notify(r.map(|_| ()).map_err(Error::from));
                         Ok(())

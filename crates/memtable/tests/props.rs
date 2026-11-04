@@ -223,67 +223,138 @@ proptest! {
         before in vec((0usize..4, 0usize..1500, 0u8..12), 0..200),
         batch in vec((0usize..4, 0usize..8000), 1..48),
     ) {
-        const CHUNK: usize = 1024;
-        let mut arena = ShardArena::new(ArenaRegion::heap(128 * CHUNK), CHUNK);
-        let mut mts: Vec<Memtable> = (0..4).map(|_| Memtable::create(&mut arena).unwrap()).collect();
-        let mut seq = 1u64;
-        let mut put = |arena: &mut ShardArena, mts: &mut [Memtable], m: usize, len: usize| {
-            let mut k = Vec::new();
-            encode_key(&mut k, &seq.to_be_bytes(), b"q", 0, seq, Kind::Put).unwrap();
-            seq += 1;
-            let r = mts[m].insert(arena, &k, &vec![7u8; len]);
-            (r, 84 + k.len() + len)
-        };
-        // Inserts, and memtables retired and replaced (freeing their chunks wherever they
-        // were), so the free space is fragmented.
-        for &(m, len, op) in &before {
-            if op == 0 {
-                let fresh = match Memtable::create(&mut arena) {
-                    Ok(fresh) => fresh,
-                    Err(_) => continue,
-                };
-                let old = std::mem::replace(&mut mts[m], fresh);
-                arena.reclaim(old.retire());
-            } else {
-                let _ = put(&mut arena, &mut mts, m, len);
-            }
+        check_engine_bound(&before, &batch)?;
+    }
+
+    /// The same for a batch of many small entries and a few spanning chunks (#1403): more
+    /// small entries than the arena has chunks, so the run check's charge for them is their
+    /// bytes, not their count, and must still cover what they take.
+    #[test]
+    fn a_batch_of_many_small_entries_stays_within_the_engine_bound(
+        before in vec((0usize..4, 0usize..1500, 0u8..12), 0..200),
+        small in vec((0usize..4, 0usize..200), 100..400),
+        large in vec((0usize..4, 1100usize..3000), 1..3),
+        at in vec(0usize..400, 1..3),
+    ) {
+        let mut batch = small;
+        for (&e, &i) in large.iter().zip(&at) {
+            batch.insert(i.min(batch.len()), e);
         }
-        let (free, run) = (arena.free_bytes(), arena.largest_free_run());
-        // Every key here has the same length (an 8-byte row).
+        check_engine_bound(&before, &batch)?;
+    }
+}
+
+/// The engine's room check (#141, #1403) against the allocator. `before` fragments the
+/// arena; then the bound must cover what `batch` takes, and a batch the engine would admit
+/// must never fail for want of space.
+fn check_engine_bound(
+    before: &[(usize, usize, u8)],
+    batch: &[(usize, usize)],
+) -> Result<(), TestCaseError> {
+    const CHUNK: usize = 1024;
+    let mut arena = ShardArena::new(ArenaRegion::heap(128 * CHUNK), CHUNK);
+    let mut mts: Vec<Memtable> = (0..4)
+        .map(|_| Memtable::create(&mut arena).unwrap())
+        .collect();
+    let mut seq = 1u64;
+    let mut put = |arena: &mut ShardArena, mts: &mut [Memtable], m: usize, len: usize| {
         let mut k = Vec::new();
-        encode_key(&mut k, &0u64.to_be_bytes(), b"q", 0, 0, Kind::Put).unwrap();
-        let sized: Vec<(usize, usize)> = batch
-            .iter()
-            .map(|&(m, len)| (m, 84 + k.len() + len))
-            .collect();
-        let mut touched: Vec<usize> = batch.iter().map(|&(m, _)| m).collect();
-        touched.sort_unstable();
-        touched.dedup();
-        let bound = batch_bound(&sized, touched.len(), CHUNK);
-        // The engine's admission (issue #141): the bound fits the free bytes, and when an
-        // entry spans chunks, a block of the largest entry's size (plus the 64-byte prefix of
-        // the arena's first chunk) is sure to be left for each such entry, whatever the
-        // batch's other allocations (at most each entry's own chunks) take first.
-        let sizes: Vec<usize> = sized.iter().map(|&(_, e)| (e + 64).div_ceil(CHUNK)).collect();
-        let k = sizes.iter().copied().max().unwrap_or(1);
-        let small = k <= 1;
-        let min_large = sizes.iter().copied().filter(|&c| c > 1).min().unwrap_or(0);
-        let blocks = arena.blocks_left(k, sizes.iter().sum::<usize>() - min_large);
-        let admitted = bound <= free && (small || blocks >= 1);
-        let _ = run;
-        let mut failed = false;
-        for &(m, len) in &batch {
-            if put(&mut arena, &mut mts, m, len).0.is_err() {
-                failed = true;
-                break;
+        encode_key(&mut k, &seq.to_be_bytes(), b"q", 0, seq, Kind::Put).unwrap();
+        seq += 1;
+        let r = mts[m].insert(arena, &k, &vec![7u8; len]);
+        (r, 84 + k.len() + len)
+    };
+    // Inserts, and memtables retired and replaced (freeing their chunks wherever they
+    // were), so the free space is fragmented.
+    for &(m, len, op) in before {
+        if op == 0 {
+            let fresh = match Memtable::create(&mut arena) {
+                Ok(fresh) => fresh,
+                Err(_) => continue,
+            };
+            let old = std::mem::replace(&mut mts[m], fresh);
+            arena.reclaim(old.retire());
+        } else {
+            let _ = put(&mut arena, &mut mts, m, len);
+        }
+    }
+    let (free, run) = (arena.free_bytes(), arena.largest_free_run());
+    // Every key here has the same length (an 8-byte row).
+    let mut k = Vec::new();
+    encode_key(&mut k, &0u64.to_be_bytes(), b"q", 0, 0, Kind::Put).unwrap();
+    let sized: Vec<(usize, usize)> = batch
+        .iter()
+        .map(|&(m, len)| (m, 84 + k.len() + len))
+        .collect();
+    let mut touched: Vec<usize> = batch.iter().map(|&(m, _)| m).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let bound = batch_bound(&sized, touched.len(), CHUNK);
+    // The engine's admission (`arena_needed`, `reserve_room`): the bound fits the free
+    // bytes, and when an entry spans chunks, a block of the largest entry's size (plus the
+    // 64-byte prefix of the arena's first chunk) is sure to be left for each such entry,
+    // whatever the batch's other allocations take first: each large entry its own chunks,
+    // and the small ones at most one each and at most what their bytes and tails fill, plus
+    // one per memtable touched, one per large entry and one more (#1403).
+    let sizes: Vec<usize> = sized
+        .iter()
+        .map(|&(_, e)| (e + 64).div_ceil(CHUNK))
+        .collect();
+    let k = sizes.iter().copied().max().unwrap_or(1);
+    let small = k <= 1;
+    let min_large = sizes.iter().copied().filter(|&c| c > 1).min().unwrap_or(0);
+    let large_chunks: usize = sizes.iter().copied().filter(|&c| c > 1).sum();
+    let large_entries = sizes.iter().filter(|&&c| c > 1).count();
+    let (small_entries, small_bytes) = sized
+        .iter()
+        .zip(&sizes)
+        .filter(|&(_, &c)| c <= 1)
+        .fold((0, 0), |(n, b), (&(_, e), _)| (n + 1, b + 2 * e));
+    let small_chunks = small_entries.min(small_bytes / CHUNK + touched.len() + large_entries + 1);
+    let blocks = arena.blocks_left(k, large_chunks + small_chunks - min_large);
+    let admitted = bound <= free && (small || blocks >= 1);
+    let _ = run;
+    let mut failed = false;
+    for &(m, len) in batch {
+        if put(&mut arena, &mut mts, m, len).0.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    if admitted {
+        prop_assert!(
+            !failed,
+            "an admitted batch ran out of arena (bound {bound}, free {free}, run {run}, {blocks} blocks of {k})"
+        );
+    }
+    if !failed {
+        let used = free - arena.free_bytes();
+        prop_assert!(used <= bound, "used {used} > bound {bound}");
+        // The run check's charge is never below the chunks the batch really took (#1403):
+        // an undercount there would admit a batch whose large entry finds no run.
+        let taken = used / CHUNK;
+        prop_assert!(
+            taken <= large_chunks + small_chunks,
+            "took {taken} chunks > charged {large_chunks} large + {small_chunks} small"
+        );
+    }
+    Ok(())
+}
+
+/// [`ShardArena::blocks_left_when_empty`] is [`ShardArena::blocks_left`] on an arena with
+/// every chunk free (#1403).
+#[test]
+fn blocks_left_when_empty_is_blocks_left_on_a_fresh_arena() {
+    for n in [1usize, 2, 3, 7, 64, 255, 256] {
+        let arena = ShardArena::new(ArenaRegion::heap(n * 1024), 1024);
+        for chunks in 1..=5 {
+            for removed in 0..n + 3 {
+                assert_eq!(
+                    arena.blocks_left_when_empty(chunks, removed),
+                    arena.blocks_left(chunks, removed),
+                    "{n} chunks, blocks of {chunks}, {removed} removed"
+                );
             }
-        }
-        if admitted {
-            prop_assert!(!failed, "an admitted batch ran out of arena (bound {bound}, free {free}, run {run}, {blocks} blocks of {k})");
-        }
-        if !failed {
-            let used = free - arena.free_bytes();
-            prop_assert!(used <= bound, "used {used} > bound {bound}");
         }
     }
 }

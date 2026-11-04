@@ -69,6 +69,7 @@ pub fn pigeonhole_memory::Consolidate<'a>::run(self) -> pigeonhole_memory::Resul
 pub struct pigeonhole_memory::ConsolidateLoop
 impl pigeonhole_memory::ConsolidateLoop
 pub fn pigeonhole_memory::ConsolidateLoop::clock(self, impl core::ops::function::Fn() -> u64 + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn pigeonhole_memory::ConsolidateLoop::interrupter(&self) -> pigeonhole_memory::LoopInterrupter
 pub fn pigeonhole_memory::ConsolidateLoop::namespaces(self, &[&str]) -> Self
 pub fn pigeonhole_memory::ConsolidateLoop::next_due(&self) -> core::option::Option<u64>
 pub fn pigeonhole_memory::ConsolidateLoop::policy(self, &pigeonhole_memory::ConsolidatePolicy) -> Self
@@ -101,6 +102,10 @@ pub fn pigeonhole_memory::ConsolidatePolicy::new() -> Self
 pub fn pigeonhole_memory::ConsolidatePolicy::sources(self, pigeonhole_memory::SourcePolicy) -> Self
 impl core::default::Default for pigeonhole_memory::ConsolidatePolicy
 pub fn pigeonhole_memory::ConsolidatePolicy::default() -> Self
+pub struct pigeonhole_memory::ConsolidateStopped
+impl core::error::Error for pigeonhole_memory::ConsolidateStopped
+impl core::fmt::Display for pigeonhole_memory::ConsolidateStopped
+pub fn pigeonhole_memory::ConsolidateStopped::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_memory::EmbeddingModel
 impl pigeonhole_memory::EmbeddingModel
 pub fn pigeonhole_memory::EmbeddingModel::dim(&self) -> u32
@@ -173,11 +178,16 @@ pub const pigeonhole_memory::LinkType::SIMILAR_TO: pigeonhole_memory::LinkType
 pub const pigeonhole_memory::LinkType::SUPERSEDES: pigeonhole_memory::LinkType
 pub fn pigeonhole_memory::LinkType::custom(u8) -> pigeonhole_memory::Result<pigeonhole_memory::LinkType>
 pub fn pigeonhole_memory::LinkType::get(self) -> u8
+pub struct pigeonhole_memory::LoopInterrupter(_)
+impl pigeonhole_memory::LoopInterrupter
+pub fn pigeonhole_memory::LoopInterrupter::interrupt(&self)
 #[non_exhaustive] pub struct pigeonhole_memory::LoopStep
 pub pigeonhole_memory::LoopStep::events: usize
 pub pigeonhole_memory::LoopStep::failed: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::Error)>
+pub pigeonhole_memory::LoopStep::interrupted: bool
 pub pigeonhole_memory::LoopStep::next_due: core::option::Option<u64>
 pub pigeonhole_memory::LoopStep::passes: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
+pub pigeonhole_memory::LoopStep::stopped: alloc::vec::Vec<(alloc::string::String, pigeonhole_memory::ConsolidatePass)>
 pub pigeonhole_memory::LoopStep::token: pigeonhole_memory::WatchToken
 #[non_exhaustive] pub struct pigeonhole_memory::Marked
 pub pigeonhole_memory::Marked::marked: usize

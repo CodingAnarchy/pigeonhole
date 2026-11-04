@@ -34,11 +34,11 @@ mod store;
 mod watch;
 
 pub use consolidate::{
-    Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
+    Consolidate, ConsolidatePass, ConsolidatePolicy, ConsolidateStopped, Consolidator, SourcePolicy,
 };
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
-pub use feed_loop::{ConsolidateLoop, LoopStep};
+pub use feed_loop::{ConsolidateLoop, LoopInterrupter, LoopStep};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use ivf::IvfOptions;
 pub use layout::{MemoryId, normalize};

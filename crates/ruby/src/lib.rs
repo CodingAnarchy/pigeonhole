@@ -483,6 +483,11 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_method("near_dedup=", method!(Store::set_near_dedup, 1))?;
     c.define_private_method("native_near_duplicate", method!(Store::near_duplicate, 3))?;
     c.define_private_method("native_consolidate", method!(Store::consolidate, 5))?;
+    c.define_private_method("native_watch", method!(Store::watch, 1))?;
+    c.define_private_method(
+        "native_consolidate_loop",
+        method!(Store::consolidate_loop, 4),
+    )?;
 
     let c = class(ruby, mm, "ReadStore")?;
     c.define_method("close", method!(ReadStore::close, 0))?;
@@ -493,5 +498,25 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_private_method("native_get", method!(ReadStore::get, 1))?;
     c.define_private_method("native_verify", method!(ReadStore::verify, 0))?;
     c.define_private_method("native_recall", method!(ReadStore::recall, 1))?;
+    c.define_private_method("native_watch", method!(ReadStore::watch, 1))?;
+
+    let c = class(ruby, mm, "Watch")?;
+    c.define_private_method("native_next", method!(classes::Watch::next, 1))?;
+    c.define_private_method("native_try_next", method!(classes::Watch::try_next, 0))?;
+    c.define_method("token", method!(classes::Watch::token, 0))?;
+    c.define_method(
+        "oldest_retained",
+        method!(classes::Watch::oldest_retained, 0),
+    )?;
+    c.define_method("close", method!(classes::Watch::close, 0))?;
+    c.define_method("closed?", method!(classes::Watch::is_closed, 0))?;
+
+    let c = class(ruby, mm, "ConsolidateLoop")?;
+    c.define_private_method(
+        "native_run_once",
+        method!(classes::ConsolidateLoop::run_once, 2),
+    )?;
+    c.define_method("next_due", method!(classes::ConsolidateLoop::next_due, 0))?;
+    c.define_method("close", method!(classes::ConsolidateLoop::close, 0))?;
     Ok(())
 }
