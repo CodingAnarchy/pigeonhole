@@ -25,8 +25,8 @@ impl DataGrpc {
             .and_then(|v| v.to_str().ok());
         let caller = self.0.caller(header)?;
         let op = op(req.into_inner());
-        let rpc = op.name();
-        let reply = self.0.router.dispatch(op, &caller).await;
+        let rpc = op.index();
+        let reply = self.0.router.dispatch(op, &caller, None).await;
         self.0.count(rpc, &reply);
         Ok(reply?)
     }

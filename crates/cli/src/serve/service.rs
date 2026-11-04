@@ -6,7 +6,7 @@
 //! request awaits its outcome. A client that goes away loses only the reply; the commit lands
 //! or fails as it would have, and a lost reply is logged and counted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,7 +54,20 @@ pub(crate) enum ServiceReply {
 }
 
 impl ServiceOp {
-    /// The RPC's name, `Service.Method`, for logs and metrics.
+    /// The RPC's index in `RPCS`.
+    pub(crate) fn index(&self) -> usize {
+        match self {
+            Self::Get(_) => 0,
+            Self::MultiGet(_) => 1,
+            Self::ReadRow(_) => 2,
+            Self::Mutate(_) => 3,
+            Self::CheckAndMutate(_) => 4,
+            Self::Batch(_) => 5,
+            Self::MutateReturning(_) => 6,
+        }
+    }
+
+    /// The RPC's name, `Service.Method`, for logs.
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Get(_) => "Data.Get",
@@ -87,22 +100,95 @@ impl ServiceOp {
     }
 }
 
-/// Request counts by RPC and outcome, and the replies lost after a write's outcome was
-/// known. Ticket 9 moves these onto D316's names; the counts are the same.
-#[derive(Debug, Default)]
+/// The RPCs, by `ServiceOp::index`.
+pub(crate) const RPCS: [&str; 7] = [
+    "Data.Get",
+    "Data.MultiGet",
+    "Data.ReadRow",
+    "Data.Mutate",
+    "Data.CheckAndMutate",
+    "Data.Batch",
+    "Data.MutateReturning",
+];
+
+/// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
+/// `other` for a code a newer engine adds.
+pub(crate) const OUTCOMES: [&str; 40] = [
+    "ok",
+    "Io",
+    "Corruption",
+    "WriterLocked",
+    "ShmVersionMismatch",
+    "ShmUnavailable",
+    "UnsupportedFormat",
+    "NetworkFilesystem",
+    "TableNotFound",
+    "TableExists",
+    "FamilyNotFound",
+    "FamilyExists",
+    "UnknownMergeOperator",
+    "MergeFailed",
+    "Conflict",
+    "ReadOnly",
+    "KeyTooLarge",
+    "ValueTooLarge",
+    "NoSpace",
+    "InvalidArgument",
+    "Unsupported",
+    "Closed",
+    "NoReaderSlot",
+    "RecordTooLarge",
+    "Busy",
+    "SnapshotExpired",
+    "WouldDeadlock",
+    "BatchTooLarge",
+    "OutcomeUnknown",
+    "NoWriter",
+    "UnsupportedFeature",
+    "FeedExpired",
+    "Unauthenticated",
+    "PermissionDenied",
+    "NotFound",
+    "Overloaded",
+    "RequestTooLarge",
+    "DeadlineExceeded",
+    "Internal",
+    "other",
+];
+
+/// Request counts by RPC and outcome, sheds, and the replies lost after a write's outcome
+/// was known. A fixed table of atomics: one relaxed add per request, no lock and no
+/// allocation (perf287's F3 on #1501). Ticket 9 moves these onto D316's names.
+#[derive(Debug)]
 pub(crate) struct Metrics {
-    requests: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
+    requests: [[AtomicU64; OUTCOMES.len()]; RPCS.len()],
     pub(crate) shed: AtomicU64,
     pub(crate) replies_lost: AtomicU64,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            shed: AtomicU64::new(0),
+            replies_lost: AtomicU64::new(0),
+        }
+    }
+}
+
 impl Metrics {
-    pub(crate) fn count(&self, rpc: &'static str, outcome: &str) {
-        let mut m = self
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *m.entry((rpc, outcome.to_owned())).or_default() += 1;
+    /// Counts one request of RPC `rpc` (`ServiceOp::index`) with outcome `code` (`None`: ok).
+    pub(crate) fn count(&self, rpc: usize, code: Option<&str>) {
+        let outcome = match code {
+            None => 0,
+            Some(c) => OUTCOMES
+                .iter()
+                .position(|o| *o == c)
+                .unwrap_or(OUTCOMES.len() - 1),
+        };
+        if let Some(row) = self.requests.get(rpc) {
+            row[outcome].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Prometheus text: the server's counters, and the engine's `async_sync_reads`
@@ -111,17 +197,17 @@ impl Metrics {
         use std::fmt::Write as _;
         let mut out = String::new();
         let _ = writeln!(out, "# TYPE pigeonhole_serve_requests_total counter");
-        let m = self
-            .requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for ((rpc, outcome), n) in m.iter() {
-            let _ = writeln!(
-                out,
-                "pigeonhole_serve_requests_total{{rpc=\"{rpc}\",outcome=\"{outcome}\"}} {n}"
-            );
+        for (rpc, row) in RPCS.iter().zip(&self.requests) {
+            for (outcome, n) in OUTCOMES.iter().zip(row) {
+                let n = n.load(Ordering::Relaxed);
+                if n > 0 {
+                    let _ = writeln!(
+                        out,
+                        "pigeonhole_serve_requests_total{{rpc=\"{rpc}\",outcome=\"{outcome}\"}} {n}"
+                    );
+                }
+            }
         }
-        drop(m);
         let _ = writeln!(out, "# TYPE pigeonhole_serve_shed_total counter");
         let _ = writeln!(
             out,
@@ -185,12 +271,25 @@ impl Service {
         }
     }
 
-    /// Answers `op` for `caller`: the scope check, the in-flight bytes budget, then the
-    /// call.
+    /// The in-flight budget's free bytes, for tests to check nothing leaked.
+    #[cfg(test)]
+    pub(crate) fn inflight_available(&self) -> usize {
+        self.inflight.available_permits()
+    }
+
+    /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: for a
+    /// front-end that knows a request's size before reading it (HTTP's `Content-Length`).
+    pub(crate) async fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.budget(bytes).await
+    }
+
+    /// Answers `op` for `caller`: the scope check, the in-flight bytes budget (unless the
+    /// front-end already reserved it, `prepaid`), then the call.
     pub(crate) async fn call(
         &self,
         op: ServiceOp,
         caller: &Caller,
+        prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
         if caller.scope < op.scope() {
             return Err(ApiError::permission_denied(&format!("call {}", op.name())));
@@ -200,20 +299,42 @@ impl Service {
             return Err(ApiError::request_too_large(self.limits.max_request_bytes));
         }
         // The budget is held until the reply is built (R3). Waiting for it counts against
-        // the request's deadline; nothing has been submitted while it waits.
-        let _budget = self.budget(size).await?;
+        // the request's deadline; nothing has been submitted while it waits. HTTP reserves
+        // it from `Content-Length` before reading the body; gRPC's is taken here, after
+        // tonic decoded the message, until ticket 3b reserves it from the HTTP/2 message
+        // length (perf287's F2 on #1501). Meanwhile each connection's HTTP/2 streams are
+        // capped (`listener::MAX_STREAMS`).
+        // Reads hold the budget until their reply is built; a write hands it to its
+        // detached task, so a client that goes away doesn't free bytes the write still
+        // holds (simp724's S1 on #1501).
+        let budget = match prepaid {
+            Some(p) => p,
+            None => self.budget(size).await?,
+        };
         match op {
-            ServiceOp::Get(r) => self.get(r).await.map(ServiceReply::Get),
-            ServiceOp::MultiGet(r) => self.multi_get(r).await.map(ServiceReply::MultiGet),
-            ServiceOp::ReadRow(r) => self.read_row(r).await.map(ServiceReply::ReadRow),
-            ServiceOp::Mutate(r) => self.mutate(r).await.map(ServiceReply::Mutate),
+            ServiceOp::Get(r) => {
+                let reply = self.get(r).await.map(ServiceReply::Get);
+                drop(budget);
+                reply
+            }
+            ServiceOp::MultiGet(r) => {
+                let reply = self.multi_get(r).await.map(ServiceReply::MultiGet);
+                drop(budget);
+                reply
+            }
+            ServiceOp::ReadRow(r) => {
+                let reply = self.read_row(r).await.map(ServiceReply::ReadRow);
+                drop(budget);
+                reply
+            }
+            ServiceOp::Mutate(r) => self.mutate(r, budget).await.map(ServiceReply::Mutate),
             ServiceOp::CheckAndMutate(r) => self
-                .check_and_mutate(r)
+                .check_and_mutate(r, budget)
                 .await
                 .map(ServiceReply::CheckAndMutate),
-            ServiceOp::Batch(r) => self.batch(r).await.map(ServiceReply::Mutate),
+            ServiceOp::Batch(r) => self.batch(r, budget).await.map(ServiceReply::Mutate),
             ServiceOp::MutateReturning(r) => self
-                .mutate_returning(r)
+                .mutate_returning(r, budget)
                 .await
                 .map(ServiceReply::MutateReturning),
         }
@@ -273,12 +394,15 @@ impl Service {
     async fn detached<T: Send + std::fmt::Debug + 'static>(
         &self,
         rpc: &'static str,
+        budget: OwnedSemaphorePermit,
         write: impl Future<Output = Result<T, ApiError>> + Send + 'static,
     ) -> Result<T, ApiError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let outcome = write.await;
+            // The write is done: its bytes leave the budget now, not when its request did.
+            drop(budget);
             if let Err(lost) = tx.send(outcome) {
                 metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
                 match lost {
@@ -310,6 +434,8 @@ impl Service {
         })
     }
 
+    /// On the blocking pool: `KeysRead::read_within` is sync-only (D196). TODO(#398, #1286):
+    /// async once multi-get pages have an async form, so a multi-get holds no blocking thread.
     async fn multi_get(
         &self,
         r: proto::MultiGetRequest,
@@ -346,7 +472,8 @@ impl Service {
     /// A row's selected cells, a page at a time: whole columns, at most `page_bytes` by
     /// D308's measure (perf287's S1) and `page_cells` cells, resumed from `after`. The
     /// first column always comes back, so a page makes progress even when one column is
-    /// larger than the budget.
+    /// larger than the budget. On the blocking pool, since row pages are sync-only (D196).
+    /// TODO(#398, #1286): `read_async`-based paging, so a row read holds no blocking thread.
     async fn read_row(&self, r: proto::ReadRowRequest) -> Result<proto::ReadRowResponse, ApiError> {
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
@@ -408,7 +535,11 @@ impl Service {
         .await
     }
 
-    async fn mutate(&self, r: proto::MutateRequest) -> Result<proto::MutateResponse, ApiError> {
+    async fn mutate(
+        &self,
+        r: proto::MutateRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::MutateResponse, ApiError> {
         let rw = r
             .writes
             .ok_or_else(|| ApiError::invalid("Mutate needs writes"))?;
@@ -418,7 +549,7 @@ impl Service {
         let table = self.table(&key.table).await?;
         let durability = convert::durability(r.durability);
         let info = self
-            .detached("Data.Mutate", async move {
+            .detached("Data.Mutate", budget, async move {
                 let mut m = table.mutate(&key.row);
                 if let Some(d) = durability {
                     m = m.durability(d);
@@ -434,6 +565,7 @@ impl Service {
     async fn check_and_mutate(
         &self,
         r: proto::CheckAndMutateRequest,
+        budget: OwnedSemaphorePermit,
     ) -> Result<proto::CheckAndMutateResponse, ApiError> {
         let rw = r
             .writes
@@ -445,7 +577,7 @@ impl Service {
         let table = self.table(&key.table).await?;
         let durability = convert::durability(r.durability);
         let info = self
-            .detached("Data.CheckAndMutate", async move {
+            .detached("Data.CheckAndMutate", budget, async move {
                 let mut m = table.mutate(&key.row);
                 if let Some(d) = durability {
                     m = m.durability(d);
@@ -461,7 +593,11 @@ impl Service {
         })
     }
 
-    async fn batch(&self, r: proto::BatchRequest) -> Result<proto::MutateResponse, ApiError> {
+    async fn batch(
+        &self,
+        r: proto::BatchRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::MutateResponse, ApiError> {
         let mut rows = Vec::with_capacity(r.rows.len());
         for rw in r.rows {
             let key = rw
@@ -473,7 +609,7 @@ impl Service {
         let durability = convert::durability(r.durability);
         let db = self.db.clone();
         let info = self
-            .detached("Data.Batch", async move {
+            .detached("Data.Batch", budget, async move {
                 let mut b = db.write_batch();
                 for (table, row, writes) in &rows {
                     convert::batch(&mut b, table, row, writes)?;
@@ -492,6 +628,7 @@ impl Service {
     async fn mutate_returning(
         &self,
         r: proto::MutateRequest,
+        budget: OwnedSemaphorePermit,
     ) -> Result<proto::MutateReturningResponse, ApiError> {
         let rw = r
             .writes
@@ -502,7 +639,7 @@ impl Service {
         let table = self.table(&key.table).await?;
         let durability = convert::durability(r.durability);
         let returned = self
-            .detached("Data.MutateReturning", async move {
+            .detached("Data.MutateReturning", budget, async move {
                 let mut m = table.mutate(&key.row);
                 if let Some(d) = durability {
                     m = m.durability(d);

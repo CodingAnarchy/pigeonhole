@@ -66,11 +66,9 @@ impl Shared {
             .ok_or_else(errors::ApiError::unauthenticated)
     }
 
-    fn count(&self, rpc: &'static str, reply: &Result<service::ServiceReply, errors::ApiError>) {
-        match reply {
-            Ok(_) => self.metrics.count(rpc, "ok"),
-            Err(e) => self.metrics.count(rpc, &e.code),
-        }
+    fn count(&self, rpc: usize, reply: &Result<service::ServiceReply, errors::ApiError>) {
+        self.metrics
+            .count(rpc, reply.as_ref().err().map(|e| e.code.as_str()));
     }
 }
 
@@ -195,13 +193,14 @@ pub(crate) fn run(
         let addr = listener.local_addr().map_err(|e| Failure::io("listen", &e))?;
         let _ = writeln!(
             stderr,
-            "phdb serve: serving {} on {addr} ({}, {}; {} network and {} blocking threads on {} free CPUs)",
+            "phdb serve: serving {} on {addr} ({}, {}; {} network and {} blocking threads on {} free CPUs, {})",
             args.file.display(),
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
             placement.io_threads,
             placement.blocking_threads,
             placement.free_cpus,
+            placement.mode,
         );
         listener::serve(listener, tls, http::router(Arc::clone(&shared)), shutdown_signal(), Duration::from_millis(args.shutdown_grace_ms)).await;
         Ok::<_, Failure>(())

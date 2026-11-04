@@ -4,3 +4,4 @@
   - **Security:** TLS, bearer tokens with `read`, `write` and `admin` scopes from a file or the environment, and a non-loopback address refused without both unless explicitly opted out.
   - **Limits and lifecycle:** request size, in-flight bytes and concurrency limits, with overload refused at once as `Overloaded`; `/v1/health`, `/metrics`, and a graceful shutdown that closes the database.
   - **Threads:** on Linux, the network threads run off the shards' CPUs.
+  - **The contract:** ICR 0112's `AggregateView.set_members` is `repeated uint32` (set members are `u32`s), corrected before any release shipped it.

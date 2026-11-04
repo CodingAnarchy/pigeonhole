@@ -22,17 +22,24 @@ pub(crate) struct Placement {
     mask: Option<nix::sched::CpuSet>,
     /// For the startup line.
     pub free_cpus: usize,
+    /// How the mask was built, for the startup line: `"off the shards' cores"` (their SMT
+    /// siblings too), `"off the shards' CPUs"` (too few CPUs to also leave the siblings
+    /// out), or `"unpinned"`.
+    pub mode: &'static str,
 }
 
 impl Placement {
     pub(crate) fn plan(db: &Pigeonhole, io: Option<usize>, blocking: Option<usize>) -> Self {
         let pinned = db.pinned_shard_cpus();
         #[cfg(target_os = "linux")]
-        let (mask, free) = linux_mask(&pinned);
+        let (mask, free, mode) = linux_mask(&pinned);
         #[cfg(not(target_os = "linux"))]
-        let free = std::thread::available_parallelism()
-            .map_or(2, std::num::NonZero::get)
-            .saturating_sub(pinned.len());
+        let (free, mode) = (
+            std::thread::available_parallelism()
+                .map_or(2, std::num::NonZero::get)
+                .saturating_sub(pinned.len()),
+            "unpinned",
+        );
         let default = free.max(2);
         Self {
             io_threads: io.unwrap_or(default).max(1),
@@ -40,6 +47,7 @@ impl Placement {
             #[cfg(target_os = "linux")]
             mask,
             free_cpus: free,
+            mode,
         }
     }
 
@@ -54,31 +62,70 @@ impl Placement {
     }
 }
 
-/// The process's CPUs minus the pinned ones, and how many that leaves.
+/// The process's CPUs minus the shards' cores: each pinned CPU and its SMT siblings
+/// (perf287's F1 on #1501: the engine pins one shard per physical core first, so a sibling
+/// left in would put network threads on a shard's core, #1244). When that leaves fewer than
+/// two CPUs, only the pinned CPUs themselves are left out.
 #[cfg(target_os = "linux")]
-fn linux_mask(pinned: &[usize]) -> (Option<nix::sched::CpuSet>, usize) {
+fn linux_mask(pinned: &[usize]) -> (Option<nix::sched::CpuSet>, usize, &'static str) {
     use nix::sched::{CpuSet, sched_getaffinity};
+    let count = |set: &CpuSet| {
+        (0..CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .count()
+    };
     let all = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    let Ok(mut set) = sched_getaffinity(nix::unistd::Pid::from_raw(0)) else {
-        return (None, all.saturating_sub(pinned.len()));
+    let Ok(process) = sched_getaffinity(nix::unistd::Pid::from_raw(0)) else {
+        return (None, all.saturating_sub(pinned.len()), "unpinned");
     };
     if pinned.is_empty() {
-        let n = (0..CpuSet::count())
-            .filter(|&c| set.is_set(c).unwrap_or(false))
-            .count();
-        return (None, n);
+        return (None, count(&process), "unpinned");
     }
+    let mut cores = process;
     for &cpu in pinned {
-        let _ = set.unset(cpu);
+        for sibling in siblings(cpu) {
+            let _ = cores.unset(sibling);
+        }
+        let _ = cores.unset(cpu);
     }
-    let free = (0..CpuSet::count())
-        .filter(|&c| set.is_set(c).unwrap_or(false))
-        .count();
-    if free == 0 {
+    if count(&cores) >= 2 {
+        return (Some(cores), count(&cores), "off the shards' cores");
+    }
+    let mut cpus = process;
+    for &cpu in pinned {
+        let _ = cpus.unset(cpu);
+    }
+    match count(&cpus) {
         // Every CPU has a shard: sharing them is all there is.
-        return (None, 0);
+        0 => (None, 0, "unpinned"),
+        n => (Some(cpus), n, "off the shards' CPUs"),
     }
-    (Some(set), free)
+}
+
+/// `cpu`'s SMT siblings, from sysfs (`0-1` or `0,8` style lists); none if unreadable.
+#[cfg(target_os = "linux")]
+fn siblings(cpu: usize) -> Vec<usize> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    std::fs::read_to_string(path)
+        .map(|s| parse_cpu_list(s.trim()))
+        .unwrap_or_default()
+}
+
+/// A sysfs CPU list (`0-3,8,10-11`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in list.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(a..=b);
+                }
+            }
+            None => out.extend(part.parse::<usize>().ok()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -105,6 +152,9 @@ mod tests {
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();
         assert!(default_shards() >= 1);
+        assert_eq!(super::parse_cpu_list("0-2,8,10-11"), [0, 1, 2, 8, 10, 11]);
+        assert_eq!(super::parse_cpu_list("4"), [4]);
+        assert!(super::parse_cpu_list("").is_empty());
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

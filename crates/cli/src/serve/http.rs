@@ -19,19 +19,20 @@ use super::grpc::DataGrpc;
 use super::proto;
 use super::service::{ServiceOp, ServiceReply};
 
-/// The whole router: gRPC and HTTP/JSON, behind the concurrency limit and load shedding.
+/// The whole router: gRPC and HTTP/JSON behind the concurrency limit and load shedding,
+/// and beside them, outside the limit, health and metrics: a probe or a scrape under
+/// overload must still answer, or a load balancer takes the node out exactly when it's
+/// busiest (perf287's F4 on #1501).
 pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let limits = shared.limits;
     let data = proto::data_server::DataServer::new(DataGrpc(Arc::clone(&shared)))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(usize::MAX);
     let shed = Arc::clone(&shared);
-    axum::Router::new()
-        .route("/v1/health", get(health))
-        .route("/metrics", get(metrics))
+    let limited = axum::Router::new()
         .route("/v1/{service}/{method}", post(call))
         .route_service("/pigeonhole.v1.Data/{*method}", data)
-        .with_state(shared)
+        .with_state(Arc::clone(&shared))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
         // alone would queue callers in `poll_ready`.
         .layer(
@@ -54,7 +55,12 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                 ))
                 .load_shed()
                 .concurrency_limit(limits.max_concurrent),
-        )
+        );
+    axum::Router::new()
+        .route("/v1/health", get(health))
+        .route("/metrics", get(metrics))
+        .with_state(shared)
+        .merge(limited)
 }
 
 /// An error in the protocol the request spoke: a gRPC status for gRPC, JSON otherwise.
@@ -112,18 +118,33 @@ async fn call(
         Ok(c) => c,
         Err(_) => return ApiError::unauthenticated().into_response(),
     };
-    // The body is read up to the limit, before anything is decoded.
+    // The in-flight budget is reserved from `Content-Length` before any of the body is
+    // read (perf287's F2 on #1501), so waiting requests hold no bodies. A body without a
+    // length (chunked) is refused; no header and no `Transfer-Encoding` is an empty body.
     let limit = shared.limits.max_request_bytes;
-    let body = match axum::body::to_bytes(req.into_body(), limit).await {
+    let length = match content_length(&headers) {
+        Ok(n) => n,
+        Err(e) => return e.into_response(),
+    };
+    if length > limit {
+        return ApiError::request_too_large(limit).into_response();
+    }
+    let budget = match shared.router.service.reserve(length).await {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let body = match axum::body::to_bytes(req.into_body(), length).await {
         Ok(b) => b,
-        Err(_) => return ApiError::request_too_large(limit).into_response(),
+        Err(_) => {
+            return ApiError::invalid("the body is longer than its Content-Length").into_response();
+        }
     };
     let op = match decode(&service, &method, &body) {
         Ok(op) => op,
         Err(e) => return e.into_response(),
     };
-    let rpc = op.name();
-    let reply = shared.router.dispatch(op, &caller).await;
+    let rpc = op.index();
+    let reply = shared.router.dispatch(op, &caller, Some(budget)).await;
     shared.count(rpc, &reply);
     match reply {
         Ok(ServiceReply::Get(r)) => json(&r),
@@ -133,6 +154,21 @@ async fn call(
         Ok(ServiceReply::CheckAndMutate(r)) => json(&r),
         Ok(ServiceReply::MutateReturning(r)) => json(&r),
         Err(e) => e.into_response(),
+    }
+}
+
+/// The body's length from `Content-Length`; 0 with neither it nor `Transfer-Encoding`.
+fn content_length(headers: &HeaderMap) -> Result<usize, ApiError> {
+    match headers.get(header::CONTENT_LENGTH) {
+        Some(v) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .ok_or_else(|| ApiError::invalid("Content-Length isn't a number")),
+        None if headers.contains_key(header::TRANSFER_ENCODING) => Err(ApiError::invalid(
+            "a request body needs a Content-Length (chunked bodies aren't taken)",
+        )),
+        None => Ok(0),
     }
 }
 

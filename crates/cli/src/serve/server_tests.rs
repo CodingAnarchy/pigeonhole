@@ -478,7 +478,7 @@ fn a_write_whose_client_went_away_still_commits() {
         })
     };
     // The table is opened once first, so the write reaches its spawn on the first poll.
-    s.block_on(service.call(get(), &Caller::anonymous()))
+    s.block_on(service.call(get(), &Caller::anonymous(), None))
         .unwrap();
     let write = ServiceOp::Mutate(proto::MutateRequest {
         writes: Some(proto::RowWrites {
@@ -501,7 +501,7 @@ fn a_write_whose_client_went_away_still_commits() {
     });
     s.block_on(async {
         let caller = Caller::anonymous();
-        let call = service.call(write, &caller);
+        let call = service.call(write, &caller, None);
         tokio::select! {
             biased;
             _ = call => panic!("the write answered before its first await"),
@@ -511,11 +511,20 @@ fn a_write_whose_client_went_away_still_commits() {
     // The request is gone; the write isn't.
     let landed = (0..100).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
-        let r = s.block_on(service.call(get(), &Caller::anonymous())).unwrap();
+        let r = s.block_on(service.call(get(), &Caller::anonymous(), None)).unwrap();
         matches!(r, super::service::ServiceReply::Get(g) if g.cell.as_ref().is_some_and(|c| &c.value[..] == b"landed"))
     });
     assert!(landed, "the detached commit landed");
-    assert_eq!(s.shared.metrics.replies_lost.load(Ordering::Relaxed), 1);
+    // The task counts the lost reply once its commit returns, which can be just after the
+    // write became visible.
+    let counted = (0..100).any(|_| {
+        std::thread::sleep(Duration::from_millis(10));
+        s.shared.metrics.replies_lost.load(Ordering::Relaxed) == 1
+    });
+    assert!(counted, "the lost reply is counted");
+    // simp724's S1 on #1501: the write held its bytes until it finished, then gave them
+    // back; none leaked when its request went away.
+    assert_eq!(service.inflight_available(), limits().inflight_bytes);
 }
 
 #[test]
@@ -550,4 +559,74 @@ fn tls_files_that_dont_load_are_a_clear_error() {
     .err()
     .unwrap();
     assert!(e.contains("/nonexistent/cert.pem"), "{e}");
+}
+
+/// Opens a raw connection and sends `head` (an HTTP/1.1 request's lines and headers).
+fn raw(url: &str, head: &str) -> std::net::TcpStream {
+    use std::io::Write as _;
+    let addr = url.trim_start_matches("http://");
+    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+    tcp.write_all(head.as_bytes()).unwrap();
+    tcp
+}
+
+#[test]
+fn health_and_metrics_answer_while_requests_are_shed() {
+    // perf287's F4 on #1501: one slot, held by a request whose body never finishes.
+    let mut l = limits();
+    l.max_concurrent = 1;
+    let s = Server::start("", l);
+    let _held = raw(
+        &s.url,
+        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, body) = s.post(
+        "Get",
+        &json!({"table": "t", "row": b64(b"r"), "family": "f", "qualifier": b64(b"q")}),
+        None,
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("Overloaded")),
+        "{body}"
+    );
+    assert_eq!(body["retry_safe"], true);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    assert_eq!(
+        agent
+            .get(format!("{}/v1/health", s.url))
+            .call()
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    let mut m = agent.get(format!("{}/metrics", s.url)).call().unwrap();
+    assert_eq!(m.status().as_u16(), 200);
+    assert!(
+        m.body_mut()
+            .read_to_string()
+            .unwrap()
+            .contains("pigeonhole_serve_shed_total 1")
+    );
+}
+
+#[test]
+fn a_body_without_a_length_is_refused_before_it_is_read() {
+    // perf287's F2 on #1501: the budget is reserved from Content-Length, so a chunked body
+    // (no length) is refused up front.
+    use std::io::Read as _;
+    let s = Server::start("", limits());
+    let mut tcp = raw(
+        &s.url,
+        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    );
+    let mut reply = String::new();
+    let _ = tcp.read_to_string(&mut reply);
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    assert!(reply.contains("Content-Length"), "{reply}");
 }

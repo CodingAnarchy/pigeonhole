@@ -14,6 +14,11 @@ use tokio_rustls::TlsAcceptor;
 /// A TLS handshake that takes longer than this is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// HTTP/2 streams per connection, set explicitly rather than left to hyper's default. It
+/// bounds what one gRPC connection holds decoded before the in-flight budget sees it, until
+/// ticket 3b reserves the budget before decoding (perf287's F2 on #1501).
+pub(crate) const MAX_STREAMS: u32 = 128;
+
 pub(crate) async fn serve(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
@@ -37,7 +42,8 @@ pub(crate) async fn serve(
         };
         let _ = stream.set_nodelay(true);
         let service = TowerToHyperService::new(app.clone());
-        let builder = auto::Builder::new(TokioExecutor::new());
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder.http2().max_concurrent_streams(MAX_STREAMS);
         match &tls {
             None => {
                 let conn = builder

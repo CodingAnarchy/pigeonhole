@@ -50,6 +50,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub request_timeout_ms: u64,
     /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
+    /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
+    /// blocking threads compete only while blocking calls run.
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
     /// Threads for blocking calls (default: the CPUs the shards don't use, at least 2).

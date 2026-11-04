@@ -34,10 +34,11 @@ impl Router {
         &self,
         op: ServiceOp,
         caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
             match *cluster {}
         }
-        self.service.call(op, caller).await
+        self.service.call(op, caller, prepaid).await
     }
 }
