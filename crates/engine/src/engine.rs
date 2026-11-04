@@ -204,6 +204,11 @@ pub struct Metrics {
     /// Its rise over an interval, divided by the interval, is how many shards' worth of
     /// work the store did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
+    /// Group syncs' in-flight time, summed over shards (D248's `sync_busy_nanos`): each
+    /// sync in flight adds its own time, so over the group syncs finished it's the mean sync
+    /// time even with several in flight. Durable groups only. Published at each sync's start
+    /// and finish (D316 A3, ICR 0116).
+    pub group_sync_nanos: u64,
     /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
     /// compactions, summed over shards (D256). Its rise over an interval, divided by the
     /// interval, is how many threads' worth of pool work the store did; zero with the pool
@@ -3203,6 +3208,7 @@ impl Engine {
             }
         }
         for s in &shared.metrics {
+            m.group_sync_nanos += s.sync_busy_nanos.load(Ordering::Relaxed);
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);

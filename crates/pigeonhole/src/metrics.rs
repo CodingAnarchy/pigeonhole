@@ -150,6 +150,13 @@ pub struct EngineMetrics {
     /// cost on its own: set the `feed_*` syncs beside it. Its rise over an interval, against
     /// the `GroupSync` commits', is the commits each sync carried.
     pub group_syncs: u64,
+    /// Nanoseconds the group syncs were in flight, summed over shards (ICR 0116): each
+    /// sync adds its own duration, so its rise over an interval, divided by
+    /// [`group_syncs`](Self::group_syncs)', is the mean group sync time, even with several
+    /// syncs in flight at once. It covers durable groups' syncs only (`GroupSync` and
+    /// `Sync` commits): flushes' and checkpoints' barrier syncs aren't in it, and `Buffered`
+    /// and `None` commits never add to it. A sync still in flight shows up when it finishes.
+    pub group_sync_nanos: u64,
     /// Syncs the change feed submitted on its own (D310): fed `Buffered` or `None` commits
     /// waited longer than the feed's sync interval for one and no commit's sync covered
     /// them. What a durable feed costs in syncs beyond the commits' own. 0 while the feed is
@@ -364,6 +371,7 @@ impl EngineMetrics {
             file_growth_nanos: m.file_growths.1,
             async_sync_reads: m.async_sync_reads,
             shard_busy_nanos: m.shard_busy_nanos,
+            group_sync_nanos: m.group_sync_nanos,
             reader_slots_active: m.reader_slots.0,
             reader_slots: m.reader_slots.1,
             reader_slots_reclaimed: m.reader_slots_reclaimed,
@@ -605,6 +613,7 @@ mod tests {
         m.commit_latency_nanos[Durability::Sync as usize] = [10, 20, 30];
         m.commit_latency_buckets[Durability::Buffered as usize].0[7] = 9;
         m.stalls = (5, 6);
+        m.group_sync_nanos = 43;
         m.room_stalls = (31, 32);
         m.pacing_stalls = (33, 34);
         m.block_cache = (7, 8);
@@ -630,6 +639,7 @@ mod tests {
             (4, 10, 20, 30)
         );
         assert_eq!((e.write_stalls, e.write_stall_nanos), (5, 6));
+        assert_eq!(e.group_sync_nanos, 43);
         assert_eq!((e.room_stalls, e.room_stall_nanos), (31, 32));
         assert_eq!((e.pacing_stalls, e.pacing_stall_nanos), (33, 34));
         assert_eq!((e.block_cache_hits, e.block_cache_misses), (7, 8));

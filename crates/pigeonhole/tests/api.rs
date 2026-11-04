@@ -145,6 +145,42 @@ fn same_database_is_one_open() {
     again.close().unwrap();
 }
 
+/// ICR 0116 (D316 A3): group syncs' in-flight time. `GroupSync` commits each wait for a
+/// group sync, so the time grows with them; `Buffered` commits never add to it. A real
+/// directory, so the syncs take real time.
+#[test]
+fn group_sync_nanos_grow_with_durable_commits_only() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("gs.phdb"), Options::default().shards(1)).unwrap();
+    let t = table(&db);
+    let before = db.engine_metrics();
+    for i in 0..20u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", b"v")
+            .durability(Durability::GroupSync)
+            .commit()
+            .unwrap();
+    }
+    let durable = db.engine_metrics();
+    assert!(durable.group_syncs > before.group_syncs, "{durable:?}");
+    assert!(
+        durable.group_sync_nanos > before.group_sync_nanos,
+        "{durable:?}"
+    );
+    for i in 0..20u32 {
+        t.mutate(&(100 + i).to_be_bytes())
+            .put("a", b"q", b"v")
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
+    }
+    let buffered = db.engine_metrics();
+    assert_eq!(buffered.group_syncs, durable.group_syncs);
+    assert_eq!(buffered.group_sync_nanos, durable.group_sync_nanos);
+    drop(t);
+    db.close().unwrap();
+}
+
 /// ICR 0115: `path` is the path as given to the open, relative or not, on every clone, and
 /// `is_closed` answers for every clone once one closes.
 #[test]
