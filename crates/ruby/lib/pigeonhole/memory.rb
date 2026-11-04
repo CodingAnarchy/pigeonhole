@@ -70,16 +70,17 @@ module Pigeonhole
     end
 
     # `verify`'s counts.
-    # `ivf_mismatched` (how far an IVF index's vector count is from the memories with an
-    # embedding) and `ivf_counter_drift` (namespaces whose counter is off) are for a quiet
-    # store, and `consistent?` leaves them out, as the crate does.
+    # `ivf_mismatched` counts the memories with an embedding missing from an IVF index plus
+    # the index's vectors with no such memory, read at verify's snapshot (#1427), and
+    # `consistent?` counts it. `ivf_counter_drift` (namespaces whose counter is off) is
+    # advisory, and `consistent?` leaves it out, as the crate does.
     StoreStats = Data.define(:memories, :no_content, :stale_dedup, :broken_links,
                              :missing_embeddings, :dangling_superseded,
                              :text_index_inconsistent, :ivf_mismatched, :ivf_counter_drift) do
       # Whether every count of a problem is zero.
       def consistent?
         [no_content, stale_dedup, broken_links, missing_embeddings, dangling_superseded].all?(&:zero?) &&
-          !text_index_inconsistent
+          !text_index_inconsistent && ivf_mismatched.zero?
       end
     end
 

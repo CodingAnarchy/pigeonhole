@@ -301,6 +301,10 @@ class StoreStats:
     def dangling_superseded(self) -> int: ...
     @property
     def text_index_inconsistent(self) -> bool: ...
+    @property
+    def ivf_mismatched(self) -> int:
+        """For a store with an IVF index: memories with an embedding missing from the index,
+        plus index vectors with no such memory, at `verify`'s snapshot (0 without an index)."""
     def is_consistent(self) -> bool: ...
 
 @final

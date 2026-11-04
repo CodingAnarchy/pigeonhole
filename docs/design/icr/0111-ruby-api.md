@@ -140,7 +140,7 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - `IvfOptions` and `Store.create(ivf:)`, with `Store#ivf`/`ReadStore#ivf`;
   - `recall(exact:, nprobe:)`;
   - `RecallStats#ivf_namespaces`/`#ivf_fallbacks`;
-  - `StoreStats#ivf_mismatched`/`#ivf_counter_drift`, which `consistent?` leaves out, as the crate does (ai1249's N3 on #1425).
+  - `StoreStats#ivf_mismatched`/`#ivf_counter_drift`, which `consistent?` leaves out, as the crate does (ai1249's N3 on #1425). From #1427, `consistent?` counts `ivf_mismatched`, as the crate now does; `ivf_counter_drift` stays out.
 - **Rebalancing (Q3).** `rebalance: :background` uses the crate's own thread. With `rebalancer: true`, `create`/`open` return `[index, rebalancer]` for a Ruby thread to drive. `run_once(budget)` and `wait(timeout)` release the GVL, and `wait` runs in 100 ms slices with interrupt checks. `set_wakeup` isn't bound, for Q2's reason.
 ### PR 3c: watching memory and the consolidation loop
 T9 (#1430, #1432) in `Pigeonhole::Memory`.

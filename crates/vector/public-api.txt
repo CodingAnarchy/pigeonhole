@@ -33,6 +33,7 @@ pub fn pigeonhole_vector::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeo
 pub fn pigeonhole_vector::Index::create_with_rebalancer(&pigeonhole::db::Pigeonhole, &str, pigeonhole::vector::VectorSpec, pigeonhole_vector::IndexOptions) -> pigeonhole_vector::Result<(pigeonhole_vector::Index, pigeonhole_vector::Rebalancer)>
 pub fn pigeonhole_vector::Index::delete(&self, &[u8]) -> pigeonhole_vector::Result<bool>
 pub fn pigeonhole_vector::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &mut pigeonhole_vector::Placed, &[u8]) -> pigeonhole_vector::Result<bool>
+pub fn pigeonhole_vector::Index::ids_at(&self, &pigeonhole::db::Snapshot) -> pigeonhole_vector::Result<alloc::vec::Vec<alloc::vec::Vec<u8>>>
 pub fn pigeonhole_vector::Index::insert_bf16(&self, &[u8], &[u16]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::insert_bf16_in(&self, &mut pigeonhole::write::Transaction, &mut pigeonhole_vector::Placed, &[u8], &[u16]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::insert_bits(&self, &[u8], &[u8]) -> pigeonhole_vector::Result<()>
@@ -56,6 +57,7 @@ pub fn pigeonhole_vector::Index::search_f32<'a>(&'a self, &'a [f32], usize) -> p
 pub fn pigeonhole_vector::Index::search_i8<'a>(&'a self, &'a [i8], usize) -> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Index::spec(&self) -> pigeonhole::vector::VectorSpec
 pub fn pigeonhole_vector::Index::verify(&self) -> pigeonhole_vector::Result<pigeonhole_vector::IndexStats>
+pub fn pigeonhole_vector::Index::verify_at(&self, &pigeonhole::db::Snapshot) -> pigeonhole_vector::Result<pigeonhole_vector::IndexStats>
 impl core::fmt::Debug for pigeonhole_vector::Index
 pub fn pigeonhole_vector::Index::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_vector::IndexOptions

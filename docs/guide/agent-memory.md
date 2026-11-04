@@ -229,7 +229,7 @@ assert_eq!(stats.ivf_namespaces, 0);
 ```
 
 - **Per namespace:** a namespace with at least `min_namespace_len` memories with an embedding (10,000 by default) is searched through the index, and a smaller one exactly. A namespace counter, kept in each write, decides at the recall's snapshot.
-- **Every write keeps the index in step:** a memory's vector goes into the index in the memory's own transaction, and leaves it when the memory is deleted, forgotten or consolidated away. `verify` checks both (`ivf_mismatched`, and `ivf_counter_drift`, which is advisory).
+- **Every write keeps the index in step:** a memory's vector goes into the index in the memory's own transaction, and leaves it when the memory is deleted, forgotten or consolidated away. `verify` checks both at one snapshot: `ivf_missing` and `ivf_stale` count the memories the index lacks and the vectors it holds for no memory, `ivf_mismatched` is their sum and counts against `is_consistent`, and `ivf_counter_drift` is advisory.
 - **Exactness:** an IVF search probes the lists nearest the query, so it can miss a memory an exact search finds. `Recall::nprobe(n)` probes more for one recall, and `Recall::exact(true)` searches exactly, for checking. A namespace that's sparse among the lists nearest the query (a small one in a big store) falls back to an exact search on its own. `RecallStats::ivf_namespaces` and `ivf_fallbacks` say which path ran.
 - **Cost:** a second copy of each embedding (about 159 MB per 100k memories at `f32`, 82 MB at `f16`), and the index's lists to maintain as memories arrive. The index rebalances in the background.
 - **It's fixed at create.** To add an index to an existing store, create a new store with it and remember the memories into it.

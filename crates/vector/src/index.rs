@@ -1495,10 +1495,16 @@ impl Index {
     /// length counter equal to its vectors. Reads the whole index; for tests and repair
     /// tooling. A contradiction is `Corruption`.
     pub fn verify(&self) -> Result<IndexStats> {
+        self.verify_at(&self.inner.db.snapshot()?)
+    }
+
+    /// [`verify`](Self::verify) at `snapshot`, a snapshot of the index's database: so a
+    /// caller can check the index against its own rows at one point in time (#1427).
+    pub fn verify_at(&self, snapshot: &Snapshot) -> Result<IndexStats> {
         let inn = &*self.inner;
         let t = &inn.table;
-        let s = inn.db.snapshot()?;
-        let layout = load(t, &inn.cen, &s)?;
+        let s = snapshot;
+        let layout = load(t, &inn.cen, s)?;
         let by_row: HashMap<u32, u32> = layout
             .lists
             .iter()
@@ -1506,7 +1512,7 @@ impl Index {
             .collect();
         let mut lens: HashMap<u32, u64> = layout.lists.iter().map(|l| (l.id, 0)).collect();
         let mut home: HashMap<Vec<u8>, u32> = HashMap::new();
-        let mut cells = t.scan_prefix(b"L").family(VEC).snapshot(&s).cells()?;
+        let mut cells = t.scan_prefix(b"L").family(VEC).snapshot(s).cells()?;
         while let Some((row, e)) = cells.next()? {
             let list = list_of(row)
                 .and_then(|r| by_row.get(&r))
@@ -1521,7 +1527,7 @@ impl Index {
             *lens.get_mut(&list).expect("listed") += 1;
         }
         let mut mapped = 0usize;
-        for row in t.scan_prefix(b"M").family(MAP).snapshot(&s).iter()? {
+        for row in t.scan_prefix(b"M").family(MAP).snapshot(s).iter()? {
             let row = row?;
             let id = &row.key()[1..];
             let list = row.get(MAP, LIST).and_then(|c| c.as_u64());
@@ -1536,7 +1542,7 @@ impl Index {
         if mapped != home.len() {
             return Err(corrupt("a vector has no mapping"));
         }
-        for row in t.scan_prefix(b"N").family(CNT).snapshot(&s).iter()? {
+        for row in t.scan_prefix(b"N").family(CNT).snapshot(s).iter()? {
             let row = row?;
             let list = list_of(row.key()).ok_or_else(|| corrupt("a count row key"))?;
             let n = row.get(CNT, b"").and_then(|c| c.as_i64()).unwrap_or(0);
@@ -1548,7 +1554,7 @@ impl Index {
             }
         }
         for l in &layout.lists {
-            if lens[&l.id] > 0 && t.get_at(&s, &count_row(l.id), CNT, b"")?.is_none() {
+            if lens[&l.id] > 0 && t.get_at(s, &count_row(l.id), CNT, b"")?.is_none() {
                 return Err(Error::Corruption(format!("list {} has no count", l.id)));
             }
         }
@@ -1556,6 +1562,26 @@ impl Index {
             list_lens: layout.lists.iter().map(|l| lens[&l.id]).collect(),
             vectors: home.len() as u64,
         })
+    }
+
+    /// The ids of every vector in the index at `snapshot` (a snapshot of the index's
+    /// database), sorted: for checking the index's membership against the rows it indexes,
+    /// as a memory store's `verify` does (#1427). Reads every list; for tests and repair
+    /// tooling. Doesn't check the index's own rows: [`verify_at`](Self::verify_at) does.
+    pub fn ids_at(&self, snapshot: &Snapshot) -> Result<Vec<Vec<u8>>> {
+        let mut ids = Vec::new();
+        let mut cells = self
+            .inner
+            .table
+            .scan_prefix(b"L")
+            .family(VEC)
+            .snapshot(snapshot)
+            .cells()?;
+        while let Some((_, e)) = cells.next()? {
+            ids.push(e.qualifier.to_vec());
+        }
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     fn insert(&self, id: &[u8], v: Input<'_>) -> Result<()> {

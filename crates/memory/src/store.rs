@@ -435,16 +435,22 @@ pub struct StoreStats {
     pub dangling_superseded: u64,
     /// The text index's own check failed ([`pigeonhole_text::IndexStats::is_consistent`]).
     pub text_index_inconsistent: bool,
-    /// For a store with an IVF index ([`StoreOptions::ivf`]): how far the index's vector
-    /// count is from the memories with an embedding (0 when they agree). The index's own
-    /// row checks (`pigeonhole_vector::Index::verify`) run too, and fail `verify` as
+    /// For a store with an IVF index ([`StoreOptions::ivf`]): memories with an embedding
+    /// that aren't in the index ([`ivf_missing`](Self::ivf_missing)) plus index vectors
+    /// with no memory with an embedding ([`ivf_stale`](Self::ivf_stale)); 0 when the index
+    /// holds exactly the embedded memories. The index's own row checks
+    /// (`pigeonhole_vector::Index::verify_at`) run too, and fail `verify` as
     /// [`Error::Vector`] if they find corruption. Checked in the writer process only.
     ///
-    /// The index counts at its own snapshot, not `verify`'s, so a write between the two
-    /// shows up here: read it on a quiet store. That's why
-    /// [`is_consistent`](Self::is_consistent) leaves it out (simp724's R2 on #1424). It
-    /// compares totals, so a missing vector and a stale one cancel out (#1427).
+    /// Everything is read at `verify`'s one snapshot, so it holds under concurrent writes
+    /// and [`is_consistent`](Self::is_consistent) counts it (#1427).
     pub ivf_mismatched: u64,
+    /// Memories with an embedding that the IVF index doesn't hold (#1427). Part of
+    /// [`ivf_mismatched`](Self::ivf_mismatched).
+    pub ivf_missing: u64,
+    /// IVF index vectors whose id isn't a memory with an embedding (#1427). Part of
+    /// [`ivf_mismatched`](Self::ivf_mismatched).
+    pub ivf_stale: u64,
     /// Namespaces whose counter (memories with an embedding, which chooses exact or IVF
     /// recall) differs from a count of them. It's advisory: drift changes only which path a
     /// recall takes, so it's reported apart from the mismatches above, and
@@ -461,6 +467,7 @@ impl StoreStats {
             && self.missing_embeddings == 0
             && self.dangling_superseded == 0
             && !self.text_index_inconsistent
+            && self.ivf_mismatched == 0
     }
 }
 
@@ -1340,8 +1347,12 @@ impl Store {
     pub fn verify(&self) -> Result<StoreStats> {
         let s = self.db.snapshot()?;
         let text_ok = self.index.verify()?.is_consistent();
-        let ivf_vectors = match &self.ivf {
-            Some(Ivf::W(index, _)) => Some(index.verify()?.vectors),
+        // The index's own rows, then its ids, at `verify`'s snapshot (#1427).
+        let ivf_ids = match &self.ivf {
+            Some(Ivf::W(index, _)) => {
+                index.verify_at(&s)?;
+                Some(index.ids_at(&s)?)
+            }
             _ => None,
         };
         let ivf = self.ivf.is_some();
@@ -1351,7 +1362,7 @@ impl Store {
             self.model.as_ref(),
             text_ok,
             ivf,
-            ivf_vectors,
+            ivf_ids,
         )
     }
 }
@@ -1533,11 +1544,13 @@ fn verify(
     model: Option<&EmbeddingModel>,
     text_ok: bool,
     ivf: bool,
-    ivf_vectors: Option<u64>,
+    ivf_ids: Option<Vec<Vec<u8>>>,
 ) -> Result<StoreStats> {
     let mut st = StoreStats::default();
     // Per namespace: memories with an embedding, and the counter's value (D311 T8).
     let mut embedded: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    // The rows of memories with an embedding: the ids the IVF index must hold (#1427).
+    let mut embedded_rows: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut counters: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
     let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
     let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
@@ -1582,6 +1595,9 @@ fn verify(
             }
             if model.is_some() && !has_emb {
                 st.missing_embeddings += 1;
+            }
+            if has_emb && ivf_ids.is_some() {
+                embedded_rows.insert(key.to_vec());
             }
             if has_emb && let Some(id) = MemoryId::from_row(key) {
                 *embedded
@@ -1634,9 +1650,37 @@ fn verify(
                 embedded.get(*ns).copied().unwrap_or(0) != counters.get(*ns).copied().unwrap_or(0)
             })
             .count() as u64;
-        if let Some(v) = ivf_vectors {
-            let have: i64 = embedded.values().sum();
-            st.ivf_mismatched = v.abs_diff(have.max(0) as u64);
+        if let Some(ids) = &ivf_ids {
+            // Both sorted: a merge walk counts each side's ids the other lacks.
+            let (mut a, mut b) = (embedded_rows.iter().peekable(), ids.iter().peekable());
+            loop {
+                match (a.peek(), b.peek()) {
+                    (Some(x), Some(y)) => match x.as_slice().cmp(y.as_slice()) {
+                        std::cmp::Ordering::Less => {
+                            st.ivf_missing += 1;
+                            a.next();
+                        }
+                        std::cmp::Ordering::Greater => {
+                            st.ivf_stale += 1;
+                            b.next();
+                        }
+                        std::cmp::Ordering::Equal => {
+                            a.next();
+                            b.next();
+                        }
+                    },
+                    (Some(_), None) => {
+                        st.ivf_missing += 1;
+                        a.next();
+                    }
+                    (None, Some(_)) => {
+                        st.ivf_stale += 1;
+                        b.next();
+                    }
+                    (None, None) => break,
+                }
+            }
+            st.ivf_mismatched = st.ivf_missing + st.ivf_stale;
         }
     }
     Ok(st)

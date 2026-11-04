@@ -7,6 +7,7 @@
 //!   delete, a rolled-back and a committed `remember_in`, and a forget pass.
 //! - Two remembers into one namespace don't conflict through the counter.
 //! - `verify` reports a drifted counter apart from mismatches.
+//! - `verify` checks the index's membership, not its count, at its own snapshot (#1427).
 
 use std::collections::BTreeSet;
 
@@ -237,7 +238,8 @@ fn the_index_and_the_counter_follow_every_write() {
             .unwrap();
         kept.push(r.id().clone());
     }
-    // A quiet store: `ivf_mismatched` holds only then (simp724's R2 on #1424).
+    // `verify` reads the index at its own snapshot (#1427), so this holds on a busy store
+    // too: see `verify_checks_the_index_s_membership_at_its_own_snapshot`.
     let ok = |what: &str| {
         let st = store.verify().unwrap();
         assert!(st.is_consistent(), "{what}: {st:?}");
@@ -411,4 +413,75 @@ fn a_delete_in_after_a_remember_in_in_one_transaction_deletes_nothing() {
         (1, 0, 0),
         "{st:?}"
     );
+}
+
+/// #1427 (simp724's R3 on #1424): `verify` compares the index's ids with the memories that
+/// have an embedding, so a missing vector and a stale one no longer cancel out, and it reads
+/// both at one snapshot, so it holds while writers run.
+#[test]
+fn verify_checks_the_index_s_membership_at_its_own_snapshot() {
+    let (_dir, db) = open();
+    let store = create(&db, small());
+    let mut rng = Rng(0x1427);
+    let mut kept = Vec::new();
+    for i in 0..150 {
+        let r = store
+            .remember(
+                "big",
+                Memory::new(format!("m {i}")).embedding(emb(&mut rng)),
+            )
+            .unwrap();
+        kept.push(r.id().clone());
+    }
+
+    // While another thread remembers and deletes, every `verify` agrees with itself.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        let writer = store.clone();
+        let mut wrng = Rng(0x7);
+        let done = &done;
+        sc.spawn(move || {
+            let mut mine = Vec::new();
+            for i in 0..200 {
+                let r = writer
+                    .remember(
+                        "big",
+                        Memory::new(format!("w {i}")).embedding(emb(&mut wrng)),
+                    )
+                    .unwrap();
+                mine.push(r.id().clone());
+                if i % 3 == 0 {
+                    assert!(writer.delete(&mine.remove(0)).unwrap());
+                }
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut checks = 0;
+        while !done.load(std::sync::atomic::Ordering::Acquire) || checks < 3 {
+            let st = store.verify().unwrap();
+            assert!(st.is_consistent(), "check {checks}: {st:?}");
+            assert_eq!(
+                (st.ivf_missing, st.ivf_stale),
+                (0, 0),
+                "check {checks}: {st:?}"
+            );
+            checks += 1;
+        }
+    });
+
+    // Damage the index behind the store's back: one memory's vector removed and one vector
+    // with no memory added. The count is unchanged, which the old count-only check passed.
+    let index = pigeonhole_vector::Index::open(&db, "mem_notes_ivf").unwrap();
+    let before = store.verify().unwrap();
+    let held = index.ids_at(&db.snapshot().unwrap()).unwrap();
+    assert!(index.delete(&held[0]).unwrap());
+    index.insert_f32(b"\xffstale", &emb(&mut rng)).unwrap();
+    let st = store.verify().unwrap();
+    assert_eq!(st.memories, before.memories);
+    assert_eq!(
+        (st.ivf_missing, st.ivf_stale, st.ivf_mismatched),
+        (1, 1, 2),
+        "{st:?}"
+    );
+    assert!(!st.is_consistent(), "{st:?}");
 }

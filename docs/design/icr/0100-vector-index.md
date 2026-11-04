@@ -12,6 +12,8 @@
   - `delete(&self, id) -> Result<bool>`: any merge it triggers runs before it returns.
   - `search_f32`, `search_i8`, `search_bits(&self, query, k) -> Search<'_>`.
   - `verify(&self) -> Result<IndexStats>`: checks the rows against each other at one snapshot. A contradiction is `Corruption`.
+  - `verify_at(&self, &Snapshot) -> Result<IndexStats>`: `verify` at a given snapshot of the index's database (#1427, 1.2.0).
+  - `ids_at(&self, &Snapshot) -> Result<Vec<Vec<u8>>>`: every vector's id at that snapshot, sorted, so that a caller can check membership against its own rows (#1427, 1.2.0).
   - `spec`, `options`, `max_list_len` (2 × target), `min_list_len` (target / 4).
 - **`IndexOptions`** (`Copy + Eq + Default`):
   - `new()`;
