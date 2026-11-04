@@ -224,6 +224,21 @@ impl FeedCursor {
         self.marks = Some(marks);
     }
 
+    /// The stream's segments as their headers were last read, by epoch: `(epoch,
+    /// prev_epoch, feed_session)` (FORMAT §10.2). A segment whose `prev_epoch` is 0 or whose
+    /// epoch isn't one above it is the first of an open: a reopened stream starts above
+    /// every epoch it saw (rule 2), a rollover one above (rule 1).
+    pub fn segments(&self) -> Vec<(u32, u32, u64)> {
+        let mut out: Vec<(u32, u32, u64)> = self
+            .grid
+            .iter()
+            .flat_map(|g| g.headers.iter().flatten())
+            .map(|h| (h.epoch, h.prev_epoch, h.feed_session))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// The epoch of the segment the cursor is in (0 once it is gone).
     pub fn epoch(&self) -> u32 {
         self.cur.as_ref().map_or(0, |c| c.epoch)

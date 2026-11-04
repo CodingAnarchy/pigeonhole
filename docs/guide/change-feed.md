@@ -65,7 +65,7 @@ for change in commit.changes() {
 ## Where it starts
 - **After now** (the default): the commits after `open()`.
 - **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed.
-- **`from_oldest()`:** the oldest history kept. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
+- **`from_oldest()`:** the oldest history kept, across reopens too: it starts at the oldest earlier open whose history every shard still keeps whole. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
 - **`resume(&token)`:** after the last commit a feed delivered before it gave that token.
 
 ## Tokens
@@ -112,7 +112,7 @@ A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, an
 - a power loss took commits a `visible()` feed had delivered;
 - a short window: a power loss between a flush's or checkpoint's metadata commit and the sync of the feed's record of it.
 
-`Feed::oldest_retained` says how far back history goes, when known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
+Once a feed has expired, `Feed::oldest_retained` says how far back the history it needed still goes, when that's known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
 
 ## Async
 `nonblocking::FeedStream` wraps a feed as a `Stream` of owned commits for any executor. It's woken, never spinning, when the frontier can move, and it yields an error once (`FeedExpired`, `Closed`) and then ends. `Feed::poll_next` is the same, one level down.

@@ -239,8 +239,9 @@ impl FeedBuilder {
     }
 
     /// Starts with the oldest commit the database's feed history still holds
-    /// ([`Options::change_feed`](crate::Options::change_feed)). Under load that history can
-    /// be recycled before the feed reaches it, which expires the feed at once;
+    /// ([`Options::change_feed`](crate::Options::change_feed)), across reopens too: from the
+    /// oldest earlier open whose history every shard still keeps whole. Under load that
+    /// history can be recycled before the feed reaches it, which expires the feed at once;
     /// [`from_snapshot`](Self::from_snapshot) is the way to start from a known state.
     pub fn from_oldest(mut self) -> Self {
         self.start = FeedStart::Oldest;
