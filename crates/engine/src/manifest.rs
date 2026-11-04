@@ -1133,6 +1133,7 @@ pub(crate) fn end(
             Arc::clone(&shared.cache),
         ));
         View {
+            _scratch: crate::scratch_views::Live::new(),
             version: view_version,
             manifest_version: version,
             tablets: match &tablets {

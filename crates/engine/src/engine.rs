@@ -1576,6 +1576,7 @@ impl Engine {
             Arc::clone(&cache),
         ));
         let first_view = Arc::new(View {
+            _scratch: crate::scratch_views::Live::new(),
             version: 1,
             manifest_version,
             tablets: Arc::clone(&tablets),
@@ -4653,6 +4654,7 @@ impl Inner {
             return Err(Error::Closed);
         }
         Ok(Snapshot {
+            _scratch: crate::scratch_views::snap(),
             seqno,
             view,
             _live: None,
@@ -5074,6 +5076,7 @@ impl Inner {
                 Ok(Some(_)) | Err(_) if live.check_current().is_err() => continue,
                 Ok(Some(view)) => {
                     return Ok(Snapshot {
+                        _scratch: crate::scratch_views::snap(),
                         seqno,
                         view,
                         _live: Some(live),
@@ -5175,6 +5178,7 @@ fn view_from_record(
     let mut no_readers = HashMap::new();
     let ssts = Arc::new(SstSet::build(&catalog, prev, &mut no_readers, file, cache));
     Ok(View {
+        _scratch: crate::scratch_views::Live::new(),
         version: record.view_version,
         manifest_version: record.manifest_version,
         tablets: Arc::new(TabletMap::build(record.view_version, &tablets)),
@@ -6014,6 +6018,7 @@ impl View {
         cache: &Arc<BlockCache>,
     ) -> Arc<View> {
         Arc::new(View {
+            _scratch: crate::scratch_views::Live::new(),
             version: 0,
             manifest_version,
             tablets: Arc::new(TabletMap::default()),

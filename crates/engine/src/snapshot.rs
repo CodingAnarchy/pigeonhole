@@ -934,6 +934,8 @@ impl Drop for SeqnoPin {
 /// in the manifest, and never appears together with that SST.
 #[derive(Debug)]
 pub struct View {
+    /// SCRATCH #1477.
+    pub(crate) _scratch: crate::scratch_views::Live,
     pub(crate) version: u64,
     pub(crate) manifest_version: ManifestVersion,
     pub(crate) tablets: Arc<TabletMap>,
@@ -1274,6 +1276,8 @@ pub struct Snapshot {
     /// The process that took it ([`pigeonhole_io::sys::process_id`]). A writer-process
     /// snapshot read in a forked child fails with `Unsupported` (#901); a reader process's
     /// fails with `SnapshotExpired` there (its slot is inert, #898).
+    /// SCRATCH #1477: a sampled snapshot's registration.
+    pub(crate) _scratch: Option<std::sync::Arc<crate::scratch_views::SnapLive>>,
     pub(crate) taken_in: u32,
 }
 
@@ -1341,6 +1345,7 @@ impl Snapshot {
     #[cfg(feature = "test-hooks")]
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
+            _scratch: self._scratch.clone(),
             taken_in: self.taken_in,
             seqno: seqno.min(self.seqno),
             view: Arc::clone(&self.view),

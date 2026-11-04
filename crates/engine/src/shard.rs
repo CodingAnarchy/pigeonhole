@@ -919,6 +919,7 @@ impl Shared {
             } else {
                 Some(
                     self.view.swap(Arc::new(crate::snapshot::View {
+                        _scratch: crate::scratch_views::Live::new(),
                         version: current.version,
                         manifest_version: current.manifest_version,
                         tablets: Arc::clone(&current.tablets),
@@ -4213,6 +4214,7 @@ impl ShardState {
                 mems[i] = piece;
             }
             View {
+                _scratch: crate::scratch_views::Live::new(),
                 version,
                 manifest_version: current.manifest_version,
                 tablets: Arc::clone(&current.tablets),
@@ -4625,7 +4627,8 @@ impl ShardState {
         crate::scratch_freezes::record(
             "PICK",
             format!(
-                "open slots ~{} open {} MiB frozen {} MiB deferred {} MiB retired-for-readers {} sealed {} free {} MiB of {} MiB reserved {} KiB picked {}",
+                "{} | open slots ~{} open {} MiB frozen {} MiB deferred {} MiB retired-for-readers {} sealed {} free {} MiB of {} MiB reserved {} KiB picked {}",
+                crate::scratch_views::summary(),
                 open_n / 25 * 25,
                 mib(open_bytes),
                 mib(frozen_bytes),

@@ -1396,6 +1396,7 @@ mod tests {
             let ssts = SstSet::build(c, None, &mut HashMap::new(), file, cache);
             let tablets: Vec<TabletEntry> = c.tablets();
             View {
+                _scratch: crate::scratch_views::Live::new(),
                 version: 1,
                 manifest_version: 1,
                 tablets: Arc::new(crate::snapshot::TabletMap::build(1, &tablets)),

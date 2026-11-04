@@ -743,6 +743,12 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
         let start = cursor.load(Ordering::Relaxed);
         let t = Instant::now();
         std::thread::scope(|sc| {
+            sc.spawn(move || {
+                for _ in 0..3 {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    pigeonhole_engine::scratch_old_snapshots(2);
+                }
+            });
             for _ in 0..threads {
                 let (store, f, cursor, busy_all, lats, done) =
                     (&store, &f, &cursor, &busy_all, &lats, &done);
@@ -800,6 +806,7 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
                 "compactions": after.compactions - before.compactions,
             })
         );
+        pigeonhole_engine::scratch_old_snapshots(3);
         pigeonhole_engine::scratch_freeze_report(&format!("threads={threads}"));
         println!("PHASE END threads={threads}");
     }

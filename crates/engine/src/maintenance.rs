@@ -197,6 +197,7 @@ fn copy_into(
     // version registered) so no extent it names is reclaimed while phase 2 reads it.
     let full = view;
     let ssts_only = Arc::new(View {
+        _scratch: crate::scratch_views::Live::new(),
         version: full.version,
         manifest_version: full.manifest_version,
         tablets: Arc::clone(&full.tablets),
