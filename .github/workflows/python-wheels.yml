@@ -18,6 +18,13 @@ on:
       - '.github/workflows/python-wheels.yml'
   workflow_dispatch:
 
+# A newer push to a pull request cancels its superseded run. On main a run is never cancelled
+# (with merges landing faster than a run, main would never finish one); GitHub keeps only the
+# newest queued run per group, so main holds at most one running and one waiting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
