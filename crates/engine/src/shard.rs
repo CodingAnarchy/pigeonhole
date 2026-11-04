@@ -4803,10 +4803,18 @@ impl ShardState {
                 crate::scratch_freezes::record(
                     if ROOM { "STARVED-room" } else { "STARVED" },
                     format!(
-                        "free {} KiB flush_running {} queued {}",
+                        "free {} KiB reserved {} KiB prepared {} pending {} frozen-slots {} flush_running {} queued {} room_wait {}",
                         self.arena.free_bytes() / 1024 / 64 * 64,
+                        self.reserved / 1024 / 64 * 64,
+                        self.prepared.len(),
+                        self.pending.len(),
+                        self.memtables
+                            .values()
+                            .filter(|s| !s.frozen.is_empty())
+                            .count(),
                         self.flush_running,
-                        self.flush_queue.len()
+                        self.flush_queue.len(),
+                        self.room_wait.is_some()
                     ),
                     slot.active.table.allocated_bytes() as u64,
                 );
