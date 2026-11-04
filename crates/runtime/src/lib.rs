@@ -342,9 +342,35 @@ struct Inbox<M> {
     signal: Arc<Signal>,
     /// The shard's caller-run entry (#1176), set at start when caller-runs is on.
     caller: std::sync::OnceLock<Arc<dyn cell::CallerTurn>>,
+    /// Caller-runs' work hint (#1176 rev 3.1, C3): messages submitted (counted only with
+    /// caller-runs on), and the count the token's holder last read before finding the queue
+    /// empty. A client takes the token only while `sent > drained`. It's a hint: a stale
+    /// value costs a turn that finds nothing, or a client that leaves a message to the
+    /// driver, whose wakeup the submit's own notify already guarantees.
+    sent: std::sync::atomic::AtomicU64,
+    drained: std::sync::atomic::AtomicU64,
 }
 
 impl<M> Inbox<M> {
+    /// Takes the next queued message, noting the queue empty for the work hint.
+    fn recv_noting(&self, rx: &Receiver<M>) -> Option<M> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seen = self.sent.load(Relaxed);
+        match rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(_) => {
+                self.drained.store(seen, Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Whether the work hint says something may be queued.
+    fn maybe_queued(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sent.load(Relaxed) > self.drained.load(Relaxed)
+    }
+
     fn close(&self) {
         self.gate.close();
         self.signal.force_wake();
@@ -433,6 +459,11 @@ impl<M: Send + 'static> Submitter<M> {
         let sent = inbox.tx.send(msg);
         inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
+        if inbox.caller.get().is_some() {
+            inbox
+                .sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         inbox.signal.notify();
         Ok(())
     }
@@ -456,8 +487,8 @@ impl<M: Send + 'static> Submitter<M> {
     #[doc(hidden)]
     pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         match self.inbox.caller.get() {
-            Some(c) => c.try_run(own_done),
-            None => false,
+            Some(c) if self.inbox.maybe_queued() => c.try_run(own_done),
+            _ => false,
         }
     }
 }
@@ -633,13 +664,14 @@ impl<H: ShardHandler> ShardCore<H> {
             handler.handle(&mut ctx, msg);
             n += 1;
         }
+        let inbox = &submitters[usize::from(id.0)].inbox;
         while n < MAX_BATCH {
-            match rx.try_recv() {
-                Ok(msg) => {
+            match inbox.recv_noting(rx) {
+                Some(msg) => {
                     handler.handle(&mut ctx, msg);
                     n += 1;
                 }
-                Err(_) => break,
+                None => break,
             }
         }
         if n > 0 {
@@ -691,9 +723,9 @@ impl<H: ShardHandler> ShardCore<H> {
             while handled < CALLER_BATCH {
                 let msg = match stash.take() {
                     Some(m) => m,
-                    None => match rx.try_recv() {
-                        Ok(m) => m,
-                        Err(_) => break,
+                    None => match submitters[usize::from(id.0)].inbox.recv_noting(rx) {
+                        Some(m) => m,
+                        None => break,
                     },
                 };
                 if !handler.caller_may_take(&msg) {
@@ -866,7 +898,7 @@ impl<H: ShardHandler> ShardCore<H> {
     fn check_before_sleep(&mut self) -> bool {
         self.signal().prepare_sleep();
         if self.stash.is_none() {
-            self.stash = self.rx.try_recv().ok();
+            self.stash = self.inbox().recv_noting(&self.rx);
         }
         if self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back() {
             self.signal().awake();
@@ -949,6 +981,8 @@ fn build<H: ShardHandler>(
                     gate: submit_gate::SubmitGate::new(),
                     signal: Arc::new(Signal::new()),
                     caller: std::sync::OnceLock::new(),
+                    sent: std::sync::atomic::AtomicU64::new(0),
+                    drained: std::sync::atomic::AtomicU64::new(0),
                 }),
             }
         })
