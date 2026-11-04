@@ -624,6 +624,24 @@ impl CompactionWork {
         } else {
             None
         };
+        // SCRATCH #1477: keep only an SST view (as maintenance.rs's phase 2 does), so a
+        // running compaction pins its inputs' extents but no memtable.
+        let view = Arc::new(View {
+            _scratch: crate::scratch_views::Live::new(),
+            version: view.version,
+            manifest_version: view.manifest_version,
+            tablets: Arc::clone(&view.tablets),
+            catalog: Arc::clone(&view.catalog),
+            mems: (0..view.mems.len())
+                .map(|_| Arc::new(crate::snapshot::ShardMems::default()))
+                .collect(),
+            ssts: Arc::clone(&view.ssts),
+            _pin: Some(crate::snapshot::ViewPin::new(
+                &shared.live_views,
+                view.manifest_version,
+            )),
+            released: false,
+        });
         Ok(Self {
             shared,
             shard,
