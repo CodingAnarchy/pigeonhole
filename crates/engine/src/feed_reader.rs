@@ -385,16 +385,25 @@ impl FeedReader {
             backoff: READER_BACKOFF_MIN,
             blob_wait: None,
         };
+        // `Oldest` from an earlier session still kept whole (#1465), when there is one.
+        let earlier = match spec.start {
+            FeedStart::Oldest => this.earlier_start(db_id),
+            _ => None,
+        };
         // Where each stream starts, and the bound below which nothing is delivered.
-        let starts: Vec<(Lsn, Option<Lsn>)> = match spec.start {
-            FeedStart::Token(bytes) => match this.decode_token(&bytes, db_id)? {
+        let starts: Vec<(Lsn, Option<Lsn>)> = match (spec.start, earlier) {
+            (_, Some((bound, at))) => {
+                this.delivered = bound;
+                at.into_iter().map(|a| (a, None)).collect()
+            }
+            (FeedStart::Token(bytes), None) => match this.decode_token(&bytes, db_id)? {
                 Ok(starts) => starts,
                 Err(e) => {
                     this.expired = Some(e);
                     return Ok(this);
                 }
             },
-            start => {
+            (start, None) => {
                 let mut reader_starts: Vec<Lsn> = Vec::new();
                 // A reader process's view of each stream's floor and lost bound, loaded once
                 // (the floor first, so the bound is at least that floor's).
@@ -1225,6 +1234,102 @@ impl FeedReader {
                 .get(id)
                 .is_none_or(|shares| shares.iter().all(|h| listed(&h.changes))),
         }
+    }
+
+    /// `FeedStart::Oldest` from before this open (#1465): the oldest earlier session of the
+    /// feed's history whose first segment every stream still keeps, and the bound to start
+    /// there. The writer's checkpoint history (`Feed::oldest_bound`) starts at this open,
+    /// since it is rebuilt at each one, so without this `Oldest` after a reopen was `Now`.
+    ///
+    /// The bound is `K = m - 1`, `m` the smallest id in any stream's first record of the
+    /// session: a single's seqno, a round's id, or a decision's id or apply seqno, the lower.
+    /// One bound for every stream, so none starts past another's earliest commit.
+    /// - **It bounds what is before the start positions.** Every record before the
+    ///   session's first segment was logged before the session opened, so its key is at
+    ///   most the allocator's start then. Every id in the session's records was allocated
+    ///   in it, above that start: replay applies a round only whole and writes nothing, and
+    ///   nothing re-logs a record. So `K` is at least the start (the rule `start_at` keeps
+    ///   for the writer's history).
+    /// - **It skips none of the session's commits.** A single's seqno is allocated in the
+    ///   group that logs it, after that stream's first record. A cross-shard commit is keyed
+    ///   by its apply seqno, reserved once every participant logged its PREPARE: after each
+    ///   participant's first record. This assumes a participant reports PREPARED only after
+    ///   its PREPARE was appended to its stream (the group settles after its WAL write); a
+    ///   change that answers before the append breaks this bound. So every commit's key is
+    ///   at least `m`. Taking only
+    ///   singles' seqnos would skip a session that opens with a cross-shard commit (simp724).
+    ///
+    /// A session's first segment is the one an open started (`prev_epoch` 0, or an epoch
+    /// more than one above it: FORMAT §10.1 rule 2), so a session partly recycled at a floor
+    /// is passed over, not started in its middle.
+    ///
+    /// `None` (the current history decides) when no earlier session qualifies or anything
+    /// read fails: a later start only has a larger bound, so it is always safe (simp724).
+    fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>)> {
+        let shards = self.shared.shards;
+        let open = |s: usize, at: Lsn| {
+            FeedCursor::open(
+                &self.shared.vfs,
+                &self.shared.path,
+                StreamId(s as u32),
+                db_id,
+                at,
+            )
+            .ok()
+        };
+        // Each stream's first retained segment of every earlier session in the history.
+        let mut firsts: Vec<HashMap<u64, u32>> = Vec::with_capacity(shards);
+        for s in 0..shards {
+            let floor = self.floor(s);
+            let mut f = HashMap::new();
+            for (epoch, prev, session) in open(s, Lsn::default())?.segments() {
+                let opened = prev == 0 || epoch != prev.wrapping_add(1);
+                if opened
+                    && epoch >= floor
+                    && session != self.current
+                    && self.history.holds(session)
+                {
+                    f.entry(session).or_insert(epoch);
+                }
+            }
+            firsts.push(f);
+        }
+        let mut sessions: Vec<(u32, u64)> = firsts
+            .first()?
+            .iter()
+            .filter(|(id, _)| firsts.iter().all(|f| f.contains_key(id)))
+            .map(|(&id, &epoch)| (epoch, id))
+            .collect();
+        sessions.sort_unstable();
+        for (_, session) in sessions {
+            let mut first = None::<Seqno>;
+            for (s, f) in firsts.iter().enumerate() {
+                let mut c = open(s, Lsn::new(f[&session], 0))?;
+                if let Step::Record {
+                    session: of,
+                    record,
+                    ..
+                } = c.step().ok()?
+                    && of == session
+                {
+                    let id = match record {
+                        WalRecord::Batch { seqno, .. }
+                        | WalRecord::Prepare { seqno, .. }
+                        | WalRecord::Commit { seqno, .. } => seqno,
+                        WalRecord::Decision {
+                            seqno, apply_seqno, ..
+                        } => seqno.min(apply_seqno),
+                        _ => continue,
+                    };
+                    first = Some(first.map_or(id, |f| f.min(id)));
+                }
+            }
+            // A session that logged nothing: the next one decides.
+            let Some(first) = first else { continue };
+            let at = firsts.iter().map(|f| Lsn::new(f[&session], 0)).collect();
+            return Some((first.saturating_sub(1), at));
+        }
+        None
     }
 
     /// Stream `s`'s floor: no segment of a smaller epoch is kept (the writer's shared-memory

@@ -141,6 +141,9 @@ struct Sub {
     durable: bool,
     /// In the reader process (D310 PR 4), not the writer's.
     process: bool,
+    /// Keeps no token: subscribes `FeedStart::Oldest` each time, after every reopen too
+    /// (#1465: from the oldest earlier session still kept, its first single's seqno less one).
+    oldest: bool,
     reader: Option<FeedReader>,
     token: Option<Vec<u8>>,
     /// (seqno, tag) delivered, in order.
@@ -236,6 +239,7 @@ impl Run {
     fn subscribe(&mut self, i: usize) {
         let start = match &self.subs[i].token {
             Some(t) => FeedStart::Token(t.clone()),
+            None if self.subs[i].oldest => FeedStart::Oldest,
             None => FeedStart::Now,
         };
         let spec = self.spec(self.subs[i].durable, start);
@@ -366,7 +370,7 @@ impl Run {
                     // A reader process's feed after its writer restarted: resubscribe from
                     // its own token on the new writer (D310 PR 4, M2).
                     Err(pigeonhole_engine::Error::SnapshotExpired) if sub.process => {
-                        sub.token = Some(r.token());
+                        sub.token = (!sub.oldest).then(|| r.token());
                         sub.reader = None;
                         self.subscribe(i);
                         continue;
@@ -446,7 +450,9 @@ impl Run {
 
     fn take_tokens(&mut self) {
         for sub in &mut self.subs {
-            if let Some(r) = &sub.reader {
+            if let Some(r) = &sub.reader
+                && !sub.oldest
+            {
                 sub.token = Some(r.token());
             }
         }
@@ -631,18 +637,28 @@ fn run(seed: u64) {
         reader_db: None,
         shards: Vec::new(),
         made: BTreeMap::new(),
-        // A durable and a visible subscriber in the writer, and the same in a reader process.
-        subs: [(true, false), (false, false), (true, true), (false, true)]
-            .into_iter()
-            .map(|(durable, process)| Sub {
-                durable,
-                process,
-                reader: None,
-                token: None,
-                delivered: Vec::new(),
-                last: 0,
-            })
-            .collect(),
+        // A durable and a visible subscriber in the writer, and the same in a reader process;
+        // and two that subscribe from the oldest each time (#1465): a durable one in the
+        // writer and a visible one in the reader process.
+        subs: [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, true, true),
+        ]
+        .into_iter()
+        .map(|(durable, process, oldest)| Sub {
+            durable,
+            process,
+            oldest,
+            reader: None,
+            token: None,
+            delivered: Vec::new(),
+            last: 0,
+        })
+        .collect(),
         window_expiries: 0,
         lost_total: 0,
     };
@@ -672,7 +688,11 @@ fn run(seed: u64) {
                 // Resume one subscriber from a token taken now, in this session.
                 run.poll();
                 let i = rng.below(run.subs.len() as u64) as usize;
-                run.subs[i].token = run.subs[i].reader.as_ref().map(|r| r.token());
+                // A subscriber without tokens subscribes from the oldest again instead.
+                run.subs[i].token = match run.subs[i].oldest {
+                    true => None,
+                    false => run.subs[i].reader.as_ref().map(|r| r.token()),
+                };
                 run.subs[i].reader = None;
                 run.subscribe(i);
             }
