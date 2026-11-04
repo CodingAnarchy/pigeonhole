@@ -65,7 +65,7 @@ for change in commit.changes() {
 ## Where it starts
 - **After now** (the default): the commits after `open()`.
 - **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed.
-- **`from_oldest()`:** the oldest history kept. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
+- **`from_oldest()`:** the oldest history kept, across reopens too: it starts at the oldest earlier open whose history every shard still keeps whole. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
 - **`resume(&token)`:** after the last commit a feed delivered before it gave that token.
 
 ## Tokens
@@ -112,7 +112,7 @@ A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, an
 - a power loss took commits a `visible()` feed had delivered;
 - a short window: a power loss between a flush's or checkpoint's metadata commit and the sync of the feed's record of it.
 
-`Feed::oldest_retained` says how far back history goes, when known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
+Once a feed has expired, `Feed::oldest_retained` says how far back the history it needed still goes, when that's known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
 
 ## Async
 `nonblocking::FeedStream` wraps a feed as a `Stream` of owned commits for any executor. It's woken, never spinning, when the frontier can move, and it yields an error once (`FeedExpired`, `Closed`) and then ends. `Feed::poll_next` is the same, one level down.
@@ -156,6 +156,21 @@ Across a writer restart, the feed follows the new writer from its own token, so 
 - **Writers:** a fed commit costs the same as an unfed one on the commit path. The feed's work happens once per log segment, retention pass and checkpoint, and for `None` commits in the lazy write.
 - **Disk:** retention keeps up to the configured bytes of log, plus any blob files that history still points to (`DatabaseInfo::feed` reports both). The log stops growing once it holds the retention: old history is recycled, never blocking a writer.
 - **Subscribers:** each delivered change is copied out of the log, and its value resolved if it was stored separately.
+
+### What a feed costs
+These numbers were measured on a Hetzner AX102: an AMD Ryzen 9 7950X3D (16 cores), an NVMe drive with power-loss protection, XFS, Linux 6.8 and io_uring. The workload was `phdb-bench ycsb-a`: 1 million rows of 100-byte values, half reads and half updates, from **one client thread** at `Durability::Buffered`. The figures are medians of 6 runs (D310, #1444, #1450).
+
+| Setup | Writer throughput vs the feed off | Delivery latency, p50 / p99 |
+|---|--:|--:|
+| Feed on, no subscriber | 0.985x | – |
+| One durable subscriber (the default) | 0.977x | 57 / 104 ms |
+| One `visible()` subscriber | 0.953x | 42 / 126 µs |
+| One durable subscriber, `GroupSync` commits | – | 1.1 / 1.5 ms |
+| One reader-process subscriber (durable), idle | 0.006 CPU-seconds/s in the reader | 102 / 106 ms |
+
+- **Durable delivery waits for a sync.** Under `Buffered` that's the feed's background sync, after 100 ms (1 s on macOS). For low latency use `visible()`, or commit at `GroupSync`, where each group's own sync covers its commits.
+- **The `GroupSync` row was measured before #1450,** so only its latency is shown. In it, the feed never added a sync of its own beside the 500,000 group syncs.
+- **An idle reader process keeps polling** with its 5 ms backoff. That costs about 0.6% of a core (0.010 CPU-s/s at 50 commits/s).
 
 ## Next
 [Reader processes](readers.md) · [Async](async.md) · [Durability](durability.md) · [Errors](errors.md)

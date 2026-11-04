@@ -1,0 +1,2 @@
+### Added
+- `RowMutation::commit_returning` and `commit_returning_async` (D314, ICR 0113): commit a row mutation and get back each counter cell it wrote, with its value after the commit, as BigTable's `ReadModifyWriteRow` does. Concurrent increments of one counter each get their own value, so `N` callers adding 1 from zero get exactly `1..=N`: sequence numbers, ID allocation and step counters without a transaction. `Incremented::value` and `value_at` return each cell's `Result<Option<i64>>`. See the guide's Counters section for durability and `OutcomeUnknown`.

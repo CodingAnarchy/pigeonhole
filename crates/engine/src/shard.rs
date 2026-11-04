@@ -187,8 +187,15 @@ pub(crate) struct ShardMetrics {
     /// Counter checkpoints kept, and those dropped (D291).
     pub checkpoints: AtomicU64,
     pub checkpoints_dropped: AtomicU64,
+    /// Returning commits' cells folded from the active memtable, and those that took the
+    /// full read (D314).
+    pub returning_fast: AtomicU64,
+    pub returning_full: AtomicU64,
     /// The change feed's background syncs submitted (D310, *T_sync*).
     pub feed_syncs: AtomicU64,
+    /// Group syncs finished, a failed one included (D310 PR 5b): what the feed's background
+    /// syncs are measured against.
+    pub group_syncs: AtomicU64,
     /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
     pub pacing_stalls: AtomicU64,
     pub pacing_stall_nanos: AtomicU64,
@@ -243,7 +250,10 @@ impl Default for ShardMetrics {
             room_stall_nanos: AtomicU64::new(0),
             checkpoints: AtomicU64::new(0),
             checkpoints_dropped: AtomicU64::new(0),
+            returning_fast: AtomicU64::new(0),
+            returning_full: AtomicU64::new(0),
             feed_syncs: AtomicU64::new(0),
+            group_syncs: AtomicU64::new(0),
             pacing_stalls: AtomicU64::new(0),
             pacing_stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
@@ -1202,8 +1212,63 @@ pub(crate) fn remove_wal_files(vfs: &VfsRef, path: &std::path::Path) -> Result<(
 pub(crate) enum Reply {
     Commit(Notifier<Result<Settled>>),
     Check(Notifier<Result<(bool, Option<CommitInfo>)>>),
+    /// A single-row commit that returns its incremented counters (D314): `Commit`'s reply,
+    /// plus the cells to fold after its apply. Boxed: rare, and `Reply` rides every member.
+    Returning(Box<Returning>),
     /// Internal (2PC records): nothing to notify directly.
     None,
+}
+
+/// A returning commit's reply (D314): `Commit`'s notifier, and the slot the shard fills with
+/// the counters the commit incremented, after its apply and before the notify (which orders
+/// the fill before the committer's read).
+#[derive(Debug)]
+pub(crate) struct Returning {
+    pub notifier: Notifier<Result<Settled>>,
+    pub out: ReturnSlot,
+}
+
+/// Where a returning commit's values go: each counter cell it incremented, in the order
+/// the batch first incremented it (D314).
+pub(crate) type ReturnSlot = Arc<Mutex<Option<Vec<crate::engine::Returned>>>>;
+
+/// One counter cell a returning commit incremented, as the shard reads it from the batch.
+#[derive(Debug)]
+pub(crate) struct ReturnCell<'a> {
+    pub table: TableId,
+    pub family: FamilyId,
+    pub row: &'a [u8],
+    pub qualifier: &'a [u8],
+    pub ts: Timestamp,
+    /// The family's TTL (µs, 0: none) and `max_versions` (0: all), from the one lookup.
+    pub ttl: u64,
+    pub max_versions: u32,
+}
+
+/// The counter cells `batch` writes (`Merge`s, `Put`s and cell deletes in a `Counter`
+/// family), in batch order, repeats included (D314, simp724 on #1440). Not only
+/// increments: by now an increment after a `put_i64` of the same cell is one `Put` (D186's
+/// combining), and an increment before a `delete_cell` of it is gone (D34). A column, family
+/// or row delete writes no one cell, so it adds none.
+fn return_cells<'a>(
+    batch: BatchRef<'a>,
+    view: &'a View,
+) -> impl Iterator<Item = ReturnCell<'a>> + 'a {
+    batch.iter().flatten().filter_map(move |m| {
+        if !matches!(m.kind, Kind::Merge | Kind::Put | Kind::CellDelete) {
+            return None;
+        }
+        let f = view.catalog.family(m.family)?;
+        (f.options.kind == pigeonhole_format::manifest::FamilyKind::Counter).then(|| ReturnCell {
+            table: m.table,
+            family: m.family,
+            row: m.row,
+            qualifier: m.qualifier,
+            ts: m.ts.unwrap_or(crate::write::COUNTER_TS),
+            ttl: f.options.ttl_micros,
+            max_versions: f.options.max_versions,
+        })
+    })
 }
 
 impl Reply {
@@ -1216,6 +1281,9 @@ impl Reply {
     fn resolve_returning(self, outcome: Result<CommitInfo>, batch: Option<BatchBuilder>) {
         match self {
             Reply::Commit(n) => n.notify(outcome.map(|info| Settled { info, batch })),
+            Reply::Returning(r) => r
+                .notifier
+                .notify(outcome.map(|info| Settled { info, batch })),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
@@ -3109,6 +3177,8 @@ pub(crate) struct ShardState {
     held_rows: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
     touched_slots: Vec<(TabletId, FamilyId)>,
+    /// A returning fold's seek key, kept between folds (D314).
+    return_key: Vec<u8>,
     /// D290, with the row cache on: the rows the last `apply` wrote first in this commit
     /// (table, row within the batch) with their slot's value before it (`p < seqno`), for
     /// the write-through once the apply succeeded.
@@ -3560,6 +3630,7 @@ impl ShardState {
             group_rank: 0,
             held_rows: FastSet::default(),
             touched_slots: Vec::new(),
+            return_key: Vec::new(),
             cache_rows: Vec::new(),
             cache_stale: Vec::new(),
             closing: false,
@@ -5600,15 +5671,31 @@ impl ShardState {
         qualifier: &[u8],
     ) -> Result<Vec<Source>> {
         let mut out = Vec::new();
-        mem_sources_from(mems, &ScanFilter::all(), &mut out);
+        self.point_sources_into(view, mems, tablet, family, row, qualifier, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`point_sources`](Self::point_sources) into `out` (a reused resolver's own list).
+    #[allow(clippy::too_many_arguments)]
+    fn point_sources_into(
+        &self,
+        view: &View,
+        mems: &[MemtableReader],
+        tablet: TabletId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+        out: &mut Vec<Source>,
+    ) -> Result<()> {
+        mem_sources_from(mems, &ScanFilter::all(), out);
         let l = view.locate(self.id, tablet, family);
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
             let mut key = ColumnKey::new(row, qualifier);
-            sst_sources_point::<false>(fam, &view.ssts, &mut key, l.priority, &mut out)?;
+            sst_sources_point::<false>(fam, &view.ssts, &mut key, l.priority, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Resolves the newest version of one column at the latest state (everything applied).
@@ -6105,6 +6192,307 @@ impl ShardState {
         } else {
             m.checkpoints_dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// D314: each returning cell's value at `seqno`, just after its commit's apply. Every
+    /// seqno below it that writes the row has been applied here (a returning member waits
+    /// for undecided shares on its row, as a predicate does), so this read at the applied
+    /// state is the read at `seqno`. A bucket's TTL is judged at the commit's own timestamp.
+    /// Fast path: the active memtable, newest first, down to a `Put` base; otherwise a full
+    /// point read. A fold of `RETURN_CHECKPOINT_STEPS` operands or more, or one that took
+    /// the full read, leaves its value as a D291 checkpoint; a `None` never does.
+    #[cold]
+    #[inline(never)]
+    fn fold_returning(
+        &mut self,
+        bytes: &Bytes,
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) -> Vec<crate::engine::Returned> {
+        let view = self.shared.view.load_full();
+        let Ok(batch) = bytes.batch() else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::engine::Returned> = Vec::new();
+        for c in return_cells(batch, &view) {
+            // Each cell once, in the order the batch first writes it. The scan is bounded by
+            // one row's mutations: a returning batch is one row (`Engine::commit_returning`
+            // refuses any other), so family, qualifier and timestamp name a cell.
+            if out
+                .iter()
+                .any(|r| r.family == c.family && r.ts == c.ts && r.qualifier == c.qualifier)
+            {
+                continue;
+            }
+            let value = self.fold_cell(&c, seqno, commit_ts);
+            out.push(crate::engine::Returned {
+                family: c.family,
+                qualifier: c.qualifier.to_vec(),
+                ts: c.ts,
+                value,
+            });
+        }
+        out
+    }
+
+    /// One cell's value for [`fold_returning`](Self::fold_returning), leaving a checkpoint as
+    /// it describes.
+    fn fold_cell(
+        &mut self,
+        c: &ReturnCell<'_>,
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) -> Result<Option<i64>> {
+        if c.ttl != 0 && c.ts.saturating_add(c.ttl) <= commit_ts {
+            // Expired at the commit's own time: what a read then returns.
+            return Ok(None);
+        }
+        // A family that keeps `max_versions` hides this version once that many newer
+        // ones exist, as a read does: only the full read counts them.
+        let fast = if c.max_versions == 0 {
+            let mut key = std::mem::take(&mut self.return_key);
+            let fast = self.fold_fast(c, seqno, &mut key);
+            self.return_key = key;
+            fast
+        } else {
+            None
+        };
+        let metrics = &self.shared.metrics[usize::from(self.id.0)];
+        if fast.is_some() {
+            metrics.returning_fast.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.returning_full.fetch_add(1, Ordering::Relaxed);
+        }
+        let (value, steps, slow) = match fast {
+            Some((v, steps)) => (Ok(v), steps, false),
+            None => (
+                self.read_cell(c, seqno, c.ttl, c.max_versions, commit_ts),
+                0,
+                true,
+            ),
+        };
+        if let Ok(Some(v)) = value
+            && (slow || steps >= RETURN_CHECKPOINT_STEPS)
+            && let Some((tablet, _)) = self.tablets.route(c.table, c.row)
+        {
+            let mut stored = Vec::with_capacity(9);
+            pigeonhole_format::value::encode_value(
+                &mut stored,
+                pigeonhole_format::value::ValueRef::I64(v),
+            );
+            let cp = crate::read::CounterCheckpoint {
+                shard: self.id,
+                table: c.table,
+                tablet,
+                family: c.family,
+                row: c.row.to_vec(),
+                qualifier: c.qualifier.to_vec(),
+                ts: c.ts,
+                seqno,
+                stored,
+            };
+            self.counter_checkpoint(&cp);
+        }
+        value
+    }
+
+    /// The slow path: `c`'s value at `seqno` through the view (its memtables and SSTs), for
+    /// its own timestamp, with the TTL judged at `now` and the family's `max_versions` (0:
+    /// all) applied as a read applies them. At `seqno`, not at the applied state: a
+    /// cross-shard share decided after this member's stamp may already have applied here
+    /// above it.
+    fn read_cell(
+        &self,
+        c: &ReturnCell<'_>,
+        seqno: Seqno,
+        ttl: u64,
+        max_versions: u32,
+        now: Timestamp,
+    ) -> Result<Option<i64>> {
+        let (view, mems) = self.shared.flushed_roots.read(|flushed| {
+            let view = self.shared.view.load_full();
+            let mems = view
+                .tablets()
+                .route(c.table, c.row)
+                .and_then(|(tablet, _)| self.memtables.get(&(tablet, c.family)))
+                .map(|slot| slot.readers(self.id, flushed))
+                .unwrap_or_default();
+            (view, mems)
+        });
+        let Some((tablet, _)) = view.tablets().route(c.table, c.row) else {
+            return Ok(None);
+        };
+        let Some(meta) = view.catalog.family(c.family) else {
+            return Ok(None);
+        };
+        // A resolver of this thread's pool (the read path's), so the full read allocates no
+        // resolver, cursor or source list of its own.
+        let mut resolver = crate::read::take_scan_resolver();
+        let filled = self.point_sources_into(
+            &view,
+            &mems,
+            tablet,
+            c.family,
+            c.row,
+            c.qualifier,
+            resolver.cursor_mut().sources_mut(),
+        );
+        if filled.is_err() || resolver.cursor_mut().sources().is_empty() {
+            crate::read::give_back(resolver);
+            return filled.map(|()| None);
+        }
+        let mut opts = ResolveOptions::new(seqno, now);
+        opts.ttl_micros = ttl;
+        opts.merge = meta.merge_op.clone();
+        opts.counter = meta.options.kind.is_aggregate();
+        if max_versions == 0 {
+            // Just this version.
+            opts.versions = 1;
+            opts.time_range = Some((c.ts, c.ts.saturating_add(1)));
+        } else {
+            // The versions a read returns, newest first; this one only if among them.
+            opts.versions = max_versions;
+        }
+        let mut col = Vec::with_capacity(c.row.len() + c.qualifier.len() + 24);
+        encode_row_prefix(&mut col, c.row)?;
+        encode_key_after_row(&mut col, c.qualifier, 0, 0, Kind::Put)?;
+        col.truncate(col.len() - SUFFIX_LEN);
+        let blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
+        resolver.cursor_mut().reset();
+        resolver.reset(opts);
+        let found = (|| -> Result<Option<Vec<u8>>> {
+            resolver.seek_column(c.row, c.qualifier)?;
+            loop {
+                let next = resolver.next_cell();
+                let Some(cell) = next.map_err(|e| crate::read::read_error(e, meta))? else {
+                    return Ok(None);
+                };
+                if !cell.key.starts_with(&col) || cell.key.len() != col.len() + SUFFIX_LEN {
+                    return Ok(None);
+                }
+                match cell.ts.cmp(&c.ts) {
+                    std::cmp::Ordering::Greater => {}
+                    std::cmp::Ordering::Equal => return Ok(Some(cell.value.to_vec())),
+                    std::cmp::Ordering::Less => return Ok(None),
+                }
+            }
+        })();
+        crate::read::give_back(resolver);
+        let found = found?;
+        crate::read::ResolverBlobs::check(blobs.as_ref())?;
+        let Some(value) = found else {
+            return Ok(None);
+        };
+        let stored = match view.ssts.read_blob(&value)? {
+            Some(v) => v.to_vec(),
+            None => value,
+        };
+        decode_i64(&stored)
+            .map(Some)
+            .ok_or_else(|| Error::Corruption("a counter cell is not an i64".into()))
+    }
+
+    /// The fold of `c` at `seqno` from the active memtable alone, and the operands it folded:
+    /// `None` unless the walk reaches a `Put` base or a delete of the column before leaving
+    /// the memtable, and no family marker of the row (a row or family delete) lies between
+    /// that entry and `seqno`, which the walk of the column alone would miss. The full read
+    /// resolves markers.
+    fn fold_fast(
+        &self,
+        c: &ReturnCell<'_>,
+        seqno: Seqno,
+        key: &mut Vec<u8>,
+    ) -> Option<(Option<i64>, u64)> {
+        let (tablet, _) = self.tablets.route(c.table, c.row)?;
+        let slot = self.memtables.get(&(tablet, c.family))?;
+        key.clear();
+        encode_row_prefix(key, c.row).ok()?;
+        let row_len = key.len();
+        // From the column's first key: its newer timestamps come first, then this one's
+        // entries newest first.
+        encode_key_after_row(key, c.qualifier, Timestamp::MAX, Seqno::MAX, Kind::Put).ok()?;
+        let col_len = key.len() - SUFFIX_LEN;
+        let reader = slot.active.table.reader();
+        let mut it = reader.iter();
+        it.seek(key).ok()?;
+        let mut acc = 0i64;
+        let mut steps = 0u64;
+        // The newest column delete at or below `seqno` among the newer timestamps: it covers
+        // this timestamp too (a delete takes its commit's timestamp, and covers every version
+        // at or below it), which the walk of this timestamp alone would miss.
+        let mut col_delete: Option<Seqno> = None;
+        let mut newer = 0u64;
+        let (value, low) = loop {
+            if !it.valid() {
+                return None;
+            }
+            let k = it.key();
+            if k.len() != key.len() || k[..col_len] != key[..col_len] {
+                return None;
+            }
+            let (_, ts, s, kind) = split_suffix(k).ok()?;
+            if ts > c.ts {
+                // The newer timestamps' entries (buckets above a ts-0 counter, say) are stepped
+                // over, not folded: past a few K of them the full read is cheaper (simp724).
+                newer += 1;
+                if newer > 4 * RETURN_CHECKPOINT_STEPS {
+                    return None;
+                }
+                if kind == Kind::ColumnDelete && s <= seqno {
+                    col_delete = col_delete.max(Some(s));
+                }
+                it.next().ok()?;
+                continue;
+            }
+            if ts < c.ts {
+                return None;
+            }
+            if s > seqno {
+                // Applied here after this member's stamp (a later share): not in its fold.
+                it.next().ok()?;
+                continue;
+            }
+            match kind {
+                // K counts the operands folded (perf287 on #1440), not the base.
+                Kind::Merge => {
+                    steps += 1;
+                    acc = acc.wrapping_add(decode_i64(it.value())?);
+                }
+                Kind::Put => break (Some(acc.wrapping_add(decode_i64(it.value())?)), s),
+                // A delete hides what is older: the operands above it are the value, and
+                // none at all (this commit deleted the cell last) reads as absent.
+                Kind::CellDelete | Kind::ColumnDelete => break ((steps > 0).then_some(acc), s),
+                _ => return None,
+            }
+            it.next().ok()?;
+        };
+        if col_delete.is_some_and(|d| d >= low) {
+            return None;
+        }
+        // A row or family delete between the fold's last entry and `seqno`: the full read.
+        // A memtable that has never held a delete has no marker to look for.
+        // Only the active memtable can hold one. The walk's last entry is in it (the walk
+        // never leaves it), and every other source of the slot lies wholly below the active
+        // memtable's seqnos (D287: a memtable freezes only once all below it is durable, and
+        // a decided share not applied yet holds `CROSS_HELD`, so it lands above). No SST holds
+        // anything above the walk's base. A tablet change freezes the slot first, and the
+        // changed tablet gets a slot of its own.
+        if !slot.active.deletes {
+            return Some((value, steps));
+        }
+        key.truncate(row_len);
+        key.extend_from_slice(&MARKER_QUALIFIER);
+        let prefix = key.len();
+        let mut m = reader.iter();
+        m.seek(key).ok()?;
+        while m.valid() && m.key().len() > prefix && m.key()[..prefix] == key[..prefix] {
+            let (_, _, s, _) = split_suffix(m.key()).ok()?;
+            if s <= seqno && s >= low {
+                return None;
+            }
+            m.next().ok()?;
+        }
+        Some((value, steps))
     }
 
     fn try_counter_checkpoint(&mut self, c: &crate::read::CounterCheckpoint) -> bool {
@@ -7202,6 +7590,12 @@ impl ShardState {
                             .map_err(Error::from)
                             .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts, m.decoded))
                     };
+                    if applied.is_ok()
+                        && let Reply::Returning(r) = &m.reply
+                    {
+                        let values = self.fold_returning(&m.bytes, m.seqno, m.commit_ts);
+                        *r.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(values);
+                    }
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poison(crate::health::FailureCause::Internal);
@@ -8341,6 +8735,18 @@ impl ShardState {
         {
             return true;
         }
+        // D314 (simp724's Q2 on #1440): a returning member reads its row at apply, so it waits
+        // for an undecided share writing that row, as a predicate does: the share's seqno,
+        // reserved at its decision, would otherwise land below the member's after its fold.
+        if let Reply::Returning(_) = &m.reply
+            && let Ok(batch) = m.bytes.batch()
+            && batch
+                .iter()
+                .flatten()
+                .any(|mu| self.pending_rows.contains_key(&hash_row(mu.table, mu.row)))
+        {
+            return true;
+        }
         false
     }
 
@@ -8525,6 +8931,19 @@ impl ShardState {
                 .hooks
                 .abort_decides
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "test-hooks")]
+        if shard != self.id
+            && matches!(msg, ShardMsg::Decide { commit: true, .. })
+            && self.shared.hooks.faults.on(crate::Fault::HoldDecides)
+        {
+            self.shared
+                .hooks
+                .held_decides
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((shard, msg));
+            return;
         }
         if shard == self.id {
             self.handle_msg(msg, ctx);
@@ -11053,6 +11472,9 @@ impl ShardState {
                 if group_sync {
                     self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight = self.group_syncs_in_flight.saturating_sub(1);
+                    self.shared.metrics[usize::from(self.id.0)]
+                        .group_syncs
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 self.resolve_through(group, result, ctx);
                 if group_sync && self.sync_wanted {
@@ -11776,3 +12198,18 @@ mod message_size {
         );
     }
 }
+
+/// A stored counter value's `i64`: `ValueTag::I64` and 8 little-endian bytes, as the `i64`
+/// add operator reads its operands and base (D314).
+fn decode_i64(stored: &[u8]) -> Option<i64> {
+    match stored {
+        [tag, rest @ ..] if *tag == pigeonhole_format::value::ValueTag::I64 as u8 => {
+            <[u8; 8]>::try_from(rest).ok().map(i64::from_le_bytes)
+        }
+        _ => None,
+    }
+}
+
+/// The operands a returning fold reads before it leaves its value as a checkpoint (D314):
+/// perf287's sweep on #1440 found 8 cheapest on a hot cell (4: +1.2%, 16: +1.9%).
+const RETURN_CHECKPOINT_STEPS: u64 = 8;

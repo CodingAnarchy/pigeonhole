@@ -393,3 +393,128 @@ fn an_open_inherits_nothing_once_every_fed_table_is_dropped() {
     assert!(db.info().unwrap().feed.is_none());
     db.close().unwrap();
 }
+
+#[test]
+fn the_feed_s_syncs_are_counted_beside_the_group_syncs() {
+    use pigeonhole::Durability;
+    let dir = pigeonhole::doc_support::temp_dir();
+    // The feed off: a group sync counts, the feed's syncs stay 0.
+    let db = Pigeonhole::open(dir.join("off.phdb"), Options::default().shards(1)).unwrap();
+    let (a, _) = tables(&db);
+    a.mutate(b"r")
+        .put("f", b"q", b"1")
+        .durability(Durability::GroupSync)
+        .commit()
+        .unwrap();
+    let m = db.engine_metrics();
+    assert!(m.group_syncs >= 1);
+    assert_eq!((m.feed_background_syncs, m.feed_sidecar_syncs), (0, 0));
+    db.close().unwrap();
+
+    // The feed on: the catalog changes' sidecar entries are synced.
+    let db = Pigeonhole::open(dir.join("on.phdb"), fed()).unwrap();
+    let (a, _) = tables(&db);
+    a.mutate(b"r")
+        .put("f", b"q", b"1")
+        .durability(Durability::GroupSync)
+        .commit()
+        .unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while db.engine_metrics().feed_sidecar_syncs == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let m = db.engine_metrics();
+    assert!(m.group_syncs >= 1);
+    assert!(
+        m.feed_sidecar_syncs >= 1,
+        "the table creations' sidecar entries"
+    );
+    db.close().unwrap();
+}
+
+/// #1465 (ai1's repro): `from_oldest` after a reopen starts at the oldest retained history,
+/// not at the reopen. Two shards, small segments; small values (one segment per session)
+/// and 4 KiB ones (several). After one reopen and after a second (two earlier sessions),
+/// with the feed inherited or set again, every commit is delivered once, in order. A token
+/// from before the close still resumes after it.
+#[test]
+fn from_oldest_after_a_reopen_starts_at_the_oldest_retained_history() {
+    for big in [false, true] {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let path = dir.join("f.phdb");
+        let opts = || {
+            Options::default()
+                .shards(2)
+                .pin_threads(false)
+                .wal_segment_size(256 << 10)
+        };
+        let fed = || opts().change_feed(FeedRetention::bytes(4 << 20));
+        let oldest = |db: &Pigeonhole| -> Vec<u64> {
+            let t = db.table("events").unwrap().open().unwrap();
+            let mut f = t.feed().from_oldest().open().unwrap();
+            let mut got = Vec::new();
+            while let Some(c) = f.next(Duration::from_millis(300)).unwrap() {
+                got.push(c.seqno());
+            }
+            got
+        };
+        let commit = |t: &Table, i: u64| {
+            let v = if big {
+                format!("event {i}").repeat(400)
+            } else {
+                format!("event {i}")
+            };
+            t.mutate(format!("r{:02}", i % 7).as_bytes())
+                .put("e", b"what", v.as_bytes())
+                .commit()
+                .unwrap();
+        };
+        let db = Pigeonhole::open(&path, fed()).unwrap();
+        let t = db
+            .table("events")
+            .unwrap()
+            .family("e", Family::default())
+            .create()
+            .unwrap();
+        for i in 0..300 {
+            commit(&t, i);
+        }
+        let first = oldest(&db);
+        assert_eq!(first.len(), 300, "big {big}: before the close");
+        let token = {
+            let mut f = t.feed().from_oldest().open().unwrap();
+            for _ in 0..100 {
+                f.next(WAIT).unwrap().unwrap();
+            }
+            f.token()
+        };
+        drop(t);
+        db.close().unwrap();
+
+        // Inherited: the open doesn't mention the feed.
+        let db = Pigeonhole::open(&path, opts()).unwrap();
+        assert_eq!(oldest(&db), first, "big {big}: after a reopen");
+        {
+            let t = db.table("events").unwrap().open().unwrap();
+            let mut f = t.feed().resume(&token).open().unwrap();
+            let mut n = 0;
+            while f.next(Duration::from_millis(300)).unwrap().is_some() {
+                n += 1;
+            }
+            assert_eq!(n, 200, "big {big}: the token resumes");
+            for i in 300..350 {
+                commit(&t, i);
+            }
+        }
+        let both = oldest(&db);
+        assert_eq!(both.len(), 350, "big {big}: both sessions");
+        db.close().unwrap();
+
+        // Set again, a third session: two earlier ones to start from.
+        let db = Pigeonhole::open(&path, fed()).unwrap();
+        let got = oldest(&db);
+        assert_eq!(got, both, "big {big}: after a second reopen");
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "in order, once each");
+        db.close().unwrap();
+    }
+}

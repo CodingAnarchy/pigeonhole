@@ -143,6 +143,23 @@ pub struct EngineMetrics {
     pub transaction_retries: u64,
     /// Cross-shard commits: their two-phase rounds and the commits that failed fast.
     pub cross_shard: CrossShardMetrics,
+    /// Group syncs finished, a failed one included: each is one WAL sync covering the
+    /// [`Durability::GroupSync`](crate::Durability::GroupSync) commits batched behind it,
+    /// however many there were. Counted with the change feed on or off, so it isn't a feed
+    /// cost on its own: set the `feed_*` syncs beside it. Its rise over an interval, against
+    /// the `GroupSync` commits', is the commits each sync carried.
+    pub group_syncs: u64,
+    /// Syncs the change feed submitted on its own (D310): fed `Buffered` or `None` commits
+    /// waited longer than the feed's sync interval for one and no commit's sync covered
+    /// them. What a durable feed costs in syncs beyond the commits' own. 0 while the feed is
+    /// off. For the feed's retained history, see
+    /// [`DatabaseInfo::feed`](crate::DatabaseInfo::feed).
+    pub feed_background_syncs: u64,
+    /// Syncs of the change feed's sidecar file (`<db>-feed`, D310): at most one in flight,
+    /// covering the sidecar entries of the flushes, checkpoints and catalog changes since the
+    /// last one, never per commit. 0 while the feed is off. See
+    /// [`DatabaseInfo::feed`](crate::DatabaseInfo::feed) for the feed's state.
+    pub feed_sidecar_syncs: u64,
 }
 
 impl EngineMetrics {
@@ -235,6 +252,9 @@ impl EngineMetrics {
                 rounds: x.rounds,
                 failed_fast: x.failed_fast,
             },
+            group_syncs: 0,
+            feed_background_syncs: 0,
+            feed_sidecar_syncs: 0,
         }
     }
 }
@@ -358,6 +378,9 @@ pub struct ShardStats {
     pub spin_time_nanos: u64,
     /// Nanoseconds the shard's client commits spent in flight (D257, D262).
     pub commit_inflight_nanos: u64,
+    /// WAL rollovers that reused the oldest change-feed-retained segment because no free
+    /// segment was ready (D310): history cut early rather than a writer waiting. Expected 0.
+    pub feed_retained_taken: u64,
 }
 
 #[cfg(feature = "__unstable-hooks")]
@@ -374,6 +397,7 @@ impl ShardStats {
             pool_busy_nanos: s.pool_busy_nanos,
             spin_time_nanos: s.spin_time_nanos,
             commit_inflight_nanos: s.commit_inflight_nanos,
+            feed_retained_taken: s.feed_retained_taken,
         }
     }
 }

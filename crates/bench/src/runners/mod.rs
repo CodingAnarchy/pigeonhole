@@ -1,6 +1,7 @@
 //! Store runners and the hand-written wide-column key encoding the key-value
 //! comparison runners share.
 
+pub(crate) mod feed;
 pub(crate) mod inline;
 pub(crate) mod pigeonhole;
 pub(crate) mod placement;
@@ -456,6 +457,7 @@ mod concurrent_rmw {
         let incr = BenchOp::Incr {
             row: b"c".to_vec(),
             delta: 1,
+            returning: false,
         };
         r.execute(&incr).unwrap();
         let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();

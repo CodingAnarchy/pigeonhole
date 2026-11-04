@@ -1276,43 +1276,67 @@ fn a_released_target_without_the_controller_returns_to_a_thread_per_shard() {
 /// #1015: a trace without the load controller observes. It logs every driver's window and
 /// what the controller would decide, here a shrink (a light load, a wake per message), but
 /// never resizes.
+///
+/// Deterministic (#1462): the controller's windows run on the VFS clock, so under `SimVfs`
+/// this test closes each one by advancing the clock while every driver is parked. With the
+/// clock still during each window, the drivers' busy time and slow passes are exactly 0, and
+/// every message is submitted to a parked driver, so it is a producer wake. Each window's
+/// ops, wakes, busy and slow passes therefore meet the shrink rule however the runner is
+/// scheduled; the old version drove the load with wall-clock sleeps, and a loaded macOS
+/// runner never met it.
 #[test]
 fn a_trace_without_the_controller_logs_its_decisions_but_never_resizes() {
-    let rt = Arc::new(Runtime::start(config(4, PreadVfs::new(1)), handlers(4)).unwrap());
+    /// Messages per shard per window: 4 x 30 = 120 a window, over the rule's 100.
+    const PER_SHARD: usize = 30;
+    /// The controller's window is 100 ms, and one over 200 ms isn't counted: 110 ms each.
+    const WINDOW: Duration = Duration::from_millis(110);
+    /// The rule needs 50 counted windows; the shrink must show well before this.
+    const MAX_WINDOWS: usize = 80;
+    let (cfg, sim) = sim_config(4);
+    let rt = Runtime::start(cfg, handlers(4)).unwrap();
     assert!(
         rt.driver_trace().is_empty(),
         "nothing logged before the trace started"
     );
-    let stop = Arc::new(AtomicBool::new(false));
-    let clients: Vec<_> = (0..4u16)
-        .map(|shard| {
-            let (rt, stop) = (Arc::clone(&rt), Arc::clone(&stop));
-            thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let (n, w) = completion();
-                    rt.submitter(ShardId(shard))
-                        .submit(Msg::Echo(1, n))
-                        .unwrap();
-                    assert_eq!(w.wait(), Some(1));
-                    thread::sleep(Duration::from_micros(200));
-                }
-            })
-        })
-        .collect();
+    let parks = |shard: u16| rt.submitter(ShardId(shard)).idle_counts().0;
+    // Until shard `shard`'s driver has parked more than `before` times (a real-time bound
+    // only against a hang: nothing below depends on how long it takes).
+    let await_park = |shard: u16, before: u64| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while parks(shard) <= before {
+            assert!(
+                Instant::now() < deadline,
+                "shard {shard}'s driver never parked"
+            );
+            thread::yield_now();
+        }
+    };
+    // Every driver parks once it has nothing to do (`idle_spin` is 0).
+    for shard in 0..4u16 {
+        await_park(shard, 0);
+    }
     let mut lines = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !lines
-        .iter()
-        .any(|l: &String| l.contains(r#""why":"Shrink""#))
-        && Instant::now() < deadline
-    {
-        thread::sleep(Duration::from_millis(100));
+    for _ in 0..MAX_WINDOWS {
+        for _ in 0..PER_SHARD {
+            for shard in 0..4u16 {
+                // Submitted to a parked driver: a producer wake.
+                let before = parks(shard);
+                let (n, w) = completion();
+                rt.submitter(ShardId(shard))
+                    .submit(Msg::Echo(1, n))
+                    .unwrap();
+                assert_eq!(w.wait(), Some(1));
+                await_park(shard, before);
+            }
+        }
+        // Every driver is parked, so no turn spans the jump. The next message's pass closes
+        // the window.
+        sim.advance(u64::try_from(WINDOW.as_nanos()).unwrap());
         lines.extend(rt.driver_trace());
         assert_eq!(rt.driver_target(), 4, "an observing controller resized");
-    }
-    stop.store(true, Ordering::Relaxed);
-    for c in clients {
-        c.join().unwrap();
+        if lines.iter().any(|l| l.contains(r#""why":"Shrink""#)) {
+            break;
+        }
     }
     let shrink = lines
         .iter()
@@ -1332,7 +1356,7 @@ fn a_trace_without_the_controller_logs_its_decisions_but_never_resizes() {
         .unwrap();
     assert_eq!(ops.split(',').count(), 4, "one column per driver: {first}");
     assert_eq!(rt.driver_target(), 4);
-    Arc::into_inner(rt).unwrap().shutdown().unwrap();
+    rt.shutdown().unwrap();
 }
 
 #[test]

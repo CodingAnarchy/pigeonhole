@@ -437,6 +437,9 @@ stats.mutate(b"user:42").incr("stats", b"logins", 1).commit()?;
 let n: i64 = stats.get(b"user:42", "stats", b"logins")?
     .and_then(|c| c.as_i64()).unwrap_or(0);
 # assert_eq!(n, 1);
+// The value this increment produced, atomically (D314): unique per caller.
+let r = stats.mutate(b"user:42").incr("stats", b"logins", 1).commit_returning()?;
+assert_eq!(r.value("stats", b"logins")?, Some(2));
 # Ok::<(), pigeonhole::Error>(())
 ```
 

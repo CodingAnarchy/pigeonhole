@@ -588,3 +588,78 @@ fn an_idle_feed_reads_the_streams_once_per_frontier() {
     idle(&mut r);
     db.close().unwrap();
 }
+
+/// Every commit a feed delivers until nothing more comes within a short wait.
+fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
+    let mut got = Vec::new();
+    loop {
+        match r.wait(Duration::from_millis(200)).unwrap() {
+            Next::Commit(c) => got.push(c.seqno),
+            Next::Pending => return got,
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    }
+}
+
+/// #1465: `Oldest` after reopens starts at the oldest earlier session still kept, in every
+/// stream (simp724's cases). Session 1 opens with a cross-shard commit, then commits on both
+/// shards; session 2 starts with a cross-shard commit too, so stream 1's only record in it
+/// is a PREPARE, then commits only on shard 0; session 3 subscribes from the oldest. Every
+/// commit arrives once, in order, from the first. Mutation-checked: a bound of the first id
+/// (not one less) loses the first commit, and one taken from singles only loses the
+/// session's opening cross-shard commit.
+#[test]
+fn oldest_after_reopens_starts_at_the_oldest_session_kept() {
+    let vfs = SimVfs::new(3165);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    db.close().unwrap();
+    // The tables' creation is the first session: session 1 is this one, opening with a
+    // cross-shard commit.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let cross = |db: &Engine, row: &[u8]| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &a, row, row);
+        put(&mut wb, &b, row, row);
+        db.commit(wb, Some(Durability::GroupSync)).unwrap().seqno
+    };
+    let mut made = vec![
+        cross(&db, b"x1"),
+        single(&db, &a, b"a1", Durability::GroupSync),
+        single(&db, &b, b"b1", Durability::GroupSync),
+    ];
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    made.push(cross(&db, b"x2"));
+    made.push(single(&db, &a, b"a2", Durability::GroupSync));
+    made.push(single(&db, &a, b"a2'", Durability::Buffered));
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    assert_eq!(
+        drain_seqnos(&mut r),
+        made,
+        "every session's commits, from the first"
+    );
+    // And a commit of this session after them.
+    let now = single(&db, &b, b"b3", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, now);
+    drop(r);
+    db.close().unwrap();
+
+    // Past a feed-off open the earlier sessions aren't this history: `Oldest` starts at
+    // this open, as before, and doesn't expire.
+    open(&vfs, None).close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    assert!(
+        drain_seqnos(&mut r).is_empty(),
+        "nothing from before the unfed open"
+    );
+    let later = single(&db, &a, b"a4", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, later);
+    drop(r);
+    db.close().unwrap();
+}
