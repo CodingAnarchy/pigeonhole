@@ -1191,6 +1191,10 @@ impl Pigeonhole {
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
         let mut m = crate::EngineMetrics::from_engine(self.engine().metrics());
         self.db.txn_counts.fill(&mut m);
+        let engine = self.engine();
+        m.group_syncs = engine.group_syncs();
+        m.feed_background_syncs = engine.feed_background_syncs();
+        m.feed_sidecar_syncs = engine.feed_sidecar_syncs();
         m
     }
 

@@ -63,6 +63,10 @@ pub struct DatabaseInfo {
 
 /// What the change feed's history costs on disk ([`DatabaseInfo::feed`], D310).
 ///
+/// This is the state at one moment. The syncs the feed costs over time are counters in
+/// [`EngineMetrics`](crate::EngineMetrics): `feed_background_syncs` and `feed_sidecar_syncs`,
+/// beside `group_syncs`.
+///
 /// ```
 /// use pigeonhole::{FeedRetention, Options, Pigeonhole};
 ///

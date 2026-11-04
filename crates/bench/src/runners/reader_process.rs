@@ -240,3 +240,176 @@ pub fn child(path: &Path, records: u64, seed: u64) -> Result<(), String> {
     say(&serde_json::to_string(&report).map_err(|e| e.to_string())?);
     Ok(())
 }
+
+/// What a `reader --feed` child reports when it stops (D310 PR 5b).
+#[derive(Debug, Serialize, Deserialize)]
+struct FeedChildReport {
+    delivered: Vec<(u32, u64)>,
+    expired: u64,
+    errors: u64,
+    secs: f64,
+    /// User + system CPU seconds over the run (Linux), `None` elsewhere.
+    cpu_secs: Option<f64>,
+    /// Voluntary context switches over the run (Linux), `None` elsewhere.
+    wakeups: Option<u64>,
+}
+
+/// The `reader --feed` children, merged when they stop.
+#[derive(Debug)]
+pub(crate) struct FeedChildren {
+    children: Vec<(Child, Option<ChildStdin>, BufReader<ChildStdout>)>,
+}
+
+/// What [`FeedChildren::stop`] merged.
+#[derive(Debug)]
+pub(crate) struct FeedChildrenReport {
+    pub(crate) processes: u32,
+    pub(crate) hist: Histogram,
+    pub(crate) expired: u64,
+    pub(crate) errors: u64,
+    pub(crate) cpu_per_sec: Option<f64>,
+    pub(crate) wakeups_per_sec: Option<f64>,
+}
+
+/// Spawns `n` `phdb-bench reader --feed` children on the database at `db` and waits until
+/// each has its feed open.
+pub(crate) fn spawn_feed(db: &Path, n: usize) -> Result<FeedChildren, String> {
+    let exe = match std::env::var_os(EXE_ENV) {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe().map_err(|e| e.to_string())?,
+    };
+    let mut children = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut child = Command::new(&exe)
+            .arg("reader")
+            .arg("--feed")
+            .arg("--path")
+            .arg(db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawning feed reader {}: {e}", exe.display()))?;
+        let stdin = child.stdin.take();
+        let mut out = BufReader::new(child.stdout.take().expect("piped"));
+        let ready = tagged(&mut out)?;
+        if ready != "READY" {
+            let _ = child.kill();
+            return Err(format!("feed reader {i}: {ready}"));
+        }
+        children.push((child, stdin, out));
+    }
+    Ok(FeedChildren { children })
+}
+
+impl FeedChildren {
+    /// Closes every child's stdin and merges their reports.
+    pub(crate) fn stop(mut self) -> Result<FeedChildrenReport, String> {
+        for (_, stdin, _) in &mut self.children {
+            drop(stdin.take());
+        }
+        let mut out = FeedChildrenReport {
+            processes: self.children.len() as u32,
+            hist: Histogram::new(),
+            expired: 0,
+            errors: 0,
+            cpu_per_sec: Some(0.0),
+            wakeups_per_sec: Some(0.0),
+        };
+        for (mut child, _, mut lines) in self.children.drain(..) {
+            let line = tagged(&mut lines)?;
+            let status = child.wait().map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err(format!("a feed reader failed: {status}"));
+            }
+            let r: FeedChildReport = serde_json::from_str(&line)
+                .map_err(|e| format!("feed reader report {line:?}: {e}"))?;
+            out.hist.merge(&Histogram::from_sparse(&r.delivered));
+            out.expired += r.expired;
+            out.errors += r.errors;
+            let secs = r.secs.max(1e-9);
+            out.cpu_per_sec = out.cpu_per_sec.zip(r.cpu_secs).map(|(a, c)| a + c / secs);
+            out.wakeups_per_sec = out
+                .wakeups_per_sec
+                .zip(r.wakeups)
+                .map(|(a, w)| a + w as f64 / secs);
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for FeedChildren {
+    fn drop(&mut self) {
+        for (child, _, _) in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// This process's user + system CPU seconds (Linux: `/proc/self/stat` fields 14 and 15, in
+/// clock ticks of 100 Hz, the kernel's `USER_HZ` on every Linux the bench runs on).
+fn cpu_secs() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the command name, which is in parentheses and may hold spaces.
+    let rest = stat.rsplit_once(") ")?.1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some((utime + stime) as f64 / 100.0)
+}
+
+/// This process's voluntary context switches, every thread (Linux: `/proc/self/status` counts
+/// the main thread only, so the threads' own status files are summed).
+fn wakeups() -> Option<u64> {
+    let mut total = 0;
+    for task in std::fs::read_dir("/proc/self/task").ok()? {
+        let status = std::fs::read_to_string(task.ok()?.path().join("status")).ok()?;
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("voluntary_ctxt_switches:"))?;
+        total += line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    }
+    Some(total)
+}
+
+/// `phdb-bench reader --feed`: attaches to `path` with `Pigeonhole::open_reader`, follows the
+/// `bench` table's durable feed from now until stdin closes, then prints its report: the
+/// delivery latencies (wall clock minus each commit's timestamp), and its CPU and wakeups
+/// over the run, so a backoff's idle cost is measured beside its latency.
+pub fn child_feed(path: &Path) -> Result<(), String> {
+    let say = |line: &str| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{TAG}{line}");
+        let _ = out.flush();
+    };
+    let reader = pigeonhole::Pigeonhole::open_reader(path, pigeonhole::ReaderOptions::default())
+        .map_err(|e| e.to_string())?;
+    let table = reader.table("bench").map_err(|e| e.to_string())?;
+    let open = || table.feed().open();
+    let feed = open().map_err(|e| e.to_string())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut sink);
+            stop.store(true, Ordering::Release);
+        });
+    }
+    let (cpu0, wake0) = (cpu_secs(), wakeups());
+    say("READY");
+    let begun = Instant::now();
+    let followed = super::feed::follow(feed, open, &stop);
+    let secs = begun.elapsed().as_secs_f64();
+    let report = FeedChildReport {
+        delivered: followed.hist.to_sparse(),
+        expired: followed.expired,
+        errors: followed.errors,
+        secs,
+        cpu_secs: cpu0.zip(cpu_secs()).map(|(a, b)| b - a),
+        wakeups: wake0.zip(wakeups()).map(|(a, b)| b.saturating_sub(a)),
+    };
+    say(&serde_json::to_string(&report).map_err(|e| e.to_string())?);
+    Ok(())
+}

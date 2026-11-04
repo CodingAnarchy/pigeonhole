@@ -386,6 +386,12 @@ fn a_durable_feed_waits_for_a_sync_on_buffered_commits() {
         0,
         "a covering sync needs none of its own"
     );
+    assert_eq!(
+        db.group_syncs(),
+        1,
+        "the GroupSync commit's sync, counted once"
+    );
+    assert!(db.shard_stats().iter().all(|s| s.feed_retained_taken == 0));
     close_real(&db, &mut shard);
 }
 
@@ -426,6 +432,7 @@ fn the_background_sync_moves_the_durable_feed_on_a_buffered_only_table() {
         settle(&mut shard);
     }
     assert!(db.feed_background_syncs() >= 1);
+    assert_eq!(db.group_syncs(), 0, "only the feed's own syncs ran");
     settle(&mut shard);
     assert!(shard.next_deadline().is_none(), "nothing held: no deadline");
     close_real(&db, &mut shard);
