@@ -7,6 +7,15 @@ use pyo3::prelude::*;
 
 pyo3::create_exception!(pigeonhole, Error, PyException, "A Pigeonhole error.");
 
+pyo3::create_exception!(
+    pigeonhole,
+    ReturnedValueError,
+    Error,
+    "A counter's value couldn't be read after its commit applied (D314): the commit \
+     succeeded, so don't retry it. `seqno` is the commit's; `code`, `code_num` and \
+     `__cause__` are the read's error."
+);
+
 /// Declares an exception per code, the code → class mapping, and the module registration.
 macro_rules! codes {
     ($($code:ident),* $(,)?) => {
@@ -24,6 +33,7 @@ macro_rules! codes {
         pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
             let py = m.py();
             m.add("Error", py.get_type::<Error>())?;
+            m.add("ReturnedValueError", py.get_type::<ReturnedValueError>())?;
             $(m.add(stringify!($code), py.get_type::<$code>())?;)*
             Ok(())
         }
@@ -79,6 +89,26 @@ pub(crate) fn with_code(code: ErrorCode, message: &str) -> PyErr {
 /// A library error as its Python exception.
 pub(crate) fn to_py(e: pigeonhole::Error) -> PyErr {
     with_code(e.code(), e.message())
+}
+
+/// A read that failed after commit `seqno` applied, as `ReturnedValueError` with the read's
+/// error as its cause (perf2's S1 on #1473): a caller can tell it from a failed commit,
+/// which a retry is safe after.
+pub(crate) fn returned_value(seqno: u64, e: pigeonhole::Error) -> PyErr {
+    Python::attach(|py| {
+        let code = e.code();
+        let err = ReturnedValueError::new_err(format!(
+            "the commit (seqno {seqno}) succeeded, but reading the value after it failed: {}",
+            e.message()
+        ));
+        let value = err.value(py);
+        // Setting attributes on a fresh exception instance can't fail.
+        let _ = value.setattr("seqno", seqno);
+        let _ = value.setattr("code", format!("{code:?}"));
+        let _ = value.setattr("code_num", code as u32);
+        err.set_cause(py, Some(to_py(e)));
+        err
+    })
 }
 
 /// `Result` with library errors converted.

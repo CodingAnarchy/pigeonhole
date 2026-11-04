@@ -126,6 +126,7 @@ with ph.open(path, create=True) as db:
 ## Writes, batches and transactions
 - **`Table.put`, `incr` and `delete`** each commit one change.
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
+- **Increments that return the value (D314):** `mutate(row)....commit_returning()` commits like `commit` and returns an `Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts=None)` or `r[family, qualifier]`; iterating gives the keys `(family, qualifier, ts)`. `Table.incr_returning(...)` is the one-cell form and returns the new value. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `None` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts=0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `ph.ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its cause): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `Durability.GROUP_SYNC` (the default) or `SYNC` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
 - **`db.write_batch()`** spans rows and tables atomically. As a context manager, it commits on a clean exit and writes nothing if the block raises.
 - **`db.transaction()`** is optimistic: its reads see one snapshot, and `commit()` raises `Conflict` if a cell it read changed meanwhile.
 - **`db.transact(fn)`** runs `fn(txn)` and retries it on `Conflict` and `Busy`, with backoff. It returns what `fn` returned. `fn` may run more than once, so keep its side effects inside the transaction.
@@ -145,6 +146,17 @@ with ph.open(path, create=True) as db:
 
     db.transact(transfer)
     assert acct.get(b"bob", "bal", b"v").as_int() == 30
+```
+
+```python
+import pigeonhole as ph
+
+with ph.open(path, create=True) as db:
+    seq = db.table("seq").family("n", ph.Family.counter()).create()
+    assert seq.incr_returning(b"orders", "n", b"next", 1) == 1
+    r = seq.mutate(b"orders").incr("n", b"next", 1).incr("n", b"shipped", 1).commit_returning()
+    assert r.value("n", b"next") == 2 and r["n", b"shipped"] == 1
+    assert list(r) == [("n", b"next", 0), ("n", b"shipped", 0)]
 ```
 
 ## Vectors

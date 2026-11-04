@@ -1466,7 +1466,8 @@ impl Engine {
             }
             for (stream, rec) in recoveries {
                 let i = stream.0 as usize;
-                let wal = rec.into_stream(wal_opts)?;
+                let opts = stream_wal_opts(&shared, wal_opts, &rec);
+                let wal = rec.into_stream(opts)?;
                 let _ = shared.metrics[i].wal.set(wal.counters());
                 note_feed_marks(&shared, i, &wal);
                 states[i].set_wal(Box::new(wal));
@@ -1490,7 +1491,8 @@ impl Engine {
                 let i = stream.0 as usize;
                 if i < shards {
                     let end = rec.end();
-                    let mut wal = rec.into_stream(wal_opts)?;
+                    let opts = stream_wal_opts(&shared, wal_opts, &rec);
+                    let mut wal = rec.into_stream(opts)?;
                     wal.checkpoint(end)?;
                     let _ = shared.metrics[i].wal.set(wal.counters());
                     note_feed_marks(&shared, i, &wal);
@@ -3543,6 +3545,24 @@ fn spill_recovered(
 /// manifest commit as the SSTs that point into it, so only a value separated at commit time
 /// can leave one: its commit never became durable, or was refused and its release did not
 /// run before the process ended.
+/// The WAL options for a stream recovery reopens: with the feed on, its retention counted in
+/// the file's own slot size, which the file keeps whatever `wal.segment_size` the open asks
+/// for (#1471). Before the stream adopts its slots, since retention sets its floor there and
+/// the floor never goes down.
+fn stream_wal_opts(
+    shared: &Shared,
+    mut opts: pigeonhole_wal::WalOptions,
+    rec: &Recovery,
+) -> pigeonhole_wal::WalOptions {
+    // Without a segment (`slot_size` is `None`) `into_stream` starts the file afresh at
+    // `opts.segment_size`, the configured size, which `retain_segments` (set from the feed
+    // at open) is already counted in.
+    if let (Some(feed), Some(slot)) = (&shared.feed, rec.slot_size()) {
+        opts.retain_segments = feed.retain_for(slot);
+    }
+    opts
+}
+
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
 fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {

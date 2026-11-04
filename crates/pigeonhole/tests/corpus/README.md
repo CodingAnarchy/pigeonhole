@@ -27,6 +27,7 @@ Small database files that every later build must open, read, check and write (D2
 | `memory` | a `pigeonhole-memory` store with an embedding model, its text index and its IVF index, over two namespaces, with a link, a supersede, uses and a delete |
 | `feed` | the change feed on: 300 commits to two tables over several WAL segments, flushed twice and closed cleanly, so the WAL and the sidecar keep the history; a subscriber's token from before the first commit is stored in a table, and the check resumes from it |
 | `feed_crash` | the same, left by a process crash |
+| `feed_sessions` | the change feed over two sessions: 150 commits, a clean close, a reopen that inherits the feed, 150 more, and a clean close. The check's open is the third session, with the default WAL segment size (the writer's is 256 KiB), and a feed from the oldest history must start at the first session's first commit and deliver both (#1465, #1471) |
 | `returning` | `commit_returning` increments (D314) on a hot counter whose base is an older SST's `Put`, flushed: its SST holds the newest write-time D291 checkpoint as the counter's base, at its commit's seqno, with the later operands above it |
 
 The check copies each entry to a temporary directory, opens it with the real filesystem, and compares every cell with `expected.txt`. It then writes a row through a flush and a compaction, closes, runs the offline check, reopens, and reads everything again.

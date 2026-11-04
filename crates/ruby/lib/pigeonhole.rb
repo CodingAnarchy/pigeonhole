@@ -26,6 +26,20 @@ module Pigeonhole
       @code_num = code_num
     end
   end
+
+  # A counter's value couldn't be read after its commit applied (Table#incr_returning,
+  # Incremented's readers): the commit succeeded, so don't retry it. `seqno` is the commit's;
+  # `code`, `code_num` and `cause` are the read's error. A failed commit raises its own
+  # exception instead.
+  class ReturnedValueError
+    # The commit's sequence number.
+    attr_reader :seqno
+
+    def initialize(message = nil, code = nil, code_num = nil, seqno = nil)
+      super(message, code, code_num)
+      @seqno = seqno
+    end
+  end
 end
 
 require_relative "pigeonhole/api"
