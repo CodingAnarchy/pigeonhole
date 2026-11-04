@@ -6871,7 +6871,16 @@ impl ShardState {
                     .filter(|s| s.seal == Seal::Open && s.active.max_seqno() > shm.durable_seqno())
                     .count();
                 crate::scratch_room::record(format!(
-                    "{bucket} flush_running {} queued {} frozen-slots {} to_freeze {} freeze_deferred {} starved_all {} retry {} | prepared {} unresolved {} pending {} | free {} MiB reserved {} MiB deferred {} MiB retired-for-readers {} | visible-durable {} open-above-durable {} | op {}",
+                    "{bucket} snapshots {} oldest-snap-behind {} | flush_running {} queued {} frozen-slots {} to_freeze {} freeze_deferred {} starved_all {} retry {} | prepared {} unresolved {} pending {} | free {} MiB reserved {} MiB deferred {} MiB retired-for-readers {} | visible-durable {} open-above-durable {} | op {}",
+                    self.shared.live_seqnos.scratch_summary().0,
+                    {
+                        let (n, oldest) = self.shared.live_seqnos.scratch_summary();
+                        if n == 0 {
+                            0
+                        } else {
+                            shm.visible_seqno().saturating_sub(oldest).min(100_000) / 1000 * 1000
+                        }
+                    },
                     self.flush_running,
                     self.flush_queue.len(),
                     self.memtables

@@ -909,6 +909,14 @@ impl SeqnoPin {
     }
 }
 
+impl LiveSeqnos {
+    /// SCRATCH #1497: live snapshots and the oldest one's seqno.
+    pub(crate) fn scratch_summary(&self) -> (u32, Seqno) {
+        let m = self.seqnos.lock().unwrap_or_else(PoisonError::into_inner);
+        (m.values().sum(), m.keys().next().copied().unwrap_or(0))
+    }
+}
+
 impl Drop for SeqnoPin {
     fn drop(&mut self) {
         if self.registry.owner != pigeonhole_io::sys::process_id() {
