@@ -1,0 +1,320 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): the types every service shares.
+//
+// Conventions:
+// - Row keys, qualifiers, values and opaque tokens are `bytes` (base64 in the JSON mapping).
+// - Timestamps are microseconds since the Unix epoch, as in the Rust API.
+// - Ids the server hands out (`txn_id`, `snapshot_id`, `session_id`) are opaque strings. A
+//   client stores and returns them; it never parses them.
+// - Every enum's zero value is `*_UNSPECIFIED`, meaning "the default" where a default exists.
+// - v1 changes only additively: no field number is reused, and removed fields are reserved.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+// How durable a commit is before it returns (the Rust API's `Durability`).
+enum Durability {
+  // The server's default: the database's writer default (`GroupSync` unless configured).
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_NONE = 1;
+  DURABILITY_BUFFERED = 2;
+  DURABILITY_GROUP_SYNC = 3;
+  DURABILITY_SYNC = 4;
+}
+
+// A row of a table.
+message RowKey {
+  string table = 1;
+  bytes row = 2;
+}
+
+// Where a stateful call (a transaction, a pinned snapshot) runs once the database is split
+// into partitions (D317): the partition owning `row`, or a named partition. A single-node
+// server ignores it; a cluster with more than one partition requires it.
+message RoutingKey {
+  oneof key {
+    RowKey row = 1;
+    string partition = 2;
+  }
+}
+
+// A vector family's element type.
+enum Element {
+  ELEMENT_UNSPECIFIED = 0;
+  ELEMENT_F32 = 1;
+  ELEMENT_F16 = 2;
+  ELEMENT_BF16 = 3;
+  ELEMENT_I8 = 4;
+  ELEMENT_BIT = 5;
+}
+
+// A vector family's distance; smaller is nearer.
+enum Metric {
+  METRIC_UNSPECIFIED = 0;
+  METRIC_L2 = 1;
+  METRIC_COSINE = 2;
+  METRIC_INNER_PRODUCT = 3;
+  METRIC_HAMMING = 4;
+}
+
+// A vector: `data` is the elements packed little-endian (`f32` as 4 bytes each, `i8` as 1,
+// `f16`/`bf16` as 2), or the packed bits for `ELEMENT_BIT`. One field for the whole vector,
+// not one per element.
+message Vector {
+  Element element = 1;
+  uint32 dim = 2;
+  bytes data = 3;
+}
+
+// A cell's value, typed.
+message Value {
+  oneof kind {
+    bytes bytes = 1;
+    sint64 i64 = 2;
+    double f64 = 3;
+    uint64 u64 = 4;
+    Vector vector = 5;
+  }
+}
+
+// One version of a cell, as a read returns it.
+message Cell {
+  string family = 1;
+  bytes qualifier = 2;
+  uint64 timestamp = 3;
+  // The value's stored bytes (an i64's 8 bytes little-endian, a sketch's encoding).
+  bytes value = 4;
+  // The value decoded by its type, when the server knows it.
+  Value typed = 5;
+  // For an aggregate family's cell: the readings its kind supports.
+  AggregateView aggregate = 6;
+}
+
+// A row's cells, in the API's order: by family, then qualifier, then newest version first.
+message Row {
+  bytes key = 1;
+  repeated Cell cells = 2;
+}
+
+// What an aggregate family's cell reads as (D294, D298). Which field is set follows the
+// family's kind; `quantiles` and `bloom` answer the request's `AggregateQuery`.
+message AggregateView {
+  optional uint64 hll_estimate = 1;
+  MeanVar mean_var = 2;
+  repeated uint64 histogram_counts = 3;
+  QuantileReading quantiles = 4;
+  BloomReading bloom = 5;
+  repeated bytes set_members = 6;
+}
+
+message MeanVar {
+  uint64 count = 1;
+  double mean = 2;
+  double variance = 3;
+}
+
+message QuantileReading {
+  uint64 count = 1;
+  // One value per requested quantile, in the request's order.
+  repeated double values = 2;
+}
+
+message BloomReading {
+  double fill = 1;
+  // One answer per probe, in the request's order (`i64` probes first, then `bytes`).
+  repeated bool contains = 2;
+}
+
+// Questions for aggregate cells, answered in `AggregateView`.
+message AggregateQuery {
+  repeated double quantiles = 1;
+  repeated sint64 bloom_i64 = 2;
+  repeated bytes bloom_bytes = 3;
+}
+
+// A commit's result.
+message CommitInfo {
+  uint64 seqno = 1;
+  Durability durability = 2;
+}
+
+// A column of a row: a family and a qualifier.
+message Column {
+  string family = 1;
+  bytes qualifier = 2;
+}
+
+enum Ordering {
+  ORDERING_UNSPECIFIED = 0;
+  ORDERING_LESS = 1;
+  ORDERING_EQUAL = 2;
+  ORDERING_GREATER = 3;
+}
+
+// A predicate on a cell's value (the Rust API's `ValueFilter`).
+message ValueFilter {
+  oneof kind {
+    bytes equals = 1;
+    bytes prefix = 2;
+    I64Comparison i64 = 3;
+  }
+}
+
+// The value is an i64 that compares to `operand` as `ordering` says.
+message I64Comparison {
+  Ordering ordering = 1;
+  sint64 operand = 2;
+}
+
+// A condition on one column of the mutated row (`commit_if`).
+message Condition {
+  oneof kind {
+    Column exists = 1;
+    Column absent = 2;
+    ValueCondition value = 3;
+  }
+}
+
+message ValueCondition {
+  Column column = 1;
+  ValueFilter filter = 2;
+}
+
+// One end of a key or qualifier range. Absent means unbounded.
+message Bound {
+  bytes key = 1;
+  bool inclusive = 2;
+}
+
+// Timestamps in `[start, end)`.
+message TimeRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// What a read selects within each row (the Rust `RowRead`/`Scan` builders' selection).
+message Selection {
+  // Families to read, in this order; empty reads every family.
+  repeated string families = 1;
+  bytes qualifier_prefix = 2;
+  Bound qualifier_start = 3;
+  Bound qualifier_end = 4;
+  // Versions per column: 0 means the newest only (the default); use `all_versions` for all.
+  uint32 versions = 5;
+  bool all_versions = 6;
+  TimeRange time_range = 7;
+  // At most this many columns per row (0: no limit).
+  uint32 column_limit = 8;
+  ValueFilter value_filter = 9;
+  // Read at a pinned snapshot (`Snapshots.Open`) instead of now.
+  string snapshot_id = 10;
+  AggregateQuery aggregate = 11;
+}
+
+// One write of a row mutation.
+message Write {
+  oneof op {
+    Put put = 1;
+    Incr incr = 2;
+    AggregateInput aggregate = 3;
+    Merge merge = 4;
+    DeleteCell delete_cell = 5;
+    DeleteColumn delete_column = 6;
+    DeleteFamily delete_family = 7;
+    DeleteRow delete_row = 8;
+  }
+}
+
+// A put: `timestamp` unset means the commit's timestamp.
+message Put {
+  string family = 1;
+  bytes qualifier = 2;
+  optional uint64 timestamp = 3;
+  Value value = 4;
+}
+
+// An increment of a counter family's cell (or, with `timestamp`, its bucket).
+message Incr {
+  string family = 1;
+  bytes qualifier = 2;
+  optional uint64 timestamp = 3;
+  sint64 delta = 4;
+}
+
+// An input to an aggregate family's cell, typed by the family's kind (i64, u64, f64 or bytes).
+message AggregateInput {
+  string family = 1;
+  bytes qualifier = 2;
+  optional uint64 timestamp = 3;
+  Value input = 4;
+}
+
+// An operand for the family's registered merge operator.
+message Merge {
+  string family = 1;
+  bytes qualifier = 2;
+  bytes operand = 3;
+}
+
+message DeleteCell {
+  string family = 1;
+  bytes qualifier = 2;
+  uint64 timestamp = 3;
+}
+
+message DeleteColumn {
+  string family = 1;
+  bytes qualifier = 2;
+}
+
+message DeleteFamily {
+  string family = 1;
+}
+
+message DeleteRow {}
+
+// The writes to one row.
+message RowWrites {
+  RowKey row = 1;
+  repeated Write writes = 2;
+}
+
+// An error's stable identity, in every error response: in gRPC as a `google.rpc.Status`
+// detail (`type.googleapis.com/pigeonhole.v1.ErrorDetail`), and in HTTP/JSON as the body.
+// A write is known not to have been applied only when a response carries this detail with
+// `retry_safe` true (ICR 0112, "When a write is retry-safe"). Each code's `retry_safe`,
+// `retry_from` and statuses are fixed for v1.
+message ErrorDetail {
+  // The stable code's name: an `ErrorCode` (`Conflict`, `Busy`, ...) or a server code
+  // (`SessionBusy`, `TransactionExpired`, `Overloaded`, ...).
+  string code = 1;
+  // `ErrorCode`'s number; 0 for a server code.
+  uint32 code_num = 2;
+  string message = 3;
+  // True when the request was not applied, so the operation may be retried, from the point
+  // `retry_from` says. False: don't retry as is (it may have been applied, or it can't
+  // succeed as sent).
+  bool retry_safe = 4;
+  // A pause to wait first, for `Busy` and `Overloaded`.
+  uint32 retry_after_ms = 5;
+  // Where a retry starts, when `retry_safe` (simp724's E2 on #1496).
+  RetryFrom retry_from = 6;
+}
+
+// Where a retry starts.
+enum RetryFrom {
+  // Not retry-safe.
+  RETRY_FROM_UNSPECIFIED = 0;
+  // Send the same request again (after `retry_after_ms`).
+  RETRY_FROM_REQUEST = 1;
+  // Run the whole transaction again from `Transactions.Begin` (or re-open the snapshot):
+  // the same request would get the same answer (a `Conflict`, an expired session).
+  RETRY_FROM_BEGIN = 2;
+}
+
+// A stream's position moved without an event the subscriber asked for (perf287's S2 on
+// #1496): commits the stream's filters skipped. Carries no data; its `token` is what a
+// reconnect resumes from, so a quiet filtered stream's position doesn't age out of the
+// history. Sent after a quiet interval, never more often than events.
+message Progress {}
+
+message Empty {}

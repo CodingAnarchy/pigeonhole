@@ -1,0 +1,71 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): the change feed (D310) as a stream.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+// Committed changes of some tables, as whole commits in commit order, once each.
+service Feed {
+  // A stream that doesn't end on its own: it ends with an error, such as `FeedExpired`
+  // when the history no longer holds the requested start.
+  rpc Subscribe(SubscribeRequest) returns (stream FeedEvent);
+}
+
+message SubscribeRequest {
+  // The tables to follow (at least one).
+  repeated string tables = 1;
+  // Only rows starting with this prefix.
+  bytes prefix = 2;
+  // Deliver at visibility rather than durability.
+  bool visible = 3;
+  // Where the stream starts; unset: from now.
+  oneof start {
+    // After everything a pinned snapshot sees.
+    string from_snapshot = 4;
+    // From the oldest commit the history holds.
+    bool from_oldest = 5;
+    // After an earlier event's `token`.
+    bytes resume = 6;
+  }
+}
+
+message FeedEvent {
+  // The feed's position after this event: `resume` continues exactly after it. Opaque,
+  // and not comparable byte for byte across streams.
+  bytes token = 1;
+  oneof event {
+    FeedCommit commit = 2;
+    // Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
+    // The position moved past commits the stream's filters skipped: only `token` matters.
+    Progress progress = 4;
+  }
+}
+
+message FeedCommit {
+  uint64 seqno = 1;
+  uint64 timestamp = 2;
+  repeated Change changes = 3;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_PUT = 1;
+  // A merge operand, a counter increment or an aggregate input.
+  CHANGE_KIND_MERGE = 2;
+  CHANGE_KIND_DELETE_CELL = 3;
+  CHANGE_KIND_DELETE_COLUMN = 4;
+  // A row delete is one `DELETE_FAMILY` per family.
+  CHANGE_KIND_DELETE_FAMILY = 5;
+}
+
+message Change {
+  string table = 1;
+  string family = 2;
+  ChangeKind kind = 3;
+  bytes row = 4;
+  bytes qualifier = 5;
+  uint64 timestamp = 6;
+  // The written value, for puts and merges.
+  Value value = 7;
+}

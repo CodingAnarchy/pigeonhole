@@ -10,8 +10,14 @@ name: Publish to RubyGems
 # Owner setup, once, before the first release tag:
 #   - Settings → Environments → `rubygems`: add the owner as required reviewer, and limit
 #     deployments to tags matching `v*`.
-#   - rubygems.org: add a (pending) trusted publisher for gem `pigeonhole-db`: repository
+#   - rubygems.org: a trusted publisher for gem `pigeonhole-db`: repository
 #     CodingAnarchy/pigeonhole, workflow publish-rubygems.yml, environment rubygems.
+#
+# Trusted publishing can't create a new gem unless the token exchange names the owning
+# account, and configure-rubygems-credentials (v2.1.0) has no `owner` input. So 1.1.0, the
+# first version, was pushed by hand by the owner from this workflow's built gems (run
+# 41880205614), and the trusted publisher is then added on the existing gem. Every later tag
+# publishes here. A new gem (another name) needs the same first manual push.
 
 on:
   push:

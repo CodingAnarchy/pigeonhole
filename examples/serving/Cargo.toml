@@ -1,0 +1,34 @@
+[package]
+name = "pigeonhole-example-serving"
+description = "The reference pattern for sharing one Pigeonhole database across processes and hosts: one process owns the file and serves a small HTTP API (#1397 step 1, D313; docs/guide/serving.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# An example to read and copy, not a library to depend on.
+publish = false
+
+[[bin]]
+name = "serving-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "serving-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+# The public crate only, as an application would use it.
+pigeonhole = { workspace = true }
+futures-core = { workspace = true }
+# The server: an async runtime and an HTTP framework. Only this example depends on them.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+# The worker's HTTP client: synchronous, already in the tree through phdb's `embed`.
+ureq = { version = "3.5", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true

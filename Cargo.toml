@@ -22,6 +22,7 @@ members = [
     "crates/python",
     "crates/text",
     "crates/memory",
+    "examples/serving",
 ]
 # The Ruby bindings are a workspace of their own: building them needs a Ruby with headers
 # (rb-sys), which `cargo build --workspace` mustn't require (#697, ICR 0111).

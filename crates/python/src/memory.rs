@@ -841,6 +841,7 @@ pub(crate) struct StoreStats {
     missing_embeddings: u64,
     dangling_superseded: u64,
     text_index_inconsistent: bool,
+    ivf_mismatched: u64,
 }
 
 #[pymethods]
@@ -853,6 +854,7 @@ impl StoreStats {
             && self.missing_embeddings == 0
             && self.dangling_superseded == 0
             && !self.text_index_inconsistent
+            && self.ivf_mismatched == 0
     }
 }
 
@@ -866,6 +868,7 @@ impl From<mem::StoreStats> for StoreStats {
             missing_embeddings: s.missing_embeddings,
             dangling_superseded: s.dangling_superseded,
             text_index_inconsistent: s.text_index_inconsistent,
+            ivf_mismatched: s.ivf_mismatched,
         }
     }
 }
