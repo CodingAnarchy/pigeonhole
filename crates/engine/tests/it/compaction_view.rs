@@ -108,10 +108,41 @@ fn a_held_compaction_does_not_keep_a_flushed_memtables_chunks() {
         "{after} of {size} bytes free after the flush ({before} before it): the held \
          compaction keeps the flushed memtable's chunks"
     );
+    // The SST view is enough for the job: released, the compaction finishes (L0 merges),
+    // and every row reads back, the late ones from the SST the retired memtable became.
+    let l0 = || engine.sst_levels().iter().filter(|s| s.1 == 0).count();
+    let l0_held = l0();
     engine.hold_compactions(false);
-    for _ in 0..64 {
+    for _ in 0..1000 {
         step(&mut shard);
+        if l0() < l0_held {
+            break;
+        }
     }
+    assert!(
+        l0() < l0_held,
+        "the released compaction never finished ({l0_held} L0 SSTs)"
+    );
+    let snap = engine.snapshot().unwrap();
+    for r in 0..4u8 {
+        for i in 0..4u8 {
+            assert!(
+                engine.get(&snap, t.id, f, &[r, i], b"q").unwrap().is_some(),
+                "row {r}/{i}"
+            );
+        }
+    }
+    for i in [0u32, 767, 1535] {
+        let row = format!("late{i:05}");
+        assert!(
+            engine
+                .get(&snap, t.id, f, row.as_bytes(), b"q")
+                .unwrap()
+                .is_some(),
+            "{row}"
+        );
+    }
+    drop(snap);
     engine.close().unwrap();
     step(&mut shard);
 }
