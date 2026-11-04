@@ -49,6 +49,12 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 # The app-owned io_uring test waits in `poll` on the shard's completion fd (#408).
 libc = { workspace = true }
+# The format corpus writes and checks the structures these crates build on the public API
+# (`tests/corpus.rs`, the 1.1.0 release corpus). By path only, without a version, so
+# `cargo publish` drops them: they publish after this crate.
+pigeonhole-memory = { path = "../memory" }
+pigeonhole-text = { path = "../text" }
+pigeonhole-vector = { path = "../vector" }
 
 [[bench]]
 name = "public"
