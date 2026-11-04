@@ -18,6 +18,7 @@
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
 | `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
 | `phdb mcp <file> [--read-only] [--create] [--memory NAME]` | A Model Context Protocol server on standard input and output, for AI agents, with optional [agent memory tools](ai-agents.md#the-memory-tools): see [Using Pigeonhole from AI agents](ai-agents.md). New in 1.1.0. |
+| `phdb serve <file> [--listen ADDR:PORT] [--tls-cert PEM --tls-key PEM] [--token-file FILE]` | Serve the database over gRPC and HTTP/JSON on one port (ICR 0112): see [`phdb serve`](#phdb-serve). Only in a build with the `serve` feature (`cargo install pigeonhole-cli --features serve`). New in 1.2.0, in progress. |
 
 **Global flags,** before or after the command:
 
@@ -337,6 +338,20 @@ seqno   3
 row  family   qualifier  ts                value
 u1   profile  name       1761030000000000  Ada
 ```
+
+### `phdb serve`
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves `Data`'s single-call RPCs (`Get`, `MultiGet`, `ReadRow`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`) over gRPC and HTTP/JSON. Scans, transactions, the change feed, schema and the other services follow; ICR 0112 is the full contract.
+
+`phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
+
+- **Security:**
+  - **TLS:** `--tls-cert` and `--tls-key` take PEM files; every connection is then TLS.
+  - **Tokens:** `--token-file`, or the `PHDB_SERVE_TOKENS` environment variable, holds one token per line: `read|write|admin [ns=a,b] <token>`, or `sha256:<hex>` for the token's digest. Requests carry `Authorization: Bearer <token>`. Tokens are never a flag's value.
+  - **The bind rule:** an address other hosts can reach needs both TLS and tokens, or the server refuses to start. `--insecure-no-tls-no-auth` overrides that for a trusted private network. A loopback address needs neither.
+- **Limits:** `--max-request-bytes` (16 MiB), `--inflight-bytes` (256 MiB of request bodies held at once), `--max-concurrent` (1,024 requests; more are refused at once with `Overloaded`, never queued) and `--request-timeout-ms` (the longest wait for those limits). A write the server has submitted always answers its real outcome.
+- **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts.
+- **`GET /v1/health`** answers without a token. `GET /metrics` serves the request counters in Prometheus text, with read scope.
+- **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown.
 
 ## Exit status
 

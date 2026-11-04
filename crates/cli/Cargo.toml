@@ -23,7 +23,11 @@ default = ["embed"]
 embed = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
 # `phdb serve` (D313, #1397), off by default (owner, 2026-11-04). This build has only the
 # network API's generated types (ICR 0112); the server follows.
-serve = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde"]
+serve = [
+    "dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde",
+    "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",
+    "dep:sha2", "dep:arc-swap", "dep:num_cpus", "dep:nix", "dep:futures-core",
+]
 
 [dependencies]
 # The public crates only: phdb uses no engine internals (#692).
@@ -47,6 +51,22 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"], op
 tonic-prost = { version = "0.14", optional = true }
 pbjson = { version = "0.9", optional = true }
 serde = { version = "1", optional = true }
+# `serve`'s server: the runtime, one router for gRPC and HTTP/JSON, the limits, one accept
+# loop for plain and TLS connections, token digests, the table cache, and core counts for
+# placing threads off the shards' CPUs (perf287's R1 on D313).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"], optional = true }
+tower = { version = "0.5", features = ["limit", "load-shed", "util"], optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio", "service"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+sha2 = { version = "0.10", optional = true }
+arc-swap = { version = "1", optional = true }
+num_cpus = { version = "1", optional = true }
+futures-core = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `serve`: the Tokio threads' affinity mask (R1), through nix's safe `sched_setaffinity`.
+nix = { version = "0.29", default-features = false, features = ["sched", "process"], optional = true }
 
 [dev-dependencies]
 # The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).
@@ -54,6 +74,9 @@ pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 insta = { version = "1.49", features = ["filters"] }
 # `tests/check_fixtures.rs` rewrites structures with valid checksums.
 pigeonhole-format = { workspace = true }
+# `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
+ureq = { version = "3.5", default-features = false, features = ["json"] }
 
 [lints]
 workspace = true

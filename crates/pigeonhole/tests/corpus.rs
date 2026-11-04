@@ -127,8 +127,9 @@ fn sim_options(vfs: &Arc<SimVfs>, shards: usize) -> Options {
 const T0: u64 = 1_767_225_600_000_000;
 
 /// The marker file of an entry that 1.0.0 must refuse: it holds the `incompat` feature
-/// bits the refusal names (decimal). CI's 1.0.0 job fails if such an entry opens, or if
-/// the refusal names other bits (`tests/corpus/compat-reader`).
+/// bits the refusal names (decimal). CI's 1.0.0 arm fails if such an entry opens, or if
+/// the refusal names other bits (`tests/corpus/compat-reader`), and its 1.1.0 arm, whose
+/// release reads bit 0, fails if one using only bit 0 doesn't open (`compat-reader-1.1`).
 const REFUSED_BY: &str = "refused-by-1.0.0.txt";
 
 /// The file of an entry's extra listing: what [`Entry::extra`] read from the generating
