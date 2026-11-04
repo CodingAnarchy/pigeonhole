@@ -684,6 +684,114 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
     db.close().unwrap();
 }
 
+/// SCRATCH #1477 (not for merge): IVF writer scaling. Builds BUILD memories of `lme_m` into
+/// one f32 IVF store, then runs each thread count in PHASES for SECS seconds, the writers
+/// taking unseen memories from a shared cursor. Per phase: throughput, remember latency,
+/// Busy sleeps, transaction retries and conflicts, and write stalls. Prints "PHASE START"
+/// with the pid before each phase and waits 3 s, so a profiler can attach to it.
+fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let f = fixture(fix_dir, "lme_m");
+    let mut seen = BTreeSet::new();
+    let picked: Vec<usize> = (0..f.mems.len())
+        .filter(|&i| seen.insert(f.mems[i].text.as_str()))
+        .collect();
+    let (built, held) = picked.split_at(build.min(picked.len() / 2));
+    eprintln!(
+        "unique {} build {} held {}",
+        picked.len(),
+        built.len(),
+        held.len()
+    );
+    let dir = db_dir.join("ivfw");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = open(&dir);
+    let model = EmbeddingModel::new(f.model.clone(), f.dim, Element::F32).unwrap();
+    let store = Store::create(
+        &db,
+        STORE,
+        StoreOptions::new().embedding(model).ivf(IvfOptions::new()),
+    )
+    .unwrap();
+    let mut busy = 0u64;
+    let t = Instant::now();
+    for &i in built {
+        let m = &f.mems[i];
+        remember(
+            &store,
+            "big",
+            Memory::new(m.text.clone()).embedding(f.mem_vecs[i].clone()),
+            &mut busy,
+        );
+    }
+    println!(
+        "{}",
+        json!({"mode": "ivfw-build", "memories": built.len(), "seconds": t.elapsed().as_secs_f64(), "busy": busy})
+    );
+    let cursor = AtomicUsize::new(0);
+    for threads in phases
+        .split(',')
+        .map(|x| x.parse::<usize>().expect("threads"))
+    {
+        println!("PHASE START threads={threads} pid={}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let before = db.engine_metrics();
+        let busy_all = AtomicU64::new(0);
+        let lats = std::sync::Mutex::new(Vec::<u64>::new());
+        let done = AtomicUsize::new(0);
+        let start = cursor.load(Ordering::Relaxed);
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                let (store, f, cursor, busy_all, lats, done) =
+                    (&store, &f, &cursor, &busy_all, &lats, &done);
+                sc.spawn(move || {
+                    let mut busy = 0u64;
+                    let mut mine = Vec::new();
+                    while t.elapsed().as_secs_f64() < secs {
+                        let k = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(&i) = held.get(k) else { break };
+                        let s = Instant::now();
+                        remember(
+                            store,
+                            "big",
+                            Memory::new(f.mems[i].text.clone()).embedding(f.mem_vecs[i].clone()),
+                            &mut busy,
+                        );
+                        mine.push(s.elapsed().as_micros() as u64);
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    busy_all.fetch_add(busy, Ordering::Relaxed);
+                    lats.lock().unwrap().extend(mine);
+                });
+            }
+        });
+        let el = t.elapsed().as_secs_f64();
+        let after = db.engine_metrics();
+        let mut l = lats.into_inner().unwrap();
+        if l.is_empty() {
+            l.push(0);
+        }
+        let n = done.load(Ordering::Relaxed);
+        println!(
+            "{}",
+            json!({
+                "mode": "ivfw-writers", "threads": threads, "memories": n, "from": start,
+                "seconds": el, "per_second": n as f64 / el,
+                "p50_us": percentile(&mut l, 0.5), "p99_us": percentile(&mut l, 0.99), "max_us": percentile(&mut l, 1.0),
+                "busy_sleeps": busy_all.load(Ordering::Relaxed),
+                "retries": after.transaction_retries - before.transaction_retries,
+                "conflicts": after.transaction_conflicts - before.transaction_conflicts,
+                "room_stalls": after.room_stalls - before.room_stalls,
+                "pacing_stalls": after.pacing_stalls - before.pacing_stalls,
+                "flushes": after.flushes - before.flushes,
+                "compactions": after.compactions - before.compactions,
+            })
+        );
+        println!("PHASE END threads={threads}");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "memrecall FIXTURE_DIR DB_DIR (recall DATASET [ELEMENT] | size [N] | ivf [N])";
@@ -701,6 +809,13 @@ fn main() {
             &fix,
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),
+        ),
+        Some("ivfw") => ivfw(
+            &fix,
+            &db,
+            args.get(4).map_or(50_000, |n| n.parse().expect("BUILD")),
+            args.get(5).map_or(8.0, |n| n.parse().expect("SECS")),
+            args.get(6).map_or("1,4,8,4,8,16", String::as_str),
         ),
         Some("ivf") => ivf(
             &fix,
