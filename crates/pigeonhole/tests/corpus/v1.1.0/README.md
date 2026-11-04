@@ -8,6 +8,7 @@ This directory will hold the database files written by the 1.1.0 release build, 
 - **`text`:** a `pigeonhole-text` index with positions.
 - **`memory`:** a `pigeonhole-memory` store, with its text and IVF indexes.
 - **`feed`** and **`feed_crash`:** the change feed's `-feed` sidecar and its retained WAL history, closed cleanly and left crashed.
+- **`returning`:** the D291 checkpoints `commit_returning` writes at commit time (D314).
 
 **How it will be written:** from the 1.1.0 release commit, with the workspace version at `1.1.0`, by `scripts/release-corpus.sh 1.1.0`. That gives one directory per entry of `tests/corpus.rs`'s `entries()`, laid out like `format4/`, and `frozen.txt`, each file's length and xxh3-64. The entries built on the public API also get `expected-extra.txt`: what the index's or store's `verify`, or the feed's retained commits, read back.
 
