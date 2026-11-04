@@ -393,3 +393,41 @@ fn an_open_inherits_nothing_once_every_fed_table_is_dropped() {
     assert!(db.info().unwrap().feed.is_none());
     db.close().unwrap();
 }
+
+#[test]
+fn the_feed_s_syncs_are_counted_beside_the_group_syncs() {
+    use pigeonhole::Durability;
+    let dir = pigeonhole::doc_support::temp_dir();
+    // The feed off: a group sync counts, the feed's syncs stay 0.
+    let db = Pigeonhole::open(dir.join("off.phdb"), Options::default().shards(1)).unwrap();
+    let (a, _) = tables(&db);
+    a.mutate(b"r")
+        .put("f", b"q", b"1")
+        .durability(Durability::GroupSync)
+        .commit()
+        .unwrap();
+    let m = db.engine_metrics();
+    assert!(m.group_syncs >= 1);
+    assert_eq!((m.feed_background_syncs, m.feed_sidecar_syncs), (0, 0));
+    db.close().unwrap();
+
+    // The feed on: the catalog changes' sidecar entries are synced.
+    let db = Pigeonhole::open(dir.join("on.phdb"), fed()).unwrap();
+    let (a, _) = tables(&db);
+    a.mutate(b"r")
+        .put("f", b"q", b"1")
+        .durability(Durability::GroupSync)
+        .commit()
+        .unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while db.engine_metrics().feed_sidecar_syncs == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let m = db.engine_metrics();
+    assert!(m.group_syncs >= 1);
+    assert!(
+        m.feed_sidecar_syncs >= 1,
+        "the table creations' sidecar entries"
+    );
+    db.close().unwrap();
+}

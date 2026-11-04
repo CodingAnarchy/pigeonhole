@@ -38,14 +38,17 @@ mod workload;
 
 pub use histogram::Histogram;
 pub use report::{
-    Comparison, Delta, EngineCommit, Environment, GroupCommit, JUDGED_MIN_COMMITS, JUDGED_MIN_SECS,
-    LatencyStats, OpTypeStats, Placement, ReadSplit, ReaderProcesses, Riders, Rounds, RunDetail,
-    RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
+    Comparison, Delta, EngineCommit, Environment, FeedReport, GroupCommit, JUDGED_MIN_COMMITS,
+    JUDGED_MIN_SECS, LatencyStats, OpTypeStats, Placement, ReadSplit, ReaderProcesses, Riders,
+    Rounds, RunDetail, RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite,
+    Tolerance, compare,
 };
 pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PlacementOptions};
-pub use runners::reader_process::{EXE_ENV as READER_EXE_ENV, child as reader_child};
+pub use runners::reader_process::{
+    EXE_ENV as READER_EXE_ENV, child as reader_child, child_feed as reader_feed_child,
+};
 #[cfg(feature = "rocksdb")]
 pub use runners::rocksdb::RocksDbRunner;
 #[cfg(feature = "rocksdb")]
@@ -742,6 +745,19 @@ pub trait Runner {
         Ok(())
     }
 
+    /// Starts change-feed subscribers beside the measured phase, for runners asked to (D310
+    /// PR 5b, `--feed`); the default does nothing. [`run_detailed`] calls it as the measured
+    /// phase starts, after the readers, and [`stop_feed`](Self::stop_feed) as it ends.
+    fn start_feed(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stops the subscribers [`start_feed`](Self::start_feed) started and reports them with
+    /// the feed's cost over the phase; `None` (the default) when the feed was off.
+    fn stop_feed(&mut self) -> Result<Option<FeedReport>, String> {
+        Ok(None)
+    }
+
     /// Stops the reader processes and reports them; `None` (the default) when there were
     /// none.
     fn stop_reader_processes(&mut self) -> Result<Option<ReaderProcesses>, String> {
@@ -1017,6 +1033,7 @@ pub fn run_detailed(
         txn_conflicts,
         riders,
         reader_processes,
+        feed,
         capped,
         engine_commit,
     } = result?;
@@ -1060,6 +1077,7 @@ pub fn run_detailed(
             txn_conflicts,
             riders,
             reader_processes,
+            feed,
             close_ms: Some(close_ms),
             capped: options.max_measured.map(|_| capped),
             offered_rate: options.offered_rate,
@@ -1188,6 +1206,7 @@ struct Measured {
     txn_conflicts: Option<u64>,
     riders: Option<Riders>,
     reader_processes: Option<ReaderProcesses>,
+    feed: Option<FeedReport>,
     capped: bool,
     engine_commit: Option<EngineCommit>,
 }
@@ -1291,6 +1310,7 @@ fn measure(
     };
     runner.start_riders()?;
     runner.start_reader_processes(config)?;
+    runner.start_feed()?;
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     // D247: past `max_measured` no client starts another operation.
@@ -1352,6 +1372,7 @@ fn measure(
             .map(|(b, a)| a.saturating_sub(b)),
         riders: runner.stop_riders()?,
         reader_processes: runner.stop_reader_processes()?,
+        feed: runner.stop_feed()?,
         capped,
         engine_commit: before
             .commit_buckets

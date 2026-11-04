@@ -102,6 +102,14 @@ pub(crate) struct Settings {
     /// default cap: a reported variant (D274). `None`: the library's default policy, as the
     /// judged rows run.
     pub(crate) txn_backoff_micros: Option<u64>,
+    /// Commits are `Durability::None` (D310 PR 5b's lazy-flush row); before `sync` and
+    /// `group_sync`.
+    pub(crate) none_durability: bool,
+    /// The change feed's retention in bytes (`Options::change_feed`, D310); `None`: off.
+    pub(crate) feed_bytes: Option<u64>,
+    /// Durable and visible writer-process subscribers, and reader-process subscribers,
+    /// beside the measured phase (D310 PR 5b).
+    pub(crate) feed_subscribers: (usize, usize, usize),
 }
 
 #[derive(Debug)]
@@ -115,6 +123,8 @@ pub(crate) struct Open {
     riders: Option<riders::Running>,
     /// The reader processes while the measured phase runs.
     readers: Option<super::reader_process::Running>,
+    /// The change-feed subscribers while the measured phase runs.
+    feed: Option<super::feed::Running>,
     /// [`Settings::driver_trace`]'s file.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }
@@ -315,6 +325,48 @@ impl PigeonholeRunner {
     /// ```
     pub fn reader_processes(mut self, n: usize) -> Self {
         self.settings.reader_processes = n;
+        self
+    }
+
+    /// `true`: commits are `Durability::None` (D310 PR 5b: a fed table's `None` commits
+    /// reach the feed through its lazy flush). Overrides [`sync`](Self::sync) and
+    /// [`group_sync`](Self::group_sync).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().none_durability(true).describe().contains(" none"));
+    /// ```
+    pub fn none_durability(mut self, yes: bool) -> Self {
+        self.settings.none_durability = yes;
+        self
+    }
+
+    /// Opens with the change feed on, keeping `bytes` of history (`Options::change_feed`,
+    /// D310); `None` (the default) leaves it off.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().feed(Some(256 << 20)).describe().contains(" feed=256MiB"));
+    /// ```
+    pub fn feed(mut self, bytes: Option<u64>) -> Self {
+        self.settings.feed_bytes = bytes;
+        self
+    }
+
+    /// With [`feed`](Self::feed): `durable` and `visible` threads, and `readers` reader
+    /// processes, follow the bench table's feed through the measured phase, reported in the
+    /// record's `feed` (D310 PR 5b).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().feed(Some(64 << 20)).feed_subscribers(1, 1, 1);
+    /// assert!(r.describe().contains(" feed=64MiB subs=1/1/1"));
+    /// ```
+    pub fn feed_subscribers(mut self, durable: usize, visible: usize, readers: usize) -> Self {
+        self.settings.feed_subscribers = (durable, visible, readers);
         self
     }
 
@@ -796,7 +848,9 @@ fn caches(s: &Settings) -> (u64, Option<u64>) {
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
     if !s.default_durability {
-        options = options.durability(if s.group_sync {
+        options = options.durability(if s.none_durability {
+            Durability::None
+        } else if s.group_sync {
             Durability::GroupSync
         } else if s.sync {
             Durability::Sync
@@ -808,6 +862,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     let mut options = options
         .memtable_budget(s.memory.write_buffer)
         .block_cache(usize::try_from(block_cache).unwrap_or(usize::MAX));
+    if let Some(bytes) = s.feed_bytes {
+        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
+    }
     if let Some(yes) = s.tablet_changes {
         options = options.tablet_changes(yes);
     }
@@ -930,6 +987,7 @@ impl Runner for PigeonholeRunner {
             dir: dir.to_path_buf(),
             riders: None,
             readers: None,
+            feed: None,
             trace: None,
         });
         if let Some(path) = &self.settings.driver_trace {
@@ -1093,6 +1151,30 @@ impl Runner for PigeonholeRunner {
         Ok(())
     }
 
+    fn start_feed(&mut self) -> Result<(), String> {
+        if self.settings.feed_bytes.is_none() {
+            return Ok(());
+        }
+        let (durable, visible, readers) = self.settings.feed_subscribers;
+        let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
+        o.feed = Some(super::feed::start(
+            &o.target.db,
+            &o.target.table,
+            &o.dir.join("bench.phdb"),
+            durable,
+            visible,
+            readers,
+        )?);
+        Ok(())
+    }
+
+    fn stop_feed(&mut self) -> Result<Option<crate::FeedReport>, String> {
+        match self.open.as_mut().and_then(|o| o.feed.take()) {
+            Some(f) => f.stop().map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn stop_reader_processes(&mut self) -> Result<Option<crate::ReaderProcesses>, String> {
         match self.open.as_mut().and_then(|o| o.readers.take()) {
             Some(r) => r.stop().map(Some),
@@ -1145,6 +1227,8 @@ impl Runner for PigeonholeRunner {
         };
         let durability = if s.default_durability {
             default_durability()
+        } else if s.none_durability {
+            "none"
         } else if s.group_sync {
             "group-sync"
         } else {
@@ -1224,6 +1308,13 @@ impl Runner for PigeonholeRunner {
         }
         if let Some(us) = s.txn_backoff_micros {
             _ = write!(d, " txn_backoff={us}us");
+        }
+        if let Some(bytes) = s.feed_bytes {
+            _ = write!(d, " feed={}MiB", bytes >> 20);
+            let (durable, visible, readers) = s.feed_subscribers;
+            if durable + visible + readers > 0 {
+                _ = write!(d, " subs={durable}/{visible}/{readers}");
+            }
         }
         d
     }

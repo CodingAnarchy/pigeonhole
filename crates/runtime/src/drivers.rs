@@ -87,6 +87,11 @@ const IDLE_WINDOW: Duration = Duration::from_millis(200);
 /// Windows a trace keeps before its reader drains them ([`Drivers::trace`]): an hour's.
 const TRACE_WINDOWS: usize = 36_000;
 
+/// `d` in nanoseconds, for comparing against the VFS clock.
+const fn nanos(d: Duration) -> u64 {
+    d.as_nanos() as u64
+}
+
 /// One driver's counters, read by the controller (Relaxed: windowed estimates).
 #[derive(Default)]
 pub(crate) struct DriverStats {
@@ -154,10 +159,9 @@ pub(crate) struct Drivers<H: ShardHandler> {
     /// The load controller (`adaptive` only), ticked by whichever driver finds its window
     /// over: driver 0 may be parked while another driver's shards carry the load.
     controller: Mutex<Option<Controller>>,
-    /// When the controller's window started, in nanoseconds since `epoch`: one Relaxed load
-    /// per pass decides whether to try the controller's lock.
+    /// When the controller's window started, on `vfs`'s monotonic clock: one Relaxed load per
+    /// pass decides whether to try the controller's lock.
     window_at: AtomicU64,
-    epoch: Instant,
     /// A trace was asked for ([`Drivers::trace`], #1015): the controller runs, deciding
     /// without resizing unless `adaptive`, and logs every window.
     tracing: AtomicBool,
@@ -174,7 +178,7 @@ impl<H: ShardHandler> Drivers<H> {
     ) -> Self {
         let controller = adaptive.then(|| {
             let wakes = submitters.iter().map(|s| s.idle_counts().1).sum();
-            Controller::new(drivers, wakes)
+            Controller::new(drivers, wakes, vfs.monotonic_nanos())
         });
         Self {
             slots: (0..drivers)
@@ -194,7 +198,6 @@ impl<H: ShardHandler> Drivers<H> {
             moves: AtomicU64::new(0),
             controller: Mutex::new(controller),
             window_at: AtomicU64::new(0),
-            epoch: Instant::now(),
             tracing: AtomicBool::new(false),
             vfs,
             submitters,
@@ -203,8 +206,8 @@ impl<H: ShardHandler> Drivers<H> {
 
     /// Runs the controller if its window is over and no other driver is running it.
     fn tick(&self) {
-        let window = WINDOW.as_nanos() as u64;
-        let now = self.epoch.elapsed().as_nanos() as u64;
+        let window = nanos(WINDOW);
+        let now = self.vfs.monotonic_nanos();
         if now.saturating_sub(self.window_at.load(Ordering::Relaxed)) < window {
             return;
         }
@@ -303,7 +306,7 @@ impl<H: ShardHandler> Drivers<H> {
         let wakes = self.wakes();
         let mut c = lock(&self.controller);
         let c = c.get_or_insert_with(|| {
-            let mut c = Controller::new(self.slots.len(), wakes);
+            let mut c = Controller::new(self.slots.len(), wakes, self.vfs.monotonic_nanos());
             for (last, slot) in c.last.iter_mut().zip(self.slots.iter()) {
                 *last = slot.stats.counts();
             }
@@ -350,30 +353,31 @@ enum Why {
 }
 
 /// The load controller (D289 PR 2), run between passes by any driver whose pass finds the
-/// window over.
+/// window over. Its times are nanoseconds on the runtime's VFS clock (`monotonic_nanos`),
+/// the clock the drivers' busy time is measured on: real time in production, and the
+/// simulated clock under `SimVfs`, where a test closes a window by advancing it (#1462).
 struct Controller {
-    at: Instant,
+    at: u64,
     /// Per driver: busy, passes, slow, ops, sibling wait at the window's start.
     last: Vec<[u64; 5]>,
     last_wakes: u64,
     windows: VecDeque<Window>,
-    hold_until: Instant,
+    hold_until: u64,
     shrink_windows: usize,
-    last_shrink: Option<Instant>,
+    last_shrink: Option<u64>,
     /// The trace's windows not yet read ([`Drivers::trace`]), and how many it has logged.
     log: Option<VecDeque<String>>,
     logged: u64,
 }
 
 impl Controller {
-    fn new(drivers: usize, wakes: u64) -> Self {
-        let now = Instant::now();
+    fn new(drivers: usize, wakes: u64, now: u64) -> Self {
         Self {
             at: now,
             last: vec![[0; 5]; drivers],
             last_wakes: wakes,
             windows: VecDeque::new(),
-            hold_until: now + HOLD,
+            hold_until: now.saturating_add(nanos(HOLD)),
             shrink_windows: SHRINK_WINDOWS,
             last_shrink: None,
             log: None,
@@ -382,8 +386,8 @@ impl Controller {
     }
 
     fn tick<H: ShardHandler>(&mut self, drivers: &Drivers<H>) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.at);
+        let now = drivers.vfs.monotonic_nanos();
+        let elapsed = Duration::from_nanos(now.saturating_sub(self.at));
         if elapsed < WINDOW {
             return;
         }
@@ -451,13 +455,13 @@ impl Controller {
                 self.last_shrink = Some(now);
             } else if self
                 .last_shrink
-                .is_some_and(|at| now.duration_since(at) < UNDO)
+                .is_some_and(|at| now.saturating_sub(at) < nanos(UNDO))
             {
                 // A shrink undone: wait twice as long before the next one (D255).
                 self.shrink_windows = (self.shrink_windows * 2).min(MAX_SHRINK_WINDOWS);
             }
             self.windows.clear();
-            self.hold_until = now + HOLD;
+            self.hold_until = now.saturating_add(nanos(HOLD));
             drivers.set_target(next);
         }
     }
@@ -949,10 +953,9 @@ mod tests {
     use super::{Controller, GROW_WINDOWS, GapWindow, SHRINK_WINDOWS, WAIT_WINDOWS, Why, Window};
     use std::collections::VecDeque;
     use std::time::Duration;
-    use std::time::Instant;
 
     fn controller(windows: impl IntoIterator<Item = Window>) -> Controller {
-        let now = Instant::now();
+        let now = 0;
         Controller {
             at: now,
             last: Vec::new(),

@@ -498,8 +498,17 @@ impl FeedMarks {
     }
 
     pub(crate) fn set_checkpoint(&self, at: Lsn) {
-        self.checkpoint.fetch_max(at.0, Ordering::AcqRel);
-        if let Some(m) = self.mirror.get() {
+        // Mirrored only when it rises (perf287 on #1352): the mirror's bound takes the
+        // checkpoint history's lock and scans it. The caller that raised it publishes it, and
+        // the mirror's stores never go down, so a call that didn't raise it has nothing new.
+        // That holds for the bound too only because the engine appends a checkpoint-history
+        // entry (`Feed::note_checkpoint`) just before a call that raises the mark, and after a
+        // reopen the `(head, 0)` seed entry already fixes the oldest bound (simp724 on
+        // #1444). A change that appends history entries without raising the mark must
+        // mirror the bound itself.
+        if self.checkpoint.fetch_max(at.0, Ordering::AcqRel) < at.0
+            && let Some(m) = self.mirror.get()
+        {
             m.checkpoint(self.checkpoint());
         }
     }
@@ -509,8 +518,10 @@ impl FeedMarks {
     }
 
     fn raise_floor(&self, floor: u32) {
-        self.floor.fetch_max(floor, Ordering::AcqRel);
-        if let Some(m) = self.mirror.get() {
+        // Mirrored only when it rises, as `set_checkpoint`: every retention pass calls this.
+        if self.floor.fetch_max(floor, Ordering::AcqRel) < floor
+            && let Some(m) = self.mirror.get()
+        {
             m.floor(self.floor());
         }
     }
@@ -2309,5 +2320,49 @@ impl Wal for WalStream {
         drop(file);
         vfs.remove(&path)?;
         sync_parent(&vfs, &path)
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::{FeedMarks, MarkMirror};
+    use pigeonhole_format::Lsn;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// Records every mirror call.
+    #[derive(Debug, Default)]
+    struct Calls(Arc<Mutex<Vec<(&'static str, u64)>>>);
+
+    impl MarkMirror for Calls {
+        fn floor(&self, epoch: u32) {
+            self.0.lock().unwrap().push(("floor", u64::from(epoch)));
+        }
+        fn checkpoint(&self, lsn: Lsn) {
+            self.0.lock().unwrap().push(("checkpoint", lsn.0));
+        }
+    }
+
+    #[test]
+    fn the_marks_are_mirrored_only_when_they_rise() {
+        let marks = FeedMarks::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        marks.set_mirror(Box::new(Calls(Arc::clone(&calls))));
+        // `set_mirror` publishes the current values once.
+        assert_eq!(*calls.lock().unwrap(), [("floor", 0), ("checkpoint", 0)]);
+        calls.lock().unwrap().clear();
+
+        marks.raise_floor(3);
+        marks.raise_floor(3); // a retention pass that moved nothing
+        marks.raise_floor(2); // never goes down
+        marks.set_checkpoint(Lsn(40));
+        marks.set_checkpoint(Lsn(40));
+        marks.set_checkpoint(Lsn(10));
+        marks.raise_floor(4);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("floor", 3), ("checkpoint", 40), ("floor", 4)]
+        );
+        assert_eq!((marks.floor(), marks.checkpoint()), (4, Lsn(40)));
     }
 }

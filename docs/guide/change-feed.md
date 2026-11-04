@@ -157,5 +157,20 @@ Across a writer restart, the feed follows the new writer from its own token, so 
 - **Disk:** retention keeps up to the configured bytes of log, plus any blob files that history still points to (`DatabaseInfo::feed` reports both). The log stops growing once it holds the retention: old history is recycled, never blocking a writer.
 - **Subscribers:** each delivered change is copied out of the log, and its value resolved if it was stored separately.
 
+### What a feed costs
+These numbers were measured on a Hetzner AX102: an AMD Ryzen 9 7950X3D (16 cores), an NVMe drive with power-loss protection, XFS, Linux 6.8 and io_uring. The workload was `phdb-bench ycsb-a`: 1 million rows of 100-byte values, half reads and half updates, from **one client thread** at `Durability::Buffered`. The figures are medians of 6 runs (D310, #1444, #1450).
+
+| Setup | Writer throughput vs the feed off | Delivery latency, p50 / p99 |
+|---|--:|--:|
+| Feed on, no subscriber | 0.985x | – |
+| One durable subscriber (the default) | 0.977x | 57 / 104 ms |
+| One `visible()` subscriber | 0.953x | 42 / 126 µs |
+| One durable subscriber, `GroupSync` commits | – | 1.1 / 1.5 ms |
+| One reader-process subscriber (durable), idle | 0.006 CPU-seconds/s in the reader | 102 / 106 ms |
+
+- **Durable delivery waits for a sync.** Under `Buffered` that's the feed's background sync, after 100 ms (1 s on macOS). For low latency use `visible()`, or commit at `GroupSync`, where each group's own sync covers its commits.
+- **The `GroupSync` row was measured before #1450,** so only its latency is shown. In it, the feed never added a sync of its own beside the 500,000 group syncs.
+- **An idle reader process keeps polling** with its 5 ms backoff. That costs about 0.6% of a core (0.010 CPU-s/s at 50 commits/s).
+
 ## Next
 [Reader processes](readers.md) · [Async](async.md) · [Durability](durability.md) · [Errors](errors.md)

@@ -4,8 +4,11 @@ Small database files that every later build must open, read, check and write (D2
 
 `format4/<entry>/` holds one database:
 - `data.phdb`, the main file;
-- `data.phdb-wal-N`, the WAL files of an entry left crashed (`wal_crash`). The clean entries closed cleanly, so they have none;
-- `expected.txt`, every cell the generating build read back, one per line: table, row (hex), family, qualifier (hex), timestamp, value.
+- `data.phdb-wal-N`, the WAL files of an entry left crashed (`wal_crash`), or of one whose change feed retains history (`feed`). The other clean entries closed cleanly, so they have none;
+- `data.phdb-feed`, the change feed's sidecar, in the `feed` entries;
+- `expected.txt`, every cell the generating build read back, one per line: table, row (hex), family, qualifier (hex), timestamp, value. A vector value is its element, dimension and stored bytes;
+- `expected-extra.txt`, in the entries built on the public API: what the generating build's text index, vector index or memory store `verify` reported, or the commits a feed resumed from a stored token delivered. The check compares what the checking build reads with it;
+- `refused-by-1.0.0.txt`, in an entry that uses a feature 1.0.0 lacks: the `incompat` bits the refusal names (see below).
 
 | Entry | What it holds |
 |---|---|
@@ -18,6 +21,12 @@ Small database files that every later build must open, read, check and write (D2
 | `families` | every family setting the manifest records (TTL, version limit, bloom bits, block size, cache priority, tiered and FIFO compaction), flushed three times and compacted, beside a table created, written, flushed and dropped |
 | `wal_ops` | 2 shards, a flushed base, then one synced batch per operation (bytes, i64 and f64 puts, every delete kind, counter increments, merge operands, a separated value, rows on both shards, a row deleted) a process crash left only in the WAL |
 | `checkpoints` | a counter family whose reads kept D291 bases, flushed: level 0 holds the bases beside increments flushed after them |
+| `aggregates` | min, max, HLL, bitwise, `f64`, exact-sum, mean/variance, histogram, quantile, bloom and set families (D294, D298, `incompat` bit 0), with their `kind_params`; flushed, then flushed and compacted so compaction folds the bases, then more a process crash left in the WAL |
+| `vectors` | vector families of every element (`f32`, `f16`, `bf16`, `i8`, bits; value tag 0x04, `incompat` bit 0), flushed and compacted with a version and a delete on top, and a `pigeonhole-vector` IVF index whose lists split, with deletes |
+| `text` | a `pigeonhole-text` index with positions over a source column, written in the documents' transactions, with a rewrite and a delete (its statistics are aggregate families, so `incompat` bit 0) |
+| `memory` | a `pigeonhole-memory` store with an embedding model, its text index and its IVF index, over two namespaces, with a link, a supersede, uses and a delete |
+| `feed` | the change feed on: 300 commits to two tables over several WAL segments, flushed twice and closed cleanly, so the WAL and the sidecar keep the history; a subscriber's token from before the first commit is stored in a table, and the check resumes from it |
+| `feed_crash` | the same, left by a process crash |
 
 The check copies each entry to a temporary directory, opens it with the real filesystem, and compares every cell with `expected.txt`. It then writes a row through a flush and a compaction, closes, runs the offline check, reopens, and reads everything again.
 
@@ -25,9 +34,9 @@ The check copies each entry to a temporary directory, opens it with the real fil
 
 ## Release corpus
 
-`v1.0.0/` holds the files written by the 1.0.0 release build ([FORMAT.md §13](../../../../FORMAT.md#13-compatibility-promise): "a corpus of files written by the 1.0 release that every later build opens in CI"). Until the release it holds only its README.
-- **Writing it:** at the release, `scripts/release-corpus.sh 1.0.0` runs `generate_corpus` from the release build with `PIGEONHOLE_CORPUS_RELEASE=1.0.0`. That writes every entry above, plus `frozen.txt` with each file's length and xxh3-64. The generator refuses a version other than the build's own, and refuses to rewrite a corpus that has a `frozen.txt`.
-- **The check:** `release_corpus_entries_open_read_check_and_write` checks every release corpus. Its files must match `frozen.txt` byte for byte, and each entry must pass the same open, read, write and check as `format4/`. A build that fails it breaks the promise: fix the build, never the corpus.
+`v1.0.0/` holds the files written by the 1.0.0 release build ([FORMAT.md §13](../../../../FORMAT.md#13-compatibility-promise): "a corpus of files written by the 1.0 release that every later build opens in CI"). `v1.1.0/` will hold the 1.1.0 release build's, the first release to write the structures from `aggregates` on (owner, 2026-11-04). Until its release, a release corpus holds only its README.
+- **Writing it:** at the release, `scripts/release-corpus.sh <version>` runs `generate_corpus` from the release build with `PIGEONHOLE_CORPUS_RELEASE=<version>`. That writes every entry `tests/corpus.rs` has then, plus `frozen.txt` with each file's length and xxh3-64. The generator refuses a version other than the build's own, and refuses to rewrite a corpus that has a `frozen.txt`.
+- **The check:** `release_corpus_entries_open_read_check_and_write` checks every release corpus. Its files must match `frozen.txt` byte for byte, and each entry must pass the same open, read, write and check as `format4/`, with its `expected-extra.txt` where it has one. Entries are never removed from `tests/corpus.rs`, so every release corpus's entries are the current build's. A build that fails it breaks the promise: fix the build, never the corpus.
 
 ## Newer files with 1.0.0
 
