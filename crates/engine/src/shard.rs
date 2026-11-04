@@ -6854,6 +6854,51 @@ impl ShardState {
             }
         }
         self.spawn_flush(ctx);
+        // SCRATCH #1497: the state of a wait that has lasted over a second.
+        if let Some(w) = &self.room_wait {
+            let age = now.saturating_sub(w.since);
+            if age > 1_000_000_000 {
+                let bucket = match age / 1_000_000_000 {
+                    1..=4 => "1-5s",
+                    5..=14 => "5-15s",
+                    _ => "15s+",
+                };
+                let mib = |b: usize| b >> 20;
+                let shm = &self.shared.shm;
+                let deferred_slots = self
+                    .memtables
+                    .values()
+                    .filter(|s| s.seal == Seal::Open && s.active.max_seqno() > shm.durable_seqno())
+                    .count();
+                crate::scratch_room::record(format!(
+                    "{bucket} flush_running {} queued {} frozen-slots {} to_freeze {} freeze_deferred {} starved_all {} retry {} | prepared {} unresolved {} pending {} | free {} MiB reserved {} MiB deferred {} MiB retired-for-readers {} | visible-durable {} open-above-durable {} | op {}",
+                    self.flush_running,
+                    self.flush_queue.len(),
+                    self.memtables
+                        .values()
+                        .filter(|s| !s.frozen.is_empty())
+                        .count(),
+                    self.to_freeze.len(),
+                    self.freeze_deferred,
+                    self.starved_all,
+                    self.flush_retry.is_some(),
+                    self.prepared.len(),
+                    self.unresolved.len(),
+                    self.pending.len(),
+                    mib(self.arena.free_bytes()),
+                    mib(self.reserved),
+                    mib(self.arena.scratch_deferred_chunks() * self.chunk_size),
+                    self.retired.len(),
+                    shm.visible_seqno()
+                        .saturating_sub(shm.durable_seqno())
+                        .min(1000)
+                        / 10
+                        * 10,
+                    deferred_slots,
+                    self.op.is_some(),
+                ));
+            }
+        }
         // On a frozen clock with nothing in flight, nothing the shard will hear of can free
         // room (in-process snapshots hold what is left) and the timeout never comes: refuse
         // now (issue #70). A moving clock waits for the timeout (D124), since a reader may

@@ -507,6 +507,14 @@ impl ShardArena {
         self.release_unreferenced();
     }
 
+    /// SCRATCH #1497: chunks held by deferred (retired, still referenced) memtables.
+    pub fn scratch_deferred_chunks(&self) -> usize {
+        self.deferred
+            .iter()
+            .map(|r| r.runs.iter().map(|run| run.count as usize).sum::<usize>())
+            .sum()
+    }
+
     /// Frees every deferred memtable whose token holds the last in-process reference.
     fn release_unreferenced(&mut self) {
         let mut i = 0;

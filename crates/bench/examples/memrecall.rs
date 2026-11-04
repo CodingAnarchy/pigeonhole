@@ -592,6 +592,7 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
         json!({"mode": "ivf-build", "memories": rest.len(), "sparse": sparse_n,
                "seconds": t.elapsed().as_secs_f64(), "busy_retries": busy})
     );
+    pigeonhole_engine::scratch_room_report("build");
     for ns in ["big", "sparse"] {
         for (name, only) in [("fused", None), ("vector", Some(0))] {
             let mut lat = [Vec::new(), Vec::new()];
@@ -695,6 +696,7 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
                 percentile(&mut lat, 1.0),
             )
         };
+        pigeonhole_engine::scratch_room_report(&format!("threads={threads}"));
         println!(
             "{}",
             json!({
