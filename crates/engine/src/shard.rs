@@ -4800,6 +4800,16 @@ impl ShardState {
                 // Otherwise keep writing into this one; the arena-room check defers later
                 // commits until a flush frees space, and a `flush` or `compact` caller
                 // waits until this one freezes too.
+                crate::scratch_freezes::record(
+                    if ROOM { "STARVED-room" } else { "STARVED" },
+                    format!(
+                        "free {} KiB flush_running {} queued {}",
+                        self.arena.free_bytes() / 1024 / 64 * 64,
+                        self.flush_running,
+                        self.flush_queue.len()
+                    ),
+                    slot.active.table.allocated_bytes() as u64,
+                );
                 starved = true;
                 continue;
             };
