@@ -7,13 +7,16 @@
 //! or fails as it would have, and a lost reply is logged and counted.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use pigeonhole::{KeySet, KeysPosition, Pigeonhole, RowPosition, Table};
+use pigeonhole::{KeySet, KeysPosition, Pigeonhole, RowPosition, ScanPosition, Table};
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::auth::{Caller, Scope};
 use super::config::Limits;
@@ -37,6 +40,7 @@ pub(crate) enum ServiceOp {
     CheckAndMutate(proto::CheckAndMutateRequest),
     Batch(proto::BatchRequest),
     MutateReturning(proto::MutateRequest),
+    Scan(proto::ScanRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -51,6 +55,54 @@ pub(crate) enum ServiceReply {
     Mutate(proto::MutateResponse),
     CheckAndMutate(proto::CheckAndMutateResponse),
     MutateReturning(proto::MutateReturningResponse),
+    Scan(ScanPages),
+}
+
+/// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
+/// #1510). The scan task keeps a handle on it, so a client that stops reading loses the page
+/// and the budget comes back (G2): the page is taken out of the slot by whichever comes first,
+/// the client or the task's idle timeout.
+type PageSlot = Arc<std::sync::Mutex<Option<(proto::ScanPage, OwnedSemaphorePermit)>>>;
+
+/// A scan's pages as the scan task reads them, then its error if it failed. The task reads a
+/// page ahead at most, so a slow client holds back the reading, not the memory. A page's
+/// budget is released when the page is handed to the transport (this stream yields it).
+#[derive(Debug)]
+pub(crate) struct ScanPages {
+    pages: mpsc::Receiver<PageSlot>,
+    /// The error the stream ends with, sent before `pages` closes.
+    end: Option<oneshot::Receiver<ApiError>>,
+}
+
+impl futures_core::Stream for ScanPages {
+    type Item = Result<proto::ScanPage, ApiError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.pages.poll_recv(cx) {
+                Poll::Ready(Some(slot)) => {
+                    let taken = slot.lock().ok().and_then(|mut s| s.take());
+                    if let Some((page, budget)) = taken {
+                        drop(budget);
+                        return Poll::Ready(Some(Ok(page)));
+                    }
+                    // The task took it back (idle timeout): its error follows.
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let Some(end) = self.end.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let out = match Pin::new(end).poll(cx) {
+            Poll::Ready(Ok(e)) => Some(Err(e)),
+            Poll::Ready(Err(_)) => None,
+            Poll::Pending => return Poll::Pending,
+        };
+        self.end = None;
+        Poll::Ready(out)
+    }
 }
 
 impl ServiceOp {
@@ -64,6 +116,7 @@ impl ServiceOp {
             Self::CheckAndMutate(_) => 4,
             Self::Batch(_) => 5,
             Self::MutateReturning(_) => 6,
+            Self::Scan(_) => SCAN,
         }
     }
 
@@ -77,12 +130,13 @@ impl ServiceOp {
             Self::CheckAndMutate(_) => "Data.CheckAndMutate",
             Self::Batch(_) => "Data.Batch",
             Self::MutateReturning(_) => "Data.MutateReturning",
+            Self::Scan(_) => "Data.Scan",
         }
     }
 
     fn scope(&self) -> Scope {
         match self {
-            Self::Get(_) | Self::MultiGet(_) | Self::ReadRow(_) => Scope::Read,
+            Self::Get(_) | Self::MultiGet(_) | Self::ReadRow(_) | Self::Scan(_) => Scope::Read,
             _ => Scope::Write,
         }
     }
@@ -96,12 +150,16 @@ impl ServiceOp {
             Self::Mutate(r) | Self::MutateReturning(r) => r.encoded_len(),
             Self::CheckAndMutate(r) => r.encoded_len(),
             Self::Batch(r) => r.encoded_len(),
+            Self::Scan(r) => r.encoded_len(),
         }
     }
 }
 
+/// `Data.Scan`'s index in `RPCS`: its outcome is counted when its stream ends.
+pub(crate) const SCAN: usize = 7;
+
 /// The RPCs, by `ServiceOp::index`.
-pub(crate) const RPCS: [&str; 7] = [
+pub(crate) const RPCS: [&str; 8] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -109,6 +167,7 @@ pub(crate) const RPCS: [&str; 7] = [
     "Data.CheckAndMutate",
     "Data.Batch",
     "Data.MutateReturning",
+    "Data.Scan",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -156,12 +215,23 @@ pub(crate) const OUTCOMES: [&str; 40] = [
     "other",
 ];
 
-/// Request counts by RPC and outcome, sheds, and the replies lost after a write's outcome
-/// was known. A fixed table of atomics: one relaxed add per request, no lock and no
-/// allocation (perf287's F3 on #1501). Ticket 9 moves these onto D316's names.
+/// The duration histogram's bucket bounds, in microseconds: 100 µs to 10 s.
+const BUCKETS_US: [u64; 16] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000, 10_000_000,
+];
+
+/// Request counts by RPC and outcome, each RPC's durations, sheds, and the replies lost
+/// after a write's outcome was known. Fixed tables of atomics: a few relaxed adds per
+/// request, no lock and no allocation (perf287's F3 on #1501). Ticket 9 moves these onto
+/// D316's names.
 #[derive(Debug)]
 pub(crate) struct Metrics {
     requests: [[AtomicU64; OUTCOMES.len()]; RPCS.len()],
+    /// Per RPC: the count in each bucket (not cumulative; the last is past the last bound).
+    durations: [[AtomicU64; BUCKETS_US.len() + 1]; RPCS.len()],
+    /// Per RPC: the durations' sum, in microseconds.
+    duration_sum_us: [AtomicU64; RPCS.len()],
     pub(crate) shed: AtomicU64,
     pub(crate) replies_lost: AtomicU64,
 }
@@ -170,6 +240,8 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            durations: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            duration_sum_us: std::array::from_fn(|_| AtomicU64::new(0)),
             shed: AtomicU64::new(0),
             replies_lost: AtomicU64::new(0),
         }
@@ -177,8 +249,9 @@ impl Default for Metrics {
 }
 
 impl Metrics {
-    /// Counts one request of RPC `rpc` (`ServiceOp::index`) with outcome `code` (`None`: ok).
-    pub(crate) fn count(&self, rpc: usize, code: Option<&str>) {
+    /// Counts one request of RPC `rpc` (`ServiceOp::index`) with outcome `code` (`None`:
+    /// ok) that took `took`: from its decoded request to its reply, or to a stream's end.
+    pub(crate) fn count(&self, rpc: usize, code: Option<&str>, took: Duration) {
         let outcome = match code {
             None => 0,
             Some(c) => OUTCOMES
@@ -186,9 +259,14 @@ impl Metrics {
                 .position(|o| *o == c)
                 .unwrap_or(OUTCOMES.len() - 1),
         };
-        if let Some(row) = self.requests.get(rpc) {
-            row[outcome].fetch_add(1, Ordering::Relaxed);
-        }
+        let Some(row) = self.requests.get(rpc) else {
+            return;
+        };
+        row[outcome].fetch_add(1, Ordering::Relaxed);
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        let bucket = BUCKETS_US.partition_point(|&b| b < us);
+        self.durations[rpc][bucket].fetch_add(1, Ordering::Relaxed);
+        self.duration_sum_us[rpc].fetch_add(us, Ordering::Relaxed);
     }
 
     /// Prometheus text: the server's counters, and the engine's `async_sync_reads`
@@ -207,6 +285,40 @@ impl Metrics {
                     );
                 }
             }
+        }
+        let _ = writeln!(
+            out,
+            "# TYPE pigeonhole_serve_request_duration_seconds histogram"
+        );
+        for (rpc, (buckets, sum)) in RPCS
+            .iter()
+            .zip(self.durations.iter().zip(&self.duration_sum_us))
+        {
+            let mut seen = 0;
+            let mut lines = String::new();
+            for (i, n) in buckets.iter().enumerate() {
+                seen += n.load(Ordering::Relaxed);
+                let le = BUCKETS_US
+                    .get(i)
+                    .map_or_else(|| "+Inf".to_owned(), |&b| (b as f64 / 1e6).to_string());
+                let _ = writeln!(
+                    lines,
+                    "pigeonhole_serve_request_duration_seconds_bucket{{rpc=\"{rpc}\",le=\"{le}\"}} {seen}"
+                );
+            }
+            if seen == 0 {
+                continue;
+            }
+            out.push_str(&lines);
+            let sum = sum.load(Ordering::Relaxed) as f64 / 1e6;
+            let _ = writeln!(
+                out,
+                "pigeonhole_serve_request_duration_seconds_sum{{rpc=\"{rpc}\"}} {sum}"
+            );
+            let _ = writeln!(
+                out,
+                "pigeonhole_serve_request_duration_seconds_count{{rpc=\"{rpc}\"}} {seen}"
+            );
         }
         let _ = writeln!(out, "# TYPE pigeonhole_serve_shed_total counter");
         let _ = writeln!(
@@ -240,6 +352,11 @@ pub(crate) struct Service {
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
     blocking: Arc<Semaphore>,
+    /// Scans streaming at once (`--max-scans`).
+    scans: Arc<Semaphore>,
+    /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
+    /// every blocking thread from the other calls (perf287's G3 on #1510).
+    scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
 }
@@ -266,6 +383,8 @@ impl Service {
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
+            scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
+            scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
         }
@@ -281,6 +400,15 @@ impl Service {
     /// front-end that knows a request's size before reading it (HTTP's `Content-Length`).
     pub(crate) async fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
         self.budget(bytes).await
+    }
+
+    /// `reserve`, waiting at most `wait`.
+    pub(crate) async fn reserve_within(
+        &self,
+        bytes: usize,
+        wait: Duration,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        budget_within(&self.inflight, bytes, wait).await
     }
 
     /// Answers `op` for `caller`: the scope check, the in-flight bytes budget (unless the
@@ -299,11 +427,10 @@ impl Service {
             return Err(ApiError::request_too_large(self.limits.max_request_bytes));
         }
         // The budget is held until the reply is built (R3). Waiting for it counts against
-        // the request's deadline; nothing has been submitted while it waits. HTTP reserves
-        // it from `Content-Length` before reading the body; gRPC's is taken here, after
-        // tonic decoded the message, until ticket 3b reserves it from the HTTP/2 message
-        // length (perf287's F2 on #1501). Meanwhile each connection's HTTP/2 streams are
-        // capped (`listener::MAX_STREAMS`).
+        // the request's deadline; nothing has been submitted while it waits. Both front-ends
+        // reserve it before reading the message (perf287's F2 on #1501): HTTP from
+        // `Content-Length`, gRPC from the message header (`grpc::prepay`). It's taken here
+        // only for a call that comes without one.
         // Reads hold the budget until their reply is built; a write hands it to its
         // detached task, so a client that goes away doesn't free bytes the write still
         // holds (simp724's S1 on #1501).
@@ -312,21 +439,28 @@ impl Service {
             None => self.budget(size).await?,
         };
         match op {
+            // A read that fails on `Io` changed nothing, so it may be sent
+            // again (`retry_from` REQUEST, ICR 0112).
             ServiceOp::Get(r) => {
                 let reply = self.get(r).await.map(ServiceReply::Get);
                 drop(budget);
-                reply
+                reply.map_err(ApiError::for_read)
             }
             ServiceOp::MultiGet(r) => {
                 let reply = self.multi_get(r).await.map(ServiceReply::MultiGet);
                 drop(budget);
-                reply
+                reply.map_err(ApiError::for_read)
             }
             ServiceOp::ReadRow(r) => {
                 let reply = self.read_row(r).await.map(ServiceReply::ReadRow);
                 drop(budget);
-                reply
+                reply.map_err(ApiError::for_read)
             }
+            ServiceOp::Scan(r) => self
+                .scan(r, budget)
+                .await
+                .map(ServiceReply::Scan)
+                .map_err(ApiError::for_read),
             ServiceOp::Mutate(r) => self.mutate(r, budget).await.map(ServiceReply::Mutate),
             ServiceOp::CheckAndMutate(r) => self
                 .check_and_mutate(r, budget)
@@ -341,19 +475,7 @@ impl Service {
     }
 
     async fn budget(&self, size: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-        let n = u32::try_from(size.max(1)).unwrap_or(u32::MAX);
-        match tokio::time::timeout(
-            self.limits.request_timeout,
-            Arc::clone(&self.inflight).acquire_many_owned(n),
-        )
-        .await
-        {
-            Ok(Ok(p)) => Ok(p),
-            Ok(Err(_)) => Err(ApiError::internal("the in-flight budget closed")),
-            Err(_) => Err(ApiError::overloaded(
-                "the server's in-flight request bytes stayed full past the deadline",
-            )),
-        }
+        budget_within(&self.inflight, size, self.limits.request_timeout).await
     }
 
     /// The table `name`, opened on first use. A miss opens it on the blocking pool (an open
@@ -380,13 +502,7 @@ impl Service {
         &self,
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let _permit = Arc::clone(&self.blocking)
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal("the blocking pool closed"))?;
-        tokio::task::spawn_blocking(f)
-            .await
-            .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
+        blocking(&self.blocking, f).await
     }
 
     /// Runs a write as its own task and awaits its outcome (B2). If the request goes away
@@ -535,6 +651,70 @@ impl Service {
         .await
     }
 
+    /// A scan as a stream of pages (ICR 0112): each page is one `read_within` on the
+    /// blocking pool (D196: scan pages are sync-only), resumed from the last, until the range
+    /// or `limit` runs out. Each page is a new read, at its own snapshot (simp724's D1 on
+    /// #1510). The request is checked before the stream starts, so a bad one fails the call;
+    /// a failure later ends the stream with the error, a panic in the task as `Internal`. The
+    /// scan holds a `--max-scans` slot until its stream ends: a stream outlives its request's
+    /// `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read holds
+    /// no blocking thread.
+    async fn scan(
+        &self,
+        r: proto::ScanRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<ScanPages, ApiError> {
+        let Ok(slot) = Arc::clone(&self.scans).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent scan limit",
+            ));
+        };
+        convert::Select::new(r.selection.as_ref())?;
+        let after = if r.after.is_empty() {
+            None
+        } else {
+            Some(ScanPosition::from_bytes(&r.after).map_err(ApiError::from)?)
+        };
+        let table = self.table(&r.table).await?;
+        // The request's bytes are decoded and checked: the stream holds pages, not them.
+        drop(budget);
+        let (tx, rx) = mpsc::channel(1);
+        let (end_tx, end_rx) = oneshot::channel();
+        let task = ScanTask {
+            table,
+            r,
+            after,
+            pool: Arc::clone(&self.blocking),
+            reads: Arc::clone(&self.scan_reads),
+            inflight: Arc::clone(&self.inflight),
+            limits: self.limits,
+            pages: tx,
+        };
+        let metrics = Arc::clone(&self.metrics);
+        let started = Instant::now();
+        tokio::spawn(async move {
+            // Its own task, so a panic is a `JoinError` here, and the stream ends with
+            // `Internal` rather than looking like a clean end (simp724's B1 on #1510).
+            let outcome = match tokio::spawn(task.run()).await {
+                Ok(outcome) => outcome.map_err(ApiError::for_read),
+                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
+            };
+            metrics.count(
+                SCAN,
+                outcome.as_ref().err().map(|e| e.code.as_str()),
+                started.elapsed(),
+            );
+            drop(slot);
+            if let Err(e) = outcome {
+                let _ = end_tx.send(e);
+            }
+        });
+        Ok(ScanPages {
+            pages: rx,
+            end: Some(end_rx),
+        })
+    }
+
     async fn mutate(
         &self,
         r: proto::MutateRequest,
@@ -677,5 +857,203 @@ fn page_bytes(asked: u64) -> u64 {
         DEFAULT_PAGE_BYTES
     } else {
         asked.min(MAX_PAGE_BYTES)
+    }
+}
+
+/// Runs a sync-only call on the blocking pool, holding one of `pool`'s permits.
+async fn blocking<T: Send + 'static>(
+    pool: &Arc<Semaphore>,
+    f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let _permit = Arc::clone(pool)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("the blocking pool closed"))?;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
+}
+
+/// A scan's reading side, run as its own task.
+struct ScanTask {
+    table: Table,
+    r: proto::ScanRequest,
+    after: Option<ScanPosition>,
+    pool: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
+    inflight: Arc<Semaphore>,
+    limits: Limits,
+    pages: mpsc::Sender<PageSlot>,
+}
+
+impl ScanTask {
+    /// Reads the pages into `pages` until the scan ends or the client goes away.
+    ///
+    /// The row `limit` spans pages. A page cut inside a row resumes in that row, and the
+    /// engine's `limit` counts the continued row again, so a read after a row asks for one
+    /// more row than remain. A page that comes back with too many is cut here: it is the
+    /// scan's last page, so no position is needed past the cut. That includes a page whose
+    /// continued row was deleted between pages, so all its rows are new (simp724's B1 on
+    /// #1510). A page with exactly the rows that remain ends the scan unless its budget
+    /// stopped it (`cut_by_budget`), which may have cut its last row; the next read finishes
+    /// that row.
+    ///
+    /// Each page waits, in turn: for the client to take the page before it (at most
+    /// `--stream-idle-ms`, perf287's G2), for one of the scans' blocking threads (G3), and for
+    /// its share of the in-flight budget (G1, at most the request timeout).
+    async fn run(self) -> Result<(), ApiError> {
+        let Self {
+            table,
+            r,
+            mut after,
+            pool,
+            reads,
+            inflight,
+            limits,
+            pages,
+        } = self;
+        let r = Arc::new(r);
+        let budget = page_bytes(r.page_bytes);
+        let mut remaining = (r.limit > 0).then_some(r.limit);
+        // The row the last page ended in (or the client's position is in): a page that
+        // starts with it continues that row.
+        let mut last_row: Option<Vec<u8>> = after.as_ref().map(|p| p.row().to_vec());
+        // The page the client hasn't taken yet, for the idle timeout to take back.
+        let mut queued: Option<PageSlot> = None;
+        loop {
+            let Some(space) = room(&pages, &mut queued, limits.stream_idle).await? else {
+                return Ok(());
+            };
+            let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
+            let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
+            let thread = Arc::clone(&reads)
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal("the scan threads closed"))?;
+            let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
+                let select = convert::Select::new(req.selection.as_ref())?;
+                let mut scan = select.scan(&table, req.range.as_ref())?;
+                if let Some(n) = limit {
+                    scan = scan.limit(n);
+                }
+                if let Some(p) = &pos {
+                    scan = scan.resume_after(p);
+                }
+                let page = scan.read_within(budget)?;
+                let q = select.aggregate();
+                let rows: Vec<proto::Row> = page
+                    .rows()
+                    .iter()
+                    .map(|row| convert::row(row.view(), q))
+                    .collect();
+                Ok((
+                    rows,
+                    page.resume().cloned(),
+                    page.bytes(),
+                    page.cut_by_budget(),
+                ))
+            })
+            .await?;
+            drop(thread);
+            let continued = matches!(
+                (&last_row, rows.first()),
+                (Some(p), Some(first)) if first.key[..] == p[..]
+            );
+            if let Some(n) = remaining {
+                let new_rows = rows.len() as u64 - u64::from(continued);
+                if new_rows > n {
+                    // More rows than remain: the ones past the limit go, and every row kept
+                    // is whole, since another row followed it.
+                    rows.truncate(
+                        usize::try_from(n).unwrap_or(usize::MAX) + usize::from(continued),
+                    );
+                    bytes = rows.iter().map(row_bytes).sum();
+                    next = None;
+                } else if new_rows == n && !cut {
+                    // The limit (or the range's end) stopped the page, after a whole row.
+                    next = None;
+                }
+                // Otherwise the budget stopped the page, perhaps inside its last row: the
+                // next read (limit 1, for the continued row) finishes it.
+                remaining = Some(n.saturating_sub(new_rows));
+            }
+            if let Some(last) = rows.last() {
+                last_row = Some(last.key.to_vec());
+            }
+            // An empty page with a position (a budget too small for anything) ends the
+            // stream too, with the position, rather than reading the same nothing again: only
+            // an empty `next` says the scan finished (simp724's D2 on #1510).
+            let end = next.is_none() || rows.is_empty();
+            let page = proto::ScanPage {
+                rows,
+                next: next
+                    .as_ref()
+                    .map(|p| p.to_bytes().into())
+                    .unwrap_or_default(),
+                bytes,
+            };
+            // The page's share of the budget, capped so one scan can't take it all: a page
+            // over `--max-request-bytes` (one huge cell) takes the cap.
+            let share = usize::try_from(page.bytes)
+                .unwrap_or(usize::MAX)
+                .min(limits.max_request_bytes);
+            let paid = budget_within(&inflight, share, limits.request_timeout).await?;
+            let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
+            space.send(Arc::clone(&slot));
+            queued = Some(slot);
+            if end {
+                // The stream ends once the client has the last page, or the idle timeout
+                // takes it back: an unread page doesn't keep its budget.
+                room(&pages, &mut queued, limits.stream_idle).await?;
+                return Ok(());
+            }
+            after = next;
+        }
+    }
+}
+
+/// Room in `pages` for the next page, once the client has taken the last one; `None` if the
+/// client went away. A client that stays connected without reading for `idle` loses its
+/// unread page (`queued`), whose budget comes back, and the stream ends with
+/// `DeadlineExceeded`: the last page it did take has the position to resume from.
+async fn room<'a>(
+    pages: &'a mpsc::Sender<PageSlot>,
+    queued: &mut Option<PageSlot>,
+    idle: Duration,
+) -> Result<Option<mpsc::Permit<'a, PageSlot>>, ApiError> {
+    match tokio::time::timeout(idle, pages.reserve()).await {
+        Ok(Ok(room)) => Ok(Some(room)),
+        Ok(Err(_)) => Ok(None),
+        Err(_) => {
+            if let Some(slot) = queued.take() {
+                drop(slot.lock().ok().and_then(|mut s| s.take()));
+            }
+            Err(ApiError::deadline(format!(
+                "the client took no scan page for --stream-idle-ms ({} ms); resume from the \
+                 last page's next",
+                idle.as_millis()
+            )))
+        }
+    }
+}
+
+/// A row's size by D308's measure as the converted cells give it: its key and its cells.
+fn row_bytes(row: &proto::Row) -> u64 {
+    row.key.len() as u64 + row.cells.iter().map(convert::cell_bytes).sum::<u64>()
+}
+
+/// Takes `size` bytes of `inflight`, waiting at most `wait`.
+async fn budget_within(
+    inflight: &Arc<Semaphore>,
+    size: usize,
+    wait: Duration,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    let n = u32::try_from(size.max(1)).unwrap_or(u32::MAX);
+    match tokio::time::timeout(wait, Arc::clone(inflight).acquire_many_owned(n)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(_)) => Err(ApiError::internal("the in-flight budget closed")),
+        Err(_) => Err(ApiError::overloaded(
+            "the server's in-flight request bytes stayed full past the deadline",
+        )),
     }
 }

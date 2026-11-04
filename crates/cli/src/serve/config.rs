@@ -45,10 +45,19 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
+    /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
+    /// outlives its request's slot in `--max-concurrent`, so it has its own cap.
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    pub max_scans: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
     /// server has submitted always answers its real outcome, however long it takes.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub request_timeout_ms: u64,
+    /// How long a scan waits for its client to take a page, in milliseconds. Past that, the
+    /// stream ends with `DeadlineExceeded`, and the client resumes from its last page's
+    /// `next`: a client that stops reading doesn't hold its scan slot and a page forever.
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub stream_idle_ms: u64,
     /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
     /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
     /// blocking threads compete only while blocking calls run.
@@ -68,7 +77,9 @@ pub(crate) struct Limits {
     pub max_request_bytes: usize,
     pub inflight_bytes: usize,
     pub max_concurrent: usize,
+    pub max_scans: usize,
     pub request_timeout: Duration,
+    pub stream_idle: Duration,
 }
 
 impl ServeArgs {
@@ -77,7 +88,9 @@ impl ServeArgs {
             max_request_bytes: self.max_request_bytes,
             inflight_bytes: self.inflight_bytes.max(self.max_request_bytes),
             max_concurrent: self.max_concurrent.max(1),
+            max_scans: self.max_scans.max(1),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
+            stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
         }
     }
 }

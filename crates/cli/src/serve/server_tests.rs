@@ -29,7 +29,9 @@ fn limits() -> Limits {
         max_request_bytes: 1 << 20,
         inflight_bytes: 16 << 20,
         max_concurrent: 64,
+        max_scans: 4,
         request_timeout: Duration::from_secs(5),
+        stream_idle: Duration::from_secs(5),
     }
 }
 
@@ -634,4 +636,504 @@ fn a_body_without_a_length_is_refused_before_it_is_read() {
     let _ = tcp.read_to_string(&mut reply);
     assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
     assert!(reply.contains("Content-Length"), "{reply}");
+}
+
+/// Rows `r00`..`r29` with three 400-byte cells each, and `x1` outside the `r` prefix.
+fn seed_rows(s: &Server, c: &mut DataClient<tonic::transport::Channel>) {
+    let mut rows: Vec<String> = (0..30).map(|i| format!("r{i:02}")).collect();
+    rows.push("x1".into());
+    for row in rows {
+        let writes = (0..3)
+            .map(|q| proto::Write {
+                op: Some(proto::write::Op::Put(proto::Put {
+                    family: "f".into(),
+                    qualifier: format!("q{q}").into_bytes().into(),
+                    timestamp: None,
+                    value: Some(proto::Value {
+                        kind: Some(proto::value::Kind::Bytes(vec![b'v'; 400].into())),
+                    }),
+                })),
+            })
+            .collect();
+        s.block_on(c.mutate(proto::MutateRequest {
+            writes: Some(proto::RowWrites {
+                row: Some(proto::RowKey {
+                    table: "t".into(),
+                    row: row.into_bytes().into(),
+                }),
+                writes,
+            }),
+            durability: 0,
+        }))
+        .unwrap();
+    }
+}
+
+fn scan_request(page_bytes: u64, limit: u64, after: Vec<u8>) -> proto::ScanRequest {
+    proto::ScanRequest {
+        table: "t".into(),
+        range: Some(proto::KeyRange {
+            range: Some(proto::key_range::Range::Prefix(b"r".to_vec().into())),
+        }),
+        limit,
+        page_bytes,
+        after: after.into(),
+        ..Default::default()
+    }
+}
+
+/// Pages' rows joined: a row a page cut continues at the start of the next page.
+fn join(pages: &[proto::ScanPage]) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    for page in pages {
+        for row in &page.rows {
+            let cells = row.cells.iter().map(|c| c.qualifier.to_vec());
+            match out.last_mut() {
+                Some((key, have)) if key[..] == row.key[..] => have.extend(cells),
+                _ => out.push((row.key.to_vec(), cells.collect())),
+            }
+        }
+    }
+    out
+}
+
+fn grpc_scan(
+    s: &Server,
+    c: &mut DataClient<tonic::transport::Channel>,
+    req: proto::ScanRequest,
+) -> Vec<proto::ScanPage> {
+    s.block_on(async {
+        let mut stream = c.scan(req).await.unwrap().into_inner();
+        let mut pages = Vec::new();
+        while let Some(page) = stream.message().await.unwrap() {
+            pages.push(page);
+        }
+        pages
+    })
+}
+
+fn whole_rows(n: usize) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    (0..n)
+        .map(|i| {
+            (
+                format!("r{i:02}").into_bytes(),
+                (0..3).map(|q| format!("q{q}").into_bytes()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_scan_streams_every_row_once_in_byte_budgeted_pages() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let pages = grpc_scan(&s, &mut c, scan_request(1000, 0, Vec::new()));
+    assert!(pages.len() >= 10, "36 KB in 1 KB pages: {}", pages.len());
+    let (last, rest) = pages.split_last().unwrap();
+    assert!(last.next.is_empty(), "the last page has no position");
+    assert!(rest.iter().all(|p| !p.next.is_empty()), "the others do");
+    assert!(
+        rest.iter().all(|p| p.bytes <= 1000 + 450),
+        "only one column may go over a page's budget"
+    );
+    assert_eq!(
+        join(&pages),
+        whole_rows(30),
+        "the prefix's rows, whole, in order"
+    );
+}
+
+#[test]
+fn a_scans_limit_counts_rows_across_pages_and_resumes() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    // Pages cut inside rows: a continued row isn't counted twice.
+    let pages = grpc_scan(&s, &mut c, scan_request(1000, 7, Vec::new()));
+    assert_eq!(join(&pages), whole_rows(7));
+    assert!(pages.last().unwrap().next.is_empty());
+    // A client resumes from a page's position with the rows it still wants: a row the
+    // position is inside finishes without counting, as the client has already seen it.
+    let first = grpc_scan(&s, &mut c, scan_request(1000, 0, Vec::new()));
+    let resume = first[0].next.to_vec();
+    let mut resumed = vec![first[0].clone()];
+    resumed[0].next = Default::default();
+    let seen = join(&resumed).len();
+    assert!(
+        join(&resumed).last().unwrap().1.len() < 3,
+        "the first page ends inside a row, so the resume continues it"
+    );
+    resumed.extend(grpc_scan(&s, &mut c, scan_request(1000, 3, resume)));
+    assert_eq!(join(&resumed), whole_rows(seen + 3));
+}
+
+#[test]
+fn a_limit_holds_when_the_row_a_position_is_inside_is_deleted() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    // A position inside a row, as a 1 KB page leaves it.
+    let first = grpc_scan(&s, &mut c, scan_request(1000, 0, Vec::new()));
+    let mut taken = vec![first[0].clone()];
+    taken[0].next = Default::default();
+    let (inside, cells) = join(&taken).last().unwrap().clone();
+    assert!(cells.len() < 3, "the first page ends inside a row");
+    // That row is deleted before the next page (no snapshot_id): the resumed page asks for
+    // one row more than remain, and every row it brings is new (simp724's B1 on #1510).
+    s.block_on(c.mutate(proto::MutateRequest {
+        writes: Some(proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: "t".into(),
+                row: inside.clone().into(),
+            }),
+            writes: vec![proto::Write {
+                op: Some(proto::write::Op::DeleteRow(proto::DeleteRow {})),
+            }],
+        }),
+        durability: 0,
+    }))
+    .unwrap();
+    let pages = grpc_scan(&s, &mut c, scan_request(100_000, 3, first[0].next.to_vec()));
+    let at = whole_rows(30)
+        .iter()
+        .position(|(k, _)| *k == inside)
+        .unwrap();
+    assert_eq!(
+        join(&pages),
+        whole_rows(at + 4)[at + 1..],
+        "exactly the limit's rows, after the deleted one"
+    );
+    assert!(
+        pages.last().unwrap().next.is_empty(),
+        "and the scan finished"
+    );
+}
+
+/// A scan straight through the service: its pages are taken only when the test polls.
+fn direct_scan(s: &Server, req: proto::ScanRequest) -> super::service::ScanPages {
+    let service = &s.shared.router.service;
+    match s
+        .block_on(service.call(ServiceOp::Scan(req), &Caller::anonymous(), None))
+        .unwrap()
+    {
+        super::service::ServiceReply::Scan(pages) => pages,
+        _ => unreachable!(),
+    }
+}
+
+/// The scan's next item, or `None` if none comes within `wait`.
+fn next_within(
+    s: &Server,
+    pages: &mut super::service::ScanPages,
+    wait: Duration,
+) -> Option<Option<Result<proto::ScanPage, super::errors::ApiError>>> {
+    use futures_core::Stream as _;
+    s.block_on(async {
+        tokio::time::timeout(
+            wait,
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut *pages).poll_next(cx)),
+        )
+        .await
+    })
+    .ok()
+}
+
+fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ok() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn scan_pages_hold_the_in_flight_budget_until_taken() {
+    // Room for one page, not two: a full page of a 1 KB budget is over 1 KB (perf287's G1
+    // on #1510).
+    let mut l = limits();
+    l.inflight_bytes = 1500;
+    let s = Server::start("", l);
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let service = &s.shared.router.service;
+    let mut a = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    wait_for("scan a's first page takes its budget", || {
+        service.inflight_available() < 1500
+    });
+    // Scan b's first page waits for the budget a's unread page holds.
+    let mut b = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    assert!(
+        next_within(&s, &mut b, Duration::from_millis(300)).is_none(),
+        "b waits while a's page holds the budget"
+    );
+    // Once a's page is taken, its budget goes to b, which waited first.
+    assert!(matches!(
+        next_within(&s, &mut a, Duration::from_secs(5)),
+        Some(Some(Ok(_)))
+    ));
+    assert!(matches!(
+        next_within(&s, &mut b, Duration::from_secs(5)),
+        Some(Some(Ok(_)))
+    ));
+    drop((a, b));
+    wait_for("both scans' budget comes back", || {
+        service.inflight_available() == 1500
+    });
+}
+
+#[test]
+fn a_client_that_stops_reading_loses_its_scan_after_the_idle_timeout() {
+    let mut l = limits();
+    l.max_scans = 1;
+    l.stream_idle = Duration::from_millis(200);
+    let s = Server::start("", l);
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let service = &s.shared.router.service;
+    let mut stalled = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    let Some(Some(Ok(first))) = next_within(&s, &mut stalled, Duration::from_secs(5)) else {
+        panic!("the first page");
+    };
+    assert!(!first.next.is_empty());
+    // The client stops reading: its queued page and budget are taken back, its slot freed,
+    // and the stream ends with DeadlineExceeded (perf287's G2 on #1510).
+    std::thread::sleep(Duration::from_millis(600));
+    wait_for("the stalled scan's budget comes back", || {
+        service.inflight_available() == limits().inflight_bytes
+    });
+    let Some(Some(Err(e))) = next_within(&s, &mut stalled, Duration::from_secs(5)) else {
+        panic!("the stream ends with an error");
+    };
+    assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+    assert!(e.message.contains("--stream-idle-ms"), "{e:?}");
+    assert!(matches!(
+        next_within(&s, &mut stalled, Duration::from_secs(1)),
+        Some(None)
+    ));
+    // The client resumes from the last page it took, in another scan: the slot is free.
+    let mut pages = vec![first.clone()];
+    pages.extend(grpc_scan(
+        &s,
+        &mut c,
+        scan_request(1000, 0, first.next.to_vec()),
+    ));
+    assert_eq!(join(&pages), whole_rows(30));
+    let text = s.shared.metrics.render(&service.db);
+    assert!(
+        text.contains(
+            r#"pigeonhole_serve_requests_total{rpc="Data.Scan",outcome="DeadlineExceeded"} 1"#
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_scan_over_http_is_ndjson_or_server_sent_events() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let body = json!({"table": "t", "range": {"prefix": b64(b"r")}, "page_bytes": "1000"});
+    let decode = |page: &Json| -> proto::ScanPage { serde_json::from_value(page.clone()).unwrap() };
+
+    let mut resp = agent
+        .post(format!("{}/v1/Data/Scan", s.url))
+        .send_json(&body)
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    let text = resp.body_mut().read_to_string().unwrap();
+    let pages: Vec<proto::ScanPage> = text
+        .lines()
+        .map(|l| decode(&serde_json::from_str(l).unwrap()))
+        .collect();
+    assert!(pages.len() >= 10);
+    assert_eq!(join(&pages), whole_rows(30));
+
+    let mut resp = agent
+        .post(format!("{}/v1/Data/Scan", s.url))
+        .header("Accept", "text/event-stream")
+        .send_json(&body)
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let text = resp.body_mut().read_to_string().unwrap();
+    let events: Vec<&str> = text.split("\n\n").filter(|e| !e.is_empty()).collect();
+    assert!(events.iter().all(|e| e.starts_with("data: ")), "{text}");
+    let pages: Vec<proto::ScanPage> = events
+        .iter()
+        .map(|e| decode(&serde_json::from_str(&e["data: ".len()..]).unwrap()))
+        .collect();
+    assert_eq!(join(&pages), whole_rows(30));
+
+    // A bad request fails the call before any stream starts.
+    let (status, err) = s.post(
+        "Scan",
+        &json!({"table": "t", "after": b64(b"not a position")}),
+        None,
+    );
+    assert_eq!(
+        (status, err["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{err}"
+    );
+    let (status, err) = s.post("Scan", &json!({"table": "nope"}), None);
+    assert_eq!(err["code"], "TableNotFound", "{status} {err}");
+}
+
+#[test]
+fn scans_past_the_scan_limit_are_refused_until_one_ends() {
+    let mut l = limits();
+    l.max_scans = 1;
+    let s = Server::start("", l);
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let mut held = s.block_on(async {
+        let mut stream = c
+            .scan(scan_request(1000, 0, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        stream.message().await.unwrap().unwrap();
+        stream
+    });
+    let refused = s
+        .block_on(c.scan(scan_request(1000, 0, Vec::new())))
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert!(refused.message().contains("scan limit"), "{refused:?}");
+    // The held scan's stream stays readable to its end; once it ends, its slot is free.
+    let rest = s.block_on(async {
+        let mut n = 0;
+        while held.message().await.unwrap().is_some() {
+            n += 1;
+        }
+        n
+    });
+    assert!(rest > 0);
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match s.block_on(c.scan(scan_request(100_000, 0, Vec::new()))) {
+            Ok(r) => {
+                let mut stream = r.into_inner();
+                s.block_on(async { while stream.message().await.unwrap().is_some() {} });
+                break;
+            }
+            Err(e) if std::time::Instant::now() < deadline => {
+                assert_eq!(e.code(), tonic::Code::Unavailable);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the slot never came back: {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn grpc_reserves_the_budget_before_decoding_and_honors_grpc_timeout() {
+    use tower::ServiceExt as _;
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(500);
+    let s = Server::start("", l);
+    let service = &s.shared.router.service;
+    // A raw gRPC call through the router: tonic's client enforces `grpc-timeout` itself, so
+    // it would race the server's own answer.
+    let call = |timeout: Option<&str>| {
+        let msg = proto::GetRequest {
+            table: "t".into(),
+            row: b"r".to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut framed = vec![0];
+        framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&msg);
+        let mut req = axum::http::Request::post("/pigeonhole.v1.Data/Get")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers");
+        if let Some(t) = timeout {
+            req = req.header("grpc-timeout", t);
+        }
+        let req = req.body(axum::body::Body::from(framed)).unwrap();
+        let app = http::router(Arc::clone(&s.shared));
+        let resp = s.block_on(app.oneshot(req)).unwrap();
+        // An error before the handler is a trailers-only reply: the status is in the headers.
+        resp.headers()
+            .get("grpc-status")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    let all = s.block_on(service.reserve(l.inflight_bytes)).unwrap();
+    // The client's deadline is shorter than the server's: DeadlineExceeded (4).
+    assert_eq!(call(Some("100m")).as_deref(), Some("4"));
+    // No client deadline: the server's request timeout, then Overloaded (UNAVAILABLE, 14).
+    assert_eq!(call(None).as_deref(), Some("14"));
+    drop(all);
+    let mut c = s.grpc();
+    let get = proto::GetRequest {
+        table: "t".into(),
+        row: b"r".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    };
+    s.block_on(c.get(get)).unwrap();
+    // Every reservation came back.
+    assert_eq!(service.inflight_available(), l.inflight_bytes);
+}
+
+#[test]
+fn metrics_include_each_rpcs_durations() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    grpc_scan(&s, &mut c, scan_request(0, 0, Vec::new()));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    // A scan is counted when its task ends, just after its last page.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        let text = agent
+            .get(format!("{}/metrics", s.url))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        if text.contains("rpc=\"Data.Scan\",outcome=\"ok\"") || std::time::Instant::now() > deadline
+        {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        text.contains("pigeonhole_serve_requests_total{rpc=\"Data.Mutate\",outcome=\"ok\"} 31"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "pigeonhole_serve_request_duration_seconds_bucket{rpc=\"Data.Mutate\",le=\"+Inf\"} 31"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("pigeonhole_serve_request_duration_seconds_count{rpc=\"Data.Scan\"} 1"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("duration_seconds_count{rpc=\"Data.Get\"}"),
+        "an RPC never called has no histogram: {text}"
+    );
 }

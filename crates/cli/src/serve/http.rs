@@ -1,14 +1,21 @@
 //! HTTP/JSON (ICR 0112): `POST /v1/{Service}/{Method}` with the request message as proto3
 //! JSON, the reply likewise; `GET /v1/health` without a token; `GET /metrics` (read scope).
+//! A server stream (`Data.Scan`) answers as server-sent events for `Accept:
+//! text/event-stream`, otherwise as NDJSON, and a failure ends it with a final error message.
 //! The gRPC services share the router, on their own paths, so one port serves both.
 
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use futures_core::Stream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -17,7 +24,7 @@ use super::auth::Scope;
 use super::errors::ApiError;
 use super::grpc::DataGrpc;
 use super::proto;
-use super::service::{ServiceOp, ServiceReply};
+use super::service::{ScanPages, ServiceOp, ServiceReply};
 
 /// The whole router: gRPC and HTTP/JSON behind the concurrency limit and load shedding,
 /// and beside them, outside the limit, health and metrics: a probe or a scrape under
@@ -31,7 +38,15 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let shed = Arc::clone(&shared);
     let limited = axum::Router::new()
         .route("/v1/{service}/{method}", post(call))
-        .route_service("/pigeonhole.v1.Data/{*method}", data)
+        .route_service(
+            "/pigeonhole.v1.Data/{*method}",
+            tower::ServiceBuilder::new()
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&shared),
+                    super::grpc::prepay,
+                ))
+                .service(data),
+        )
         .with_state(Arc::clone(&shared))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
         // alone would queue callers in `poll_ready`.
@@ -139,13 +154,14 @@ async fn call(
             return ApiError::invalid("the body is longer than its Content-Length").into_response();
         }
     };
+    let started = Instant::now();
     let op = match decode(&service, &method, &body) {
         Ok(op) => op,
         Err(e) => return e.into_response(),
     };
     let rpc = op.index();
     let reply = shared.router.dispatch(op, &caller, Some(budget)).await;
-    shared.count(rpc, &reply);
+    shared.count(rpc, started, &reply);
     match reply {
         Ok(ServiceReply::Get(r)) => json(&r),
         Ok(ServiceReply::MultiGet(r)) => json(&r),
@@ -153,7 +169,79 @@ async fn call(
         Ok(ServiceReply::Mutate(r)) => json(&r),
         Ok(ServiceReply::CheckAndMutate(r)) => json(&r),
         Ok(ServiceReply::MutateReturning(r)) => json(&r),
+        Ok(ServiceReply::Scan(pages)) => stream(&headers, pages),
         Err(e) => e.into_response(),
+    }
+}
+
+/// A scan's pages as server-sent events or NDJSON (ICR 0112).
+fn stream(headers: &HeaderMap, pages: ScanPages) -> Response {
+    let sse = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/event-stream"));
+    let content_type = if sse {
+        "text/event-stream"
+    } else {
+        "application/x-ndjson"
+    };
+    let mut resp = Body::from_stream(Lines { pages, sse }).into_response();
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    resp
+}
+
+/// Each page as one SSE event (`data:` its JSON) or one NDJSON line; an error as an
+/// `event: error` or a `{"error": ErrorDetail}` line, after which the scan has ended.
+struct Lines {
+    pages: ScanPages,
+    sse: bool,
+}
+
+impl Stream for Lines {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let sse = self.sse;
+        Pin::new(&mut self.pages).poll_next(cx).map(|item| {
+            item.map(|page| {
+                let (event, body) = match page {
+                    Ok(page) => (None, serde_json::to_vec(&page)),
+                    Err(e) => (
+                        Some("error"),
+                        if sse {
+                            serde_json::to_vec(&e.detail())
+                        } else {
+                            serde_json::to_vec(&serde_json::json!({ "error": e.detail() }))
+                        },
+                    ),
+                };
+                // A page that can't be encoded is a server bug; it ends the stream as an
+                // error the client can see rather than as a silent cut.
+                let body = body.unwrap_or_else(|e| {
+                    let e = ApiError::internal(format!("encoding a scan page: {e}"));
+                    serde_json::to_vec(&serde_json::json!({ "error": e.detail() }))
+                        .unwrap_or_default()
+                });
+                let mut out = Vec::with_capacity(body.len() + 24);
+                if sse {
+                    if let Some(event) = event {
+                        out.extend_from_slice(b"event: ");
+                        out.extend_from_slice(event.as_bytes());
+                        out.push(b'\n');
+                    }
+                    out.extend_from_slice(b"data: ");
+                    out.extend_from_slice(&body);
+                    out.extend_from_slice(b"\n\n");
+                } else {
+                    out.extend_from_slice(&body);
+                    out.push(b'\n');
+                }
+                Ok(Bytes::from(out))
+            })
+        })
     }
 }
 
@@ -191,7 +279,7 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Data", "CheckAndMutate") => ServiceOp::CheckAndMutate(parse(body)?),
         ("Data", "Batch") => ServiceOp::Batch(parse(body)?),
         ("Data", "MutateReturning") => ServiceOp::MutateReturning(parse(body)?),
-        ("Data", "Scan") => return Err(ApiError::unimplemented("Data.Scan")),
+        ("Data", "Scan") => ServiceOp::Scan(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

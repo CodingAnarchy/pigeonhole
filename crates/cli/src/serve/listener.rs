@@ -14,9 +14,9 @@ use tokio_rustls::TlsAcceptor;
 /// A TLS handshake that takes longer than this is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// HTTP/2 streams per connection, set explicitly rather than left to hyper's default. It
-/// bounds what one gRPC connection holds decoded before the in-flight budget sees it, until
-/// ticket 3b reserves the budget before decoding (perf287's F2 on #1501).
+/// HTTP/2 streams per connection, set explicitly rather than left to hyper's default. The
+/// in-flight budget is reserved before a gRPC message is read (`grpc::prepay`), so this only
+/// bounds how many streams one connection keeps waiting.
 pub(crate) const MAX_STREAMS: u32 = 128;
 
 pub(crate) async fn serve(
