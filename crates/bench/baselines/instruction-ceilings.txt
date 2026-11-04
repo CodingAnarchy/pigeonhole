@@ -299,10 +299,11 @@ scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
 commit-async 8713 0.3
-# D314 (#1440): PROVISIONAL, replaced from this PR's own x86 run before it is ready.
-commit-incr 99999 0.3
-commit-incr-returning 99999 0.3
-commit-incr-returning-spread 99999 0.5
+# D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
+# commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
+commit-incr 12711 0.3
+commit-incr-returning 17520 0.3
+commit-incr-returning-spread 34624 0.5
 scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
