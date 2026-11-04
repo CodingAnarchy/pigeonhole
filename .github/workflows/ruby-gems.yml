@@ -19,7 +19,7 @@ on:
   pull_request:
     paths:
       - 'crates/ruby/Cargo.toml'
-      - 'crates/ruby/pigeonhole.gemspec'
+      - 'crates/ruby/pigeonhole-db.gemspec'
       - 'crates/ruby/Rakefile'
       - 'crates/ruby/extconf.rb'
       - 'crates/ruby/Gemfile*'
@@ -99,14 +99,14 @@ jobs:
         run: |
           out="$RUNNER_TEMP/source-gem"
           mkdir -p "$out/home"
-          cp crates/ruby/pkg/source/pigeonhole-*.gem crates/ruby/script/source_gem_smoke.rb "$out/"
+          cp crates/ruby/pkg/source/pigeonhole-db-*.gem crates/ruby/script/source_gem_smoke.rb "$out/"
           cd "$out"
           export GEM_HOME="$out/home" GEM_PATH="$out/home"
-          gem install --no-document ./pigeonhole-*.gem
+          gem install --no-document ./pigeonhole-db-*.gem
           ruby source_gem_smoke.rb
       - if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: gem-source
-          path: crates/ruby/pkg/source/pigeonhole-*.gem
+          path: crates/ruby/pkg/source/pigeonhole-db-*.gem
           if-no-files-found: error

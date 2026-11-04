@@ -10,12 +10,14 @@ require_relative "lib/pigeonhole/version"
 # unaffected.
 vendored = File.directory?(File.join(__dir__, "vendor"))
 if !vendored && File.basename($PROGRAM_NAME) == "gem" && ARGV.first == "build"
-  abort "pigeonhole: build the source gem with `bundle exec rake gem:source` (its Cargo.toml " \
+  abort "pigeonhole-db: build the source gem with `bundle exec rake gem:source` (its Cargo.toml " \
         "depends on ../pigeonhole), or a native gem with `bundle exec rake native:<platform> gem`"
 end
 
+# The gem is `pigeonhole-db` (owner decision 2026-11-04: RubyGems refused `pigeonhole` as too
+# close to `pigeon_hole`); it's required as "pigeonhole", and its module is Pigeonhole.
 Gem::Specification.new do |spec|
-  spec.name = "pigeonhole"
+  spec.name = "pigeonhole-db"
   spec.version = Pigeonhole::VERSION
   spec.summary = "An embedded, single-file, wide-column store: BigTable's data model, SQLite's deployment model."
   spec.homepage = "https://github.com/CodingAnarchy/pigeonhole"

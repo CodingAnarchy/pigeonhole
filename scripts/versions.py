@@ -118,12 +118,12 @@ def ruby_errors(workspace):
     gem = [l.split("=", 1)[1].strip().strip('"') for l in text.splitlines() if l.strip().startswith("VERSION =")]
     if gem != [workspace]:
         errors.append(f"{RUBY_VERSION_RB} sets VERSION {gem!r}, not {workspace!r}")
-    # The path gem's own lines: `    pigeonhole (X)` under its specs, `  pigeonhole (X)` under
-    # CHECKSUMS. Other gems' names only start with `pigeonhole` if they're ours.
+    # The path gem's own lines: `    pigeonhole-db (X)` under its specs, `  pigeonhole-db (X)`
+    # under CHECKSUMS. Other gems' names only start with `pigeonhole-db` if they're ours.
     locked = [
-        l.strip()[len("pigeonhole ("):-1]
+        l.strip()[len("pigeonhole-db ("):-1]
         for l in (ROOT / RUBY_GEMFILE_LOCK).read_text().splitlines()
-        if l.strip().startswith("pigeonhole (") and l.strip().endswith(")")
+        if l.strip().startswith("pigeonhole-db (") and l.strip().endswith(")")
     ]
     if not locked or any(v != workspace for v in locked):
         errors.append(f"{RUBY_GEMFILE_LOCK} locks the gem at {locked!r}, not {workspace!r}")
