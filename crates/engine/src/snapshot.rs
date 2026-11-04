@@ -976,6 +976,8 @@ impl View {
     /// arena under back-to-back compactions). In a reader process the pin registers in its own
     /// `live_views`, which nothing there reclaims against: harmless, and not the reader's
     /// protection (its reader pin is).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn ssts_only(&self, live_views: &Arc<LiveViews>) -> Arc<View> {
         Arc::new(View {
             version: self.version,
