@@ -750,15 +750,24 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
                     let mut mine = Vec::new();
                     while t.elapsed().as_secs_f64() < secs {
                         let k = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(&i) = held.get(k) else { break };
+                        // Past the held set, its memories again under a new text (the same
+                        // vectors), so a phase never runs out.
+                        let i = held[k % held.len()];
+                        let text = if k < held.len() {
+                            f.mems[i].text.clone()
+                        } else {
+                            format!("{} #{}", f.mems[i].text, k / held.len())
+                        };
                         let s = Instant::now();
-                        remember(
-                            store,
-                            "big",
-                            Memory::new(f.mems[i].text.clone()).embedding(f.mem_vecs[i].clone()),
-                            &mut busy,
-                        );
-                        mine.push(s.elapsed().as_micros() as u64);
+                        remember(store, "big", Memory::new(text).embedding(f.mem_vecs[i].clone()), &mut busy);
+                        let us = s.elapsed().as_micros() as u64;
+                        if us > 1_000_000 {
+                            eprintln!(
+                                "SLOW remember {us} us, started {:.3} s into the phase (threads {threads})",
+                                t.elapsed().as_secs_f64() - us as f64 / 1e6
+                            );
+                        }
+                        mine.push(us);
                         done.fetch_add(1, Ordering::Relaxed);
                     }
                     busy_all.fetch_add(busy, Ordering::Relaxed);
@@ -783,6 +792,8 @@ fn ivfw(fix_dir: &Path, db_dir: &Path, build: usize, secs: f64, phases: &str) {
                 "retries": after.transaction_retries - before.transaction_retries,
                 "conflicts": after.transaction_conflicts - before.transaction_conflicts,
                 "room_stalls": after.room_stalls - before.room_stalls,
+            "room_stall_ms": (after.room_stall_nanos - before.room_stall_nanos) / 1_000_000,
+            "pacing_stall_ms": (after.pacing_stall_nanos - before.pacing_stall_nanos) / 1_000_000,
                 "pacing_stalls": after.pacing_stalls - before.pacing_stalls,
                 "flushes": after.flushes - before.flushes,
                 "compactions": after.compactions - before.compactions,
