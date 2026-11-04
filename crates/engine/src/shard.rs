@@ -4598,13 +4598,45 @@ impl ShardState {
         open.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let half = self.arena.region().len() / 2;
         let mut picked = 0;
+        // SCRATCH #1477: the arena at a room pick.
+        let open_n = open.len();
+        let open_bytes: usize = open.iter().map(|o| o.0).sum();
+        let frozen_bytes: usize = self
+            .memtables
+            .values()
+            .flat_map(|s| s.frozen.iter())
+            .map(|m| m.table.allocated_bytes())
+            .sum();
+        let sealed = self
+            .memtables
+            .values()
+            .filter(|s| s.seal != Seal::Open)
+            .count();
+        let mut picked_n = 0usize;
         for (bytes, key) in open {
             if picked >= half {
                 break;
             }
             picked += bytes;
+            picked_n += 1;
             self.room_freezes.insert(key);
         }
+        let mib = |b: usize| b >> 20;
+        crate::scratch_freezes::record(
+            "PICK",
+            format!(
+                "open slots ~{} open {} MiB frozen {} MiB sealed {} free {} MiB of {} MiB reserved {} KiB picked {}",
+                open_n / 25 * 25,
+                mib(open_bytes),
+                mib(frozen_bytes),
+                sealed,
+                mib(self.arena.free_bytes()),
+                mib(self.arena.region().len()),
+                self.reserved / 1024 / 256 * 256,
+                picked_n / 5 * 5
+            ),
+            picked as u64,
+        );
     }
 
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
