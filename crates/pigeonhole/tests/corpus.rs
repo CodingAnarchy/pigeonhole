@@ -23,7 +23,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pigeonhole::{Aggregation, Durability, Family, Options, Pigeonhole, Value};
+use std::time::Duration;
+
+use pigeonhole::{
+    Aggregation, Durability, Element, Family, FeedRetention, Metric, Options, Pigeonhole, Value,
+    VectorSpec,
+};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 use pigeonhole_io::{OpenOptions, Vfs};
 
@@ -34,7 +39,7 @@ fn corpus_dir() -> PathBuf {
 
 /// The release corpora: written by each release's build, then frozen. A directory holding
 /// only its README is a placeholder until that release writes it.
-const RELEASE_CORPORA: [&str; 1] = ["1.0.0"];
+const RELEASE_CORPORA: [&str; 2] = ["1.0.0", "1.1.0"];
 
 /// The frozen hash list's name inside a release corpus.
 const FROZEN: &str = "frozen.txt";
@@ -71,6 +76,19 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// A value as `expected.txt` writes it. A vector is its element, dimension and stored bytes,
+/// which every element reads back exactly.
+fn value_line(v: Value<'_>) -> String {
+    match v {
+        Value::Bytes(b) => format!("bytes:{}", hex(b)),
+        Value::I64(n) => format!("i64:{n}"),
+        Value::F64(x) => format!("f64:{:016x}", x.to_bits()),
+        Value::Varint(n) => format!("varint:{n}"),
+        Value::Vector(v) => format!("vector:{:?}:{}:{}", v.element(), v.dim(), hex(v.as_bytes())),
+        other => panic!("a value type this test doesn't know: {other:?}"),
+    }
+}
+
 /// Every cell of every table, all retained versions, one line each, in scan order.
 fn contents(db: &Pigeonhole) -> Vec<String> {
     let mut tables = db.tables();
@@ -82,13 +100,7 @@ fn contents(db: &Pigeonhole) -> Vec<String> {
         let mut it = scan.iter().unwrap();
         while let Some(row) = it.next_ref().unwrap() {
             for e in row.iter() {
-                let value = match e.cell.typed() {
-                    Value::Bytes(b) => format!("bytes:{}", hex(b)),
-                    Value::I64(n) => format!("i64:{n}"),
-                    Value::F64(x) => format!("f64:{:016x}", x.to_bits()),
-                    Value::Varint(n) => format!("varint:{n}"),
-                    other => panic!("a value type this test doesn't know: {other:?}"),
-                };
+                let value = value_line(e.cell.typed());
                 lines.push(format!(
                     "{name}\t{}\t{}\t{}\t{}\t{value}",
                     hex(row.key()),
@@ -119,14 +131,30 @@ const T0: u64 = 1_767_225_600_000_000;
 /// the refusal names other bits (`tests/corpus/compat-reader`).
 const REFUSED_BY: &str = "refused-by-1.0.0.txt";
 
+/// The file of an entry's extra listing: what [`Entry::extra`] read from the generating
+/// build, compared with what the checking build reads.
+const EXTRA: &str = "expected-extra.txt";
+
 /// One corpus entry: how it is written, whether it is left crashed (WAL replay needed), and
 /// the `incompat` feature bits it uses that 1.0.0 lacks (0: 1.0.0 opens it).
 struct Entry {
     name: &'static str,
     shards: usize,
+    /// Settings the writing open adds to the simulator's (the change feed's). A later open
+    /// mentions none of them, as the check's doesn't.
+    options: fn(Options) -> Options,
     write: fn(&Pigeonhole),
     crash: bool,
     refused_by_1_0_0: u64,
+    /// What a structure built on the public API reads back (a text index's, a vector
+    /// index's or a memory store's `verify`, the change feed's retained commits), one line
+    /// each: only what every later build still reports, never a whole `Debug`.
+    extra: Option<fn(&Pigeonhole) -> String>,
+}
+
+/// An entry's open adds nothing.
+fn same(o: Options) -> Options {
+    o
 }
 
 fn entries() -> Vec<Entry> {
@@ -134,72 +162,138 @@ fn entries() -> Vec<Entry> {
         Entry {
             name: "empty",
             shards: 1,
+            options: same,
             write: |_| {},
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "values",
             shards: 1,
+            options: same,
             write: write_values,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "counters",
             shards: 2,
+            options: same,
             write: write_counters,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "blobs",
             shards: 1,
+            options: same,
             write: write_blobs,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "merge",
             shards: 1,
+            options: same,
             write: write_merge,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "wal_crash",
             shards: 2,
+            options: same,
             write: write_wal_crash,
             crash: true,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "families",
             shards: 1,
+            options: same,
             write: write_families,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "wal_ops",
             shards: 2,
+            options: same,
             write: write_wal_ops,
             crash: true,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "checkpoints",
             shards: 1,
+            options: same,
             write: write_checkpoints,
             crash: false,
             refused_by_1_0_0: 0,
+            extra: None,
         },
         Entry {
             name: "aggregates",
             shards: 2,
+            options: same,
             write: write_aggregates,
             crash: true,
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: None,
+        },
+        Entry {
+            name: "vectors",
+            shards: 2,
+            options: same,
+            write: write_vectors,
+            crash: false,
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: Some(vectors_extra),
+        },
+        Entry {
+            name: "text",
+            shards: 1,
+            options: same,
+            write: write_text,
+            crash: false,
+            // The index keeps its statistics in an aggregate family.
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: Some(text_extra),
+        },
+        Entry {
+            name: "memory",
+            shards: 1,
+            options: same,
+            write: write_memory,
+            crash: false,
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
+            extra: Some(memory_extra),
+        },
+        Entry {
+            name: "feed",
+            shards: 2,
+            options: feed_options,
+            write: write_feed,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_extra),
+        },
+        Entry {
+            name: "feed_crash",
+            shards: 2,
+            options: feed_options,
+            write: write_feed,
+            crash: true,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_extra),
         },
     ]
 }
@@ -627,14 +721,312 @@ fn write_checkpoints(db: &Pigeonhole) {
     }
 }
 
-/// The database's files in the simulator's `/db`, by name (no shared memory).
+/// Vector families of every element (D303, value tag 0x04 under `incompat` bit 0), flushed
+/// and compacted with a version and a delete on top, and a `pigeonhole-vector` IVF index
+/// (D306) over an `f32` family: enough vectors to split its lists, then deletes.
+fn write_vectors(db: &Pigeonhole) {
+    let spec =
+        |dim, element, metric| Family::vector(VectorSpec::new(dim, element, metric).unwrap());
+    let t = db
+        .table("vectors")
+        .unwrap()
+        .family("f32", spec(4, Element::F32, Metric::L2).max_versions(2))
+        .family("f16", spec(4, Element::F16, Metric::Cosine))
+        .family("bf16", spec(4, Element::BF16, Metric::InnerProduct))
+        .family("i8", spec(4, Element::I8, Metric::L2))
+        .family("bits", spec(16, Element::Bit, Metric::Hamming))
+        .create()
+        .unwrap();
+    for i in 0..12u16 {
+        let x = f32::from(i) - 5.5;
+        t.mutate(format!("v{i:02}").as_bytes())
+            .put_vector_f32("f32", b"e", &[x, -x, x / 4.0, 1.0])
+            .put_vector_f16("f16", b"e", &[0x3c00 + i, 0xbc00, 0x3800, i | 0x0400])
+            .put_vector_bf16("bf16", b"e", &[0x3f80 + i, 0xbf80, 0x4000, 0x3f00])
+            .put_vector_i8("i8", b"e", &[i as i8, -(i as i8), 127, -128])
+            .put_vector_bits("bits", b"e", &[i as u8, !(i as u8)])
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    t.mutate(b"v03")
+        .put_vector_f32("f32", b"e", &[0.5, 0.25, -0.125, 2.0])
+        .delete_column("bits", b"e")
+        .commit()
+        .unwrap();
+    let ivf = pigeonhole_vector::Index::create(
+        db,
+        "ivf",
+        VectorSpec::new(4, Element::F32, Metric::L2).unwrap(),
+        pigeonhole_vector::IndexOptions::new().target_list_len(8),
+    )
+    .unwrap();
+    for i in 0..60u32 {
+        let x = i as f32;
+        let v = [
+            (x * 0.37).sin(),
+            (x * 0.71).cos(),
+            x / 60.0,
+            (i % 7) as f32 - 3.0,
+        ];
+        ivf.insert_f32(format!("item{i:03}").as_bytes(), &v)
+            .unwrap();
+    }
+    for i in [3u32, 17, 41] {
+        assert!(ivf.delete(format!("item{i:03}").as_bytes()).unwrap());
+    }
+}
+
+/// The IVF index's `verify`: its vector count and list lengths.
+fn vectors_extra(db: &Pigeonhole) -> String {
+    let stats = pigeonhole_vector::Index::open(db, "ivf")
+        .unwrap()
+        .verify()
+        .unwrap();
+    format!(
+        "ivf vectors {}\nivf list_lens {:?}\n",
+        stats.vectors, stats.list_lens
+    )
+}
+
+/// A `pigeonhole-text` index with positions (D309) over a source column, written in the
+/// documents' transactions, with a rewrite and a delete, flushed. Its statistics family is an
+/// aggregate kind, so 1.0.0 refuses the file (`incompat` bit 0).
+fn write_text(db: &Pigeonhole) {
+    let docs = db
+        .table("docs")
+        .unwrap()
+        .family("d", Family::default())
+        .create()
+        .unwrap();
+    let index = pigeonhole_text::Index::create(
+        db,
+        "docs_text",
+        pigeonhole_text::Source::new(&docs, "d", b"body"),
+        pigeonhole_text::IndexOptions::new().positions(true),
+    )
+    .unwrap();
+    let texts = [
+        "the quick brown fox jumps over the lazy dog",
+        "a lazy afternoon with a brown dog",
+        "foxes and dogs are not the same animal",
+        "Straße, café and naïve: normalised text",
+        "the dog sleeps; the fox watches the dog",
+        "nothing in common here",
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        let doc = format!("doc{i}");
+        let mut txn = db.transaction().unwrap();
+        txn.put(&docs, doc.as_bytes(), "d", b"body", text.as_bytes());
+        index.put_in(&mut txn, doc.as_bytes(), text).unwrap();
+        txn.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let mut txn = db.transaction().unwrap();
+    txn.put(
+        &docs,
+        b"doc1",
+        "d",
+        b"body",
+        b"a busy morning with a brown fox",
+    );
+    index
+        .put_in(&mut txn, b"doc1", "a busy morning with a brown fox")
+        .unwrap();
+    assert!(index.delete_in(&mut txn, b"doc5").unwrap());
+    txn.delete_column(&docs, b"doc5", "d", b"body");
+    txn.commit().unwrap();
+}
+
+/// The text index's `verify`: its counts and whether every check agreed.
+fn text_extra(db: &Pigeonhole) -> String {
+    let stats = pigeonhole_text::Index::open(db, "docs_text")
+        .unwrap()
+        .verify()
+        .unwrap();
+    format!(
+        "text documents {}\ntext terms {}\ntext postings {}\ntext consistent {}\n",
+        stats.documents,
+        stats.terms,
+        stats.postings,
+        stats.is_consistent()
+    )
+}
+
+/// A `pigeonhole-memory` store (D311): memories in two namespaces with embeddings (a vector
+/// family, `incompat` bit 0), its text index, and its IVF index (T8) once a namespace passes
+/// `min_namespace_len`; a link, a supersede, uses and a delete; flushed.
+fn write_memory(db: &Pigeonhole) {
+    use pigeonhole_memory::{EmbeddingModel, IvfOptions, LinkType, Memory, Store, StoreOptions};
+    let store = Store::create(
+        db,
+        "agents",
+        StoreOptions::new()
+            .embedding(EmbeddingModel::new("corpus-8", 8, Element::F32).unwrap())
+            .ivf(IvfOptions::new().min_namespace_len(4)),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..24u32 {
+        let ns = if i % 3 == 0 { "agent:b" } else { "agent:a" };
+        let embedding: Vec<f32> = (0..8u32)
+            .map(|d| ((i * 7 + d * 3) % 11) as f32 - 4.5)
+            .collect();
+        let r = store
+            .remember(
+                ns,
+                Memory::new(format!("note {i} about topic {}", i % 5))
+                    .importance(f64::from(i % 10) / 10.0)
+                    .embedding(embedding),
+            )
+            .unwrap();
+        ids.push(r.id().clone());
+    }
+    store
+        .link(&ids[1], &ids[2], LinkType::SIMILAR_TO, 0.5)
+        .unwrap();
+    store.supersede(&ids[4], &ids[7]).unwrap();
+    store.mark_used(&ids[5..8]).unwrap();
+    assert!(store.delete(&ids[10]).unwrap());
+    db.flush().unwrap();
+}
+
+/// The memory store's `verify`: its count, and whether it, its text index and its IVF index
+/// agree.
+fn memory_extra(db: &Pigeonhole) -> String {
+    let stats = pigeonhole_memory::Store::open(db, "agents", "corpus-8")
+        .unwrap()
+        .verify()
+        .unwrap();
+    format!(
+        "memory memories {}\nmemory consistent {}\n",
+        stats.memories,
+        stats.is_consistent()
+    )
+}
+
+/// The change feed on for every table (D310): its retention, recorded in the `-feed`
+/// sidecar, so a later open that doesn't mention the feed inherits it. (`feed_tables` names
+/// tables that exist at the open, and an entry's tables are made by its writer.)
+fn feed_options(o: Options) -> Options {
+    o.change_feed(FeedRetention::bytes(4 << 20))
+}
+
+/// Where the feed entries keep the token their check resumes from: a subscriber's token from
+/// before the first commit, stored as an application stores one with its work.
+const FEED_TOKEN: (&str, &[u8]) = ("feed_tokens", b"events");
+
+/// Commits to two fed tables (puts, counter increments, deletes), with flushes between, so
+/// the retained history runs past the checkpoint and over several WAL segments: the WAL keeps
+/// it, ring-recycled, and the sidecar records the session. A subscriber to one table takes
+/// its token before the first commit and stores it; the check resumes from that token, and
+/// the other table's commits are passed over.
+fn write_feed(db: &Pigeonhole) {
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .family("n", Family::counter())
+        .create()
+        .unwrap();
+    let other = db
+        .table("other")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let tokens = db
+        .table(FEED_TOKEN.0)
+        .unwrap()
+        .family("t", Family::default())
+        .create()
+        .unwrap();
+    let token = events.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    for i in 0..300u64 {
+        let row = format!("r{:02}", i % 7);
+        let mut m = events
+            .mutate(row.as_bytes())
+            .put_at(
+                "e",
+                b"what",
+                T0 + i,
+                format!("event {i:03} ").repeat(150).as_bytes(),
+            )
+            .incr_at("n", b"count", T0, 1);
+        if i % 9 == 4 {
+            m = m.delete_column("e", b"old");
+        }
+        m.commit().unwrap();
+        if i % 5 == 0 {
+            other
+                .mutate(row.as_bytes())
+                .put("e", b"x", b"not followed")
+                .commit()
+                .unwrap();
+        }
+        if i % 100 == 99 {
+            db.flush().unwrap();
+        }
+    }
+}
+
+/// Every commit after the stored token, as a resumed feed delivers them: one line per change,
+/// with a value's bytes as their length and xxh3-64 (the puts are long).
+fn feed_extra(db: &Pigeonhole) -> String {
+    let tokens = db.table(FEED_TOKEN.0).unwrap().open().unwrap();
+    let stored = tokens
+        .get(FEED_TOKEN.1, "t", b"token")
+        .unwrap()
+        .expect("the stored token");
+    let token = pigeonhole::FeedToken::from_bytes(stored.value());
+    let events = db.table("events").unwrap().open().unwrap();
+    let mut feed = events.feed().resume(&token).open().unwrap();
+    let mut out = String::new();
+    while let Some(c) = feed.next(Duration::from_millis(200)).unwrap() {
+        for ch in c.changes() {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                c.seqno(),
+                ch.table(),
+                ch.family(),
+                ch.kind(),
+                hex(ch.row()),
+                hex(ch.qualifier()),
+                ch.timestamp(),
+                ch.value().map_or_else(
+                    || "-".to_owned(),
+                    |v| match v {
+                        Value::Bytes(b) => format!(
+                            "bytes:{}:{:016x}",
+                            b.len(),
+                            pigeonhole_format::checksum::xxh3_64(b)
+                        ),
+                        other => value_line(other),
+                    }
+                )
+            ));
+        }
+    }
+    assert!(!out.is_empty(), "the feed's history is empty");
+    out
+}
+
+/// The database's files in the simulator's `/db`, by name: the main file, its WAL files and
+/// the change feed's sidecar (no shared memory).
 fn sim_files(vfs: &SimVfs) -> BTreeMap<String, Vec<u8>> {
     vfs.list_dir(Path::new("/db"))
         .unwrap()
         .into_iter()
         .filter_map(|p| {
             let name = p.file_name()?.to_str()?.to_owned();
-            (name == DB || name.starts_with("data.phdb-wal-")).then_some((p, name))
+            (name == DB || name == "data.phdb-feed" || name.starts_with("data.phdb-wal-"))
+                .then_some((p, name))
         })
         .map(|(p, name)| {
             let f = vfs.open(&p, OpenOptions::read()).unwrap();
@@ -681,7 +1073,7 @@ fn generate_corpus() {
     for (seed, e) in entries().into_iter().enumerate() {
         let vfs = SimVfs::new(9_000 + seed as u64);
         let path = format!("/db/{DB}");
-        let db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
+        let db = Pigeonhole::open(&path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
         (e.write)(&db);
         if e.crash {
             vfs.crash(CrashKind::Process);
@@ -696,6 +1088,7 @@ fn generate_corpus() {
         let db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
         let mut expected = contents(&db).join("\n");
         expected.push('\n');
+        let extra = e.extra.map(|f| f(&db));
         db.close().unwrap();
 
         let dir = root.join(e.name);
@@ -705,6 +1098,13 @@ fn generate_corpus() {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
         std::fs::write(dir.join("expected.txt"), &expected).unwrap();
+        if let Some(extra) = &extra {
+            std::fs::write(dir.join(EXTRA), extra).unwrap();
+            frozen.push(frozen_line(
+                &format!("{}/{EXTRA}", e.name),
+                extra.as_bytes(),
+            ));
+        }
         for (name, bytes) in &files {
             frozen.push(frozen_line(&format!("{}/{name}", e.name), bytes));
         }
@@ -773,10 +1173,10 @@ fn real_options() -> Options {
         .merge_operator(Arc::new(Concat))
 }
 
-/// Opens a copy of the entry in `src`, reads every cell exactly as `expected.txt` says,
-/// writes through a flush and a compaction, passes the offline check, and reads everything
-/// again after a reopen.
-fn check_entry(label: &str, src: &Path) {
+/// Opens a copy of the entry in `src`, reads every cell exactly as `expected.txt` says (and
+/// its extra listing as `expected-extra.txt` does), writes through a flush and a compaction,
+/// passes the offline check, and reads everything again after a reopen.
+fn check_entry(label: &str, src: &Path, extra: Option<fn(&Pigeonhole) -> String>) {
     assert!(
         src.join("expected.txt").exists(),
         "corpus entry {label} is missing: run generate_corpus"
@@ -799,6 +1199,13 @@ fn check_entry(label: &str, src: &Path) {
     let db = Pigeonhole::open(&path, real_options())
         .unwrap_or_else(|err| panic!("{label}: open: {err}"));
     assert_eq!(contents(&db), expected, "{label}: contents");
+    // An older release's entry may predate its listing; `format4/` always has it (checked
+    // by `corpus_entries_open_read_check_and_write`).
+    match (extra, std::fs::read_to_string(src.join(EXTRA))) {
+        (Some(f), Ok(want)) => assert_eq!(f(&db), want, "{label}: {EXTRA}"),
+        (None, Ok(_)) => panic!("{label}: {EXTRA} without a check"),
+        (_, Err(_)) => {}
+    }
     // Write on top, through a flush and a compaction.
     let t = db
         .table("corpus_writes")
@@ -832,7 +1239,13 @@ fn check_entry(label: &str, src: &Path) {
 fn corpus_entries_open_read_check_and_write() {
     let root = corpus_dir();
     for e in entries() {
-        check_entry(e.name, &root.join(e.name));
+        assert_eq!(
+            root.join(e.name).join(EXTRA).exists(),
+            e.extra.is_some(),
+            "{}: {EXTRA} doesn't match the entry: run generate_corpus",
+            e.name
+        );
+        check_entry(e.name, &root.join(e.name), e.extra);
     }
 }
 
@@ -894,7 +1307,13 @@ fn release_corpus_entries_open_read_check_and_write() {
             "v{version} no longer matches {FROZEN}: a release corpus never changes"
         );
         for entry in entries {
-            check_entry(&format!("v{version}/{entry}"), &dir.join(entry));
+            // A release corpus's entries are this build's too: entries are never removed.
+            let extra = crate::entries()
+                .into_iter()
+                .find(|e| e.name == entry)
+                .unwrap_or_else(|| panic!("v{version}/{entry}: not an entry of this build"))
+                .extra;
+            check_entry(&format!("v{version}/{entry}"), &dir.join(entry), extra);
         }
     }
 }
