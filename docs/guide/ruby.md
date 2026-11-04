@@ -2,11 +2,13 @@
 
 > **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111): the core API, vectors, graphs, byte budgets, the change feed, agent memory, full-text search and the vector index.
 
-The `pigeonhole` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
+The `pigeonhole-db` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
 ## Install
+The gem is **`pigeonhole-db`**, the same name as the Python package. You still `require "pigeonhole"`, and the module is `Pigeonhole`. `require "pigeonhole-db"` works too, so `Bundler.require` (Rails) loads it from a plain `gem "pigeonhole-db"` Gemfile line.
+
 ```sh
-gem install pigeonhole
+gem install pigeonhole-db
 ```
 
 Native gems cover Linux (glibc and musl, x86_64 and aarch64), macOS (x86_64 and arm64) and Windows (x64, UCRT). On any other platform, `gem install` picks the source gem and compiles the extension (below).
@@ -20,7 +22,7 @@ bundle exec rake compile
 ruby -Ilib -e 'require "pigeonhole"; p Pigeonhole::VERSION'
 ```
 
-`bundle exec rake gem:source` builds the source gem, `pkg/source/pigeonhole-<version>.gem`. It carries the engine's crates, so it installs anywhere with Rust 1.96 or later and network access to crates.io: `gem install pkg/source/pigeonhole-*.gem` compiles the extension, with the versions `Cargo.lock` pins. The build is an optimised release build, about a minute on a recent laptop.
+`bundle exec rake gem:source` builds the source gem, `pkg/source/pigeonhole-db-<version>.gem`. It carries the engine's crates, so it installs anywhere with Rust 1.96 or later and network access to crates.io: `gem install pkg/source/pigeonhole-db-*.gem` compiles the extension, with the versions `Cargo.lock` pins. The build is an optimised release build, about a minute on a recent laptop.
 
 ## A tour
 ```ruby

@@ -1,4 +1,4 @@
-# The Ruby API's snapshot (ICR 0111): every public class and method of the `pigeonhole` gem.
+# The Ruby API's snapshot (ICR 0111): every public class and method of the `pigeonhole-db` gem.
 # test/test_signatures.rb fails if a class's public methods and these declarations differ,
 # and the suite runs under `rbs test`'s runtime checking.
 module Pigeonhole

@@ -328,7 +328,7 @@ Each companion crate is on the public 1.x line and is built on `pigeonhole`'s pu
 | Binding | Where |
 |---|---|
 | Python, `pigeonhole-db` (`import pigeonhole`, D307) | [`python.md`](python.md): the core API, vectors, graphs, byte budgets, the change feed and `pigeonhole.memory`. Not on PyPI yet. |
-| Ruby, the `pigeonhole` gem (ICR 0111) | [`ruby.md`](ruby.md): the core API, vectors, graphs, byte budgets, the change feed, `Pigeonhole::Memory` (watches and the consolidation loop too), `Pigeonhole::Text` and `Pigeonhole::Vector`. Not on RubyGems yet. |
+| Ruby, the `pigeonhole-db` gem (`require "pigeonhole"`; ICR 0111) | [`ruby.md`](ruby.md): the core API, vectors, graphs, byte budgets, the change feed, `Pigeonhole::Memory` (watches and the consolidation loop too), `Pigeonhole::Text` and `Pigeonhole::Vector`. Not on RubyGems yet. |
 | MCP, `phdb mcp` | [`ai-agents.md`](ai-agents.md): data tools, `nearest`, the change feed, and the memory tools over a `pigeonhole-memory` store. |
 
 ## Results

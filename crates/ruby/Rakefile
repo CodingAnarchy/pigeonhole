@@ -3,7 +3,7 @@
 require "rake/testtask"
 require "rake/extensiontask"
 
-GEMSPEC = Gem::Specification.load("pigeonhole.gemspec")
+GEMSPEC = Gem::Specification.load("pigeonhole-db.gemspec")
 
 # rake-compiler drives extconf.rb (beside Cargo.toml), whose `create_rust_makefile` builds
 # this crate (`pigeonhole-ruby`; its library target is `pigeonhole_native`).
@@ -16,6 +16,11 @@ Rake::ExtensionTask.new("pigeonhole_native", GEMSPEC) do |ext|
     x86_64-linux aarch64-linux x86_64-linux-musl aarch64-linux-musl
     x86_64-darwin arm64-darwin x64-mingw-ucrt
   ]
+  # A native gem ships the built extension, so it doesn't need rb_sys, which only builds one
+  # (extconf.rb's rb_sys/mkmf): its users skip installing it. The source gem keeps it.
+  ext.cross_compiling do |spec|
+    spec.dependencies.reject! { |d| d.name == "rb_sys" }
+  end
 end
 
 Rake::TestTask.new(:test) do |t|

@@ -1,5 +1,5 @@
 //! Ruby bindings for [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole) (#697, ICR
-//! 0111), over magnus and rb-sys, published to RubyGems as `pigeonhole` and required as
+//! 0111), over magnus and rb-sys, published to RubyGems as `pigeonhole-db` and required as
 //! `require "pigeonhole"`.
 //!
 //! The native extension is `pigeonhole/pigeonhole_native`; `lib/pigeonhole.rb` requires it

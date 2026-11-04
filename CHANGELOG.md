@@ -13,7 +13,7 @@ Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in for
 - **The change feed:** every commit, once and in order, to the writer process and to reader processes.
 - **Full-text search:** `pigeonhole-text`, BM25 with phrases, fuzzy terms and highlighting.
 - **Agent memory:** `pigeonhole-memory`, long-term memory with hybrid recall, forgetting and consolidation, and `phdb mcp`, a Model Context Protocol server for AI agents.
-- **Bindings:** Python (`pigeonhole-db` on PyPI) and Ruby (the `pigeonhole` gem).
+- **Bindings:** Python (`pigeonhole-db` on PyPI) and Ruby (the `pigeonhole-db` gem, required as `"pigeonhole"`).
 
 ### Upgrading from 1.0.x
 - **A file that uses a 1.1 family kind can't go back to 1.0.x.** Creating the first aggregate family of a new kind (anything but a counter) or the first vector family sets the file's `incompat` feature bit 0 (D294, D298, D303). 1.0.x then refuses to open the file with `UnsupportedFeature`, even after the family is dropped. Until then, files move freely between 1.0.x and 1.1.0. Back up before creating such a family if you may roll back. The change feed sets no feature bit.
@@ -78,12 +78,12 @@ Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in for
   - `pigeonhole.memory`.
 
   abi3 wheels for CPython 3.11 and later cover Linux, macOS and Windows, with typed stubs. See the [Python guide](docs/guide/python.md).
-- **Ruby bindings**, the `pigeonhole` gem (Ruby 3.3 and later; #697, ICR 0111), over magnus and rb-sys, with the GVL released during engine calls. The bindings cover:
+- **Ruby bindings**, the `pigeonhole-db` gem (`require "pigeonhole"`, or `"pigeonhole-db"` for `Bundler.require`; Ruby 3.3 and later; #697, ICR 0111), over magnus and rb-sys, with the GVL released during engine calls. The bindings cover:
   - the core API, vectors, multi-get, traversal, pages, byte budgets and the change feed;
   - counters that return their value: `Mutation#commit_returning` gives a frozen `Pigeonhole::Incremented` (`value`, `to_h`, `size` and `seqno`), and `Table#incr_returning(...)` gives the new value;
   - `Pigeonhole::Memory`, `Pigeonhole::Text` and `Pigeonhole::Vector`.
 
-  Native gems cover seven platforms, and a source gem builds on any other. See the [Ruby guide](docs/guide/ruby.md).
+  Native gems cover seven platforms and don't depend on `rb_sys`; a source gem, which does, builds on any other. See the [Ruby guide](docs/guide/ruby.md).
 - **Smaller additions:**
   - `Options::read_only(true)` opens a database without writing anything to its files (ICR 0109).
   - `Pigeonhole::same_database(&other)` says whether two handles come from one open database (ICR 0110).

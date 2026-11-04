@@ -1,13 +1,15 @@
 # frozen_string_literal: true
 
 # A smoke test for an installed gem, the source gem in particular (ruby-gems.yml's
-# source-gem job, #697): run from outside the repo, it loads the installed `pigeonhole`, not
-# lib/, and exercises a write, a read, a scan and a vector search.
+# source-gem job, #697): run from outside the repo, it loads the installed `pigeonhole-db`
+# gem, not lib/, and exercises a write, a read, a scan and a vector search.
 require "pigeonhole"
+# What Bundler.require does for a plain `gem "pigeonhole-db"` line (ai1249 on #1481).
+require "pigeonhole-db"
 require "tmpdir"
 
 abort "loaded #{$LOADED_FEATURES.grep(/pigeonhole\.rb\z/).first}, not an installed gem" unless
-  Gem.loaded_specs.key?("pigeonhole")
+  Gem.loaded_specs.key?("pigeonhole-db")
 
 Dir.mktmpdir("phdb-smoke") do |dir|
   Pigeonhole.open(File.join(dir, "smoke.phdb"), create: true, shards: 1) do |db|
@@ -23,4 +25,4 @@ Dir.mktmpdir("phdb-smoke") do |dir|
     raise "nearest" unless t.nearest("emb", [0.9, 0.1], 1).map(&:row) == ["b"]
   end
 end
-puts "pigeonhole #{Pigeonhole::VERSION}: the installed gem works"
+puts "pigeonhole-db #{Pigeonhole::VERSION}: the installed gem works"
