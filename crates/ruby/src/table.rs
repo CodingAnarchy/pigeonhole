@@ -16,7 +16,7 @@ use crate::classes::{
 use crate::convert::{
     self, Bytes, CellValue, Name, Secs, Val, arg_error, class_name, lock, type_error,
 };
-use crate::error::{OrRb, engine, spent, with_code};
+use crate::error::{OrRb, engine, returned_value, spent, with_code};
 use crate::fork::ForkSafe;
 use crate::gvl::without_gvl;
 use crate::read::snapshot_arg;
@@ -819,7 +819,7 @@ impl Table {
     }
 
     /// `incr_returning(row, family, qualifier, delta, ts, durability)`: the counter's value
-    /// after the commit (D314).
+    /// after the commit (D314); `ReturnedValueError` if the commit applied but the read failed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn incr_returning(
         ruby: &Ruby,
@@ -832,14 +832,17 @@ impl Table {
         durability: Option<Durability>,
     ) -> Result<Option<i64>, Error> {
         let t = rb_self.writer(ruby)?.clone();
-        engine(ruby, move || {
+        // A failed commit raises its own exception; a failed read after it, a
+        // `ReturnedValueError` (perf2's S1 on #1473).
+        let (seqno, value) = engine(ruby, move || {
             let op = Op::Incr(family.0.clone(), qualifier.0.clone(), ts, delta);
-            commit_row_returning(&t, &row.0, &[op], durability)?.value_at(
-                &family.0,
-                &qualifier.0,
-                ts.unwrap_or(0),
-            )
-        })
+            let r = commit_row_returning(&t, &row.0, &[op], durability)?;
+            Ok((
+                r.info.seqno,
+                r.value_at(&family.0, &qualifier.0, ts.unwrap_or(0)),
+            ))
+        })?;
+        value.map_err(|e| returned_value(ruby, seqno, &e))
     }
 
     /// `delete(row, family, qualifier, ts, durability)`.
@@ -1032,8 +1035,8 @@ impl Incremented {
     }
 
     /// `value(family, qualifier, ts)`: the counter (or bucket) after the commit; `nil` when a
-    /// read at the commit sees no cell. `InvalidArgument` if the commit didn't write it; the
-    /// read's error if it couldn't be read after the commit applied.
+    /// read at the commit sees no cell. `InvalidArgument` if the commit didn't write it;
+    /// `ReturnedValueError` if it couldn't be read after the commit applied.
     pub(crate) fn value(
         ruby: &Ruby,
         rb_self: &Self,
@@ -1041,14 +1044,22 @@ impl Incremented {
         qualifier: Bytes,
         ts: Option<u64>,
     ) -> Result<Option<i64>, Error> {
-        rb_self
+        let ts = ts.unwrap_or(0);
+        let wrote = rb_self
             .0
-            .value_at(&family.0, &qualifier.0, ts.unwrap_or(0))
-            .or_rb(ruby)
+            .iter()
+            .any(|(f, q, t, _)| f == family.0 && q == qualifier.0.as_slice() && t == ts);
+        let v = rb_self.0.value_at(&family.0, &qualifier.0, ts);
+        if wrote {
+            v.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))
+        } else {
+            // `InvalidArgument`, naming the cell.
+            v.or_rb(ruby)
+        }
     }
 
     /// `{[family, qualifier, ts] => value}` in the order the mutation first wrote each cell
-    /// (`ts` 0 for a plain counter); raises the first unreadable value's error.
+    /// (`ts` 0 for a plain counter); raises `ReturnedValueError` for the first unreadable value.
     pub(crate) fn to_h(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
         let h = ruby.hash_new();
         for (f, q, ts, v) in rb_self.0.iter() {
@@ -1058,7 +1069,8 @@ impl Incremented {
             let key = ruby.ary_new_from_values(&[family.as_value(), qualifier.as_value()]);
             key.push(ts)?;
             key.freeze();
-            h.aset(key, v.or_rb(ruby)?)?;
+            let v = v.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))?;
+            h.aset(key, v)?;
         }
         Ok(h)
     }

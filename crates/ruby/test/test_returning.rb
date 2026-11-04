@@ -98,6 +98,29 @@ class TestReturning < Minitest::Test
     assert_nil t.incr_returning("r", "b", "hits", 1, ts: now - (2 * HOUR_US))
   end
 
+  # perf2's S1 on #1473: a read that fails after the commit applied raises
+  # ReturnedValueError (the commit landed: don't retry), never the commit's own classes. The
+  # binding can't make that read fail, so this pins the split from the other side: commit
+  # failures and unwritten cells keep their usual classes.
+  def test_a_failed_commit_and_a_failed_read_after_it_raise_apart
+    assert_operator Pigeonhole::ReturnedValueError, :<, Pigeonhole::Error
+    refute Pigeonhole::Native::ERROR_CODES.key?("ReturnedValueError")
+    e = Pigeonhole::ReturnedValueError.new("m", "Io", 1, 7)
+    assert_equal [7, "Io", 1], [e.seqno, e.code, e.code_num]
+    # A commit the engine refuses: a TTL counter family takes only buckets.
+    e = assert_raises(Pigeonhole::InvalidArgument) { t.incr_returning("r", "b", "hits", 1) }
+    refute_kind_of Pigeonhole::ReturnedValueError, e
+    # A cell the commit didn't write is the caller's mistake, not a failed read.
+    r = t.mutate("r").incr("n", "a", 1).commit_returning
+    e = assert_raises(Pigeonhole::InvalidArgument) { r.value("n", "other") }
+    refute_kind_of Pigeonhole::ReturnedValueError, e
+    # A commit on a closed database.
+    db.close
+    @db = nil
+    e = assert_raises(Pigeonhole::Closed) { t.incr_returning("r", "n", "a", 1) }
+    refute_kind_of Pigeonhole::ReturnedValueError, e
+  end
+
   # D314: N callers adding 1 from zero get exactly 1..N (threads: the GVL is released).
   def test_concurrent_incr_returning_hands_out_each_value_once
     t

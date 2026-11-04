@@ -809,6 +809,12 @@ class Error(Exception):
     code: str
     code_num: int
 
+class ReturnedValueError(Error):
+    """A counter's value couldn't be read after its commit applied: the commit succeeded, so
+    don't retry it. `code`/`code_num` and `__cause__` are the read's error."""
+
+    seqno: int
+
 class Io(Error): ...
 class Corruption(Error): ...
 class WriterLocked(Error): ...

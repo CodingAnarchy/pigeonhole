@@ -129,3 +129,26 @@ def test_concurrent_incr_returning_hands_out_each_value_once(db, t):
         th.join()
     assert sorted(got) == list(range(1, 201))
 
+
+
+def test_a_failed_commit_and_a_failed_read_after_it_raise_apart(db, t):
+    """perf2's S1 on #1473: a read that fails after the commit applied raises
+    ReturnedValueError (the commit landed: don't retry), never the commit's own classes. The
+    bindings can't make that read fail, so this pins the split from the other side: commit
+    failures and unwritten cells keep their usual classes."""
+    assert issubclass(ph.ReturnedValueError, ph.Error)
+    assert not issubclass(ph.ReturnedValueError, (ph.Io, ph.InvalidArgument, ph.Closed))
+    # A commit the engine refuses: a TTL counter family takes only buckets.
+    with pytest.raises(ph.InvalidArgument) as e:
+        t.incr_returning(b"r", "b", b"hits", 1)
+    assert not isinstance(e.value, ph.ReturnedValueError)
+    # A cell the commit didn't write is the caller's mistake, not a failed read.
+    r = t.mutate(b"r").incr("n", b"a", 1).commit_returning()
+    with pytest.raises(ph.InvalidArgument) as e:
+        r.value("n", b"other")
+    assert not isinstance(e.value, ph.ReturnedValueError)
+    # A commit on a closed database.
+    db.close()
+    with pytest.raises(ph.Closed) as e:
+        t.incr_returning(b"r", "n", b"a", 1)
+    assert not isinstance(e.value, ph.ReturnedValueError)

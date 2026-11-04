@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::convert::{self, Val};
-use crate::error::{OrPy, with_code};
+use crate::error::{OrPy, returned_value, with_code};
 use crate::read::{Cell, Row, ScanIter, Snapshot, snapshot_arg};
 
 /// How durable a commit is before it returns: `pigeonhole.Durability`, an `enum.IntEnum`
@@ -1065,8 +1065,9 @@ impl Table {
 
     /// Adds `delta` to a counter cell, commits, and returns the counter's value after the
     /// commit: concurrent callers adding 1 from zero get exactly `1..=N` (D314). `None` only
-    /// for a bucket (`ts`) already past the family's TTL. An error raised after the commit
-    /// applied (reading the value failed) means **the increment landed**: don't retry it.
+    /// for a bucket (`ts`) already past the family's TTL. A failed commit raises its usual
+    /// exception; `ReturnedValueError` means the commit applied but reading the value failed,
+    /// so **the increment landed**: don't retry it.
     #[pyo3(signature = (row, family, qualifier, delta, *, ts=None, durability=None))]
     #[allow(clippy::too_many_arguments)]
     fn incr_returning(
@@ -1088,7 +1089,8 @@ impl Table {
             vec![op],
             durability,
         )?;
-        r.0.value_at(&family, &q, ts.unwrap_or(0)).or_py()
+        r.0.value_at(&family, &q, ts.unwrap_or(0))
+            .map_err(|e| returned_value(r.0.info.seqno, e))
     }
 
     /// Deletes and commits: the row; with `family`, that family; with `qualifier` too, the
@@ -1465,6 +1467,13 @@ impl Incremented {
             .iter()
             .any(|(f, q, t, _)| f == family && q == qualifier && t == ts)
     }
+
+    /// A cell the commit wrote: its value, or `ReturnedValueError` if it couldn't be read.
+    fn read(&self, family: &str, qualifier: &[u8], ts: u64) -> PyResult<Option<i64>> {
+        self.0
+            .value_at(family, qualifier, ts)
+            .map_err(|e| returned_value(self.0.info.seqno, e))
+    }
 }
 
 #[pymethods]
@@ -1477,10 +1486,9 @@ impl Incremented {
 
     /// The counter (or with `ts`, the bucket) in `family` at `qualifier`, after the commit.
     /// `None` when a read at the commit sees no cell: one the mutation deleted, or a bucket
-    /// already past the family's TTL. Raises
-    /// `InvalidArgument` if the commit didn't write that cell, and the read's error if the
-    /// value couldn't be read after the commit applied: **the commit succeeded** then, so
-    /// don't retry it.
+    /// already past the family's TTL. Raises `InvalidArgument` if the commit didn't write
+    /// that cell, and `ReturnedValueError` if the value couldn't be read after the commit
+    /// applied: **the commit succeeded** then, so don't retry it.
     #[pyo3(signature = (family, qualifier, *, ts=None))]
     fn value(
         &self,
@@ -1488,17 +1496,25 @@ impl Incremented {
         qualifier: &Bound<'_, PyAny>,
         ts: Option<u64>,
     ) -> PyResult<Option<i64>> {
-        self.0
-            .value_at(family, &convert::bytes(qualifier)?, ts.unwrap_or(0))
-            .or_py()
+        let (q, ts) = (convert::bytes(qualifier)?, ts.unwrap_or(0));
+        if self.contains(family, &q, ts) {
+            self.read(family, &q, ts)
+        } else {
+            // `InvalidArgument`, naming the cell.
+            self.0.value_at(family, &q, ts).or_py()
+        }
     }
 
     /// Every cell as `(family, qualifier, ts, value)`, in the order the mutation first wrote
-    /// each; raises the first unreadable value's error, as `value` does.
+    /// each; raises `ReturnedValueError` for the first unreadable value, as `value` does.
     fn cells<'py>(&self, py: Python<'py>) -> PyResult<Vec<IncrementedCell<'py>>> {
+        let seqno = self.0.info.seqno;
         self.0
             .iter()
-            .map(|(f, q, ts, v)| Ok((f.to_owned(), PyBytes::new(py, q), ts, v.or_py()?)))
+            .map(|(f, q, ts, v)| {
+                let v = v.map_err(|e| returned_value(seqno, e))?;
+                Ok((f.to_owned(), PyBytes::new(py, q), ts, v))
+            })
             .collect()
     }
 
@@ -1507,7 +1523,7 @@ impl Incremented {
         if !self.contains(&f, &q, ts) {
             return Err(pyo3::exceptions::PyKeyError::new_err(key.clone().unbind()));
         }
-        self.0.value_at(&f, &q, ts).or_py()
+        self.read(&f, &q, ts)
     }
 
     fn __contains__(&self, key: &Bound<'_, PyAny>) -> bool {

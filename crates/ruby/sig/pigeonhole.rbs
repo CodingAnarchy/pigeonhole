@@ -56,6 +56,13 @@ module Pigeonhole
   class SpentError < Error
   end
 
+  # A counter's value couldn't be read after its commit applied: the commit succeeded.
+  class ReturnedValueError < Error
+    attr_reader seqno: Integer?
+
+    def initialize: (?String? message, ?String? code, ?Integer? code_num, ?Integer? seqno) -> void
+  end
+
   class Io < Error
   end
 

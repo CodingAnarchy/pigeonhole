@@ -370,8 +370,9 @@ module Pigeonhole
 
     # Adds `delta` to a counter cell, commits it, and returns the counter's value after the
     # commit: concurrent callers adding 1 from zero get exactly 1..N (D314). `nil` only for a
-    # bucket (`ts:`) already past the family's TTL. An error raised after the commit applied
-    # (reading the value failed) means the increment landed: don't retry it.
+    # bucket (`ts:`) already past the family's TTL. A failed commit raises its usual
+    # exception; ReturnedValueError means the commit applied but reading the value failed, so
+    # the increment landed: don't retry it.
     def incr_returning(row, family, qualifier, delta, ts: nil, durability: nil)
       native_incr_returning(row, family, qualifier, delta, ts, durability)
     end
@@ -441,9 +442,10 @@ module Pigeonhole
   class Incremented
     # The counter (or with `ts:`, the bucket) in `family` at `qualifier`, after the commit;
     # nil when a read at the commit sees no cell (one the mutation deleted, or a bucket
-    # already past the family's TTL). Raises InvalidArgument if the
-    # commit didn't write that cell, and the read's error if the value couldn't be read after
-    # the commit applied: the commit succeeded then, so don't retry it.
+    # already past the family's TTL). Raises InvalidArgument if the commit didn't write that
+    # cell, and ReturnedValueError if the value couldn't be read after the commit applied: the
+    # commit succeeded then, so don't retry it. `to_h` raises it too, for the first unreadable
+    # value.
     def value(family, qualifier, ts: nil)
       native_value(family, qualifier, ts)
     end
