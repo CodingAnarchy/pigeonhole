@@ -68,6 +68,18 @@ pub const COUNTER_THREADS: usize = 16;
 /// [`WorkloadKind::Counters`](crate::WorkloadKind::Counters): the share of increments; the
 /// rest read a counter.
 const COUNTER_INCR_FRACTION: f64 = 0.9;
+
+/// The share of [`WorkloadKind::Counters`]' increments that go through `commit_returning`
+/// (`PHDB_RETURNING_SHARE`, 0 to 1, 0 by default; D314, the 1.1.0 gate's returning row).
+fn returning_share() -> f64 {
+    static S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("PHDB_RETURNING_SHARE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
 /// The operation type ([`BenchOp::type_name`]) of a [`BenchOp::Commit`] of more than one row:
 /// the commit D246 judges.
 pub const CROSS_SHARD_COMMIT: &str = "cross-shard commit";
@@ -349,6 +361,7 @@ impl Iterator for LoadIter<'_> {
                 },
                 // Every counter starts at 1.
                 WorkloadKind::Counters => BenchOp::Incr {
+                    returning: false,
                     row: counter_key(i),
                     delta: 1,
                 },
@@ -664,6 +677,7 @@ impl Iterator for RunIter<'_> {
             WorkloadKind::Counters if p < COUNTER_INCR_FRACTION => BenchOp::Incr {
                 row: counter_key(g.items.sample_scrambled(&mut self.rng)),
                 delta: 1,
+                returning: p < COUNTER_INCR_FRACTION * returning_share(),
             },
             WorkloadKind::Counters => BenchOp::ReadCounter {
                 row: counter_key(g.items.sample_scrambled(&mut self.rng)),
@@ -713,7 +727,10 @@ mod tests {
         assert_eq!(got, PINNED);
     }
 
-    /// `operation_streams_are_pinned`'s checksums: workload, load, measured run.
+    /// `operation_streams_are_pinned`'s checksums: workload, load, measured run. Counters
+    /// changed with D314's `returning` field on `BenchOp::Incr` (its `Debug` form only: the
+    /// stream draws nothing new, and with `PHDB_RETURNING_SHARE` unset every increment is
+    /// blind, as before).
     const PINNED: &str = "\
 YcsbA 2a5548aa352f708f d586d59b183a02e9
 YcsbB 2a5548aa352f708f 57e0edc2aa92d266
@@ -727,7 +744,7 @@ Adjacency 5f5788f059265648 7237dc50bec2e2fb
 SkewedMultiShard 49961b1ebf3a8d4e aba46d4bc9e3fe1b
 GroupCommit 11d92692cf715458 690344348ad2a93f
 CrossShardContention 2cb9190fe23af4c5 ee77c195e12e80d1
-Counters 0a85bb597758c85a 93cbeb7646b9a4a6
+Counters 1b9edd0b4c04d5ce bb61815ae30c18bd
 Transfer ce5a1aa63651f0d6 d4823e0372c4ed1e
 SparseWideDeletes a4e056fa586848e5 466837d14101c796
 AdjacencyPrefix 5f5788f059265648 72030ff86ccb14ee

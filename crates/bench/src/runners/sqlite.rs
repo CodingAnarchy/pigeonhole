@@ -391,7 +391,7 @@ impl Conn {
                 }
                 tx.commit().map_err(e)?;
             }
-            BenchOp::Incr { row, delta } => {
+            BenchOp::Incr { row, delta, .. } => {
                 self.0
                     .prepare_cached(INCR)
                     .map_err(e)?

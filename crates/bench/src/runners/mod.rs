@@ -456,6 +456,7 @@ mod concurrent_rmw {
         let incr = BenchOp::Incr {
             row: b"c".to_vec(),
             delta: 1,
+            returning: false,
         };
         r.execute(&incr).unwrap();
         let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();
