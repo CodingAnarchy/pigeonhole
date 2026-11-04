@@ -7,7 +7,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [1.1.0] - 2026-11-04
 
 Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in format 4, and the public API only grows (`cargo semver-checks` against 1.0.1 finds no breaking change). It adds:
-- **Aggregations:** min, max, HyperLogLog, bitwise, `f64`, exact sum, mean and variance, histograms, quantiles, bloom filters and roaring sets, each kept by the engine as counters are.
+- **Aggregations:** min, max, HyperLogLog, bitwise, `f64`, exact sum, mean and variance, histograms, quantiles, bloom filters and roaring sets, each kept by the engine as counters are; and counter increments that return the counter's new value.
 - **Vectors:** vector families with exact nearest-neighbour search in the engine, and `pigeonhole-vector`, an IVF index on the public API.
 - **Graphs and wide rows:** wide rows read cell by cell or in pages, frontier multi-gets, traversal pushdown, and reads cut to a byte budget.
 - **The change feed:** every commit, once and in order, to the writer process and to reader processes.
@@ -44,6 +44,7 @@ Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in for
   - **The index:** `Index::create` and `open` over a vector family, `insert_*`, `delete` and `search_*(q, k).nprobe(n).run()`. Every list move is a transaction, so the index stays consistent across crashes and concurrent writers, and a search with every list probed equals an exact `nearest_*`. `nprobe` defaults to 24 lists. On SIFT1M that's 95.8% recall@10 at 3.4 ms per query, single-threaded.
   - **Loading and rebalancing:** `Index::bulk_load_*` loads an empty index from a stream. Lists split and merge inside the writes that cause them, or, with `Rebalance::Background`, on the crate's thread or a `Rebalancer` the application runs.
   - **More:** `f16` and `bf16` indexes, `Search::run_async`, `Index::open_reader` for reader processes, writes inside the caller's transaction (`insert_*_in`, `delete_in`, then `after_commit`), and `Search::id_prefix` with `max_probe` and `run_with_stats`. A second `Index::open` in a process shares the open handle.
+- **Counters that return their value** (D314, ICR 0113): `RowMutation::commit_returning` and `commit_returning_async` commit a row mutation and return each counter cell it incremented or set, with its value after the commit, as BigTable's `ReadModifyWriteRow` does. Concurrent increments of one counter each get their own value, so `N` callers adding 1 from zero get exactly `1..=N`: sequence numbers, ID allocation and step counters without a transaction. `Incremented::value` and `value_at` return each cell's `Result<Option<i64>>`. An error there means the read after the commit failed, and **the commit succeeded**, so don't retry it. See the guide's Counters section for durability and `OutcomeUnknown`.
 - **Graphs and wide rows.**
   - **Wide rows** (D297): `RowRead::cells()` lends a row a cell at a time, `RowRead::pages(n)` in pages of whole columns from one reused buffer, and `RowRead::resume_after(&RowPosition)` continues a walk. `Scan::cells()` walks a scan the same way.
   - **Frontier multi-get** (D299): `Table::keys(&KeySet)` reads many rows in key order under one snapshot, setting up each tablet's read once for all its keys. `KeyRows::next_async`, `poll_next` and `into_owned_stream()` read them asynchronously, fetching the next keys' blocks together.
@@ -52,8 +53,9 @@ Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in for
 - **The change feed** (D310, ICR 0106).
   - **History:** `Options::change_feed(FeedRetention)` and `Options::feed_tables` keep committed history in the WAL past the checkpoint, ring-recycled and never stalling a writer. A clean close keeps it for the next open, and `DatabaseInfo::feed` reports its retention and disk cost.
   - **Opens inherit it:** an open that doesn't mention the feed inherits the last open's feed (retention, age and fed tables, recorded in the `<db>-feed` sidecar) and, with `Options::shards` unset, its shard count. So a tool that opens the file between two runs of an application keeps the application's history and tokens. `Options::change_feed_off()` turns the feed off.
-  - **Subscribing:** `Table::feed()` delivers whole commits, once each and in commit order, over tables or a row prefix, durable by default or `visible()` for sooner. A feed starts after now, after a snapshot, at the oldest retained history, or from a stored `FeedToken`, in this open or a later one. Each `Commit` carries its `Change`s with names, kinds and typed values. When the history a feed needs is gone, it fails with `ErrorCode::FeedExpired` (31).
+  - **Subscribing:** `Table::feed()` delivers whole commits, once each and in commit order, over tables or a row prefix, durable by default or `visible()` for sooner. A feed starts after now, after a snapshot, at the oldest retained history (after a reopen, the oldest earlier open whose history every shard still keeps whole), or from a stored `FeedToken`, in this open or a later one. Each `Commit` carries its `Change`s with names, kinds and typed values. When the history a feed needs is gone, it fails with `ErrorCode::FeedExpired` (31).
   - **Reader processes and async:** `ReadTable::feed()` follows the writer through shared memory, with no per-commit work for the writer, and continues across a writer restart. `Feed::poll_next` and `nonblocking::FeedStream` wait without holding a thread, in the writer process.
+  - **Its cost in syncs:** `EngineMetrics` counts group syncs (`group_syncs`) and the feed's own syncs (`feed_background_syncs`, `feed_sidecar_syncs`), so you can see whether a feed adds syncs beside your `GroupSync` commits.
   - **The guide:** a [change feed](docs/guide/change-feed.md) page.
 - **`pigeonhole-text`, full-text search** (D309), built on the public API.
   - **Writes:** `Index::create` and `open` over a source column, with `put_in` and `delete_in` in the caller's transaction, so the text, its postings and the statistics commit together. Positions are an option, and normalisation is NFC by default, NFKC as an option.
@@ -101,6 +103,7 @@ Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in for
 - After a cross-shard commit fails with `OutcomeUnknown`, a commit made right after the error is refused with `Closed`, as documented, instead of being admitted and then failing (#1358).
 - A commit of many small cells with one cell larger than an arena chunk is admitted. Admission charged each small cell a whole chunk, so such a commit failed `Busy` even on an empty arena (#1403).
 - A commit held back while its shard's WAL segment was nearly full could wait for ever when no other commit came (#1409).
+- The driver-load controller measures its windows on the VFS clock, as it already did the drivers' busy time, so a custom `Vfs` clock (a simulated one, say) drives it deterministically (#1462).
 
 ## [1.0.1] - 2026-10-31
 
