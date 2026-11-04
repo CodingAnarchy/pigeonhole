@@ -126,6 +126,68 @@ fn sim_options(vfs: &Arc<SimVfs>, shards: usize) -> Options {
 /// Timestamps fixed, so `expected.txt` does not depend on a clock.
 const T0: u64 = 1_767_225_600_000_000;
 
+/// Writes `e` on a new simulator seeded with `seed`, at `path`, and leaves it as the entry
+/// says: crashed, or closed cleanly with its free tail given back. `observer_delay` widens the
+/// window between each root commit's durable superblock and its feed sidecar entry (zero: as
+/// the engine runs; the regression test of #1504 sets it).
+///
+/// A crash entry's crash waits for any root commit in progress, and keeps new ones from
+/// starting, until the crash has happened ([`Pigeonhole::hold_root_commits`]). Otherwise a
+/// background compaction's root commit can be durable without its sidecar Root entry, and
+/// the next open expires the feed (D310 §2.2's fail-closed rule, #1504): a real behaviour, but
+/// not what a crash entry is for, and not reproducible.
+///
+/// The crash is a process crash, which keeps the sidecar's written but unsynced entries, so
+/// the hold alone is enough. A power-loss crash entry would still expire its feed on an
+/// unsynced sidecar entry, fail closed by design (simp724 on #1508).
+fn write_entry(e: &Entry, seed: u64, path: &str, observer_delay: Duration) -> Arc<SimVfs> {
+    let vfs = SimVfs::new(seed);
+    let mut db = Pigeonhole::open(path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
+    db.delay_root_observer(observer_delay);
+    (e.write)(&db);
+    if let Some(then) = e.then {
+        db.close().unwrap();
+        db = Pigeonhole::open(path, sim_options(&vfs, e.shards)).unwrap();
+        db.delay_root_observer(observer_delay);
+        then(&db);
+    }
+    if e.crash {
+        let hold = db
+            .hold_root_commits(Duration::from_secs(60))
+            .expect("a root commit still in progress after 60 s");
+        vfs.crash(CrashKind::Process);
+        // Releasing commits what queued meanwhile, now onto the crashed simulator: each such
+        // commit fails, as it would have in the crashed process, and leaves the files as the
+        // crash left them (feed1248 on #1508).
+        drop(hold);
+        drop(db);
+    } else {
+        // Keep the checked-in files small: give back the file's free tail.
+        db.shrink().unwrap();
+        db.close().unwrap();
+    }
+    vfs
+}
+
+/// #1504: with every root commit's sidecar entry delayed by 100 ms, the crash entries still
+/// reopen with their feed intact. Without the generator's hold on root commits, `feed_crash`
+/// fails here every time (5 of 5 runs; 2 of 3 with a 20 ms delay): a compaction's root is
+/// durable at the crash and its Root entry is not, so the reopen expires every token
+/// (`FeedExpired: history has a gap`).
+#[test]
+fn crash_entries_survive_a_slow_root_observer() {
+    for (seed, e) in entries().into_iter().enumerate().filter(|(_, e)| e.crash) {
+        let path = format!("/db/{DB}");
+        let vfs = write_entry(&e, 9_000 + seed as u64, &path, Duration::from_millis(100));
+        let db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
+        if let Some(extra) = e.extra {
+            // The feed entries' listings resume from a stored token: an expired feed panics.
+            assert!(!extra(&db).is_empty(), "{}: an empty listing", e.name);
+        }
+        db.close().unwrap();
+    }
+}
+
 /// The marker file of an entry that 1.0.0 must refuse: it holds the `incompat` feature
 /// bits the refusal names (decimal). CI's 1.0.0 arm fails if such an entry opens, or if
 /// the refusal names other bits (`tests/corpus/compat-reader`), and its 1.1.0 arm, whose
@@ -1318,23 +1380,8 @@ fn generate_corpus() {
     };
     let mut frozen = Vec::new();
     for (seed, e) in entries().into_iter().enumerate() {
-        let vfs = SimVfs::new(9_000 + seed as u64);
         let path = format!("/db/{DB}");
-        let mut db = Pigeonhole::open(&path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
-        (e.write)(&db);
-        if let Some(then) = e.then {
-            db.close().unwrap();
-            db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
-            then(&db);
-        }
-        if e.crash {
-            vfs.crash(CrashKind::Process);
-            drop(db);
-        } else {
-            // Keep the checked-in files small: give back the file's free tail.
-            db.shrink().unwrap();
-            db.close().unwrap();
-        }
+        let vfs = write_entry(&e, 9_000 + seed as u64, &path, Duration::ZERO);
         let files = sim_files(&vfs);
         // What the files hold, as this build reads them (a reopen replays a crashed entry).
         let db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();

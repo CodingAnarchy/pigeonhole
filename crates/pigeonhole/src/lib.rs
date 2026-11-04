@@ -166,6 +166,9 @@ pub use check::{
     CheckCounts, CheckOptions, CheckReport, Finding, Region, RegionKind, Severity, Structure,
     WalFile, WalPosition, check,
 };
+#[cfg(feature = "__engine-hooks")]
+#[doc(hidden)]
+pub use db::RootCommitHold;
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use feed::{Change, ChangeKind, Commit, Feed, FeedBuilder, FeedToken};

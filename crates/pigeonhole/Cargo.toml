@@ -25,6 +25,10 @@ async = ["dep:futures-core"]
 # bench use, and the `PIGEONHOLE_IO` / `PIGEONHOLE_DIRECT` test variables. Not part of the
 # API and outside the semver promise; never turn it on in an application.
 __unstable-hooks = []
+# The engine's own test hooks (`pigeonhole-engine/test-hooks`), reached through hidden
+# methods for this crate's tests (#1504): hold and fault seams only. Only this crate's
+# dev-dependency on itself turns it on; the bench's `__unstable-hooks` builds don't get it.
+__engine-hooks = ["__unstable-hooks", "pigeonhole-engine/test-hooks"]
 
 [dependencies]
 pigeonhole-engine = { workspace = true }
@@ -37,7 +41,7 @@ futures-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # This crate's own tests use its hooks.
-pigeonhole = { path = ".", features = ["__unstable-hooks"] }
+pigeonhole = { path = ".", features = ["__unstable-hooks", "__engine-hooks"] }
 # The engine's test hooks, for the unit tests that race a read (never in a normal build).
 pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }
