@@ -464,13 +464,18 @@ impl FeedReader {
             }
         };
         for (s, (at, must_reach)) in starts.into_iter().enumerate() {
-            let cursor = FeedCursor::open(
+            let mut cursor = FeedCursor::open(
                 &this.shared.vfs,
                 &this.shared.path,
                 StreamId(s as u32),
                 db_id,
                 at,
             )?;
+            // In the writer's process a stop in the head segment reads no segment headers
+            // (D310 PR 5b's subscriber cost; a reader process has no marks to follow).
+            if let Some(marks) = this.writer.as_ref().and_then(|f| f.marks(s)) {
+                cursor.follow_head(Arc::clone(marks));
+            }
             this.streams.push(StreamRead {
                 cursor,
                 delivered_end: at,
