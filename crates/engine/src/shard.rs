@@ -11476,6 +11476,10 @@ impl ShardState {
                 } else {
                     let mut m = Member::single(req);
                     m.scratch_pick = self.shared.vfs.monotonic_nanos();
+                    let waited = m.scratch_pick.saturating_sub(m.submitted_at);
+                    if waited > 100_000 {
+                        pigeonhole_runtime::scratch_slices::classify_inbox_wait(waited);
+                    }
                     self.pending.push(m);
                 }
             }
@@ -11996,6 +12000,9 @@ fn scratch_msg_name(m: &ShardMsg) -> &'static str {
         ShardMsg::TabletOpDone { .. } => "msg:TabletOpDone",
         ShardMsg::Balance { .. } => "msg:Balance",
         ShardMsg::Close { .. } => "msg:Close",
+        ShardMsg::FeedFlush => "msg:FeedFlush",
+        ShardMsg::FeedSync => "msg:FeedSync",
+        ShardMsg::FeedSynced { .. } => "msg:FeedSynced",
     }
 }
 

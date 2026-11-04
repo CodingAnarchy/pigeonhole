@@ -698,6 +698,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
         let window = gaps.as_ref().map_or(Duration::ZERO, GapWindow::window);
         if pigeonhole_io::own_io_in_flight() {
             if spin_before_park(&mut cores, window, true) {
+                scratch_idle("idle:spin", idle_from);
                 record_gap(&mut gaps, idle_from);
                 continue;
             }
@@ -708,10 +709,12 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 })
                 .min(RING_IDLE_WAIT);
             pigeonhole_io::reap_own_io(Some(until));
+            scratch_idle("idle:ring-wait", idle_from);
             record_gap(&mut gaps, idle_from);
             continue;
         }
         if spin_before_park(&mut cores, window, false) {
+            scratch_idle("idle:spin", idle_from);
             record_gap(&mut gaps, idle_from);
             continue;
         }
@@ -735,8 +738,14 @@ pub(crate) fn driver_main<H: ShardHandler>(
             }
             Some(at) => idle_park.park(&*vfs, at),
         }
+        scratch_idle("idle:park", idle_from);
         record_gap(&mut gaps, idle_from);
     }
+}
+
+/// SCRATCH #1460: an idle wait in the inbox-wait ring.
+fn scratch_idle(name: &'static str, from: Instant) {
+    crate::scratch_slices::record(name, from.elapsed().as_nanos() as u64, false);
 }
 
 fn record_gap(gaps: &mut Option<GapWindow>, idle_from: Instant) {

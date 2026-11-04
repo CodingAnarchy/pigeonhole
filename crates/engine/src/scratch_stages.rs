@@ -50,6 +50,14 @@ fn floor_us(b: usize) -> f64 {
 /// Starts (and clears) or stops recording.
 pub fn scratch_stages_record(on: bool) {
     if on {
+        for c in TDOM.iter().chain(TSUM.iter()) {
+            for x in c {
+                x.store(0, Ordering::Relaxed);
+            }
+        }
+        for x in &TN {
+            x.store(0, Ordering::Relaxed);
+        }
         for c in &H {
             for s in c {
                 for b in s {
@@ -82,6 +90,41 @@ pub(crate) fn record(asleep: bool, t0: u64, sent: u64, s: [u64; 7], c: [u64; 2],
     ];
     for (i, x) in v.iter().enumerate() {
         H[usize::from(asleep)][i][bucket(*x)].fetch_add(1, Ordering::Relaxed);
+    }
+    // SCRATCH #1460: a tail commit's dominant stage, and its stages' sums.
+    if v[10] > TAIL_NS {
+        let parts: u64 = v[..10].iter().sum();
+        let mut w = [0u64; 11];
+        w[..10].copy_from_slice(&v[..10]);
+        w[10] = v[10].saturating_sub(parts);
+        let dom = (0..11).max_by_key(|&i| w[i]).unwrap_or(10);
+        let c = usize::from(asleep);
+        TDOM[c][dom].fetch_add(1, Ordering::Relaxed);
+        for (i, x) in w.iter().enumerate() {
+            TSUM[c][i].fetch_add(*x, Ordering::Relaxed);
+        }
+        TN[c].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+const TAIL_NS: u64 = 150_000;
+static TDOM: [[AtomicU64; 11]; 2] = [const { [const { AtomicU64::new(0) }; 11] }; 2];
+static TSUM: [[AtomicU64; 11]; 2] = [const { [const { AtomicU64::new(0) }; 11] }; 2];
+static TN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// SCRATCH #1460: commits over 150 us by their largest stage.
+pub fn scratch_tail_report() {
+    for (c, name) in ["awake", "asleep"].iter().enumerate() {
+        let n = TN[c].load(Ordering::Relaxed);
+        eprintln!("SCRATCH-TAIL {name}: {n} commits over 150 us");
+        for i in 0..11 {
+            let st = if i < 10 { STAGES[i] } else { "unstamped (total - stages)" };
+            eprintln!(
+                "SCRATCH-TAIL {name} | {st:32} | dominant {:7} | mean {:8.1} us",
+                TDOM[c][i].load(Ordering::Relaxed),
+                TSUM[c][i].load(Ordering::Relaxed) as f64 / n.max(1) as f64 / 1000.0
+            );
+        }
     }
 }
 

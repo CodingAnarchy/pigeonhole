@@ -1015,6 +1015,7 @@ impl Runner for PigeonholeRunner {
                 pigeonhole_engine::scratch_stages_record(false);
                 pigeonhole_engine::scratch_stages_report();
                 pigeonhole_engine::scratch_outer_report();
+                pigeonhole_engine::scratch_tail_report();
                 pigeonhole_engine::scratch_slices::record_on(false);
                 pigeonhole_engine::scratch_slices::report();
             }

@@ -1594,10 +1594,91 @@ pub mod scratch_slices {
         }
         ON.store(on, Ordering::Relaxed);
     }
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    fn inow() -> u64 {
+        BASE.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos() as u64
+    }
+    const RING: usize = 128;
+    thread_local! {
+        /// SCRATCH #1460: this thread's recent parts over 20 us: (end, duration, name).
+        static R: std::cell::RefCell<(usize, [(u64, u64, &'static str); RING])> =
+            const { std::cell::RefCell::new((0, [(0, 0, ""); RING])) };
+    }
+    #[derive(Default)]
+    struct W {
+        n: u64,
+        wait_ns: u64,
+        covered_ns: u64,
+        over300: u64,
+    }
+    static WM: Mutex<Option<HashMap<&'static str, W>>> = Mutex::new(None);
+    /// SCRATCH #1460: a commit the shard picked after waiting `wait_ns` in its inbox:
+    /// which part of this (shard) thread's recent turns covered most of that window.
+    pub fn classify_inbox_wait(wait_ns: u64) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let end = inow();
+        let start = end.saturating_sub(wait_ns);
+        let mut by: Vec<(&'static str, u64)> = Vec::new();
+        R.with(|r| {
+            let r = r.borrow();
+            for &(e, d, name) in r.1.iter() {
+                if d == 0 {
+                    continue;
+                }
+                let b = e.saturating_sub(d);
+                let ov = e.min(end).saturating_sub(b.max(start));
+                if ov == 0 {
+                    continue;
+                }
+                match by.iter_mut().find(|(n, _)| *n == name) {
+                    Some(x) => x.1 += ov,
+                    None => by.push((name, ov)),
+                }
+            }
+        });
+        // The most specific part: a message, end_batch section or task over the drain
+        // that holds it, when it covers at least 30% of the wait.
+        let pick = |drain: bool| {
+            by.iter()
+                .filter(|(n, _)| (*n == "drain (foreground turn)") == drain)
+                .max_by_key(|(_, ov)| *ov)
+                .copied()
+        };
+        let min = wait_ns * 3 / 10;
+        let (name, cov) = match (pick(false), pick(true)) {
+            (Some(x), _) if x.1 >= min => x,
+            (_, Some(x)) if x.1 >= min => x,
+            _ => (
+                "UNCOVERED (off-cpu or short turns)",
+                by.iter().map(|x| x.1).max().unwrap_or(0),
+            ),
+        };
+        let mut g = WM.lock().unwrap();
+        let w = g.get_or_insert_with(HashMap::new).entry(name).or_default();
+        w.n += 1;
+        w.wait_ns += wait_ns;
+        w.covered_ns += cov.min(wait_ns);
+        if wait_ns > 300_000 {
+            w.over300 += 1;
+        }
+    }
     /// Records one timed part.
     pub fn record(name: &'static str, ns: u64, held: bool) {
         if !ON.load(Ordering::Relaxed) {
             return;
+        }
+        if ns > 20_000 {
+            let e = inow();
+            R.with(|r| {
+                let mut r = r.borrow_mut();
+                let i = r.0;
+                r.1[i % RING] = (e, ns, name);
+                r.0 = i + 1;
+            });
         }
         let mut g = M.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(name).or_default();
@@ -1616,6 +1697,24 @@ pub mod scratch_slices {
     }
     /// Prints the table to stderr.
     pub fn report() {
+        {
+            let mut g = WM.lock().unwrap();
+            if let Some(m) = g.as_mut() {
+                let mut v: Vec<_> = m.iter().collect();
+                v.sort_by_key(|(_, w)| std::cmp::Reverse(w.wait_ns));
+                for (name, w) in v {
+                    eprintln!(
+                        "SCRATCH-INBOXWAIT {name:40} | waits>100us {:8} | >300us {:7} | total wait {:9.1} ms | mean wait {:7.1} us | covered {:5.1}%",
+                        w.n,
+                        w.over300,
+                        w.wait_ns as f64 / 1e6,
+                        w.wait_ns as f64 / w.n.max(1) as f64 / 1000.0,
+                        100.0 * w.covered_ns as f64 / w.wait_ns.max(1) as f64
+                    );
+                }
+            }
+            *g = None;
+        }
         let mut g = M.lock().unwrap();
         let Some(m) = g.as_mut() else { return };
         let mut v: Vec<_> = m.iter_mut().collect();

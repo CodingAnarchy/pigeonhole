@@ -26,7 +26,7 @@ mod scratch_stages;
 pub use pigeonhole_runtime::scratch_slices;
 pub use scratch_stages::{
     scratch_mark_commit, scratch_op_end, scratch_op_start, scratch_outer_report,
-    scratch_stages_record, scratch_stages_report,
+    scratch_stages_record, scratch_stages_report, scratch_tail_report,
 };
 mod catalog;
 mod check;
