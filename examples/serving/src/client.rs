@@ -208,33 +208,33 @@ impl Client {
     /// Tries to claim a job: its fencing token, or `None` when another worker holds it or
     /// it's done.
     ///
-    /// The claim carries a fresh random nonce, and a claim whose outcome is unknown (no
-    /// reply) is sent again with the **same** nonce: if the first attempt landed, the server
+    /// The claim carries a fresh random claim id, and a claim whose outcome is unknown (no
+    /// reply) is sent again with the **same** claim id: if the first attempt landed, the server
     /// recognises its own token and hands it back, so a lost reply never leaves the job held
     /// by a claim nobody knows about (simp724's L1 on #1491).
     pub fn claim(&self, id: &str, worker: &str) -> Result<Option<Claim>, ClientError> {
-        let nonce = nonce();
+        let claim_id = new_claim_id();
         let mut tried = 0;
         loop {
             tried += 1;
-            match self.claim_with_nonce(id, worker, &nonce) {
+            match self.claim_with_id(id, worker, &claim_id) {
                 Err(e) if e.outcome_unknown() && tried < 3 => continue,
                 r => return r,
             }
         }
     }
 
-    /// [`claim`](Self::claim) with a nonce the caller chose: the same nonce again is the same
+    /// [`claim`](Self::claim) with a claim id the caller chose: the same claim id again is the same
     /// claim, answered with the same token if it holds the job.
-    pub fn claim_with_nonce(
+    pub fn claim_with_id(
         &self,
         id: &str,
         worker: &str,
-        nonce: &str,
+        claim_id: &str,
     ) -> Result<Option<Claim>, ClientError> {
         match self.post(
             &format!("/jobs/{id}/claim"),
-            &json!({ "worker": worker, "nonce": nonce }),
+            &json!({ "worker": worker, "claim_id": claim_id }),
         ) {
             Ok(v) => Ok(v.get("fence").and_then(Value::as_str).map(|f| Claim {
                 fence: f.to_owned(),
@@ -442,7 +442,7 @@ impl Iterator for Events {
 /// A random enough id for a claim: 128 bits from the standard library's randomly keyed
 /// hasher, the time and a counter. An application would use a UUID v4 or its own random
 /// source; this keeps the example free of another dependency.
-fn nonce() -> String {
+fn new_claim_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

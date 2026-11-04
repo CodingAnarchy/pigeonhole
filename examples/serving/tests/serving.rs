@@ -295,22 +295,22 @@ fn a_configured_token_is_required() {
 #[test]
 fn a_retried_claim_gets_its_own_token_back() {
     // simp724's L1 on #1491: a claim whose reply was lost is sent again with the same
-    // nonce. It must get the same token back, not `Claimed` from its own lease.
+    // claim id. It must get the same token back, not `Claimed` from its own lease.
     let server = Server::start(Duration::from_secs(30), None);
     let client = server.client();
     client.create_job("job:1", "spec").unwrap();
     let first = client
-        .claim_with_nonce("job:1", "w1", "n-1")
+        .claim_with_id("job:1", "w1", "n-1")
         .unwrap()
         .expect("unclaimed");
-    let retried = client.claim_with_nonce("job:1", "w1", "n-1").unwrap();
+    let retried = client.claim_with_id("job:1", "w1", "n-1").unwrap();
     assert_eq!(
         retried.as_ref(),
         Some(&first),
         "the retry is the same claim"
     );
-    // A different claim (another nonce, the same worker or another) is refused.
-    assert_eq!(client.claim_with_nonce("job:1", "w1", "n-2").unwrap(), None);
-    assert_eq!(client.claim_with_nonce("job:1", "w2", "n-1").unwrap(), None);
+    // A different claim (another claim id, the same worker or another) is refused.
+    assert_eq!(client.claim_with_id("job:1", "w1", "n-2").unwrap(), None);
+    assert_eq!(client.claim_with_id("job:1", "w2", "n-1").unwrap(), None);
     assert!(client.complete("job:1", &first, "done").unwrap());
 }

@@ -358,7 +358,7 @@ async fn list_jobs(State(app): State<Arc<App>>, Query(q): Query<PageQuery>) -> A
 struct ClaimRequest {
     worker: String,
     /// A random id the worker makes for this claim and reuses only to retry it.
-    nonce: String,
+    claim_id: String,
 }
 
 #[derive(Deserialize)]
@@ -380,13 +380,13 @@ fn holder_is(fence: &str) -> Condition {
 ///
 /// The claim is a conditional write on the lease column: it lands only if the column is
 /// absent, which it is when nobody claimed the job or the last claim expired (the lease
-/// family's TTL). The lease's value is a fencing token unique to this claim, `worker/nonce`,
+/// family's TTL). The lease's value is a fencing token unique to this claim, `worker/claim_id`,
 /// returned to the worker: every later write for the job (renew, complete) is conditioned on
 /// the lease still holding that exact token. A worker that stalls past its TTL then can't
 /// overwrite the work of whoever claimed the job after it, even though it still thinks it
 /// holds the lease.
 ///
-/// The nonce comes from the worker so a claim can be retried (simp724's L1 on #1491): a
+/// The claim id comes from the worker so a claim can be retried (simp724's L1 on #1491): a
 /// worker whose claim reply was lost sends the same request again, and gets its own token
 /// back if the first attempt landed, or `Claimed` if someone else holds the job. Without
 /// it, a lost reply would leave the job held by a lease nobody knows they own, until the
@@ -396,14 +396,14 @@ async fn claim_job(
     Path(id): Path<String>,
     Json(req): Json<ClaimRequest>,
 ) -> ApiResult<Response> {
-    if req.nonce.is_empty() || req.worker.contains('/') {
+    if req.claim_id.is_empty() || req.worker.contains('/') {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
-            "a claim needs a nonce, and a worker name without '/'",
+            "a claim needs a claim_id, and a worker name without '/'",
         ));
     }
-    let fence = format!("{}/{}", req.worker, req.nonce);
+    let fence = format!("{}/{}", req.worker, req.claim_id);
     let unclaimed = Condition::Absent {
         family: LEASE.into(),
         qualifier: HOLDER.to_vec(),
