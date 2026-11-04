@@ -1216,6 +1216,11 @@ impl Pigeonhole {
     /// if a commit still held the exclusion after `timeout`. A test hold seam (#1504): the
     /// corpus generator takes it before it crashes a fed database, so a background
     /// compaction's root commit can't straddle the crash.
+    ///
+    /// **A process crash only.** Every root commit records its sidecar entry before it lets
+    /// the exclusion go, so under a process crash no root is half-recorded while the hold
+    /// lasts. The entry's sync isn't waited for: a power loss can still drop it (feed1248 on
+    /// #1508).
     #[cfg(feature = "__engine-hooks")]
     #[doc(hidden)]
     pub fn hold_root_commits(&self, timeout: Duration) -> Option<RootCommitHold> {

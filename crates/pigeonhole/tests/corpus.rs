@@ -136,6 +136,10 @@ const T0: u64 = 1_767_225_600_000_000;
 /// background compaction's root commit can be durable without its sidecar Root entry, and
 /// the next open expires the feed (D310 §2.2's fail-closed rule, #1504): a real behaviour, but
 /// not what a crash entry is for, and not reproducible.
+///
+/// The crash is a process crash, which keeps the sidecar's written but unsynced entries, so
+/// the hold alone is enough. A power-loss crash entry would still expire its feed on an
+/// unsynced sidecar entry, fail closed by design (simp724 on #1508).
 fn write_entry(e: &Entry, seed: u64, path: &str, observer_delay: Duration) -> Arc<SimVfs> {
     let vfs = SimVfs::new(seed);
     let mut db = Pigeonhole::open(path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
@@ -152,6 +156,9 @@ fn write_entry(e: &Entry, seed: u64, path: &str, observer_delay: Duration) -> Ar
             .hold_root_commits(Duration::from_secs(60))
             .expect("a root commit still in progress after 60 s");
         vfs.crash(CrashKind::Process);
+        // Releasing commits what queued meanwhile, now onto the crashed simulator: each such
+        // commit fails, as it would have in the crashed process, and leaves the files as the
+        // crash left them (feed1248 on #1508).
         drop(hold);
         drop(db);
     } else {
