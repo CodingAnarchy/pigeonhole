@@ -4625,10 +4625,12 @@ impl ShardState {
         crate::scratch_freezes::record(
             "PICK",
             format!(
-                "open slots ~{} open {} MiB frozen {} MiB sealed {} free {} MiB of {} MiB reserved {} KiB picked {}",
+                "open slots ~{} open {} MiB frozen {} MiB deferred {} MiB retired-for-readers {} sealed {} free {} MiB of {} MiB reserved {} KiB picked {}",
                 open_n / 25 * 25,
                 mib(open_bytes),
                 mib(frozen_bytes),
+                mib(self.arena.scratch_deferred_chunks() * self.chunk_size),
+                self.retired.len(),
                 sealed,
                 mib(self.arena.free_bytes()),
                 mib(self.arena.region().len()),
