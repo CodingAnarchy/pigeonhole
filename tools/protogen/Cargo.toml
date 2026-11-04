@@ -1,0 +1,21 @@
+# Regenerates the network API's Rust code (D313, ICR 0112) from proto/pigeonhole/v1/*.proto
+# into crates/cli/src/serve/proto/. A workspace of its own, so the main workspace never
+# builds the generators; CI runs it and fails if the checked-in code differs.
+#
+#     cargo run --locked --manifest-path tools/protogen/Cargo.toml
+[package]
+name = "pigeonhole-protogen"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+# A pure-Rust .proto compiler, so nobody needs protoc.
+protox = "0.10"
+prost = "0.14"
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+pbjson-build = "0.9"

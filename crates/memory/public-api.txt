@@ -348,6 +348,8 @@ pub pigeonhole_memory::StoreStats::broken_links: u64
 pub pigeonhole_memory::StoreStats::dangling_superseded: u64
 pub pigeonhole_memory::StoreStats::ivf_counter_drift: u64
 pub pigeonhole_memory::StoreStats::ivf_mismatched: u64
+pub pigeonhole_memory::StoreStats::ivf_missing: u64
+pub pigeonhole_memory::StoreStats::ivf_stale: u64
 pub pigeonhole_memory::StoreStats::memories: u64
 pub pigeonhole_memory::StoreStats::missing_embeddings: u64
 pub pigeonhole_memory::StoreStats::no_content: u64

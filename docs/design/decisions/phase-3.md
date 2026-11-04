@@ -4286,6 +4286,48 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - A future attempt would need a way to store into the WAL without the per-page fault after each sync, for example a slot that is never synced while it's being written. None was found that keeps `Buffered`'s and `Default`'s shared WAL.
 - The D310 cursor fix that D312's review prompted (#1370, above) stands on its own: any torn read past the frontier is handled the same way.
 
+<a id="d313"></a>
+## D313 — `phdb serve`: one process serves a database over gRPC, HTTP/JSON and remote MCP, on one shared service layer (cli692, design; owner decisions, 2026-11-03 and 2026-11-04; reviewed by simp724, perf287 and ai1249; cli, #1397, ICR 0112)
+
+**Decided:** two deliverables, in order. Step 1 is a reference pattern for teams that own their server (`docs/guide/serving.md` and `examples/serving`). Step 2 is `phdb serve`, a feature of the existing `phdb` binary (`serve`, off by default). It serves gRPC, HTTP/JSON (`/v1`) and remote MCP (Streamable HTTP at `/mcp`) from one process and one port. All three call one service layer, and neither gRPC nor HTTP is a wrapper around the other. The API covers every feature: data, transactions, counters and aggregates, schema, the change feed, graph, vector, text, memory, admin and backup. The full design, with its review history, is [the note on #1397](https://github.com/CodingAnarchy/pigeonhole/issues/1397#issuecomment-6637314515); the contract is ICR 0112.
+
+**The contract.**
+- **One schema:** `proto/pigeonhole/v1/*.proto`. HTTP/JSON is the proto's canonical JSON mapping, with base64 bytes (owner, Q3).
+- **Codegen is checked in** (`tools/protogen`, with a CI drift check), so building never needs `protoc`.
+- **Ids are opaque.** A `RoutingKey` on `Begin` and `Snapshots.Open` is in v1 from the start, for D317's partitions.
+- **v1 changes only additively.**
+
+**Writes and their outcomes (simp724's B1–B3).** After a write has been sent, no response the client can get reads as "not committed" unless it is.
+- **Retry-safe responses:** a write is retry-safe only with the stable `code` detail saying so. A bare transport status, or a 5xx without the API's body, means the outcome is unknown.
+- **Detached commits:** commits run in their own task, so a disconnect loses only the reply. A submitted commit outlives the request's deadline and answers its real outcome.
+- **No automatic retry:** the published gRPC config retries no write.
+
+**Sessions.**
+- **Transactions, pinned snapshots and MCP sessions** live in one session table. Each has an unguessable id bound to its token (`NOT_FOUND` across tokens), an idle lease renewed at each call's start and end, a hard lifetime, and caps. The reaper never expires a session with a call in flight.
+- **A transaction allows one call at a time** (`SessionBusy`). Snapshots and MCP sessions allow concurrent calls, MCP up to a per-session cap.
+- **After `Commit`, a transaction's session becomes a tombstone holding the outcome,** and answers it to every later call until it expires. `TransactionExpired` means only "expired before any `Commit`".
+
+**Threads, streams and limits (perf287's R1–R3).**
+- **Placement:** Tokio's workers and the blocking pool run on the CPUs outside `pinned_shard_cpus()`, and `phdb serve`'s default shard count leaves physical cores for the network side.
+- **Calls:** the hot path uses the async front door (D210). Sync-only calls run on a bounded blocking pool, with memory and embedding calls under their own sub-limit.
+- **Feeds:** clients of one feed spec share one engine subscription, fanned out in the server.
+- **Limits:**
+  - an in-flight body-bytes budget, acquired before decoding;
+  - load shedding rather than queueing (`Overloaded`);
+  - deadlines that cover the time a request queues;
+  - capped scan pages.
+
+**Security (owner sign-off, 2026-11-03 and Q2 and Q6 on 2026-11-04).**
+- **TLS** via rustls.
+- **Bearer tokens** from a file or the environment, never a flag.
+- **Scopes:** `read`, `write` and `admin`, and memory tokens can be limited to namespaces.
+- **Bind rule:** a non-loopback bind is refused without TLS and auth unless explicitly opted out.
+- **Limits:** size, timeout and concurrency.
+
+The same rules hold for all three protocols, and every call path enforces scopes in the service layer.
+
+**The limits, stated in the guide:** one writer node, so no replication or HA, only backup and restore; the file on local disk; one machine's throughput. Read replicas (#1436) and partitions (D317, #1482) build on this service layer.
+
 <a id="d314"></a>
 ## D314 — A row mutation's counters can return their values after its commit: `commit_returning`, folded on the row's shard right after the commit applies (perf2, design; owner decision, 2026-11-03; reviewed by simp724 and perf287; engine, pigeonhole, #1440, ICR 0113)
 

@@ -1,0 +1,103 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): optimistic transactions and pinned
+// snapshots, held on the server as leased sessions (D313 §3).
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+import "pigeonhole/v1/data.proto";
+
+// A transaction reads at one snapshot, buffers writes, and commits them atomically; a
+// conflicting commit fails with `Conflict` and writes nothing. The retry loop is the
+// client's. A session allows one call at a time (`SessionBusy` otherwise), expires when
+// idle (`TransactionExpired`, only before any `Commit`), and after `Commit` answers every
+// call with the commit's recorded outcome until it expires (D313 B1, B2).
+service Transactions {
+  rpc Begin(BeginRequest) returns (BeginResponse);
+  rpc Get(TxnGetRequest) returns (GetResponse);
+  rpc GetRow(TxnGetRowRequest) returns (ReadRowResponse);
+  // Buffers writes; nothing is visible until `Commit`.
+  rpc Write(TxnWriteRequest) returns (Empty);
+  // Commits the buffered writes and `writes`. A repeated `Commit` answers the first one's
+  // outcome.
+  rpc Commit(TxnCommitRequest) returns (TxnCommitResponse);
+  // Ends the transaction without writing.
+  rpc Abort(TxnAbortRequest) returns (Empty);
+}
+
+message BeginRequest {
+  // The commit's durability (unset: the writer default).
+  Durability durability = 1;
+  // Where the transaction runs once the database is partitioned (D317): send it from the
+  // start. A single-node server ignores it.
+  RoutingKey route = 2;
+}
+
+message BeginResponse {
+  // Opaque: store it and send it back; don't parse it.
+  string txn_id = 1;
+  // The snapshot's seqno, which the transaction reads at.
+  uint64 snapshot_seqno = 2;
+}
+
+message TxnGetRequest {
+  string txn_id = 1;
+  string table = 2;
+  bytes row = 3;
+  string family = 4;
+  bytes qualifier = 5;
+}
+
+message TxnGetRowRequest {
+  string txn_id = 1;
+  string table = 2;
+  bytes row = 3;
+  // The families to read; each counts as read in full for the conflict check.
+  repeated string families = 4;
+}
+
+message TxnWriteRequest {
+  string txn_id = 1;
+  repeated RowWrites rows = 2;
+}
+
+message TxnCommitRequest {
+  string txn_id = 1;
+  // More writes, committed with the buffered ones.
+  repeated RowWrites rows = 2;
+}
+
+message TxnCommitResponse {
+  CommitInfo commit = 1;
+}
+
+message TxnAbortRequest {
+  string txn_id = 1;
+}
+
+// A snapshot pinned on the server, for reads that must agree across requests (paging a
+// scan at one point in time). It holds back purges while it lives, so it's leased: each
+// read at it renews the lease, and an idle one expires (D313 §3).
+service Snapshots {
+  rpc Open(OpenSnapshotRequest) returns (OpenSnapshotResponse);
+  // Releases it now. Reads already running finish; later ones get `NOT_FOUND`.
+  rpc Release(ReleaseSnapshotRequest) returns (Empty);
+}
+
+message OpenSnapshotRequest {
+  // Only data durable at the writer's level (`durable_snapshot`), instead of everything
+  // visible.
+  bool durable = 1;
+  // As for `BeginRequest.route`.
+  RoutingKey route = 2;
+}
+
+message OpenSnapshotResponse {
+  // Opaque; pass it as `Selection.snapshot_id` or `GetRequest.snapshot_id`.
+  string snapshot_id = 1;
+  uint64 seqno = 2;
+}
+
+message ReleaseSnapshotRequest {
+  string snapshot_id = 1;
+}

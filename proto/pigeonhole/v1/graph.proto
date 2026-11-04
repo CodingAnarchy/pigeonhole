@@ -1,0 +1,57 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): breadth-first traversal (D304).
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+
+service Graph {
+  // Walks an edge family from the seeds: a node is a row, an edge a column of `family`
+  // whose qualifier is the destination's row key.
+  rpc Traverse(TraverseRequest) returns (TraverseResponse);
+}
+
+message TraverseRequest {
+  string table = 1;
+  repeated bytes seeds = 2;
+  // The edge family (exactly one).
+  string family = 3;
+  // 1 to 64 (0: 1).
+  uint32 hops = 4;
+  // Edges read per node (0: all).
+  uint32 per_node_limit = 5;
+  // Nodes kept per hop (0: all).
+  uint64 hop_limit = 6;
+  // Nodes in all, the seeds included (0: the library's default).
+  uint64 max_nodes = 7;
+  // Report each node's source in the previous hop.
+  bool parents = 8;
+  // The edge selection.
+  bytes qualifier_prefix = 9;
+  Bound qualifier_start = 10;
+  Bound qualifier_end = 11;
+  TimeRange time_range = 12;
+  ValueFilter value_filter = 13;
+  string snapshot_id = 14;
+}
+
+message TraverseResponse {
+  // Hop 1 first; fewer than asked when a frontier ran empty or `max_nodes` was reached.
+  repeated Hop hops = 1;
+  TraverseStats stats = 2;
+}
+
+message Hop {
+  // The nodes new at this hop, sorted.
+  repeated bytes nodes = 1;
+  // With `parents`: each node's source, as an index into the previous hop's nodes (or the
+  // seeds, for hop 1).
+  repeated uint32 parents = 2;
+}
+
+message TraverseStats {
+  uint64 rows = 1;
+  uint64 edges = 2;
+  uint32 hops_cut = 3;
+  bool cut_by_max_nodes = 4;
+}

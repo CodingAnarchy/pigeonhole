@@ -1,0 +1,133 @@
+// Pigeonhole's network API, v1 (D313, ICR 0112): exact nearest neighbours over a vector
+// family (D303), and `pigeonhole-vector`'s IVF index (ICR 0100).
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/common.proto";
+import "pigeonhole/v1/data.proto";
+import "pigeonhole/v1/schema.proto";
+
+service Vectors {
+  // Exact top-k over a scan's or a multi-get's vectors, nearest first.
+  rpc Nearest(NearestRequest) returns (NearestResponse);
+  rpc CreateIndex(CreateVectorIndexRequest) returns (Empty);
+  rpc Insert(VectorInsertRequest) returns (Empty);
+  rpc Delete(VectorDeleteRequest) returns (Empty);
+  rpc Search(VectorSearchRequest) returns (VectorSearchResponse);
+  // Loads many vectors into an empty index, streamed in batches.
+  rpc BulkLoad(stream VectorBulkLoadRequest) returns (Empty);
+  rpc Verify(VectorVerifyRequest) returns (VectorVerifyResponse);
+}
+
+message NearestRequest {
+  string table = 1;
+  // Which rows' vectors to search.
+  oneof source {
+    KeyRange range = 2;
+    KeyList keys = 3;
+  }
+  // The vector family.
+  string family = 4;
+  Vector query = 5;
+  uint32 k = 6;
+  string snapshot_id = 7;
+  // Cut the result to this many bytes by D308's measure (0: no budget).
+  uint64 page_bytes = 8;
+}
+
+message KeyList {
+  repeated bytes keys = 1;
+}
+
+message NearestResponse {
+  repeated Neighbour neighbours = 1;
+  bool cut_by_budget = 2;
+}
+
+message Neighbour {
+  bytes row = 1;
+  bytes qualifier = 2;
+  double distance = 3;
+  uint64 timestamp = 4;
+}
+
+message CreateVectorIndexRequest {
+  string name = 1;
+  VectorSpec spec = 2;
+  // Unset options take the library's defaults.
+  optional uint32 target_list_len = 3;
+  optional uint32 nprobe = 4;
+  optional uint32 reassign_neighbours = 5;
+  Rebalance rebalance = 6;
+  // With `if_missing`, an existing index is opened instead.
+  bool if_missing = 7;
+}
+
+enum Rebalance {
+  REBALANCE_UNSPECIFIED = 0;
+  REBALANCE_INLINE = 1;
+  REBALANCE_BACKGROUND = 2;
+}
+
+message VectorInsertRequest {
+  string index = 1;
+  bytes id = 2;
+  Vector vector = 3;
+}
+
+message VectorDeleteRequest {
+  string index = 1;
+  bytes id = 2;
+}
+
+message VectorSearchRequest {
+  string index = 1;
+  Vector query = 2;
+  uint32 k = 3;
+  // Lists probed (0: the index's default).
+  uint32 nprobe = 4;
+  // Only ids starting with this prefix.
+  bytes id_prefix = 5;
+  // Lists probed at most, while the prefix filter needs more (0: no cap).
+  uint32 max_probe = 6;
+  // Report the search's statistics.
+  bool stats = 7;
+}
+
+message VectorSearchResponse {
+  repeated VectorHit hits = 1;
+  VectorSearchStats stats = 2;
+}
+
+message VectorHit {
+  bytes id = 1;
+  double distance = 2;
+}
+
+message VectorSearchStats {
+  uint32 lists_probed = 1;
+  uint32 lists = 2;
+}
+
+message VectorBulkLoadRequest {
+  // In the first message only.
+  string index = 1;
+  // In the first message only: about how many vectors follow, for sizing the lists.
+  uint64 expected = 2;
+  repeated VectorItem items = 3;
+}
+
+message VectorItem {
+  bytes id = 1;
+  Vector vector = 2;
+}
+
+message VectorVerifyRequest {
+  string index = 1;
+}
+
+message VectorVerifyResponse {
+  uint64 vectors = 1;
+  uint64 lists = 2;
+}
