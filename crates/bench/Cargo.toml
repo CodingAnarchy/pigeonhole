@@ -28,6 +28,7 @@ sqlite = ["dep:rusqlite"]
 fixed-seed = []
 
 [dependencies]
+libc = { workspace = true }
 # Default features (async included): the instruction counts measure what users get.
 # The bench reads pigeonhole's test and bench hooks (ICR 0085).
 pigeonhole = { workspace = true, features = ["__unstable-hooks"] }

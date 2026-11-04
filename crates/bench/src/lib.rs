@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::path::Path;
 use std::str::FromStr;
@@ -1571,6 +1571,7 @@ fn pass(
                share: &[(BenchOp, Class)],
                i: usize|
      -> Result<(Histogram, Split), String> {
+        scratch_client_setup();
         let mut hist = Histogram::new();
         let mut split = Split::default();
         let paced_from = Instant::now();
@@ -2101,5 +2102,83 @@ mod tests {
         .unwrap();
         assert!(!s.settled);
         assert!(s.millis >= 300);
+    }
+}
+
+// ---- SCRATCH #1460 (not for merge): client placement and priority arms ----
+static SCRATCH_AVOID: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// The pinned shard CPUs; with PH_SCRATCH_CLIENT_AVOID the clients avoid them and their
+/// SMT siblings.
+pub(crate) fn scratch_set_avoid(cpus: &[usize]) {
+    *SCRATCH_AVOID.lock().unwrap() = cpus.to_vec();
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_siblings(cpu: usize) -> Vec<usize> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![cpu];
+    };
+    let mut out = Vec::new();
+    for part in text.trim().split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(a..=b);
+                }
+            }
+            None => {
+                if let Ok(a) = part.parse() {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Applies PH_SCRATCH_CLIENT_NICE and PH_SCRATCH_CLIENT_AVOID to this client thread.
+#[allow(unsafe_code)]
+fn scratch_client_setup() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(n) = std::env::var("PH_SCRATCH_CLIENT_NICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            // SAFETY: plain syscalls on this thread.
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                libc::setpriority(libc::PRIO_PROCESS, tid, n);
+            }
+        }
+        if std::env::var_os("PH_SCRATCH_CLIENT_AVOID").is_some() {
+            let pinned = SCRATCH_AVOID.lock().unwrap().clone();
+            if pinned.is_empty() {
+                return;
+            }
+            let mut avoid = std::collections::HashSet::new();
+            for c in &pinned {
+                avoid.extend(scratch_siblings(*c));
+            }
+            let n = std::thread::available_parallelism().map_or(1, |n| n.get()).max(64);
+            // SAFETY: cpu_set_t is plain old data; all-zero is the empty set.
+            let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            let mut any = false;
+            for c in 0..n.min(1024) {
+                if !avoid.contains(&c) && std::path::Path::new(&format!("/sys/devices/system/cpu/cpu{c}")).exists() {
+                    // SAFETY: c < CPU_SETSIZE.
+                    unsafe { libc::CPU_SET(c, &mut set) };
+                    any = true;
+                }
+            }
+            if any {
+                // SAFETY: a valid, initialized cpu_set_t.
+                unsafe {
+                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                }
+            }
+        }
     }
 }

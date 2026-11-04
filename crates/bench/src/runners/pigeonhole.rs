@@ -847,6 +847,9 @@ fn caches(s: &Settings) -> (u64, Option<u64>) {
 
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
+    if std::env::var_os("PH_SCRATCH_NOPIN").is_some() {
+        options = options.pin_threads(false);
+    }
     if !s.default_durability {
         options = options.durability(if s.none_durability {
             Durability::None
@@ -1005,6 +1008,10 @@ impl Runner for PigeonholeRunner {
     }
 
     fn mark_phase(&mut self, phase: &str) {
+        // SCRATCH #1460: the CPUs the clients avoid (PH_SCRATCH_CLIENT_AVOID).
+        if let Some(open) = self.open.as_ref() {
+            crate::scratch_set_avoid(&open.target.db.pinned_shard_cpus());
+        }
         // SCRATCH #1206: the commit stage histograms cover the measured phase only.
         match phase {
             "measured" => {
