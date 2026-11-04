@@ -1,0 +1,60 @@
+name: Publish to PyPI
+
+# Uploads the pigeonhole-db wheels and sdist (python-wheels.yml) to PyPI on a release tag
+# (#696). Trusted publishing: the upload authenticates with this run's OIDC token, so no API
+# token is stored anywhere. The publish job runs in the `pypi` environment, whose required
+# reviewer (the owner) approves each release before anything is uploaded.
+#
+# Owner setup, once, before the first release tag:
+#   - Settings → Environments → `pypi`: add the owner as required reviewer, and limit
+#     deployments to tags matching `v*`.
+#   - pypi.org: add a (pending) trusted publisher for project `pigeonhole-db`: owner
+#     CodingAnarchy, repository pigeonhole, workflow publish-pypi.yml, environment pypi.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/python-wheels.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pigeonhole-db/
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing; this job only
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '{wheel-*,sdist}'
+          path: dist
+          merge-multiple: true
+      # Every file must carry the tag's version: a tag pushed on a commit whose workspace
+      # version wasn't bumped stops here, before the upload.
+      - name: The packages match the tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          ls -l dist
+          shopt -s nullglob
+          files=(dist/*)
+          [ "${#files[@]}" -gt 0 ] || { echo "no packages downloaded"; exit 1; }
+          for f in "${files[@]}"; do
+            case "$(basename "$f")" in
+              pigeonhole_db-"$version"-*.whl|pigeonhole_db-"$version".tar.gz) ;;
+              *) echo "$f does not match version $version"; exit 1 ;;
+            esac
+          done
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -252,6 +252,14 @@
 # (1687 -> 1612, -4.4%), knn-budget 1700 -> 1625 (1694 -> 1620, -4.4%). Every other shape
 # is level within its #1305 spread.
 #
+# KNN shapes lowered for #1443 (#1283 lever 3: a reduction lane over one SST with nothing to
+# resolve reads it straight, with no merge, resolver group walk or copy; D195 ceilings
+# commit, perf287), each the head's count (run 41753768738, 2d143d38, main merged) times
+# (1 + 0.3%): knn-exact 1625 -> 1069 (count 1620 -> 1065, -34.3%), knn-filtered 3335 -> 2740
+# (3325 -> 2731, -17.9%), knn-exact-f16 1901 -> 1368 (1895 -> 1363, -28.1%), knn-exact-bf16
+# 1617 -> 1084 (1612 -> 1080, -33.0%), knn-budget 1625 -> 1069 (1620 -> 1065, -34.3%).
+# Every other shape is level within its #1305 spread.
+#
 # Lowered by #1311 (#1206 lever 1 step 2) from its head 555dda5a's counts, merged onto main
 # (instructions run 41441034950), with `instruction-ceilings.py lower`: commit-one 9562 ->
 # 8834, commit-sixteen 50384 -> 38937, commit-overwrite 11660 -> 10829, commit-at 10590 ->
@@ -307,10 +315,10 @@ wide-row-cells 1506 0.3
 wide-row-pages 1520 0.3
 multi-get-dense 12568 0.5
 multi-get-sparse 17108 0.5
-knn-exact 1625 0.3
-knn-filtered 3335 0.3
+knn-exact 1069 0.3
+knn-filtered 2740 0.3
 scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
-knn-exact-f16 1901 0.3
-knn-exact-bf16 1617 0.3
-knn-budget 1625 0.3
+knn-exact-f16 1368 0.3
+knn-exact-bf16 1084 0.3
+knn-budget 1069 0.3
