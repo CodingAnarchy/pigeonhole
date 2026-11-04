@@ -600,6 +600,7 @@ pub fn pigeonhole::Pigeonhole::drop_table(&self, &str) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::durable_snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
 pub fn pigeonhole::Pigeonhole::engine_metrics(&self) -> pigeonhole::EngineMetrics
 pub fn pigeonhole::Pigeonhole::failure(&self) -> core::option::Option<pigeonhole::Failure>
+pub fn pigeonhole::Pigeonhole::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::Pigeonhole::flush(&self) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
 pub fn pigeonhole::Pigeonhole::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
@@ -629,6 +630,7 @@ pub fn pigeonhole::PigeonholeReader::async_sync_reads(&self) -> u64
 pub fn pigeonhole::PigeonholeReader::backup(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
 pub fn pigeonhole::PigeonholeReader::backup_durable(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
 pub fn pigeonhole::PigeonholeReader::durable_snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
+pub fn pigeonhole::PigeonholeReader::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::PigeonholeReader::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
 pub fn pigeonhole::PigeonholeReader::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
 pub fn pigeonhole::PigeonholeReader::row_cache_stats(&self) -> pigeonhole::RowCacheStats

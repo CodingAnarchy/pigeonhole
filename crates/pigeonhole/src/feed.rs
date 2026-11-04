@@ -168,6 +168,8 @@ impl FeedToken {
 pub struct FeedBuilder {
     db: Arc<Db>,
     tables: Vec<Arc<TableCore>>,
+    /// Every table, including those created later ([`crate::Pigeonhole::feed`], D315).
+    all: bool,
     prefix: Vec<u8>,
     durable: bool,
     start: FeedStart,
@@ -180,6 +182,20 @@ impl FeedBuilder {
         FeedBuilder {
             db: Arc::clone(&core.db),
             tables: vec![Arc::clone(core)],
+            all: false,
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+            error: None,
+        }
+    }
+
+    /// A feed of every table of `db` (D315, ICR 0114).
+    pub(crate) fn all_tables(db: &Arc<Db>) -> Self {
+        FeedBuilder {
+            db: Arc::clone(db),
+            tables: Vec::new(),
+            all: true,
             prefix: Vec::new(),
             durable: true,
             start: FeedStart::Now,
@@ -200,6 +216,16 @@ impl FeedBuilder {
     }
 
     fn add(mut self, core: &Arc<TableCore>) -> Self {
+        if self.all {
+            self.error.get_or_insert(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "a feed of every table already follows table {:?}",
+                    core.info.name
+                ),
+            ));
+            return self;
+        }
         if !Arc::ptr_eq(&self.db, &core.db) {
             self.error.get_or_insert(Error::new(
                 ErrorCode::InvalidArgument,
@@ -263,7 +289,9 @@ impl FeedBuilder {
     ///
     /// Fails with `InvalidArgument` if the database's change feed is off or doesn't follow
     /// one of the tables ([`Options::feed_tables`](crate::Options::feed_tables)), or if a
-    /// token is not one of this database's. A start whose history is gone shows at the first
+    /// token is not one of this database's. A feed of every table
+    /// ([`Pigeonhole::feed`](crate::Pigeonhole::feed)) needs the change feed on for every
+    /// table, with no `feed_tables` list. A start whose history is gone shows at the first
     /// [`Feed::next`], as `FeedExpired`.
     pub fn open(self) -> Result<Feed> {
         if let Some(e) = self.error {
