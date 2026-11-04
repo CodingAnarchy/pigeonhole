@@ -376,6 +376,11 @@ pub(crate) struct Feed {
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,
+    /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
+    /// observer waits before it records the root, widening the window between a durable
+    /// superblock and its sidecar entry. 0 (the default) waits nothing.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) root_observer_delay_nanos: AtomicU64,
 }
 
 /// Whether a sidecar sync is in flight, and whether appends since its submission wait for
@@ -422,6 +427,8 @@ impl Feed {
             staged_catalog: Mutex::default(),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            root_observer_delay_nanos: AtomicU64::new(0),
         }
     }
 
@@ -632,6 +639,13 @@ impl Feed {
     /// never followed by more, and the next feeding open sees the sequence ahead of the last
     /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
     pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
+        #[cfg(feature = "test-hooks")]
+        {
+            let delay = self.root_observer_delay_nanos.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(delay));
+            }
+        }
         // A catalog change this root commit made (D315): its entry goes first, in the same
         // append and the same sync as the Root entry, so a torn tail keeps it only without
         // the Root (the chain breaks), never the Root without it.
