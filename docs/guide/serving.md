@@ -59,11 +59,15 @@ app.jobs.mutate(id).put("spec", b"body", spec).put("state", b"status", b"queued"
 ## Leases, with a fencing token
 A worker claims a job, so that no other worker runs it at the same time. If the worker dies, the claim must expire on its own.
 - **Claim:** `commit_if(Absent lease:holder)` writes the lease, in a family with a TTL (`Family::default().ttl(..)`). An expired lease reads as absent, so an abandoned job becomes claimable again with no cleanup process.
-- **The lease's value is a fencing token** unique to this claim: the holder's name, the server's start time and a counter. The worker gets it back from the claim.
+- **The lease's value is a fencing token** unique to this claim: `worker/nonce`, where the worker makes the nonce, a random id per claim. The worker gets the token back from the claim.
+- **A claim can be retried.** If a claim's reply is lost, the worker doesn't know whether it holds the job, so it sends the same claim again, with the same nonce. A claim that finds its own token already in the lease returns success with it; any other token is `409 Claimed`. Without the worker's nonce, the retry would be refused by its own invisible lease, and the job would sit held by nobody who knows it until the TTL (simp724's L1 on #1491). `Client::claim` does this.
 - **Every later write for the job is conditioned on the lease still holding that exact token.** That covers renewing it and completing the job (`commit_if(Value lease:holder == token)`).
 - **Renewal is a fresh put of the same token,** so the TTL counts from the renewal. A renewal fails once the TTL has passed, even if nobody else claimed the job, because the expired cell is invisible to the condition. The worker must then stop and treat the job as lost.
+- **Renew at least every third of the TTL,** and treat a renewal that fails *or gets no answer* as lost. A renewal whose outcome is unknown may not have extended the claim, and the safe reading is "stop".
 
 **Why the token matters.** A TTL alone doesn't stop a slow holder. A worker paused past its TTL (a GC pause, a stalled VM) still believes it holds the job, while another worker has claimed and finished it. Without fencing, the slow worker's "complete" would overwrite the newer result. With the token, its write is refused (`409 Lost`), and the result stays the new holder's.
+
+**What the token doesn't fence.** It fences writes that go through the database. A side effect outside it (sending an email, taking a payment, calling another service) isn't fenced: a stalled worker can still do it after its claim expired. So before each such step, renew and check the renewal. Better, pass the token to the downstream system and have it refuse a token older than the newest it has seen, which is the general fencing rule.
 
 ```rust,no_run
 # fn main() -> Result<(), pigeonhole_example_serving::ClientError> {
@@ -71,7 +75,8 @@ use pigeonhole_example_serving::Client;
 
 let client = Client::new("http://127.0.0.1:7070", None);
 if let Some(claim) = client.claim("job:1", "worker-7")? {
-    // ... do the work, calling client.renew(..) well within the TTL ...
+    // ... do the work, calling client.renew(..) at least every TTL/3, and stopping if a
+    // renewal returns false or an error ...
     if !client.complete("job:1", &claim, "resized")? {
         // The claim expired and someone else took the job: our result was not recorded.
     }

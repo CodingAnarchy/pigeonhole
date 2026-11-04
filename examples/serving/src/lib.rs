@@ -21,9 +21,8 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -65,13 +64,10 @@ pub struct Config {
 pub struct App {
     db: Pigeonhole,
     jobs: Table,
-    accounts: Table,
+    /// The `accounts` table.
+    ledger: Table,
     ops: Table,
     token: Option<String>,
-    /// Makes fencing tokens unique across restarts: the process's start time.
-    epoch: u64,
-    /// Makes fencing tokens unique within the process.
-    fences: AtomicU64,
 }
 
 // The schema. `jobs`: `spec:body`, `state:status` ("queued" or "done"), `state:result`, and
@@ -112,7 +108,7 @@ impl App {
                 Family::default().max_versions(1).ttl(config.lease_ttl),
             )
             .create_if_missing()?;
-        let accounts = db
+        let ledger = db
             .table("accounts")?
             .family(BAL, Family::default())
             .create_if_missing()?;
@@ -120,35 +116,25 @@ impl App {
             .table("ops")?
             .family(OP, Family::default())
             .create_if_missing()?;
-        let epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros() as u64);
         Ok(Arc::new(Self {
             db,
             jobs,
-            accounts,
+            ledger,
             ops,
             token: config.token.clone(),
-            epoch,
-            fences: AtomicU64::new(0),
         }))
     }
 
-    /// Closes the database cleanly, once the server has stopped.
+    /// Closes the database cleanly, once the server has stopped, and reports the close's
+    /// error. If something still holds the app (a request still finishing, or a stream),
+    /// this returns `Ok` without closing: the database then closes when the last handle
+    /// drops, which is not a clean `close()` and reports no error. Stop serving first, as
+    /// the server binary does, so this is the last handle.
     pub fn close(self: Arc<Self>) -> pigeonhole::Result<()> {
         match Arc::try_unwrap(self) {
             Ok(app) => app.db.close(),
-            // Something still holds the app (a request or a stream): the handles close when
-            // the last one drops.
             Err(_) => Ok(()),
         }
-    }
-
-    /// A fencing token no other claim has: the holder's name, the process's epoch and a
-    /// counter. Stored as the lease cell's value, it's what every fenced write compares.
-    fn fence(&self, worker: &str) -> String {
-        let n = self.fences.fetch_add(1, Ordering::Relaxed);
-        format!("{worker}/{}-{n}", self.epoch)
     }
 }
 
@@ -371,6 +357,8 @@ async fn list_jobs(State(app): State<Arc<App>>, Query(q): Query<PageQuery>) -> A
 #[derive(Deserialize)]
 struct ClaimRequest {
     worker: String,
+    /// A random id the worker makes for this claim and reuses only to retry it.
+    nonce: String,
 }
 
 #[derive(Deserialize)]
@@ -392,16 +380,30 @@ fn holder_is(fence: &str) -> Condition {
 ///
 /// The claim is a conditional write on the lease column: it lands only if the column is
 /// absent, which it is when nobody claimed the job or the last claim expired (the lease
-/// family's TTL). The lease's value is a fencing token unique to this claim, returned to the
-/// worker: every later write for the job (renew, complete) is conditioned on the lease still
-/// holding that exact token. A worker that stalls past its TTL then can't overwrite the work
-/// of whoever claimed the job after it, even though it still thinks it holds the lease.
+/// family's TTL). The lease's value is a fencing token unique to this claim, `worker/nonce`,
+/// returned to the worker: every later write for the job (renew, complete) is conditioned on
+/// the lease still holding that exact token. A worker that stalls past its TTL then can't
+/// overwrite the work of whoever claimed the job after it, even though it still thinks it
+/// holds the lease.
+///
+/// The nonce comes from the worker so a claim can be retried (simp724's L1 on #1491): a
+/// worker whose claim reply was lost sends the same request again, and gets its own token
+/// back if the first attempt landed, or `Claimed` if someone else holds the job. Without
+/// it, a lost reply would leave the job held by a lease nobody knows they own, until the
+/// TTL.
 async fn claim_job(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     Json(req): Json<ClaimRequest>,
 ) -> ApiResult<Response> {
-    let fence = app.fence(&req.worker);
+    if req.nonce.is_empty() || req.worker.contains('/') {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "a claim needs a nonce, and a worker name without '/'",
+        ));
+    }
+    let fence = format!("{}/{}", req.worker, req.nonce);
     let unclaimed = Condition::Absent {
         family: LEASE.into(),
         qualifier: HOLDER.to_vec(),
@@ -413,11 +415,16 @@ async fn claim_job(
         .commit_if_async(&unclaimed)
         .await?;
     if claimed.is_none() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "Claimed",
-            "another worker holds the job",
-        ));
+        // Someone holds the lease. If it's this very claim (a retry after the first
+        // attempt's reply was lost), the worker gets its token back; anyone else is refused.
+        let holder = app.jobs.get_async(id.as_bytes(), LEASE, HOLDER).await?;
+        if holder.is_none_or(|c| c.value() != fence.as_bytes()) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "Claimed",
+                "another worker holds the job",
+            ));
+        }
     }
     // A condition tests one column, so whether the job still needs doing is checked after
     // taking the lease: a done (or missing) job gives the lease straight back.
@@ -516,7 +523,7 @@ async fn open_account(
         qualifier: BALANCE.to_vec(),
     };
     let opened = app
-        .accounts
+        .ledger
         .mutate(id.as_bytes())
         .put_i64(BAL, BALANCE, req.balance)
         .commit_if_async(&absent)
@@ -533,7 +540,7 @@ async fn open_account(
 
 /// `GET /accounts/{id}`.
 async fn get_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<Response> {
-    match app.accounts.get_async(id.as_bytes(), BAL, BALANCE).await? {
+    match app.ledger.get_async(id.as_bytes(), BAL, BALANCE).await? {
         Some(c) => Ok(Json(json!({ "balance": c.as_i64() })).into_response()),
         None => Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -583,13 +590,13 @@ async fn transfer(State(app): State<Arc<App>>, Json(t): Json<Transfer>) -> ApiRe
     }
     let app2 = app.clone();
     blocking(move || {
-        let (accounts, ops) = (&app2.accounts, &app2.ops);
+        let (ledger, ops) = (&app2.ledger, &app2.ops);
         let outcome = app2.db.transact(&RetryPolicy::default(), |txn| {
             if txn.get(ops, t.op_id.as_bytes(), OP, APPLIED)?.is_some() {
                 return Ok(false);
             }
             let balance = |txn: &mut pigeonhole::Transaction, who: &str| {
-                txn.get(accounts, who.as_bytes(), BAL, BALANCE)
+                txn.get(ledger, who.as_bytes(), BAL, BALANCE)
                     .map(|c| c.and_then(|c| c.as_i64()))
             };
             let (Some(from), Some(to)) = (balance(txn, &t.from)?, balance(txn, &t.to)?) else {
@@ -598,8 +605,8 @@ async fn transfer(State(app): State<Arc<App>>, Json(t): Json<Transfer>) -> ApiRe
             if from < t.amount {
                 return Err(TransferError::Insufficient);
             }
-            txn.put_i64(accounts, t.from.as_bytes(), BAL, BALANCE, from - t.amount)
-                .put_i64(accounts, t.to.as_bytes(), BAL, BALANCE, to + t.amount)
+            txn.put_i64(ledger, t.from.as_bytes(), BAL, BALANCE, from - t.amount)
+                .put_i64(ledger, t.to.as_bytes(), BAL, BALANCE, to + t.amount)
                 .put(ops, t.op_id.as_bytes(), OP, APPLIED, b"1");
             Ok(true)
         });

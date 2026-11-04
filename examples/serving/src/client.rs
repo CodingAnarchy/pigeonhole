@@ -207,8 +207,35 @@ impl Client {
 
     /// Tries to claim a job: its fencing token, or `None` when another worker holds it or
     /// it's done.
+    ///
+    /// The claim carries a fresh random nonce, and a claim whose outcome is unknown (no
+    /// reply) is sent again with the **same** nonce: if the first attempt landed, the server
+    /// recognises its own token and hands it back, so a lost reply never leaves the job held
+    /// by a claim nobody knows about (simp724's L1 on #1491).
     pub fn claim(&self, id: &str, worker: &str) -> Result<Option<Claim>, ClientError> {
-        match self.post(&format!("/jobs/{id}/claim"), &json!({ "worker": worker })) {
+        let nonce = nonce();
+        let mut tried = 0;
+        loop {
+            tried += 1;
+            match self.claim_with_nonce(id, worker, &nonce) {
+                Err(e) if e.outcome_unknown() && tried < 3 => continue,
+                r => return r,
+            }
+        }
+    }
+
+    /// [`claim`](Self::claim) with a nonce the caller chose: the same nonce again is the same
+    /// claim, answered with the same token if it holds the job.
+    pub fn claim_with_nonce(
+        &self,
+        id: &str,
+        worker: &str,
+        nonce: &str,
+    ) -> Result<Option<Claim>, ClientError> {
+        match self.post(
+            &format!("/jobs/{id}/claim"),
+            &json!({ "worker": worker, "nonce": nonce }),
+        ) {
             Ok(v) => Ok(v.get("fence").and_then(Value::as_str).map(|f| Claim {
                 fence: f.to_owned(),
             })),
@@ -218,6 +245,10 @@ impl Client {
     }
 
     /// Extends a claim. `false` when it was lost (expired, or taken by another worker).
+    ///
+    /// Renew at least every third of the TTL. Treat a renewal that fails **or gets no
+    /// answer** (an `Err`) as lost too, and stop working on the job: a renewal whose outcome
+    /// is unknown may not have extended the claim.
     pub fn renew(&self, id: &str, claim: &Claim) -> Result<bool, ClientError> {
         Self::fenced(self.post(
             &format!("/jobs/{id}/renew"),
@@ -406,4 +437,25 @@ impl Iterator for Events {
             }
         }
     }
+}
+
+/// A random enough id for a claim: 128 bits from the standard library's randomly keyed
+/// hasher, the time and a counter. An application would use a UUID v4 or its own random
+/// source; this keeps the example free of another dependency.
+fn nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let half = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(now);
+        h.write_u64(n);
+        h.write_u64(salt);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", half(1), half(2))
 }

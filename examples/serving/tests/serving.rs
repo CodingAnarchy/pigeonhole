@@ -152,7 +152,8 @@ fn every_job_is_done_once_by_concurrent_workers() {
 
 #[test]
 fn a_stalled_worker_cannot_overwrite_the_next_holders_work() {
-    let ttl = Duration::from_millis(800);
+    // Long enough that the claims and renewal below land within it on a loaded runner.
+    let ttl = Duration::from_secs(3);
     let server = Server::start(ttl, None);
     let client = server.client();
     client.create_job("job:1", "spec").unwrap();
@@ -289,4 +290,27 @@ fn a_configured_token_is_required() {
     ));
     let right = Client::new(server.url.clone(), Some("s3cret".into()));
     right.create_job("job:1", "spec").unwrap();
+}
+
+#[test]
+fn a_retried_claim_gets_its_own_token_back() {
+    // simp724's L1 on #1491: a claim whose reply was lost is sent again with the same
+    // nonce. It must get the same token back, not `Claimed` from its own lease.
+    let server = Server::start(Duration::from_secs(30), None);
+    let client = server.client();
+    client.create_job("job:1", "spec").unwrap();
+    let first = client
+        .claim_with_nonce("job:1", "w1", "n-1")
+        .unwrap()
+        .expect("unclaimed");
+    let retried = client.claim_with_nonce("job:1", "w1", "n-1").unwrap();
+    assert_eq!(
+        retried.as_ref(),
+        Some(&first),
+        "the retry is the same claim"
+    );
+    // A different claim (another nonce, the same worker or another) is refused.
+    assert_eq!(client.claim_with_nonce("job:1", "w1", "n-2").unwrap(), None);
+    assert_eq!(client.claim_with_nonce("job:1", "w2", "n-1").unwrap(), None);
+    assert!(client.complete("job:1", &first, "done").unwrap());
 }
