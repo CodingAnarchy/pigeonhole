@@ -280,8 +280,9 @@ message RowWrites {
 
 // An error's stable identity, in every error response: in gRPC as a `google.rpc.Status`
 // detail (`type.googleapis.com/pigeonhole.v1.ErrorDetail`), and in HTTP/JSON as the body.
-// A write is safe to send again only when a response carries this detail with
-// `retry_safe` true (ICR 0112, "When a write is retry-safe").
+// A write is known not to have been applied only when a response carries this detail with
+// `retry_safe` true (ICR 0112, "When a write is retry-safe"). Each code's `retry_safe`,
+// `retry_from` and statuses are fixed for v1.
 message ErrorDetail {
   // The stable code's name: an `ErrorCode` (`Conflict`, `Busy`, ...) or a server code
   // (`SessionBusy`, `TransactionExpired`, `Overloaded`, ...).
@@ -289,10 +290,31 @@ message ErrorDetail {
   // `ErrorCode`'s number; 0 for a server code.
   uint32 code_num = 2;
   string message = 3;
-  // True when the request was not applied and can be sent again unchanged.
+  // True when the request was not applied, so the operation may be retried, from the point
+  // `retry_from` says. False: don't retry as is (it may have been applied, or it can't
+  // succeed as sent).
   bool retry_safe = 4;
   // A pause to wait first, for `Busy` and `Overloaded`.
   uint32 retry_after_ms = 5;
+  // Where a retry starts, when `retry_safe` (simp724's E2 on #1496).
+  RetryFrom retry_from = 6;
 }
+
+// Where a retry starts.
+enum RetryFrom {
+  // Not retry-safe.
+  RETRY_FROM_UNSPECIFIED = 0;
+  // Send the same request again (after `retry_after_ms`).
+  RETRY_FROM_REQUEST = 1;
+  // Run the whole transaction again from `Transactions.Begin` (or re-open the snapshot):
+  // the same request would get the same answer (a `Conflict`, an expired session).
+  RETRY_FROM_BEGIN = 2;
+}
+
+// A stream's position moved without an event the subscriber asked for (perf287's S2 on
+// #1496): commits the stream's filters skipped. Carries no data; its `token` is what a
+// reconnect resumes from, so a quiet filtered stream's position doesn't age out of the
+// history. Sent after a quiet interval, never more often than events.
+message Progress {}
 
 message Empty {}

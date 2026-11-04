@@ -36,9 +36,10 @@ message FeedEvent {
   bytes token = 1;
   oneof event {
     FeedCommit commit = 2;
-    // Field 3 is reserved for catalog events of a whole-database feed (D315, #1436).
+    // Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
+    // The position moved past commits the stream's filters skipped: only `token` matters.
+    Progress progress = 4;
   }
-  reserved 3;
 }
 
 message FeedCommit {

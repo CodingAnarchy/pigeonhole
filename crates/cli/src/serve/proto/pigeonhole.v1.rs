@@ -358,8 +358,9 @@ pub struct RowWrites {
 }
 /// An error's stable identity, in every error response: in gRPC as a `google.rpc.Status`
 /// detail (`type.googleapis.com/pigeonhole.v1.ErrorDetail`), and in HTTP/JSON as the body.
-/// A write is safe to send again only when a response carries this detail with
-/// `retry_safe` true (ICR 0112, "When a write is retry-safe").
+/// A write is known not to have been applied only when a response carries this detail with
+/// `retry_safe` true (ICR 0112, "When a write is retry-safe"). Each code's `retry_safe`,
+/// `retry_from` and statuses are fixed for v1.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorDetail {
     /// The stable code's name: an `ErrorCode` (`Conflict`, `Busy`, ...) or a server code
@@ -371,13 +372,24 @@ pub struct ErrorDetail {
     pub code_num: u32,
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
-    /// True when the request was not applied and can be sent again unchanged.
+    /// True when the request was not applied, so the operation may be retried, from the point
+    /// `retry_from` says. False: don't retry as is (it may have been applied, or it can't
+    /// succeed as sent).
     #[prost(bool, tag = "4")]
     pub retry_safe: bool,
     /// A pause to wait first, for `Busy` and `Overloaded`.
     #[prost(uint32, tag = "5")]
     pub retry_after_ms: u32,
+    /// Where a retry starts, when `retry_safe` (simp724's E2 on #1496).
+    #[prost(enumeration = "RetryFrom", tag = "6")]
+    pub retry_from: i32,
 }
+/// A stream's position moved without an event the subscriber asked for (perf287's S2 on
+/// \#1496): commits the stream's filters skipped. Carries no data; its `token` is what a
+/// reconnect resumes from, so a quiet filtered stream's position doesn't age out of the
+/// history. Sent after a quiet interval, never more often than events.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Progress {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
 /// How durable a commit is before it returns (the Rust API's `Durability`).
@@ -524,6 +536,40 @@ impl Ordering {
         }
     }
 }
+/// Where a retry starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RetryFrom {
+    /// Not retry-safe.
+    Unspecified = 0,
+    /// Send the same request again (after `retry_after_ms`).
+    Request = 1,
+    /// Run the whole transaction again from `Transactions.Begin` (or re-open the snapshot):
+    /// the same request would get the same answer (a `Conflict`, an expired session).
+    Begin = 2,
+}
+impl RetryFrom {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RETRY_FROM_UNSPECIFIED",
+            Self::Request => "RETRY_FROM_REQUEST",
+            Self::Begin => "RETRY_FROM_BEGIN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RETRY_FROM_UNSPECIFIED" => Some(Self::Unspecified),
+            "RETRY_FROM_REQUEST" => Some(Self::Request),
+            "RETRY_FROM_BEGIN" => Some(Self::Begin),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthResponse {
     /// "ok" while the database is open and not failed.
@@ -559,19 +605,34 @@ pub struct BackupResponse {
     #[prost(uint64, tag = "1")]
     pub bytes: u64,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupDownloadRequest {
     #[prost(bool, tag = "1")]
     pub durable: bool,
+    /// Resume an earlier download: its `backup_id`, from `offset` bytes in. Unset: take a
+    /// fresh backup. An id the server no longer keeps is `NotFound`; start over.
+    #[prost(string, tag = "2")]
+    pub backup_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupChunk {
-    /// The next bytes of the backup file, in order.
+    /// The next bytes of the backup file, in order, from `offset`.
     #[prost(bytes = "bytes", tag = "1")]
     pub data: ::prost::bytes::Bytes,
     /// In the last chunk: the file's total size.
     #[prost(uint64, tag = "2")]
     pub total: u64,
+    /// In every chunk: the backup this is, for resuming. Opaque.
+    #[prost(string, tag = "3")]
+    pub backup_id: ::prost::alloc::string::String,
+    /// Where `data` starts in the file.
+    #[prost(uint64, tag = "4")]
+    pub offset: u64,
+    /// In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub sha256: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MetricsResponse {
@@ -763,7 +824,9 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Backup"));
             self.inner.unary(req, path, codec).await
         }
-        /// A fresh consistent backup, streamed as the file's bytes.
+        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
+        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
         pub async fn backup_download(
             &mut self,
             request: impl tonic::IntoRequest<super::BackupDownloadRequest>,
@@ -858,7 +921,9 @@ pub mod admin_server {
             >
             + std::marker::Send
             + 'static;
-        /// A fresh consistent backup, streamed as the file's bytes.
+        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
+        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
         async fn backup_download(
             &self,
             request: tonic::Request<super::BackupDownloadRequest>,
@@ -1337,7 +1402,7 @@ pub struct MultiGetResponse {
     /// Where to continue, or empty once the read is done.
     #[prost(bytes = "bytes", tag = "2")]
     pub next: ::prost::bytes::Bytes,
-    /// The page's size by D308's measure.
+    /// This page's size by D308's measure, for sizing a client's buffers.
     #[prost(uint64, tag = "3")]
     pub bytes: u64,
 }
@@ -1349,13 +1414,16 @@ pub struct ReadRowRequest {
     pub row: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "3")]
     pub selection: ::core::option::Option<Selection>,
-    /// Page a wide row: at most this many cells per response (0: the whole row, within the
-    /// server's request limits).
+    /// At most this many cells per page as well (0: no cell limit).
     #[prost(uint32, tag = "4")]
     pub page_cells: u32,
     /// A previous page's `next` (a `RowPosition`), to continue the walk.
     #[prost(bytes = "bytes", tag = "5")]
     pub after: ::prost::bytes::Bytes,
+    /// Each page's size by D308's measure; 0 is the server's default (1 MiB). The server caps
+    /// it. A page holds whole columns (perf287's S1 on #1496).
+    #[prost(uint64, tag = "6")]
+    pub page_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadRowResponse {
@@ -1365,6 +1433,9 @@ pub struct ReadRowResponse {
     /// Where the next page starts, or empty after the last.
     #[prost(bytes = "bytes", tag = "2")]
     pub next: ::prost::bytes::Bytes,
+    /// This page's size by D308's measure, for sizing a client's buffers.
+    #[prost(uint64, tag = "3")]
+    pub bytes: u64,
 }
 /// A scan's key range: a prefix, or bounds (either may be absent: unbounded).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1417,6 +1488,7 @@ pub struct ScanPage {
     /// Where the next page starts, or empty after the last page.
     #[prost(bytes = "bytes", tag = "2")]
     pub next: ::prost::bytes::Bytes,
+    /// This page's size by D308's measure, for sizing a client's buffers.
     #[prost(uint64, tag = "3")]
     pub bytes: u64,
 }
@@ -2337,16 +2409,19 @@ pub struct FeedEvent {
     /// and not comparable byte for byte across streams.
     #[prost(bytes = "bytes", tag = "1")]
     pub token: ::prost::bytes::Bytes,
-    #[prost(oneof = "feed_event::Event", tags = "2")]
+    #[prost(oneof = "feed_event::Event", tags = "2, 4")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
 /// Nested message and enum types in `FeedEvent`.
 pub mod feed_event {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
-        /// Field 3 is reserved for catalog events of a whole-database feed (D315, #1436).
         #[prost(message, tag = "2")]
         Commit(super::FeedCommit),
+        /// Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
+        /// The position moved past commits the stream's filters skipped: only `token` matters.
+        #[prost(message, tag = "4")]
+        Progress(super::Progress),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3102,9 +3177,10 @@ pub struct MemoryLink {
 pub struct NewMemory {
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
-    /// Unset: the server embeds the text with its configured model, if any.
-    #[prost(float, repeated, tag = "2")]
-    pub embedding: ::prost::alloc::vec::Vec<f32>,
+    /// Unset: the server embeds the text with its configured model, if any. In the store's
+    /// element type, packed (perf287's S3 on #1496).
+    #[prost(message, optional, tag = "2")]
+    pub embedding: ::core::option::Option<Vector>,
     #[prost(enumeration = "MemoryKind", tag = "3")]
     pub kind: i32,
     #[prost(double, optional, tag = "4")]
@@ -3132,14 +3208,14 @@ pub struct RememberResponse {
     #[prost(enumeration = "RememberOutcome", tag = "2")]
     pub outcome: i32,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecallRequest {
     #[prost(string, repeated, tag = "1")]
     pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "2")]
     pub text: ::prost::alloc::string::String,
-    #[prost(float, repeated, tag = "3")]
-    pub embedding: ::prost::alloc::vec::Vec<f32>,
+    #[prost(message, optional, tag = "3")]
+    pub embedding: ::core::option::Option<Vector>,
     #[prost(uint32, tag = "4")]
     pub k: u32,
     /// Cut the hits to this many bytes (0: no budget).
@@ -3181,8 +3257,8 @@ pub struct MemoryHit {
     #[prost(double, tag = "7")]
     pub score: f64,
     /// With `with_embeddings`.
-    #[prost(float, repeated, tag = "8")]
-    pub embedding: ::prost::alloc::vec::Vec<f32>,
+    #[prost(message, optional, tag = "8")]
+    pub embedding: ::core::option::Option<Vector>,
     /// With `with_signals`: each ranking signal's score, by name (`vector`, `keyword`,
     /// `recency`, `graph`).
     #[prost(map = "string, double", tag = "9")]
@@ -3239,15 +3315,31 @@ pub struct MemoryEvent {
     /// Where to resume after this event. Opaque.
     #[prost(bytes = "bytes", tag = "1")]
     pub token: ::prost::bytes::Bytes,
-    #[prost(string, tag = "2")]
+    #[prost(oneof = "memory_event::Event", tags = "2, 3")]
+    pub event: ::core::option::Option<memory_event::Event>,
+}
+/// Nested message and enum types in `MemoryEvent`.
+pub mod memory_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "2")]
+        Memory(super::WatchedMemory),
+        /// The position moved past writes outside the watched namespaces (perf287's S2).
+        #[prost(message, tag = "3")]
+        Progress(super::Progress),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchedMemory {
+    #[prost(string, tag = "1")]
     pub namespace: ::prost::alloc::string::String,
-    #[prost(bytes = "bytes", tag = "3")]
+    #[prost(bytes = "bytes", tag = "2")]
     pub id: ::prost::bytes::Bytes,
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "3")]
     pub text: ::prost::alloc::string::String,
-    #[prost(enumeration = "MemoryKind", tag = "5")]
+    #[prost(enumeration = "MemoryKind", tag = "4")]
     pub kind: i32,
-    #[prost(uint64, tag = "6")]
+    #[prost(uint64, tag = "5")]
     pub created: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

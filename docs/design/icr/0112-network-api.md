@@ -24,7 +24,8 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
 
 ## Conventions
 - **Keys and values are `bytes`.** Timestamps are microseconds since the Unix epoch.
-- **Vectors are one packed field** (`Vector.data`, little-endian elements or packed bits), not one field per element.
+- **Vectors are one packed field** (`Vector.data`, little-endian elements or packed bits), not one field per element. That includes memory embeddings, in the store's element type.
+- **Every read that can return a lot is byte-budgeted:** `Scan`, `MultiGet` and `ReadRow` take `page_bytes` (0 is the server's default, 1 MiB, and the server caps it). Each page reports its own D308 size in `bytes`.
 - **Ids the server hands out are opaque strings:** `txn_id`, `snapshot_id`. Clients store and return them, and never parse them. Their encoding (for example the partition and node, under D317) may change.
 - **Opaque positions are `bytes`:** a scan's or multi-get's `next`, a row page's `next`, a feed event's `token`. They're stateless: any server process resumes from them, now or after a restart. Feed tokens aren't comparable byte for byte across streams.
 - **`RoutingKey`** (D317's C1) on `Begin` and `Snapshots.Open` names a row (`table`, `row`) or a partition. A single-node server ignores it. A cluster with more than one partition requires it (`InvalidArgument`), so clients should send it from the start.
@@ -33,7 +34,10 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
 ## gRPC
 - **Paths** are gRPC's own: `/pigeonhole.v1.Data/Get`, and so on.
 - **Errors** carry a status code from the table below, plus a `google.rpc.Status` detail holding `pigeonhole.v1.ErrorDetail` (the stable `code`, `code_num`, `retry_safe`, `retry_after_ms`). `Busy` and `Overloaded` also carry a `google.rpc.RetryInfo`.
-- **The published service config retries no write RPC.** A client must not configure automatic retries for `Data.Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`, `Transactions.Commit`, or any `Vectors`, `Text`, `Memory`, `Schema` or `Admin` write. Reads (`Get`, `MultiGet`, `ReadRow`, `Scan` from its last position, `Traverse`, `Nearest`, `Search`, `Recall`) may be retried.
+- **The published service config retries no write RPC.** A client must not configure automatic retries for `Data.Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`, `Transactions.Write` (it buffers writes, so a re-sent increment would be buffered twice), `Transactions.Commit`, or any `Vectors`, `Text`, `Memory`, `Schema` or `Admin` write.
+- **Reads may be retried:** `Get`, `MultiGet`, `ReadRow`, `Scan` from its last position, `Traverse`, `Nearest`, `Search`, `Recall`.
+- **`Transactions.Begin` and `Snapshots.Open` may be retried too,** but a lost reply leaves a session nobody holds until its idle lease ends. That's expected, not a leak to report.
+- **Deadlines are the service layer's, not tonic's.** The server doesn't use tonic's request timeout for write RPCs: it would drop the handler and answer a bare `DEADLINE_EXCEEDED`, breaking the rule that a submitted write answers its real outcome. The service layer knows whether a write was submitted, and enforces the deadline only before that (simp724 on #1496).
 
 ## HTTP/JSON (`/v1`)
 - **Unary calls** are `POST /v1/{Service}/{Method}`, with the request message as the JSON body and the response message as the JSON reply. For example, `POST /v1/Data/CheckAndMutate`. The names are exactly the proto's, so every gRPC method has one HTTP path.
@@ -46,8 +50,9 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
   - otherwise, `application/x-ndjson`, one JSON message per line.
   - A stream's error ends it with a final message: an SSE `event: error`, or an NDJSON line `{"error": ErrorDetail}`.
 - **`Last-Event-ID`** on `Feed.Subscribe` or `Memory.Watch` resumes after that token, and takes precedence over the body's `resume`. So an SSE client reconnects natively.
-- **`Admin.BackupDownload`** is `application/octet-stream`: the backup file's bytes.
-- **Client streams** (`Vectors.BulkLoad`) take `application/x-ndjson`: one request message per line.
+- **Progress events** (`Progress`, in `FeedEvent` and `MemoryEvent`) carry only a token. The server sends one after a quiet interval (about 10 s), when the stream's position has moved past commits its filters skipped, and never more often than events. A filtered or quiet stream's latest token then stays within the history's retention, so a reconnect doesn't get `FeedExpired` for having missed nothing (perf287's S2).
+- **`Admin.BackupDownload`** is `application/octet-stream`: the backup file's bytes. Over gRPC it's chunks of up to 1 MiB, each with its `backup_id` and `offset`, and the last with `total` and `sha256`. The server keeps the backup for a few minutes after the stream ends or breaks, so a client resumes with `backup_id` and `offset` (over HTTP, `Range: bytes=<offset>-` with `?backup_id=`), and checks the SHA-256 before relying on the copy (perf287's S4).
+- **Client streams** (`Vectors.BulkLoad`) take `application/x-ndjson`: one request message per line. The size limit (`--max-request-bytes`) and the in-flight bytes budget apply per message, not per stream, and HTTP/2 flow control throttles the client as the server applies batches, so a long bulk load is fine.
 - **Auth:** `Authorization: Bearer <token>` on every request but `/v1/health`.
 - **Errors:** the HTTP status from the table below, with the body an `ErrorDetail` as JSON (`{"code": "Conflict", "code_num": 13, "message": …}`). `Busy` and `Overloaded` add `Retry-After` (seconds, rounded up).
 
@@ -62,36 +67,40 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
 ## Errors
 Every response's error has a stable `code`. Engine errors use the `ErrorCode` names; server-level codes are listed after them.
 
-| Code | gRPC | HTTP | The request was | Retry-safe |
+Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clients key their retries on them. `retry_from` is `REQUEST` (send it again) or `BEGIN` (run the transaction again from `Begin`); "no" means `retry_safe: false`.
+
+| Code | gRPC | HTTP | The request was | Retry |
 |---|---|---|---|---|
-| `Conflict` | `ABORTED` | 409 | not applied | yes: run the transaction again |
-| `Busy` | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | yes, after the pause |
-| `SnapshotExpired` | `ABORTED` | 409 | not applied | yes, from `Begin` |
-| `Closed` | `UNAVAILABLE` | 503 | not applied | yes, against a running server |
-| `OutcomeUnknown` | `UNKNOWN` | 500 | **maybe applied** | no: check the operation id first |
+| `Conflict` | `ABORTED` | 409 | not applied | `BEGIN`: run the transaction again |
+| `Busy` | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
+| `SnapshotExpired` | `ABORTED` | 409 | not applied | `BEGIN` |
+| `Closed` | `UNAVAILABLE` + detail | 503 | not applied | `REQUEST`, against a running server |
+| `OutcomeUnknown` | `UNKNOWN` + detail | 500 | **maybe applied** | no: check the operation id first |
 | `TableNotFound`, `FamilyNotFound` | `NOT_FOUND` | 404 | not applied | no |
 | `TableExists`, `FamilyExists` | `ALREADY_EXISTS` | 409 | not applied | no |
 | `InvalidArgument`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge`, `BatchTooLarge` | `INVALID_ARGUMENT` | 400 | not applied | no |
 | `ReadOnly`, `NoWriter`, `WouldDeadlock` | `FAILED_PRECONDITION` | 409 | not applied | no |
-| `FeedExpired` | `OUT_OF_RANGE` | 410 | (a read) | resubscribe from now |
+| `FeedExpired` | `OUT_OF_RANGE` | 410 | (a read) | no: resubscribe from now |
 | `Unsupported`, `UnsupportedFeature`, `UnsupportedFormat`, `UnknownMergeOperator` | `UNIMPLEMENTED` | 501 | not applied | no |
-| `NoSpace` | `RESOURCE_EXHAUSTED` | 507 | not applied | no, until space is freed |
-| `MergeFailed` | `INTERNAL` | 500 | not applied | no |
-| `Io` | `INTERNAL` | 500 | not applied, unless the code is `OutcomeUnknown` | no |
-| `Corruption` | `DATA_LOSS` | 500 | not applied | no |
+| `NoSpace` | `RESOURCE_EXHAUSTED` | 507 | **maybe applied**, for a write; not applied, for a read | no: check the operation id |
+| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no |
+| `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no: check the operation id |
+| `Corruption` | `DATA_LOSS` | 500 | **maybe applied**, for a write; not applied, for a read | no |
 | `WriterLocked`, `ShmVersionMismatch`, `ShmUnavailable`, `NetworkFilesystem`, `NoReaderSlot` | `UNAVAILABLE` | 503 | not applied (the server can't open the database) | no |
 | **Server codes** | | | | |
 | `Unauthenticated` | `UNAUTHENTICATED` | 401 | not applied | no |
 | `PermissionDenied` (scope or namespace, D313 Q2, Q6) | `PERMISSION_DENIED` | 403 | not applied | no |
 | `NotFound` (an id that isn't known, or is another token's) | `NOT_FOUND` | 404 | not applied (but see below) | no |
-| `SessionBusy` (a second concurrent call on one transaction, B2) | `FAILED_PRECONDITION` | 409 | not applied | yes, once the first call answers |
-| `TransactionExpired` (idle before any `Commit`, B1) | `ABORTED` | 409 | not applied | yes, from `Begin` |
-| `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | yes, after the pause |
+| `SessionBusy` (a second concurrent call on one transaction, B2) | `FAILED_PRECONDITION` | 409 | not applied | `REQUEST`, once the first call answers |
+| `TransactionExpired` (idle before any `Commit`, B1) | `ABORTED` | 409 | not applied | `BEGIN` |
+| `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
-| `DeadlineExceeded` (only before a write was submitted, B3) | `DEADLINE_EXCEEDED` | 504 | not applied | yes |
+| `DeadlineExceeded` (only before a write was submitted, B3) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
-A code an older client doesn't know follows its gRPC status and its `retry_safe` flag.
+A code an older client doesn't know follows its `retry_safe` and `retry_from`.
+
+**A write is "not applied" only for the codes whose meaning guarantees it** (simp724's E1 on #1496): `Conflict`, `Busy`, `Closed`, `SnapshotExpired`, the validation and schema errors, and the server codes refused before submission. Any other error on a write leaves its outcome unknown.
 
 ### When a write is retry-safe (D313 B3)
 - **Only a response that carries the stable `code` detail with `retry_safe: true` says a write wasn't applied.** Without the detail, the outcome is unknown, however the response came about:
@@ -108,8 +117,9 @@ A code an older client doesn't know follows its gRPC status and its `retry_safe`
 
 ## Versioning
 - **v1 changes only additively:** new RPCs, new fields, new enum values and new server codes.
-- **No field number is reused.** A removed field is `reserved`, as `FeedEvent`'s 3 is for D315's catalog events.
-- **Clients must accept** unknown enum values, unknown fields, and unknown `code`s (falling back to the gRPC status and `retry_safe`).
+- **No field number is reused.** A removed field is `reserved`. A number planned for later (`FeedEvent`'s 3, for D315's catalog events) is only commented, never `reserved`, which means "never use".
+- **Clients must accept** unknown enum values, unknown fields, and unknown `code`s (falling back to `retry_safe` and `retry_from`).
+- **An existing code's statuses, `retry_safe` and `retry_from` never change in v1.** Clients key retries on them, so changing one is breaking even though no field changes.
 - **A breaking change is `pigeonhole.v2`,** served beside v1 for at least one minor release.
 
 ## The listener

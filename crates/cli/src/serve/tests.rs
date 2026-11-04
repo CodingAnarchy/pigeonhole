@@ -111,6 +111,7 @@ fn a_returned_cells_error_is_a_value_not_a_failed_rpc() {
             message: "read failed".into(),
             retry_safe: false,
             retry_after_ms: 0,
+            retry_from: 0,
         })),
     };
     let json = serde_json::to_value(&cell).unwrap();
@@ -137,4 +138,35 @@ fn every_service_is_generated_with_a_server_and_a_client() {
     exists::<proto::text_server::TextServer<()>>();
     exists::<proto::memory_server::MemoryServer<()>>();
     exists::<proto::admin_server::AdminServer<()>>();
+}
+
+#[test]
+fn a_conflict_says_to_retry_from_begin() {
+    // simp724's E2 on #1496: `retry_safe` alone would let a client re-send `Commit`, which
+    // the tombstone answers with the same `Conflict` forever.
+    let conflict = ErrorDetail {
+        code: "Conflict".into(),
+        code_num: 13,
+        message: "a read changed".into(),
+        retry_safe: true,
+        retry_after_ms: 0,
+        retry_from: proto::RetryFrom::Begin as i32,
+    };
+    let json = serde_json::to_value(&conflict).unwrap();
+    assert_eq!(json["retry_from"], "RETRY_FROM_BEGIN");
+    assert_eq!(json["retry_safe"], true);
+}
+
+#[test]
+fn a_quiet_stream_still_moves_its_token() {
+    // perf287's S2 on #1496: a progress event carries only a token.
+    let event = proto::FeedEvent {
+        token: b"\x01\x02".to_vec().into(),
+        event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["token"], "AQI=");
+    assert!(json["progress"].is_object());
+    let back: proto::FeedEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, event);
 }

@@ -59,7 +59,7 @@ message MultiGetResponse {
   repeated Row rows = 1;
   // Where to continue, or empty once the read is done.
   bytes next = 2;
-  // The page's size by D308's measure.
+  // This page's size by D308's measure, for sizing a client's buffers.
   uint64 bytes = 3;
 }
 
@@ -67,11 +67,13 @@ message ReadRowRequest {
   string table = 1;
   bytes row = 2;
   Selection selection = 3;
-  // Page a wide row: at most this many cells per response (0: the whole row, within the
-  // server's request limits).
+  // At most this many cells per page as well (0: no cell limit).
   uint32 page_cells = 4;
   // A previous page's `next` (a `RowPosition`), to continue the walk.
   bytes after = 5;
+  // Each page's size by D308's measure; 0 is the server's default (1 MiB). The server caps
+  // it. A page holds whole columns (perf287's S1 on #1496).
+  uint64 page_bytes = 6;
 }
 
 message ReadRowResponse {
@@ -79,6 +81,8 @@ message ReadRowResponse {
   Row row = 1;
   // Where the next page starts, or empty after the last.
   bytes next = 2;
+  // This page's size by D308's measure, for sizing a client's buffers.
+  uint64 bytes = 3;
 }
 
 // A scan's key range: a prefix, or bounds (either may be absent: unbounded).
@@ -113,6 +117,7 @@ message ScanPage {
   repeated Row rows = 1;
   // Where the next page starts, or empty after the last page.
   bytes next = 2;
+  // This page's size by D308's measure, for sizing a client's buffers.
   uint64 bytes = 3;
 }
 

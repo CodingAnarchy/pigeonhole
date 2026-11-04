@@ -16,7 +16,9 @@ service Admin {
   rpc Compact(Empty) returns (Empty);
   // Writes a consistent backup to `path`, inside the server's `--backup-dir`.
   rpc Backup(BackupRequest) returns (BackupResponse);
-  // A fresh consistent backup, streamed as the file's bytes.
+  // A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
+  // keeps the backup for a few minutes after the stream ends or breaks, so a download can
+  // resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
   rpc BackupDownload(BackupDownloadRequest) returns (stream BackupChunk);
   // The metrics in Prometheus text format, under D316's names (read scope).
   rpc Metrics(Empty) returns (MetricsResponse);
@@ -50,13 +52,23 @@ message BackupResponse {
 
 message BackupDownloadRequest {
   bool durable = 1;
+  // Resume an earlier download: its `backup_id`, from `offset` bytes in. Unset: take a
+  // fresh backup. An id the server no longer keeps is `NotFound`; start over.
+  string backup_id = 2;
+  uint64 offset = 3;
 }
 
 message BackupChunk {
-  // The next bytes of the backup file, in order.
+  // The next bytes of the backup file, in order, from `offset`.
   bytes data = 1;
   // In the last chunk: the file's total size.
   uint64 total = 2;
+  // In every chunk: the backup this is, for resuming. Opaque.
+  string backup_id = 3;
+  // Where `data` starts in the file.
+  uint64 offset = 4;
+  // In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
+  bytes sha256 = 5;
 }
 
 message MetricsResponse {
