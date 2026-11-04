@@ -131,7 +131,10 @@ jobs:
           # has a ceiling for. The new shapes show as new, with no base count.
           if ! (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
             --target-dir "$GITHUB_WORKSPACE/target"); then
-            echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples"
+            # Shapes whose example code differs from base's are then compared across different
+            # code: name the files, and the count step marks their shapes not comparable.
+            git diff --name-only "$base" HEAD -- crates/bench/examples > /tmp/examples-differ
+            echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples; files that differ: $(tr '\n' ' ' < /tmp/examples-differ)"
             git -C /tmp/base checkout -q -- crates/bench/examples
             (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
               --target-dir "$GITHUB_WORKSPACE/target")
@@ -162,9 +165,34 @@ jobs:
             done
             scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
           done
-          # Base and head by name: `name base head`, base `-` for a shape new in the head.
-          awk 'NR == FNR { b[$1] = $2; next } { print $1, (($1 in b) ? b[$1] : "-"), $2 }' \
-            /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
+          if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
+            echo "a side counted nothing: base $(wc -l < /tmp/base.txt) lines, head $(wc -l < /tmp/head.txt)"
+            exit 1
+          fi
+          # With base on its own examples: the binaries whose example files differ (every
+          # binary if a shared module under support/ does). Their shapes, and hotrow's states
+          # for hotrow, are compared across different code, so they are marked, not checked.
+          : > /tmp/differ-bins
+          if [ -e /tmp/base-own-examples ]; then
+            if grep -q '^crates/bench/examples/support/' /tmp/examples-differ; then
+              echo ALL > /tmp/differ-bins
+            else
+              sed -n 's|^crates/bench/examples/\([^/]*\)\.rs$|\1|p' /tmp/examples-differ > /tmp/differ-bins
+            fi
+          fi
+          : > /tmp/shape-bins
+          for g in $SHAPES; do
+            IFS=, read -ra list <<< "${g#*:}"
+            for s in "${list[@]}"; do echo "$s ${g%%:*}" >> /tmp/shape-bins; done
+          done
+          # Base and head by name: `name base head flag`, base `-` for a shape new in the head,
+          # flag `x` for one whose example code differs from base's.
+          awk 'FILENAME == ARGV[1] { d[$1] = 1; next }
+               FILENAME == ARGV[2] { bin[$1] = $2; next }
+               FILENAME == ARGV[3] { b[$1] = $2; next }
+               { e = ($1 in bin) ? bin[$1] : "hotrow"
+                 print $1, (($1 in b) ? b[$1] : "-"), $2, (("ALL" in d) || (e in d)) ? "x" : "-" }' \
+            /tmp/differ-bins /tmp/shape-bins /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
           {
             echo "### Instructions per unit (callgrind)"
             echo
@@ -172,9 +200,15 @@ jobs:
             echo
             echo "| State or shape | base | head | change |"
             echo "|---|--:|--:|--:|"
-            while read -r state b h; do
+            if [ -s /tmp/differ-bins ]; then
+              echo "Base ran its own examples (the head's use an API this PR adds). Example files that differ from base: $(tr '\n' ' ' < /tmp/examples-differ). Their existing shapes are compared across different example code: marked, not checked."
+              echo
+            fi
+            while read -r state b h flag; do
               if [ "$b" = - ]; then
                 echo "| $state | (new) | $h | new |"
+              elif [ "$flag" = x ]; then
+                echo "| $state | $b | $h | not comparable (example changed) |"
               else
                 echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
               fi
@@ -194,8 +228,9 @@ jobs:
               n = split(thresholds, kv, " ")
               for (i = 1; i <= n; i++) { split(kv[i], p, "="); limit[p[1]] = p[2] }
             }
-            # A shape new in the head has no base to compare; its absolute ceiling still holds.
-            $2 == "-" { next }
+            # A shape new in the head has no base to compare, and one whose example code
+            # differs from base's isn't like for like; their absolute ceilings still hold.
+            $2 == "-" || $4 == "x" { next }
             {
               t = ($1 in limit) ? limit[$1] : limit["default"]
               if ($3 > $2 * (1 + t / 100)) {
