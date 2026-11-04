@@ -1,0 +1,70 @@
+name: Publish to RubyGems
+
+# Pushes the pigeonhole gems (ruby-gems.yml: seven precompiled platform gems and the source
+# gem) to RubyGems on a release tag (#697, ICR 0111). Trusted publishing: the push
+# authenticates with this run's OIDC token, so no API key is stored anywhere. The publish job
+# runs in the `rubygems` environment, whose required reviewer (the owner) approves each
+# release before anything is pushed.
+#
+# Owner setup, once, before the first release tag:
+#   - Settings → Environments → `rubygems`: add the owner as required reviewer, and limit
+#     deployments to tags matching `v*`.
+#   - rubygems.org: add a (pending) trusted publisher for gem `pigeonhole`: repository
+#     CodingAnarchy/pigeonhole, workflow publish-rubygems.yml, environment rubygems.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/ruby-gems.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: rubygems
+      url: https://rubygems.org/gems/pigeonhole
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing; this job only
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gem-*
+          path: pkg
+          merge-multiple: true
+      # Every gem must carry the tag's version: a tag pushed on a commit whose
+      # Pigeonhole::VERSION wasn't bumped stops here, before the push.
+      - name: The gems match the tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          ls -l pkg
+          shopt -s nullglob
+          gems=(pkg/*.gem)
+          [ "${#gems[@]}" -eq 8 ] || { echo "expected 8 gems (7 platforms + source), got ${#gems[@]}"; exit 1; }
+          for g in "${gems[@]}"; do
+            case "$(basename "$g")" in
+              pigeonhole-"$version".gem|pigeonhole-"$version"-*.gem) ;;
+              *) echo "$g does not match version $version"; exit 1 ;;
+            esac
+          done
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
+      # The platform gems first, the source gem last: until the source gem is up, a platform
+      # without a precompiled gem resolves to the previous release, never to a half-published
+      # one.
+      - name: Push the gems
+        shell: bash
+        run: |
+          for g in pkg/pigeonhole-*-*.gem; do gem push "$g"; done
+          gem push pkg/pigeonhole-"${GITHUB_REF_NAME#v}".gem
