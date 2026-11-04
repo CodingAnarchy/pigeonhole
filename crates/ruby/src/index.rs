@@ -1013,7 +1013,7 @@ pub(crate) struct Fair<T> {
 }
 
 impl<T> Fair<T> {
-    fn new(v: T) -> Self {
+    pub(crate) fn new(v: T) -> Self {
         Self {
             m: Mutex::new(v),
             wanted: std::sync::atomic::AtomicUsize::new(0),
@@ -1021,7 +1021,7 @@ impl<T> Fair<T> {
     }
 
     /// The value, counted in `wanted` until the lock is ours.
-    fn acquire(&self) -> std::sync::MutexGuard<'_, T> {
+    pub(crate) fn acquire(&self) -> std::sync::MutexGuard<'_, T> {
         use std::sync::atomic::Ordering;
         self.wanted.fetch_add(1, Ordering::SeqCst);
         let g = lock(&self.m);
@@ -1030,7 +1030,7 @@ impl<T> Fair<T> {
     }
 
     /// Waits, with the GVL released, until nobody else wants the lock or `limit` passes.
-    fn give_way(&self, ruby: &Ruby, limit: Duration) -> Result<(), Error>
+    pub(crate) fn give_way(&self, ruby: &Ruby, limit: Duration) -> Result<(), Error>
     where
         T: Send,
     {

@@ -338,3 +338,80 @@ fn a_saved_position_whose_history_is_gone_catches_up() {
     assert_eq!(summaries(&store, "n"), 1);
     db.close().unwrap();
 }
+
+/// cli692 on #1441: a consolidator that stops (`ConsolidateStopped`, as an interrupted
+/// binding returns) doesn't postpone its namespace by `min_age`, as a failure does: it's in
+/// `stopped`, and due again at the next step, on the same clock.
+#[test]
+fn a_stopped_consolidator_keeps_the_namespace_due() {
+    struct StopOnce(AtomicUsize);
+    impl Consolidator for StopOnce {
+        fn consolidate(
+            &self,
+            group: &[StoredMemory],
+        ) -> Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Box::new(pigeonhole_memory::ConsolidateStopped));
+            }
+            Ok(vec![Memory::new(format!("summary: {} notes", group.len()))])
+        }
+    }
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let c = Arc::new(StopOnce(AtomicUsize::new(0)));
+    let clock = Arc::new(AtomicU64::new(now()));
+    let t = Arc::clone(&clock);
+    let p = policy(Duration::from_secs(10));
+    let mut l = store
+        .consolidate_loop("main", c.clone())
+        .policy(&p)
+        .clock(move || t.load(Ordering::SeqCst));
+    l.run_once(Duration::ZERO).unwrap();
+    pair(&store, "n", "s1");
+    l.run_once(Duration::from_secs(2)).unwrap();
+    clock.fetch_add(11 * SEC, Ordering::SeqCst);
+    let step = l.run_once(Duration::ZERO).unwrap();
+    let ns: Vec<&str> = step.stopped.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(ns, vec!["n"], "{step:?}");
+    assert_eq!(step.stopped[0].1.committed, 0, "stopped at its first group");
+    assert!(step.failed.is_empty() && step.passes.is_empty(), "{step:?}");
+    // Same clock: still due, so the next step runs the pass (a failure would wait 10 s).
+    let step = l.run_once(Duration::ZERO).unwrap();
+    assert_eq!(step.passes.len(), 1, "{step:?}");
+    assert_eq!(step.passes[0].1.committed, 1);
+    db.close().unwrap();
+}
+
+/// perf2 on #1441: a `LoopInterrupter` ends a step's wait early (from another thread, as a
+/// binding whose caller was interrupted does): the step returns well before its timeout,
+/// with `interrupted` set, having saved. One set before a step makes it return at once.
+#[test]
+fn an_interrupter_ends_a_steps_wait_early() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let c = Arc::new(Concat::new());
+    let mut l = store.consolidate_loop("main", c.clone());
+    l.run_once(Duration::ZERO).unwrap();
+    let stop = l.interrupter();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        stop.interrupt();
+    });
+    let started = std::time::Instant::now();
+    let step = l.run_once(Duration::from_secs(5)).unwrap();
+    let took = started.elapsed();
+    t.join().unwrap();
+    assert!(step.interrupted, "{step:?}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Not interrupted: a short step runs to its timeout.
+    let step = l.run_once(Duration::from_millis(100)).unwrap();
+    assert!(!step.interrupted);
+    // Set before a step: it returns at once.
+    l.interrupter().interrupt();
+    let started = std::time::Instant::now();
+    let step = l.run_once(Duration::from_secs(5)).unwrap();
+    assert!(step.interrupted && started.elapsed() < Duration::from_secs(1));
+    db.close().unwrap();
+}

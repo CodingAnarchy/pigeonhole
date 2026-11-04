@@ -142,5 +142,15 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - `RecallStats#ivf_namespaces`/`#ivf_fallbacks`;
   - `StoreStats#ivf_mismatched`/`#ivf_counter_drift`, which `consistent?` leaves out, as the crate does (ai1249's N3 on #1425).
 - **Rebalancing (Q3).** `rebalance: :background` uses the crate's own thread. With `rebalancer: true`, `create`/`open` return `[index, rebalancer]` for a Ruby thread to drive. `run_once(budget)` and `wait(timeout)` release the GVL, and `wait` runs in 100 ms slices with interrupt checks. `set_wakeup` isn't bound, for Q2's reason.
+### PR 3c: watching memory and the consolidation loop
+T9 (#1430, #1432) in `Pigeonhole::Memory`.
+- **`Store#watch`/`ReadStore#watch(namespaces, from_snapshot:, resume:, visible:)`** returns a `Watch`. Its `next(timeout:)`, `try_next`, `each(timeout:)`, `token`, `oldest_retained`, `close` and `closed?` are built as `Feed`'s are: slices, and 3b's `Fair` lock for give-way. `MemoryCommit`/`MemoryEvent` are frozen `Data`, and `kind` is a Symbol (`:unknown` for a later kind). `StoredMemory#summary?` reads `meta:summary`.
+- **`Store#consolidate_loop(name, policy:, namespaces:, clock_offset:) { |group| ... }`** returns a `ConsolidateLoop`.
+  - The crate's loop is owned (#1432's B2). Each `run_once(timeout)` moves it onto a worker thread, and its consolidator is answered with the block by the channel pattern. That uses the `drive` that `consolidate` now shares, so every path joins the worker.
+  - The block is kept in a Ruby instance variable and passed to each step, so Rust holds no Ruby value.
+  - A `StandardError` from the block fails that group's namespace only, reported in `LoopStep#failed` with the block's exception. A jump or interrupt stops the step and raises once the worker has returned the loop. `break` raises `LocalJumpError`, since the block outlives the call that took it.
+  - `LoopTakenOver < Conflict` carries the crate's don't-retry rule.
+  - A Ruby clock can't run inside a step, so `clock_offset:` (seconds) shifts the system clock instead.
+
 ## Callers changed
 None. It's a new crate.

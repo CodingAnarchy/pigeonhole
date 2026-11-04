@@ -264,3 +264,11 @@ pub(crate) struct Rebalancer(
 /// `Pigeonhole::Vector::BulkLoad`: a bulk load in progress; `None` once finished.
 #[magnus::wrap(class = "Pigeonhole::Vector::BulkLoad", free_immediately, size)]
 pub(crate) struct VectorBulkLoad(pub(crate) ForkSafe<Mutex<Option<crate::index::BulkState>>>);
+
+/// `Pigeonhole::Memory::Watch`: a store's memory events (T9); `None` once closed.
+#[magnus::wrap(class = "Pigeonhole::Memory::Watch", free_immediately, size)]
+pub(crate) struct Watch(pub(crate) ForkSafe<crate::index::Fair<Option<pigeonhole_memory::Watch>>>);
+
+/// `Pigeonhole::Memory::ConsolidateLoop`: feed-driven consolidation (T9).
+#[magnus::wrap(class = "Pigeonhole::Memory::ConsolidateLoop", free_immediately, size)]
+pub(crate) struct ConsolidateLoop(pub(crate) ForkSafe<Mutex<crate::memory::LoopSlot>>);

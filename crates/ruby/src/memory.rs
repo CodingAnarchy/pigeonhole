@@ -27,6 +27,7 @@ use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value, prelude::*,
 use pigeonhole::ErrorCode;
 use pigeonhole_memory as mem;
 
+use crate::classes::{ConsolidateLoop, Watch};
 use crate::classes::{
     ConsolidatePolicy, Database, EmbeddingModel, Expand, ForgetPolicy, IvfOptions, Memory,
     MemoryId, NearDedup, ReadStore, Reader, Snapshot, Store, Transaction, Weights,
@@ -110,6 +111,22 @@ fn err(ruby: &Ruby, e: mem::Error) -> Error {
                     format!("embedding model mismatch: {m}"),
                     "InvalidArgument",
                     ErrorCode::InvalidArgument as u32,
+                ))?;
+                Ok(Error::from(e))
+            };
+            make().unwrap_or_else(|e| e)
+        }
+        mem::Error::LoopTakenOver(name) => {
+            let make = || -> Result<Error, Error> {
+                let class: magnus::ExceptionClass =
+                    memory_module(ruby)?.const_get("LoopTakenOver")?;
+                let e = class.new_instance((
+                    format!(
+                        "another consolidation loop named {name:?} took over: stop this one \
+                         (don't retry it or make a new one in its place)"
+                    ),
+                    "Conflict",
+                    ErrorCode::Conflict as u32,
                 ))?;
                 Ok(Error::from(e))
             };
@@ -823,7 +840,7 @@ fn links_value(ruby: &Ruby, ls: &[mem::Link]) -> Result<RArray, Error> {
 /// `[id, text, kind, importance, uses, last_used_us, session, pinned, consolidated,
 /// superseded_by, sources, links, backlinks, embedding]`.
 fn stored(ruby: &Ruby, m: &mem::StoredMemory) -> Result<RArray, Error> {
-    let a = ruby.ary_new_capa(14);
+    let a = ruby.ary_new_capa(15);
     a.push(id_value(m.id.clone()))?;
     a.push(text(ruby, &m.text))?;
     a.push(ruby.to_symbol(kind_name(m.kind)))?;
@@ -842,6 +859,7 @@ fn stored(ruby: &Ruby, m: &mem::StoredMemory) -> Result<RArray, Error> {
     a.push(links_value(ruby, &m.links)?)?;
     a.push(links_value(ruby, &m.backlinks)?)?;
     a.push(m.embedding.as_deref().map(|e| floats(ruby, e)))?;
+    a.push(m.summary)?;
     Ok(a)
 }
 
@@ -1051,15 +1069,7 @@ fn recall_args(ruby: &Ruby, a: RArray) -> Result<RecallArgs, Error> {
 
 // ---- The consolidator --------------------------------------------------------------------
 
-/// The worker's message to the Ruby thread.
-enum ToRuby {
-    /// A group to fold; the worker waits for its answer.
-    Group(Vec<mem::StoredMemory>),
-    /// The pass ended.
-    Done(mem::Result<mem::ConsolidatePass>),
-}
-
-/// Why the Ruby side gave no memories for a group: the pass stops.
+/// Why the Ruby side gave no memories for a group: that group's pass stops.
 #[derive(Debug)]
 struct Stopped;
 
@@ -1071,24 +1081,191 @@ impl std::fmt::Display for Stopped {
 
 impl std::error::Error for Stopped {}
 
-/// The crate's `Consolidator`, answered by the Ruby thread over channels.
-struct ChannelConsolidator {
-    to_ruby: Mutex<Sender<ToRuby>>,
-    answers: Mutex<Receiver<Option<Vec<mem::Memory>>>>,
+/// The Ruby side's answer for one group.
+enum Answer {
+    /// The block's memories.
+    Memories(Vec<mem::Memory>),
+    /// The block raised: the group's pass failed.
+    Failed,
+    /// The group was refused, not answered (an interrupt, or an earlier failure in a
+    /// `consolidate`): a `ConsolidateLoop` keeps its namespace due (#1442's
+    /// `ConsolidateStopped`).
+    Refused,
 }
 
-impl mem::Consolidator for ChannelConsolidator {
+/// One drive's channels: groups to the Ruby thread, answers back.
+type Channels = (Sender<Vec<mem::StoredMemory>>, Receiver<Answer>);
+
+/// The crate's `Consolidator`, answered by the Ruby thread over the channels `drive`
+/// installs for each call (a `ConsolidateLoop` keeps one across its steps). With none
+/// installed, a group fails.
+#[derive(Default)]
+pub(crate) struct SlotConsolidator {
+    slot: Mutex<Option<Channels>>,
+}
+
+impl mem::Consolidator for SlotConsolidator {
     fn consolidate(
         &self,
         group: &[mem::StoredMemory],
     ) -> Result<Vec<mem::Memory>, Box<dyn std::error::Error + Send + Sync>> {
-        lock(&self.to_ruby)
-            .send(ToRuby::Group(group.to_vec()))
+        let slot = lock(&self.slot);
+        let Some((to_ruby, answers)) = slot.as_ref() else {
+            return Err(Box::new(Stopped));
+        };
+        to_ruby
+            .send(group.to_vec())
             .map_err(|_| Box::new(Stopped))?;
-        match lock(&self.answers).recv() {
-            Ok(Some(memories)) => Ok(memories),
-            _ => Err(Box::new(Stopped)),
+        match answers.recv() {
+            Ok(Answer::Memories(memories)) => Ok(memories),
+            Ok(Answer::Failed) => Err(Box::new(Stopped)),
+            // Refused, or the Ruby side is gone: stopped rather than failed.
+            Ok(Answer::Refused) | Err(_) => Err(Box::new(mem::ConsolidateStopped)),
         }
+    }
+}
+
+/// How `drive` treats a `StandardError` from the block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnRaise {
+    /// It stops the pass: later groups are refused (`consolidate`).
+    StopAll,
+    /// It fails that group's namespace only, and later groups still get the block
+    /// (`ConsolidateLoop#run_once`, which reports it in `failed`).
+    PerGroup,
+}
+
+/// What `drive` returns once the worker has ended: its result, the `StandardError`s the
+/// block raised (with the namespace of the group each was for), and the jump or interrupt
+/// to raise after the caller has tidied up, if any.
+struct Driven<R> {
+    out: R,
+    raised: Vec<(String, Error)>,
+    jump: Option<Error>,
+}
+
+/// Runs `work` on a thread of its own, answering its consolidator's groups with `block`
+/// on this thread, by the owner's channel pattern (O3): the Ruby thread waits with the GVL
+/// released in 100 ms slices, with interrupt checks between them, and calls the block with
+/// the GVL held. However the wait ends, the worker is joined before this returns (ai1249's
+/// B1 and perf2's S1 on #1425), so no thread outlives the call.
+///
+/// `interrupter`, for a loop's step, is tripped as soon as a jump or interrupt is recorded,
+/// so the step stops waiting for new memories within about 50 ms instead of at its timeout
+/// (perf2's S1 on #1441, #1447's `LoopInterrupter`).
+fn drive<R: Send + 'static>(
+    ruby: &Ruby,
+    slot: &Arc<SlotConsolidator>,
+    block: magnus::block::Proc,
+    on_raise: OnRaise,
+    name: &str,
+    interrupter: Option<&mem::LoopInterrupter>,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Result<Driven<R>, Error> {
+    let trip = || {
+        if let Some(i) = interrupter {
+            i.interrupt();
+        }
+    };
+    let (to_ruby, groups) = mpsc::channel::<Vec<mem::StoredMemory>>();
+    let (answer_tx, answers) = mpsc::channel::<Answer>();
+    *lock(&slot.slot) = Some((to_ruby, answers));
+    // The worker empties the slot as soon as its work returns, dropping the sender, so the
+    // wait below sees `Disconnected` at once rather than at the end of a slice (ai1249's
+    // N1 on #1441).
+    let worker_slot = Arc::clone(slot);
+    let run = move || {
+        let out = work();
+        lock(&worker_slot.slot).take();
+        out
+    };
+    let worker = match std::thread::Builder::new().name(name.into()).spawn(run) {
+        Ok(w) => w,
+        Err(e) => {
+            lock(&slot.slot).take();
+            return Err(arg_error(
+                ruby,
+                format!("can't start the {name} thread: {e}"),
+            ));
+        }
+    };
+    let groups = Arc::new(Mutex::new(groups));
+    let mut raised: Vec<(String, Error)> = Vec::new();
+    let mut jump: Option<Error> = None;
+    loop {
+        let rx = Arc::clone(&groups);
+        // `without_gvl` raises an interrupt already pending instead of waiting: recorded,
+        // and the loop keeps draining until the worker ends.
+        let msg = match without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE)) {
+            Ok(msg) => msg,
+            Err(e) => {
+                jump.get_or_insert(e);
+                trip();
+                continue;
+            }
+        };
+        match msg {
+            Ok(group) => {
+                let refuse = jump.is_some() || (on_raise == OnRaise::StopAll && !raised.is_empty());
+                let reply = if refuse {
+                    Answer::Refused
+                } else {
+                    match call_block(ruby, block, &group) {
+                        Ok(memories) => Answer::Memories(memories),
+                        Err(Early::Raised(e)) => {
+                            let ns = group
+                                .first()
+                                .map(|m| m.id.namespace().to_owned())
+                                .unwrap_or_default();
+                            raised.push((ns, e));
+                            Answer::Failed
+                        }
+                        Err(Early::Jump(e)) => {
+                            jump = Some(e);
+                            trip();
+                            Answer::Refused
+                        }
+                    }
+                };
+                // A send fails only once the worker is gone, which `is_finished` then shows.
+                let _ = answer_tx.send(reply);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if worker.is_finished() {
+                    break;
+                }
+                if jump.is_none()
+                    && let Err(e) = ruby.thread_check_ints()
+                {
+                    // The worker is inside the engine; its next group is refused.
+                    jump = Some(e);
+                    trip();
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // The worker has ended (or is ending): the join doesn't wait on the engine. If an
+    // interrupt is pending, `without_gvl` raises it without running the join; the join then
+    // runs with the GVL held.
+    let worker = Mutex::new(Some(worker));
+    let joined = match without_gvl(ruby, || {
+        lock(&worker).take().map(std::thread::JoinHandle::join)
+    }) {
+        Ok(j) => j,
+        Err(e) => {
+            jump.get_or_insert(e);
+            lock(&worker).take().map(std::thread::JoinHandle::join)
+        }
+    };
+    lock(&slot.slot).take();
+    match joined {
+        Some(Ok(out)) => Ok(Driven { out, raised, jump }),
+        _ => Err(crate::error::uncoded(
+            ruby,
+            "Error",
+            &format!("the {name} thread panicked"),
+        )),
     }
 }
 
@@ -1113,15 +1290,6 @@ fn answer(ruby: &Ruby, out: Value) -> Result<Vec<mem::Memory>, Error> {
                 .map_err(|_| bad())
         })
         .collect()
-}
-
-/// Records an interrupt (or a jump) as how the pass ends. It replaces a `StandardError`
-/// the block raised before it: the interrupt (Ctrl-C, `Timeout`) is the one the caller
-/// must see (perf2 on #1425). An earlier jump stays.
-fn note_jump(early: &mut Option<Early>, e: Error) {
-    if !matches!(early, Some(Early::Jump(_))) {
-        *early = Some(Early::Jump(e));
-    }
 }
 
 /// How the Ruby side of a pass ended early.
@@ -1497,21 +1665,22 @@ impl Store {
         policy: Option<&ConsolidatePolicy>,
         after: Option<Value>,
         now_us: Option<u64>,
-        consolidator: magnus::block::Proc,
+        block: magnus::block::Proc,
     ) -> Result<RArray, Error> {
         let policy = policy.map(|p| p.0.clone());
         let after = opt_id(ruby, after)?;
         let s = rb_self.handle(ruby)?;
-        let (to_ruby, from_worker) = mpsc::channel::<ToRuby>();
-        let (answer_tx, answers) = mpsc::channel::<Option<Vec<mem::Memory>>>();
-        let channel = ChannelConsolidator {
-            to_ruby: Mutex::new(to_ruby.clone()),
-            answers: Mutex::new(answers),
-        };
-        let worker = std::thread::Builder::new()
-            .name("pigeonhole-consolidate".into())
-            .spawn(move || {
-                let mut run = s.consolidate(&ns, &channel);
+        let slot = Arc::new(SlotConsolidator::default());
+        let consolidator = Arc::clone(&slot);
+        let d = drive(
+            ruby,
+            &slot,
+            block,
+            OnRaise::StopAll,
+            "pigeonhole-consolidate",
+            None,
+            move || {
+                let mut run = s.consolidate(&ns, &*consolidator);
                 if let Some(p) = &policy {
                     run = run.policy(p);
                 }
@@ -1521,128 +1690,50 @@ impl Store {
                 if let Some(u) = now_us {
                     run = run.now_us(u);
                 }
-                let out = run.run();
-                // The Ruby thread may have stopped waiting; then nobody reads this.
-                let _ = to_ruby.send(ToRuby::Done(out));
-            })
-            .map_err(|e| arg_error(ruby, format!("can't start the consolidation thread: {e}")))?;
-        let from_worker = Arc::new(Mutex::new(from_worker));
-        let mut early: Option<Early> = None;
-        let done = loop {
-            let rx = Arc::clone(&from_worker);
-            // `without_gvl` raises an interrupt already pending instead of waiting. That
-            // must not end the loop: the worker would be left running, detached and holding
-            // the store (ai1249's B1 and perf2's S1 on #1425). It's recorded, and the loop
-            // keeps draining until the worker says it's done.
-            let msg = match without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE)) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    note_jump(&mut early, e);
-                    continue;
-                }
-            };
-            match msg {
-                Ok(ToRuby::Group(group)) => {
-                    let reply = if early.is_some() {
-                        None
-                    } else {
-                        match Self::call_block(ruby, consolidator, &group) {
-                            Ok(memories) => Some(memories),
-                            Err(e) => {
-                                early = Some(e);
-                                None
-                            }
-                        }
-                    };
-                    // A send fails only once the worker is gone, which `Done` then reports.
-                    let _ = answer_tx.send(reply);
-                }
-                Ok(ToRuby::Done(out)) => break Some(out),
-                Err(RecvTimeoutError::Timeout) => {
-                    if early.is_none()
-                        && let Err(e) = ruby.thread_check_ints()
-                    {
-                        // The worker is inside the engine; its next group is refused, so
-                        // the pass ends at its current group's commit.
-                        early = Some(Early::Jump(e));
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => break None,
-            }
-        };
-        // `Done` was the worker's last act, so this join doesn't wait on the engine. If an
-        // interrupt is pending, `without_gvl` raises it without running the join; the join
-        // then runs with the GVL held (it's at most the worker's exit), and the interrupt is
-        // what the call raises.
-        let worker = Mutex::new(Some(worker));
-        let joined = without_gvl(ruby, || lock(&worker).take().map(|w| w.join().is_err()));
-        let panicked = match joined {
-            Ok(p) => p.unwrap_or(false),
-            Err(e) => {
-                note_jump(&mut early, e);
-                lock(&worker).take().is_some_and(|w| w.join().is_err())
-            }
-        };
-        match early {
-            Some(Early::Jump(e)) => Err(e),
-            Some(Early::Raised(e)) => {
-                let pass = match done {
-                    Some(Err(mem::Error::Consolidate { pass, .. })) => pass,
-                    Some(Ok(pass)) => pass,
-                    Some(Err(other)) => return Err(err(ruby, other)),
-                    None => mem::ConsolidatePass::default(),
-                };
-                let out = ruby.ary_new_capa(2);
-                out.push(consolidate_pass(ruby, pass)?)?;
-                out.push(e.value().unwrap_or_else(|| ruby.qnil().as_value()))?;
-                Ok(out)
-            }
-            None => match done {
-                Some(Ok(pass)) => {
-                    let out = ruby.ary_new_capa(2);
-                    out.push(consolidate_pass(ruby, pass)?)?;
-                    out.push(ruby.qnil())?;
-                    Ok(out)
-                }
-                Some(Err(e)) => Err(err(ruby, e)),
-                None if panicked => Err(crate::error::uncoded(
-                    ruby,
-                    "Error",
-                    "the consolidation thread panicked",
-                )),
-                None => Err(crate::error::uncoded(
-                    ruby,
-                    "Error",
-                    "the consolidation thread ended without a result",
-                )),
+                run.run()
             },
+        )?;
+        if let Some(e) = d.jump {
+            return Err(e);
         }
-    }
-
-    /// Calls the block with one group; its answer, or how it ended early.
-    fn call_block(
-        ruby: &Ruby,
-        consolidator: magnus::block::Proc,
-        group: &[mem::StoredMemory],
-    ) -> Result<Vec<mem::Memory>, Early> {
-        let arg = || -> Result<RArray, Error> {
-            let a = ruby.ary_new_capa(group.len());
-            for m in group {
-                a.push(stored(ruby, m)?)?;
-            }
-            Ok(a)
+        let pass = match d.out {
+            Ok(pass) => pass,
+            Err(mem::Error::Consolidate { pass, .. }) if !d.raised.is_empty() => pass,
+            Err(e) => return Err(err(ruby, e)),
         };
-        let a = arg().map_err(Early::Raised)?;
-        // A `StandardError` from the block becomes `ConsolidateError`. Anything else (a
-        // non-local exit, `Interrupt`, `Timeout`'s and `Thread#raise`'s interrupts,
-        // `SystemExit`) propagates as it is, once the worker has stopped: what `rescue => e`
-        // would let through.
-        let out: Value = consolidator.call((a,)).map_err(|e| match e.value() {
-            Some(v) if v.is_kind_of(ruby.exception_standard_error()) => Early::Raised(e),
-            _ => Early::Jump(e),
-        })?;
-        answer(ruby, out).map_err(Early::Raised)
+        let out = ruby.ary_new_capa(2);
+        out.push(consolidate_pass(ruby, pass)?)?;
+        match d.raised.into_iter().next() {
+            Some((_, e)) => out.push(e.value().unwrap_or_else(|| ruby.qnil().as_value()))?,
+            None => out.push(ruby.qnil())?,
+        }
+        Ok(out)
     }
+}
+
+/// Calls the block with one group; its answer, or how it ended early.
+fn call_block(
+    ruby: &Ruby,
+    consolidator: magnus::block::Proc,
+    group: &[mem::StoredMemory],
+) -> Result<Vec<mem::Memory>, Early> {
+    let arg = || -> Result<RArray, Error> {
+        let a = ruby.ary_new_capa(group.len());
+        for m in group {
+            a.push(stored(ruby, m)?)?;
+        }
+        Ok(a)
+    };
+    let a = arg().map_err(Early::Raised)?;
+    // A `StandardError` from the block becomes `ConsolidateError`. Anything else (a
+    // non-local exit, `Interrupt`, `Timeout`'s and `Thread#raise`'s interrupts,
+    // `SystemExit`) propagates as it is, once the worker has stopped: what `rescue => e`
+    // would let through.
+    let out: Value = consolidator.call((a,)).map_err(|e| match e.value() {
+        Some(v) if v.is_kind_of(ruby.exception_standard_error()) => Early::Raised(e),
+        _ => Early::Jump(e),
+    })?;
+    answer(ruby, out).map_err(Early::Raised)
 }
 
 fn normalization_arg(ruby: &Ruby, v: Value) -> Result<mem::Normalization, Error> {
@@ -1728,5 +1819,360 @@ impl ReadStore {
             a.run(r)
         })?;
         hits(ruby, out)
+    }
+}
+
+// ---- Watch (T9 part 1) -------------------------------------------------------------------
+
+fn event_kind(e: &mem::MemoryEvent) -> &'static str {
+    match e {
+        mem::MemoryEvent::Remembered(_) => "remembered",
+        mem::MemoryEvent::Summarized(_) => "summarized",
+        mem::MemoryEvent::Superseded { .. } => "superseded",
+        mem::MemoryEvent::Deleted(_) => "deleted",
+        mem::MemoryEvent::Updated(_) => "updated",
+        _ => "unknown",
+    }
+}
+
+/// `[seqno, timestamp_us, [[kind, id, by], ...]]`.
+fn memory_commit(ruby: &Ruby, c: &mem::MemoryCommit) -> Result<RArray, Error> {
+    let events = ruby.ary_new_capa(c.events.len());
+    for e in &c.events {
+        let by = match e {
+            mem::MemoryEvent::Superseded { by, .. } => Some(id_value(by.clone())),
+            _ => None,
+        };
+        events.push((ruby.to_symbol(event_kind(e)), id_value(e.id().clone()), by))?;
+    }
+    let a = ruby.ary_new_capa(3);
+    a.push(c.seqno)?;
+    a.push(c.timestamp_us)?;
+    a.push(events)?;
+    Ok(a)
+}
+
+/// A watch's builder arguments, `[namespaces, from_snapshot, resume, visible]`, applied.
+fn open_watch(
+    ruby: &Ruby,
+    b: impl FnOnce(&[&str]) -> mem::WatchBuilder,
+    a: RArray,
+) -> Result<Watch, Error> {
+    if a.len() != 4 {
+        return Err(arg_error(ruby, "native_watch takes 4 arguments"));
+    }
+    let ns: Vec<String> = a.entry(0)?;
+    let snap: Option<Value> = a.entry(1)?;
+    let snap = snap.map(<&Snapshot>::try_convert).transpose()?;
+    let snap = snapshot_arg(ruby, snap)?;
+    let resume: Option<crate::convert::Bytes> = a.entry(2)?;
+    let visible: bool = a.entry(3)?;
+    let refs: Vec<&str> = ns.iter().map(String::as_str).collect();
+    let mut w = b(&refs);
+    if let Some(s) = &snap {
+        w = w.from_snapshot(s);
+    }
+    if let Some(r) = resume {
+        w = w.resume(&mem::WatchToken::from_bytes(r.0));
+    }
+    if visible {
+        w = w.visible();
+    }
+    let watch = call(ruby, move || w.open())?;
+    Ok(Watch(ForkSafe::new(crate::index::Fair::new(Some(watch)))))
+}
+
+impl Store {
+    /// `native_watch([namespaces, from_snapshot, resume, visible])`.
+    pub(crate) fn watch(ruby: &Ruby, rb_self: &Self, a: RArray) -> Result<Watch, Error> {
+        let s = rb_self.handle(ruby)?;
+        open_watch(ruby, |ns| s.watch(ns), a)
+    }
+}
+
+impl ReadStore {
+    /// `native_watch([namespaces, from_snapshot, resume, visible])`, in a reader process.
+    pub(crate) fn watch(ruby: &Ruby, rb_self: &Self, a: RArray) -> Result<Watch, Error> {
+        let s = rb_self.store(ruby)?;
+        open_watch(ruby, |ns| s.watch(ns), a)
+    }
+}
+
+const WATCH_CLOSED: &str = "the watch is closed";
+
+impl Watch {
+    /// One wait of at most `slice` (`None`: no wait), with the GVL released.
+    fn poll(
+        ruby: &Ruby,
+        rb_self: &Self,
+        slice: Option<Duration>,
+    ) -> Result<Option<mem::MemoryCommit>, Error> {
+        let state = rb_self.0.get(ruby)?;
+        let polled = without_gvl(ruby, || {
+            let mut g = state.acquire();
+            g.as_mut().map(|w| match slice {
+                Some(d) => w.next(d),
+                None => w.try_next(),
+            })
+        })?;
+        match polled {
+            None => Err(with_code(ruby, ErrorCode::Closed, WATCH_CLOSED)),
+            Some(r) => r.or_mem(ruby),
+        }
+    }
+
+    /// `native_next(timeout)`: as `Feed#next`, in slices with an interrupt check between
+    /// them, giving way to other threads that want the watch (#1411).
+    pub(crate) fn next(
+        ruby: &Ruby,
+        rb_self: &Self,
+        timeout: Option<Secs>,
+    ) -> Result<Option<RArray>, Error> {
+        let deadline = timeout.and_then(|t| std::time::Instant::now().checked_add(t.0));
+        let state = rb_self.0.get(ruby)?;
+        loop {
+            let left = || {
+                deadline.map_or(SLICE, |d| {
+                    d.saturating_duration_since(std::time::Instant::now())
+                        .min(SLICE)
+                })
+            };
+            state.give_way(ruby, left())?;
+            ruby.thread_check_ints()?;
+            if let Some(c) = Self::poll(ruby, rb_self, Some(left()))? {
+                return memory_commit(ruby, &c).map(Some);
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub(crate) fn try_next(ruby: &Ruby, rb_self: &Self) -> Result<Option<RArray>, Error> {
+        Self::poll(ruby, rb_self, None)?
+            .map(|c| memory_commit(ruby, &c))
+            .transpose()
+    }
+
+    /// Where the watch is, as bytes, for `Store#watch(resume:)`.
+    pub(crate) fn token(ruby: &Ruby, rb_self: &Self) -> Result<RString, Error> {
+        let state = rb_self.0.get(ruby)?;
+        let t = without_gvl(ruby, || state.acquire().as_ref().map(mem::Watch::token))?
+            .ok_or_else(|| with_code(ruby, ErrorCode::Closed, WATCH_CLOSED))?;
+        Ok(crate::convert::binary(ruby, t.as_bytes()))
+    }
+
+    pub(crate) fn oldest_retained(ruby: &Ruby, rb_self: &Self) -> Result<Option<u64>, Error> {
+        let state = rb_self.0.get(ruby)?;
+        without_gvl(ruby, || {
+            state
+                .acquire()
+                .as_ref()
+                .and_then(mem::Watch::oldest_retained)
+        })
+    }
+
+    pub(crate) fn close(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        let state = rb_self.0.get(ruby)?;
+        without_gvl(ruby, || drop(state.acquire().take()))
+    }
+
+    pub(crate) fn is_closed(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
+        let state = rb_self.0.get(ruby)?;
+        without_gvl(ruby, || state.acquire().is_none())
+    }
+}
+
+// ---- ConsolidateLoop (T9 part 2) ---------------------------------------------------------
+
+/// A loop and the consolidator its steps answer through; `None` while a step runs on its
+/// worker, or once closed.
+pub(crate) struct LoopState {
+    lp: mem::ConsolidateLoop,
+    slot: Arc<SlotConsolidator>,
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+impl Store {
+    /// `native_consolidate_loop(name, policy, namespaces, clock_offset_us)`.
+    pub(crate) fn consolidate_loop(
+        ruby: &Ruby,
+        rb_self: &Self,
+        name: String,
+        policy: Option<&ConsolidatePolicy>,
+        namespaces: Option<Vec<String>>,
+        clock_offset_us: Option<i64>,
+    ) -> Result<ConsolidateLoop, Error> {
+        let s = rb_self.handle(ruby)?;
+        let slot = Arc::new(SlotConsolidator::default());
+        let consolidator: Arc<dyn mem::Consolidator> = slot.clone();
+        let mut lp = s.consolidate_loop(&name, consolidator);
+        if let Some(p) = policy {
+            lp = lp.policy(&p.0);
+        }
+        if let Some(ns) = &namespaces {
+            let refs: Vec<&str> = ns.iter().map(String::as_str).collect();
+            lp = lp.namespaces(&refs);
+        }
+        // A Ruby clock can't run inside a step (it's called with the GVL released), so the
+        // binding offers a fixed offset from the system clock, enough for tests.
+        if let Some(off) = clock_offset_us {
+            lp = lp.clock(move || now_us().saturating_add_signed(off));
+        }
+        Ok(ConsolidateLoop(ForkSafe::new(Mutex::new(LoopSlot::Idle(
+            Box::new(LoopState { lp, slot }),
+        )))))
+    }
+}
+
+/// Where a `ConsolidateLoop` is: ready, in a step on another thread, closed, or lost to a
+/// worker panic (perf2's N1 on #1441: each says why a call can't run).
+pub(crate) enum LoopSlot {
+    Idle(Box<LoopState>),
+    Running,
+    Closed,
+    Lost,
+}
+
+impl LoopSlot {
+    /// The loop, if it's ready; else why it isn't.
+    fn take(&mut self, ruby: &Ruby) -> Result<LoopState, Error> {
+        match std::mem::replace(self, LoopSlot::Running) {
+            LoopSlot::Idle(s) => Ok(*s),
+            other => {
+                let why = other.why();
+                *self = other;
+                Err(spent(ruby, why))
+            }
+        }
+    }
+
+    fn why(&self) -> &'static str {
+        match self {
+            LoopSlot::Running => "a step of this consolidation loop is running on another thread",
+            LoopSlot::Closed => "the consolidation loop is closed",
+            LoopSlot::Lost => "the consolidation loop's thread panicked: the loop is gone",
+            LoopSlot::Idle(_) => "the consolidation loop is ready",
+        }
+    }
+}
+
+impl ConsolidateLoop {
+    /// `native_run_once(timeout, block)`: one step on a worker thread, its consolidator
+    /// answered by `block` here (the channel pattern). `[events, [[ns, pass], ...],
+    /// [[ns, exception], ...], next_due, token]`. A `StandardError` from the block fails
+    /// that namespace only (it's in `failed`); anything else stops the step and is raised.
+    pub(crate) fn run_once(
+        ruby: &Ruby,
+        rb_self: &Self,
+        timeout: Secs,
+        block: magnus::block::Proc,
+    ) -> Result<RArray, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let LoopState { mut lp, slot } = lock(m).take(ruby)?;
+        let interrupter = lp.interrupter();
+        let d = drive(
+            ruby,
+            &slot,
+            block,
+            OnRaise::PerGroup,
+            "pigeonhole-consolidate-loop",
+            Some(&interrupter),
+            move || {
+                let step = lp.run_once(timeout.0);
+                (lp, step)
+            },
+        );
+        let d = match d {
+            Ok(d) => d,
+            // The worker panicked: the loop went with it.
+            Err(e) => {
+                *lock(m) = LoopSlot::Lost;
+                return Err(e);
+            }
+        };
+        let (lp, step) = d.out;
+        let state = Box::new(LoopState { lp, slot });
+        let closed = {
+            let mut g = lock(m);
+            if matches!(*g, LoopSlot::Running) {
+                *g = LoopSlot::Idle(state);
+                None
+            } else {
+                // A `close` while the step ran leaves the loop closed. The loop (its watch
+                // and store handle) is dropped with the GVL released, as `close` drops it
+                // (perf2's nit on #1441).
+                Some(state)
+            }
+        };
+        // The recorded jump wins over an interrupt the drop's `without_gvl` might raise
+        // (ai1249's nit on #1452: "the interrupt takes effect").
+        let dropped = if closed.is_some() {
+            without_gvl(ruby, move || drop(closed))
+        } else {
+            Ok(())
+        };
+        if let Some(e) = d.jump {
+            return Err(e);
+        }
+        dropped?;
+        let step = step.or_mem(ruby)?;
+        let passes = ruby.ary_new_capa(step.passes.len());
+        for (ns, p) in step.passes {
+            passes.push((ns, consolidate_pass(ruby, p)?))?;
+        }
+        let mut raised = d.raised;
+        let failed = ruby.ary_new_capa(step.failed.len());
+        for (ns, e) in step.failed {
+            // The block's own exception for its namespace, when that's why it failed.
+            let exc = match raised.iter().position(|(n, _)| *n == ns) {
+                Some(i) if matches!(e, mem::Error::Consolidate { .. }) => raised.swap_remove(i).1,
+                _ => err(ruby, e),
+            };
+            failed.push((ns, exc.value().unwrap_or_else(|| ruby.qnil().as_value())))?;
+        }
+        let stopped = ruby.ary_new_capa(step.stopped.len());
+        for (ns, p) in step.stopped {
+            stopped.push((ns, consolidate_pass(ruby, p)?))?;
+        }
+        let a = ruby.ary_new_capa(7);
+        a.push(step.events)?;
+        a.push(passes)?;
+        a.push(failed)?;
+        a.push(stopped)?;
+        a.push(step.interrupted)?;
+        a.push(step.next_due)?;
+        a.push(crate::convert::binary(ruby, step.token.as_bytes()))?;
+        Ok(a)
+    }
+
+    /// The µs time the next pass falls due, if any.
+    pub(crate) fn next_due(ruby: &Ruby, rb_self: &Self) -> Result<Option<u64>, Error> {
+        match &*lock(rb_self.0.get(ruby)?) {
+            LoopSlot::Idle(s) => Ok(s.lp.next_due()),
+            other => Err(spent(ruby, other.why())),
+        }
+    }
+
+    /// Closes the loop. A step running on another thread finishes, and the loop is then
+    /// dropped instead of kept.
+    pub(crate) fn close(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        let s = {
+            let mut g = lock(rb_self.0.get(ruby)?);
+            match std::mem::replace(&mut *g, LoopSlot::Closed) {
+                LoopSlot::Lost => {
+                    *g = LoopSlot::Lost;
+                    None
+                }
+                LoopSlot::Idle(s) => Some(s),
+                _ => None,
+            }
+        };
+        without_gvl(ruby, move || drop(s))
     }
 }

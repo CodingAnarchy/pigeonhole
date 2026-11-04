@@ -2608,7 +2608,8 @@ struct ArenaNeed {
     run_chunks: usize,
     /// Chunks its smallest entry larger than a chunk takes (0 without one).
     min_large: usize,
-    /// Chunks its allocations can take in all.
+    /// Chunks its allocations can take in all, for the run check (#141, #1403): 0 when no
+    /// entry spans chunks (`run_chunks` 1), the only case where it isn't read.
     alloc_chunks: usize,
 }
 
@@ -2972,9 +2973,12 @@ pub(crate) struct ShardState {
     pub(crate) id: ShardId,
     shared: Arc<Shared>,
     pub(crate) wal: Option<Box<dyn Wal>>,
-    /// The WAL stream reported itself blocked and will kick the shard when it is not (#19):
-    /// groups wait meanwhile.
-    wal_blocked: bool,
+    /// A wake is registered with the WAL stream for a hold-back (#19): it kicks the shard
+    /// when the stream's wait ends, and clears this first. A stream can be blocked for two
+    /// reasons (its header waits for a sync, or no spare is ready), and its wake covers the
+    /// one it found. So a shard still held back once the wake has run registers again,
+    /// and never waits on a wake already spent (#1403).
+    wal_wake_armed: Arc<AtomicBool>,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
     /// End of the newest PREPARE or COMMIT record given a ticket since open. Other shards' flushes
@@ -3505,7 +3509,7 @@ impl ShardState {
             id,
             shared,
             wal: None,
-            wal_blocked: false,
+            wal_wake_armed: Arc::new(AtomicBool::new(false)),
             poisoned: false,
             cross_end: Lsn::default(),
             cross_durable_at_close: false,
@@ -4173,8 +4177,17 @@ impl ShardState {
     ///
     /// An entry larger than a chunk needs contiguous free chunks, which free bytes scattered
     /// across the arena do not provide. So this also returns the largest and smallest such
-    /// entry's size in chunks, and how many chunks the batch's allocations can take in all
-    /// (each entry at most its own, each slot it creates one).
+    /// entry's size in chunks, and how many chunks the batch's allocations can take in all:
+    /// each large entry its own run, each slot it creates one, and the small entries (within
+    /// a chunk) at most one each, but also at most what their bytes can fill (#1403). Small
+    /// entries pack into a memtable's current run, and one takes a new chunk only when it
+    /// doesn't fit the rest, losing a tail shorter than itself. So in each memtable every
+    /// chunk small entries took but its last is filled by their bytes and tails, or was left
+    /// by a large entry starting a run of its own. That bounds their chunks by `⌊(their bytes
+    /// + their waste) / chunk⌋`, plus one per slot touched and one per large entry, plus one
+    /// for the arena's first chunk (its 64-byte prefix). Charging them one chunk each made a
+    /// batch of thousands of small entries (a long memory's postings) need more chunks than
+    /// the arena has, so it was refused room even on an empty arena.
     /// Also leaves in `rows` the hash of each row the batch writes (once per run of writes
     /// to one row), which `touch_rows` records if the member is admitted.
     ///
@@ -4186,7 +4199,10 @@ impl ShardState {
         let mut total = 0usize;
         let mut waste = 0usize;
         let mut largest = 0usize;
-        let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
+        // Entries spanning chunks: rare, so only they are counted here, and the small ones'
+        // count and bytes follow from the totals (the commit shapes pay no more per entry).
+        let (mut large_chunks, mut large_entries, mut large_bytes) = (0usize, 0usize, 0usize);
+        let mut min_large = usize::MAX;
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
@@ -4206,8 +4222,10 @@ impl ShardState {
             largest = largest.max(entry);
             // The arena's first chunk loses a 64-byte prefix.
             let chunks = (entry + 64).div_ceil(self.chunk_size);
-            alloc_chunks += chunks;
             if chunks > 1 {
+                large_chunks += chunks;
+                large_entries += 1;
+                large_bytes += entry;
                 min_large = min_large.min(chunks);
             }
             let tablet = match last {
@@ -4233,6 +4251,17 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
+        // Read only by the run check, which only an entry spanning chunks needs: a batch of
+        // small entries skips the arithmetic.
+        let alloc_chunks = if large_entries == 0 {
+            0
+        } else {
+            // The small entries' bytes and the most they can waste (a tail shorter than each).
+            let small_bytes = 2 * (total - large_bytes);
+            let small_chunks = (keys.len() - large_entries)
+                .min(small_bytes / self.chunk_size + touched.len() + unrouted + large_entries + 1);
+            large_chunks + small_chunks + new_slots
+        };
         ArenaNeed {
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
@@ -4241,7 +4270,7 @@ impl ShardState {
             } else {
                 min_large
             },
-            alloc_chunks: alloc_chunks + new_slots,
+            alloc_chunks,
         }
     }
 
@@ -4424,8 +4453,16 @@ impl ShardState {
             if let (Some(g), Some(mark)) = (group, mark) {
                 g.slots.truncate(mark);
             }
-            // Whether it could ever fit is judged on its own, as if first in its group.
-            return Err(if need.bytes + 2 * self.chunk_size > total {
+            // Whether it could ever fit is judged on its own, as if first in its group, and
+            // on both counts: its bytes, and its largest entry's run in an empty arena. One
+            // that only the run check refuses would otherwise wait for room that freeing
+            // everything wouldn't give, and fail `Busy` at every stall timeout (#1403).
+            let never_run = need.run_chunks > 1
+                && self
+                    .arena
+                    .blocks_left_when_empty(need.run_chunks, need.alloc_chunks - need.min_large)
+                    == 0;
+            return Err(if need.bytes + 2 * self.chunk_size > total || never_run {
                 Room::Never
             } else {
                 Room::Wait
@@ -6244,13 +6281,17 @@ impl ShardState {
             return false;
         };
         if !wal.blocked() {
-            self.wal_blocked = false;
             return false;
         }
-        if !self.wal_blocked {
-            self.wal_blocked = true;
+        // Not once per hold: the wake registered for a header's sync can run while no spare
+        // is ready yet, and the kick it sends finds the stream still blocked. Nothing would
+        // kick the shard again (#1403), so register a new wake whenever none is pending.
+        if !self.wal_wake_armed.swap(true, Ordering::AcqRel) {
             let submitter = ctx.submitter(self.id).clone();
+            let armed = Arc::clone(&self.wal_wake_armed);
             wal.notify_unblocked(Box::new(move || {
+                // Cleared before the kick, so the turn it starts can register again.
+                armed.store(false, Ordering::Release);
                 let _ = submitter.submit(ShardMsg::Kick);
             }));
             // Held back for want of a spare: prepare one now.
