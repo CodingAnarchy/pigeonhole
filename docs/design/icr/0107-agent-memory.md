@@ -258,7 +258,8 @@ The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–
   - **The fallback:** the search widens to at most `max(nprobe, count / 64)` lists (64 is a seek's cost in scored cells, perf287's rule after R1). A search cut there falls back to the exact scan for that namespace.
   - **`Recall::exact(bool)`** forces the exact scan, and **`Recall::nprobe(u32)`** sets the first probe per recall.
   - **`RecallStats::ivf_namespaces` and `ivf_fallbacks`** say which path ran.
-- **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
+- **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`.
+  - **Amended by #1427 (1.2.0):** `verify` compares the index's ids with the memories that have an embedding, both at `verify`'s snapshot (`pigeonhole_vector::Index::verify_at` and `ids_at`). The new `StoreStats::ivf_missing` and `ivf_stale` count each side, `ivf_mismatched` is their sum, and `is_consistent` counts it. The Python binding gains `StoreStats.ivf_mismatched`, and Ruby's `consistent?` counts it too. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
 - **`Error::Vector(pigeonhole_vector::Error)`**, with the index's database errors mapped to `Error::Db`.
 
 ## T9, part 1: memory events from the change feed (#1343)

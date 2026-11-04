@@ -58,6 +58,12 @@ fn a_seeded_model_holds_the_invariants_after_every_operation() {
                     }
                 }
                 check(&index, &model, &ctx);
+                // `ids_at` lists exactly the model's ids, in order, once each (#1427).
+                let mut ids = Vec::new();
+                index
+                    .ids_at(&db.snapshot().unwrap(), |id| ids.push(id.to_vec()))
+                    .unwrap_or_else(|e| panic!("{ctx}: ids_at: {e}"));
+                assert!(ids.iter().eq(model.keys()), "{ctx}: ids_at");
             }
             assert!(
                 index.verify().unwrap().list_lens.len() > 2,
@@ -502,4 +508,27 @@ fn half_indexes_store_exact_bits_and_take_f32() {
     assert_eq!((hit[0].id.as_slice(), hit[0].distance), (&b"one"[..], 0.0));
     drop((index, b));
     db.close().unwrap();
+}
+
+/// #1427 (perf287's V3 on #1492): `verify_at` and `ids_at` refuse a snapshot of another
+/// database, as any read at a foreign snapshot is refused.
+#[test]
+fn verify_at_and_ids_at_refuse_another_database_s_snapshot() {
+    let (d1, d2) = (
+        pigeonhole::doc_support::temp_dir(),
+        pigeonhole::doc_support::temp_dir(),
+    );
+    let (db, other) = (open(&d1), open(&d2));
+    let index = Index::create(&db, "idx", specs()[0], small()).expect("create");
+    let foreign = other.snapshot().unwrap();
+    assert!(
+        matches!(index.verify_at(&foreign), Err(Error::Db(_))),
+        "verify_at"
+    );
+    assert!(
+        matches!(index.ids_at(&foreign, |_| {}), Err(Error::Db(_))),
+        "ids_at"
+    );
+    let own = db.snapshot().unwrap();
+    assert_eq!(index.verify_at(&own).unwrap().vectors, 0);
 }
