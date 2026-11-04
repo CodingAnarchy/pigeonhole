@@ -2969,9 +2969,12 @@ pub(crate) struct ShardState {
     pub(crate) id: ShardId,
     shared: Arc<Shared>,
     pub(crate) wal: Option<Box<dyn Wal>>,
-    /// The WAL stream reported itself blocked and will kick the shard when it is not (#19):
-    /// groups wait meanwhile.
-    wal_blocked: bool,
+    /// A wake is registered with the WAL stream for a hold-back (#19): it kicks the shard
+    /// when the stream's wait ends, and clears this first. A stream can be blocked for two
+    /// reasons (its header waits for a sync, or no spare is ready), and its wake covers the
+    /// one it found. So a shard still held back once the wake has run registers again,
+    /// and never waits on a wake already spent (#1403).
+    wal_wake_armed: Arc<AtomicBool>,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
     /// End of the newest PREPARE or COMMIT record given a ticket since open. Other shards' flushes
@@ -3502,7 +3505,7 @@ impl ShardState {
             id,
             shared,
             wal: None,
-            wal_blocked: false,
+            wal_wake_armed: Arc::new(AtomicBool::new(false)),
             poisoned: false,
             cross_end: Lsn::default(),
             cross_durable_at_close: false,
@@ -6274,13 +6277,17 @@ impl ShardState {
             return false;
         };
         if !wal.blocked() {
-            self.wal_blocked = false;
             return false;
         }
-        if !self.wal_blocked {
-            self.wal_blocked = true;
+        // Not once per hold: the wake registered for a header's sync can run while no spare
+        // is ready yet, and the kick it sends finds the stream still blocked. Nothing would
+        // kick the shard again (#1403), so register a new wake whenever none is pending.
+        if !self.wal_wake_armed.swap(true, Ordering::AcqRel) {
             let submitter = ctx.submitter(self.id).clone();
+            let armed = Arc::clone(&self.wal_wake_armed);
             wal.notify_unblocked(Box::new(move || {
+                // Cleared before the kick, so the turn it starts can register again.
+                armed.store(false, Ordering::Release);
                 let _ = submitter.submit(ShardMsg::Kick);
             }));
             // Held back for want of a spare: prepare one now.

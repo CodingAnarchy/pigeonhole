@@ -38,7 +38,7 @@ pub use consolidate::{
 };
 pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
-pub use feed_loop::{ConsolidateLoop, LoopStep};
+pub use feed_loop::{ConsolidateLoop, LoopInterrupter, LoopStep};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use ivf::IvfOptions;
 pub use layout::{MemoryId, normalize};
