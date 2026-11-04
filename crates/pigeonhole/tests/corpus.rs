@@ -295,6 +295,15 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
         },
+        Entry {
+            name: "returning",
+            shards: 1,
+            options: same,
+            write: write_returning,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: None,
+        },
     ]
 }
 
@@ -1054,6 +1063,35 @@ fn feed_extra(db: &Pigeonhole) -> String {
         }
     }
     out
+}
+
+/// D314: `commit_returning` increments on a hot counter whose base is an older SST's `Put`.
+/// The first returning commit reads through to that base and leaves a D291 checkpoint at its
+/// own seqno; later ones checkpoint every eight folded operands. Flushed, so the SSTs hold
+/// write-time checkpoints from both paths just below their commits' operands (perf2 on
+/// #1466). Each returned value is the count so far.
+fn write_returning(db: &Pigeonhole) {
+    let t = db
+        .table("returning")
+        .unwrap()
+        .family("c", Family::counter())
+        .create()
+        .unwrap();
+    t.mutate(b"hot").put_i64("c", b"n", 100).commit().unwrap();
+    db.flush().unwrap();
+    for want in 101..=120i64 {
+        let r = t
+            .mutate(b"hot")
+            .incr("c", b"n", 1)
+            .commit_returning()
+            .unwrap();
+        assert_eq!(r.value("c", b"n").unwrap(), Some(want));
+    }
+    db.flush().unwrap();
+    assert_eq!(
+        t.get(b"hot", "c", b"n").unwrap().and_then(|c| c.as_i64()),
+        Some(120)
+    );
 }
 
 /// The database's files in the simulator's `/db`, by name: the main file, its WAL files and
