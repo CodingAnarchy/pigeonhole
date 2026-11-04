@@ -663,3 +663,76 @@ fn oldest_after_reopens_starts_at_the_oldest_session_kept() {
     drop(r);
     db.close().unwrap();
 }
+
+/// The sidecar's entries, as a writer left them.
+fn sidecar_entries(vfs: &Arc<SimVfs>) -> Vec<pigeonhole_format::feed::FeedEntry> {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader, decode_entries};
+    let path = format!("{DB}{FEED_SUFFIX}");
+    use pigeonhole_io::Vfs;
+    let file = vfs
+        .open(Path::new(&path), pigeonhole_io::OpenOptions::read())
+        .unwrap();
+    let mut bytes = vec![0u8; file.len().unwrap() as usize];
+    file.read_at(&mut bytes, 0).unwrap();
+    decode_entries(&bytes[FeedHeader::LEN..]).0
+}
+
+/// D315 PR 2: a catalog change with the change feed on appends a `Catalog` sidecar entry,
+/// its edits in order and its `seqno_ceiling` at most the first commit to the new table,
+/// just before its root commit's Root entry; and its hold on the frontier is released, so
+/// a feed of every table delivers that commit. A drop records its `DropTable` the same way.
+#[test]
+fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
+    use pigeonhole_format::feed::FeedEntry;
+    use pigeonhole_format::manifest::Edit;
+    let vfs = SimVfs::new(3151);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut all = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = single(&db, &c, b"c1", Durability::GroupSync);
+    assert_eq!(next(&mut all).seqno, s, "the hold was released");
+
+    let entries = sidecar_entries(&vfs);
+    let at = entries
+        .iter()
+        .rposition(|e| matches!(e, FeedEntry::Catalog { edits, .. } if edits.iter().any(|e| matches!(e, Edit::CreateTable { name, .. } if name == "c"))))
+        .expect("the create's Catalog entry");
+    let FeedEntry::Catalog {
+        session,
+        sequence,
+        seqno_ceiling,
+        edits,
+    } = &entries[at]
+    else {
+        unreachable!()
+    };
+    assert!(
+        *seqno_ceiling <= s,
+        "ceiling {seqno_ceiling} after the table's first commit {s}"
+    );
+    assert!(
+        matches!(edits[..], [Edit::CreateTable { table, .. }, Edit::PutFamily { table: f, .. }] if table == c.id && f == c.id),
+        "{edits:?}"
+    );
+    assert!(
+        matches!(&entries[at + 1], FeedEntry::Root { session: r, sequence: q } if r == session && q == sequence),
+        "the Root entry right after it: {:?}",
+        entries.get(at + 1)
+    );
+
+    db.drop_table(a.id).unwrap();
+    let entries = sidecar_entries(&vfs);
+    let drop_at = entries
+        .iter()
+        .rposition(|e| matches!(e, FeedEntry::Catalog { edits, .. } if edits.iter().any(|e| matches!(e, Edit::DropTable { table } if *table == a.id))))
+        .expect("the drop's Catalog entry");
+    assert!(matches!(entries[drop_at + 1], FeedEntry::Root { .. }));
+    // The frontier still moves past the drop.
+    let later = single(&db, &c, b"c2", Durability::GroupSync);
+    assert_eq!(next(&mut all).seqno, later);
+    drop(all);
+    db.close().unwrap();
+}
