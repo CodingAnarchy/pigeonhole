@@ -478,15 +478,19 @@ fn guide_table() -> String {
     out
 }
 
+/// A file of the repository's docs, with `\n` line endings: a Windows checkout may give
+/// it `\r\n` (`core.autocrlf`).
+fn doc_file(path: &str) -> String {
+    std::fs::read_to_string(format!("{}/../../docs/{path}", env!("CARGO_MANIFEST_DIR")))
+        .unwrap()
+        .replace("\r\n", "\n")
+}
+
 /// The guide's table is generated from `metrics()`, so the guide, the code and this test
 /// can't drift apart: on a mismatch, this prints the table to paste between the markers.
 #[test]
 fn the_guide_lists_every_metric_as_the_code_does() {
-    let guide = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/guide/observability.md"
-    ))
-    .unwrap();
+    let guide = doc_file("guide/observability.md");
     let (begin, end) = ("<!-- metrics:begin -->\n", "<!-- metrics:end -->");
     let want = guide_table();
     let got = guide
@@ -537,9 +541,8 @@ fn known_names_only(what: &str, text: &str) -> usize {
 /// is exported as.
 #[test]
 fn the_dashboard_and_the_alerts_query_only_documented_metrics() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
-    let dashboard = std::fs::read_to_string(format!("{root}/grafana/pigeonhole.json")).unwrap();
+    let dashboard = doc_file("grafana/pigeonhole.json");
     assert!(known_names_only("the dashboard", &dashboard) >= 10);
-    let guide = std::fs::read_to_string(format!("{root}/guide/observability.md")).unwrap();
+    let guide = doc_file("guide/observability.md");
     assert!(known_names_only("the guide", &guide) >= 10);
 }
