@@ -558,7 +558,12 @@ fn tls_files_that_dont_load_are_a_clear_error() {
     )
     .err()
     .unwrap();
-    assert!(e.contains("/nonexistent/cert.pem"), "{e}");
+    // The message isn't printed on failure: CodeQL reads a string from loading a
+    // certificate as sensitive (rust/cleartext-logging), though it holds only the path.
+    assert!(
+        e.contains("/nonexistent/cert.pem"),
+        "the error names the file"
+    );
 }
 
 /// Opens a raw connection and sends `head` (an HTTP/1.1 request's lines and headers).
