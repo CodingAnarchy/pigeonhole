@@ -47,7 +47,7 @@ use crate::catalog::Catalog;
 use crate::flush::SstSink;
 use crate::manifest::{self, ManifestReq, ManifestWriter, ReqKind, Rewrite};
 use crate::shard::Shared;
-use crate::snapshot::{ShardMems, Snapshot, SstSet, View, ViewPin};
+use crate::snapshot::{Snapshot, SstSet};
 use crate::source::{Source, mem_sources};
 use crate::{Error, Result};
 
@@ -196,21 +196,7 @@ fn copy_into(
     // Release the memtables: keep only an SST view of the snapshot, pinned (its manifest
     // version registered) so no extent it names is reclaimed while phase 2 reads it.
     let full = view;
-    let ssts_only = Arc::new(View {
-        version: full.version,
-        manifest_version: full.manifest_version,
-        tablets: Arc::clone(&full.tablets),
-        catalog: Arc::clone(&full.catalog),
-        mems: (0..full.mems.len())
-            .map(|_| Arc::new(ShardMems::default()))
-            .collect(),
-        ssts: Arc::clone(&full.ssts),
-        // The writer's protection for the extents below. In a reader process this
-        // registers in its own `live_views`, which nothing there reclaims against:
-        // harmless, and not the reader's protection (that is `reader_pin` above).
-        _pin: Some(ViewPin::new(&shared.live_views, full.manifest_version)),
-        released: false,
-    });
+    let ssts_only = full.ssts_only(&shared.live_views);
     drop(full);
     drop(snapshot);
     #[cfg(feature = "test-hooks")]
