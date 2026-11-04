@@ -1477,8 +1477,15 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                 last_seq = Some(*sequence);
             }
             FeedEntry::Unfed { .. } => broken = true,
+            // A catalog change (D315) is appended just before its root commit's Root entry,
+            // which carries the chain: one of another session breaks it.
+            FeedEntry::Catalog { session, .. } => {
+                if sessions.last().is_none_or(|s| s.0 != *session) {
+                    broken = true;
+                }
+            }
             // A newer build's entry may mean a break: fail closed (simp724's nit on #1316).
-            FeedEntry::Unknown(_) => broken = true,
+            FeedEntry::Unknown(_) | _ => broken = true,
         }
     }
     let Some(pos) = sessions.iter().rposition(|s| s.0 == current) else {

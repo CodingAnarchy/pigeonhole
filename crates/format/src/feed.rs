@@ -44,6 +44,7 @@
 //! ```
 
 use crate::bytes::{Reader, le_u32};
+use crate::manifest::Edit;
 use crate::{Error, TableId};
 
 /// The sidecar's magic.
@@ -125,6 +126,7 @@ impl FeedTables {
 
 /// One sidecar entry. Numbers (the type byte) are frozen.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FeedEntry {
     /// Type 1: a feeding session's open, written and synced before the session writes any
     /// WAL segment (each of which carries `session` in its header, FORMAT §10.2).
@@ -157,8 +159,25 @@ pub enum FeedEntry {
         /// The superblock's `sequence` when the open read it.
         sequence: u64,
     },
+    /// Type 4 (D315): a feeding session's root commit that changed the catalog, appended
+    /// just before that commit's [`FeedEntry::Root`], in the same append. A feed of every
+    /// table delivers `edits` after every commit below `seqno_ceiling` and before any at or
+    /// above it.
+    Catalog {
+        /// The session that committed.
+        session: u64,
+        /// The root's sequence, as its Root entry records it.
+        sequence: u64,
+        /// The manifest commit's `seqno_ceiling`: every seqno assigned before it is below.
+        seqno_ceiling: u64,
+        /// The commit's catalog edits, in the order they applied: `CreateTable`,
+        /// `PutFamily` and `DropTable`, in the manifest's own encoding (FORMAT §9.3).
+        edits: Vec<Edit>,
+    },
     /// An entry type this build does not know, written by a newer one (its checksum
-    /// passed). A reader treats it as the end of the history before it.
+    /// passed). A reader treats it as the end of the history before it. So is a `Catalog`
+    /// entry with an edit this build can't decode: never a torn entry, which a writer would
+    /// cut off.
     Unknown(u8),
 }
 
@@ -203,6 +222,21 @@ impl FeedEntry {
             FeedEntry::Unfed { sequence } => {
                 p.push(3);
                 p.extend_from_slice(&sequence.to_le_bytes());
+            }
+            FeedEntry::Catalog {
+                session,
+                sequence,
+                seqno_ceiling,
+                edits,
+            } => {
+                p.push(4);
+                p.extend_from_slice(&session.to_le_bytes());
+                p.extend_from_slice(&sequence.to_le_bytes());
+                p.extend_from_slice(&seqno_ceiling.to_le_bytes());
+                p.extend_from_slice(&(edits.len() as u32).to_le_bytes());
+                for e in edits {
+                    e.encode(&mut p);
+                }
             }
             FeedEntry::Unknown(t) => p.push(*t),
         }
@@ -252,6 +286,30 @@ impl FeedEntry {
                 sequence: r.u64()?,
             },
             3 => FeedEntry::Unfed { sequence: r.u64()? },
+            4 => {
+                let (session, sequence, seqno_ceiling) = (r.u64()?, r.u64()?, r.u64()?);
+                let n = r.u32()? as usize;
+                let mut rest = r.rest();
+                let mut edits = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    // An edit this build doesn't know (a newer one's): the entry is
+                    // unknown, ending the history, not torn (a writer would cut it off).
+                    let Ok((edit, used)) = Edit::decode(rest) else {
+                        return Ok(FeedEntry::Unknown(4));
+                    };
+                    edits.push(edit);
+                    rest = &rest[used..];
+                }
+                if !rest.is_empty() {
+                    return Err(Error::Corrupt { what: WHAT });
+                }
+                return Ok(FeedEntry::Catalog {
+                    session,
+                    sequence,
+                    seqno_ceiling,
+                    edits,
+                });
+            }
             t => return Ok(FeedEntry::Unknown(t)),
         };
         if r.remaining() != 0 {

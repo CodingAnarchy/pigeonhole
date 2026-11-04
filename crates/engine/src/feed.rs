@@ -186,7 +186,8 @@ pub(crate) fn last_session(
 pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
     for e in entries.iter().rev() {
         match e {
-            FeedEntry::Root { .. } => continue,
+            // A catalog change's entry (D315) is its session's, as its Root entry is.
+            FeedEntry::Root { .. } | FeedEntry::Catalog { .. } => continue,
             FeedEntry::Session {
                 retention_bytes,
                 retention_age_secs,
@@ -201,7 +202,8 @@ pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
                     tables: tables.clone(),
                 });
             }
-            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) => return None,
+            // An entry this build doesn't know may change what the session was: fail closed.
+            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) | _ => return None,
         }
     }
     None

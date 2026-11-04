@@ -153,7 +153,10 @@ impl Inner {
     /// before `pending` lets a seqno go.
     fn written_seqno(&self, durable: bool) -> Seqno {
         let (next, held) = self.next_and_held();
-        let mut lowest = next.min(held);
+        // After `NEXT_SEQNO`: a catalog change stores its hold under the allocator's lock,
+        // before the mirror passes its ceiling (D315), as a decision does `CROSS_HELD`.
+        let catalog = self.h64(header::CATALOG_HOLD).load(Ordering::Acquire);
+        let mut lowest = next.min(held).min(catalog);
         for shard in 0..self.header.shard_count {
             lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
             if durable {
@@ -360,6 +363,7 @@ fn init_region(
     page[header::NEXT_SEQNO..header::NEXT_SEQNO + 8]
         .copy_from_slice(&first_seqno.max(1).to_le_bytes());
     page[header::CROSS_HELD..header::CROSS_HELD + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    page[header::CATALOG_HOLD..header::CATALOG_HOLD + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     region.write(0, &page);
     for shard in 0..h.shard_count {
         let off = h.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
@@ -906,6 +910,16 @@ impl ShmRegion {
     /// [`publish_pending`](Self::publish_pending) releases the seqno (FORMAT §11.2).
     pub fn publish_written(&self, shard: u32, written: Seqno) {
         self.inner.written(shard).store(written, Ordering::Release);
+    }
+
+    /// Publishes the catalog hold with release ordering (layout version 9, D315): the
+    /// ceiling of a catalog change whose `Catalog` sidecar entry isn't appended yet, or
+    /// `u64::MAX` once it is (or the change failed). The writer stores it under the seqno
+    /// allocator's lock, before the `NEXT_SEQNO` mirror can pass the ceiling.
+    pub fn publish_catalog_hold(&self, ceiling: Seqno) {
+        self.inner
+            .h64(header::CATALOG_HOLD)
+            .store(ceiling, Ordering::Release);
     }
 
     /// Publishes `shard`'s synced watermark with release ordering (layout version 7, D310):
@@ -1513,13 +1527,13 @@ mod tests {
         assert!(e.to_string().contains("10 bytes"));
         let e = Error::from(pigeonhole_format::Error::UnsupportedVersion {
             what: "shm header",
-            found: 9,
+            found: 10,
         });
         assert!(matches!(
             e,
             Error::VersionMismatch {
-                found: 9,
-                expected: 8
+                found: 10,
+                expected: 9
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });
