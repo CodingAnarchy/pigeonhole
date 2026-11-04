@@ -1102,6 +1102,12 @@ const FEED_SPAN: (&str, &[u8]) = ("feed_tokens", b"span");
 /// One session of `feed_sessions`: commits to `events` and `other` over WAL segments, then a
 /// clean close. The first session makes the tables and records the first commit's seqno; each
 /// session records the last. Written twice, so the files keep two closed sessions of history.
+///
+/// Both sessions must fit the feed's retention, or the oldest history is rightly gone: 4 MiB
+/// over 2 streams is 8 segments of 256 KiB per stream, and the two sessions use about 4–5
+/// (each open starts a fresh segment). A later change to the WAL's framing or to retention
+/// that tips this over shows up as this entry failing: check the sizing before suspecting
+/// the feed (feed1248 on #1476).
 fn write_feed_session(db: &Pigeonhole) {
     let fresh = !db.tables().iter().any(|t| t == "events");
     if fresh {
