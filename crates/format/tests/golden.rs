@@ -651,6 +651,73 @@ fn feed_sidecar() {
     assert_eq!(FeedHeader::LEN + end, bytes.len());
 }
 
+/// D315: the sidecar's `Catalog` entry (type 4), beside its Root entry, in a sibling of the
+/// frozen `feed_sidecar.bin`. An edit this build can't decode makes the entry `Unknown(4)`,
+/// which ends the history; it is never read as torn, which a writer would cut off.
+#[test]
+fn feed_sidecar_catalog() {
+    use pigeonhole_format::FamilyId;
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, decode_entries};
+    use pigeonhole_format::manifest::{Edit, FamilyOptions};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Catalog {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 42,
+            seqno_ceiling: 1000,
+            timestamp: 1_767_225_600_000_000,
+            edits: vec![
+                Edit::CreateTable {
+                    table: TableId(7),
+                    name: "events".into(),
+                },
+                Edit::PutFamily {
+                    table: TableId(7),
+                    family: FamilyId(11),
+                    name: "e".into(),
+                    options: FamilyOptions::default(),
+                },
+                Edit::DropTable { table: TableId(3) },
+            ],
+        },
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 42,
+        },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar_catalog.bin", &file);
+    let bytes = golden("feed_sidecar_catalog.bin");
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+
+    // A newer build's edit (an unknown tag, length-prefixed as every edit is) inside a
+    // Catalog entry: the entry is unknown, and the Root entry after it still decodes.
+    let mut payload = vec![4u8];
+    for v in [1u64, 43, 2000, 1_767_225_600_000_001] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.push(250);
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(b"new");
+    let mut log = Vec::new();
+    log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+    log.extend_from_slice(&payload);
+    entries[1].encode(&mut log);
+    let (decoded, end) = decode_entries(&log);
+    assert_eq!(decoded, [FeedEntry::Unknown(4), entries[1].clone()]);
+    assert_eq!(end, log.len(), "nothing cut off");
+}
+
 #[test]
 fn wal() {
     let header = SegmentHeader {

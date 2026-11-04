@@ -72,6 +72,20 @@ impl Reservation {
         self.lock().next
     }
 
+    /// A catalog change's ceiling (D315): the next seqno to reserve, `C`, read and held from
+    /// the change feed (shm `CATALOG_HOLD = C`, Release) under the lock, as a group's hold is
+    /// (D300). No seqno at or above `C` is reserved before the hold is stored, and the mirror
+    /// passes `C` only after, so a feed's frontier never reaches a commit at or above the
+    /// ceiling before the change's sidecar entry is appended; and `C`, the allocator's next,
+    /// is above every visible seqno, so the store never lowers a frontier already read.
+    /// Released (`u64::MAX`) once the entry is appended or the change failed.
+    pub(crate) fn hold_catalog(&self, shm: &ShmRegion) -> Seqno {
+        let st = self.lock();
+        let ceiling = st.next;
+        shm.publish_catalog_hold(ceiling);
+        ceiling
+    }
+
     /// The largest default timestamp handed out (the manifest's `ts_floor`).
     pub(crate) fn last_ts(&self) -> Timestamp {
         self.lock().h
