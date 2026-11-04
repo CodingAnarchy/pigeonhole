@@ -36,7 +36,7 @@ The check copies each entry to a temporary directory, opens it with the real fil
 
 ## Release corpus
 
-`v1.0.0/` holds the files written by the 1.0.0 release build ([FORMAT.md §13](../../../../FORMAT.md#13-compatibility-promise): "a corpus of files written by the 1.0 release that every later build opens in CI"). `v1.1.0/` will hold the 1.1.0 release build's, the first release to write the structures from `aggregates` on (owner, 2026-11-04). Until its release, a release corpus holds only its README.
+`v1.0.0/` holds the files written by the 1.0.0 release build ([FORMAT.md §13](../../../../FORMAT.md#13-compatibility-promise): "a corpus of files written by the 1.0 release that every later build opens in CI"). `v1.1.0/` holds the 1.1.0 release build's, the first release to write the structures from `aggregates` on (owner, 2026-11-04).
 - **Writing it:** at the release, `scripts/release-corpus.sh <version>` runs `generate_corpus` from the release build with `PIGEONHOLE_CORPUS_RELEASE=<version>`. That writes every entry `tests/corpus.rs` has then, plus `frozen.txt` with each file's length and xxh3-64. The generator refuses a version other than the build's own, and refuses to rewrite a corpus that has a `frozen.txt`.
 - **The check:** `release_corpus_entries_open_read_check_and_write` checks every release corpus. Its files must match `frozen.txt` byte for byte, and each entry must pass the same open, read, write and check as `format4/`, with its `expected-extra.txt` where it has one. Entries are never removed from `tests/corpus.rs`, so every release corpus's entries are the current build's. A build that fails it breaks the promise: fix the build, never the corpus.
 
