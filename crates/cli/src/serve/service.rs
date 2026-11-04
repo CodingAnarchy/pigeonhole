@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use pigeonhole::{KeySet, KeysPosition, Pigeonhole, RowPosition, ScanPosition, Table};
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::auth::{Caller, Scope};
 use super::config::Limits;
@@ -58,16 +58,50 @@ pub(crate) enum ServiceReply {
     Scan(ScanPages),
 }
 
-/// A scan's pages as the scan task reads them, ending with its error if it fails. The task
-/// reads a page ahead at most, so a slow client holds back the reading, not the memory.
+/// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
+/// #1510). The scan task keeps a handle on it, so a client that stops reading loses the page
+/// and the budget comes back (G2): the page is taken out of the slot by whichever comes first,
+/// the client or the task's idle timeout.
+type PageSlot = Arc<std::sync::Mutex<Option<(proto::ScanPage, OwnedSemaphorePermit)>>>;
+
+/// A scan's pages as the scan task reads them, then its error if it failed. The task reads a
+/// page ahead at most, so a slow client holds back the reading, not the memory. A page's
+/// budget is released when the page is handed to the transport (this stream yields it).
 #[derive(Debug)]
-pub(crate) struct ScanPages(mpsc::Receiver<Result<proto::ScanPage, ApiError>>);
+pub(crate) struct ScanPages {
+    pages: mpsc::Receiver<PageSlot>,
+    /// The error the stream ends with, sent before `pages` closes.
+    end: Option<oneshot::Receiver<ApiError>>,
+}
 
 impl futures_core::Stream for ScanPages {
     type Item = Result<proto::ScanPage, ApiError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        loop {
+            match self.pages.poll_recv(cx) {
+                Poll::Ready(Some(slot)) => {
+                    let taken = slot.lock().ok().and_then(|mut s| s.take());
+                    if let Some((page, budget)) = taken {
+                        drop(budget);
+                        return Poll::Ready(Some(Ok(page)));
+                    }
+                    // The task took it back (idle timeout): its error follows.
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let Some(end) = self.end.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let out = match Pin::new(end).poll(cx) {
+            Poll::Ready(Ok(e)) => Some(Err(e)),
+            Poll::Ready(Err(_)) => None,
+            Poll::Pending => return Poll::Pending,
+        };
+        self.end = None;
+        Poll::Ready(out)
     }
 }
 
@@ -320,6 +354,9 @@ pub(crate) struct Service {
     blocking: Arc<Semaphore>,
     /// Scans streaming at once (`--max-scans`).
     scans: Arc<Semaphore>,
+    /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
+    /// every blocking thread from the other calls (perf287's G3 on #1510).
+    scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
 }
@@ -347,6 +384,7 @@ impl Service {
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
+            scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
         }
@@ -401,7 +439,7 @@ impl Service {
             None => self.budget(size).await?,
         };
         match op {
-            // A read that fails on `Io` or `MergeFailed` changed nothing, so it may be sent
+            // A read that fails on `Io` changed nothing, so it may be sent
             // again (`retry_from` REQUEST, ICR 0112).
             ServiceOp::Get(r) => {
                 let reply = self.get(r).await.map(ServiceReply::Get);
@@ -615,9 +653,10 @@ impl Service {
 
     /// A scan as a stream of pages (ICR 0112): each page is one `read_within` on the
     /// blocking pool (D196: scan pages are sync-only), resumed from the last, until the range
-    /// or `limit` runs out. The request is checked before the stream starts, so a bad one
-    /// fails the call; a failure later ends the stream with the error. The scan holds a
-    /// `--max-scans` slot until its stream ends: a stream outlives its request's
+    /// or `limit` runs out. Each page is a new read, at its own snapshot (simp724's D1 on
+    /// #1510). The request is checked before the stream starts, so a bad one fails the call;
+    /// a failure later ends the stream with the error, a panic in the task as `Internal`. The
+    /// scan holds a `--max-scans` slot until its stream ends: a stream outlives its request's
     /// `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read holds
     /// no blocking thread.
     async fn scan(
@@ -640,13 +679,26 @@ impl Service {
         // The request's bytes are decoded and checked: the stream holds pages, not them.
         drop(budget);
         let (tx, rx) = mpsc::channel(1);
-        let pool = Arc::clone(&self.blocking);
+        let (end_tx, end_rx) = oneshot::channel();
+        let task = ScanTask {
+            table,
+            r,
+            after,
+            pool: Arc::clone(&self.blocking),
+            reads: Arc::clone(&self.scan_reads),
+            inflight: Arc::clone(&self.inflight),
+            limits: self.limits,
+            pages: tx,
+        };
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         tokio::spawn(async move {
-            let outcome = scan_pages(&pool, table, r, after, &tx)
-                .await
-                .map_err(ApiError::for_read);
+            // Its own task, so a panic is a `JoinError` here, and the stream ends with
+            // `Internal` rather than looking like a clean end (simp724's B1 on #1510).
+            let outcome = match tokio::spawn(task.run()).await {
+                Ok(outcome) => outcome.map_err(ApiError::for_read),
+                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
+            };
             metrics.count(
                 SCAN,
                 outcome.as_ref().err().map(|e| e.code.as_str()),
@@ -654,10 +706,13 @@ impl Service {
             );
             drop(slot);
             if let Err(e) = outcome {
-                let _ = tx.send(Err(e)).await;
+                let _ = end_tx.send(e);
             }
         });
-        Ok(ScanPages(rx))
+        Ok(ScanPages {
+            pages: rx,
+            end: Some(end_rx),
+        })
     }
 
     async fn mutate(
@@ -819,92 +874,166 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
-/// Reads `r`'s pages into `tx` until the scan ends or the client goes away.
-///
-/// The row `limit` spans pages. A page cut inside a row resumes in that row, and the
-/// engine's `limit` counts the continued row again, so a read after a row asks for one more
-/// row than remain. A page that comes back with too many is cut here: it is the scan's last
-/// page, so no position is needed past the cut. A page with exactly the rows that remain
-/// ends the scan unless its budget stopped it (`cut_by_budget`), which may have cut its last
-/// row; the next read finishes that row.
-async fn scan_pages(
-    pool: &Arc<Semaphore>,
+/// A scan's reading side, run as its own task.
+struct ScanTask {
     table: Table,
     r: proto::ScanRequest,
-    mut after: Option<ScanPosition>,
-    tx: &mpsc::Sender<Result<proto::ScanPage, ApiError>>,
-) -> Result<(), ApiError> {
-    let r = Arc::new(r);
-    let budget = page_bytes(r.page_bytes);
-    let mut remaining = (r.limit > 0).then_some(r.limit);
-    // The row the last page ended in (or the client's position is in): a page that starts
-    // with it continues that row.
-    let mut last_row: Option<Vec<u8>> = after.as_ref().map(|p| p.row().to_vec());
-    loop {
-        let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
-        let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
-        let (mut rows, mut next, mut bytes, cut) = blocking(pool, move || {
-            let select = convert::Select::new(req.selection.as_ref())?;
-            let mut scan = select.scan(&table, req.range.as_ref())?;
-            if let Some(n) = limit {
-                scan = scan.limit(n);
+    after: Option<ScanPosition>,
+    pool: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
+    inflight: Arc<Semaphore>,
+    limits: Limits,
+    pages: mpsc::Sender<PageSlot>,
+}
+
+impl ScanTask {
+    /// Reads the pages into `pages` until the scan ends or the client goes away.
+    ///
+    /// The row `limit` spans pages. A page cut inside a row resumes in that row, and the
+    /// engine's `limit` counts the continued row again, so a read after a row asks for one
+    /// more row than remain. A page that comes back with too many is cut here: it is the
+    /// scan's last page, so no position is needed past the cut. That includes a page whose
+    /// continued row was deleted between pages, so all its rows are new (simp724's B1 on
+    /// #1510). A page with exactly the rows that remain ends the scan unless its budget
+    /// stopped it (`cut_by_budget`), which may have cut its last row; the next read finishes
+    /// that row.
+    ///
+    /// Each page waits, in turn: for the client to take the page before it (at most
+    /// `--stream-idle-ms`, perf287's G2), for one of the scans' blocking threads (G3), and for
+    /// its share of the in-flight budget (G1, at most the request timeout).
+    async fn run(self) -> Result<(), ApiError> {
+        let Self {
+            table,
+            r,
+            mut after,
+            pool,
+            reads,
+            inflight,
+            limits,
+            pages,
+        } = self;
+        let r = Arc::new(r);
+        let budget = page_bytes(r.page_bytes);
+        let mut remaining = (r.limit > 0).then_some(r.limit);
+        // The row the last page ended in (or the client's position is in): a page that
+        // starts with it continues that row.
+        let mut last_row: Option<Vec<u8>> = after.as_ref().map(|p| p.row().to_vec());
+        // The page the client hasn't taken yet, for the idle timeout to take back.
+        let mut queued: Option<PageSlot> = None;
+        loop {
+            let Some(space) = room(&pages, &mut queued, limits.stream_idle).await? else {
+                return Ok(());
+            };
+            let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
+            let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
+            let thread = Arc::clone(&reads)
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal("the scan threads closed"))?;
+            let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
+                let select = convert::Select::new(req.selection.as_ref())?;
+                let mut scan = select.scan(&table, req.range.as_ref())?;
+                if let Some(n) = limit {
+                    scan = scan.limit(n);
+                }
+                if let Some(p) = &pos {
+                    scan = scan.resume_after(p);
+                }
+                let page = scan.read_within(budget)?;
+                let q = select.aggregate();
+                let rows: Vec<proto::Row> = page
+                    .rows()
+                    .iter()
+                    .map(|row| convert::row(row.view(), q))
+                    .collect();
+                Ok((
+                    rows,
+                    page.resume().cloned(),
+                    page.bytes(),
+                    page.cut_by_budget(),
+                ))
+            })
+            .await?;
+            drop(thread);
+            let continued = matches!(
+                (&last_row, rows.first()),
+                (Some(p), Some(first)) if first.key[..] == p[..]
+            );
+            if let Some(n) = remaining {
+                let new_rows = rows.len() as u64 - u64::from(continued);
+                if new_rows > n {
+                    // More rows than remain: the ones past the limit go, and every row kept
+                    // is whole, since another row followed it.
+                    rows.truncate(
+                        usize::try_from(n).unwrap_or(usize::MAX) + usize::from(continued),
+                    );
+                    bytes = rows.iter().map(row_bytes).sum();
+                    next = None;
+                } else if new_rows == n && !cut {
+                    // The limit (or the range's end) stopped the page, after a whole row.
+                    next = None;
+                }
+                // Otherwise the budget stopped the page, perhaps inside its last row: the
+                // next read (limit 1, for the continued row) finishes it.
+                remaining = Some(n.saturating_sub(new_rows));
             }
-            if let Some(p) = &pos {
-                scan = scan.resume_after(p);
+            if let Some(last) = rows.last() {
+                last_row = Some(last.key.to_vec());
             }
-            let page = scan.read_within(budget)?;
-            let q = select.aggregate();
-            let rows: Vec<proto::Row> = page
-                .rows()
-                .iter()
-                .map(|row| convert::row(row.view(), q))
-                .collect();
-            Ok((
+            // An empty page with a position (a budget too small for anything) ends the
+            // stream too, with the position, rather than reading the same nothing again: only
+            // an empty `next` says the scan finished (simp724's D2 on #1510).
+            let end = next.is_none() || rows.is_empty();
+            let page = proto::ScanPage {
                 rows,
-                page.resume().cloned(),
-                page.bytes(),
-                page.cut_by_budget(),
-            ))
-        })
-        .await?;
-        let continued = matches!(
-            (&last_row, rows.first()),
-            (Some(p), Some(first)) if first.key[..] == p[..]
-        );
-        if let Some(n) = remaining {
-            let new_rows = rows.len() as u64 - u64::from(continued);
-            if new_rows > n {
-                // More rows than remain: the ones past the limit go, and every row kept is
-                // whole, since another row followed it.
-                rows.truncate(usize::try_from(n).unwrap_or(usize::MAX) + usize::from(continued));
-                bytes = rows.iter().map(row_bytes).sum();
-                next = None;
-            } else if new_rows == n && !cut {
-                // The limit (or the range's end) stopped the page, after a whole row.
-                next = None;
+                next: next
+                    .as_ref()
+                    .map(|p| p.to_bytes().into())
+                    .unwrap_or_default(),
+                bytes,
+            };
+            // The page's share of the budget, capped so one scan can't take it all: a page
+            // over `--max-request-bytes` (one huge cell) takes the cap.
+            let share = usize::try_from(page.bytes)
+                .unwrap_or(usize::MAX)
+                .min(limits.max_request_bytes);
+            let paid = budget_within(&inflight, share, limits.request_timeout).await?;
+            let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
+            space.send(Arc::clone(&slot));
+            queued = Some(slot);
+            if end {
+                // The stream ends once the client has the last page, or the idle timeout
+                // takes it back: an unread page doesn't keep its budget.
+                room(&pages, &mut queued, limits.stream_idle).await?;
+                return Ok(());
             }
-            // Otherwise the budget stopped the page, perhaps inside its last row: the next
-            // read (limit 1, for the continued row) finishes it.
-            remaining = Some(n - new_rows);
+            after = next;
         }
-        if let Some(last) = rows.last() {
-            last_row = Some(last.key.to_vec());
+    }
+}
+
+/// Room in `pages` for the next page, once the client has taken the last one; `None` if the
+/// client went away. A client that stays connected without reading for `idle` loses its
+/// unread page (`queued`), whose budget comes back, and the stream ends with
+/// `DeadlineExceeded`: the last page it did take has the position to resume from.
+async fn room<'a>(
+    pages: &'a mpsc::Sender<PageSlot>,
+    queued: &mut Option<PageSlot>,
+    idle: Duration,
+) -> Result<Option<mpsc::Permit<'a, PageSlot>>, ApiError> {
+    match tokio::time::timeout(idle, pages.reserve()).await {
+        Ok(Ok(room)) => Ok(Some(room)),
+        Ok(Err(_)) => Ok(None),
+        Err(_) => {
+            if let Some(slot) = queued.take() {
+                drop(slot.lock().ok().and_then(|mut s| s.take()));
+            }
+            Err(ApiError::deadline(format!(
+                "the client took no scan page for --stream-idle-ms ({} ms); resume from the \
+                 last page's next",
+                idle.as_millis()
+            )))
         }
-        // An empty page with a position (a budget too small for anything) ends the stream
-        // too, with the position, rather than reading the same nothing again.
-        let end = next.is_none() || rows.is_empty();
-        let page = proto::ScanPage {
-            rows,
-            next: next
-                .as_ref()
-                .map(|p| p.to_bytes().into())
-                .unwrap_or_default(),
-            bytes,
-        };
-        if tx.send(Ok(page)).await.is_err() || end {
-            return Ok(());
-        }
-        after = next;
     }
 }
 

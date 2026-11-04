@@ -142,12 +142,12 @@ impl ApiError {
         err
     }
 
-    /// The same error for a read: a read that failed with `Io` or `MergeFailed` wrote
-    /// nothing, so it may be sent again (simp724 on #1501). Writes keep "maybe applied".
+    /// The same error for a read: a read that failed with `Io` wrote nothing and may pass
+    /// on a second try, so it may be sent again (simp724 on #1501). Writes keep "maybe
+    /// applied". `MergeFailed` stays no-retry for a read too: a merge operator failing on
+    /// stored data fails the same way again (simp724 on #1510).
     pub(crate) fn for_read(mut self) -> Self {
-        if self.retry_from == RetryFrom::Unspecified
-            && (self.code == "Io" || self.code == "MergeFailed")
-        {
+        if self.retry_from == RetryFrom::Unspecified && self.code == "Io" {
             self.retry_from = RetryFrom::Request;
         }
         self
@@ -210,10 +210,16 @@ impl ApiError {
     /// The client's own deadline (`grpc-timeout`) passed while the request waited for the
     /// server's limits, before anything was submitted.
     pub(crate) fn deadline_exceeded() -> Self {
+        Self::deadline("the request waited past its deadline for the server's limits")
+    }
+
+    /// `DeadlineExceeded` with its own message: a scan whose client stopped reading for
+    /// `--stream-idle-ms` (perf287's G2 on #1510), resumable from its last page's `next`.
+    pub(crate) fn deadline(message: impl Into<String>) -> Self {
         Self::new(
             "DeadlineExceeded",
             0,
-            "the request waited past its deadline for the server's limits",
+            message,
             tonic::Code::DeadlineExceeded,
             StatusCode::GATEWAY_TIMEOUT,
         )
@@ -397,11 +403,19 @@ mod tests {
         // nothing (ICR 0112).
         assert_eq!(io().retry_from, RetryFrom::Unspecified);
         assert_eq!(io().for_read().retry_from, RetryFrom::Request);
-        // Other codes keep their rule.
+        // Other codes keep their rule; MergeFailed fails the same way again, read or write.
         assert_eq!(
             ApiError::invalid("x").for_read().retry_from,
             RetryFrom::Unspecified
         );
+        let merge = ApiError::new(
+            "MergeFailed",
+            ErrorCode::MergeFailed as u32,
+            "x",
+            tonic::Code::Internal,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(merge.for_read().retry_from, RetryFrom::Unspecified);
     }
 
     #[test]

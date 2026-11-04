@@ -3,8 +3,9 @@
 //!
 //! **The in-flight budget is reserved before decoding** (perf287's F2 on #1501): `prepay`
 //! reads a request's 5-byte message header, reserves the message's length, and only then
-//! lets tonic read and decode the body. So a request waiting for the budget holds 5 bytes,
-//! not its message.
+//! lets tonic read and decode the body. So a request waiting for the budget holds the data
+//! frames read so far, not its message: at most the HTTP/2 stream window (64 KiB by default)
+//! per stream, with `listener::MAX_STREAMS` streams per connection.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -39,6 +40,12 @@ impl Prepaid {
 /// before tonic decodes the message. The wait is bounded by the request timeout, and by the
 /// client's `grpc-timeout` when that is shorter (`DeadlineExceeded` then). A message longer
 /// than `--max-request-bytes` reserves only that much; tonic refuses it as it decodes.
+///
+/// The header's length is the message as sent, compressed or not. tonic isn't configured to
+/// accept compressed requests (`accept_compressed`), so it refuses them and the reservation
+/// is exact; enabling compression would need the decoded bound,
+/// `max_decoding_message_size`, reserved instead. TODO(`Vectors.BulkLoad`'s ticket): a
+/// client-streaming RPC needs a reservation per message; this reserves only the first.
 pub(crate) async fn prepay(
     State(shared): State<Arc<Shared>>,
     req: HttpRequest,

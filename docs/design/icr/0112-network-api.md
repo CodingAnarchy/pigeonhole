@@ -49,6 +49,10 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
   - with `Accept: text/event-stream`, server-sent events: each message is one event's `data:` as JSON, and for `Feed.Subscribe` and `Memory.Watch` the event's `id:` is the message's `token`;
   - otherwise, `application/x-ndjson`, one JSON message per line.
   - A stream's error ends it with a final message: an SSE `event: error`, or an NDJSON line `{"error": ErrorDetail}`.
+- **`Data.Scan`'s stream**, over either protocol:
+  - **It is complete only when its last page's `next` is empty** (simp724's D2 on #1510). A stream can end cleanly with a `next`: a `page_bytes` too small for anything returns an empty page with its position. Resume from it with a larger `page_bytes`.
+  - **Without a `snapshot_id`, each page reads at its own snapshot** (simp724's D1 on #1510). A row is never torn, but rows can change between pages, so the stream isn't one point in time. Pin a snapshot (`Snapshots.Open`) for that.
+  - **A client that stops reading for `--stream-idle-ms`** ends its stream with `DeadlineExceeded` (`REQUEST`): resume from the last page's `next` (perf287's G2 on #1510).
 - **`Last-Event-ID`** on `Feed.Subscribe` or `Memory.Watch` resumes after that token, and takes precedence over the body's `resume`. So an SSE client reconnects natively.
 - **Progress events** (`Progress`, in `FeedEvent` and `MemoryEvent`) carry only a token. The server sends one after a quiet interval (about 10 s), when the stream's position has moved past commits its filters skipped, and never more often than events. A filtered or quiet stream's latest token then stays within the history's retention, so a reconnect doesn't get `FeedExpired` for having missed nothing (perf287's S2).
 - **`Admin.BackupDownload`** is `application/octet-stream`: the backup file's bytes. Over gRPC it's chunks of up to 1 MiB, each with its `backup_id` and `offset`, and the last with `total` and `sha256`. The server keeps the backup for a few minutes after the stream ends or breaks, so a client resumes with `backup_id` and `offset` (over HTTP, `Range: bytes=<offset>-` with `?backup_id=`), and checks the SHA-256 before relying on the copy (perf287's S4).
@@ -83,7 +87,7 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `FeedExpired` | `OUT_OF_RANGE` | 410 | (a read) | no: resubscribe from now |
 | `Unsupported`, `UnsupportedFeature`, `UnsupportedFormat`, `UnknownMergeOperator` | `UNIMPLEMENTED` | 501 | not applied | no |
 | `NoSpace` | `RESOURCE_EXHAUSTED` | 507 | **maybe applied**, for a write; not applied, for a read | no: check the operation id |
-| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no, for a write; `REQUEST`, for a read |
+| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no (a read fails the same way again) |
 | `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no, for a write (check the operation id); `REQUEST`, for a read |
 | `Corruption` | `DATA_LOSS` | 500 | **maybe applied**, for a write; not applied, for a read | no |
 | `WriterLocked`, `ShmVersionMismatch`, `ShmUnavailable`, `NetworkFilesystem`, `NoReaderSlot` | `UNAVAILABLE` | 503 | not applied (the server can't open the database) | no |

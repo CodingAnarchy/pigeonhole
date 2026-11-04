@@ -31,6 +31,7 @@ fn limits() -> Limits {
         max_concurrent: 64,
         max_scans: 4,
         request_timeout: Duration::from_secs(5),
+        stream_idle: Duration::from_secs(5),
     }
 }
 
@@ -765,6 +766,166 @@ fn a_scans_limit_counts_rows_across_pages_and_resumes() {
     );
     resumed.extend(grpc_scan(&s, &mut c, scan_request(1000, 3, resume)));
     assert_eq!(join(&resumed), whole_rows(seen + 3));
+}
+
+#[test]
+fn a_limit_holds_when_the_row_a_position_is_inside_is_deleted() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    // A position inside a row, as a 1 KB page leaves it.
+    let first = grpc_scan(&s, &mut c, scan_request(1000, 0, Vec::new()));
+    let mut taken = vec![first[0].clone()];
+    taken[0].next = Default::default();
+    let (inside, cells) = join(&taken).last().unwrap().clone();
+    assert!(cells.len() < 3, "the first page ends inside a row");
+    // That row is deleted before the next page (no snapshot_id): the resumed page asks for
+    // one row more than remain, and every row it brings is new (simp724's B1 on #1510).
+    s.block_on(c.mutate(proto::MutateRequest {
+        writes: Some(proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: "t".into(),
+                row: inside.clone().into(),
+            }),
+            writes: vec![proto::Write {
+                op: Some(proto::write::Op::DeleteRow(proto::DeleteRow {})),
+            }],
+        }),
+        durability: 0,
+    }))
+    .unwrap();
+    let pages = grpc_scan(&s, &mut c, scan_request(100_000, 3, first[0].next.to_vec()));
+    let at = whole_rows(30)
+        .iter()
+        .position(|(k, _)| *k == inside)
+        .unwrap();
+    assert_eq!(
+        join(&pages),
+        whole_rows(at + 4)[at + 1..],
+        "exactly the limit's rows, after the deleted one"
+    );
+    assert!(
+        pages.last().unwrap().next.is_empty(),
+        "and the scan finished"
+    );
+}
+
+/// A scan straight through the service: its pages are taken only when the test polls.
+fn direct_scan(s: &Server, req: proto::ScanRequest) -> super::service::ScanPages {
+    let service = &s.shared.router.service;
+    match s
+        .block_on(service.call(ServiceOp::Scan(req), &Caller::anonymous(), None))
+        .unwrap()
+    {
+        super::service::ServiceReply::Scan(pages) => pages,
+        _ => unreachable!(),
+    }
+}
+
+/// The scan's next item, or `None` if none comes within `wait`.
+fn next_within(
+    s: &Server,
+    pages: &mut super::service::ScanPages,
+    wait: Duration,
+) -> Option<Option<Result<proto::ScanPage, super::errors::ApiError>>> {
+    use futures_core::Stream as _;
+    s.block_on(async {
+        tokio::time::timeout(
+            wait,
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut *pages).poll_next(cx)),
+        )
+        .await
+    })
+    .ok()
+}
+
+fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !ok() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn scan_pages_hold_the_in_flight_budget_until_taken() {
+    // Room for one page, not two: a full page of a 1 KB budget is over 1 KB (perf287's G1
+    // on #1510).
+    let mut l = limits();
+    l.inflight_bytes = 1500;
+    let s = Server::start("", l);
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let service = &s.shared.router.service;
+    let mut a = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    wait_for("scan a's first page takes its budget", || {
+        service.inflight_available() < 1500
+    });
+    // Scan b's first page waits for the budget a's unread page holds.
+    let mut b = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    assert!(
+        next_within(&s, &mut b, Duration::from_millis(300)).is_none(),
+        "b waits while a's page holds the budget"
+    );
+    // Once a's page is taken, its budget goes to b, which waited first.
+    assert!(matches!(
+        next_within(&s, &mut a, Duration::from_secs(5)),
+        Some(Some(Ok(_)))
+    ));
+    assert!(matches!(
+        next_within(&s, &mut b, Duration::from_secs(5)),
+        Some(Some(Ok(_)))
+    ));
+    drop((a, b));
+    wait_for("both scans' budget comes back", || {
+        service.inflight_available() == 1500
+    });
+}
+
+#[test]
+fn a_client_that_stops_reading_loses_its_scan_after_the_idle_timeout() {
+    let mut l = limits();
+    l.max_scans = 1;
+    l.stream_idle = Duration::from_millis(200);
+    let s = Server::start("", l);
+    let mut c = s.grpc();
+    seed_rows(&s, &mut c);
+    let service = &s.shared.router.service;
+    let mut stalled = direct_scan(&s, scan_request(1000, 0, Vec::new()));
+    let Some(Some(Ok(first))) = next_within(&s, &mut stalled, Duration::from_secs(5)) else {
+        panic!("the first page");
+    };
+    assert!(!first.next.is_empty());
+    // The client stops reading: its queued page and budget are taken back, its slot freed,
+    // and the stream ends with DeadlineExceeded (perf287's G2 on #1510).
+    std::thread::sleep(Duration::from_millis(600));
+    wait_for("the stalled scan's budget comes back", || {
+        service.inflight_available() == limits().inflight_bytes
+    });
+    let Some(Some(Err(e))) = next_within(&s, &mut stalled, Duration::from_secs(5)) else {
+        panic!("the stream ends with an error");
+    };
+    assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+    assert!(e.message.contains("--stream-idle-ms"), "{e:?}");
+    assert!(matches!(
+        next_within(&s, &mut stalled, Duration::from_secs(1)),
+        Some(None)
+    ));
+    // The client resumes from the last page it took, in another scan: the slot is free.
+    let mut pages = vec![first.clone()];
+    pages.extend(grpc_scan(
+        &s,
+        &mut c,
+        scan_request(1000, 0, first.next.to_vec()),
+    ));
+    assert_eq!(join(&pages), whole_rows(30));
+    let text = s.shared.metrics.render(&service.db);
+    assert!(
+        text.contains(
+            r#"pigeonhole_serve_requests_total{rpc="Data.Scan",outcome="DeadlineExceeded"} 1"#
+        ),
+        "{text}"
+    );
 }
 
 #[test]
