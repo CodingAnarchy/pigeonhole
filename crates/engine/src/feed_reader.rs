@@ -1257,7 +1257,8 @@ impl FeedReader {
     ///   its PREPARE was appended to its stream (the group settles after its WAL write); a
     ///   change that answers before the append breaks this bound. So every commit's key is
     ///   at least `m`. Taking only
-    ///   singles' seqnos would skip a session that opens with a cross-shard commit (simp724).
+    ///   singles' seqnos would skip that commit when a session opens with a cross-shard one
+    ///   (simp724).
     ///
     /// A session's first segment is the one an open started (`prev_epoch` 0, or an epoch
     /// more than one above it: FORMAT §10.1 rule 2), so a session partly recycled at a floor
@@ -1301,28 +1302,37 @@ impl FeedReader {
             .map(|(&id, &epoch)| (epoch, id))
             .collect();
         sessions.sort_unstable();
-        for (_, session) in sessions {
+        'sessions: for (_, session) in sessions {
             let mut first = None::<Seqno>;
             for (s, f) in firsts.iter().enumerate() {
-                let mut c = open(s, Lsn::new(f[&session], 0))?;
-                if let Step::Record {
-                    session: of,
-                    record,
-                    ..
-                } = c.step().ok()?
-                    && of == session
-                {
-                    let id = match record {
+                let Some(mut c) = open(s, Lsn::new(f[&session], 0)) else {
+                    continue 'sessions;
+                };
+                let id = match c.step() {
+                    // The stream logged nothing in the session: no id from it.
+                    Ok(Step::End) => continue,
+                    Ok(Step::Record {
+                        session: of,
+                        record,
+                        ..
+                    }) if of == session => match record {
                         WalRecord::Batch { seqno, .. }
                         | WalRecord::Prepare { seqno, .. }
                         | WalRecord::Commit { seqno, .. } => seqno,
                         WalRecord::Decision {
                             seqno, apply_seqno, ..
                         } => seqno.min(apply_seqno),
-                        _ => continue,
-                    };
-                    first = Some(first.map_or(id, |f| f.min(id)));
-                }
+                        // A kind this build can't key: the session can't be started in.
+                        _ => continue 'sessions,
+                    },
+                    // The segment gone (recycled since the headers were read) or cut,
+                    // another session's record there, or a read that failed: this session
+                    // can't be started in (simp724's B1), so a later one or the history
+                    // decides. Dropping only this stream would start it at a gone or foreign
+                    // segment, or take `m` too high and skip its earliest commits.
+                    _ => continue 'sessions,
+                };
+                first = Some(first.map_or(id, |f| f.min(id)));
             }
             // A session that logged nothing: the next one decides.
             let Some(first) = first else { continue };
