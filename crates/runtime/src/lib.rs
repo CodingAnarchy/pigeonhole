@@ -355,20 +355,13 @@ struct Inbox<M> {
 }
 
 impl<M> Inbox<M> {
-    /// Takes the next queued message, noting the queue empty for the work hint.
-    fn recv_noting(&self, rx: &Receiver<M>) -> Option<M> {
+    /// Notes the queue found empty, for the work hint (caller-runs only). Read after the
+    /// empty look: a message that came in between is then counted drained, which only keeps
+    /// a client from trying; the driver's wake for it is the submit's notify.
+    #[cold]
+    fn note_drained(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        if !self.caller_runs {
-            return rx.try_recv().ok();
-        }
-        let seen = self.sent.load(Relaxed);
-        match rx.try_recv() {
-            Ok(m) => Some(m),
-            Err(_) => {
-                self.drained.store(seen, Relaxed);
-                None
-            }
-        }
+        self.drained.store(self.sent.load(Relaxed), Relaxed);
     }
 
     /// Whether the work hint says something may be queued.
@@ -569,6 +562,10 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
+    /// `RuntimeConfig::caller_runs` (#1176): whether a look that finds the queue empty
+    /// notes it for the work hint. Off, the look is main's exactly, plus this branch on the
+    /// empty path only.
+    caller_runs: bool,
     /// Messages handled and background slices run, in all (`ShardDriver::work_count`).
     work_done: u64,
     /// Turns in a row that ended before their background slices because a future of the
@@ -657,6 +654,7 @@ impl<H: ShardHandler> ShardCore<H> {
             submitters,
             spawner,
             vfs,
+            caller_runs,
             ..
         } = self;
         let mut ctx = ShardContext {
@@ -670,14 +668,18 @@ impl<H: ShardHandler> ShardCore<H> {
             handler.handle(&mut ctx, msg);
             n += 1;
         }
-        let inbox = &submitters[usize::from(id.0)].inbox;
         while n < MAX_BATCH {
-            match inbox.recv_noting(rx) {
-                Some(msg) => {
+            match rx.try_recv() {
+                Ok(msg) => {
                     handler.handle(&mut ctx, msg);
                     n += 1;
                 }
-                None => break,
+                Err(_) => {
+                    if *caller_runs {
+                        submitters[usize::from(id.0)].inbox.note_drained();
+                    }
+                    break;
+                }
             }
         }
         if n > 0 {
@@ -729,9 +731,12 @@ impl<H: ShardHandler> ShardCore<H> {
             while handled < CALLER_BATCH {
                 let msg = match stash.take() {
                     Some(m) => m,
-                    None => match submitters[usize::from(id.0)].inbox.recv_noting(rx) {
-                        Some(m) => m,
-                        None => break,
+                    None => match rx.try_recv() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            submitters[usize::from(id.0)].inbox.note_drained();
+                            break;
+                        }
                     },
                 };
                 if !handler.caller_may_take(&msg) {
@@ -904,7 +909,10 @@ impl<H: ShardHandler> ShardCore<H> {
     fn check_before_sleep(&mut self) -> bool {
         self.signal().prepare_sleep();
         if self.stash.is_none() {
-            self.stash = self.inbox().recv_noting(&self.rx);
+            self.stash = self.rx.try_recv().ok();
+            if self.caller_runs && self.stash.is_none() {
+                self.inbox().note_drained();
+            }
         }
         if self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back() {
             self.signal().awake();
@@ -1021,6 +1029,7 @@ fn build<H: ShardHandler>(
             released: false,
             own_ring: false,
             spin: IdleSpin::new(config.idle_spin, config.idle_spin_cap),
+            caller_runs: config.caller_runs,
         })
         .collect();
     (submitters, cores)

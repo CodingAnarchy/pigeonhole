@@ -970,7 +970,10 @@ fn spin_poll<H: ShardHandler>(cores: &[Arc<ShardCell<H>>], window: Duration, rea
                 continue;
             };
             if core.stash.is_none() {
-                core.stash = core.inbox().recv_noting(&core.rx);
+                core.stash = core.rx.try_recv().ok();
+                if core.caller_runs && core.stash.is_none() {
+                    core.inbox().note_drained();
+                }
             }
             if core.stash.is_some() || core.signal().task_woken() || core.inbox().is_closed() {
                 break 'poll true;
