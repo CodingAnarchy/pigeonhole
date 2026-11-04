@@ -1,12 +1,14 @@
 name: Ruby gems
 
 # Precompiled native gems for every platform the bindings support, and the source gem that
-# compiles on any other, as artifacts (#697, ICR 0111). Nothing is pushed to RubyGems: the
-# first publish is the owner's call, and gets its own workflow.
+# compiles on any other, as artifacts (#697, ICR 0111). Nothing is pushed to RubyGems here:
+# publish-rubygems.yml calls this workflow on a release tag and pushes what it builds.
 
 on:
   # Seven cross-compiles: on changes to the gem itself, weekly for everything under it (the
-  # engine), and on demand, rather than on every push to main (ai1249's P1 on #1399).
+  # engine), on demand, and from publish-rubygems.yml on a release tag, rather than on every
+  # push to main (ai1249's P1 on #1399). A pull request builds them only when it touches the
+  # gem tooling.
   push:
     branches: [main]
     paths:
@@ -25,6 +27,14 @@ on:
       - 'crates/ruby/script/**'
       - '.github/workflows/ruby-gems.yml'
   workflow_dispatch:
+  workflow_call:
+
+# A newer push to a pull request cancels its superseded run. On main a run is never cancelled
+# (with merges landing faster than a run, main would never finish one); GitHub keeps only the
+# newest queued run per group, so main holds at most one running and one waiting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

@@ -28,6 +28,19 @@ fn check(store: &Store, ctx: &str) {
     assert!(st.is_consistent(), "{ctx}: {st:?}");
 }
 
+/// A store with `policy` whose passes the test runs itself: no crate forgetter thread, which
+/// would run a pass of its own at once and could delete a due memory before the test looks
+/// (perf287's #1456). The thread is tested by `the_crates_forgetter_thread_runs_the_policy`.
+fn create_own(db: &Pigeonhole, policy: ForgetPolicy) -> Store {
+    Store::create_with(
+        db,
+        "m",
+        StoreOptions::new().forget(policy),
+        OpenOptions::new().without_embeddings().own_forgetter(),
+    )
+    .unwrap()
+}
+
 fn ids(store: &Store) -> Vec<MemoryId> {
     let st = store.verify().unwrap();
     let _ = st;
@@ -51,7 +64,7 @@ fn retention_and_ttl_decide_and_protection_holds() {
     let policy = ForgetPolicy::new()
         .min_retention(0.2)
         .max_age(Kind::Procedural, Duration::from_secs(3600));
-    let store = Store::create(&db, "m", StoreOptions::new().forget(policy.clone())).unwrap();
+    let store = create_own(&db, policy);
     let ns = "a";
     let low = store
         .remember(ns, Memory::new("note low").importance(0.1))
@@ -164,7 +177,7 @@ fn race(name: &str, race: impl FnOnce(&Store, &MemoryId)) {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let policy = ForgetPolicy::new().min_retention(0.15);
-    let store = Store::create(&db, "m", StoreOptions::new().forget(policy)).unwrap();
+    let store = create_own(&db, policy);
     let ns = "a";
     let m = store
         .remember(ns, Memory::new("note raced").importance(0.1))
@@ -406,12 +419,7 @@ fn a_failed_pass_backs_off() {
 fn a_close_during_a_pass_drops_its_deletion_whole() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
-    let store = Store::create(
-        &db,
-        "m",
-        StoreOptions::new().forget(ForgetPolicy::new().min_retention(0.5)),
-    )
-    .unwrap();
+    let store = create_own(&db, ForgetPolicy::new().min_retention(0.5));
     let m = store
         .remember("a", Memory::new("note doomed").importance(0.1))
         .unwrap();
