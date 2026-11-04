@@ -172,7 +172,9 @@ impl From<pigeonhole_format::Error> for Error {
 #[non_exhaustive]
 pub struct WalOptions {
     /// Segment size in bytes; a multiple of 32 KiB, at most 4 GiB − 32 KiB (decision D43).
-    /// Default 64 MiB.
+    /// Default 64 MiB. A new stream's only: [`Recovery::into_stream`] keeps an existing
+    /// file's slot size ([`Recovery::slot_size`]), so a retention in segments
+    /// ([`WalOptions::retain_segments`]) is counted in that size (#1471).
     pub segment_size: u64,
     /// Segments kept preallocated ahead of the writer. Default 2.
     pub spare_segments: u32,

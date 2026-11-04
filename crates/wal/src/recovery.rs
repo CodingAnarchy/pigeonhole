@@ -324,6 +324,13 @@ impl Recovery {
         Ok(Some((self.end, record)))
     }
 
+    /// The stream file's slot size, `None` while it holds no segment. An existing file keeps
+    /// its slot size: [`Recovery::into_stream`] uses `opts.segment_size` only without one, so
+    /// a retention in bytes is counted in this size's segments (#1471).
+    pub fn slot_size(&self) -> Option<u64> {
+        self.grid.as_ref().map(|g| g.segment_size)
+    }
+
     /// Where the valid log ends (after `next_record` returned `None`).
     pub fn end(&self) -> Lsn {
         self.end

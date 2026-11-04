@@ -250,9 +250,7 @@ pub(crate) fn open_session(
     };
     let segment = options.wal.segment_size.max(1);
     let streams = shards.max(1) as u64;
-    let retain = (cfg.retention_bytes / streams)
-        .div_ceil(segment)
-        .clamp(MIN_RETAINED, u64::from(u32::MAX)) as u32;
+    let retain = retain_segments(cfg.retention_bytes / streams, segment);
     let mut session = 0;
     while session == 0 {
         session = vfs.random_u64();
@@ -268,6 +266,7 @@ pub(crate) fn open_session(
     let sidecar = open_sidecar(vfs, path, db_id, &entry, true)?
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
+    feed.retain_bytes_per_stream = cfg.retention_bytes / streams;
     if let Some(us) = cfg.sync_interval_micros {
         feed.sync_interval_nanos = us.saturating_mul(1_000).max(1);
     }
@@ -299,6 +298,13 @@ const SYNC_INTERVAL_NANOS: u64 = if cfg!(target_os = "macos") {
 /// The fewest segments a stream retains with the feed on (D310 §2.1).
 const MIN_RETAINED: u64 = 2;
 
+/// `bytes` of retention in whole `slot_size`-byte segments, at least [`MIN_RETAINED`].
+fn retain_segments(bytes: u64, slot_size: u64) -> u32 {
+    bytes
+        .div_ceil(slot_size.max(1))
+        .clamp(MIN_RETAINED, u64::from(u32::MAX)) as u32
+}
+
 /// A blob file the horizon keeps ([`Feed::hold_drops`]).
 #[derive(Debug)]
 struct HeldBlob {
@@ -324,8 +330,12 @@ struct Held {
 pub(crate) struct Feed {
     /// This session's id, in every segment header it writes and in its sidecar entries.
     pub session: u64,
-    /// Retained segments per stream.
+    /// Retained segments per stream, counted in the configured segment size: a new stream's.
+    /// A stream whose file already exists keeps its own slot size and takes
+    /// [`Feed::retain_for`] that size instead (#1471).
     pub retain_segments: u32,
+    /// The requested retention per stream, in bytes (`retention_bytes / streams`).
+    pub retain_bytes_per_stream: u64,
     /// The retention in effect, for the whole database: the request, rounded up to whole
     /// segments per stream and raised to two of them (`DatabaseInfo` reports it).
     pub retention_bytes: u64,
@@ -389,6 +399,7 @@ impl Feed {
         Feed {
             session,
             retain_segments,
+            retain_bytes_per_stream: 0,
             retention_bytes: 0,
             age_micros,
             tables,
@@ -714,6 +725,31 @@ impl Feed {
             .filter_map(OnceLock::get)
             .map(|m| m.retained_bytes())
             .sum()
+    }
+
+    /// The segments a stream whose file has `slot_size`-byte slots retains: the requested
+    /// bytes per stream in whole slots, at least [`MIN_RETAINED`] (#1471: an existing file
+    /// keeps its slot size whatever the open's `wal_segment_size`, so counting in the
+    /// configured size kept too little history or far too much).
+    pub(crate) fn retain_for(&self, slot_size: u64) -> u32 {
+        retain_segments(self.retain_bytes_per_stream, slot_size)
+    }
+
+    /// The retention in effect, for the whole database: each stream's retained segments
+    /// times its file's own slot size, once every stream is open; until then, as computed
+    /// at open in the configured size.
+    pub(crate) fn retention_in_effect(&self) -> u64 {
+        let open: Vec<u64> = self
+            .marks
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(|m| m.retention())
+            .collect();
+        if open.len() == self.marks.len() {
+            open.iter().sum()
+        } else {
+            self.retention_bytes
+        }
     }
 
     /// The bytes of blob files kept only for the horizon.
