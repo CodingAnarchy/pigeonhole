@@ -176,6 +176,10 @@ pub enum FeedEntry {
         /// The commit's catalog edits, in the order they applied: `CreateTable`,
         /// `PutFamily` and `DropTable`, in the manifest's own encoding (FORMAT §9.3).
         edits: Vec<Edit>,
+        /// The name, as the catalog held it before these edits, of each table a `PutFamily`
+        /// or `DropTable` here names without its `CreateTable` here, once per table: a feed
+        /// resumed after the drop of a table older than the feed still names it.
+        names: Vec<(TableId, String)>,
     },
     /// An entry type this build does not know, written by a newer one (its checksum
     /// passed). A reader treats it as the end of the history before it. So is a `Catalog`
@@ -232,6 +236,7 @@ impl FeedEntry {
                 seqno_ceiling,
                 timestamp,
                 edits,
+                names,
             } => {
                 p.push(4);
                 p.extend_from_slice(&session.to_le_bytes());
@@ -241,6 +246,14 @@ impl FeedEntry {
                 p.extend_from_slice(&(edits.len() as u32).to_le_bytes());
                 for e in edits {
                     e.encode(&mut p);
+                }
+                // None: no count either, the layout #1493 wrote (and its frozen golden).
+                if !names.is_empty() {
+                    p.extend_from_slice(&(names.len() as u32).to_le_bytes());
+                    for (table, name) in names {
+                        p.extend_from_slice(&table.0.to_le_bytes());
+                        crate::varint::put_bytes(&mut p, name.as_bytes());
+                    }
                 }
             }
             FeedEntry::Unknown(t) => p.push(*t),
@@ -306,7 +319,24 @@ impl FeedEntry {
                     edits.push(edit);
                     rest = &rest[used..];
                 }
-                if !rest.is_empty() {
+                // The names (D315 2b) follow the edits; an entry that ends after them (the
+                // layout #1493 wrote, frozen in `feed_sidecar_catalog.bin`) names none.
+                let mut r = Reader::new(rest, WHAT);
+                let n = if r.remaining() == 0 {
+                    0
+                } else {
+                    r.u32()? as usize
+                };
+                // Each pair takes at least 5 bytes (a u32 and a varint length): a count the
+                // payload can't hold is damage, and never sizes an allocation.
+                if n > r.remaining() / 5 {
+                    return Err(Error::Corrupt { what: WHAT });
+                }
+                let mut names = Vec::with_capacity(n);
+                for _ in 0..n {
+                    names.push((TableId(r.u32()?), r.string()?));
+                }
+                if r.remaining() != 0 {
                     return Err(Error::Corrupt { what: WHAT });
                 }
                 return Ok(FeedEntry::Catalog {
@@ -315,6 +345,7 @@ impl FeedEntry {
                     seqno_ceiling,
                     timestamp,
                     edits,
+                    names,
                 });
             }
             t => return Ok(FeedEntry::Unknown(t)),

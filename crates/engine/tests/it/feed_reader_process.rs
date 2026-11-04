@@ -145,6 +145,7 @@ fn ready(feed: &mut FeedReader) -> Result<Got, Error> {
             }
             Next::Pending => return Ok(out),
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
 }
@@ -382,6 +383,7 @@ fn a_reader_process_delivers_a_separated_value() {
             Next::Commit(c) => break c.clone(),
             Next::Pending => continue,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     };
     assert_eq!(c.seqno, seqno);

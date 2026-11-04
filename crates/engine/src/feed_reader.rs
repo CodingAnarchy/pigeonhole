@@ -150,6 +150,9 @@ pub struct CatalogEvent {
     pub sequence: u64,
     /// Its edits, in the order they applied: `CreateTable`, `PutFamily`, `DropTable`.
     pub edits: Vec<pigeonhole_format::manifest::Edit>,
+    /// The name of each table the edits name without a `CreateTable` among them, as the
+    /// catalog held it before them: every table an event names is named in the event.
+    pub names: Vec<(TableId, String)>,
 }
 
 /// A mutation as read, before its commit's timestamp is known.
@@ -1513,6 +1516,7 @@ impl FeedReader {
                 seqno_ceiling,
                 timestamp,
                 edits,
+                names,
             } = e
             else {
                 continue;
@@ -1534,6 +1538,7 @@ impl FeedReader {
                 timestamp,
                 sequence,
                 edits,
+                names,
             });
         }
         Ok(())

@@ -367,7 +367,7 @@ pub(crate) struct Feed {
     /// it, before its root commit, and appended as a `Catalog` sidecar entry just before that
     /// commit's Root entry. Taken by the root-commit observer, or dropped by
     /// `unstage_catalog` if the commit failed. Root commits never overlap, so one slot.
-    staged_catalog: Mutex<Option<(u64, u64, Vec<Edit>)>>,
+    staged_catalog: Mutex<Option<StagedCatalog>>,
     /// The session's sidecar appends stopped (D315; simp724 on #1493): an append or a sync
     /// failed, so no later catalog change can get its `Catalog` entry. Terminal. Feeds of
     /// every table in this process expire on seeing it; the manifest pump freezes the catalog
@@ -389,6 +389,20 @@ pub(crate) struct Feed {
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
+}
+
+/// A catalog change staged for its root commit's `Catalog` sidecar entry (D315).
+#[derive(Debug)]
+pub(crate) struct StagedCatalog {
+    /// The manifest commit's `seqno_ceiling` (its catalog hold).
+    pub(crate) ceiling: u64,
+    /// The manifest commit's `ts_floor`.
+    pub(crate) timestamp: u64,
+    /// Its `CreateTable`, `PutFamily` and `DropTable` edits, in the order they applied.
+    pub(crate) edits: Vec<Edit>,
+    /// The names, from the catalog before the edits, of the tables they name without a
+    /// `CreateTable` of their own.
+    pub(crate) names: Vec<(pigeonhole_format::TableId, String)>,
 }
 
 /// Whether a sidecar sync is in flight, and whether appends since its submission wait for
@@ -669,13 +683,14 @@ impl Feed {
             let Some(s) = sidecar.as_mut() else {
                 return;
             };
-            if let Some((seqno_ceiling, timestamp, edits)) = staged
+            if let Some(c) = staged
                 && let Err(e) = s.append(&FeedEntry::Catalog {
                     session: self.session,
                     sequence,
-                    seqno_ceiling,
-                    timestamp,
-                    edits,
+                    seqno_ceiling: c.ceiling,
+                    timestamp: c.timestamp,
+                    edits: c.edits,
+                    names: c.names,
                 })
             {
                 crate::shard::trace!("feed: sidecar append of catalog {sequence} failed: {e}");
@@ -697,13 +712,13 @@ impl Feed {
         self.request_sidecar_sync(file);
     }
 
-    /// Stages a catalog change's ceiling, timestamp floor and edits for its root commit's
-    /// `Catalog` entry (D315), before that commit.
-    pub(crate) fn stage_catalog(&self, ceiling: u64, timestamp: u64, edits: Vec<Edit>) {
+    /// Stages a catalog change for its root commit's `Catalog` entry (D315), before that
+    /// commit.
+    pub(crate) fn stage_catalog(&self, change: StagedCatalog) {
         *self
             .staged_catalog
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, timestamp, edits));
+            .unwrap_or_else(PoisonError::into_inner) = Some(change);
     }
 
     /// Whether the session's sidecar appends stopped (D315): see `appends_stopped`.

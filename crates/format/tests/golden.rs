@@ -683,6 +683,7 @@ fn feed_sidecar_catalog() {
                 },
                 Edit::DropTable { table: TableId(3) },
             ],
+            names: Vec::new(),
         },
         FeedEntry::Root {
             session: 0x0123_4567_89ab_cdef,
@@ -716,6 +717,68 @@ fn feed_sidecar_catalog() {
     let (decoded, end) = decode_entries(&log);
     assert_eq!(decoded, [FeedEntry::Unknown(4), entries[1].clone()]);
     assert_eq!(end, log.len(), "nothing cut off");
+}
+
+/// D315 2b: a `Catalog` entry's names, after its edits, of the tables its `PutFamily` and
+/// `DropTable` edits name without their `CreateTable` (`feed_sidecar_catalog.bin`, frozen,
+/// is the layout without them, which still reads as naming none). A names count the payload
+/// can't hold is damage: the entry doesn't decode, and nothing is allocated for it.
+#[test]
+fn feed_sidecar_catalog_names() {
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, decode_entries};
+    use pigeonhole_format::manifest::{Edit, FamilyOptions};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Catalog {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 43,
+            seqno_ceiling: 1200,
+            timestamp: 1_767_225_600_000_002,
+            edits: vec![
+                Edit::PutFamily {
+                    table: TableId(5),
+                    family: FamilyId(12),
+                    name: "n".into(),
+                    options: FamilyOptions::default(),
+                },
+                Edit::DropTable { table: TableId(3) },
+            ],
+            names: vec![(TableId(5), "pages".into()), (TableId(3), "old".into())],
+        },
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 43,
+        },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar_catalog_names.bin", &file);
+    let bytes = golden("feed_sidecar_catalog_names.bin");
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+
+    // The names count claims more pairs than the bytes after it could hold.
+    let mut payload = vec![4u8];
+    for v in [1u64, 44, 2000, 1_767_225_600_000_003] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    payload.extend_from_slice(&5u32.to_le_bytes());
+    payload.push(0);
+    let mut log = Vec::new();
+    log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+    log.extend_from_slice(&payload);
+    let (decoded, end) = decode_entries(&log);
+    assert!(decoded.is_empty(), "{decoded:?}");
+    assert_eq!(end, 0, "the reader stops at the damaged entry");
 }
 
 #[test]

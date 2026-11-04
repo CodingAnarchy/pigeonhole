@@ -81,6 +81,7 @@ fn next(r: &mut FeedReader) -> Commit {
         Next::Commit(c) => c.clone(),
         Next::Pending => panic!("no commit within {WAIT:?} (frontier {})", r.frontier()),
         Next::Expired(e) => panic!("expired: {e:?}"),
+        Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
     }
 }
 
@@ -360,7 +361,7 @@ fn retention_passing_a_token_expires_it() {
     let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
     let expired = loop {
         match r.wait(WAIT).unwrap() {
-            Next::Commit(_) => continue,
+            Next::Commit(_) | Next::Catalog(_) => continue,
             Next::Pending => break false,
             Next::Expired(_) => break true,
         }
@@ -406,6 +407,7 @@ fn drain(r: &mut FeedReader, shards: &mut [EngineShard]) -> Vec<Commit> {
             Next::Commit(c) => got.push(c.clone()),
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
     panic!("never drained");
@@ -597,6 +599,7 @@ fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
             Next::Commit(c) => got.push(c.seqno),
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
 }

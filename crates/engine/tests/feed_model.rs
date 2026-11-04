@@ -403,6 +403,9 @@ impl Run {
                             sub.durable
                         )
                     }
+                    Next::Catalog(e) => {
+                        panic!("seed {seed}: a catalog event in a per-table feed: {e:?}")
+                    }
                 };
                 let tag = tag_of(&c, seed);
                 let m = self
