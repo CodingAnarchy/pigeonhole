@@ -150,6 +150,10 @@ struct Entry {
     /// index's or a memory store's `verify`, the change feed's retained commits), one line
     /// each: only what every later build still reports, never a whole `Debug`.
     extra: Option<fn(&Pigeonhole) -> String>,
+    /// A later session's writes: the generator closes the database cleanly after `write`,
+    /// reopens it with the simulator's options alone (so it inherits what the first open
+    /// set), and runs this before the entry's crash or close.
+    then: Option<fn(&Pigeonhole)>,
 }
 
 /// An entry's open adds nothing.
@@ -167,6 +171,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "values",
@@ -176,6 +181,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "counters",
@@ -185,6 +191,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "blobs",
@@ -194,6 +201,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "merge",
@@ -203,6 +211,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "wal_crash",
@@ -212,6 +221,7 @@ fn entries() -> Vec<Entry> {
             crash: true,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "families",
@@ -221,6 +231,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "wal_ops",
@@ -230,6 +241,7 @@ fn entries() -> Vec<Entry> {
             crash: true,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "checkpoints",
@@ -239,6 +251,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
         Entry {
             name: "aggregates",
@@ -248,6 +261,7 @@ fn entries() -> Vec<Entry> {
             crash: true,
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: None,
+            then: None,
         },
         Entry {
             name: "vectors",
@@ -257,6 +271,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(vectors_extra),
+            then: None,
         },
         Entry {
             name: "text",
@@ -267,6 +282,7 @@ fn entries() -> Vec<Entry> {
             // The index keeps its statistics in an aggregate family.
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(text_extra),
+            then: None,
         },
         Entry {
             name: "memory",
@@ -276,6 +292,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(memory_extra),
+            then: None,
         },
         Entry {
             name: "feed",
@@ -285,6 +302,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
+            then: None,
         },
         Entry {
             name: "feed_crash",
@@ -294,6 +312,17 @@ fn entries() -> Vec<Entry> {
             crash: true,
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
+            then: None,
+        },
+        Entry {
+            name: "feed_sessions",
+            shards: 2,
+            options: feed_options,
+            write: write_feed_session,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_oldest_extra),
+            then: Some(write_feed_session),
         },
         Entry {
             name: "returning",
@@ -303,6 +332,7 @@ fn entries() -> Vec<Entry> {
             crash: false,
             refused_by_1_0_0: 0,
             extra: None,
+            then: None,
         },
     ]
 }
@@ -1065,6 +1095,138 @@ fn feed_extra(db: &Pigeonhole) -> String {
     out
 }
 
+/// Where `feed_sessions` keeps what its check needs: the seqno of the first commit to
+/// `events` (where a feed from the oldest history must start) and of the last.
+const FEED_SPAN: (&str, &[u8]) = ("feed_tokens", b"span");
+
+/// One session of `feed_sessions`: commits to `events` and `other` over WAL segments, then a
+/// clean close. The first session makes the tables and records the first commit's seqno; each
+/// session records the last. Written twice, so the files keep two closed sessions of history.
+fn write_feed_session(db: &Pigeonhole) {
+    let fresh = !db.tables().iter().any(|t| t == "events");
+    if fresh {
+        db.table("events")
+            .unwrap()
+            .family("e", Family::default())
+            .family("n", Family::counter())
+            .create()
+            .unwrap();
+        db.table("other")
+            .unwrap()
+            .family("e", Family::default())
+            .create()
+            .unwrap();
+        db.table(FEED_SPAN.0)
+            .unwrap()
+            .family("t", Family::default())
+            .create()
+            .unwrap();
+    }
+    let events = db.table("events").unwrap().open().unwrap();
+    let other = db.table("other").unwrap().open().unwrap();
+    let span = db.table(FEED_SPAN.0).unwrap().open().unwrap();
+    let base = if fresh { 0 } else { 150 };
+    for i in base..base + 150u64 {
+        let row = format!("r{:02}", i % 7);
+        let seqno = events
+            .mutate(row.as_bytes())
+            .put_at(
+                "e",
+                b"what",
+                T0 + i,
+                format!("session event {i:03} ").repeat(120).as_bytes(),
+            )
+            .incr_at("n", b"count", T0, 1)
+            .commit()
+            .unwrap()
+            .seqno;
+        if i == 0 {
+            span.mutate(FEED_SPAN.1)
+                .put_i64("t", b"first", seqno as i64)
+                .commit()
+                .unwrap();
+        }
+        if i == base + 149 {
+            span.mutate(FEED_SPAN.1)
+                .put_i64("t", b"last", seqno as i64)
+                .commit()
+                .unwrap();
+        }
+        if i % 4 == 0 {
+            other
+                .mutate(row.as_bytes())
+                .put("e", b"x", b"not followed")
+                .commit()
+                .unwrap();
+        }
+        if i % 50 == 49 {
+            db.flush().unwrap();
+        }
+    }
+}
+
+/// #1465 (D310): a feed from the oldest history, in an open after two closed sessions, starts
+/// at the first session's first commit and delivers both sessions' commits up to the last.
+/// The listing asserts the start itself, so a build that loses the earlier sessions can't
+/// write (or pass) a short listing.
+fn feed_oldest_extra(db: &Pigeonhole) -> String {
+    assert!(
+        db.info().unwrap().feed.is_some(),
+        "the open didn't inherit the change feed"
+    );
+    let span = db.table(FEED_SPAN.0).unwrap().open().unwrap();
+    let seqno = |q: &[u8]| {
+        span.get(FEED_SPAN.1, "t", q)
+            .unwrap()
+            .expect("the stored span")
+            .as_i64()
+            .unwrap() as u64
+    };
+    let (first, last) = (seqno(b"first"), seqno(b"last"));
+    let events = db.table("events").unwrap().open().unwrap();
+    let mut feed = events.feed().from_oldest().open().unwrap();
+    let mut out = String::new();
+    loop {
+        let c = feed
+            .next(FEED_WAIT)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the feed from the oldest history stopped before {last}"));
+        if out.is_empty() {
+            assert_eq!(
+                c.seqno(),
+                first,
+                "a feed from the oldest history must start at the first session's first commit"
+            );
+        }
+        for ch in c.changes() {
+            out.push_str(&format!(
+                "{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                c.seqno(),
+                ch.family(),
+                ch.kind(),
+                hex(ch.row()),
+                hex(ch.qualifier()),
+                ch.timestamp(),
+                ch.value().map_or_else(
+                    || "-".to_owned(),
+                    |v| match v {
+                        Value::Bytes(b) => format!(
+                            "bytes:{}:{:016x}",
+                            b.len(),
+                            pigeonhole_format::checksum::xxh3_64(b)
+                        ),
+                        other => value_line(other),
+                    }
+                )
+            ));
+        }
+        if c.seqno() >= last {
+            break;
+        }
+    }
+    out
+}
+
 /// D314: `commit_returning` increments on a hot counter whose base is an older SST's `Put`.
 /// The first returning commit reads through to that base and leaves a D291 checkpoint at its
 /// own seqno; later ones checkpoint every eight folded operands. The flush's combining may
@@ -1151,8 +1313,13 @@ fn generate_corpus() {
     for (seed, e) in entries().into_iter().enumerate() {
         let vfs = SimVfs::new(9_000 + seed as u64);
         let path = format!("/db/{DB}");
-        let db = Pigeonhole::open(&path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
+        let mut db = Pigeonhole::open(&path, (e.options)(sim_options(&vfs, e.shards))).unwrap();
         (e.write)(&db);
+        if let Some(then) = e.then {
+            db.close().unwrap();
+            db = Pigeonhole::open(&path, sim_options(&vfs, e.shards)).unwrap();
+            then(&db);
+        }
         if e.crash {
             vfs.crash(CrashKind::Process);
             drop(db);
