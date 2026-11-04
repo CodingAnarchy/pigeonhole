@@ -169,7 +169,8 @@ impl std::fmt::Debug for Registration {
 impl Registration {
     /// Points the registration at `db`, a reopen of the database, keeping every counter
     /// monotonic: each continues from the value it reached, rather than restarting from 0.
-    /// The name stays the one the registration was made with.
+    /// The `pigeonhole.db.name` attribute stays the one the registration was made with, even
+    /// when `db`'s file name differs, so the series continue; the other settings stay too.
     pub fn rebind(&self, db: &Pigeonhole) {
         self.shared.lock().rebind(db);
     }
@@ -229,7 +230,7 @@ pub struct MetricInfo {
 
 impl MetricInfo {
     /// The name OpenTelemetry's Prometheus exporter gives it, as `opentelemetry-prometheus`
-    /// 0.33 translates names by default: dots become underscores, the unit's word is appended
+    /// 0.33 (the version this crate's tests check it against) translates names by default: dots become underscores, the unit's word is appended
     /// (`_seconds`, `_bytes`, `_ratio`; a `{…}` annotation adds nothing), and a counter gains
     /// `_total`.
     pub fn prometheus_name(&self) -> String {

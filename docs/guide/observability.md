@@ -46,7 +46,7 @@ assert!(String::from_utf8(body)?.contains("pigeonhole_commits_total"));
 ```
 
 ## An OTLP collector
-To push to an OpenTelemetry collector, or to any OTLP backend, use `opentelemetry-otlp`'s metric exporter behind a `PeriodicReader`. Register the same way:
+To push to an OpenTelemetry collector, or to any OTLP backend, use `opentelemetry-otlp`'s metric exporter behind a `PeriodicReader`. Register the same way. This needs `opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic"] }` beside `opentelemetry_sdk`, and a Tokio runtime for tonic's gRPC client:
 
 ```rust,ignore
 let exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -88,7 +88,7 @@ Every instrument is observable, so nothing runs on any engine thread. Commits an
 That's microseconds per collection. At a 15-second interval it's nothing.
 
 ## The metrics
-Every metric carries `pigeonhole.db.name`, and the attributes listed below. "Prometheus name" is what OpenTelemetry's Prometheus exporter (`opentelemetry-prometheus` 0.33, with its default name translation) calls it: dots become underscores, and the unit's word (`_seconds`, `_bytes`, `_ratio`) is appended. A counter also gains `_total`. A test checks each name against the exporter's real output.
+Every metric carries `pigeonhole.db.name`, and the attributes listed below. "Prometheus name" is what OpenTelemetry's Prometheus exporter calls it, as `opentelemetry-prometheus` 0.33 translates names by default (a test checks against 0.33's real output): dots become underscores, and the unit's word (`_seconds`, `_bytes`, `_ratio`) is appended. A counter also gains `_total`. A test checks each name against the exporter's real output.
 
 Counters are cumulative from registration. They stay monotonic across an automatic recovery (`Options::auto_recover`), whose new engine's own counters restart from 0, and across a `rebind`. Metrics a database doesn't have report no values: the change feed's while it's off, and io_uring's on other backends.
 

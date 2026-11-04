@@ -225,8 +225,9 @@ impl LatencyHistogram {
     /// The number of buckets.
     pub const BUCKETS: usize = 64;
 
-    /// The commits counted in each bucket, bucket 0 first.
-    pub fn counts(&self) -> &[u64; Self::BUCKETS] {
+    /// The commits counted in each bucket, bucket 0 first: [`BUCKETS`](Self::BUCKETS) of
+    /// them. A slice, so a later release can change the bucket count without breaking it.
+    pub fn counts(&self) -> &[u64] {
         &self.counts
     }
 
@@ -266,10 +267,11 @@ impl LatencyHistogram {
     }
 
     /// The `q` quantile (`0.99` for p99), as the upper bound in nanoseconds of the bucket it
-    /// falls in, so it errs high, never low: at least a fraction `q` of the commits took
-    /// less. `None` when the histogram is empty or `q` is outside `0.0..=1.0` (NaN
-    /// included). A quantile in the last bucket, which has no upper bound, reports that
-    /// bucket's lower bound.
+    /// falls in, so it errs high: at least a fraction `q` of the commits took less. The one
+    /// exception is the last bucket, which has no upper bound: a quantile there reports that
+    /// bucket's lower bound (about 3.2 seconds), and the commits it counts took at least
+    /// that long. `None` when the histogram is empty or `q` is outside `0.0..=1.0` (NaN
+    /// included).
     pub fn quantile_upper_nanos(&self, q: f64) -> Option<u64> {
         if !(0.0..=1.0).contains(&q) {
             return None;

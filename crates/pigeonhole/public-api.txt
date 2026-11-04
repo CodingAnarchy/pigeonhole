@@ -526,7 +526,7 @@ impl pigeonhole::LatencyHistogram
 pub const pigeonhole::LatencyHistogram::BUCKETS: usize
 pub fn pigeonhole::LatencyHistogram::bucket_lower_nanos(usize) -> u64
 pub fn pigeonhole::LatencyHistogram::bucket_upper_nanos(usize) -> core::option::Option<u64>
-pub fn pigeonhole::LatencyHistogram::counts(&self) -> &[u64; 64]
+pub fn pigeonhole::LatencyHistogram::counts(&self) -> &[u64]
 pub fn pigeonhole::LatencyHistogram::quantile_upper_nanos(&self, f64) -> core::option::Option<u64>
 pub fn pigeonhole::LatencyHistogram::since(&self, &pigeonhole::LatencyHistogram) -> pigeonhole::LatencyHistogram
 pub fn pigeonhole::LatencyHistogram::total(&self) -> u64
