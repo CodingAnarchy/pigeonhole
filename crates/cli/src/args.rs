@@ -159,6 +159,10 @@ pub(crate) enum Command {
         #[command(flatten)]
         memory: MemoryArgs,
     },
+    /// Serve the database over the network (D313): gRPC and HTTP/JSON on one port (ICR
+    /// 0112). Holds the database until stopped with Ctrl-C or SIGTERM, then closes it.
+    #[cfg(feature = "serve")]
+    Serve(Box<crate::serve::ServeArgs>),
 }
 
 /// `phdb mcp`'s agent memory options (D311 T7): a `pigeonhole-memory` store and the tools
