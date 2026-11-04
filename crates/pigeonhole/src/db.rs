@@ -965,6 +965,18 @@ impl Pigeonhole {
         })
     }
 
+    /// A [`Feed`](crate::Feed) of every table's commits (D315, ICR 0114), whole, once each,
+    /// in commit order, including tables created after it opened. The change feed must be on
+    /// for every table ([`Options::change_feed`] without [`Options::feed_tables`]), and so
+    /// must every earlier open its history spans: one with a table list ends it. A change to
+    /// a table dropped before the feed reached it comes with empty names. The builder's
+    /// [`prefix`](crate::FeedBuilder::prefix), [`visible`](crate::FeedBuilder::visible) and
+    /// start positions apply as for a table's feed; [`table`](crate::FeedBuilder::table) is
+    /// refused, since the feed already follows every table.
+    pub fn feed(&self) -> crate::FeedBuilder {
+        crate::FeedBuilder::all_tables(&self.db)
+    }
+
     /// Starts defining or opening a table: chain `.family(..)` and finish with
     /// `.create_if_missing()`, `.create()` or `.open()`.
     pub fn table(&self, name: &str) -> Result<TableBuilder<'_>> {
@@ -1561,6 +1573,12 @@ impl PigeonholeReader {
     /// writer restarted or recovered) empties the cache and starts the counts again.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
         crate::RowCacheStats::from_engine(&self.engine())
+    }
+
+    /// A [`Feed`](crate::Feed) of every table, in a reader process
+    /// ([`Pigeonhole::feed`] there; D315).
+    pub fn feed(&self) -> crate::FeedBuilder {
+        crate::FeedBuilder::all_tables(&self.db)
     }
 
     /// Opens an existing table for reading.

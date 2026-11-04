@@ -603,3 +603,66 @@ fn a_changed_wal_segment_size_keeps_the_feed_s_retention() {
         db.close().unwrap();
     }
 }
+
+/// D315 PR 1: a feed of every table (`Pigeonhole::feed`) follows every table, including one
+/// created after it opened, in commit order with names, and keeps its prefix. It needs the
+/// feed on for every table, takes no `table`, and its history ends at an open with a table
+/// list: a token from before such an open expires.
+#[test]
+fn a_feed_of_every_table_follows_tables_created_later() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("all.phdb");
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let (a, b) = tables(&db);
+    let mut feed = db.feed().open().unwrap();
+    let mut keyed = db.feed().prefix(b"k").open().unwrap();
+    let s1 = a.mutate(b"k1").put("f", b"q", b"1").commit().unwrap();
+    let s2 = b.mutate(b"x2").put("f", b"q", b"2").commit().unwrap();
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("g", Family::default())
+        .create()
+        .unwrap();
+    let s3 = c.mutate(b"k3").put("g", b"q", b"3").commit().unwrap();
+    let got: Vec<(u64, String, String)> = (0..3)
+        .map(|_| {
+            let c = next(&mut feed);
+            let ch = &c.changes()[0];
+            (c.seqno(), ch.table().to_string(), ch.family().to_string())
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (s1.seqno, "a".into(), "f".into()),
+            (s2.seqno, "b".into(), "f".into()),
+            (s3.seqno, "c".into(), "g".into())
+        ]
+    );
+    let keyed: Vec<u64> = (0..2).map(|_| next(&mut keyed).seqno()).collect();
+    assert_eq!(keyed, [s1.seqno, s3.seqno], "the prefix still applies");
+    let token = feed.token();
+
+    // A table is refused: the feed already follows every table.
+    let e = db.feed().table(&a).open().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    drop((feed, a, b, c));
+    db.close().unwrap();
+
+    // An open with a table list: a feed of every table is refused there, and it ends the
+    // history, so the token expires at the next open that feeds every table.
+    let db = Pigeonhole::open(&path, fed().feed_tables(["a"])).unwrap();
+    let e = db.feed().open().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    let a = db.table("a").unwrap().open().unwrap();
+    a.mutate(b"k4").put("f", b"q", b"4").commit().unwrap();
+    drop(a);
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let mut f = db.feed().resume(&token).open().unwrap();
+    let e = f.next(WAIT).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FeedExpired, "{e}");
+    drop(f);
+    db.close().unwrap();
+}

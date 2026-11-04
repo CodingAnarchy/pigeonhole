@@ -63,7 +63,9 @@ pub enum FeedStart {
 /// What a feed follows.
 #[derive(Debug, Clone)]
 pub struct FeedSpec {
-    /// The tables (at least one), each fed by the session.
+    /// The tables, each fed by the session. Empty: every table (D315), including tables
+    /// created after the feed opened; the session must feed every table (the change feed
+    /// on without a table list), and so must every session of its history.
     pub tables: Vec<TableId>,
     /// Only mutations of rows starting with these bytes (empty: every row).
     pub prefix: Vec<u8>,
@@ -345,9 +347,12 @@ impl FeedReader {
         let mut tables = spec.tables;
         tables.sort_unstable();
         tables.dedup();
-        if tables.is_empty() {
+        // Every table (D315): the session must feed every table, not a list of them.
+        if tables.is_empty() && !matches!(fed, FeedTables::All) {
             return Err(Error::InvalidArgument(
-                "a change feed follows at least one table".into(),
+                "a feed of every table needs the change feed on for every table: open \
+                 without a feed table list"
+                    .into(),
             ));
         }
         if let Some(t) = tables.iter().find(|&&t| !fed.contains(t)) {
@@ -949,7 +954,9 @@ impl FeedReader {
                 let m = m?;
                 // The table first, then the row: a mutation outside is skipped by its
                 // lengths, never copied (§2.7).
-                if tables.binary_search(&m.table).is_err() || !m.row.starts_with(prefix) {
+                // An empty list is every table (D315).
+                let followed = tables.is_empty() || tables.binary_search(&m.table).is_ok();
+                if !followed || !m.row.starts_with(prefix) {
                     continue;
                 }
                 out.push(Raw {
@@ -1430,10 +1437,13 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                 tables: fed,
                 ..
             } => {
-                let feeds = tables.iter().all(|&t| match fed {
-                    FeedTables::All => true,
-                    FeedTables::Only(_) => fed.contains(t),
-                });
+                // A feed of every table (an empty list, D315) needs a session that fed every
+                // table: one with a list may have left out any table created since.
+                let feeds = if tables.is_empty() {
+                    matches!(fed, FeedTables::All)
+                } else {
+                    tables.iter().all(|&t| fed.contains(t))
+                };
                 let chained = !broken && last_seq == Some(*opened_at);
                 sessions.push((*session, feeds, *streams, chained));
                 last_seq = Some(*opened_at);
