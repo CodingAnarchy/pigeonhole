@@ -41,6 +41,8 @@ pub(crate) struct Db {
     supervision: Option<crate::recovery::Supervision>,
     /// What a reopen needs: the options and the path (writers with the option on).
     reopen: Option<(Options, PathBuf)>,
+    /// The path the database was opened with, as given ([`Pigeonhole::path`]).
+    path: PathBuf,
     /// `Options::write_stall_timeout`: how long an operation waits for a recovery's swap.
     stall_timeout: Duration,
     /// Transaction outcomes since open (ICR 0061).
@@ -264,8 +266,8 @@ impl Cached {
 const CLOSED: u64 = 1 << 63;
 
 impl Db {
-    fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
-        Self::with_recovery(engine, vfs, max_value, None, Duration::from_secs(30))
+    fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize, path: PathBuf) -> Arc<Self> {
+        Self::with_recovery(engine, vfs, max_value, None, path, Duration::from_secs(30))
     }
 
     /// `new`, supervised when `reopen` names the options and path to recover with and the
@@ -275,6 +277,7 @@ impl Db {
         vfs: VfsRef,
         max_value: usize,
         reopen: Option<(Options, PathBuf)>,
+        path: PathBuf,
         stall_timeout: Duration,
     ) -> Arc<Self> {
         let supervision = reopen
@@ -294,6 +297,7 @@ impl Db {
             max_value,
             supervision,
             reopen,
+            path,
             stall_timeout,
             txn_counts: Default::default(),
             watch_id,
@@ -742,6 +746,7 @@ impl Pigeonhole {
             vfs,
             max_value,
             Some((options, path.as_ref().to_path_buf())),
+            path.as_ref().to_path_buf(),
             stall_timeout,
         );
         if supervised {
@@ -763,7 +768,7 @@ impl Pigeonhole {
         let engine_options = options.to_engine()?;
         let vfs = Arc::clone(&engine_options.vfs);
         let engine = Engine::open_reader(path.as_ref(), engine_options)?;
-        let db = Db::new(engine, vfs, 0);
+        let db = Db::new(engine, vfs, 0, path.as_ref().to_path_buf());
         let cached = Cached::new(&db);
         Ok(PigeonholeReader { db, cached })
     }
@@ -956,7 +961,7 @@ impl Pigeonhole {
                 io_fd_used: std::sync::atomic::AtomicBool::new(false),
             })
             .collect();
-        let db = Db::new(engine, Arc::clone(&vfs), max_value);
+        let db = Db::new(engine, Arc::clone(&vfs), max_value, path.to_path_buf());
         let cached = Cached::new(&db);
         Ok(AppOwned {
             db: Pigeonhole { db, cached },
@@ -1029,6 +1034,25 @@ impl Pigeonhole {
     /// per-database state, such as a registry of open handles, can key on it.
     pub fn same_database(&self, other: &Pigeonhole) -> bool {
         Arc::ptr_eq(&self.db, &other.db)
+    }
+
+    /// Whether the database was closed ([`close`](Self::close), through this handle or any
+    /// clone of it): every operation then fails with
+    /// [`ErrorCode::Closed`](crate::ErrorCode::Closed). Cheap (one atomic load): a library
+    /// that holds a handle, such as a metrics exporter, can check it before reading
+    /// (ICR 0115).
+    pub fn is_closed(&self) -> bool {
+        self.db.check_open().is_err()
+    }
+
+    /// The path this database was opened with, exactly as given to
+    /// [`open`](Self::open) (or [`open_application_owned`](Self::open_application_owned)):
+    /// not canonicalised, so a relative path stays relative (ICR 0115). Every clone of the
+    /// handle reports the same path, and an automatic recovery keeps it. A label for logs
+    /// and metrics (`pigeonhole-otel` names a database by its file name); to tell two
+    /// handles' databases apart, use [`same_database`](Self::same_database).
+    pub fn path(&self) -> &Path {
+        &self.db.path
     }
 
     /// Whether this instance has failed (ICR 0040): a shard's thread panicked, an
@@ -1599,6 +1623,12 @@ impl PigeonholeReader {
     /// does not track allocations.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
         Ok(crate::DatabaseInfo::from_engine(self.engine().info()?))
+    }
+
+    /// The path this reader was opened with, exactly as given to
+    /// [`open_reader`](Pigeonhole::open_reader), not canonicalised (ICR 0115).
+    pub fn path(&self) -> &Path {
+        &self.db.path
     }
 
     /// What this reader's row cache did since it last attached to a writer: hits, misses

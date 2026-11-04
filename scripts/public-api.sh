@@ -15,7 +15,8 @@ case $mode in check|bless) ;; *) echo "usage: $0 [check|bless]" >&2; exit 2 ;; e
 cd "$(dirname "$0")/.."
 status=0
 for entry in pigeonhole:crates/pigeonhole pigeonhole-arrow:crates/arrow pigeonhole-cli:crates/cli \
-  pigeonhole-vector:crates/vector pigeonhole-text:crates/text pigeonhole-memory:crates/memory; do
+  pigeonhole-vector:crates/vector pigeonhole-text:crates/text pigeonhole-memory:crates/memory \
+  pigeonhole-otel:crates/otel; do
   pkg=${entry%%:*}
   snapshot=${entry#*:}/public-api.txt
   listing=$(cargo "+$NIGHTLY" public-api -p "$pkg" -sss --all-features)

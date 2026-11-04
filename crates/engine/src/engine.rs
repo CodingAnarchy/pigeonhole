@@ -105,6 +105,19 @@ pub struct CommitInfo {
     pub durability: Durability,
 }
 
+/// One durability level's commit latency histogram ([`Metrics::commit_latency_buckets`]):
+/// commits per half-power-of-two bucket, bucket `b` starting at
+/// [`Engine::commit_latency_floor(b)`](Engine::commit_latency_floor) nanoseconds. A newtype
+/// because the standard library has no `Default` for arrays this long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyBuckets(pub [u64; 64]);
+
+impl Default for LatencyBuckets {
+    fn default() -> Self {
+        Self([0; 64])
+    }
+}
+
 /// Counters and latencies.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -113,6 +126,10 @@ pub struct Metrics {
     pub commits: [u64; 4],
     /// Commit latency in nanoseconds (p50, p99, p99.9) per durability level.
     pub commit_latency_nanos: [[u64; 3]; 4],
+    /// The commit latency histograms those percentiles come from, per durability level,
+    /// summed over shards since open: [`Engine::commit_latency_buckets`]'s buckets, read in
+    /// the same pass (ICR 0115).
+    pub commit_latency_buckets: [LatencyBuckets; 4],
     /// Flushes completed.
     pub flushes: u64,
     /// Compactions completed.
@@ -3169,6 +3186,7 @@ impl Engine {
                     *h += s.latency[d][b].load(Ordering::Relaxed);
                 }
             }
+            m.commit_latency_buckets[d] = LatencyBuckets(hist);
             let total: u64 = hist.iter().sum();
             if total > 0 {
                 for (i, q) in [0.5, 0.99, 0.999].into_iter().enumerate() {

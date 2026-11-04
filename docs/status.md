@@ -127,7 +127,8 @@ Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
 ## On main for 1.2.0
-Nothing has merged for 1.2.0 yet. Its scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). What has merged is listed here as it lands, with the changelog's fragments in [`changelog.d/`](../changelog.d/README.md).
+1.2.0's scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). What has merged is listed here as it lands, with the changelog's fragments in [`changelog.d/`](../changelog.d/README.md).
+- **`pigeonhole-otel`** ([D316](design/decisions/phase-3.md#d316), #1458, ICR 0115): the engine's metrics through OpenTelemetry, to Prometheus, Grafana or an OTLP collector, on its own 0.N version line. It includes the public `LatencyHistogram` behind engine-side commit latency ([Observability](guide/observability.md)). A2–A4 (memtable bytes, group-sync time, feed lag) follow under ICR 0116.
 
 ## Tracked follow-ups
 Deferred work is one GitHub issue each, labeled with its crate and phase and assigned to the phase's milestone (D62). The open list is the milestone itself:

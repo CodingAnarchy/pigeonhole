@@ -1,0 +1,29 @@
+[package]
+name = "pigeonhole-otel"
+description = "Exports Pigeonhole's engine metrics through OpenTelemetry."
+# Its own 0.N line (owner, 2026-11-04: D316 Q1), not the public 1.x line: `register` takes an
+# `opentelemetry::metrics::Meter`, so each opentelemetry minor is a breaking change here. The
+# metric names are stable separately, by D316.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["database", "opentelemetry", "metrics", "prometheus", "embedded"]
+categories = ["database-implementations", "development-tools::profiling"]
+readme = "README.md"
+
+[dependencies]
+pigeonhole = { workspace = true }
+opentelemetry = { workspace = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true }
+# The guide's Prometheus example, and the test that the documented Prometheus names are the
+# exporter's own.
+opentelemetry-prometheus = { workspace = true }
+prometheus = { workspace = true }
+
+[lints]
+workspace = true

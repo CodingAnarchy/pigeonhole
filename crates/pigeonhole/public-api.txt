@@ -364,6 +364,7 @@ pub pigeonhole::EngineMetrics::unpinned_reason: core::option::Option<&'static st
 pub pigeonhole::EngineMetrics::write_stall_nanos: u64
 pub pigeonhole::EngineMetrics::write_stalls: u64
 impl pigeonhole::EngineMetrics
+pub fn pigeonhole::EngineMetrics::commit_latency(&self, pigeonhole::Durability) -> pigeonhole::LatencyHistogram
 pub fn pigeonhole::EngineMetrics::commits(&self, pigeonhole::Durability) -> pigeonhole::CommitStats
 pub struct pigeonhole::Error
 impl pigeonhole::Error
@@ -520,6 +521,17 @@ pub fn pigeonhole::KeysRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::KeysRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::KeysRead<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
 pub fn pigeonhole::KeysRead<'t>::versions(self, u32) -> Self
+pub struct pigeonhole::LatencyHistogram
+impl pigeonhole::LatencyHistogram
+pub const pigeonhole::LatencyHistogram::BUCKETS: usize
+pub fn pigeonhole::LatencyHistogram::bucket_lower_nanos(usize) -> u64
+pub fn pigeonhole::LatencyHistogram::bucket_upper_nanos(usize) -> core::option::Option<u64>
+pub fn pigeonhole::LatencyHistogram::counts(&self) -> &[u64]
+pub fn pigeonhole::LatencyHistogram::quantile_upper_nanos(&self, f64) -> core::option::Option<u64>
+pub fn pigeonhole::LatencyHistogram::since(&self, &pigeonhole::LatencyHistogram) -> pigeonhole::LatencyHistogram
+pub fn pigeonhole::LatencyHistogram::total(&self) -> u64
+impl core::default::Default for pigeonhole::LatencyHistogram
+pub fn pigeonhole::LatencyHistogram::default() -> Self
 #[non_exhaustive] pub struct pigeonhole::LevelInfo
 pub pigeonhole::LevelInfo::bytes: u64
 pub pigeonhole::LevelInfo::entries: u64
@@ -604,10 +616,12 @@ pub fn pigeonhole::Pigeonhole::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::Pigeonhole::flush(&self) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
 pub fn pigeonhole::Pigeonhole::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
+pub fn pigeonhole::Pigeonhole::is_closed(&self) -> bool
 pub fn pigeonhole::Pigeonhole::is_failed(&self) -> bool
 pub fn pigeonhole::Pigeonhole::open(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::Pigeonhole>
 pub fn pigeonhole::Pigeonhole::open_application_owned(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::AppOwned>
 pub fn pigeonhole::Pigeonhole::open_reader(impl core::convert::AsRef<std::path::Path>, pigeonhole::ReaderOptions) -> pigeonhole::Result<pigeonhole::PigeonholeReader>
+pub fn pigeonhole::Pigeonhole::path(&self) -> &std::path::Path
 pub fn pigeonhole::Pigeonhole::pinned_shard_cpus(&self) -> alloc::vec::Vec<usize>
 pub fn pigeonhole::Pigeonhole::recovery_stats(&self) -> pigeonhole::RecoveryStats
 pub fn pigeonhole::Pigeonhole::row_cache_stats(&self) -> pigeonhole::RowCacheStats
@@ -633,6 +647,7 @@ pub fn pigeonhole::PigeonholeReader::durable_snapshot(&self) -> pigeonhole::Resu
 pub fn pigeonhole::PigeonholeReader::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::PigeonholeReader::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
 pub fn pigeonhole::PigeonholeReader::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
+pub fn pigeonhole::PigeonholeReader::path(&self) -> &std::path::Path
 pub fn pigeonhole::PigeonholeReader::row_cache_stats(&self) -> pigeonhole::RowCacheStats
 pub fn pigeonhole::PigeonholeReader::snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
 pub fn pigeonhole::PigeonholeReader::table(&self, &str) -> pigeonhole::Result<pigeonhole::ReadTable>
