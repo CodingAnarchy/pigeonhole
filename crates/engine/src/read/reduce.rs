@@ -19,14 +19,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pigeonhole_format::key::{Escaped, TERMINATOR, encode_row_prefix};
-use pigeonhole_format::{FamilyId, TableId, Timestamp};
+use pigeonhole_format::{Cursor, FamilyId, TableId, Timestamp};
 
 use super::keys::{KeyCursor, KeyGroup, KeySet, key_groups};
 use super::{
-    FORK_CHECK_ROWS, Lane, MergeKind, ReadSpec, clamp_into, give_back, past_row, row_of,
-    skips_columns, take_scan_resolver,
+    FORK_CHECK_ROWS, Lane, LaneValue, MergeKind, ReadSpec, clamp_into, column_of, give_back,
+    past_row, row_of, skips_columns, take_scan_resolver,
 };
-use crate::snapshot::{Snapshot, TabletEntry, View};
+use crate::catalog::FamilyMeta;
+use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
+use crate::source::{Located, Pinned, Source};
 use crate::{ColumnPosition, Error, Result};
 
 /// A row range on unescaped row keys, `(start, end)`.
@@ -263,6 +265,8 @@ pub struct ReduceStats {
     pub cells: u64,
     /// Threads used (1 when the read ran on the caller's thread).
     pub threads: u64,
+    /// Lanes read straight from their one SST, with nothing to resolve (#1283 lever 3).
+    pub plain_lanes: u64,
 }
 
 impl ReduceStats {
@@ -270,6 +274,7 @@ impl ReduceStats {
         self.groups += o.groups;
         self.rows += o.rows;
         self.cells += o.cells;
+        self.plain_lanes += o.plain_lanes;
     }
 }
 
@@ -450,21 +455,20 @@ impl Resume {
 
     /// Positions the lane of family rank `rank`, pending in the position's row (escaped as
     /// `row_esc`), as the resume says: dropped from the row, moved past the column, or left.
-    pub(super) fn apply(&self, lane: &mut Lane, rank: u32, row_esc: &[u8]) -> Result<()> {
+    pub(super) fn apply<L: ReduceLane>(
+        &self,
+        lane: &mut L,
+        rank: u32,
+        row_esc: &[u8],
+    ) -> Result<()> {
         if !in_row(lane, row_esc) {
             return Ok(());
         }
         match rank.cmp(&self.rank) {
-            std::cmp::Ordering::Less => {
-                lane.pending = false;
-                lane.resolver.skip_row()
-            }
+            std::cmp::Ordering::Less => lane.drop_row(),
             std::cmp::Ordering::Equal => {
                 if lane.col() < self.past.as_slice() {
-                    lane.pending = false;
-                    lane.pinned = None;
-                    lane.resolver.seek(&self.past)?;
-                    lane.fetch()?;
+                    lane.reseek(&self.past)?;
                 }
                 Ok(())
             }
@@ -473,9 +477,259 @@ impl Resume {
     }
 }
 
+/// A lane `visit_lanes` reads: a [`Lane`] (through the MVCC resolver), or a [`PlainLane`]
+/// (#1283 lever 3). A group reads through one kind only, so each is its own instance of the
+/// loop, and neither pays a dispatch per cell.
+pub(super) trait ReduceLane {
+    /// The lane's family.
+    fn family(&self) -> FamilyId;
+    /// A cell is held (fetched, not yet handed on).
+    fn pending(&self) -> bool;
+    /// No cell is left.
+    fn done(&self) -> bool;
+    /// The held cell's timestamp.
+    fn ts(&self) -> Timestamp;
+    /// Moves to the next visible cell.
+    fn fetch(&mut self) -> Result<()>;
+    /// The held cell's column prefix (only while pending).
+    fn col(&self) -> &[u8];
+    /// The held cell's stored value (only while pending).
+    fn value(&self) -> &[u8];
+    /// Drops the held cell and the rest of its row.
+    fn drop_row(&mut self) -> Result<()>;
+    /// Drops the held cell and holds the first visible one at or after `key`.
+    fn reseek(&mut self, key: &[u8]) -> Result<()>;
+}
+
+impl ReduceLane for Lane {
+    #[inline]
+    fn family(&self) -> FamilyId {
+        self.family
+    }
+    #[inline]
+    fn pending(&self) -> bool {
+        self.pending
+    }
+    #[inline]
+    fn done(&self) -> bool {
+        self.done
+    }
+    #[inline]
+    fn ts(&self) -> Timestamp {
+        self.ts
+    }
+    #[inline]
+    fn fetch(&mut self) -> Result<()> {
+        Lane::fetch(self)
+    }
+    #[inline]
+    fn col(&self) -> &[u8] {
+        Lane::col(self)
+    }
+    #[inline]
+    fn value(&self) -> &[u8] {
+        Lane::value(self)
+    }
+    fn drop_row(&mut self) -> Result<()> {
+        self.pending = false;
+        self.resolver.skip_row()
+    }
+    fn reseek(&mut self, key: &[u8]) -> Result<()> {
+        self.pending = false;
+        self.pinned = None;
+        self.resolver.seek(key)?;
+        Lane::fetch(self)
+    }
+}
+
+/// A lane over the one SST source of its family in the tablet, when nothing in it needs the
+/// MVCC resolver (#1283 lever 3, [`plain_lane`]). A column's first entry in key order is
+/// then its version (newest timestamp, then newest seqno), so the lane takes it from the
+/// block as it lies and steps past the column's older entries: no merge, group walk or copy.
+struct PlainLane {
+    family: FamilyId,
+    src: Source,
+    /// The view's SSTs and blob files, to read separated values.
+    ssts: Arc<SstSet>,
+    /// The column prefix of the cell last taken: an entry still in it is an older version.
+    col: Vec<u8>,
+    /// The group's end (an encoded row prefix), as `CellResolver::set_upper_bound`.
+    hi: Option<Vec<u8>>,
+    /// The source is on the held cell (it moves past it on the next fetch).
+    held: bool,
+    ts: Timestamp,
+    /// A separated value, read from its blob file.
+    pinned: Option<LaneValue>,
+    pending: bool,
+    done: bool,
+}
+
+impl PlainLane {
+    /// The lane `lane` (opened by `open_lanes`, plain by [`plain_lane`]) as a plain one: its
+    /// SST source, seeked to the group's start. The resolver goes back to the pool.
+    fn from_lane(mut lane: Lane, g: &Group<'_>) -> Result<PlainLane> {
+        let mut sources = std::mem::take(lane.resolver.cursor_mut().sources_mut());
+        give_back(lane.resolver);
+        // The empty memtables' sources go (`plain_lane` checked they hold nothing).
+        sources.retain(|s| matches!(s, Source::Sst(_)));
+        let mut src = sources.pop().expect("plain_lane checked one SST source");
+        src.seek(g.lo.as_deref().unwrap_or(&[]))?;
+        Ok(PlainLane {
+            family: lane.family,
+            src,
+            ssts: lane.ssts,
+            col: Vec::new(),
+            hi: g.hi.clone(),
+            held: false,
+            ts: 0,
+            pinned: None,
+            pending: false,
+            done: false,
+        })
+    }
+}
+
+impl ReduceLane for PlainLane {
+    #[inline]
+    fn family(&self) -> FamilyId {
+        self.family
+    }
+    #[inline]
+    fn pending(&self) -> bool {
+        self.pending
+    }
+    #[inline]
+    fn done(&self) -> bool {
+        self.done
+    }
+    #[inline]
+    fn ts(&self) -> Timestamp {
+        self.ts
+    }
+    fn fetch(&mut self) -> Result<()> {
+        self.pending = false;
+        self.pinned = None;
+        if self.done {
+            return Ok(());
+        }
+        if std::mem::take(&mut self.held) {
+            self.src.next()?;
+        }
+        while self.src.valid() {
+            let key = self.src.key();
+            if self.hi.as_deref().is_some_and(|hi| key >= hi) {
+                break;
+            }
+            let (col, ts, _, kind) = pigeonhole_format::key::split_suffix(key)?;
+            if col == self.col.as_slice() {
+                // An older version of the column just taken.
+                self.src.next()?;
+                continue;
+            }
+            if kind != pigeonhole_format::Kind::Put {
+                // `plain_lane` checked the SSTs hold no deletes, and the family no operands.
+                return Err(Error::Corruption(
+                    "an entry other than a put in an SST counted without deletes or operands"
+                        .into(),
+                ));
+            }
+            self.col.clear();
+            self.col.extend_from_slice(col);
+            self.held = true;
+            self.ts = ts;
+            if let Some(v) = self.ssts.read_blob(self.src.value())? {
+                self.pinned = Some(LaneValue::Pinned(Pinned::Block(v)));
+            }
+            self.pending = true;
+            return Ok(());
+        }
+        self.done = true;
+        Ok(())
+    }
+    #[inline]
+    fn col(&self) -> &[u8] {
+        column_of(self.src.key())
+    }
+    #[inline]
+    fn value(&self) -> &[u8] {
+        match &self.pinned {
+            Some(v) => v,
+            None => self.src.value(),
+        }
+    }
+    fn drop_row(&mut self) -> Result<()> {
+        // The source is on the held cell, in the row: skip from there.
+        self.pending = false;
+        self.held = false;
+        self.src.skip_row()
+    }
+    fn reseek(&mut self, key: &[u8]) -> Result<()> {
+        self.pending = false;
+        self.held = false;
+        self.col.clear();
+        self.src.seek(key)?;
+        self.fetch()
+    }
+}
+
+/// Whether a lane with `sources` (filled for `located` with `filter`) and options `opts` can
+/// read plain ([`PlainLane`]) at read point `snapshot`. Checked once, when the lane opens
+/// (simp724's review on #1283):
+/// 1. one SST source (an SST, or one level's SSTs), and every memtable of the family here
+///    empty. `scan_sources_located` adds a source for every memtable, the empty active one
+///    included; one empty when the lane opens holds nothing at or below the read point,
+///    since every commit there applied before the read point became visible;
+/// 2. no delete entries (cell, column or family: `SstMeta::deletes` counts every kind) in
+///    any of the family's SSTs here;
+/// 3. every entry at or below the read point;
+/// 4. a standard or vector family (plain puts) with no merge operator, known or not;
+/// 5. one version, no time range (the resolver's or the filter's), no column limit and no
+///    value predicate;
+/// 6. no TTL.
+fn plain_lane(
+    located: &Located<'_>,
+    meta: &FamilyMeta,
+    opts: &pigeonhole_compaction::ResolveOptions,
+    filter: &pigeonhole_format::scan::ScanFilter,
+    sources: &[Source],
+    snapshot: pigeonhole_format::Seqno,
+) -> bool {
+    let Some(ssts) = located.ssts else {
+        return false;
+    };
+    sources.iter().filter(|s| matches!(s, Source::Sst(_))).count() == 1
+        && located
+            .mems
+            .is_none_or(|m| m.readers.iter().all(|r| r.is_empty()))
+        && ssts
+            .iter()
+            .all(|s| s.meta.deletes == 0 && s.meta.seqno_range.1 <= snapshot)
+        // A kind added later stays out until listed here.
+        && matches!(
+            meta.options.kind,
+            pigeonhole_format::manifest::FamilyKind::Standard
+                | pigeonhole_format::manifest::FamilyKind::Vector
+        )
+        // `merge_op` alone is also `None` for an operator this build doesn't know
+        // (`MergeKind::Unknown`), whose operands are still there.
+        && meta.merge == MergeKind::None
+        && meta.merge_op.is_none()
+        && meta.options.ttl_micros == 0
+        && opts.versions == 1
+        && opts.time_range.is_none()
+        && filter.time_range.is_none()
+        && opts.columns_per_row == 0
+        && opts.value.is_none()
+}
+
 /// Opens the group's lanes, one per family with data in the tablet's range, each seeked to
 /// the group's start: [`super::ScanCursor`]'s tablet opening, for one tablet.
-fn open_lanes(ctx: &Ctx<'_>, g: &Group<'_>, lanes: &mut Vec<Lane>) -> Result<()> {
+fn open_lanes(
+    ctx: &Ctx<'_>,
+    g: &Group<'_>,
+    lanes: &mut Vec<Lane>,
+    plain: &mut Vec<bool>,
+) -> Result<()> {
     let view = &ctx.snapshot.view;
     for &family in ctx.families {
         let located = view.locate(g.tablet.shard, g.tablet.id, family);
@@ -505,6 +759,14 @@ fn open_lanes(ctx: &Ctx<'_>, g: &Group<'_>, lanes: &mut Vec<Lane>) -> Result<()>
             continue;
         }
         opts.skip_columns = skips_columns(resolver.cursor_mut().sources());
+        plain.push(plain_lane(
+            &located,
+            meta,
+            &opts,
+            &filter,
+            resolver.cursor_mut().sources(),
+            ctx.snapshot.seqno,
+        ));
         resolver.cursor_mut().reset();
         resolver.reset(opts);
         resolver.set_upper_bound(g.hi.as_deref());
@@ -536,8 +798,8 @@ fn rank_of(families: &[FamilyId], family: FamilyId) -> u32 {
 }
 
 /// Whether the lane's pending cell is in the row whose escaped key is `row_esc`.
-pub(super) fn in_row(lane: &Lane, row_esc: &[u8]) -> bool {
-    if !lane.pending {
+pub(super) fn in_row<L: ReduceLane>(lane: &L, row_esc: &[u8]) -> bool {
+    if !lane.pending() {
         return false;
     }
     let col = lane.col();
@@ -546,11 +808,10 @@ pub(super) fn in_row(lane: &Lane, row_esc: &[u8]) -> bool {
 }
 
 /// Drops the rest of the row in every lane (a seek past it).
-fn skip_row(lanes: &mut [Lane], row_esc: &[u8]) -> Result<()> {
+fn skip_row<L: ReduceLane>(lanes: &mut [L], row_esc: &[u8]) -> Result<()> {
     for lane in lanes {
         if in_row(lane, row_esc) {
-            lane.pending = false;
-            lane.resolver.skip_row()?;
+            lane.drop_row()?;
         }
     }
     Ok(())
@@ -570,13 +831,34 @@ where
 {
     ctx.snapshot.check_process()?;
     let mut lanes = Vec::new();
-    let opened = open_lanes(ctx, g, &mut lanes);
+    let mut plain = Vec::new();
+    let opened = open_lanes(ctx, g, &mut lanes, &mut plain);
     // Each lane's family position in the read's family order, once per group (perf287's
     // nit on #1209: not a search per cell).
     let ranks: Vec<u32> = lanes
         .iter()
         .map(|l| rank_of(ctx.families, l.family))
         .collect();
+    if opened.is_ok() && !lanes.is_empty() && plain.iter().all(|p| *p) {
+        // Every lane plain (#1283 lever 3): the group reads through `PlainLane`s, a second
+        // instance of `visit_lanes`, so neither kind of lane pays for the other per cell.
+        let mut plains = Vec::with_capacity(lanes.len());
+        let mut moved = Ok(());
+        for lane in lanes {
+            match moved.and_then(|()| PlainLane::from_lane(lane, g)) {
+                Ok(p) => {
+                    plains.push(p);
+                    moved = Ok(());
+                }
+                Err(e) => moved = Err(e),
+            }
+        }
+        stats.plain_lanes += plains.len() as u64;
+        let read =
+            moved.and_then(|()| visit_lanes(ctx, g, &mut plains, &ranks, visitor, reducer, stats));
+        stats.groups += 1;
+        return ctx.snapshot.checked(read);
+    }
     let read =
         opened.and_then(|()| visit_lanes(ctx, g, &mut lanes, &ranks, visitor, reducer, stats));
     for lane in lanes {
@@ -588,10 +870,10 @@ where
     ctx.snapshot.checked(read)
 }
 
-fn visit_lanes<V, R>(
+fn visit_lanes<V, R, L>(
     ctx: &Ctx<'_>,
     g: &Group<'_>,
-    lanes: &mut [Lane],
+    lanes: &mut [L],
     ranks: &[u32],
     visitor: &mut V,
     reducer: &mut R,
@@ -600,6 +882,7 @@ fn visit_lanes<V, R>(
 where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
+    L: ReduceLane,
 {
     let (mut row_esc, mut row, mut qualifier) = (Vec::new(), Vec::new(), Vec::new());
     loop {
@@ -607,14 +890,14 @@ where
             return Ok(false);
         }
         for lane in lanes.iter_mut() {
-            if !lane.pending && !lane.done {
+            if !lane.pending() && !lane.done() {
                 lane.fetch()?;
             }
         }
         // The smallest pending row across lanes.
         let Some(best) = lanes
             .iter()
-            .filter(|l| l.pending)
+            .filter(|l| l.pending())
             .map(|l| row_of(l.col()))
             .min()
         else {
@@ -664,7 +947,7 @@ where
                 }
                 stats.cells += 1;
                 let q: &[u8] = if V::QUALIFIER { &qualifier } else { &[] };
-                let visit = visitor.visit(&row, lane.family, q, lane.ts, lane.value());
+                let visit = visitor.visit(&row, lane.family(), q, lane.ts(), lane.value());
                 let (item, after) = match visit {
                     Visit::Skip => (None, None),
                     Visit::Emit(item) => (Some(item), None),
@@ -683,9 +966,9 @@ where
                     let cell = CellRef {
                         row: &row,
                         family_rank,
-                        family: lane.family,
+                        family: lane.family(),
                         qualifier: &qualifier,
-                        ts: lane.ts,
+                        ts: lane.ts(),
                     };
                     if reducer.push(cell, item).is_break() {
                         return Ok(true);

@@ -73,6 +73,7 @@ mod milestone_b;
 mod network_fs;
 mod open_cost;
 mod pager_growth;
+mod plain_lane;
 mod poisoned_flush_barrier;
 mod purge_bound;
 mod purge_race;
