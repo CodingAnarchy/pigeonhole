@@ -465,53 +465,74 @@ impl Store {
 
     /// Calls `f` with each memory after `after` (all, from the start, with `None`), in key
     /// order, with what forgetting reads of it, until `f` returns `false`.
+    ///
+    /// It reads in pages of [`SCAN_PAGE`] rows, each with its own iterator, dropped before
+    /// the next page starts after the last row read (#1507). An iterator holds its view
+    /// while it lives, and a view pins the memtables it can read. One iterator for a whole
+    /// pass over a large store kept flushed memtables from being reused, so writers waited
+    /// for room (#1477, #1506). A pass needs no single snapshot: each nominated memory is
+    /// evaluated again in its own transaction before it's deleted ([`Store::forget_with`]).
     fn scan_memories(
         &self,
         after: Option<&[u8]>,
         mut f: impl FnMut(&MemoryId, &Facts) -> Result<bool>,
     ) -> Result<()> {
         use std::ops::Bound;
-        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut it = self
-            .table()
-            .scan_bounds(start, Bound::Unbounded)
-            .families([CONTENT, META, STATS, PEAK])
-            .iter()?;
-        while let Some(r) = it.next_ref()? {
-            let Some(id) = MemoryId::from_row(r.key()) else {
-                continue;
-            };
-            if r.get(CONTENT, TEXT).is_none() {
-                continue;
+        let mut resume: Option<Vec<u8>> = after.map(<[u8]>::to_vec);
+        loop {
+            let start = resume.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+            let mut it = self
+                .table()
+                .scan_bounds(start, Bound::Unbounded)
+                .families([CONTENT, META, STATS, PEAK])
+                .limit(SCAN_PAGE)
+                .iter()?;
+            let mut rows = 0;
+            while let Some(r) = it.next_ref()? {
+                rows += 1;
+                resume = Some(r.key().to_vec());
+                let Some(id) = MemoryId::from_row(r.key()) else {
+                    continue;
+                };
+                if r.get(CONTENT, TEXT).is_none() {
+                    continue;
+                }
+                let kind = match r.get(META, KIND).and_then(|c| c.value().first().copied()) {
+                    Some(c) => Kind::from_code(c)?,
+                    None => Kind::Episodic,
+                };
+                let facts = Facts {
+                    created: id.created_us(),
+                    kind,
+                    importance: r
+                        .get(PEAK, IMPORTANCE)
+                        .and_then(|c| c.as_i64())
+                        .map_or(0.0, |p| p as f64 / PPM),
+                    uses: r
+                        .get(STATS, USES)
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0)
+                        .max(0) as u64,
+                    last_used: r
+                        .get(PEAK, LAST_USED)
+                        .and_then(|c| c.as_i64())
+                        .map(|v| v.max(0) as u64),
+                };
+                if !f(&id, &facts)? {
+                    return Ok(());
+                }
             }
-            let kind = match r.get(META, KIND).and_then(|c| c.value().first().copied()) {
-                Some(c) => Kind::from_code(c)?,
-                None => Kind::Episodic,
-            };
-            let facts = Facts {
-                created: id.created_us(),
-                kind,
-                importance: r
-                    .get(PEAK, IMPORTANCE)
-                    .and_then(|c| c.as_i64())
-                    .map_or(0.0, |p| p as f64 / PPM),
-                uses: r
-                    .get(STATS, USES)
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0)
-                    .max(0) as u64,
-                last_used: r
-                    .get(PEAK, LAST_USED)
-                    .and_then(|c| c.as_i64())
-                    .map(|v| v.max(0) as u64),
-            };
-            if !f(&id, &facts)? {
-                break;
+            if rows < SCAN_PAGE {
+                return Ok(());
             }
         }
-        Ok(())
     }
 }
+
+/// Rows one page of a forgetting pass's scan reads with one iterator (#1507): enough that a
+/// page's setup is noise beside its rows, few enough that its view lives a few
+/// milliseconds.
+const SCAN_PAGE: u64 = 256;
 
 #[derive(Debug, Default)]
 struct State {
