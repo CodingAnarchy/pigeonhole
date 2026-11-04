@@ -984,16 +984,20 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .cloned()
         .collect();
     let catalog_held = shared.feed.is_some() && !catalog_edits.is_empty();
-    catalog.counters.seqno_ceiling = match &shared.feed {
-        Some(feed) if catalog_held => {
-            let ceiling = shared.clock.hold_catalog(&shared.shm);
-            feed.stage_catalog(ceiling, catalog_edits);
-            ceiling
-        }
-        _ => shared.clock.next_seqno(),
+    catalog.counters.seqno_ceiling = if catalog_held {
+        shared.clock.hold_catalog(&shared.shm)
+    } else {
+        shared.clock.next_seqno()
     };
     // D271: every default timestamp comes from the one allocator, at or below its `H`.
     catalog.counters.ts_floor = shared.clock.last_ts().max(catalog.counters.ts_floor);
+    if catalog_held && let Some(feed) = &shared.feed {
+        feed.stage_catalog(
+            catalog.counters.seqno_ceiling,
+            catalog.counters.ts_floor,
+            catalog_edits,
+        );
+    }
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);

@@ -367,7 +367,7 @@ pub(crate) struct Feed {
     /// it, before its root commit, and appended as a `Catalog` sidecar entry just before that
     /// commit's Root entry. Taken by the root-commit observer, or dropped by
     /// `unstage_catalog` if the commit failed. Root commits never overlap, so one slot.
-    staged_catalog: Mutex<Option<(u64, Vec<pigeonhole_format::manifest::Edit>)>>,
+    staged_catalog: Mutex<Option<(u64, u64, Vec<Edit>)>>,
     /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
@@ -645,11 +645,12 @@ impl Feed {
             let Some(s) = sidecar.as_mut() else {
                 return;
             };
-            if let Some((seqno_ceiling, edits)) = staged
+            if let Some((seqno_ceiling, timestamp, edits)) = staged
                 && let Err(e) = s.append(&FeedEntry::Catalog {
                     session: self.session,
                     sequence,
                     seqno_ceiling,
+                    timestamp,
                     edits,
                 })
             {
@@ -670,17 +671,13 @@ impl Feed {
         self.request_sidecar_sync(file);
     }
 
-    /// Stages a catalog change's ceiling and edits for its root commit's `Catalog` entry
-    /// (D315), before that commit.
-    pub(crate) fn stage_catalog(
-        &self,
-        ceiling: u64,
-        edits: Vec<pigeonhole_format::manifest::Edit>,
-    ) {
+    /// Stages a catalog change's ceiling, timestamp floor and edits for its root commit's
+    /// `Catalog` entry (D315), before that commit.
+    pub(crate) fn stage_catalog(&self, ceiling: u64, timestamp: u64, edits: Vec<Edit>) {
         *self
             .staged_catalog
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, edits));
+            .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, timestamp, edits));
     }
 
     /// Drops a staged catalog change whose root commit didn't happen (D315).

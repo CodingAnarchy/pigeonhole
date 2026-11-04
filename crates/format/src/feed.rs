@@ -170,6 +170,9 @@ pub enum FeedEntry {
         sequence: u64,
         /// The manifest commit's `seqno_ceiling`: every seqno assigned before it is below.
         seqno_ceiling: u64,
+        /// The manifest commit's `ts_floor`: every default timestamp assigned before it is at
+        /// most this (D271's `H`).
+        timestamp: u64,
         /// The commit's catalog edits, in the order they applied: `CreateTable`,
         /// `PutFamily` and `DropTable`, in the manifest's own encoding (FORMAT §9.3).
         edits: Vec<Edit>,
@@ -227,12 +230,14 @@ impl FeedEntry {
                 session,
                 sequence,
                 seqno_ceiling,
+                timestamp,
                 edits,
             } => {
                 p.push(4);
                 p.extend_from_slice(&session.to_le_bytes());
                 p.extend_from_slice(&sequence.to_le_bytes());
                 p.extend_from_slice(&seqno_ceiling.to_le_bytes());
+                p.extend_from_slice(&timestamp.to_le_bytes());
                 p.extend_from_slice(&(edits.len() as u32).to_le_bytes());
                 for e in edits {
                     e.encode(&mut p);
@@ -287,7 +292,8 @@ impl FeedEntry {
             },
             3 => FeedEntry::Unfed { sequence: r.u64()? },
             4 => {
-                let (session, sequence, seqno_ceiling) = (r.u64()?, r.u64()?, r.u64()?);
+                let (session, sequence, seqno_ceiling, timestamp) =
+                    (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
                 let n = r.u32()? as usize;
                 let mut rest = r.rest();
                 let mut edits = Vec::with_capacity(n.min(64));
@@ -307,6 +313,7 @@ impl FeedEntry {
                     session,
                     sequence,
                     seqno_ceiling,
+                    timestamp,
                     edits,
                 });
             }

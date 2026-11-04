@@ -705,6 +705,7 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
         sequence,
         seqno_ceiling,
         edits,
+        ..
     } = &entries[at]
     else {
         unreachable!()

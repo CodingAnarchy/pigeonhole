@@ -669,6 +669,7 @@ fn feed_sidecar_catalog() {
             session: 0x0123_4567_89ab_cdef,
             sequence: 42,
             seqno_ceiling: 1000,
+            timestamp: 1_767_225_600_000_000,
             edits: vec![
                 Edit::CreateTable {
                     table: TableId(7),
@@ -700,7 +701,7 @@ fn feed_sidecar_catalog() {
     // A newer build's edit (an unknown tag, length-prefixed as every edit is) inside a
     // Catalog entry: the entry is unknown, and the Root entry after it still decodes.
     let mut payload = vec![4u8];
-    for v in [1u64, 43, 2000] {
+    for v in [1u64, 43, 2000, 1_767_225_600_000_001] {
         payload.extend_from_slice(&v.to_le_bytes());
     }
     payload.extend_from_slice(&1u32.to_le_bytes());

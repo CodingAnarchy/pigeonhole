@@ -589,7 +589,7 @@ Header (40 bytes):
 | Session | `1` | `session` u64 (random, nonzero), `opened_at` u64 (the superblock `sequence` the open read, before any root commit of its own), `retention_bytes` u64, `retention_age_secs` u64 (0 = none), `streams` u32 (WAL streams, the shard count), `all_tables` u8 (1 = every table), `count` u32, then `count` × `table` u32 (zero when `all_tables` is 1) |
 | Root | `2` | `session` u64, `sequence` u64 (the new superblock's) |
 | Unfed | `3` | `sequence` u64 (the superblock `sequence` the open read) |
-| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 (the manifest commit's, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Appended just before that root commit's Root entry, in the same append |
+| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Appended just before that root commit's Root entry, in the same append |
 
 **Torn and unknown entries:**
 - A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
