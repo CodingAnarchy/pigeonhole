@@ -240,8 +240,8 @@ module SourceGem
     # pkg/source is this task's own output; it starts empty each time.
     FileUtils.rm_rf(File.join(RUBY_DIR, "pkg", "source"))
     FileUtils.mkdir_p(STAGE)
-    gemspec = Gem::Specification.load(File.join(RUBY_DIR, "pigeonhole.gemspec"))
-    (gemspec.files + ["pigeonhole.gemspec"]).each do |f|
+    gemspec = Gem::Specification.load(File.join(RUBY_DIR, "pigeonhole-db.gemspec"))
+    (gemspec.files + ["pigeonhole-db.gemspec"]).each do |f|
       FileUtils.mkdir_p(File.join(STAGE, File.dirname(f)))
       FileUtils.cp(File.join(RUBY_DIR, f), File.join(STAGE, f))
     end
@@ -286,7 +286,7 @@ namespace :gem do
     # checkout's gemspec (the Gemfile's `gemspec`) and then the staged one, defining
     # Pigeonhole::VERSION twice (perf2's nit 1 on #1414).
     Bundler.with_unbundled_env do
-      Dir.chdir(SourceGem::STAGE) { sh "gem", "build", "pigeonhole.gemspec" }
+      Dir.chdir(SourceGem::STAGE) { sh "gem", "build", "pigeonhole-db.gemspec" }
     end
   end
 end

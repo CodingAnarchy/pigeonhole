@@ -1,15 +1,16 @@
 name: Publish to RubyGems
 
-# Pushes the pigeonhole gems (ruby-gems.yml: seven precompiled platform gems and the source
+# Pushes the pigeonhole-db gems (ruby-gems.yml: seven precompiled platform gems and the source
 # gem) to RubyGems on a release tag (#697, ICR 0111). Trusted publishing: the push
 # authenticates with this run's OIDC token, so no API key is stored anywhere. The publish job
 # runs in the `rubygems` environment, whose required reviewer (the owner) approves each
-# release before anything is pushed.
+# release before anything is pushed. The gem is `pigeonhole-db` (owner decision 2026-11-04:
+# RubyGems refused `pigeonhole`); it's still required as "pigeonhole".
 #
 # Owner setup, once, before the first release tag:
 #   - Settings → Environments → `rubygems`: add the owner as required reviewer, and limit
 #     deployments to tags matching `v*`.
-#   - rubygems.org: add a (pending) trusted publisher for gem `pigeonhole`: repository
+#   - rubygems.org: add a (pending) trusted publisher for gem `pigeonhole-db`: repository
 #     CodingAnarchy/pigeonhole, workflow publish-rubygems.yml, environment rubygems.
 
 on:
@@ -28,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: rubygems
-      url: https://rubygems.org/gems/pigeonhole
+      url: https://rubygems.org/gems/pigeonhole-db
     permissions:
       contents: read
       id-token: write  # trusted publishing; this job only
@@ -55,7 +56,7 @@ jobs:
           [ "${#gems[@]}" -eq 8 ] || { echo "expected 8 gems (7 platforms + source), got ${#gems[@]}"; exit 1; }
           for g in "${gems[@]}"; do
             case "$(basename "$g")" in
-              pigeonhole-"$version".gem|pigeonhole-"$version"-*.gem) ;;
+              pigeonhole-db-"$version".gem|pigeonhole-db-"$version"-*.gem) ;;
               *) echo "$g does not match version $version"; exit 1 ;;
             esac
           done
@@ -66,5 +67,6 @@ jobs:
       - name: Push the gems
         shell: bash
         run: |
-          for g in pkg/pigeonhole-*-*.gem; do gem push "$g"; done
-          gem push pkg/pigeonhole-"${GITHUB_REF_NAME#v}".gem
+          version="${GITHUB_REF_NAME#v}"
+          for g in pkg/pigeonhole-db-"$version"-*.gem; do gem push "$g"; done
+          gem push pkg/pigeonhole-db-"$version".gem

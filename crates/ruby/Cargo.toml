@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole-ruby"
-description = "Ruby bindings for Pigeonhole (the `pigeonhole` gem), over magnus and rb-sys (#697, ICR 0111)."
+description = "Ruby bindings for Pigeonhole (the `pigeonhole-db` gem), over magnus and rb-sys (#697, ICR 0111)."
 # A workspace of its own (the root workspace excludes it: building it needs a Ruby with headers).
 # These follow the root's `[workspace.package]`; the version is the public line's (D295).
 version = "1.0.0"

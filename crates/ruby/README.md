@@ -1,6 +1,8 @@
-# pigeonhole
+# pigeonhole-db
 
 Ruby bindings for [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole): an embedded, single-file, wide-column store, with BigTable's data model and SQLite's deployment model. The gem binds the Rust crate directly through magnus and rb-sys, with no C layer. Every engine call releases the GVL.
+
+Install it with `gem install pigeonhole-db` (or `gem "pigeonhole-db"` in a Gemfile); you still `require "pigeonhole"`, and the module is `Pigeonhole`.
 
 ```ruby
 require "pigeonhole"

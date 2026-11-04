@@ -3,7 +3,7 @@
 require "rake/testtask"
 require "rake/extensiontask"
 
-GEMSPEC = Gem::Specification.load("pigeonhole.gemspec")
+GEMSPEC = Gem::Specification.load("pigeonhole-db.gemspec")
 
 # rake-compiler drives extconf.rb (beside Cargo.toml), whose `create_rust_makefile` builds
 # this crate (`pigeonhole-ruby`; its library target is `pigeonhole_native`).

@@ -1,15 +1,15 @@
-# 0111: the Ruby API (the `pigeonhole` gem, `require "pigeonhole"`)
+# 0111: the Ruby API (the `pigeonhole-db` gem, `require "pigeonhole"`)
 
 **Status:** Approved (number from the coordinator, 2026-11-03).
 - The owner's decisions on #697 (2026-11-03): magnus and rb-sys directly over the Rust `pigeonhole` crate (D250; the 2026-10-31 note), mirroring the Python crate (D307, ICR 0102).
-  - **O1:** the RubyGems name is `pigeonhole`.
+  - **O1:** the RubyGems name is `pigeonhole-db` (amended by the owner on 2026-11-04: RubyGems refused `pigeonhole` as too similar to `pigeon_hole`, and `pigeonhole-db` matches the PyPI name). The require path stays `"pigeonhole"` and the module stays `Pigeonhole`.
   - **O2:** Ruby 3.3 is the floor.
   - **O3:** `gvl.rs` is the crate's single hand-written `unsafe` exception.
 - The design is cli692's comment on #697 (c6595164923), its O3 amendment, and simp724's G1 and R1–R4, all adopted.
 
 ## The change
 A new crate, `crates/ruby` (`pigeonhole-ruby`, `publish = false` on crates.io), builds the native extension `pigeonhole/pigeonhole_native` with magnus 0.9 and rb-sys. The gem's files sit beside it:
-- `pigeonhole.gemspec`, `Gemfile` and `Rakefile` (rake-compiler);
+- `pigeonhole-db.gemspec`, `Gemfile` and `Rakefile` (rake-compiler);
 - `extconf.rb` (rb_sys's `create_rust_makefile`);
 - `lib/pigeonhole.rb` (the pure-Ruby parts);
 - `sig/pigeonhole.rbs`;
