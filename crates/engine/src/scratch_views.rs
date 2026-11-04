@@ -47,47 +47,47 @@ impl Drop for SnapLive {
 }
 
 /// One line: live views, the oldest one's age, and sampled snapshots older than 50 ms.
+/// One lock at a time, never both (a monitor thread and a shard thread call it).
 pub(crate) fn summary() -> String {
     let now = Instant::now();
-    let v = VIEWS.lock().unwrap();
-    let oldest = v
-        .values()
-        .map(|t| now.duration_since(*t).as_millis())
-        .max()
-        .unwrap_or(0);
-    let old = v
-        .values()
-        .filter(|t| now.duration_since(**t).as_millis() > 50)
-        .count();
-    let s = SNAPS.lock().unwrap();
-    let old_snaps = s
-        .values()
-        .filter(|(t, _)| now.duration_since(*t).as_millis() > 50)
-        .count();
+    let (n, oldest, old) = {
+        let v = VIEWS.lock().unwrap();
+        let ages = v.values().map(|t| now.duration_since(*t).as_millis());
+        (
+            v.len(),
+            ages.clone().max().unwrap_or(0),
+            ages.filter(|a| *a > 50).count(),
+        )
+    };
+    let old_snaps = {
+        let s = SNAPS.lock().unwrap();
+        s.values()
+            .filter(|(t, _)| now.duration_since(*t).as_millis() > 50)
+            .count()
+    };
     format!(
-        "views {} (>50ms {}) oldest ~{} ms, sampled snaps >50ms {}",
-        v.len(),
-        old,
-        oldest / 10 * 10,
-        old_snaps
+        "views {n} (>50ms {old}) oldest ~{} ms, sampled snaps >50ms {old_snaps}",
+        oldest / 10 * 10
     )
 }
 
 /// Prints the sampled snapshots older than 50 ms with their backtraces (at most `n`).
 pub fn scratch_old_snapshots(n: usize) {
     let now = Instant::now();
-    let s = SNAPS.lock().unwrap();
-    let mut old: Vec<_> = s
-        .values()
-        .filter(|(t, _)| now.duration_since(*t).as_millis() > 50)
-        .collect();
+    let line = summary();
+    let mut old: Vec<(Instant, String)> = {
+        let s = SNAPS.lock().unwrap();
+        s.values()
+            .filter(|(t, _)| now.duration_since(*t).as_millis() > 50)
+            .map(|(t, b)| (*t, b.clone()))
+            .collect()
+    };
     old.sort_by_key(|(t, _)| *t);
     eprintln!(
-        "SCRATCH-OLDSNAPS {} sampled snapshots older than 50 ms; {}",
-        old.len(),
-        summary()
+        "SCRATCH-OLDSNAPS {} sampled snapshots older than 50 ms; {line}",
+        old.len()
     );
-    for (t, bt) in old.into_iter().take(n) {
+    for (t, bt) in old.iter().take(n) {
         eprintln!(
             "SCRATCH-OLDSNAP age {} ms:\n{}",
             now.duration_since(*t).as_millis(),
