@@ -4,6 +4,8 @@
 # source-gem job, #697): run from outside the repo, it loads the installed `pigeonhole-db`
 # gem, not lib/, and exercises a write, a read, a scan and a vector search.
 require "pigeonhole"
+# What Bundler.require does for a plain `gem "pigeonhole-db"` line (ai1249 on #1481).
+require "pigeonhole-db"
 require "tmpdir"
 
 abort "loaded #{$LOADED_FEATURES.grep(/pigeonhole\.rb\z/).first}, not an installed gem" unless

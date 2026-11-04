@@ -5,7 +5,7 @@
 The `pigeonhole-db` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
 ## Install
-The gem is **`pigeonhole-db`** (`gem install pigeonhole-db`, or `gem "pigeonhole-db"` in a Gemfile), the same name as the Python package. You still `require "pigeonhole"`, and the module is `Pigeonhole`.
+The gem is **`pigeonhole-db`** (`gem install pigeonhole-db`, or `gem "pigeonhole-db"` in a Gemfile), the same name as the Python package. You still `require "pigeonhole"`, and the module is `Pigeonhole`. `require "pigeonhole-db"` works too, so `Bundler.require` (Rails) loads it from the plain Gemfile line.
 
 Until the gem is published, build it from a checkout (Rust and Bundler needed):
 
