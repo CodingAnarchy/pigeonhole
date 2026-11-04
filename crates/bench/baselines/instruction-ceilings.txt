@@ -281,49 +281,67 @@
 # 10818 -> 10608, commit-at 9769 -> 9532, commit-async 8928 -> 8713, ycsb-a 25940 -> 25844 (its
 # 107-instruction drop is twice its run-to-run spread). Shapes the run lists as lowerable but
 # this change leaves level are left; multi-get-dense's 2 instructions are noise.
-as-written 2028 0.3
-flushed 1842 0.3
-compacted 1240 0.3
+#
+# Lowered by the #1305 ceilings pass (perf2 with perf287, D195) from main c25fedf3's
+# instructions run 41777358043 (workflow_dispatch), with `instruction-ceilings.py lower`:
+# every shape the run lists as lowerable, 30 of them, which takes in the drift of the PRs that
+# merged without lowering (the read and scan shapes, flush and compact, ycsb-c, and the D314
+# shapes by a few instructions). Left out: multi-get-dense and multi-get-sparse, whose spread
+# (20-40, the note beside them) is inside their headroom (#1373). commit-at and ycsb-a weren't
+# lowerable. counter keeps its permanent 0.5%.
+as-written 1936 0.3
+flushed 1692 0.3
+compacted 1216 0.3
 get-mem 5699 0.1
-get-sst 17360 0.5
-get-miss 4190 0.3
-row 2475 1.0
-scan 1358 0.3
-scan-filtered 5776 0.3
-versions 5536 0.3
-counter 9388 0.5
-rows 19655 0.3
-level-scans 14015 0.6
-short-scans 13564 0.3
+get-sst 16701 0.5
+get-miss 3402 0.3
+row 2373 1.0
+scan 1290 0.3
+scan-filtered 5445 0.3
+versions 5290 0.3
+counter 8661 0.5
+rows 18847 0.3
+level-scans 13814 0.6
+short-scans 13068 0.3
 commit-one 8589 0.3
-commit-sixteen 36529 0.3
-flush 2199 0.3
-compact 2783 0.5
-ycsb-c 43293 1.0
+commit-sixteen 36382 0.3
+flush 2087 0.3
+compact 2615 0.5
+ycsb-c 41605 1.0
+# ycsb-a (#1305): identical code is usually flat, with occasional outliers up to about 40 per
+# unit (0.16%) from the commit handoff (Signal::wake_target / park_for_reply), inside its 1.0%
+# headroom. Re-run once before treating a delta within 40 in the PR's base-vs-head table as cost.
 ycsb-a 25844 1.0
 commit-overwrite 10608 0.5
+# commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
+# wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
+# before treating a delta within 10 in the PR's base-vs-head table as cost.
 commit-at 9532 0.3
-scan-narrow 1398 0.3
-scan-small 1374 0.3
-scan-wide 1296 0.3
+scan-narrow 1381 0.3
+scan-small 1358 0.3
+scan-wide 1279 0.3
 commit-async 8713 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
-commit-incr 12711 0.3
-commit-incr-returning 17520 0.3
-commit-incr-returning-spread 34624 0.5
-scan-narrow-q1 5277 0.3
-scan-wide-q10 1784 0.3
-scan-wide-q1 14326 0.3
-scan-interleaved 3394 0.3
-wide-row-cells 1506 0.3
+commit-incr 12706 0.3
+commit-incr-returning 17519 0.3
+commit-incr-returning-spread 34610 0.5
+scan-narrow-q1 5053 0.3
+scan-wide-q10 1744 0.3
+scan-wide-q1 13395 0.3
+scan-interleaved 3176 0.3
+wide-row-cells 1505 0.3
 wide-row-pages 1520 0.3
+# multi-get-dense, multi-get-sparse (#1305): identical code reads 20-40 per unit apart (glibc
+# __memcmp_avx2_movbe's path depends on where the compared bytes lie; removing the call is
+# #1373), inside their 0.5% headroom (about 63 and 85). Left out of #1305's tightening. Re-run
+# once before treating a delta within 40 in the PR's base-vs-head table as cost.
 multi-get-dense 12568 0.5
 multi-get-sparse 17108 0.5
 knn-exact 1069 0.3
 knn-filtered 2740 0.3
-scan-budget 3342 0.3
-scan-budget-twin 1374 0.3
+scan-budget 3341 0.3
+scan-budget-twin 1370 0.3
 knn-exact-f16 1368 0.3
 knn-exact-bf16 1084 0.3
 knn-budget 1069 0.3
