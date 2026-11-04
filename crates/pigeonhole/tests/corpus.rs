@@ -302,7 +302,8 @@ fn entries() -> Vec<Entry> {
 /// exact-sum, mean-variance, histogram, quantile and bloom families (D298, the same bit; the
 /// last three with `kind_params`), with bytes elements into HLL and bloom families: inputs at the fixed timestamp and in buckets, puts,
 /// deletes and checkpointed reads, sparse and dense sketches, signed zeros and infinities;
-/// flushed, then more in the WAL that the crash leaves for replay.
+/// flushed, then flushed and compacted, so compaction-folded bases are on disk, then more in
+/// the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
     let t = db
         .table("aggregates")
@@ -418,6 +419,14 @@ fn write_aggregates(db: &Pigeonhole) {
                 // A read that folds what the flush below writes as a base.
                 let _ = t.get(b"a03", "lo", b"all").unwrap();
                 db.flush().unwrap();
+            }
+            // A compaction folds every kind's inputs into its stored bases (D298): a settled
+            // set, merged HLL sketches, and the mean/variance, histogram and quantile states.
+            // The commits after it stay on top, in the WAL the crash leaves (perf2's S1 on
+            // #1466).
+            30 => {
+                db.flush().unwrap();
+                db.compact().unwrap();
             }
             _ => {}
         }
@@ -914,8 +923,14 @@ fn feed_options(o: Options) -> Options {
 }
 
 /// Where the feed entries keep the token their check resumes from: a subscriber's token from
-/// before the first commit, stored as an application stores one with its work.
+/// before the first commit, stored as an application stores one with its work, beside the
+/// seqno of the last commit the feed delivers (`last`), where the check stops.
 const FEED_TOKEN: (&str, &[u8]) = ("feed_tokens", b"events");
+
+/// How long the check waits for each commit of the retained history: long, so a slow runner
+/// never ends the listing early (feed1248's P1 on #1466). The history is all on disk, so a
+/// healthy build delivers it at once.
+const FEED_WAIT: Duration = Duration::from_secs(30);
 
 /// Commits to two fed tables (puts, counter increments, deletes), with flushes between, so
 /// the retained history runs past the checkpoint and over several WAL segments: the WAL keeps
@@ -948,6 +963,7 @@ fn write_feed(db: &Pigeonhole) {
         .put("t", b"token", token.as_bytes())
         .commit()
         .unwrap();
+    let mut last = 0;
     for i in 0..300u64 {
         let row = format!("r{:02}", i % 7);
         let mut m = events
@@ -962,7 +978,7 @@ fn write_feed(db: &Pigeonhole) {
         if i % 9 == 4 {
             m = m.delete_column("e", b"old");
         }
-        m.commit().unwrap();
+        last = m.commit().unwrap().seqno;
         if i % 5 == 0 {
             other
                 .mutate(row.as_bytes())
@@ -974,21 +990,42 @@ fn write_feed(db: &Pigeonhole) {
             db.flush().unwrap();
         }
     }
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
 }
 
-/// Every commit after the stored token, as a resumed feed delivers them: one line per change,
-/// with a value's bytes as their length and xxh3-64 (the puts are long).
+/// Every commit after the stored token, as a resumed feed delivers them, up to the stored
+/// last seqno: one line per change, with a value's bytes as their length and xxh3-64 (the
+/// puts are long).
 fn feed_extra(db: &Pigeonhole) -> String {
+    // The open inherited the feed from the sidecar (feed1248's S1 on #1466).
+    assert!(
+        db.info().unwrap().feed.is_some(),
+        "the open didn't inherit the change feed"
+    );
     let tokens = db.table(FEED_TOKEN.0).unwrap().open().unwrap();
     let stored = tokens
         .get(FEED_TOKEN.1, "t", b"token")
         .unwrap()
         .expect("the stored token");
     let token = pigeonhole::FeedToken::from_bytes(stored.value());
+    let last = tokens
+        .get(FEED_TOKEN.1, "t", b"last")
+        .unwrap()
+        .expect("the stored last seqno")
+        .as_i64()
+        .unwrap() as u64;
     let events = db.table("events").unwrap().open().unwrap();
     let mut feed = events.feed().resume(&token).open().unwrap();
     let mut out = String::new();
-    while let Some(c) = feed.next(Duration::from_millis(200)).unwrap() {
+    loop {
+        let c = feed
+            .next(FEED_WAIT)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the feed stopped before seqno {last}"));
         for ch in c.changes() {
             out.push_str(&format!(
                 "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
@@ -1012,8 +1049,10 @@ fn feed_extra(db: &Pigeonhole) -> String {
                 )
             ));
         }
+        if c.seqno() >= last {
+            break;
+        }
     }
-    assert!(!out.is_empty(), "the feed's history is empty");
     out
 }
 
