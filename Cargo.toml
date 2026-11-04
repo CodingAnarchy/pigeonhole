@@ -22,6 +22,7 @@ members = [
     "crates/python",
     "crates/text",
     "crates/memory",
+    "crates/otel",
 ]
 # The Ruby bindings are a workspace of their own: building them needs a Ruby with headers
 # (rb-sys), which `cargo build --workspace` mustn't require (#697, ICR 0111).
@@ -68,6 +69,8 @@ pigeonhole-vector = { path = "crates/vector", version = "1.1.0" }
 pigeonhole-text = { path = "crates/text", version = "1.1.0" }
 pigeonhole-memory = { path = "crates/memory", version = "1.1.0" }
 pigeonhole-capi = { path = "crates/capi", version = "1.1.0" }
+# Its own 0.N line (D316): it follows opentelemetry's minor releases.
+pigeonhole-otel = { path = "crates/otel", version = "0.1.0" }
 
 # External dependencies. Each one is justified in docs/design/interfaces.md.
 # `std` (which needs `alloc`): without it the crate is `no_std` and wants a panic handler.
@@ -95,7 +98,13 @@ arrow-schema = { version = "60", default-features = false }
 # phdb's JSON output, fields in their documented order (the bench writes JSON with it too).
 serde_json = { version = "1", features = ["preserve_order"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading"] }
+# pigeonhole-otel (D316): the API crate only, for the `Meter` an application hands it; one
+# opentelemetry minor at a time, which pigeonhole-otel's own 0.N line follows.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 # Dev-only.
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
+opentelemetry-prometheus = "0.33"
+prometheus = { version = "0.14", default-features = false }
 proptest = "1"
 half = { version = "2.7", default-features = false }
 loom = "0.7"

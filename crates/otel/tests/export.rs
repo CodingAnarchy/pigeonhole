@@ -1,0 +1,545 @@
+//! `pigeonhole-otel` through a real OpenTelemetry SDK (D316): every documented metric is
+//! reported, with its documented kind, unit and attributes, after a workload that exercises
+//! it; a dropped registration reports nothing; counters continue across a reopen; the
+//! default cardinality doesn't grow with the schema; and the Prometheus exporter's names are
+//! the ones `MetricInfo::prometheus_name` documents.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+use pigeonhole::{Durability, ErrorCode, Family, FeedRetention, Options, Pigeonhole, Table};
+use pigeonhole_otel::{Config, InstrumentKind, MetricInfo};
+
+/// One collected point: its value and attributes.
+#[derive(Debug, Clone)]
+struct Point {
+    value: f64,
+    attrs: BTreeMap<String, String>,
+}
+
+/// One collected metric.
+#[derive(Debug)]
+struct Collected {
+    kind: InstrumentKind,
+    unit: String,
+    points: Vec<Point>,
+}
+
+struct Sdk {
+    provider: SdkMeterProvider,
+    exporter: InMemoryMetricExporter,
+}
+
+impl Sdk {
+    fn new() -> Self {
+        let exporter = InMemoryMetricExporter::default();
+        // Collections happen when the test flushes; the interval only has to be long.
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        Self { provider, exporter }
+    }
+
+    fn meter(&self) -> opentelemetry::metrics::Meter {
+        self.provider.meter("pigeonhole-otel-test")
+    }
+
+    /// One collection, by metric name.
+    fn collect(&self) -> BTreeMap<String, Collected> {
+        self.exporter.reset();
+        self.provider.force_flush().unwrap();
+        let mut out = BTreeMap::new();
+        for rm in self.exporter.get_finished_metrics().unwrap() {
+            for scope in rm.scope_metrics() {
+                for m in scope.metrics() {
+                    let (kind, points) = points(m.data());
+                    out.insert(
+                        m.name().to_owned(),
+                        Collected {
+                            kind,
+                            unit: m.unit().to_owned(),
+                            points,
+                        },
+                    );
+                }
+            }
+        }
+        out
+    }
+}
+
+fn attrs<'a>(kvs: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> BTreeMap<String, String> {
+    kvs.map(|kv| (kv.key.to_string(), kv.value.to_string()))
+        .collect()
+}
+
+fn points(data: &AggregatedMetrics) -> (InstrumentKind, Vec<Point>) {
+    fn of<T: Copy + Into<f64> + std::fmt::Debug>(
+        d: &MetricData<T>,
+    ) -> (InstrumentKind, Vec<Point>) {
+        match d {
+            MetricData::Gauge(g) => (
+                InstrumentKind::Gauge,
+                g.data_points()
+                    .map(|p| Point {
+                        value: p.value().into(),
+                        attrs: attrs(p.attributes()),
+                    })
+                    .collect(),
+            ),
+            MetricData::Sum(s) => {
+                assert!(s.is_monotonic(), "a sum that isn't monotonic");
+                (
+                    InstrumentKind::Counter,
+                    s.data_points()
+                        .map(|p| Point {
+                            value: p.value().into(),
+                            attrs: attrs(p.attributes()),
+                        })
+                        .collect(),
+                )
+            }
+            other => panic!("unexpected aggregation {other:?}"),
+        }
+    }
+    match data {
+        AggregatedMetrics::F64(d) => of(d),
+        AggregatedMetrics::U64(d) => {
+            // u64 has no lossless `Into<f64>`; the test's values are small.
+            let (kind, pts) = match d {
+                MetricData::Gauge(g) => (
+                    InstrumentKind::Gauge,
+                    g.data_points()
+                        .map(|p| (p.value(), attrs(p.attributes())))
+                        .collect::<Vec<_>>(),
+                ),
+                MetricData::Sum(s) => {
+                    assert!(s.is_monotonic(), "a sum that isn't monotonic");
+                    (
+                        InstrumentKind::Counter,
+                        s.data_points()
+                            .map(|p| (p.value(), attrs(p.attributes())))
+                            .collect(),
+                    )
+                }
+                other => panic!("unexpected aggregation {other:?}"),
+            };
+            (
+                kind,
+                pts.into_iter()
+                    .map(|(v, attrs)| Point {
+                        value: v as f64,
+                        attrs,
+                    })
+                    .collect(),
+            )
+        }
+        AggregatedMetrics::I64(_) => panic!("pigeonhole-otel reports no i64 instrument"),
+    }
+}
+
+fn options() -> Options {
+    Options::default()
+        .shards(1)
+        .pin_threads(false)
+        .row_cache(1 << 20)
+        .change_feed(FeedRetention::bytes(8 << 20))
+}
+
+fn table(db: &Pigeonhole, name: &str) -> Table {
+    db.table(name)
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap()
+}
+
+/// Commits at every durability, transactions (one conflicting), flushes, a compaction, and
+/// repeated reads, so that every counter the workload can move has moved.
+fn workload(db: &Pigeonhole, t: &Table) {
+    for (i, d) in [
+        Durability::None,
+        Durability::Buffered,
+        Durability::GroupSync,
+        Durability::Sync,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for j in 0..20 {
+            t.mutate(format!("r{i}-{j}").as_bytes())
+                .put("f", b"q", b"value")
+                .durability(d)
+                .commit()
+                .unwrap();
+        }
+    }
+    let mut a = db.transaction().unwrap();
+    let mut b = db.transaction().unwrap();
+    a.get(t, b"r2-0", "f", b"q").unwrap();
+    b.get(t, b"r2-0", "f", b"q").unwrap();
+    a.put(t, b"r2-0", "f", b"q", b"a");
+    b.put(t, b"r2-0", "f", b"q", b"b");
+    a.commit().unwrap();
+    assert_eq!(b.commit().unwrap_err().code(), ErrorCode::Conflict);
+    db.flush().unwrap();
+    for j in 0..20 {
+        t.mutate(format!("r2-{j}").as_bytes())
+            .put("f", b"q2", b"value")
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    for _ in 0..3 {
+        for j in 0..20 {
+            t.get(format!("r2-{j}").as_bytes(), "f", b"q").unwrap();
+        }
+    }
+}
+
+fn info(name: &str) -> MetricInfo {
+    pigeonhole_otel::metrics()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| panic!("{name} isn't a documented metric"))
+}
+
+fn total(c: &Collected) -> f64 {
+    c.points.iter().map(|p| p.value).sum()
+}
+
+/// Metrics a workload on this platform may leave without values: io_uring's off Linux's
+/// io_uring backend, and the counters nothing in the workload can move.
+fn may_be_empty(db: &Pigeonhole, name: &str) -> bool {
+    name.starts_with("pigeonhole.io.") && db.io_rings().is_none()
+}
+
+#[test]
+fn every_documented_metric_is_reported_with_its_kind_unit_and_attributes() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("app.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    let sdk = Sdk::new();
+    let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    workload(&db, &t);
+    let got = sdk.collect();
+    for m in pigeonhole_otel::metrics() {
+        // The SDK leaves an instrument without values out of the export entirely.
+        if may_be_empty(&db, m.name) && !got.contains_key(m.name) {
+            continue;
+        }
+        let c = got
+            .get(m.name)
+            .unwrap_or_else(|| panic!("{} wasn't exported", m.name));
+        assert_eq!(c.kind, m.kind, "{}", m.name);
+        assert_eq!(c.unit, m.unit, "{}", m.name);
+        if may_be_empty(&db, m.name) {
+            continue;
+        }
+        assert!(!c.points.is_empty(), "{} has no values", m.name);
+        for p in &c.points {
+            assert_eq!(
+                p.attrs.get("pigeonhole.db.name").map(String::as_str),
+                Some("app.phdb"),
+                "{}",
+                m.name
+            );
+            for key in p.attrs.keys() {
+                assert!(
+                    key == "pigeonhole.db.name" || m.attributes.contains(&key.as_str()),
+                    "{}: undocumented attribute {key}",
+                    m.name
+                );
+            }
+        }
+    }
+    // The workload's own counts.
+    let commits = &got["pigeonhole.commits"];
+    let group_sync = commits
+        .points
+        .iter()
+        .find(|p| p.attrs["pigeonhole.durability"] == "group_sync")
+        .unwrap();
+    assert!(group_sync.value >= 40.0, "{group_sync:?}");
+    let txns = &got["pigeonhole.transactions"];
+    let outcome = |o: &str| {
+        txns.points
+            .iter()
+            .find(|p| p.attrs["pigeonhole.outcome"] == o)
+            .unwrap()
+            .value
+    };
+    assert_eq!((outcome("committed"), outcome("conflict")), (1.0, 1.0));
+    assert!(total(&got["pigeonhole.flushes"]) >= 2.0);
+    assert!(total(&got["pigeonhole.block_cache.requests"]) > 0.0);
+    // Engine-side latency: seconds, and plausible.
+    for p in &got["pigeonhole.commit.engine_latency"].points {
+        assert!(p.value > 0.0 && p.value < 10.0, "{p:?}");
+    }
+    assert!(
+        got["pigeonhole.commit.engine_latency"]
+            .points
+            .iter()
+            .any(|p| p.attrs["pigeonhole.durability"] == "sync"
+                && p.attrs["pigeonhole.quantile"] == "0.99")
+    );
+    assert_eq!(total(&got["pigeonhole.failed"]), 0.0);
+    drop(metrics);
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_dropped_registration_or_a_closed_database_reports_nothing() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("drop.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    let sdk = Sdk::new();
+    let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
+    assert!(!sdk.collect()["pigeonhole.commits"].points.is_empty());
+    drop(metrics);
+    let after = sdk.collect();
+    assert!(
+        after.values().all(|c| c.points.is_empty()),
+        "values after the drop: {after:?}"
+    );
+    // A registration over a database that closes stops too.
+    let sdk = Sdk::new();
+    let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    drop(t);
+    db.close().unwrap();
+    let after = sdk.collect();
+    assert!(
+        after.values().all(|c| c.points.is_empty()),
+        "values after the close: {after:?}"
+    );
+    drop(metrics);
+}
+
+#[test]
+fn rebind_keeps_counters_monotonic_across_a_reopen() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("re.phdb");
+    let db = Pigeonhole::open(&path, options()).unwrap();
+    let t = table(&db, "t");
+    let sdk = Sdk::new();
+    let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    for j in 0..10 {
+        t.mutate(format!("r{j}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let before = total(&sdk.collect()["pigeonhole.commits"]);
+    assert!(before >= 10.0);
+    drop(t);
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, options()).unwrap();
+    metrics.rebind(&db);
+    let t = table(&db, "t");
+    t.mutate(b"after").put("f", b"q", b"v").commit().unwrap();
+    let after = total(&sdk.collect()["pigeonhole.commits"]);
+    assert!(after >= before + 1.0, "{before} then {after}");
+    drop(metrics);
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn default_cardinality_is_independent_of_the_schema() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("card.phdb"), options()).unwrap();
+    let tables: Vec<Table> = (0..6).map(|i| table(&db, &format!("t{i}"))).collect();
+    for t in &tables {
+        t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
+    }
+    db.flush().unwrap();
+    let sdk = Sdk::new();
+    let by_level = pigeonhole_otel::register(&db, &sdk.meter());
+    let got = sdk.collect();
+    let ssts = &got["pigeonhole.sst.count"];
+    let levels: BTreeSet<_> = ssts
+        .points
+        .iter()
+        .map(|p| p.attrs["pigeonhole.level"].clone())
+        .collect();
+    assert_eq!(
+        ssts.points.len(),
+        levels.len(),
+        "one series per level: {ssts:?}"
+    );
+    assert!(
+        ssts.points
+            .iter()
+            .all(|p| !p.attrs.contains_key("pigeonhole.table"))
+    );
+    assert!(total(ssts) >= 6.0, "{ssts:?}");
+    drop(by_level);
+    // storage_by_table: one series per table, family and level.
+    let sdk = Sdk::new();
+    let by_table = Config::new()
+        .storage_by_table(true)
+        .db_name("cards")
+        .register(&db, &sdk.meter());
+    let got = sdk.collect();
+    let ssts = &got["pigeonhole.sst.count"];
+    let named: BTreeSet<_> = ssts
+        .points
+        .iter()
+        .map(|p| p.attrs["pigeonhole.table"].clone())
+        .collect();
+    assert_eq!(named.len(), 6, "{ssts:?}");
+    assert!(
+        ssts.points
+            .iter()
+            .all(|p| p.attrs["pigeonhole.db.name"] == "cards")
+    );
+    drop(by_table);
+    drop(tables);
+    db.close().unwrap();
+}
+
+#[test]
+fn prometheus_names_are_the_exporters() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("prom.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    let registry = prometheus::Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()
+        .unwrap();
+    let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    let metrics = pigeonhole_otel::register(&db, &provider.meter("prom"));
+    workload(&db, &t);
+    let mut text = String::new();
+    {
+        use prometheus::Encoder as _;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        text.push_str(&String::from_utf8(buf).unwrap());
+    }
+    for m in pigeonhole_otel::metrics() {
+        if may_be_empty(&db, m.name) {
+            continue;
+        }
+        let name = m.prometheus_name();
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with(&format!("{name}{{")) || l.starts_with(&format!("{name} "))),
+            "{} isn't exported as {name}:\n{text}",
+            m.name
+        );
+    }
+    assert_eq!(
+        info("pigeonhole.write_stall.time").prometheus_name(),
+        "pigeonhole_write_stall_time_seconds_total"
+    );
+    drop(metrics);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// The guide's metric table, as `metrics()` gives it: one row per metric, in order.
+fn guide_table() -> String {
+    let mut out = String::from(
+        "| Metric | Prometheus name | Kind | Unit | Attributes | What it measures |\n|---|---|---|---|---|---|\n",
+    );
+    for m in pigeonhole_otel::metrics() {
+        let kind = match m.kind {
+            InstrumentKind::Counter => "counter",
+            InstrumentKind::Gauge => "gauge",
+            _ => unreachable!(),
+        };
+        let attrs = if m.attributes.is_empty() {
+            "".to_owned()
+        } else {
+            m.attributes
+                .iter()
+                .map(|a| format!("`{a}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!(
+            "| `{}` | `{}` | {kind} | `{}` | {attrs} | {} |\n",
+            m.name,
+            m.prometheus_name(),
+            m.unit,
+            m.description
+        ));
+    }
+    out
+}
+
+/// The guide's table is generated from `metrics()`, so the guide, the code and this test
+/// can't drift apart: on a mismatch, this prints the table to paste between the markers.
+#[test]
+fn the_guide_lists_every_metric_as_the_code_does() {
+    let guide = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/guide/observability.md"
+    ))
+    .unwrap();
+    let (begin, end) = ("<!-- metrics:begin -->\n", "<!-- metrics:end -->");
+    let want = guide_table();
+    let got = guide
+        .split_once(begin)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(table, _)| table);
+    assert_eq!(
+        got,
+        Some(want.as_str()),
+        "the guide's table should be:\n{want}"
+    );
+}
+
+/// Every `pigeonhole_…` name in `text` is a metric's Prometheus name or a label name; how
+/// many metric names it uses.
+fn known_names_only(what: &str, text: &str) -> usize {
+    let known: BTreeSet<String> = pigeonhole_otel::metrics()
+        .map(|m| m.prometheus_name())
+        .collect();
+    // Label names: the attribute keys, with dots as underscores.
+    let labels: BTreeSet<String> = pigeonhole_otel::metrics()
+        .flat_map(|m| m.attributes.iter().copied().chain(["pigeonhole.db.name"]))
+        .map(|a| a.replace('.', "_"))
+        .collect();
+    let mut queried = 0;
+    for (i, _) in text.match_indices("pigeonhole_") {
+        if i > 0 && text[..i].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let name: String = text[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        // The crate's own path, in the guide's code.
+        if labels.contains(&name) || name == "pigeonhole_otel" {
+            continue;
+        }
+        assert!(
+            known.contains(&name),
+            "{what} uses {name}, which no metric is exported as"
+        );
+        queried += 1;
+    }
+    queried
+}
+
+/// Every Prometheus name the starter dashboard and the guide's alerts query is one a metric
+/// is exported as.
+#[test]
+fn the_dashboard_and_the_alerts_query_only_documented_metrics() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
+    let dashboard = std::fs::read_to_string(format!("{root}/grafana/pigeonhole.json")).unwrap();
+    assert!(known_names_only("the dashboard", &dashboard) >= 10);
+    let guide = std::fs::read_to_string(format!("{root}/guide/observability.md")).unwrap();
+    assert!(known_names_only("the guide", &guide) >= 10);
+}

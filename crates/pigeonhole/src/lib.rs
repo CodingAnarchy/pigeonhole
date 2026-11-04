@@ -173,7 +173,7 @@ pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
     TableInfo,
 };
-pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
+pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics, LatencyHistogram};
 pub use options::{
     Aggregation, BloomParams, Compaction, CpuProfile, Family, FeedRetention, HistogramParams,
     IoBackend, IoRings, Options, Priority, QuantileParams, ReaderOptions, Recovery, days,

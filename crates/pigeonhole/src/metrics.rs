@@ -40,6 +40,7 @@ use crate::Durability;
 #[non_exhaustive]
 pub struct EngineMetrics {
     commits: [CommitStats; 4],
+    commit_latency: [LatencyHistogram; 4],
     /// Memtable flushes completed (each writes one or more SSTs into the file).
     pub flushes: u64,
     /// Flushes that failed. They are retried after a growing backoff; the WAL keeps their
@@ -167,6 +168,128 @@ impl EngineMetrics {
     pub fn commits(&self, durability: Durability) -> CommitStats {
         self.commits[durability as usize]
     }
+
+    /// The latency histogram of the commits at `durability` since open (ICR 0115): the
+    /// buckets [`commits`](Self::commits)' percentiles come from. Unlike those, two readings
+    /// subtracted ([`LatencyHistogram::since`]) give an interval's latency, so a regression
+    /// shows up within that interval rather than being diluted by everything since open.
+    ///
+    /// ```
+    /// # use pigeonhole::{Durability, Family, Options, Pigeonhole};
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// # let db = Pigeonhole::open(dir.join("h.phdb"), Options::default())?;
+    /// # let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// let before = db.engine_metrics().commit_latency(Durability::GroupSync);
+    /// t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    /// let interval = db.engine_metrics().commit_latency(Durability::GroupSync).since(&before);
+    /// assert_eq!(interval.total(), 1);
+    /// let p99 = interval.quantile_upper_nanos(0.99).unwrap();
+    /// assert!(p99 > 0);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok::<(), pigeonhole::Error>(())
+    /// ```
+    pub fn commit_latency(&self, durability: Durability) -> LatencyHistogram {
+        self.commit_latency[durability as usize]
+    }
+}
+
+/// The commit latency histogram of one durability level
+/// ([`EngineMetrics::commit_latency`], ICR 0115).
+///
+/// **What it measures:** each commit's time from its submission to its resolution on its
+/// shard, the engine side of the commit. It leaves out the caller's wake-up, the wait for
+/// the commit to become visible and the return, which is where a commit's tail latency
+/// often is: measure end-to-end latency in the application.
+///
+/// **Buckets:** [`BUCKETS`](Self::BUCKETS) half-power-of-two buckets, cumulative since open
+/// and summed over shards. Bucket `b` counts the commits from
+/// [`bucket_lower_nanos(b)`](Self::bucket_lower_nanos) up to, not including,
+/// [`bucket_upper_nanos(b)`](Self::bucket_upper_nanos). Adjacent bounds differ by a factor of
+/// 1.5 or 1.33 (about 1.41 on average), so a quantile is known to within one bucket. The
+/// last bucket, from about 3.2 seconds, has no upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyHistogram {
+    counts: [u64; LatencyHistogram::BUCKETS],
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            counts: [0; Self::BUCKETS],
+        }
+    }
+}
+
+impl LatencyHistogram {
+    /// The number of buckets.
+    pub const BUCKETS: usize = 64;
+
+    /// The commits counted in each bucket, bucket 0 first.
+    pub fn counts(&self) -> &[u64; Self::BUCKETS] {
+        &self.counts
+    }
+
+    /// The commits counted in all the buckets.
+    pub fn total(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    /// The smallest latency, in nanoseconds, that bucket `b` counts. Panics if `b` is not
+    /// below [`BUCKETS`](Self::BUCKETS).
+    pub fn bucket_lower_nanos(b: usize) -> u64 {
+        assert!(b < Self::BUCKETS, "bucket {b} of {}", Self::BUCKETS);
+        if b <= 1 {
+            // Bucket 0 counts 0 and 1 ns; bucket 1 is never used.
+            0
+        } else {
+            pigeonhole_engine::Engine::commit_latency_floor(b)
+        }
+    }
+
+    /// The latency, in nanoseconds, at which bucket `b` ends (the next bucket's lower
+    /// bound), or `None` for the last bucket, which has no end. Panics if `b` is not below
+    /// [`BUCKETS`](Self::BUCKETS).
+    pub fn bucket_upper_nanos(b: usize) -> Option<u64> {
+        assert!(b < Self::BUCKETS, "bucket {b} of {}", Self::BUCKETS);
+        (b + 1 < Self::BUCKETS).then(|| Self::bucket_lower_nanos(b + 1).max(2))
+    }
+
+    /// The commits counted since `earlier`, a reading of the same histogram taken before
+    /// this one: bucket by bucket, this reading's count less `earlier`'s. A bucket that
+    /// went down, as the counts do when an automatic recovery
+    /// (`Options::auto_recover`) starts a new engine, counts 0.
+    pub fn since(&self, earlier: &LatencyHistogram) -> LatencyHistogram {
+        LatencyHistogram {
+            counts: std::array::from_fn(|b| self.counts[b].saturating_sub(earlier.counts[b])),
+        }
+    }
+
+    /// The `q` quantile (`0.99` for p99), as the upper bound in nanoseconds of the bucket it
+    /// falls in, so it errs high, never low: at least a fraction `q` of the commits took
+    /// less. `None` when the histogram is empty or `q` is outside `0.0..=1.0` (NaN
+    /// included). A quantile in the last bucket, which has no upper bound, reports that
+    /// bucket's lower bound.
+    pub fn quantile_upper_nanos(&self, q: f64) -> Option<u64> {
+        if !(0.0..=1.0).contains(&q) {
+            return None;
+        }
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let target = ((total as f64 * q).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (b, &n) in self.counts.iter().enumerate() {
+            seen += n;
+            if seen >= target {
+                return Some(
+                    Self::bucket_upper_nanos(b).unwrap_or_else(|| Self::bucket_lower_nanos(b)),
+                );
+            }
+        }
+        None
+    }
 }
 
 /// Commits at one durability level ([`EngineMetrics::commits`]).
@@ -213,6 +336,9 @@ impl EngineMetrics {
                 p50_nanos: m.commit_latency_nanos[d][0],
                 p99_nanos: m.commit_latency_nanos[d][1],
                 p999_nanos: m.commit_latency_nanos[d][2],
+            }),
+            commit_latency: std::array::from_fn(|d| LatencyHistogram {
+                counts: m.commit_latency_buckets[d].0,
             }),
             flushes: m.flushes,
             flush_failures: m.flush_failures,
@@ -406,11 +532,76 @@ impl ShardStats {
 mod tests {
     use super::*;
 
+    fn histogram(counts: &[(usize, u64)]) -> LatencyHistogram {
+        let mut h = LatencyHistogram::default();
+        for &(b, n) in counts {
+            h.counts[b] = n;
+        }
+        h
+    }
+
+    #[test]
+    fn latency_buckets_tile_the_line() {
+        assert_eq!(LatencyHistogram::bucket_lower_nanos(0), 0);
+        assert_eq!(LatencyHistogram::bucket_upper_nanos(0), Some(2));
+        for b in 1..LatencyHistogram::BUCKETS - 1 {
+            let upper = LatencyHistogram::bucket_upper_nanos(b).unwrap();
+            assert_eq!(
+                upper,
+                LatencyHistogram::bucket_lower_nanos(b + 1).max(2),
+                "bucket {b}"
+            );
+            assert!(
+                upper >= LatencyHistogram::bucket_lower_nanos(b),
+                "bucket {b}"
+            );
+        }
+        assert_eq!(
+            LatencyHistogram::bucket_upper_nanos(LatencyHistogram::BUCKETS - 1),
+            None
+        );
+    }
+
+    #[test]
+    fn quantiles_report_the_upper_bound_of_their_bucket() {
+        assert_eq!(LatencyHistogram::default().quantile_upper_nanos(0.5), None);
+        // 98 commits in bucket 10 ([32, 48) ns), 2 in bucket 20 ([1024, 1536) ns).
+        let h = histogram(&[(10, 98), (20, 2)]);
+        assert_eq!(h.total(), 100);
+        assert_eq!(h.quantile_upper_nanos(0.5), Some(48));
+        assert_eq!(h.quantile_upper_nanos(0.98), Some(48));
+        assert_eq!(h.quantile_upper_nanos(0.99), Some(1536));
+        assert_eq!(h.quantile_upper_nanos(1.0), Some(1536));
+        assert_eq!(h.quantile_upper_nanos(0.0), Some(48));
+        assert_eq!(h.quantile_upper_nanos(1.5), None);
+        assert_eq!(h.quantile_upper_nanos(f64::NAN), None);
+        // The open-ended last bucket reports its lower bound.
+        let last = LatencyHistogram::BUCKETS - 1;
+        let tail = histogram(&[(last, 1)]);
+        assert_eq!(
+            tail.quantile_upper_nanos(0.99),
+            Some(LatencyHistogram::bucket_lower_nanos(last))
+        );
+    }
+
+    #[test]
+    fn since_subtracts_bucket_by_bucket_and_never_goes_negative() {
+        let before = histogram(&[(10, 5), (20, 7)]);
+        let after = histogram(&[(10, 8), (20, 3), (30, 1)]);
+        let d = after.since(&before);
+        assert_eq!(d.counts()[10], 3);
+        // A count that fell (a recovery's new engine) counts 0, not a wrap.
+        assert_eq!(d.counts()[20], 0);
+        assert_eq!(d.counts()[30], 1);
+        assert_eq!(d.total(), 4);
+    }
+
     #[test]
     fn every_engine_counter_lands_in_its_named_field() {
         let mut m = pigeonhole_engine::Metrics::default();
         m.commits = [1, 2, 3, 4];
         m.commit_latency_nanos[Durability::Sync as usize] = [10, 20, 30];
+        m.commit_latency_buckets[Durability::Buffered as usize].0[7] = 9;
         m.stalls = (5, 6);
         m.room_stalls = (31, 32);
         m.pacing_stalls = (33, 34);
@@ -428,6 +619,9 @@ mod tests {
         let e = EngineMetrics::from_engine(m.clone());
         assert_eq!(e.commits(Durability::None).count, 1);
         assert_eq!(e.commits(Durability::GroupSync).count, 3);
+        let buffered = e.commit_latency(Durability::Buffered);
+        assert_eq!((buffered.counts()[7], buffered.total()), (9, 9));
+        assert_eq!(e.commit_latency(Durability::Sync).total(), 0);
         let sync = e.commits(Durability::Sync);
         assert_eq!(
             (sync.count, sync.p50_nanos, sync.p99_nanos, sync.p999_nanos),

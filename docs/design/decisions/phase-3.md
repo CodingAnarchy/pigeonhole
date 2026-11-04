@@ -4320,3 +4320,33 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 - **After `OutcomeUnknown`:** there is no value, and a blind retry counts the increment twice if it landed.
 
 **Testing.** `tests/returning.rs` is a model-check target of its own. Its families are a plain `sum`, `sum_v2` (2 versions), `sum_ttl` and `f`. Returning commits there include members of concurrent batches beside blind cross-shard writers, with and without deletes. Each value is compared with the model's fold at *Y*, and the run asserts the fast path is taken. Its sweep is conditional: it runs on #1440's PRs and on any PR touching counter or returning apply code (REQUIRE_SWEEPS=6).
+
+<a id="d316"></a>
+## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
+
+**Decided:** a companion crate, `pigeonhole-otel`, registers a database's metrics with an application's OpenTelemetry `Meter` in one call (`register(&db, &meter)`). The metric list is a stable contract: its names, kinds, units and attributes. A rename or removal needs a new decision and a major version on whatever line the crate is on. The core crates take no OpenTelemetry dependency. The design comment on #1458 (rev 2) is the full record. In summary:
+
+- **Observable only.** Every instrument is an observable counter or gauge, so nothing runs on an engine thread, and commits and reads pay nothing.
+  - **One reading per collection:** the first callback of a collection reads `engine_metrics()`, `recovery_stats()` and `info()` once, on the exporter's thread. The other callbacks reuse that reading for 100 ms.
+  - **The cost** (perf287): about 300 relaxed loads a shard, and `info()`'s catalog walk. `pager.stats()` takes the pager's `alloc` lock, which commits never take.
+- **Names:**
+  - `pigeonhole.` then dot-separated lowercase, with plural nouns for counted events;
+  - UCUM units (`s` as `f64` seconds, `By`, `1`, `{…}` annotations);
+  - outcomes and reasons as attributes, every attribute prefixed `pigeonhole.`;
+  - `.time` for every counter of seconds, leaving `*.duration` to histograms (cli692's N2).
+- **Attributes:** `pigeonhole.db.name` on every metric. By default it's the file name (`Pigeonhole::path()`); the OTel resource tells processes apart.
+  - **The bound:** with the defaults, the number of series doesn't depend on the schema.
+  - **`storage_by_table`** adds `pigeonhole.table` and `pigeonhole.family` to the SST and blob gauges, bounded by the schema.
+  - **Never per row, key or seqno.** `pigeonhole.shard` is reserved; per-shard values are a hidden bench hook, not API.
+- **Monotonic counters:** an automatic recovery's new engine restarts its counters from 0, so the registration carries the old engine's last reading as a base. `Registration::rebind` does the same across a reopen.
+- **Commit latency (A1):** `pigeonhole.commit.engine_latency`, a gauge per durability and quantile (0.5, 0.99, 0.999) over a sliding window (default 60 s). It's computed from D213's buckets, now public as `LatencyHistogram`, as the difference of two readings.
+  - **What it measures:** engine-side latency, from submission to resolution on the shard. It excludes the caller's wake-up and the visibility wait (perf287: 98 µs against the client's 391 µs in #1206).
+  - **The value reported:** the bucket's upper bound, since the buckets are about 1.41× apart.
+  - **Why a gauge:** OTel Rust has no observable histogram.
+- **Versioning (owner, Q1):** `pigeonhole-otel` has its own 0.N line, outside D295's public 1.x line, because its API takes `opentelemetry` types, and each opentelemetry minor is a breaking change.
+- **The rest of the contract (owner, Q2: in 1.2.0, ICR 0116), each in its own PR:**
+  - **A2:** `pigeonhole.memtable.size` and `.limit`, a compare-and-store per group in `publish_arena`;
+  - **A3:** `pigeonhole.wal.group_sync.time`, summing D248's existing `sync_busy_nanos`;
+  - **A4:** `pigeonhole.feed.lag`, with `Feed::progress()` and `visible_seqno()`, stored once per delivered batch.
+- **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
+- **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
