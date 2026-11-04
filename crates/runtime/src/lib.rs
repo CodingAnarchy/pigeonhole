@@ -58,6 +58,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod cell;
 mod completion;
 mod drivers;
 mod pool;
@@ -1001,9 +1002,10 @@ impl<H: ShardHandler> Runtime<H> {
             rt.workers.push(handle);
             acks.push(ack);
         }
-        let mut held: Vec<Vec<ShardCore<H>>> = (0..k).map(|_| Vec::new()).collect();
+        let mut held: Vec<Vec<Arc<cell::ShardCell<H>>>> = (0..k).map(|_| Vec::new()).collect();
         for core in cores {
-            held[drivers::Drivers::<H>::owner(core.id, k)].push(core);
+            held[drivers::Drivers::<H>::owner(core.id, k)]
+                .push(Arc::new(cell::ShardCell::new(core)));
         }
         for (d, cores) in held.into_iter().enumerate() {
             // A fixed thread per shard keeps the shard's name, as before D289; drivers whose
