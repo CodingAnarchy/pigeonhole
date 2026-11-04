@@ -69,6 +69,7 @@ pub struct Options {
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
     shard_spin_cap: Option<Duration>,
+    caller_runs: bool,
     shard_threads: Option<usize>,
     adaptive_shard_threads: bool,
     background_workers: usize,
@@ -301,6 +302,7 @@ impl Default for Options {
             commit_spin: None,
             shard_spin: None,
             shard_spin_cap: None,
+            caller_runs: false,
             shard_threads: None,
             adaptive_shard_threads: true,
             background_workers: 0,
@@ -546,6 +548,16 @@ impl Options {
     #[doc(hidden)]
     pub fn shard_spin_cap(mut self, cap: Duration) -> Self {
         self.shard_spin_cap = Some(cap);
+        self
+    }
+
+    /// A prototype under evaluation, off by default (#1176, D198's C2): a thread waiting
+    /// on its non-durable single-shard commit runs the shard's turn itself when no thread
+    /// is running it, rather than waiting for the shard's driver. Engine-owned mode.
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn caller_runs(mut self, on: bool) -> Self {
+        self.caller_runs = on;
         self
     }
 
@@ -1803,6 +1815,7 @@ impl Options {
         if let Some(cap) = cap {
             o.shard_spin_cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
         }
+        o.caller_runs = self.caller_runs;
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         }

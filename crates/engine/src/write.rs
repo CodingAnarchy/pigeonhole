@@ -9,7 +9,7 @@ use pigeonhole_format::Kind;
 use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
 use pigeonhole_format::wal::{BatchBuilder, BatchRef};
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
-use pigeonhole_runtime::{Notifier, SlotCache, Waiter, completion, completion_from};
+use pigeonhole_runtime::{Notifier, ShardId, SlotCache, Waiter, completion, completion_from};
 
 use crate::engine::Inner;
 use crate::{CellData, CommitInfo, Error, Snapshot};
@@ -54,6 +54,11 @@ pub struct WriteBatch {
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
 const INITIAL_BATCH_BYTES: usize = 256;
+
+/// Caller-runs (#1176 rev 3.1, C3): a waiting committer tries its shard's run token once
+/// every this many polls, about a microsecond apart, so polling clients load the run word
+/// rarely enough to stay off the lines its holder writes.
+const CALLER_POLLS: u32 = 32;
 
 /// The largest batch whose buffer a thread keeps for its next batch (#320): a thread that
 /// once committed a large batch does not hold that much memory for good.
@@ -526,7 +531,7 @@ impl Submission {
         if forked(&self.shared) {
             return Err(crate::engine::forked());
         }
-        wait_body(&self.shared, &mut self.waiter, self.spins)
+        wait_body(&self.shared, &mut self.waiter, self.spins, None)
     }
 }
 
@@ -559,8 +564,9 @@ pub(crate) fn wait_blocking(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
+    caller: Option<ShardId>,
 ) -> crate::Result<CommitInfo> {
-    let r = wait_body(shared, waiter, spins);
+    let r = wait_body(shared, waiter, spins, caller);
     let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
     r
 }
@@ -572,6 +578,7 @@ fn wait_body(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
+    caller: Option<ShardId>,
 ) -> crate::Result<CommitInfo> {
     let window = if spins { shared.commit_spin_nanos } else { 0 };
     if window == 0 {
@@ -582,7 +589,7 @@ fn wait_body(
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
-    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin, caller)?;
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
     Ok(info)
@@ -755,6 +762,7 @@ fn wait_reply_spinning<T: Send>(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<T>>,
     spin: &mut SpinWait,
+    caller: Option<ShardId>,
 ) -> crate::Result<T> {
     if shared.drivers.current_drives() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -765,15 +773,32 @@ fn wait_reply_spinning<T: Send>(
         };
     }
     let mut polled = None;
+    // Caller-runs (#1176): the shard of a commit queued there, which this thread may run
+    // itself every `CALLER_POLLS` polls (about a microsecond) while no thread runs it.
+    let submitter = caller.map(|s| shared.submitter(s));
+    let mut polls = 0u32;
     spin.poll(|| {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        match Pin::new(&mut *waiter).poll(&mut cx) {
-            Poll::Pending => false,
-            ready => {
-                polled = Some(ready);
-                true
+        let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            match Pin::new(&mut *waiter).poll(&mut cx) {
+                Poll::Pending => false,
+                ready => {
+                    *polled = Some(ready);
+                    true
+                }
             }
+        };
+        if ready_now(waiter, &mut polled) {
+            return true;
         }
+        polls = polls.wrapping_add(1);
+        if let Some(sub) = submitter
+            && polls.is_multiple_of(CALLER_POLLS)
+        {
+            sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+            return polled.is_some();
+        }
+        false
     });
     match polled {
         Some(Poll::Ready(Some(r))) => return r,

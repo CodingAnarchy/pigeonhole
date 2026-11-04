@@ -1611,6 +1611,7 @@ impl Engine {
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
         config.idle_spin_cap = std::time::Duration::from_nanos(options.shard_spin_cap_nanos);
+        config.caller_runs = options.caller_runs;
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
             b => b,
@@ -1770,6 +1771,17 @@ impl Engine {
     }
 
     // ---- catalog ----
+
+    /// Turns committing threads ran on the shards themselves, summed over shards (the
+    /// caller-runs prototype, #1176; 0 with it off). Relaxed.
+    #[doc(hidden)]
+    pub fn caller_turns(&self) -> u64 {
+        self.inner
+            .shared
+            .submitters
+            .get()
+            .map_or(0, |subs| subs.iter().map(|s| s.caller_turns()).sum())
+    }
 
     /// Creates a table with its families (a manifest commit).
     pub fn create_table(
@@ -1948,7 +1960,7 @@ impl Engine {
         )? {
             Routed::Sent {
                 mut waiter, spins, ..
-            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
+            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins, None),
             Routed::Held(p) => inner.send(p)?.wait(),
         }?;
         Ok((info, returned(&out)))
@@ -4485,8 +4497,17 @@ impl Inner {
     ) -> Result<CommitInfo> {
         match self.route_and_send(batch, durability, None, None, NoAdmission)? {
             Routed::Sent {
-                mut waiter, spins, ..
-            } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
+                mut waiter,
+                spins,
+                target,
+                ..
+            } => {
+                // Caller-runs (#1176): the commit's shard, which this thread may run itself
+                // while it waits. A cross-shard commit's coordinator refuses it (only
+                // single-shard commits are a caller's to run).
+                let caller = (spins && self.shared.caller_runs).then_some(target);
+                crate::write::wait_blocking(&self.shared, &mut waiter, spins, caller)
+            }
             Routed::Held(p) => self.send(p)?.wait(),
         }
     }
@@ -5959,6 +5980,7 @@ impl Shared {
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
+            caller_runs: options.caller_runs,
             tail_index: false,
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),
