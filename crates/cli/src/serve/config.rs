@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub(crate) use super::sessions::Leases;
+
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -58,6 +60,27 @@ pub(crate) struct ServeArgs {
     /// `next`: a client that stops reading doesn't hold its scan slot and a page forever.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub stream_idle_ms: u64,
+    /// How long a transaction may sit idle between calls, in milliseconds, before it expires
+    /// (`TransactionExpired`, if no `Commit` arrived).
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    pub txn_idle_ms: u64,
+    /// The longest a transaction lives, in milliseconds, however busy.
+    #[arg(long, value_name = "MS", default_value_t = 300_000)]
+    pub txn_lifetime_ms: u64,
+    /// How long a pinned snapshot may sit idle, in milliseconds: each read at it renews it.
+    #[arg(long, value_name = "MS", default_value_t = 60_000)]
+    pub snapshot_idle_ms: u64,
+    /// The longest a pinned snapshot lives, in milliseconds. A held snapshot holds back
+    /// compaction's version GC and blob GC.
+    #[arg(long, value_name = "MS", default_value_t = 600_000)]
+    pub snapshot_lifetime_ms: u64,
+    /// Sessions (transactions, pinned snapshots, and the tombstones of committed
+    /// transactions) held at once.
+    #[arg(long, value_name = "N", default_value_t = 1024)]
+    pub max_sessions: usize,
+    /// Sessions one token may hold at once.
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    pub max_sessions_per_token: usize,
     /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
     /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
     /// blocking threads compete only while blocking calls run.
@@ -80,6 +103,7 @@ pub(crate) struct Limits {
     pub max_scans: usize,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
+    pub leases: Leases,
 }
 
 impl ServeArgs {
@@ -91,6 +115,14 @@ impl ServeArgs {
             max_scans: self.max_scans.max(1),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
+            leases: Leases {
+                txn_idle: Duration::from_millis(self.txn_idle_ms.max(1)),
+                txn_lifetime: Duration::from_millis(self.txn_lifetime_ms.max(1)),
+                snapshot_idle: Duration::from_millis(self.snapshot_idle_ms.max(1)),
+                snapshot_lifetime: Duration::from_millis(self.snapshot_lifetime_ms.max(1)),
+                max_sessions: self.max_sessions.max(1),
+                max_per_token: self.max_sessions_per_token.max(1),
+            },
         }
     }
 }

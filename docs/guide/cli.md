@@ -340,7 +340,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`) over gRPC and HTTP/JSON. Transactions, the change feed, schema and the other services follow; ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions` and `Snapshots` over gRPC and HTTP/JSON. The change feed, schema and the other services follow; ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
@@ -349,16 +349,24 @@ u1   profile  name       1761030000000000  Ada
   - **Tokens:** `--token-file`, or the `PHDB_SERVE_TOKENS` environment variable, holds one token per line: `read|write|admin [ns=a,b] <token>`, or `sha256:<hex>` for the token's digest. Requests carry `Authorization: Bearer <token>`. Tokens are never a flag's value.
   - **The bind rule:** an address other hosts can reach needs both TLS and tokens, or the server refuses to start. `--insecure-no-tls-no-auth` overrides that for a trusted private network. A loopback address needs neither.
 - **Scans** stream pages of up to `page_bytes` each (default 1 MiB). Over gRPC, `Data.Scan` is a server stream. Over HTTP, `POST /v1/Data/Scan` answers one JSON page per line (`application/x-ndjson`), or server-sent events with `Accept: text/event-stream`. A scan that fails partway ends with a final error message: an NDJSON line `{"error": ...}`, or an SSE `event: error`. Each page's `next` resumes the scan later, from any server process. The scan is complete only when the last page's `next` is empty; a page budget too small for anything ends the stream with an empty page and a position, so resume with a larger `page_bytes`. Each page reads at its own snapshot: a row is never torn, but rows can change between pages. A client that stops reading for `--stream-idle-ms` (default 30 s) gets `DeadlineExceeded`, and resumes from the last page's `next`.
+- **Transactions** (`Transactions.Begin`, `Get`, `GetRow`, `Write`, `Commit`, `Abort`) are held on the server between calls, under an opaque `txn_id` bound to the token that began them:
+  - **One call at a time.** A second call while one runs gets `SessionBusy`; send it again when the first answers.
+  - **`Commit`** runs to its outcome even if the client goes away. Sent again, it answers the first one's outcome and commits nothing twice. After `Commit`, other calls answer `TransactionFinished`.
+  - **Leases:** a transaction idle for `--txn-idle-ms` (30 s), or older than `--txn-lifetime-ms` (5 min), expires. Before any `Commit`, that's `TransactionExpired`: nothing was written, so begin again. A call in flight never expires.
+  - **`NotFound` for a `txn_id` you sent `Commit` to** (after a restart, or once its record expires) means the outcome is unknown: check an operation id the transaction wrote before retrying ([recovery](recovery.md)).
+  - A read token may begin, read and commit a transaction without writes; writing needs a write token.
+- **Pinned snapshots** (`Snapshots.Open`, `Release`) make reads agree across requests: pass the `snapshot_id` as `GetRequest.snapshot_id`, or as `Selection.snapshot_id` for `MultiGet`, `ReadRow` and `Scan`. Each read renews the snapshot's lease (`--snapshot-idle-ms`, 60 s; at most `--snapshot-lifetime-ms`, 10 min). A held snapshot holds back version and blob GC, so release it when done. Reads already running when it's released finish; later ones, and a scan's later pages, get `NotFound`.
 - **Limits:**
   - `--max-request-bytes` (16 MiB): the largest request.
   - `--inflight-bytes` (256 MiB): request bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC.
   - `--max-concurrent` (1,024 requests): more are refused at once with `Overloaded`, never queued.
   - `--max-scans` (64): scans streaming at once, refused past that the same way. A scan's pages count against `--inflight-bytes` until they're handed to the connection, and at most half the blocking threads read scan pages at once.
   - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page before ending the stream.
+  - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
   - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
   - A write the server has submitted always answers its real outcome.
 - **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts.
-- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, and each RPC's durations as a histogram (a scan's runs to the end of its stream).
+- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (a scan's runs to the end of its stream), open sessions by kind, and the oldest open session's age.
 - **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown. A read may be retried; one that failed on `Io` says so (`retry_from: REQUEST`). `MergeFailed` doesn't: a merge operator that fails on stored data fails the same way again.
 
 ## Exit status

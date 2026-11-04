@@ -103,6 +103,11 @@ fn elements(v: &proto::Vector) -> Result<Elements> {
     )
 }
 
+/// Whether `v`'s data fits its element type and dimension.
+pub(crate) fn check_vector(v: &proto::Vector) -> Result<()> {
+    elements(v).map(|_| ())
+}
+
 fn value_of(v: Option<&proto::Value>) -> Result<&value::Kind> {
     v.and_then(|v| v.kind.as_ref())
         .ok_or_else(|| ApiError::invalid("a put needs a value"))
@@ -236,6 +241,98 @@ pub(crate) fn batch(
     Ok(())
 }
 
+/// Buffers one row's `writes` in a transaction: the same ops as a row mutation.
+pub(crate) fn txn_writes(
+    t: &mut pigeonhole::Transaction,
+    table: &Table,
+    row: &[u8],
+    writes: &[proto::Write],
+) -> Result<()> {
+    for w in writes {
+        match w
+            .op
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
+        {
+            write::Op::Put(p) => {
+                let (f, q) = (p.family.as_str(), &p.qualifier[..]);
+                match (value_of(p.value.as_ref())?, p.timestamp) {
+                    (value::Kind::Bytes(b), None) => t.put(table, row, f, q, b),
+                    (value::Kind::Bytes(b), Some(ts)) => t.put_at(table, row, f, q, ts, b),
+                    (value::Kind::I64(n), None) => t.put_i64(table, row, f, q, *n),
+                    (value::Kind::I64(n), Some(ts)) => t.put_i64_at(table, row, f, q, ts, *n),
+                    (value::Kind::F64(x), None) => t.put_f64(table, row, f, q, *x),
+                    (value::Kind::F64(x), Some(ts)) => t.put_f64_at(table, row, f, q, ts, *x),
+                    (value::Kind::U64(n), None) => t.put_u64(table, row, f, q, *n),
+                    (value::Kind::U64(n), Some(ts)) => t.put_u64_at(table, row, f, q, ts, *n),
+                    (value::Kind::Vector(v), ts) => match (elements(v)?, ts) {
+                        (Elements::F32(x), None) => t.put_vector_f32(table, row, f, q, &x),
+                        (Elements::F32(x), Some(ts)) => {
+                            t.put_vector_f32_at(table, row, f, q, ts, &x)
+                        }
+                        (Elements::I8(x), None) => t.put_vector_i8(table, row, f, q, &x),
+                        (Elements::I8(x), Some(ts)) => t.put_vector_i8_at(table, row, f, q, ts, &x),
+                        (Elements::Bits(x), None) => t.put_vector_bits(table, row, f, q, &x),
+                        (Elements::Bits(x), Some(ts)) => {
+                            t.put_vector_bits_at(table, row, f, q, ts, &x)
+                        }
+                        (Elements::F16(x), None) => t.put_vector_f16(table, row, f, q, &x),
+                        (Elements::F16(x), Some(ts)) => {
+                            t.put_vector_f16_at(table, row, f, q, ts, &x)
+                        }
+                        (Elements::Bf16(x), None) => t.put_vector_bf16(table, row, f, q, &x),
+                        (Elements::Bf16(x), Some(ts)) => {
+                            t.put_vector_bf16_at(table, row, f, q, ts, &x)
+                        }
+                    },
+                };
+            }
+            write::Op::Incr(i) => {
+                match i.timestamp {
+                    None => t.incr(table, row, &i.family, &i.qualifier, i.delta),
+                    Some(ts) => t.incr_at(table, row, &i.family, &i.qualifier, ts, i.delta),
+                };
+            }
+            write::Op::Aggregate(a) => {
+                let (f, q) = (a.family.as_str(), &a.qualifier[..]);
+                match (value_of(a.input.as_ref())?, a.timestamp) {
+                    (value::Kind::I64(n), None) => t.aggregate(table, row, f, q, *n),
+                    (value::Kind::I64(n), Some(ts)) => t.aggregate_at(table, row, f, q, ts, *n),
+                    (value::Kind::U64(n), None) => t.aggregate_u64(table, row, f, q, *n),
+                    (value::Kind::U64(n), Some(ts)) => t.aggregate_u64_at(table, row, f, q, ts, *n),
+                    (value::Kind::F64(x), None) => t.aggregate_f64(table, row, f, q, *x),
+                    (value::Kind::F64(x), Some(ts)) => t.aggregate_f64_at(table, row, f, q, ts, *x),
+                    (value::Kind::Bytes(b), None) => t.aggregate_bytes(table, row, f, q, b),
+                    (value::Kind::Bytes(b), Some(ts)) => {
+                        t.aggregate_bytes_at(table, row, f, q, ts, b)
+                    }
+                    (value::Kind::Vector(_), _) => {
+                        return Err(ApiError::invalid(
+                            "an aggregate input is an i64, u64, f64 or bytes",
+                        ));
+                    }
+                };
+            }
+            write::Op::Merge(g) => {
+                t.merge(table, row, &g.family, &g.qualifier, &g.operand);
+            }
+            write::Op::DeleteCell(d) => {
+                t.delete_cell(table, row, &d.family, &d.qualifier, d.timestamp);
+            }
+            write::Op::DeleteColumn(d) => {
+                t.delete_column(table, row, &d.family, &d.qualifier);
+            }
+            write::Op::DeleteFamily(d) => {
+                t.delete_family(table, row, &d.family);
+            }
+            write::Op::DeleteRow(_) => {
+                t.delete_row(table, row);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn condition(c: Option<&proto::Condition>) -> Result<pigeonhole::Condition> {
     use proto::condition::Kind;
     let col = |c: &Option<proto::Column>| {
@@ -304,7 +401,7 @@ fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
 
 /// Applies a selection to any of the read builders, which share these methods.
 macro_rules! select {
-    ($s:expr, $r:expr) => {{
+    ($s:expr, $snap:expr, $r:expr) => {{
         let mut r = $r;
         if let Some(s) = $s {
             if !s.families.is_empty() {
@@ -334,24 +431,29 @@ macro_rules! select {
                 r = r.value_filter(value_filter(s.value_filter.as_ref())?);
             }
         }
+        if let Some(snap) = $snap {
+            r = r.snapshot(snap);
+        }
         Ok(r)
     }};
 }
 
-/// A selection's parts, checked once and applied to row reads and multi-gets alike.
+/// A selection's parts, checked once and applied to row reads and multi-gets alike, at the
+/// pinned snapshot its `snapshot_id` names (resolved by the service, `at`), or now.
 pub(crate) struct Select<'s> {
     s: Option<&'s proto::Selection>,
+    snapshot: Option<pigeonhole::Snapshot>,
 }
 
 impl<'s> Select<'s> {
     pub(crate) fn new(s: Option<&'s proto::Selection>) -> Result<Self> {
-        if let Some(s) = s
-            && !s.snapshot_id.is_empty()
-        {
-            // Pinned snapshots arrive with D313's ticket 4; until then no id exists.
-            return Err(ApiError::not_found("no such snapshot"));
-        }
-        Ok(Self { s })
+        Ok(Self { s, snapshot: None })
+    }
+
+    /// Reads at `snapshot` (a pinned snapshot session's), or now with `None`.
+    pub(crate) fn at(mut self, snapshot: Option<pigeonhole::Snapshot>) -> Self {
+        self.snapshot = snapshot;
+        self
     }
 
     pub(crate) fn aggregate(&self) -> Option<&'s proto::AggregateQuery> {
@@ -359,11 +461,11 @@ impl<'s> Select<'s> {
     }
 
     pub(crate) fn row<'t>(&self, r: pigeonhole::RowRead<'t>) -> Result<pigeonhole::RowRead<'t>> {
-        select!(self.s, r)
+        select!(self.s, self.snapshot.as_ref(), r)
     }
 
     pub(crate) fn keys<'t>(&self, r: pigeonhole::KeysRead<'t>) -> Result<pigeonhole::KeysRead<'t>> {
-        select!(self.s, r)
+        select!(self.s, self.snapshot.as_ref(), r)
     }
 
     /// A scan of `range` in `table` (no range: the whole table) with this selection.
@@ -380,7 +482,7 @@ impl<'s> Select<'s> {
             }
             None => table.scan_bounds(Bound::Unbounded, Bound::Unbounded),
         };
-        select!(self.s, r)
+        select!(self.s, self.snapshot.as_ref(), r)
     }
 }
 

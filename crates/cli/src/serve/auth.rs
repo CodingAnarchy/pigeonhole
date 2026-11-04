@@ -13,9 +13,11 @@ pub(crate) enum Scope {
     Admin,
 }
 
-/// Who is calling: the scope of the token that matched, and its namespace limit.
+/// Who is calling: the token that matched (its line, `token`), its scope, and its namespace
+/// limit. Sessions are bound to `token` (D313 §3).
 #[derive(Debug, Clone)]
 pub(crate) struct Caller {
+    pub token: u32,
     pub scope: Scope,
     /// `None`: every namespace. Used by the memory calls (ticket 8).
     #[allow(dead_code)]
@@ -26,6 +28,7 @@ impl Caller {
     /// The caller when no tokens are configured (a loopback server): everything.
     pub(crate) fn anonymous() -> Self {
         Self {
+            token: u32::MAX,
             scope: Scope::Admin,
             namespaces: None,
         }
@@ -112,9 +115,10 @@ impl Tokens {
     pub(crate) fn caller(&self, token: &str) -> Option<Caller> {
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let mut found = None;
-        for e in &self.0 {
+        for (i, e) in self.0.iter().enumerate() {
             if constant_time_eq(&e.digest, &digest) && found.is_none() {
                 found = Some(Caller {
+                    token: u32::try_from(i).unwrap_or(u32::MAX - 1),
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                 });

@@ -23,6 +23,7 @@ use super::config::Limits;
 use super::convert;
 use super::errors::ApiError;
 use super::proto;
+use super::sessions::{SnapshotGuard, Taken};
 
 /// A page's size when a request leaves it at 0 (D313 §4: 1 MiB), and the cap on a request's
 /// own.
@@ -41,6 +42,14 @@ pub(crate) enum ServiceOp {
     Batch(proto::BatchRequest),
     MutateReturning(proto::MutateRequest),
     Scan(proto::ScanRequest),
+    Begin(proto::BeginRequest),
+    TxnGet(proto::TxnGetRequest),
+    TxnGetRow(proto::TxnGetRowRequest),
+    TxnWrite(proto::TxnWriteRequest),
+    Commit(proto::TxnCommitRequest),
+    Abort(proto::TxnAbortRequest),
+    OpenSnapshot(proto::OpenSnapshotRequest),
+    ReleaseSnapshot(proto::ReleaseSnapshotRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -56,6 +65,10 @@ pub(crate) enum ServiceReply {
     CheckAndMutate(proto::CheckAndMutateResponse),
     MutateReturning(proto::MutateReturningResponse),
     Scan(ScanPages),
+    Begin(proto::BeginResponse),
+    Commit(proto::TxnCommitResponse),
+    OpenSnapshot(proto::OpenSnapshotResponse),
+    Empty(proto::Empty),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -117,27 +130,42 @@ impl ServiceOp {
             Self::Batch(_) => 5,
             Self::MutateReturning(_) => 6,
             Self::Scan(_) => SCAN,
+            Self::Begin(_) => 8,
+            Self::TxnGet(_) => 9,
+            Self::TxnGetRow(_) => 10,
+            Self::TxnWrite(_) => 11,
+            Self::Commit(_) => 12,
+            Self::Abort(_) => 13,
+            Self::OpenSnapshot(_) => 14,
+            Self::ReleaseSnapshot(_) => 15,
         }
     }
 
     /// The RPC's name, `Service.Method`, for logs.
     pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::Get(_) => "Data.Get",
-            Self::MultiGet(_) => "Data.MultiGet",
-            Self::ReadRow(_) => "Data.ReadRow",
-            Self::Mutate(_) => "Data.Mutate",
-            Self::CheckAndMutate(_) => "Data.CheckAndMutate",
-            Self::Batch(_) => "Data.Batch",
-            Self::MutateReturning(_) => "Data.MutateReturning",
-            Self::Scan(_) => "Data.Scan",
-        }
+        RPCS[self.index()]
     }
 
     fn scope(&self) -> Scope {
         match self {
-            Self::Get(_) | Self::MultiGet(_) | Self::ReadRow(_) | Self::Scan(_) => Scope::Read,
-            _ => Scope::Write,
+            // A transaction's reads, and its Commit (one that carries writes is checked
+            // for write scope where it's answered: a read-only Commit is a consistent read).
+            Self::Get(_)
+            | Self::MultiGet(_)
+            | Self::ReadRow(_)
+            | Self::Scan(_)
+            | Self::Begin(_)
+            | Self::TxnGet(_)
+            | Self::TxnGetRow(_)
+            | Self::Commit(_)
+            | Self::Abort(_)
+            | Self::OpenSnapshot(_)
+            | Self::ReleaseSnapshot(_) => Scope::Read,
+            Self::Mutate(_)
+            | Self::CheckAndMutate(_)
+            | Self::Batch(_)
+            | Self::MutateReturning(_)
+            | Self::TxnWrite(_) => Scope::Write,
         }
     }
 
@@ -151,6 +179,14 @@ impl ServiceOp {
             Self::CheckAndMutate(r) => r.encoded_len(),
             Self::Batch(r) => r.encoded_len(),
             Self::Scan(r) => r.encoded_len(),
+            Self::Begin(r) => r.encoded_len(),
+            Self::TxnGet(r) => r.encoded_len(),
+            Self::TxnGetRow(r) => r.encoded_len(),
+            Self::TxnWrite(r) => r.encoded_len(),
+            Self::Commit(r) => r.encoded_len(),
+            Self::Abort(r) => r.encoded_len(),
+            Self::OpenSnapshot(r) => r.encoded_len(),
+            Self::ReleaseSnapshot(r) => r.encoded_len(),
         }
     }
 }
@@ -159,7 +195,7 @@ impl ServiceOp {
 pub(crate) const SCAN: usize = 7;
 
 /// The RPCs, by `ServiceOp::index`.
-pub(crate) const RPCS: [&str; 8] = [
+pub(crate) const RPCS: [&str; 16] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -168,11 +204,19 @@ pub(crate) const RPCS: [&str; 8] = [
     "Data.Batch",
     "Data.MutateReturning",
     "Data.Scan",
+    "Transactions.Begin",
+    "Transactions.Get",
+    "Transactions.GetRow",
+    "Transactions.Write",
+    "Transactions.Commit",
+    "Transactions.Abort",
+    "Snapshots.Open",
+    "Snapshots.Release",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 40] = [
+pub(crate) const OUTCOMES: [&str; 43] = [
     "ok",
     "Io",
     "Corruption",
@@ -211,6 +255,9 @@ pub(crate) const OUTCOMES: [&str; 40] = [
     "Overloaded",
     "RequestTooLarge",
     "DeadlineExceeded",
+    "SessionBusy",
+    "TransactionExpired",
+    "TransactionFinished",
     "Internal",
     "other",
 ];
@@ -342,6 +389,28 @@ impl Metrics {
     }
 }
 
+/// The session table's gauges (D313 §3): open sessions by kind, and the oldest open one's age,
+/// since a held transaction or snapshot holds back compaction's version GC and blob GC. A
+/// client that leaks sessions shows up here. Ticket 9 moves these onto D316's names.
+pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sessions) {
+    use std::fmt::Write as _;
+    let s = sessions.stats(Instant::now());
+    let _ = writeln!(out, "# TYPE pigeonhole_serve_sessions gauge");
+    for (kind, n) in [
+        ("transaction", s.transactions),
+        ("snapshot", s.snapshots),
+        ("tombstone", s.tombstones),
+    ] {
+        let _ = writeln!(out, "pigeonhole_serve_sessions{{kind=\"{kind}\"}} {n}");
+    }
+    let _ = writeln!(out, "# TYPE pigeonhole_serve_oldest_session_seconds gauge");
+    let _ = writeln!(
+        out,
+        "pigeonhole_serve_oldest_session_seconds {:.3}",
+        s.oldest.as_secs_f64()
+    );
+}
+
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
     pub(crate) db: Pigeonhole,
@@ -354,6 +423,8 @@ pub(crate) struct Service {
     blocking: Arc<Semaphore>,
     /// Scans streaming at once (`--max-scans`).
     scans: Arc<Semaphore>,
+    /// Transactions and pinned snapshots between requests (D313 §3).
+    pub(crate) sessions: Arc<super::sessions::Sessions>,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -384,6 +455,7 @@ impl Service {
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
+            sessions: super::sessions::Sessions::new(limits.leases),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
@@ -442,22 +514,22 @@ impl Service {
             // A read that fails on `Io` changed nothing, so it may be sent
             // again (`retry_from` REQUEST, ICR 0112).
             ServiceOp::Get(r) => {
-                let reply = self.get(r).await.map(ServiceReply::Get);
+                let reply = self.get(r, caller).await.map(ServiceReply::Get);
                 drop(budget);
                 reply.map_err(ApiError::for_read)
             }
             ServiceOp::MultiGet(r) => {
-                let reply = self.multi_get(r).await.map(ServiceReply::MultiGet);
+                let reply = self.multi_get(r, caller).await.map(ServiceReply::MultiGet);
                 drop(budget);
                 reply.map_err(ApiError::for_read)
             }
             ServiceOp::ReadRow(r) => {
-                let reply = self.read_row(r).await.map(ServiceReply::ReadRow);
+                let reply = self.read_row(r, caller).await.map(ServiceReply::ReadRow);
                 drop(budget);
                 reply.map_err(ApiError::for_read)
             }
             ServiceOp::Scan(r) => self
-                .scan(r, budget)
+                .scan(r, caller, budget)
                 .await
                 .map(ServiceReply::Scan)
                 .map_err(ApiError::for_read),
@@ -471,6 +543,44 @@ impl Service {
                 .mutate_returning(r, budget)
                 .await
                 .map(ServiceReply::MutateReturning),
+            ServiceOp::Begin(r) => {
+                drop(budget);
+                self.begin(r, caller).map(ServiceReply::Begin)
+            }
+            ServiceOp::TxnGet(r) => {
+                let reply = self.txn_get(r, caller).await.map(ServiceReply::Get);
+                drop(budget);
+                reply.map_err(ApiError::for_read)
+            }
+            ServiceOp::TxnGetRow(r) => {
+                let reply = self.txn_get_row(r, caller).await.map(ServiceReply::ReadRow);
+                drop(budget);
+                reply.map_err(ApiError::for_read)
+            }
+            ServiceOp::TxnWrite(r) => {
+                let reply = self.txn_write(r, caller).await.map(ServiceReply::Empty);
+                drop(budget);
+                reply
+            }
+            ServiceOp::Commit(r) => self
+                .commit(r, caller, budget)
+                .await
+                .map(ServiceReply::Commit),
+            ServiceOp::Abort(r) => {
+                drop(budget);
+                self.abort(&r, caller).map(ServiceReply::Empty)
+            }
+            ServiceOp::OpenSnapshot(r) => {
+                drop(budget);
+                self.open_snapshot(&r, caller)
+                    .map(ServiceReply::OpenSnapshot)
+            }
+            ServiceOp::ReleaseSnapshot(r) => {
+                drop(budget);
+                self.sessions
+                    .release(&r.snapshot_id, caller.token)
+                    .map(|()| ServiceReply::Empty(proto::Empty {}))
+            }
         }
     }
 
@@ -539,12 +649,22 @@ impl Service {
         })
     }
 
-    async fn get(&self, r: proto::GetRequest) -> Result<proto::GetResponse, ApiError> {
-        if !r.snapshot_id.is_empty() {
-            return Err(ApiError::not_found("no such snapshot"));
-        }
+    async fn get(
+        &self,
+        r: proto::GetRequest,
+        caller: &Caller,
+    ) -> Result<proto::GetResponse, ApiError> {
+        let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
-        let cell = table.get_async(&r.row, &r.family, &r.qualifier).await?;
+        let cell = match &pinned {
+            Some(p) => {
+                table
+                    .get_at_async(p.snapshot(), &r.row, &r.family, &r.qualifier)
+                    .await?
+            }
+            None => table.get_async(&r.row, &r.family, &r.qualifier).await?,
+        };
+        drop(pinned);
         Ok(proto::GetResponse {
             cell: cell.map(|c| convert::cell(&r.family, &r.qualifier, &c, r.aggregate.as_ref())),
         })
@@ -555,11 +675,14 @@ impl Service {
     async fn multi_get(
         &self,
         r: proto::MultiGetRequest,
+        caller: &Caller,
     ) -> Result<proto::MultiGetResponse, ApiError> {
+        let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
         self.blocking(move || {
-            let select = convert::Select::new(r.selection.as_ref())?;
+            let at = pinned.as_ref().map(|p| p.snapshot().clone());
+            let select = convert::Select::new(r.selection.as_ref())?.at(at);
             let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
             let mut read = select.keys(table.keys(&keys))?;
             let after;
@@ -590,7 +713,12 @@ impl Service {
     /// first column always comes back, so a page makes progress even when one column is
     /// larger than the budget. On the blocking pool, since row pages are sync-only (D196).
     /// TODO(#398, #1286): `read_async`-based paging, so a row read holds no blocking thread.
-    async fn read_row(&self, r: proto::ReadRowRequest) -> Result<proto::ReadRowResponse, ApiError> {
+    async fn read_row(
+        &self,
+        r: proto::ReadRowRequest,
+        caller: &Caller,
+    ) -> Result<proto::ReadRowResponse, ApiError> {
+        let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
         let cells_cap = if r.page_cells == 0 {
@@ -599,7 +727,8 @@ impl Service {
             r.page_cells as usize
         };
         self.blocking(move || {
-            let select = convert::Select::new(r.selection.as_ref())?;
+            let at = pinned.as_ref().map(|p| p.snapshot().clone());
+            let select = convert::Select::new(r.selection.as_ref())?.at(at);
             let mut read = select.row(table.row(&r.row))?;
             let after;
             if !r.after.is_empty() {
@@ -654,7 +783,7 @@ impl Service {
     /// A scan as a stream of pages (ICR 0112): each page is one `read_within` on the
     /// blocking pool (D196: scan pages are sync-only), resumed from the last, until the range
     /// or `limit` runs out. Each page is a new read, at its own snapshot (simp724's D1 on
-    /// #1510). The request is checked before the stream starts, so a bad one fails the call;
+    /// #1510), unless the selection names a pinned one, which the stream holds. The request is checked before the stream starts, so a bad one fails the call;
     /// a failure later ends the stream with the error, a panic in the task as `Internal`. The
     /// scan holds a `--max-scans` slot until its stream ends: a stream outlives its request's
     /// `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read holds
@@ -662,6 +791,7 @@ impl Service {
     async fn scan(
         &self,
         r: proto::ScanRequest,
+        caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<ScanPages, ApiError> {
         let Ok(slot) = Arc::clone(&self.scans).try_acquire_owned() else {
@@ -670,6 +800,9 @@ impl Service {
             ));
         };
         convert::Select::new(r.selection.as_ref())?;
+        // A pinned snapshot is held for the stream's life, and checked before each page: a
+        // page that starts after its `Release` gets NotFound.
+        let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let after = if r.after.is_empty() {
             None
         } else {
@@ -684,6 +817,7 @@ impl Service {
             table,
             r,
             after,
+            pinned,
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
             inflight: Arc::clone(&self.inflight),
@@ -713,6 +847,204 @@ impl Service {
             pages: rx,
             end: Some(end_rx),
         })
+    }
+
+    /// The pinned snapshot `id` names, held for one read; `None` for an empty id (now).
+    fn pinned(&self, id: &str, caller: &Caller) -> Result<Option<SnapshotGuard>, ApiError> {
+        if id.is_empty() {
+            return Ok(None);
+        }
+        self.sessions.snapshot(id, caller.token).map(Some)
+    }
+
+    fn pinned_selection(
+        &self,
+        s: Option<&proto::Selection>,
+        caller: &Caller,
+    ) -> Result<Option<SnapshotGuard>, ApiError> {
+        self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
+    }
+
+    /// `Transactions.Begin`: a transaction at a snapshot taken now, held for the caller.
+    fn begin(
+        &self,
+        r: proto::BeginRequest,
+        caller: &Caller,
+    ) -> Result<proto::BeginResponse, ApiError> {
+        let txn = self.db.transaction()?;
+        let snapshot_seqno = txn.snapshot_seqno();
+        let txn_id = self
+            .sessions
+            .begin(caller.token, txn, convert::durability(r.durability))?;
+        Ok(proto::BeginResponse {
+            txn_id,
+            snapshot_seqno,
+        })
+    }
+
+    /// Takes transaction `id` for a call that only an open transaction answers.
+    fn open_txn(&self, id: &str, caller: &Caller) -> Result<super::sessions::TxnGuard, ApiError> {
+        match self.sessions.take(id, caller.token)? {
+            Taken::Open(g) => Ok(g),
+            Taken::Done(outcome) => Err(ApiError::transaction_finished(&outcome)),
+        }
+    }
+
+    /// The tables `rows` name, opened before the transaction is taken out, so a missing table
+    /// fails the call without touching the session.
+    async fn row_tables<'r>(
+        &self,
+        rows: &'r [proto::RowWrites],
+    ) -> Result<Vec<(Table, &'r [u8], &'r [proto::Write])>, ApiError> {
+        let mut out = Vec::with_capacity(rows.len());
+        for rw in rows {
+            let key = rw
+                .row
+                .as_ref()
+                .ok_or_else(|| ApiError::invalid("each row's writes name its table and row"))?;
+            check_writes(&rw.writes)?;
+            out.push((self.table(&key.table).await?, &key.row[..], &rw.writes[..]));
+        }
+        Ok(out)
+    }
+
+    async fn txn_get(
+        &self,
+        r: proto::TxnGetRequest,
+        caller: &Caller,
+    ) -> Result<proto::GetResponse, ApiError> {
+        let table = self.table(&r.table).await?;
+        let mut g = self.open_txn(&r.txn_id, caller)?;
+        let cell = g
+            .txn()
+            .get_async(&table, &r.row, &r.family, &r.qualifier)
+            .await?;
+        drop(g);
+        Ok(proto::GetResponse {
+            cell: cell.map(|c| convert::cell(&r.family, &r.qualifier, &c, None)),
+        })
+    }
+
+    /// On the blocking pool, as `get_row` is sync-only (D196): the transaction is lent to the
+    /// blocking call and back, and a panic there expires the session (uncommitted).
+    async fn txn_get_row(
+        &self,
+        r: proto::TxnGetRowRequest,
+        caller: &Caller,
+    ) -> Result<proto::ReadRowResponse, ApiError> {
+        let table = self.table(&r.table).await?;
+        let mut g = self.open_txn(&r.txn_id, caller)?;
+        let mut txn = g.lend();
+        let (txn, row) = self
+            .blocking(move || {
+                let families: Vec<&str> = r.families.iter().map(String::as_str).collect();
+                let row = txn
+                    .get_row(&table, &r.row, &families)
+                    .map(|row| row.map(|row| convert::row(row, None)));
+                Ok((txn, row))
+            })
+            .await?;
+        g.restore(txn);
+        drop(g);
+        let row = row?;
+        let bytes = row.as_ref().map_or(0, row_bytes);
+        Ok(proto::ReadRowResponse {
+            row,
+            next: Default::default(),
+            bytes,
+        })
+    }
+
+    /// `Transactions.Write`: buffers the writes. They're checked before any is buffered, so a
+    /// malformed request buffers nothing; what only the engine can check (a family, a size)
+    /// fails the `Commit`, as in-process.
+    async fn txn_write(
+        &self,
+        r: proto::TxnWriteRequest,
+        caller: &Caller,
+    ) -> Result<proto::Empty, ApiError> {
+        let rows = self.row_tables(&r.rows).await?;
+        let mut g = self.open_txn(&r.txn_id, caller)?;
+        for (table, row, writes) in &rows {
+            convert::txn_writes(g.txn(), table, row, writes)?;
+        }
+        Ok(proto::Empty {})
+    }
+
+    /// `Transactions.Commit`, detached from the request (D313 B2): the commit runs in its own
+    /// task, which records the outcome as the session's tombstone (B1), so a client that goes
+    /// away loses only the reply. A repeated `Commit` answers the tombstone.
+    async fn commit(
+        &self,
+        r: proto::TxnCommitRequest,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::TxnCommitResponse, ApiError> {
+        if !r.rows.is_empty() && caller.scope < Scope::Write {
+            return Err(ApiError::permission_denied("commit writes"));
+        }
+        let rows = self.row_tables(&r.rows).await?;
+        let mut g = match self.sessions.take(&r.txn_id, caller.token)? {
+            Taken::Open(g) => g,
+            Taken::Done(outcome) => {
+                return outcome.map(|c| proto::TxnCommitResponse {
+                    commit: Some(convert::commit_info(c)),
+                });
+            }
+        };
+        for (table, row, writes) in &rows {
+            convert::txn_writes(g.txn(), table, row, writes)?;
+        }
+        drop(rows);
+        let (txn, durability, ticket) = g.commit();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let metrics = Arc::clone(&self.metrics);
+        tokio::spawn(async move {
+            let commit = match durability {
+                Some(d) => txn.commit_with_async(d),
+                None => txn.commit_async(),
+            };
+            // Its own task, so a panic still records an outcome (unknown), never nothing.
+            let outcome = match tokio::spawn(commit).await {
+                Ok(r) => r.map_err(ApiError::from),
+                Err(e) => Err(ApiError::outcome_unknown(format!(
+                    "the commit's task failed: {e}"
+                ))),
+            };
+            ticket.finish(outcome.clone());
+            drop(budget);
+            if tx.send(outcome).is_err() {
+                metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let outcome = rx.await.unwrap_or_else(|_| {
+            Err(ApiError::outcome_unknown(
+                "the commit's task ended without an outcome",
+            ))
+        })?;
+        Ok(proto::TxnCommitResponse {
+            commit: Some(convert::commit_info(outcome)),
+        })
+    }
+
+    fn abort(&self, r: &proto::TxnAbortRequest, caller: &Caller) -> Result<proto::Empty, ApiError> {
+        self.open_txn(&r.txn_id, caller)?.abort();
+        Ok(proto::Empty {})
+    }
+
+    fn open_snapshot(
+        &self,
+        r: &proto::OpenSnapshotRequest,
+        caller: &Caller,
+    ) -> Result<proto::OpenSnapshotResponse, ApiError> {
+        let snapshot = if r.durable {
+            self.db.durable_snapshot()?
+        } else {
+            self.db.snapshot()?
+        };
+        let seqno = snapshot.seqno();
+        let snapshot_id = self.sessions.open_snapshot(caller.token, snapshot)?;
+        Ok(proto::OpenSnapshotResponse { snapshot_id, seqno })
     }
 
     async fn mutate(
@@ -879,6 +1211,7 @@ struct ScanTask {
     table: Table,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
+    pinned: Option<SnapshotGuard>,
     pool: Arc<Semaphore>,
     reads: Arc<Semaphore>,
     inflight: Arc<Semaphore>,
@@ -906,6 +1239,7 @@ impl ScanTask {
             table,
             r,
             mut after,
+            pinned,
             pool,
             reads,
             inflight,
@@ -925,13 +1259,17 @@ impl ScanTask {
                 return Ok(());
             };
             let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
+            if let Some(p) = &pinned {
+                p.check()?;
+            }
+            let at = pinned.as_ref().map(|p| p.snapshot().clone());
             let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
             let thread = Arc::clone(&reads)
                 .acquire_owned()
                 .await
                 .map_err(|_| ApiError::internal("the scan threads closed"))?;
             let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
-                let select = convert::Select::new(req.selection.as_ref())?;
+                let select = convert::Select::new(req.selection.as_ref())?.at(at);
                 let mut scan = select.scan(&table, req.range.as_ref())?;
                 if let Some(n) = limit {
                     scan = scan.limit(n);
@@ -1035,6 +1373,41 @@ async fn room<'a>(
             )))
         }
     }
+}
+
+/// The checks `convert::txn_writes` makes, without buffering anything, so a transaction's
+/// `Write` or `Commit` is all or nothing on the server's side.
+fn check_writes(writes: &[proto::Write]) -> Result<(), ApiError> {
+    use proto::write::Op;
+    for w in writes {
+        match w
+            .op
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
+        {
+            Op::Put(p) => {
+                let kind = p
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.kind.as_ref())
+                    .ok_or_else(|| ApiError::invalid("a put needs a value"))?;
+                if let proto::value::Kind::Vector(v) = kind {
+                    convert::check_vector(v)?;
+                }
+            }
+            Op::Aggregate(a) => match a.input.as_ref().and_then(|v| v.kind.as_ref()) {
+                None => return Err(ApiError::invalid("a put needs a value")),
+                Some(proto::value::Kind::Vector(_)) => {
+                    return Err(ApiError::invalid(
+                        "an aggregate input is an i64, u64, f64 or bytes",
+                    ));
+                }
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// A row's size by D308's measure as the converted cells give it: its key and its cells.

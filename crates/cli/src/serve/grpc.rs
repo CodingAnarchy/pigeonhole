@@ -154,18 +154,107 @@ impl DataGrpc {
         req: Request<T>,
         op: impl FnOnce(T) -> ServiceOp,
     ) -> Result<ServiceReply, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
-        let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
-        let started = Instant::now();
-        let op = op(req.into_inner());
-        let rpc = op.index();
-        let reply = self.0.router.dispatch(op, &caller, prepaid).await;
-        self.0.count(rpc, started, &reply);
-        Ok(reply?)
+        call(&self.0, req, op).await
+    }
+}
+
+/// One gRPC call through the router, for every service.
+async fn call<T>(
+    shared: &Shared,
+    req: Request<T>,
+    op: impl FnOnce(T) -> ServiceOp,
+) -> Result<ServiceReply, Status> {
+    let header = req
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+    let caller = shared.caller(header)?;
+    let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+    let started = Instant::now();
+    let op = op(req.into_inner());
+    let rpc = op.index();
+    let reply = shared.router.dispatch(op, &caller, prepaid).await;
+    shared.count(rpc, started, &reply);
+    Ok(reply?)
+}
+
+/// A unary RPC: the call, and its reply's variant.
+macro_rules! unary {
+    ($shared:expr, $req:expr, $op:ident, $reply:ident) => {
+        match call($shared, $req, ServiceOp::$op).await? {
+            ServiceReply::$reply(r) => Ok(Response::new(r)),
+            _ => Err(unexpected()),
+        }
+    };
+}
+
+/// `Transactions` over gRPC (D313 §3).
+#[derive(Debug, Clone)]
+pub(crate) struct TxnGrpc(pub(crate) Arc<Shared>);
+
+#[tonic::async_trait]
+impl proto::transactions_server::Transactions for TxnGrpc {
+    async fn begin(
+        &self,
+        req: Request<proto::BeginRequest>,
+    ) -> Result<Response<proto::BeginResponse>, Status> {
+        unary!(&self.0, req, Begin, Begin)
+    }
+
+    async fn get(
+        &self,
+        req: Request<proto::TxnGetRequest>,
+    ) -> Result<Response<proto::GetResponse>, Status> {
+        unary!(&self.0, req, TxnGet, Get)
+    }
+
+    async fn get_row(
+        &self,
+        req: Request<proto::TxnGetRowRequest>,
+    ) -> Result<Response<proto::ReadRowResponse>, Status> {
+        unary!(&self.0, req, TxnGetRow, ReadRow)
+    }
+
+    async fn write(
+        &self,
+        req: Request<proto::TxnWriteRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, TxnWrite, Empty)
+    }
+
+    async fn commit(
+        &self,
+        req: Request<proto::TxnCommitRequest>,
+    ) -> Result<Response<proto::TxnCommitResponse>, Status> {
+        unary!(&self.0, req, Commit, Commit)
+    }
+
+    async fn abort(
+        &self,
+        req: Request<proto::TxnAbortRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Abort, Empty)
+    }
+}
+
+/// `Snapshots` over gRPC (D313 §3).
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotGrpc(pub(crate) Arc<Shared>);
+
+#[tonic::async_trait]
+impl proto::snapshots_server::Snapshots for SnapshotGrpc {
+    async fn open(
+        &self,
+        req: Request<proto::OpenSnapshotRequest>,
+    ) -> Result<Response<proto::OpenSnapshotResponse>, Status> {
+        unary!(&self.0, req, OpenSnapshot, OpenSnapshot)
+    }
+
+    async fn release(
+        &self,
+        req: Request<proto::ReleaseSnapshotRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, ReleaseSnapshot, Empty)
     }
 }
 
