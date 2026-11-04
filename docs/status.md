@@ -32,7 +32,7 @@ Phase 4 shipped as 1.0.0. Main was versioned 0.4.0 during the phase (#775) becau
 | Baseline cleanup (test hooks, debug output, dead code) | **done** (#951). The owner's follow-on rule that tests run production paths, not test-only ones, is **done** too (#1084, #1087, ICR 0089). |
 | Stable C ABI | **deferred** to post-1.0 (#690, [D250](design/decisions/phase-3.md#d250)). |
 | Arrow export | **done** (#691: #822, #823, #825; [guide](guide/arrow.md)). |
-| CLI and dump tools (`phdb`) | **done on main** (#692: info, check, dump, load, backup, compact, schema and the shell; [CLI guide](guide/cli.md)). `phdb mcp`, an MCP server for AI agents, is on main for 1.1.0 (#1249; [guide](guide/ai-agents.md)). The issue stays open until `pigeonhole-cli` is published: crates.io still has the 0.3.0 placeholder. |
+| CLI and dump tools (`phdb`) | **done on main** (#692: info, check, dump, load, backup, compact, schema and the shell; [CLI guide](guide/cli.md)). `phdb mcp`, an MCP server for AI agents, shipped in 1.1.0 (#1249; [guide](guide/ai-agents.md)). `pigeonhole-cli` 1.1.0 is on crates.io (`cargo install pigeonhole-cli`). |
 | Python bindings (`pigeonhole-db`) | **done on main** for 1.1.0 (#696, D307, ICR 0102): the core API, stubs, tests and CI wheels; vectors, multi-get, traversal, row pages and byte budgets; the change feed; and `pigeonhole.memory` ([guide](guide/python.md)). Not on PyPI yet: the first publish is the owner's call. |
 | Multi-process readers, 1.0 hardening | **done** (#693: #39 by #894, #150 by #898, #683 by #846 and #848; #397 deferred by the owner; the reader row cache #926). |
 | OCC transactions, 1.0 hardening | **done** (#694; #655 by #679). #656 is deferred. |
@@ -105,7 +105,7 @@ The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2
 - **Releases from `release/0.2.x`, also in 0.3.0:** [0.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.1) (D209) and [0.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.2) (the cross-shard close fixes, [D225](design/decisions/phase-3.md#d225), #591, #597) and [0.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.3) (the cross-shard timestamp order, D244 and D245 without the room refusal).
 
 ## 1.1.0
-Everything below shipped in 1.1.0, on `main` since 1.0.0. [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) (2026-10-31, from `release/1.0.x`) backported the D300 fix (#1208). The per-change list is the [changelog](../CHANGELOG.md).
+Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0) (2026-11-04), on `main` since 1.0.0. [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) (2026-10-31, from `release/1.0.x`) backported the D300 fix (#1208). The per-change list is the [changelog](../CHANGELOG.md).
 - **Wide rows, multi-get and traversal** (#489): a row walked cell by cell or in pages with resumable positions ([D297](design/decisions/phase-3.md#d297)), multi-get over a `KeySet` ([D299](design/decisions/phase-3.md#d299)), breadth-first traversal inside the engine ([D304](design/decisions/phase-3.md#d304)), sync and async; the guide's [Graphs](guide/graphs.md).
 - **Vectors** (#490, [D303](design/decisions/phase-3.md#d303), ICR 0098): vector families (`f32`, `i8`, bits, and `f16`/`bf16`, ICR 0104), exact `nearest_*` search ([D296](design/decisions/phase-3.md#d296)); and **`pigeonhole-vector`**, an IVF index ([D306](design/decisions/phase-3.md#d306), ICR 0100) with bulk loads, background rebalancing, reader processes, writes in a caller's transaction and prefixed searches; the guide's [Vectors](guide/vectors.md).
 - **Byte-budgeted reads** (#1250, [D308](design/decisions/phase-3.md#d308), ICR 0103): `read_within` on scans and multi-gets, and `Nearest::run_within`, with resumable positions; [Scans and filters](guide/scans-and-filters.md).
@@ -125,6 +125,9 @@ Everything below shipped in 1.1.0, on `main` since 1.0.0. [1.0.1](https://github
   - **Deferred:** the candidates D298 didn't take are in #1317.
   - **Still owed:** §7's box measurement of the hub case (common neighbours of two 2M-element sets, ≤ 2 ms), #1319.
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
+
+## On main for 1.2.0
+Nothing has merged for 1.2.0 yet. Its scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). What has merged is listed here as it lands, with the changelog's fragments in [`changelog.d/`](../changelog.d/README.md).
 
 ## Tracked follow-ups
 Deferred work is one GitHub issue each, labeled with its crate and phase and assigned to the phase's milestone (D62). The open list is the milestone itself:
