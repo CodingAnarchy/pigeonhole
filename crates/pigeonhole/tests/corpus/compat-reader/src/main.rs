@@ -1,4 +1,9 @@
-//! Opens files written by a newer build with the published 1.0.0 (FORMAT §13, "newer files").
+//! Opens files written by a newer build with a published release (FORMAT §13, "newer files").
+//!
+//! Two manifests build this file: `compat-reader` against `pigeonhole =1.0.0`, and
+//! `compat-reader-1.1` against `=1.1.0` (with its `v1_1` feature, for the value types 1.0.0
+//! lacks; #1489). Each package's version is the release it pins, and below "1.0.0" means that
+//! release.
 //!
 //! `cargo run --release -- <corpus dir>` checks every entry under the directory: a database
 //! written by `tests/corpus.rs`'s `generate_corpus` (`PIGEONHOLE_CORPUS_OUT=<dir>`), with its
@@ -7,9 +12,11 @@
 //! again after a reopen. An entry that uses a feature 1.0.0 lacks may be refused with
 //! `UnsupportedFeature`, as the promise allows: an `ro_compat` one is then read read-only
 //! with `read_only_fallback`, an `incompat` one is reported and skipped. An entry with a
-//! `refused-by-1.0.0.txt` (D294: it names the `incompat` bits it uses) must be refused, for
-//! exactly those bits: opening it, read-write or read-only, fails the entry. Exits 1 if any
-//! entry fails.
+//! `refused-by-1.0.0.txt` (D294: it names the `incompat` bits it uses, which 1.0.0 lacks)
+//! must be refused by a release that lacks any of them, for exactly the ones it lacks: opening
+//! it, read-write or read-only, fails the entry. A release that knows all of them (1.1.0
+//! knows bit 0) must open it read-write, and a refusal fails the entry. Exits 1 if any entry
+//! fails.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +25,14 @@ use pigeonhole::{ErrorCode, Family, MergeError, MergeOperator, Options, Pigeonho
 
 /// The database file's name inside an entry.
 const DB: &str = "data.phdb";
+
+/// The release this reader is built against: its package's version, which is the version
+/// its manifest pins.
+const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+/// The `incompat` feature bits that release reads (FORMAT §8.2): 1.1.0 added bit 0 (D294,
+/// D298 and vector families).
+const KNOWN_INCOMPAT: u64 = if cfg!(feature = "v1_1") { 1 } else { 0 };
 
 /// `corpus.concat`, as the corpus registers it: concatenated payloads.
 #[derive(Debug)]
@@ -79,7 +94,16 @@ fn contents(db: &Pigeonhole) -> Result<Vec<String>, String> {
                     Value::I64(n) => format!("i64:{n}"),
                     Value::F64(x) => format!("f64:{:016x}", x.to_bits()),
                     Value::Varint(n) => format!("varint:{n}"),
-                    other => return Err(format!("a value type 1.0.0 doesn't print: {other:?}")),
+                    // As tests/corpus.rs's `value_line` prints it.
+                    #[cfg(feature = "v1_1")]
+                    Value::Vector(v) => {
+                        format!("vector:{:?}:{}:{}", v.element(), v.dim(), hex(v.as_bytes()))
+                    }
+                    other => {
+                        return Err(format!(
+                            "a value type {RELEASE}'s reader doesn't print: {other:?}"
+                        ));
+                    }
                 };
                 lines.push(format!(
                     "{name}\t{}\t{}\t{}\t{}\t{value}",
@@ -150,7 +174,7 @@ fn check(src: &Path, tmp: &Path) -> Result<Outcome, String> {
         .and_then(|b| b.family("f", Family::default()).create_if_missing())
         .map_err(|e| format!("create: {e}"))?;
     t.mutate(b"written")
-        .put("f", b"q", b"by 1.0.0")
+        .put("f", b"q", format!("by {RELEASE}").as_bytes())
         .commit()
         .map_err(|e| format!("write: {e}"))?;
     db.flush().map_err(|e| format!("flush: {e}"))?;
@@ -180,6 +204,7 @@ fn main() {
             .nth(1)
             .expect("usage: compat-reader <corpus dir>"),
     );
+    println!("checking with pigeonhole {RELEASE}");
     let scratch = std::env::temp_dir().join(format!("compat-reader-{}", std::process::id()));
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("the corpus directory")
@@ -195,11 +220,41 @@ fn main() {
     let mut failed = 0;
     for src in &entries {
         let name = src.file_name().unwrap().to_string_lossy().into_owned();
-        // The bits a marked entry must be refused for.
-        let must_refuse = std::fs::read_to_string(src.join("refused-by-1.0.0.txt"))
+        // A marked entry's bits, less the ones this release reads: what it must be refused
+        // for, if any are left. A marked entry this release reads must open.
+        let marked = std::fs::read_to_string(src.join("refused-by-1.0.0.txt"))
             .ok()
-            .map(|bits| format!("incompatible feature bits {})", bits.trim()));
-        match (check(src, &scratch.join(&name)), &must_refuse) {
+            .map(|bits| {
+                bits.trim()
+                    .parse::<u64>()
+                    .expect("refused-by-1.0.0.txt: a decimal bit mask")
+            });
+        let unknown = marked
+            .map(|bits| bits & !KNOWN_INCOMPAT)
+            .filter(|&b| b != 0);
+        let must_refuse = unknown.map(|bits| format!("incompatible feature bits {bits})"));
+        let outcome = check(src, &scratch.join(&name));
+        if marked.is_some() && must_refuse.is_none() {
+            match outcome {
+                Ok(Outcome::Passed) => println!("{name}: ok (incompat bits {RELEASE} reads)"),
+                Ok(Outcome::ReadOnly) => {
+                    println!("{name}: FAILED: read-only, but {RELEASE} reads every bit it uses");
+                    failed += 1;
+                }
+                Ok(Outcome::Refused(why)) => {
+                    println!(
+                        "{name}: FAILED: refused, but {RELEASE} reads every bit it uses: {why}"
+                    );
+                    failed += 1;
+                }
+                Err(why) => {
+                    println!("{name}: FAILED: {why}");
+                    failed += 1;
+                }
+            }
+            continue;
+        }
+        match (outcome, &must_refuse) {
             (Ok(Outcome::Refused(why)), Some(bits)) if why.contains(bits.as_str()) => {
                 println!("{name}: refused, as it must be: {why}");
             }
