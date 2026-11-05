@@ -173,7 +173,7 @@ pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Sn
 pub use error::{Error, ErrorCode, Result};
 pub use feed::{
     CatalogChange, CatalogEdit, Change, ChangeKind, Commit, Feed, FeedBuilder, FeedEvent,
-    FeedPosition, FeedToken,
+    FeedPosition, FeedProgress, FeedToken,
 };
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,

@@ -16,6 +16,11 @@ readme = "README.md"
 name = "phdb"
 path = "src/main.rs"
 
+# D313 ticket 5's acceptance run: idle feed subscribers against `phdb serve`'s writes.
+[[example]]
+name = "serve_feed_load"
+required-features = ["serve"]
+
 [features]
 default = ["embed"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,

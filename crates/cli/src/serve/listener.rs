@@ -19,6 +19,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// bounds how many streams one connection keeps waiting.
 pub(crate) const MAX_STREAMS: u32 = 128;
 
+/// The HTTP/2 ping interval, and how long a ping may go unanswered.
+const KEEPALIVE: Duration = Duration::from_secs(20);
+
 pub(crate) async fn serve(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
@@ -43,7 +46,14 @@ pub(crate) async fn serve(
         let _ = stream.set_nodelay(true);
         let service = TowerToHyperService::new(app.clone());
         let mut builder = auto::Builder::new(TokioExecutor::new());
-        builder.http2().max_concurrent_streams(MAX_STREAMS);
+        // An idle stream (a feed with nothing to send) is kept open through proxies by
+        // HTTP/2 pings; a peer that stops answering them is dropped (D313 §4).
+        builder
+            .http2()
+            .max_concurrent_streams(MAX_STREAMS)
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(KEEPALIVE)
+            .keep_alive_timeout(KEEPALIVE);
         match &tls {
             None => {
                 let conn = builder

@@ -50,6 +50,7 @@ pub(crate) enum ServiceOp {
     Abort(proto::TxnAbortRequest),
     OpenSnapshot(proto::OpenSnapshotRequest),
     ReleaseSnapshot(proto::ReleaseSnapshotRequest),
+    Subscribe(proto::SubscribeRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -69,6 +70,7 @@ pub(crate) enum ServiceReply {
     Commit(proto::TxnCommitResponse),
     OpenSnapshot(proto::OpenSnapshotResponse),
     Empty(proto::Empty),
+    Feed(super::feed::FeedEvents),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -138,6 +140,7 @@ impl ServiceOp {
             Self::Abort(_) => 13,
             Self::OpenSnapshot(_) => 14,
             Self::ReleaseSnapshot(_) => 15,
+            Self::Subscribe(_) => FEED,
         }
     }
 
@@ -160,7 +163,8 @@ impl ServiceOp {
             | Self::Commit(_)
             | Self::Abort(_)
             | Self::OpenSnapshot(_)
-            | Self::ReleaseSnapshot(_) => Scope::Read,
+            | Self::ReleaseSnapshot(_)
+            | Self::Subscribe(_) => Scope::Read,
             Self::Mutate(_)
             | Self::CheckAndMutate(_)
             | Self::Batch(_)
@@ -187,6 +191,7 @@ impl ServiceOp {
             Self::Abort(r) => r.encoded_len(),
             Self::OpenSnapshot(r) => r.encoded_len(),
             Self::ReleaseSnapshot(r) => r.encoded_len(),
+            Self::Subscribe(r) => r.encoded_len(),
         }
     }
 }
@@ -195,7 +200,10 @@ impl ServiceOp {
 pub(crate) const SCAN: usize = 7;
 
 /// The RPCs, by `ServiceOp::index`.
-pub(crate) const RPCS: [&str; 16] = [
+/// `Feed.Subscribe`'s index in `RPCS`: counted when its stream ends, as a scan's is.
+pub(crate) const FEED: usize = 16;
+
+pub(crate) const RPCS: [&str; 17] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -212,6 +220,7 @@ pub(crate) const RPCS: [&str; 16] = [
     "Transactions.Abort",
     "Snapshots.Open",
     "Snapshots.Release",
+    "Feed.Subscribe",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -411,6 +420,49 @@ pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sess
     );
 }
 
+/// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
+pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
+    use std::fmt::Write as _;
+    let g = feeds.gauges();
+    let st = &feeds.stats;
+    for (name, kind, v) in [
+        ("pigeonhole_serve_feed_hubs", "gauge", g.hubs as u64),
+        (
+            "pigeonhole_serve_feed_ring_bytes",
+            "gauge",
+            g.ring_bytes as u64,
+        ),
+        (
+            "pigeonhole_serve_feed_catching_up",
+            "gauge",
+            g.catching_up as u64,
+        ),
+        (
+            "pigeonhole_serve_feed_catch_up_waits_total",
+            "counter",
+            st.catch_up_waits.load(Ordering::Relaxed),
+        ),
+        (
+            "pigeonhole_serve_feed_fell_behind_total",
+            "counter",
+            st.fell_behind.load(Ordering::Relaxed),
+        ),
+        (
+            "pigeonhole_serve_feed_rejoined_total",
+            "counter",
+            st.rejoined.load(Ordering::Relaxed),
+        ),
+        (
+            "pigeonhole_serve_feed_hub_failures_total",
+            "counter",
+            st.hub_failures.load(Ordering::Relaxed),
+        ),
+    ] {
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        let _ = writeln!(out, "{name} {v}");
+    }
+}
+
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
     pub(crate) db: Pigeonhole,
@@ -425,6 +477,11 @@ pub(crate) struct Service {
     scans: Arc<Semaphore>,
     /// Transactions and pinned snapshots between requests (D313 §3).
     pub(crate) sessions: Arc<super::sessions::Sessions>,
+    /// Feed and watch streams at once (`--max-streams`): a stream outlives its request's
+    /// `--max-concurrent` slot, as a scan does.
+    streams: Arc<Semaphore>,
+    /// The feed fan-out's hubs (D313 R2).
+    pub(crate) feeds: Arc<super::feed::Feeds>,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -448,7 +505,7 @@ impl Service {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            db,
+            db: db.clone(),
             tables: ArcSwap::from_pointee(HashMap::new()),
             inflight: Arc::new(Semaphore::new(
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
@@ -456,6 +513,17 @@ impl Service {
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             sessions: super::sessions::Sessions::new(limits.leases),
+            streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
+            feeds: super::feed::Feeds::new(
+                db.clone(),
+                super::feed::FeedLimits {
+                    ring_bytes: limits.feed_ring_bytes,
+                    max_hubs: limits.max_feed_hubs,
+                    max_catch_up: limits.max_catch_up,
+                    quiet: limits.feed_quiet,
+                    stream_idle: limits.stream_idle,
+                },
+            ),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
@@ -575,6 +643,11 @@ impl Service {
                 self.open_snapshot(&r, caller)
                     .map(ServiceReply::OpenSnapshot)
             }
+            ServiceOp::Subscribe(r) => self
+                .subscribe(r, caller, budget)
+                .await
+                .map(ServiceReply::Feed)
+                .map_err(ApiError::for_read),
             ServiceOp::ReleaseSnapshot(r) => {
                 drop(budget);
                 self.sessions
@@ -863,6 +936,60 @@ impl Service {
         caller: &Caller,
     ) -> Result<Option<SnapshotGuard>, ApiError> {
         self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
+    }
+
+    /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
+    /// catch-up stream follow the same table ids), its start checked, and its stream handed to
+    /// the fan-out. It holds a `--max-streams` slot until it ends.
+    async fn subscribe(
+        &self,
+        r: proto::SubscribeRequest,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<super::feed::FeedEvents, ApiError> {
+        use super::feed::Start;
+        use proto::subscribe_request::Start as S;
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        if r.tables.is_empty() {
+            return Err(ApiError::invalid("a subscription names at least one table"));
+        }
+        let mut names = r.tables.clone();
+        names.sort();
+        names.dedup();
+        let mut tables = Vec::with_capacity(names.len());
+        for name in &names {
+            tables.push(self.table(name).await?);
+        }
+        let start = match r.start {
+            None | Some(S::FromOldest(false)) => Start::Now,
+            Some(S::FromOldest(true)) => Start::Oldest,
+            Some(S::FromSnapshot(id)) => Start::Snapshot(
+                self.sessions
+                    .snapshot(&id, caller.token)?
+                    .snapshot()
+                    .clone(),
+            ),
+            Some(S::Resume(token)) => {
+                Start::Token(pigeonhole::FeedToken::from_bytes(token.to_vec()))
+            }
+        };
+        drop(budget);
+        let metrics = Arc::clone(&self.metrics);
+        let started = Instant::now();
+        self.feeds.subscribe(
+            super::feed::Spec {
+                tables,
+                prefix: r.prefix.to_vec(),
+                visible: r.visible,
+                start,
+            },
+            slot,
+            move |e| metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed()),
+        )
     }
 
     /// `Transactions.Begin`: a transaction at a snapshot taken now, held for the caller.

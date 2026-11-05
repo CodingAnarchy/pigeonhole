@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole_engine::{CatalogEvent, FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
@@ -416,7 +417,9 @@ impl FeedBuilder {
         for t in &self.tables {
             note_names(&mut names, &t.info);
         }
-        let (reader, generation) = subscribe(&self.db, spec.clone())?;
+        let (mut reader, generation) = subscribe(&self.db, spec.clone())?;
+        let reader_progress = Arc::new(AtomicU64::new(0));
+        reader.set_progress(Arc::clone(&reader_progress));
         Ok(Feed {
             db: self.db,
             // Only ever resubscribed from its own token: the start isn't kept, so a snapshot
@@ -435,6 +438,7 @@ impl FeedBuilder {
             covered: pigeonhole_engine::FeedPosition::default(),
             oldest_retained: None,
             failed: None,
+            progress: FeedProgress::attach(reader_progress),
         })
     }
 }
@@ -516,6 +520,53 @@ pub struct Feed {
     /// reader had already moved past the commit it was delivering, so going on would skip
     /// it.
     failed: Option<Error>,
+    /// Its position, published by the reader as it moves ([`Feed::progress`]).
+    progress: FeedProgress,
+}
+
+/// Where a [`Feed`] is, readable from any thread ([`Feed::progress`], D316 A4, ICR 0116): a
+/// cheap handle, cloned from the feed, that a metrics exporter keeps while the feed's own
+/// thread reads it. `pigeonhole-otel`'s `Registration::watch_feed` reports
+/// [`Pigeonhole::visible_seqno`](crate::Pigeonhole::visible_seqno) less
+/// [`covered_seqno`](Self::covered_seqno) as the feed's lag.
+#[derive(Debug, Clone)]
+pub struct FeedProgress {
+    covered: Arc<AtomicU64>,
+    live: Arc<AtomicBool>,
+}
+
+impl FeedProgress {
+    fn attach(covered: Arc<AtomicU64>) -> Self {
+        Self {
+            covered,
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// How far the feed has covered its history, as a seqno: every commit at or below it
+    /// is covered, delivered or passed over (it carried nothing for the feed's tables, or no
+    /// record holds it) or before the feed's start. Catalog changes aren't included. It's
+    /// the seqno part of the feed's position, kept current as the feed reads, even while it
+    /// waits, so a feed that keeps up stays near [`Pigeonhole::visible_seqno`]. It never
+    /// goes back, a resubscribe after a recovery included.
+    ///
+    /// [`Pigeonhole::visible_seqno`]: crate::Pigeonhole::visible_seqno
+    pub fn covered_seqno(&self) -> u64 {
+        self.covered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the feed still exists: `false` once it was dropped. A feed that failed or
+    /// expired but is still held stays live, and its position stops, so a lag measured from
+    /// it grows until the feed is dropped (cli692 on #1523).
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.progress.live.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The longest single wait handed to the engine; a longer `next` waits again.
@@ -719,6 +770,13 @@ impl Feed {
         }
     }
 
+    /// A handle to the feed's position, for another thread (D316 A4, ICR 0116): it stays
+    /// current as the feed reads, and reports [`is_live`](FeedProgress::is_live) `false`
+    /// once the feed is dropped. Cheap: two `Arc` clones.
+    pub fn progress(&self) -> FeedProgress {
+        self.progress.clone()
+    }
+
     /// Where the feed is: [`FeedBuilder::resume`] continues after the last commit delivered.
     pub fn token(&self) -> FeedToken {
         FeedToken(self.reader.token())
@@ -767,10 +825,11 @@ impl Feed {
     fn resubscribe(&mut self) -> Result<()> {
         let mut spec = self.spec.clone();
         spec.start = FeedStart::Token(self.reader.token());
-        let (reader, generation) = subscribe(&self.db, spec)?;
+        let (mut reader, generation) = subscribe(&self.db, spec)?;
         // Nothing of the spec lies undelivered between the token and the old reader's
         // position, so it stays covered.
         self.covered = self.covered.join(self.reader.position());
+        reader.set_progress(Arc::clone(&self.progress.covered));
         self.reader = reader;
         self.generation = generation;
         Ok(())

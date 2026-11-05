@@ -318,6 +318,10 @@ pub struct FeedReader {
     /// Every commit with a key at or below this was delivered, skipped or precedes the
     /// start.
     delivered: Seqno,
+    /// Where [`position`](Self::position)'s seqno is published, for a metrics exporter on
+    /// another thread (`set_progress`, D316 A4, ICR 0116): a `fetch_max` at the end of every
+    /// poll, on the feed's own thread. `None` until one's set.
+    progress: Option<Arc<AtomicU64>>,
     /// The frontier as of the last poll.
     frontier: Seqno,
     /// The frontier the streams were last read to their ends under (#1448): while the
@@ -507,6 +511,7 @@ impl FeedReader {
             streams: Vec::with_capacity(shared.shards),
             history,
             delivered: 0,
+            progress: None,
             frontier: 0,
             read_through: None,
             stream_reads: 0,
@@ -846,6 +851,16 @@ impl FeedReader {
         }
     }
 
+    /// Publishes [`position`](Self::position)'s seqno into `sink` from now on, as a
+    /// `fetch_max` at the end of every poll (D316 A4, ICR 0116): it moves past commits that
+    /// carry nothing for the feed and past seqnos no record holds, even while the feed waits,
+    /// so a caught-up feed reads as caught up. `fetch_max`, so a resubscribe's new reader,
+    /// whose position can start lower, never moves it back. Stores the current one at once.
+    pub fn set_progress(&mut self, sink: Arc<AtomicU64>) {
+        sink.fetch_max(self.position().seqno, Ordering::Relaxed);
+        self.progress = Some(sink);
+    }
+
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
     /// commit [`FeedReader::try_next`] returned, never inside one (§2.5).
     pub fn token(&self) -> Vec<u8> {
@@ -966,7 +981,20 @@ impl FeedReader {
         Ok(Ok(starts))
     }
 
+    /// One poll ([`poll_inner`](Self::poll_inner)), then the position published to the
+    /// progress sink, if one is set ([`set_progress`](Self::set_progress), D316 A4): on
+    /// every path out, a commit, `Pending`, an expiry or an error, so a waiting feed's
+    /// position keeps up with the frontier it passes. One `fetch_max` a poll, on the feed's
+    /// own thread; nothing on the commit path.
     fn poll(&mut self) -> Result<Polled> {
+        let polled = self.poll_inner();
+        if let Some(p) = &self.progress {
+            p.fetch_max(self.position().seqno, Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_inner(&mut self) -> Result<Polled> {
         if let Some(e) = &self.failed {
             return Err(Error::Corruption(format!(
                 "the change feed stopped at an earlier error: {e}"

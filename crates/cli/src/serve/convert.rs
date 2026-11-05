@@ -677,6 +677,23 @@ macro_rules! readable {
 readable!(pigeonhole::Cell);
 readable!(pigeonhole::CellRef<'_>);
 
+/// A value as the feed delivers it (`Change::value`), in its proto form.
+pub(crate) fn value_out(v: pigeonhole::Value<'_>) -> proto::Value {
+    let kind = match v {
+        pigeonhole::Value::I64(n) | pigeonhole::Value::Varint(n) => value::Kind::I64(n),
+        pigeonhole::Value::F64(x) => value::Kind::F64(x),
+        pigeonhole::Value::Vector(v) => value::Kind::Vector(proto::Vector {
+            element: element_out(v.element()),
+            dim: v.dim(),
+            data: v.as_bytes().to_vec().into(),
+        }),
+        pigeonhole::Value::Bytes(b) => value::Kind::Bytes(b.to_vec().into()),
+        // A kind a newer library adds: its bytes are all a v1 client can take.
+        _ => value::Kind::Bytes(Vec::new().into()),
+    };
+    proto::Value { kind: Some(kind) }
+}
+
 fn element_out(e: Element) -> i32 {
     (match e {
         Element::F32 => proto::Element::F32,
