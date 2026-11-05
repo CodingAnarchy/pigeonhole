@@ -324,15 +324,18 @@ commit-at 9532 0.3
 scan-narrow 1381 0.3
 scan-small 1358 0.3
 scan-wide 1279 0.3
-commit-async 8713 0.3
+# commit-async (#1517, D314 amendment 1): +6 per commit for RowMutation's boxed return_previous
+# request (8 bytes, moved and dropped) and its refusal test, 8710 -> 8716/8718 on runs
+# 41956036295 and 41959886002: the highest times 1.003.
+commit-async 8745 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
 commit-incr 12706 0.3
 commit-incr-returning 17519 0.3
 commit-incr-returning-spread 34610 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
-# Provisional until this PR's run measures it.
-commit-put-previous 99999 0.3
+# From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
+commit-put-previous 21668 0.3
 scan-narrow-q1 5053 0.3
 scan-wide-q10 1744 0.3
 scan-wide-q1 13395 0.3
