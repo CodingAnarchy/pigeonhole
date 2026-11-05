@@ -988,15 +988,11 @@ impl FeedReader {
         bytes: &[u8],
         db_id: [u8; 16],
     ) -> Result<std::result::Result<Vec<(Lsn, Option<Lsn>)>, Expiry>> {
-        let bad = || Error::InvalidArgument("not a change feed token".into());
-        let (&version, rest) = bytes.split_first().ok_or_else(bad)?;
-        if !matches!(version, TOKEN_VERSION | TOKEN_VERSION_ALL) || rest.len() < 16 + 4 + 8 + 8 {
-            return Err(bad());
-        }
+        let h = TokenHeader::parse(bytes)?;
         // A feed of every table resumes only from a token of one (simp724's S1 on #1487). A
         // feed of some tables may resume from an all-tables token: it follows a subset of
         // what that feed did, from the same position.
-        if self.tables.is_empty() && version != TOKEN_VERSION_ALL {
+        if self.tables.is_empty() && !h.all_tables {
             return Err(Error::InvalidArgument(
                 "a feed of every table can't resume from a token of a feed of some tables: \
                  the other tables' commits before it would be skipped"
@@ -1004,27 +1000,15 @@ impl FeedReader {
             ));
         }
         let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-        if rest[..16] != db_id {
+        if h.db_id != db_id {
             return Err(Error::InvalidArgument(
                 "the token is another database's".into(),
             ));
         }
-        let streams = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
-        let delivered = u64_at(rest, 20);
-        let session = u64_at(rest, 28);
-        let mut per = &rest[36..];
-        if version == TOKEN_VERSION_ALL {
-            // The last catalog change delivered and the start's bound, after the streams'
-            // positions (D315).
-            let Some(split) = per.len().checked_sub(16) else {
-                return Err(bad());
-            };
-            self.catalog_seq = u64_at(per, split);
-            self.catalog_bound = u64_at(per, split + 8);
-            per = &per[..split];
-        }
-        if per.len() != streams * 16 {
-            return Err(bad());
+        let (streams, delivered, session, per) = (h.streams, h.delivered, h.session, h.per);
+        if h.all_tables {
+            self.catalog_seq = h.catalog_seq;
+            self.catalog_bound = h.catalog_bound;
         }
         self.delivered = delivered;
         self.session = session;
@@ -2034,20 +2018,69 @@ struct Link {
     chained: bool,
 }
 
+/// A token's header, as encoded by [`FeedReader::token`]: the one decoder of its layout.
+struct TokenHeader<'a> {
+    all_tables: bool,
+    db_id: [u8; 16],
+    streams: usize,
+    delivered: u64,
+    session: u64,
+    /// Each stream's position (16 bytes each), checked to be `streams` of them.
+    per: &'a [u8],
+    /// A feed of every table's last catalog change delivered, and its start's bound (D315).
+    catalog_seq: u64,
+    catalog_bound: u64,
+}
+
+impl<'a> TokenHeader<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let bad = || Error::InvalidArgument("not a change feed token".into());
+        let (&version, rest) = bytes.split_first().ok_or_else(bad)?;
+        if !matches!(version, TOKEN_VERSION | TOKEN_VERSION_ALL) || rest.len() < 16 + 4 + 8 + 8 {
+            return Err(bad());
+        }
+        let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let all_tables = version == TOKEN_VERSION_ALL;
+        let streams = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
+        let mut per = &rest[36..];
+        let (mut catalog_seq, mut catalog_bound) = (0, 0);
+        if all_tables {
+            // The last catalog change delivered and the start's bound, after the streams'
+            // positions (D315).
+            let Some(split) = per.len().checked_sub(16) else {
+                return Err(bad());
+            };
+            catalog_seq = u64_at(per, split);
+            catalog_bound = u64_at(per, split + 8);
+            per = &per[..split];
+        }
+        if per.len() != streams * 16 {
+            return Err(bad());
+        }
+        Ok(Self {
+            all_tables,
+            db_id: rest[..16].try_into().unwrap(),
+            streams,
+            delivered: u64_at(rest, 20),
+            session: u64_at(rest, 28),
+            per,
+            catalog_seq,
+            catalog_bound,
+        })
+    }
+}
+
 /// Where a token of a feed of every table stands (#1436, ICR 0125): its database, the last
 /// seqno delivered (or passed over), and the last catalog change delivered. A replica stores
 /// this as where its bootstrap copy starts. `InvalidArgument` for anything but such a token.
 pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
-    let bad = || Error::InvalidArgument("not a token of a feed of every table".into());
-    let (&version, rest) = token.split_first().ok_or_else(bad)?;
-    if version != TOKEN_VERSION_ALL || rest.len() < 16 + 4 + 8 + 8 + 16 {
-        return Err(bad());
+    let h = TokenHeader::parse(token)?;
+    if !h.all_tables {
+        return Err(Error::InvalidArgument(
+            "not a token of a feed of every table".into(),
+        ));
     }
-    let u64_at = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
-    let db_id: [u8; 16] = rest[..16].try_into().unwrap();
-    let delivered = u64_at(20);
-    let catalog = u64_at(rest.len() - 16);
-    Ok((db_id, delivered, catalog))
+    Ok((h.db_id, h.delivered, h.catalog_seq))
 }
 
 #[cfg(test)]

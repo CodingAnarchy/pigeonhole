@@ -2045,8 +2045,10 @@ impl Engine {
     /// Turns a replica into a primary (#1436, ICR 0125) at what it applied last: drops the
     /// state table and sets the one-way promoted state in one catalog change (an apply
     /// racing it fails), then a second commit clears `ro_compat` bit 0 once the drop is
-    /// durable (FORMAT §8.2; an open after a crash between them clears it), then lifts R6's
-    /// refusal. `InvalidArgument` unless it is a replica.
+    /// durable (FORMAT §8.2), then lifts R6's refusal. If that second commit fails (or a crash
+    /// comes between them), the database is a primary already, its bit stale: reopen to
+    /// finish, since a writable open clears it (`clear_stale_replica_bit`). `InvalidArgument`
+    /// unless it is a replica.
     pub fn promote(&self) -> Result<()> {
         self.inner.promote()
     }

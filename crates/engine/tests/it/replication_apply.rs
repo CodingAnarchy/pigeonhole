@@ -293,3 +293,38 @@ fn a_state_write_racing_promote_fails_and_brings_nothing_back() {
     db.commit(wb, None).unwrap();
     db.close().unwrap();
 }
+
+/// `all_tables_token_position` reads a token through the reader's own decoder (simp724's N2
+/// on #1578): a feed of every table's token round-trips to its database, its delivered seqno
+/// and its catalog position, after commits and a catalog change.
+#[test]
+fn a_token_s_position_is_where_its_feed_stood() {
+    let vfs = SimVfs::new(5106);
+    let db = open(&vfs, PRIMARY);
+    let mut r = every_table(&db);
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..3u8 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            t.families[0].id,
+            &[i],
+            b"q",
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    }
+    for _ in 0..4 {
+        r.wait(WAIT).unwrap();
+    }
+    let token = r.token();
+    let (id, delivered, catalog) = pigeonhole_engine::all_tables_token_position(&token).unwrap();
+    assert_eq!(id, db.info().unwrap().db_id);
+    assert_eq!((delivered, catalog), (r.delivered(), r.position().catalog));
+    assert!(catalog >= 1, "the create was delivered");
+    db.close().unwrap();
+}

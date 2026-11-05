@@ -20,7 +20,7 @@
 - **`promote`:**
   - it sets a one-way promoted state under the manifest exclusion, in the catalog change that drops the table, so an apply racing it fails and nothing brings the table, the bit or the gate back;
   - a second commit then clears the bit (`flag_features` clears a stale bit before any commit that doesn't drop the table itself);
-  - a writable open clears a bit left without its table after a crash. It never fails the open (`ManifestWriter::clear_stale_replica_bit`).
+  - a writable open clears a bit left without its table, after a crash or a failed second commit: reopen to finish (simp724's N3). It never fails the open (`ManifestWriter::clear_stale_replica_bit`). It stays as a step of its own: an open with the feed off and nothing to recover makes no manifest commit before it returns, and `it::replication_apply::an_open_clears_a_replica_bit_left_without_its_state_table` fails without it.
 - **The replica's state cell (version 2) records the primary's database id.** An apply of another database's events is refused. Version 1 cells (D315 PR 3) still read.
 
 **Not here:** the serve side (`phdb serve --replica-of`, the `Replication` service, re-bootstrap's file swap, `Admin.Promote`), which is in ICR 0112's amendment. Read-your-writes on a replica (#1577).

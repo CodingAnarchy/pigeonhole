@@ -206,8 +206,9 @@ impl Pigeonhole {
     /// Turns this replica into a primary at the last event it applied (#1436, ICR 0125):
     /// returns the primary's token stored with that event (`None` if it applied none). It then
     /// takes writes, and its own feed goes on; an apply after it is refused. Stop following
-    /// the old primary first, and stop the old primary's writers: nothing fences it. Not part
-    /// of the stable API.
+    /// the old primary first, and stop the old primary's writers: nothing fences it. If it fails after
+    /// dropping the state (its bit's commit failed), the database is already no replica: reopen
+    /// it to finish. Not part of the stable API.
     #[doc(hidden)]
     pub fn promote(&self) -> Result<Option<FeedToken>> {
         let token = self.replicated_token()?;
