@@ -297,9 +297,10 @@ impl ConsolidateLoop {
         let started = std::time::Instant::now();
         loop {
             let (_, saved) = self.state.as_ref().expect("started");
+            let now = (self.clock)();
             let mut wait = timeout.saturating_sub(started.elapsed());
             if let Some(due) = saved.next_due(min_age) {
-                wait = wait.min(Duration::from_micros(due.saturating_sub((self.clock)())));
+                wait = wait.min(Duration::from_micros(due.saturating_sub(now)));
             }
             // In slices, so an interrupt (`LoopInterrupter`) ends the wait within one.
             if self.interrupt.swap(false, Ordering::AcqRel) {
