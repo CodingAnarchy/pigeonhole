@@ -6,8 +6,9 @@
 use crate::common;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pigeonhole_engine::{
     Engine, EngineOptions, Error, FamilyOptions, Predicate, TableInfo, ValueRef, WriteBatch,
@@ -38,11 +39,20 @@ fn setup(seed: u64) -> (Arc<SimVfs>, Arc<Engine>, Vec<Arc<TableInfo>>) {
 
 /// Runs `f` on a thread and panics if it has not finished within five seconds.
 fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    within_for(what, Duration::from_secs(5), f)
+}
+
+/// [`within`] with its own hang limit.
+fn within_for<T: Send + 'static>(
+    what: &str,
+    limit: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    match rx.recv_timeout(limit) {
         Ok(r) => r,
         Err(_) => panic!("{what} never resolved (a hang)"),
     }
@@ -265,6 +275,13 @@ fn aborts_from_busy_poison_and_close_all_resolve() {
     }
 }
 
+/// [`conditional_writes_see_same_group_writes_and_pending_shares`]'s liveness floor: at least
+/// this many CAS calls (and, after them, transactions) apply in all.
+const PROGRESS: u64 = 8;
+
+/// How long its threads keep trying past their 25 attempts each to reach [`PROGRESS`].
+const PROGRESS_FOR: Duration = Duration::from_secs(10);
+
 #[test]
 fn conditional_writes_see_same_group_writes_and_pending_shares() {
     let (_vfs, db, t) = setup(15);
@@ -279,15 +296,28 @@ fn conditional_writes_see_same_group_writes_and_pending_shares() {
         .unwrap();
     let db2 = Arc::clone(&db);
     let (a2, b2) = (Arc::clone(a), Arc::clone(b));
-    let applied = within("races", move || {
+    // Each thread makes its 25 attempts, then keeps trying while fewer than `PROGRESS` have
+    // applied in all, for at most `PROGRESS_FOR`: a failed CAS read a value the predicate's
+    // applied-state read had already moved past (a stale visible read, while a cross-shard
+    // round holds visibility back), and on a starved runner those windows can cover most of
+    // a thread's attempts (applied 4 of 200 once on CI, against 25-73 measured).
+    let deadline = Instant::now() + PROGRESS_FOR;
+    let total = Arc::new(AtomicU64::new(0));
+    let total2 = Arc::clone(&total);
+    let applied = within_for("races", PROGRESS_FOR + Duration::from_secs(5), move || {
         std::thread::scope(|s| {
             let mut hs = Vec::new();
             for _ in 0..8 {
                 let db = Arc::clone(&db2);
                 let a = Arc::clone(&a2);
+                let total = Arc::clone(&total2);
                 hs.push(s.spawn(move || {
                     let mut applied = 0u64;
-                    for _ in 0..25 {
+                    let mut attempts = 0u32;
+                    while attempts < 25
+                        || (total.load(Ordering::Relaxed) < PROGRESS && Instant::now() < deadline)
+                    {
+                        attempts += 1;
                         let v = db.get_latest(a.id, f, b"ctr", b"q").unwrap().unwrap();
                         let n = u64::from_le_bytes(v.stored()[1..].try_into().unwrap());
                         let pred = Predicate::Value {
@@ -310,6 +340,7 @@ fn conditional_writes_see_same_group_writes_and_pending_shares() {
                             .0
                         {
                             applied += 1;
+                            total.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     applied
@@ -349,48 +380,65 @@ fn conditional_writes_see_same_group_writes_and_pending_shares() {
     let v = db.get_latest(a.id, f, b"ctr", b"q").unwrap().unwrap();
     let n = u64::from_le_bytes(v.stored()[1..].try_into().unwrap());
     assert_eq!(n, applied, "lost or phantom increments");
-    assert!(applied >= 8, "{applied}");
+    assert!(applied >= PROGRESS, "{applied}");
     // The same invariant through optimistic transactions (read, then write n + 1).
     let db2 = Arc::clone(&db);
     let a2 = Arc::clone(a);
-    let committed = within("txn races", move || {
-        std::thread::scope(|s| {
-            let mut hs = Vec::new();
-            for _ in 0..8 {
-                let db = Arc::clone(&db2);
-                let a = Arc::clone(&a2);
-                hs.push(s.spawn(move || {
-                    let mut ok = 0u64;
-                    for _ in 0..25 {
-                        let mut txn = db.begin().unwrap();
-                        let v = txn.get(a.id, f, b"ctr", b"q").unwrap().unwrap();
-                        let n = u64::from_le_bytes(v.stored()[1..].try_into().unwrap());
-                        txn.batch()
-                            .put(
-                                a.id,
-                                f,
-                                b"ctr",
-                                b"q",
-                                None,
-                                ValueRef::Bytes(&(n + 1).to_le_bytes()),
-                            )
-                            .unwrap();
-                        match txn.commit(Some(Durability::Buffered)) {
-                            Ok(_) => ok += 1,
-                            Err(Error::Conflict) => {}
-                            Err(e) => panic!("{e}"),
+    // As above: 25 attempts each, then on while fewer than `PROGRESS` committed in all.
+    let deadline = Instant::now() + PROGRESS_FOR;
+    let total = Arc::new(AtomicU64::new(0));
+    let total2 = Arc::clone(&total);
+    let committed = within_for(
+        "txn races",
+        PROGRESS_FOR + Duration::from_secs(5),
+        move || {
+            std::thread::scope(|s| {
+                let mut hs = Vec::new();
+                for _ in 0..8 {
+                    let db = Arc::clone(&db2);
+                    let a = Arc::clone(&a2);
+                    let total = Arc::clone(&total2);
+                    hs.push(s.spawn(move || {
+                        let mut ok = 0u64;
+                        let mut attempts = 0u32;
+                        while attempts < 25
+                            || (total.load(Ordering::Relaxed) < PROGRESS
+                                && Instant::now() < deadline)
+                        {
+                            attempts += 1;
+                            let mut txn = db.begin().unwrap();
+                            let v = txn.get(a.id, f, b"ctr", b"q").unwrap().unwrap();
+                            let n = u64::from_le_bytes(v.stored()[1..].try_into().unwrap());
+                            txn.batch()
+                                .put(
+                                    a.id,
+                                    f,
+                                    b"ctr",
+                                    b"q",
+                                    None,
+                                    ValueRef::Bytes(&(n + 1).to_le_bytes()),
+                                )
+                                .unwrap();
+                            match txn.commit(Some(Durability::Buffered)) {
+                                Ok(_) => {
+                                    ok += 1;
+                                    total.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(Error::Conflict) => {}
+                                Err(e) => panic!("{e}"),
+                            }
                         }
-                    }
-                    ok
-                }));
-            }
-            hs.into_iter().map(|h| h.join().unwrap()).sum::<u64>()
-        })
-    });
+                        ok
+                    }));
+                }
+                hs.into_iter().map(|h| h.join().unwrap()).sum::<u64>()
+            })
+        },
+    );
     let v = db.get_latest(a.id, f, b"ctr", b"q").unwrap().unwrap();
     let n = u64::from_le_bytes(v.stored()[1..].try_into().unwrap());
     assert_eq!(n, applied + committed, "lost update through transactions");
-    assert!(committed >= 8, "{committed}");
+    assert!(committed >= PROGRESS, "{committed}");
     // Transactions whose reads overlap a same-group write must abort or see it.
     let mut txn = db.begin().unwrap();
     let before = txn
