@@ -19,19 +19,24 @@
 //! there natively. The instructions workflow runs it once per side before the shapes, which
 //! then only open it. Without the variable, a shape builds the index into its own scratch
 //! directory first. The build reads a stepped wall clock from a fixed start (`FixedClock`),
-//! so the index is byte-identical however and wherever it's built: wall-clock timestamps
-//! would change the SSTs' encoding and block boundaries, and with them the counts (#1305).
+//! with a fixed sequence of random ids, so the index is laid out the same however and wherever
+//! it's built. Wall-clock timestamps would change the SSTs' encoding and block boundaries,
+//! and with them the counts (#1305). (The files still differ in bytes no search reads.)
 //!
-//! **Shapes.** Each runs 50 queries of one kind ([`QUERIES`]) per iteration, at top 10 unless
-//! noted, over the warm index (a pass of every query runs before measuring). Counted per
-//! search. Two independent builds of the index count within 4 instructions per search of each
-//! other on `text-term-hub` (about 66 million each).
+//! **Shapes.** Each runs 50 queries of one kind ([`QUERIES`]; 25 for the phrases,
+//! [`PHRASE_QUERIES`]) per iteration, at top 10 unless noted, over the warm index (a pass of
+//! every query runs before measuring). Counted per search. Two independent builds of the
+//! index count within 4 instructions per search of each other on `text-term-hub` (about 66
+//! million each, on arm), and base and head agree to 0.0% on CI.
 //! - `text-term-rare`: one term of rank 1,000 or more;
 //! - `text-term-hub`: one of the 20 most common terms;
 //! - `text-two-terms`, `text-five-terms`: two or five terms drawn by Zipf frequency;
 //! - `text-two-terms-k100`: `text-two-terms` at top 100;
 //! - `text-fuzzy`: a fuzzy term at 1 edit, a Zipf-drawn word with one digit replaced (a
-//!   dense dictionary: the vocabulary is `w0` to `w49999`);
+//!   dense dictionary: the vocabulary is `w0` to `w49999`). `Fuzziness::One`, not `Auto`:
+//!   `Auto` allows 2 edits for a 6-character word such as `w12345`, 1 for 3 to 5
+//!   characters and none for `w0` to `w9`, so the shape would mix costs by the drawn word's
+//!   length. A fixed edit count keeps every query the same kind of work (perf287 on #1575);
 //! - `text-phrase`, `text-phrase-slop2`: a two-word phrase taken from a document, one word
 //!   among the 20 most common and one not, at slop 0 and 2.
 //!
@@ -65,9 +70,13 @@ const DOCS: usize = 100_000;
 /// The vocabulary: `w0` to `w49999`.
 const VOCAB: usize = 50_000;
 /// Queries per shape: 50, each searched once per iteration (the job's 4: 200 searches). A
-/// hub search is about 66 million instructions, so 200 per shape keeps the job's added
-/// valgrind time to a few minutes per side.
+/// hub search is about 72 million instructions on CI, so this bounds the job's added
+/// valgrind time.
 const QUERIES: usize = 50;
+/// Queries per phrase shape: 25. A phrase search is about 140 million instructions (both
+/// terms' positions are read), and at 50 the two phrase shapes were over half the text
+/// shapes' time: 18 minutes per side on CI in all (run 42116931651).
+const PHRASE_QUERIES: usize = 25;
 /// Documents holding the most common term, `w0`, checked by `build`: it pins the corpus.
 const HUB_POSTINGS: usize = 95_649;
 /// The index directory's name inside `DIR` when the shape builds it itself.
@@ -296,8 +305,8 @@ fn build(dir: &Path) {
 
 /// Two-word phrases from documents, one word among the 20 most common and one not.
 fn phrases(corpus: &[Vec<usize>], rng: &mut Rng) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(QUERIES);
-    while out.len() < QUERIES {
+    let mut out = Vec::with_capacity(PHRASE_QUERIES);
+    while out.len() < PHRASE_QUERIES {
         let d = &corpus[rng.below(corpus.len())];
         let i = rng.below(d.len() - 1);
         if (d[i] < 20) != (d[i + 1] < 20) {
