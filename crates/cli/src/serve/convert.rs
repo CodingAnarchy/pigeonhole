@@ -337,6 +337,8 @@ pub(crate) fn batch(
     writes: &[proto::Write],
 ) -> Result<()> {
     for w in writes {
+        // The batch's only guard against u64 and vector puts and aggregate inputs: `dispatch!`
+        // expands those arms for `WriteBatch` too (ai1249's N2 on #1555).
         match w.op.as_ref() {
             Some(write::Op::Put(p))
                 if matches!(
