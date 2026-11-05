@@ -11,7 +11,7 @@
   - **The first version** published at the end of every batch (perf287's option (a)). It cost 10–13 instructions per commit on the single-commit callgrind shapes, which put `commit-one` and `commit-async` over their ceilings, since `commit-one`'s ceiling was base + 1. The coordinator asked for this cold-path version instead (#1512).
   - **pigeonhole-engine** (internal, additive): `Metrics::memtable_bytes` and `Metrics::memtable_limit`.
   - **pigeonhole-otel:** `pigeonhole.memtable.size` and `pigeonhole.memtable.limit` (D316).
-- **A3, group-sync time** (a later PR): `EngineMetrics::wal_sync_nanos`, summing the shards' existing `sync_busy_nanos` (D248) with no new atomic. It's exported as `pigeonhole.wal.group_sync.time`.
+- **A3, group-sync time:** `EngineMetrics::group_sync_nanos`, named to pair with `group_syncs` (D316 rev 2 called it `wal_sync_nanos`). It sums the shards' existing `sync_busy_nanos` (D248), with no new atomic and no new clock read, so the commit path is unchanged. It covers group syncs only, the ones `group_syncs` counts (groups with a `GroupSync` commit): a `Sync` commit's own sync isn't in it (cli692). It's current as of the last time a group sync started or finished on its shard (perf287, cli692). It's exported as `pigeonhole.wal.group_sync.time`. The engine adds `Metrics::group_sync_nanos`.
 - **A4, feed lag** (a later PR): `Feed::progress() -> FeedProgress`, a cheap `Clone + Send` handle to the last delivered seqno, stored once per delivered batch, and `Pigeonhole::visible_seqno()`. `pigeonhole-otel` gains `Registration::watch_feed(name, progress)`, exported as `pigeonhole.feed.lag`.
 
 ## Why
