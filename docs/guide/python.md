@@ -92,6 +92,38 @@ with ph.open(path, create=True) as db:
         assert len(t.row(b"timeline", snapshot=snap)) == 25
 ```
 
+### A scan as Arrow batches
+**`scan(...).to_arrow()`** hands a scan's cells to pandas, Polars, DuckDB or pyarrow without a Python object per cell (#1480, ICR 0120). It returns an `ArrowStream`: Arrow batches with one Arrow row per cell, in the same schema as the Rust `pigeonhole-arrow` crate and `phdb dump --format arrow` (see [Arrow](arrow.md)).
+- **The consumers:** an `ArrowStream` speaks the Arrow PyCapsule protocol, so Polars (`pl.DataFrame(stream)`), DuckDB (a query naming the variable) and pyarrow (`pa.RecordBatchReader.from_stream(stream)`) take it directly. `stream.to_pyarrow()` is the same reader in one call. For pandas, call `.read_pandas()` on that reader.
+- **No new required dependency:** pyarrow is optional. `pip install pigeonhole-db[arrow]` adds it (18.0 or later), for `to_pyarrow()`.
+- **The selection:** the batches hold the scan's cells: its prefix or range, `families`, `qualifier_prefix`, `versions` (0 for every version), `limit`, `column_limit` and `snapshot`.
+- **The options:** `to_arrow`'s keyword arguments are the export's.
+  - `batch_cells` (default 8192) and `batch_bytes` (default 8 MiB) close a batch, so memory stays bounded by one batch.
+  - `typed_values=True` adds `value_i64` and `value_f64`; `vector_dim=n` adds `value_vector`.
+  - `utf8_keys`, `row_dictionary`, and `ts="uint64"` change the key and timestamp types.
+- **One consumer per scan:** `to_arrow()` takes the scan, so the iterator ends, and it works only on a scan not yet iterated. A stream is read once: a second consumer raises `ValueError`. Close a stream you never hand over (`with t.scan().to_arrow() as s:`, or `s.close()`), as with a scan, to release its snapshot.
+- **Errors while reading:** `to_arrow()` raises pigeonhole's own exceptions for its arguments and for the scan. A read that fails later, mid-stream (the database closed under it, say), comes out of the consumer as the consumer's own exception, carrying pigeonhole's message. For pyarrow that's an `ArrowInvalid` reading `External error: the database is closed`, not a `pigeonhole` error class, so catch the consumer's exception type there.
+- **Don't write while a stream is open on the same thread:** an open stream holds its scan's snapshot, like a live scan, so a commit from that thread can wait on room only that snapshot holds, and fail with `Busy` after the write-stall timeout. Read the stream to the end (or close it) first. See [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit).
+- **The GIL:** the stream reads without the GIL, but a consumer that keeps the GIL while it reads blocks other Python threads for that long.
+
+```python
+import pigeonhole as ph
+import polars as pl
+import pyarrow as pa
+
+with ph.open(path, create=True) as db:
+    t = db.table("events").family("e").create()
+    with db.write_batch() as wb:
+        for i in range(1000):
+            wb.put(t, f"u{i % 10}:{i:04}", "e", "n", i)
+    df = pl.DataFrame(t.scan(prefix="u3:").to_arrow(typed_values=True))
+    assert df.height == 100 and df["value_i64"].sum() == sum(range(3, 1000, 10))
+
+    reader = t.scan().to_arrow().to_pyarrow()    # a pyarrow.RecordBatchReader
+    assert reader.read_all().num_rows == 1000
+    assert isinstance(reader, pa.RecordBatchReader)
+```
+
 ### Reads within a byte budget
 For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
 - **`scan_within(prefix, bytes=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.

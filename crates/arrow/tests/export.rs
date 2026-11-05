@@ -349,3 +349,27 @@ fn vector_cells_export_exactly_and_fill_value_vector() {
     drop(t);
     db.close().unwrap();
 }
+
+/// ICR 0120: `ArrowScan::from_rows` streams a scan the caller started, from its next row,
+/// at the snapshot it started at: a commit after the start isn't in the batches.
+#[test]
+fn from_rows_streams_a_started_scan_from_its_next_row_at_its_snapshot() {
+    let vfs = SimVfs::new(1480);
+    let (db, t) = open(&vfs);
+    for r in [&b"a"[..], b"b", b"c"] {
+        t.mutate(r).put("f", b"q", b"v").commit().unwrap();
+    }
+    let mut rows = t.scan_prefix(b"").iter().unwrap();
+    assert_eq!(rows.next_ref().unwrap().unwrap().key(), b"a");
+    t.mutate(b"d").put("f", b"q", b"v").commit().unwrap();
+    let keys: Vec<Vec<u8>> = ArrowScan::from_rows(rows, &ArrowOptions::default())
+        .flat_map(|b| {
+            let b = b.unwrap();
+            let rows = b.column_by_name("row").unwrap().as_binary::<i32>().clone();
+            rows.iter().map(|k| k.unwrap().to_vec()).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(keys, [b"b".to_vec(), b"c".to_vec()]);
+    drop(t);
+    db.close().unwrap();
+}

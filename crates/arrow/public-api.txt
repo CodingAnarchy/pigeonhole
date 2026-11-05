@@ -21,6 +21,8 @@ impl pigeonhole_arrow::ArrowScan<'_>
 pub fn pigeonhole_arrow::ArrowScan<'_>::schema(&self) -> arrow_schema::schema::SchemaRef
 impl pigeonhole_arrow::ArrowScan<'static>
 pub fn pigeonhole_arrow::ArrowScan<'static>::into_ffi_stream(self) -> arrow_array::ffi_stream::FFI_ArrowArrayStream
+impl<'t> pigeonhole_arrow::ArrowScan<'t>
+pub fn pigeonhole_arrow::ArrowScan<'t>::from_rows(pigeonhole::read::RowIter<'t>, &pigeonhole_arrow::ArrowOptions) -> Self
 impl arrow_array::record_batch::RecordBatchReader for pigeonhole_arrow::ArrowScan<'_>
 pub fn pigeonhole_arrow::ArrowScan<'_>::schema(&self) -> arrow_schema::schema::SchemaRef
 impl core::iter::traits::iterator::Iterator for pigeonhole_arrow::ArrowScan<'_>
