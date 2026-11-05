@@ -23,9 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_format::BlobFileId;
-use pigeonhole_format::feed::{
-    FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries, decode_entries_at,
-};
+use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries_at};
 use pigeonhole_format::manifest::Edit;
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
 use pigeonhole_runtime::ShardId;
@@ -119,23 +117,12 @@ pub(crate) fn open_sidecar(
     }
     let file = vfs.open(&path, OpenOptions::read_write_create())?;
     let len = file.len()?;
-    let mut bytes = vec![0u8; len as usize];
-    if len > 0 {
-        file.read_at(&mut bytes, 0)?;
-    }
-    let valid = match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == db_id => {
-            let (entries, end) = decode_entries_at(&bytes[FeedHeader::LEN..]);
-            Some(resolve_intent(
-                &file,
-                &entries,
-                FeedHeader::LEN + end,
-                opened,
-            )?)
-        }
-        // Another database's, or a torn or damaged header: its history is not ours. A reader
-        // finds no session for the segments' marks and expires.
-        _ => None,
+    let bytes = read_whole(&file)?;
+    // Another database's, or a torn or damaged header: its history is not ours. A reader
+    // finds no session for the segments' marks and expires.
+    let valid = match entries_of(&bytes, db_id) {
+        Some((entries, end)) => Some(resolve_intent(&file, &entries, end, opened)?),
+        None => None,
     };
     let rewritten = valid.is_none();
     let mut sidecar = match valid {
@@ -272,15 +259,40 @@ pub(crate) fn last_session(
     if !vfs.exists(&path)? {
         return Ok(None);
     }
-    let file = vfs.open(&path, OpenOptions::read())?;
+    Ok(read_sidecar(vfs, db, db_id)?.and_then(|entries| last_of(&entries)))
+}
+
+/// This database's sidecar entries, the file read whole: `None` when its header is another
+/// database's or damaged (its history isn't ours). A missing file is the open's error.
+pub(crate) fn read_sidecar(
+    vfs: &VfsRef,
+    db: &Path,
+    db_id: [u8; 16],
+) -> Result<Option<Vec<FeedEntry>>> {
+    let file = vfs.open(&sidecar_path(db), OpenOptions::read())?;
+    let bytes = read_whole(&file)?;
+    Ok(entries_of(&bytes, db_id).map(|(entries, _)| entries.into_iter().map(|(_, e)| e).collect()))
+}
+
+/// The file's bytes.
+fn read_whole(file: &FileRef) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; file.len()? as usize];
-    file.read_at(&mut bytes, 0)?;
-    match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == db_id => {}
-        _ => return Ok(None),
+    if !bytes.is_empty() {
+        file.read_at(&mut bytes, 0)?;
     }
-    let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..]);
-    Ok(last_of(&entries))
+    Ok(bytes)
+}
+
+/// The valid entries after `bytes`' header, each with its offset past the header, and where
+/// they end in `bytes`: `None` unless the header is this database's.
+fn entries_of(bytes: &[u8], db_id: [u8; 16]) -> Option<(Vec<(usize, FeedEntry)>, usize)> {
+    match FeedHeader::decode(bytes) {
+        Ok(h) if h.db_id == db_id => {
+            let (entries, end) = decode_entries_at(&bytes[FeedHeader::LEN..]);
+            Some((entries, FeedHeader::LEN + end))
+        }
+        _ => None,
+    }
 }
 
 /// [`last_session`]'s rule over decoded entries.
