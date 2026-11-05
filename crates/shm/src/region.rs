@@ -150,12 +150,16 @@ impl Inner {
     /// [`durable_seqno`](Self::durable_seqno) with `durable`, and also below every shard's
     /// written watermark (and, with `durable`, its synced one). Per shard, `pending` (and
     /// `durable`) first, then `written` (and `synced`), all Acquire: a shard stores those
-    /// before `pending` lets a seqno go.
-    fn written_seqno(&self, durable: bool) -> Seqno {
+    /// before `pending` lets a seqno go. With `catalog`, also below `CATALOG_HOLD`.
+    fn written_seqno(&self, durable: bool, catalog: bool) -> Seqno {
         let (next, held) = self.next_and_held();
         // After `NEXT_SEQNO`: a catalog change stores its hold under the allocator's lock,
         // before the mirror passes its ceiling (D315), as a decision does `CROSS_HELD`.
-        let catalog = self.h64(header::CATALOG_HOLD).load(Ordering::Acquire);
+        let catalog = if catalog {
+            self.h64(header::CATALOG_HOLD).load(Ordering::Acquire)
+        } else {
+            u64::MAX
+        };
         let mut lowest = next.min(held).min(catalog);
         for shard in 0..self.header.shard_count {
             lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
@@ -973,8 +977,13 @@ impl ShmRegion {
     /// The change feed's frontier (D310): every commit at or below it is applied on every
     /// shard and its records are in their stream files; with `durable`, it is durable at its
     /// level and the records the feed needs are synced, so no crash undoes it. Never above [`ShmRegion::visible_seqno`].
-    pub fn written_seqno(&self, durable: bool) -> Seqno {
-        self.inner.written_seqno(durable)
+    ///
+    /// With `catalog` (a feed of every table, D315), it is also below `CATALOG_HOLD`, the
+    /// ceiling of a catalog change whose sidecar entry isn't appended yet. A feed of some
+    /// tables delivers no catalog changes, so it doesn't wait for them (simp724's F2 on
+    /// #1515).
+    pub fn written_seqno(&self, durable: bool, catalog: bool) -> Seqno {
+        self.inner.written_seqno(durable, catalog)
     }
 
     /// The highest seqno a durable snapshot may include (D227, ICR 0037): every commit at or
@@ -1451,22 +1460,37 @@ mod tests {
         let shm = ShmRegion::in_memory([3; 16], &small());
         shm.advance_next_seqno(100);
         assert_eq!(shm.visible_seqno(), 99);
-        assert_eq!(shm.written_seqno(false), 99);
+        assert_eq!(shm.written_seqno(false, false), 99);
         shm.publish_written(1, 40);
-        assert_eq!(shm.written_seqno(false), 39);
-        assert_eq!(shm.written_seqno(true), 39);
+        assert_eq!(shm.written_seqno(false, false), 39);
+        assert_eq!(shm.written_seqno(true, false), 39);
         assert_eq!(shm.visible_seqno(), 99, "snapshots ignore it");
         // A durable feed is also below every durable and synced watermark.
         shm.publish_durable(0, 20);
-        assert_eq!(shm.written_seqno(true), 19);
-        assert_eq!(shm.written_seqno(false), 39);
+        assert_eq!(shm.written_seqno(true, false), 19);
+        assert_eq!(shm.written_seqno(false, false), 39);
         shm.publish_synced(0, 10);
-        assert_eq!(shm.written_seqno(true), 9);
-        assert_eq!(shm.written_seqno(false), 39, "a visible feed ignores it");
+        assert_eq!(shm.written_seqno(true, false), 9);
+        assert_eq!(
+            shm.written_seqno(false, false),
+            39,
+            "a visible feed ignores it"
+        );
         shm.publish_written(1, u64::MAX);
         shm.publish_durable(0, u64::MAX);
         shm.publish_synced(0, u64::MAX);
-        assert_eq!(shm.written_seqno(true), 99);
+        assert_eq!(shm.written_seqno(true, false), 99);
+        // D315: the catalog hold bounds only a feed of every table's frontier.
+        shm.publish_catalog_hold(50);
+        assert_eq!(shm.written_seqno(true, true), 49);
+        assert_eq!(shm.written_seqno(false, true), 49);
+        assert_eq!(
+            shm.written_seqno(true, false),
+            99,
+            "a feed of some tables ignores it"
+        );
+        shm.publish_catalog_hold(u64::MAX);
+        assert_eq!(shm.written_seqno(true, true), 99);
     }
 
     #[test]
