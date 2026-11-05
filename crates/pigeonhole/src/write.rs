@@ -950,6 +950,8 @@ impl RowMutation<'_> {
     ///     .commit_returning()?;
     /// let old = r.previous("s", b"holder")?.expect("held before");
     /// assert_eq!(old.value(), b"worker-3");
+    /// # drop(t);
+    /// # db.close()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -2878,7 +2880,7 @@ pub struct Returned {
     previous: Vec<PreviousCell>,
 }
 
-/// One cell of an [`Returned`]: family, qualifier, timestamp, value.
+/// One cell of a [`Returned`]: family, qualifier, timestamp, value.
 type ReturnedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
 
 /// One previous value of a [`Returned`]: family, qualifier, and the version before the

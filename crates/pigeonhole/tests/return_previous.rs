@@ -180,16 +180,37 @@ fn a_counter_drains() {
 }
 
 /// simp724's C3: the read at the seqno below the commit does not see the D290 row cache,
-/// which the commit's write-through has already moved forward.
+/// which the commit's write-through has already moved forward. The row is flushed and
+/// read until it is cached (a hit), and each swap moves the cached row forward (a
+/// write-through), so a read that consulted the cache would see the swap's own write.
 #[test]
 fn a_cached_row_returns_the_value_before_the_commit() {
-    let (_db, t) = open_with(5, |o| o.row_cache(1 << 20).row_cache_get_fill(true));
+    let (db, t) = open_with(5, |o| o.row_cache(1 << 20));
     t.mutate(b"r").put("s", b"q", b"a").commit().unwrap();
+    db.flush().unwrap();
+    let read = || {
+        t.row(b"r")
+            .family("s")
+            .read()
+            .unwrap()
+            .map(|r| r.to_owned())
+            .is_some()
+    };
     for _ in 0..3 {
-        assert_eq!(t.get(b"r", "s", b"q").unwrap().unwrap().value(), b"a");
+        assert!(read());
     }
-    assert_eq!(swap(&t, b"r", b"b").as_deref(), Some(&b"a"[..]));
-    assert_eq!(swap(&t, b"r", b"c").as_deref(), Some(&b"b"[..]));
+    let s = db.row_cache_stats();
+    assert!(read());
+    assert_eq!(db.row_cache_stats().hits, s.hits + 1, "the row is cached");
+    for (put, was) in [(&b"b"[..], &b"a"[..]), (b"c", b"b")] {
+        let w = db.row_cache_stats().write_throughs;
+        assert_eq!(swap(&t, b"r", put).as_deref(), Some(was));
+        assert_eq!(
+            db.row_cache_stats().write_throughs,
+            w + 1,
+            "the swap moved the cached row forward"
+        );
+    }
 }
 
 /// A separated (blob) value is read out.

@@ -7755,22 +7755,16 @@ impl ShardState {
                     if applied.is_ok()
                         && let Reply::Returning(r) = &m.reply
                     {
-                        let previous_of = std::mem::take(
-                            &mut r
-                                .out
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .previous_of,
-                        );
-                        let values = self.fold_returning(&m.bytes, m.seqno, m.commit_ts);
-                        let previous = if previous_of.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.previous_values(&m.bytes, previous_of, m.seqno, m.commit_ts)
-                        };
+                        // One lock scope (simp724's N1 on #1517): the committer locks the
+                        // slot only at its reply, so holding it across the reads contends
+                        // with nothing.
                         let mut out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
-                        out.cells = Some(values);
-                        out.previous = previous;
+                        let previous_of = std::mem::take(&mut out.previous_of);
+                        out.cells = Some(self.fold_returning(&m.bytes, m.seqno, m.commit_ts));
+                        if !previous_of.is_empty() {
+                            out.previous =
+                                self.previous_values(&m.bytes, previous_of, m.seqno, m.commit_ts);
+                        }
                     }
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
