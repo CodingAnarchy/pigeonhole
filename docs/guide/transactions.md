@@ -88,6 +88,20 @@ Transactions are **serializable over what they read with `get` and `get_row`**: 
 - **Keep the default retry policy.** Retrying at once (`backoff` with a zero base) or capping the pause low (1–5 ms) measured worse here: up to 28% fewer transfers and a higher p99. Those settings fill the shards with rounds that are bound to lose. The default pauses (5 µs doubling, up to 100 ms, with full jitter) spread the contenders out.
 - **For a value many transactions update,** use a counter family (`incr` is a blind write) or split the row, as above.
 
+## Don't hold a snapshot across your own commit
+
+A snapshot, an iterator, and a value read from a memtable keep the memtables they saw in memory until you drop them, including ones that have already been written to disk. That's how a snapshot stays consistent. A thread that holds one of them while it commits can then wait on itself:
+1. its commit finds the memtable arena full and waits for room;
+2. the wait flushes memtables to free room;
+3. their memory can't be reused, because this thread's own snapshot, iterator or value still refers to them;
+4. nothing else will free it, so the commit fails with `Busy` after the write-stall timeout (`Options::write_stall_timeout`, 30 s by default).
+
+**The rule:** read what you need, copy it into your own values (`to_vec`, `to_owned`, or collecting into a `Vec`), drop the snapshot or iterator, and only then commit. For example, read a page of rows with `scan_within`, take its `ScanPosition`, drop the page, write what you decided, and resume from the position for the next page. Don't commit inside a `for row in scan.iter()` loop.
+
+A transaction is fine: `transact` and `Transaction::commit` release the transaction's own snapshot before the commit waits (only its read set is checked). The trap is an extra `Pigeonhole::snapshot()`, a scan, or a value kept alive on the same thread while it commits.
+
+Found in `pigeonhole-vector`'s IVF splits (#1497, fixed): a split read a list's members at a snapshot and kept it while its own transactions committed. Under a write load that filled the arena, every such commit waited the whole timeout.
+
 ## Errors
 
 | Code | Meaning | Do |

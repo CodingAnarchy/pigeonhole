@@ -226,6 +226,60 @@ impl ApiError {
         .retry(RetryFrom::Request)
     }
 
+    /// A second call on a transaction while one is running, or any call while its `Commit`
+    /// runs (D313 B2): this call did nothing, so it may be sent again once the first answers.
+    pub(crate) fn session_busy() -> Self {
+        Self::new(
+            "SessionBusy",
+            0,
+            "another call on this transaction is running; send this one when it answers",
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+        .retry(RetryFrom::Request)
+    }
+
+    /// The transaction's lease ran out before any `Commit` arrived (D313 B1): nothing was
+    /// written, so the client starts again from `Begin`.
+    pub(crate) fn transaction_expired() -> Self {
+        Self::new(
+            "TransactionExpired",
+            0,
+            "the transaction expired before any Commit; begin a new one",
+            tonic::Code::Aborted,
+            StatusCode::CONFLICT,
+        )
+        .retry(RetryFrom::Begin)
+    }
+
+    /// A call other than `Commit` on a transaction that has received `Commit`: the session
+    /// is its tombstone (D313 B1), and `Commit` answers the recorded outcome, which this
+    /// error's message names too. Not retry-safe: whatever the call wanted is past.
+    pub(crate) fn transaction_finished(outcome: &Result<pigeonhole::CommitInfo, Self>) -> Self {
+        let what = match outcome {
+            Ok(c) => format!("committed at seqno {}", c.seqno),
+            Err(e) => format!("its Commit failed with {}", e.code),
+        };
+        Self::new(
+            "TransactionFinished",
+            0,
+            format!("the transaction has received Commit ({what}); Commit answers its outcome"),
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// A commit whose outcome the server couldn't learn (its task ended without one).
+    pub(crate) fn outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new(
+            "OutcomeUnknown",
+            ErrorCode::OutcomeUnknown as u32,
+            message,
+            tonic::Code::Unknown,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    }
+
     /// A malformed request: missing a required field, or a value out of range.
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::new(

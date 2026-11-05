@@ -1,7 +1,8 @@
 //! `phdb serve` (D313, #1397): one process serving a database over gRPC and HTTP/JSON on one
 //! port, as ICR 0112 specifies. So far: the skeleton (the listener, TLS, tokens and scopes,
-//! limits, health, metrics, shutdown, thread placement, D317's Router seam) and the `Data`
-//! service, `Scan`'s stream included; the other services follow.
+//! limits, health, metrics, shutdown, thread placement, D317's Router seam), the `Data`
+//! service with `Scan`'s stream, and `Transactions` and `Snapshots` on the session table
+//! (`sessions`); the other services follow.
 //!
 //! Startup checks everything it can before opening the database: the tokens, the TLS files
 //! and the bind rule. The database opens on the main thread, so the engine pins its shards
@@ -26,6 +27,7 @@ mod listener;
 mod placement;
 mod router;
 mod service;
+mod sessions;
 mod tls;
 
 pub(crate) use config::ServeArgs;

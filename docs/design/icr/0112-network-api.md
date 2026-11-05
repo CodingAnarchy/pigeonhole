@@ -97,9 +97,10 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `NotFound` (an id that isn't known, or is another token's) | `NOT_FOUND` | 404 | not applied (but see below) | no |
 | `SessionBusy` (a second concurrent call on one transaction, B2) | `FAILED_PRECONDITION` | 409 | not applied | `REQUEST`, once the first call answers |
 | `TransactionExpired` (idle before any `Commit`, B1) | `ABORTED` | 409 | not applied | `BEGIN` |
+| `TransactionFinished` (a call other than `Commit` on a transaction that received `Commit`; the message names the outcome) | `FAILED_PRECONDITION` | 409 | that call did nothing; the transaction's outcome is `Commit`'s | no: send `Commit` for the outcome |
 | `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
-| `DeadlineExceeded` (only before a write was submitted, B3) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
+| `DeadlineExceeded` (only before a write was submitted, B3; or a `Data.Scan` whose client took no page for `--stream-idle-ms`, resumable from its last page's `next`) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
 A code an older client doesn't know follows its `retry_safe` and `retry_from`.
@@ -116,6 +117,9 @@ A code an older client doesn't know follows its `retry_safe` and `retry_from`.
 - **A write the server has submitted** to the engine answers its real outcome even past the request's deadline, never `DEADLINE_EXCEEDED`.
 - **At shutdown,** in-flight writes end with the engine's outcome: `Closed` means not committed, `OutcomeUnknown` otherwise.
 - **After `Commit` on a transaction, the session answers every call with the recorded outcome until its tombstone expires** (B1). `TransactionExpired` appears only before a `Commit` arrived.
+  - **A `Commit` sent again** answers the first one's outcome (its `CommitInfo`, or its `Conflict` or `OutcomeUnknown`), and commits nothing twice, even if it carries rows.
+  - **Any other call** (`Get`, `GetRow`, `Write`, `Abort`) answers `TransactionFinished`, naming the outcome in its message. It never answers success: an `Abort` that succeeded would read as "not committed".
+  - **A call while the `Commit` runs** answers `SessionBusy`.
 - **`NOT_FOUND` for a `txn_id` that was sent `Commit`** (a restarted server, or an expired tombstone) means the outcome is unknown, not "not applied". The client checks the operation id.
 - **`MutateReturning`'s per-cell `error`** is a value, not an RPC error. The commit succeeded, and only that cell's read failed (D314).
 
