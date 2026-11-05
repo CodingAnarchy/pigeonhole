@@ -432,9 +432,20 @@ module Pigeonhole
       self
     end
 
-    # Commits like `commit`, and returns a frozen Incremented: each counter cell the writes
-    # incremented or set, as a read at the commit sees it (D314). Concurrent increments of one
-    # cell each get their own value.
+    # Asks `commit_returning` for the column `family`:`qualifier` as it was just before the
+    # commit, read in the same step: `previous(family, qualifier)` on the result (ICR 0113).
+    # Only `commit_returning` takes such a mutation: `commit` and `commit_if` raise
+    # InvalidArgument, as does a mutation that writes nothing. Asking twice for one column is
+    # one request.
+    def return_previous(family, qualifier)
+      native_return_previous(family, qualifier)
+      self
+    end
+
+    # Commits like `commit`, and returns a frozen Incremented (also named Returned): each
+    # counter cell the writes incremented or set, as a read at the commit sees it (D314), and
+    # the columns `return_previous` asked for, as they were just before it. Concurrent
+    # increments of one cell each get their own value.
     def commit_returning = native_commit_returning.freeze
   end
 
@@ -449,7 +460,18 @@ module Pigeonhole
     def value(family, qualifier, ts: nil)
       native_value(family, qualifier, ts)
     end
+
+    # `previous(family, qualifier)`: the column `return_previous` asked for, as it was just
+    # before the commit (a Cell), or nil if it had no visible version. Raises InvalidArgument
+    # if the mutation didn't ask for it, and ReturnedValueError if it couldn't be read after
+    # the commit applied: the commit succeeded then, so don't retry it.
+    def previous(family, qualifier)
+      native_previous(family, qualifier)
+    end
   end
+
+  # Incremented's name since 1.2, when it gained `previous` (ICR 0113): the same class.
+  Returned = Incremented
 
   # The write methods `WriteBatch` and `Transaction` share: the table and row first; each
   # returns self.

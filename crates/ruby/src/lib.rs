@@ -147,12 +147,17 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("commit", method!(Mutation::commit, 0))?;
     c.define_method("commit_if", method!(Mutation::commit_if, 1))?;
     c.define_private_method(
+        "native_return_previous",
+        method!(Mutation::return_previous, 2),
+    )?;
+    c.define_private_method(
         "native_commit_returning",
         method!(Mutation::commit_returning, 0),
     )?;
 
     let c = class(ruby, m, "Incremented")?;
     c.define_method("seqno", method!(Incremented::seqno, 0))?;
+    c.define_private_method("native_previous", method!(Incremented::previous, 2))?;
     c.define_private_method("native_value", method!(Incremented::value, 3))?;
     c.define_method("to_h", method!(Incremented::to_h, 0))?;
     c.define_method("size", method!(Incremented::size, 0))?;

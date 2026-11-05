@@ -512,10 +512,12 @@ pub(crate) fn commit_row(
     table: &pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    previous: &[(String, Vec<u8>)],
     durability: Option<Durability>,
     condition: Option<&pigeonhole::Condition>,
 ) -> pigeonhole::Result<Option<u64>> {
-    let m = row_mutation(table, row, ops, durability);
+    // A mutation with `return_previous` requests is refused here (ICR 0113).
+    let m = row_mutation(table, row, ops, previous, durability);
     match condition {
         None => m.commit().map(|i| Some(i.seqno)),
         Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
@@ -528,9 +530,10 @@ pub(crate) fn commit_row_returning(
     table: &pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    previous: &[(String, Vec<u8>)],
     durability: Option<Durability>,
 ) -> pigeonhole::Result<pigeonhole::Incremented> {
-    row_mutation(table, row, ops, durability).commit_returning()
+    row_mutation(table, row, ops, previous, durability).commit_returning()
 }
 
 /// `ops` buffered on a row mutation of `row`, uncommitted.
@@ -538,6 +541,7 @@ fn row_mutation<'t>(
     table: &'t pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    previous: &[(String, Vec<u8>)],
     durability: Option<Durability>,
 ) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
@@ -580,6 +584,9 @@ fn row_mutation<'t>(
             Op::DeleteColumn(f, q) => m.delete_column(f, q),
             Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
         };
+    }
+    for (f, q) in previous {
+        m = m.return_previous(f, q);
     }
     m
 }
@@ -769,6 +776,7 @@ impl Table {
             table: rb_self.writer(ruby)?.clone(),
             row: row.0,
             ops: Mutex::new(Some(Vec::new())),
+            previous: Mutex::new(Vec::new()),
             durability: Mutex::new(None),
         })))
     }
@@ -782,8 +790,10 @@ impl Table {
         durability: Option<Durability>,
     ) -> Result<u64, Error> {
         let t = rb_self.writer(ruby)?.clone();
-        engine(ruby, move || commit_row(&t, &row, &[op], durability, None))
-            .map(|s| s.expect("unconditional"))
+        engine(ruby, move || {
+            commit_row(&t, &row, &[op], &[], durability, None)
+        })
+        .map(|s| s.expect("unconditional"))
     }
 
     /// `put(row, family, qualifier, value, ts, durability)`.
@@ -836,7 +846,7 @@ impl Table {
         // `ReturnedValueError` (perf2's S1 on #1473).
         let (seqno, value) = engine(ruby, move || {
             let op = Op::Incr(family.0.clone(), qualifier.0.clone(), ts, delta);
-            let r = commit_row_returning(&t, &row.0, &[op], durability)?;
+            let r = commit_row_returning(&t, &row.0, &[op], &[], durability)?;
             Ok((
                 r.info.seqno,
                 r.value_at(&family.0, &qualifier.0, ts.unwrap_or(0)),
@@ -970,6 +980,22 @@ impl Mutation {
         Ok(())
     }
 
+    /// `return_previous(family, qualifier)`: asks `commit_returning` for that column as it was
+    /// just before the commit (ICR 0113).
+    pub(crate) fn return_previous(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<(), Error> {
+        let m = rb_self.0.get(ruby)?;
+        if lock(&m.ops).is_none() {
+            return Err(spent(ruby, "the mutation was already committed"));
+        }
+        lock(&m.previous).push((family.0, qualifier.0));
+        Ok(())
+    }
+
     /// Commits the recorded writes as one atomic row mutation; returns its sequence number.
     pub(crate) fn commit(ruby: &Ruby, rb_self: &Self) -> Result<u64, Error> {
         Self::finish(ruby, rb_self, None).map(|s| s.expect("unconditional"))
@@ -992,10 +1018,12 @@ impl Mutation {
         // As in `finish`: the writes are taken inside the call.
         let r = without_gvl(ruby, move || {
             let ops = lock(&m.ops).take()?;
-            Some(commit_row_returning(&m.table, &m.row, &ops, durability))
+            let previous = std::mem::take(&mut *lock(&m.previous));
+            let r = commit_row_returning(&m.table, &m.row, &ops, &previous, durability);
+            Some(r.map(|r| Incremented(r, previous)))
         })?;
         match r {
-            Some(r) => r.map(Incremented).or_rb(ruby),
+            Some(r) => r.or_rb(ruby),
             None => Err(spent(ruby, "the mutation was already committed")),
         }
     }
@@ -1011,10 +1039,12 @@ impl Mutation {
         // didn't run, the mutation keeps them.
         let r = without_gvl(ruby, move || {
             let ops = lock(&m.ops).take()?;
+            let previous = std::mem::take(&mut *lock(&m.previous));
             Some(commit_row(
                 &m.table,
                 &m.row,
                 &ops,
+                &previous,
                 durability,
                 condition.as_ref(),
             ))
@@ -1055,6 +1085,32 @@ impl Incremented {
         } else {
             // `InvalidArgument`, naming the cell.
             v.or_rb(ruby)
+        }
+    }
+
+    /// `previous(family, qualifier)`: the column `return_previous` asked for, as it was just
+    /// before the commit, or `nil` if it had no visible version. `InvalidArgument` if the
+    /// mutation didn't ask for it; `ReturnedValueError` if it couldn't be read after the
+    /// commit applied.
+    pub(crate) fn previous(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<Option<Cell>, Error> {
+        let asked = rb_self
+            .1
+            .iter()
+            .any(|(f, q)| *f == family.0 && *q == qualifier.0);
+        let c = rb_self
+            .0
+            .previous(&family.0, &qualifier.0)
+            .map(|c| c.map(Cell));
+        if asked {
+            c.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))
+        } else {
+            // `InvalidArgument`, naming the column.
+            c.or_rb(ruby)
         }
     }
 

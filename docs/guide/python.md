@@ -159,6 +159,7 @@ with ph.open(path, create=True) as db:
 - **`Table.put`, `incr` and `delete`** each commit one change.
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
 - **Increments that return the value (D314):** `mutate(row)....commit_returning()` commits like `commit` and returns an `Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts=None)` or `r[family, qualifier]`; iterating gives the keys `(family, qualifier, ts)`. `Table.incr_returning(...)` is the one-cell form and returns the new value. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `None` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts=0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `ph.ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its cause): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `Durability.GROUP_SYNC` (the default) or `SYNC` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
+- **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning()` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Cell`, or `None` if it had none. One call, for example, takes a lease and says who held it. Only `commit_returning()` (and `commit_returning_async()`) takes such a mutation: `commit()` and `commit_if()` raise `InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Returned` is the same class as `Incremented`, under the name the Rust struct has had since 1.2.
 - **`db.write_batch()`** spans rows and tables atomically. As a context manager, it commits on a clean exit and writes nothing if the block raises.
 - **`db.transaction()`** is optimistic: its reads see one snapshot, and `commit()` raises `Conflict` if a cell it read changed meanwhile.
 - **`db.transact(fn)`** runs `fn(txn)` and retries it on `Conflict` and `Busy`, with backoff. It returns what `fn` returned. `fn` may run more than once, so keep its side effects inside the transaction.
@@ -189,6 +190,17 @@ with ph.open(path, create=True) as db:
     r = seq.mutate(b"orders").incr("n", b"next", 1).incr("n", b"shipped", 1).commit_returning()
     assert r.value("n", b"next") == 2 and r["n", b"shipped"] == 1
     assert list(r) == [("n", b"next", 0), ("n", b"shipped", 0)]
+
+    # A lease handoff: take the lease, and learn who held it, in one commit.
+    leases = db.table("leases").family("s").create()
+    leases.mutate(b"lease:42").put("s", b"holder", b"worker-3").commit()
+    r = (
+        leases.mutate(b"lease:42")
+        .put("s", b"holder", b"worker-7")
+        .return_previous("s", b"holder")
+        .commit_returning()
+    )
+    assert r.previous("s", b"holder").value == b"worker-3"
 ```
 
 ## Vectors

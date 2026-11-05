@@ -48,6 +48,8 @@ pub(crate) struct MutationState {
     pub(crate) row: Vec<u8>,
     /// `None` once committed.
     pub(crate) ops: Mutex<Option<Vec<Op>>>,
+    /// The columns `return_previous` asked for: family and qualifier (ICR 0113).
+    pub(crate) previous: Mutex<Vec<(String, Vec<u8>)>>,
     pub(crate) durability: Mutex<Option<Durability>>,
 }
 
@@ -82,10 +84,15 @@ pub(crate) struct Snapshot(pub(crate) ForkSafe<Mutex<Option<pigeonhole::Snapshot
 #[magnus::wrap(class = "Pigeonhole::Cell", free_immediately, size)]
 pub(crate) struct Cell(pub(crate) pigeonhole::Cell);
 
-/// `Pigeonhole::Incremented`: the counter cells a `Mutation#commit_returning` wrote, after
-/// its commit (D314). Plain data: no handle, so nothing to guard across a fork.
+/// `Pigeonhole::Incremented` (also `Pigeonhole::Returned`): the counter cells a
+/// `Mutation#commit_returning` wrote, after its commit (D314), and the columns
+/// `return_previous` asked for, as they were before it, with those requests. Plain data: no
+/// handle, so nothing to guard across a fork.
 #[magnus::wrap(class = "Pigeonhole::Incremented", free_immediately, size)]
-pub(crate) struct Incremented(pub(crate) pigeonhole::Incremented);
+pub(crate) struct Incremented(
+    pub(crate) pigeonhole::Incremented,
+    pub(crate) Vec<(String, Vec<u8>)>,
+);
 
 /// `Pigeonhole::Row`.
 #[magnus::wrap(class = "Pigeonhole::Row", free_immediately, size)]
