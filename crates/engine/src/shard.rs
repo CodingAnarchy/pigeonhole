@@ -745,6 +745,7 @@ impl Shared {
         // pigeonhole, follows a recovery).
         if let Some(feed) = &self.feed {
             feed.wake_hold_waiters();
+            feed.wake_catalog_waiters();
         }
     }
 

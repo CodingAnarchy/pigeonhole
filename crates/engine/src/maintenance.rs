@@ -108,96 +108,36 @@ fn copy_into(
     pager: &Arc<Pager>,
     closing: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    let seqno = snapshot.seqno;
     let view = Arc::clone(&snapshot.view);
     let source = Arc::clone(&view.catalog);
-    // New SSTs (the memtables', and any rewritten) take ids above every source SST's.
-    let sst_ids = Arc::new(AtomicU64::new(source.counters.next_sst));
-    let created = shared.vfs.now_micros();
-    let all = ScanFilter::all();
-    // Reads of SSTs the copy rewrites: kept off the engine's cache, which they would only
-    // churn.
-    let rewrite_cache = Arc::new(BlockCache::new(4 << 20, 1));
-    // What phase 2 copies byte for byte, and what it rewrites, from the snapshot's catalog.
-    let mut edits = source.snapshot_edits();
-    // The SSTs copied byte for byte, with their families.
-    let mut verbatim: HashMap<SstId, FamilyId> = HashMap::new();
-    let mut verbatim_len: HashMap<ExtentRef, u64> = HashMap::new();
-    // By id, so a seed lays the copy out the same way every run.
-    let mut rewrite: BTreeMap<SstId, (Arc<SstMeta>, Vec<Slot>)> = BTreeMap::new();
-    for e in &edits {
-        if let Edit::AddSst {
-            tablet,
-            family,
-            level,
-            meta,
-        } = e
-        {
-            if meta.seqno_range.1 <= seqno {
-                verbatim.insert(meta.id, *family);
-                verbatim_len.insert(meta.extent, meta.len);
-            } else {
-                rewrite
-                    .entry(meta.id)
-                    .or_insert_with(|| (Arc::new(meta.clone()), Vec::new()))
-                    .1
-                    .push((*tablet, *family, *level));
-            }
-        }
-    }
+    let copier = Copier {
+        shared,
+        pager,
+        // New SSTs (the memtables', and any rewritten) take ids above every source SST's.
+        sst_ids: Arc::new(AtomicU64::new(source.counters.next_sst)),
+        seqno: snapshot.seqno,
+        created: shared.vfs.now_micros(),
+        closing,
+    };
+    let (mut plan, kept_refs) = CopyPlan::new(&source, copier.seqno);
     // Their extents in the copy, reserved now, largest first, before phase 1's SSTs take
     // any space: an extent is aligned to its size, and the smaller ones (the memtables'
     // SSTs among them) then fill the gaps the larger ones leave. The blob files the kept
     // SSTs reference are reserved too; those only new SSTs reference follow in phase 2.
-    let mut recorded: HashMap<SstId, &Vec<(BlobFileId, u64)>> = HashMap::new();
-    for e in &edits {
-        if let Edit::SstBlobRefs { sst, refs } = e
-            && verbatim.contains_key(sst)
-        {
-            recorded.insert(*sst, refs);
-        }
-    }
-    let any_of: HashSet<FamilyId> = verbatim
-        .iter()
-        .filter(|(id, _)| !recorded.contains_key(id))
-        .map(|(_, f)| *f)
-        .collect();
-    let kept_refs: HashSet<BlobFileId> = recorded
-        .values()
-        .flat_map(|refs| refs.iter().map(|(b, _)| *b))
-        .collect();
-    let mut moved: HashMap<ExtentRef, ExtentRef> = HashMap::new();
     reserve(
         pager,
-        &mut moved,
-        extents_to_copy(&edits, &verbatim, |b, f| {
-            kept_refs.contains(b) || any_of.contains(f)
+        &mut plan.moved,
+        extents_to_copy(&plan.edits, &plan.verbatim, |b, f| {
+            kept_refs.contains(b) || plan.any_of.contains(f)
         }),
     )?;
-    drop(recorded);
-    // Phase 1: every slot's memtable entries at or below the snapshot into level-0 SSTs
-    // of the copy (a flush, in effect), while the snapshot pins the memtables.
-    let mut mem_edits = Vec::new();
-    let full = &view;
-    for t in source.tablets() {
-        for f in source.family_ids_of(t.table) {
-            closing()?;
-            let (Some(meta), Some(set)) = (source.family(f), full.memtables(t.shard, t.id, f))
-            else {
-                continue;
-            };
-            let mut sources = Vec::new();
-            mem_sources(set, &all, &mut sources);
-            let options = writer_options(&meta.options, t.table, f, t.id, created);
-            let mut sink = copy_at(shared, pager, &sst_ids, options, sources, seqno, closing)?;
-            mem_edits.extend(sink.take_edits(t.id, f, 0));
-        }
-    }
+    drop(kept_refs);
+    // Phase 1, while the snapshot pins the memtables.
+    let mem_edits = copier.memtables(&view, &source)?;
     // Release the memtables: keep only an SST view of the snapshot, pinned (its manifest
     // version registered) so no extent it names is reclaimed while phase 2 reads it.
-    let full = view;
-    let ssts_only = full.ssts_only(&shared.live_views);
-    drop(full);
+    let ssts_only = view.ssts_only(&shared.live_views);
+    drop(view);
     drop(snapshot);
     #[cfg(feature = "test-hooks")]
     shared
@@ -211,147 +151,20 @@ fn copy_into(
     // An SST holding commits above the snapshot (flushed but not yet durable, under a
     // durable snapshot) is rewritten without them instead.
     let src = &ssts_only.ssts.file;
-    // SSTs holding commits above the snapshot, rewritten first (their blob references
-    // count below): each once however many tablets share it, unclamped, its values
-    // written as they are.
-    let mut rewritten = Vec::new();
-    for (meta, slots) in rewrite.into_values() {
-        closing()?;
-        let (tablet, family, _) = slots[0];
-        let (Some(info), Some(t)) = (source.family(family), source.tablet(tablet)) else {
-            return Err(Error::Corruption(format!(
-                "backup: SST {:?} is under an unknown tablet or family",
-                meta.id
-            )));
-        };
-        let table = t.table;
-        let reader = Arc::new(SstReader::open(
-            src.clone(),
-            &meta,
-            Arc::clone(&rewrite_cache),
-            Priority::Low,
-        )?);
-        let sources = vec![Source::Sst(
-            reader.iter(all.clone(), ReadOptions::default()).into(),
-        )];
-        let options = writer_options(&info.options, table, family, tablet, created);
-        let mut sink = copy_at(shared, pager, &sst_ids, options, sources, seqno, closing)?;
-        for (out, refs) in sink.outputs.drain(..).zip(sink.refs.drain(..)) {
-            for &(tablet, family, level) in &slots {
-                rewritten.push(Edit::AddSst {
-                    tablet,
-                    family,
-                    level,
-                    meta: out.clone(),
-                });
-            }
-            rewritten.push(Edit::SstBlobRefs { sst: out.id, refs });
-        }
-    }
-    // The blob files the copy references and the bytes it references in each (their
-    // `live_bytes`): the kept SSTs' recorded references and the new SSTs'. A kept SST
-    // with none recorded (an older build's) may point anywhere in its family, whose files
-    // are then all kept at their source live bytes. Files nothing references (values of
-    // commits above the snapshot, a failed commit's) stay behind.
-    let mut live: HashMap<BlobFileId, u64> = HashMap::new();
-    let new_refs = mem_edits.iter().chain(&rewritten);
-    for e in edits
-        .iter()
-        .filter(|e| matches!(e, Edit::SstBlobRefs { sst, .. } if verbatim.contains_key(sst)))
-        .chain(new_refs)
-    {
-        if let Edit::SstBlobRefs { refs, .. } = e {
-            for (blob, bytes) in refs {
-                *live.entry(*blob).or_default() += bytes;
-            }
-        }
-    }
-    let listed: HashSet<BlobFileId> = edits
-        .iter()
-        .filter_map(|e| match e {
-            Edit::PutBlobFile { blob_file, .. } => Some(*blob_file),
-            _ => None,
-        })
-        .collect();
-    if let Some(missing) = live.keys().find(|b| !listed.contains(b)) {
-        return Err(Error::Corruption(format!(
-            "backup: an SST points into blob file {missing:?}, which the snapshot does not list"
-        )));
-    }
-    let kept =
-        |blob: &BlobFileId, family: &FamilyId| live.contains_key(blob) || any_of.contains(family);
+    let rewritten = copier.rewrite(src, &source, std::mem::take(&mut plan.rewrite))?;
+    let live = plan.live_blob_bytes(mem_edits.iter().chain(&rewritten))?;
+    let kept = |blob: &BlobFileId, family: &FamilyId| {
+        live.contains_key(blob) || plan.any_of.contains(family)
+    };
     // Blob files only the new SSTs reference get their extents now; then every reserved
     // extent is filled from the source.
-    reserve(pager, &mut moved, extents_to_copy(&edits, &verbatim, kept))?;
-    // In the copy's order, so its writes are sequential.
-    let mut order: Vec<(&ExtentRef, &ExtentRef)> = moved.iter().collect();
-    order.sort_by_key(|(_, to)| **to);
-    let mut buf = vec![0u8; COPY_CHUNK];
-    for (from, to) in order {
-        closing()?;
-        let len = verbatim_len.get(from).copied().unwrap_or(from.len());
-        let mut at = 0;
-        while at < len {
-            let n = (len - at).min(COPY_CHUNK as u64) as usize;
-            src.read_at(&mut buf[..n], from.offset() + at)?;
-            pager.write(*to, at, &buf[..n])?;
-            at += n as u64;
-        }
-    }
-    // The source's edits, pointed at the copies: the WAL checkpoints go (the copy has no
-    // log), every slot is flushed through the snapshot, and the counters come last.
-    edits.retain_mut(|e| match e {
-        Edit::AddSst { meta, .. } => match moved.get(&meta.extent) {
-            Some(to) if verbatim.contains_key(&meta.id) => {
-                meta.extent = *to;
-                true
-            }
-            _ => false,
-        },
-        Edit::SstBlobRefs { sst, .. } => verbatim.contains_key(sst),
-        Edit::PutBlobFile {
-            blob_file,
-            family,
-            extents,
-            live_bytes,
-            ..
-        } => {
-            if !kept(blob_file, family) {
-                return false;
-            }
-            for x in extents.iter_mut() {
-                *x = moved[x];
-            }
-            if !any_of.contains(family) {
-                *live_bytes = live[blob_file];
-            }
-            true
-        }
-        Edit::SetFlushed { .. } | Edit::WalCheckpoint { .. } | Edit::Counters { .. } => false,
-        _ => true,
-    });
-    edits.extend(rewritten);
-    edits.extend(mem_edits);
-    for t in source.tablets() {
-        for f in source.family_ids_of(t.table) {
-            edits.push(Edit::SetFlushed {
-                tablet: t.id,
-                family: f,
-                seqno,
-            });
-        }
-    }
-    let c = source.counters;
-    edits.push(Edit::Counters {
-        next_table: c.next_table,
-        next_family: c.next_family,
-        next_tablet: c.next_tablet,
-        next_sst: sst_ids.load(Ordering::Relaxed),
-        next_blob_file: c.next_blob_file,
-        seqno_ceiling: seqno + 1,
-        // D271: every default timestamp handed out is at or below the allocator's `H`.
-        ts_floor: shared.clock.last_ts().max(c.ts_floor),
-    });
+    reserve(
+        pager,
+        &mut plan.moved,
+        extents_to_copy(&plan.edits, &plan.verbatim, kept),
+    )?;
+    copier.extents(src, &plan.moved, &plan.verbatim_len)?;
+    let edits = plan.copy_edits(&copier, &source, &live, rewritten, mem_edits);
     let mut catalog = Catalog::with_registry(Arc::clone(source.registry()));
     for e in &edits {
         catalog.apply(e, 1)?;
@@ -367,6 +180,192 @@ fn copy_into(
 
 /// Where the source lists an SST: its tablet, family and level.
 type Slot = (TabletId, FamilyId, u8);
+
+/// What a backup copies byte for byte and what it rewrites, from the snapshot catalog's
+/// edits, and where each copied extent goes in the copy.
+struct CopyPlan {
+    /// The snapshot catalog's edits, pointed at the copies at the end ([`Self::copy_edits`]).
+    edits: Vec<Edit>,
+    /// The SSTs copied byte for byte, with their families.
+    verbatim: HashMap<SstId, FamilyId>,
+    /// The bytes each of them uses, by extent.
+    verbatim_len: HashMap<ExtentRef, u64>,
+    /// The SSTs holding commits above the snapshot, each with every slot that lists it. By
+    /// id, so a seed lays the copy out the same way every run.
+    rewrite: BTreeMap<SstId, (Arc<SstMeta>, Vec<Slot>)>,
+    /// The families of kept SSTs with no blob references recorded (an older build's): such
+    /// an SST may point anywhere in its family, whose blob files are then all kept.
+    any_of: HashSet<FamilyId>,
+    /// Each source extent copied, and its extent in the copy.
+    moved: HashMap<ExtentRef, ExtentRef>,
+}
+
+impl CopyPlan {
+    /// The plan for a copy at `seqno`, and the blob files the kept SSTs' recorded
+    /// references name.
+    fn new(source: &Catalog, seqno: pigeonhole_format::Seqno) -> (Self, HashSet<BlobFileId>) {
+        let edits = source.snapshot_edits();
+        let mut verbatim: HashMap<SstId, FamilyId> = HashMap::new();
+        let mut verbatim_len: HashMap<ExtentRef, u64> = HashMap::new();
+        let mut rewrite: BTreeMap<SstId, (Arc<SstMeta>, Vec<Slot>)> = BTreeMap::new();
+        for e in &edits {
+            if let Edit::AddSst {
+                tablet,
+                family,
+                level,
+                meta,
+            } = e
+            {
+                if meta.seqno_range.1 <= seqno {
+                    verbatim.insert(meta.id, *family);
+                    verbatim_len.insert(meta.extent, meta.len);
+                } else {
+                    rewrite
+                        .entry(meta.id)
+                        .or_insert_with(|| (Arc::new(meta.clone()), Vec::new()))
+                        .1
+                        .push((*tablet, *family, *level));
+                }
+            }
+        }
+        let (mut recorded, mut kept_refs) = (HashSet::new(), HashSet::new());
+        for e in &edits {
+            if let Edit::SstBlobRefs { sst, refs } = e
+                && verbatim.contains_key(sst)
+            {
+                recorded.insert(*sst);
+                kept_refs.extend(refs.iter().map(|(b, _)| *b));
+            }
+        }
+        let any_of = verbatim
+            .iter()
+            .filter(|(id, _)| !recorded.contains(id))
+            .map(|(_, f)| *f)
+            .collect();
+        let plan = Self {
+            edits,
+            verbatim,
+            verbatim_len,
+            rewrite,
+            any_of,
+            moved: HashMap::new(),
+        };
+        (plan, kept_refs)
+    }
+
+    /// The blob files the copy references and the bytes it references in each (their
+    /// `live_bytes`): the kept SSTs' recorded references and the new SSTs' (`new_refs`, the
+    /// edits of phase 1 and the rewrites). Files nothing references (values of commits above
+    /// the snapshot, a failed commit's) stay behind. A reference to a file the snapshot
+    /// doesn't list is corruption.
+    fn live_blob_bytes<'e>(
+        &'e self,
+        new_refs: impl Iterator<Item = &'e Edit>,
+    ) -> Result<HashMap<BlobFileId, u64>> {
+        let mut live: HashMap<BlobFileId, u64> = HashMap::new();
+        let kept = self.edits.iter().filter(
+            |e| matches!(e, Edit::SstBlobRefs { sst, .. } if self.verbatim.contains_key(sst)),
+        );
+        for e in kept.chain(new_refs) {
+            if let Edit::SstBlobRefs { refs, .. } = e {
+                for (blob, bytes) in refs {
+                    *live.entry(*blob).or_default() += bytes;
+                }
+            }
+        }
+        let listed: HashSet<BlobFileId> = self
+            .edits
+            .iter()
+            .filter_map(|e| match e {
+                Edit::PutBlobFile { blob_file, .. } => Some(*blob_file),
+                _ => None,
+            })
+            .collect();
+        if let Some(missing) = live.keys().find(|b| !listed.contains(b)) {
+            return Err(Error::Corruption(format!(
+                "backup: an SST points into blob file {missing:?}, which the snapshot does not list"
+            )));
+        }
+        Ok(live)
+    }
+
+    /// The copy's manifest edits: the source's, pointed at the copies, without the WAL
+    /// checkpoints (the copy has no log), then the rewritten and phase 1 SSTs, every slot
+    /// flushed through the snapshot, and the counters last.
+    fn copy_edits(
+        self,
+        copier: &Copier<'_>,
+        source: &Catalog,
+        live: &HashMap<BlobFileId, u64>,
+        rewritten: Vec<Edit>,
+        mem_edits: Vec<Edit>,
+    ) -> Vec<Edit> {
+        let seqno = copier.seqno;
+        let Self {
+            mut edits,
+            verbatim,
+            any_of,
+            moved,
+            ..
+        } = self;
+        let kept = |blob: &BlobFileId, family: &FamilyId| {
+            live.contains_key(blob) || any_of.contains(family)
+        };
+        edits.retain_mut(|e| match e {
+            Edit::AddSst { meta, .. } => match moved.get(&meta.extent) {
+                Some(to) if verbatim.contains_key(&meta.id) => {
+                    meta.extent = *to;
+                    true
+                }
+                _ => false,
+            },
+            Edit::SstBlobRefs { sst, .. } => verbatim.contains_key(sst),
+            Edit::PutBlobFile {
+                blob_file,
+                family,
+                extents,
+                live_bytes,
+                ..
+            } => {
+                if !kept(blob_file, family) {
+                    return false;
+                }
+                for x in extents.iter_mut() {
+                    *x = moved[x];
+                }
+                if !any_of.contains(family) {
+                    *live_bytes = live[blob_file];
+                }
+                true
+            }
+            Edit::SetFlushed { .. } | Edit::WalCheckpoint { .. } | Edit::Counters { .. } => false,
+            _ => true,
+        });
+        edits.extend(rewritten);
+        edits.extend(mem_edits);
+        for t in source.tablets() {
+            for f in source.family_ids_of(t.table) {
+                edits.push(Edit::SetFlushed {
+                    tablet: t.id,
+                    family: f,
+                    seqno,
+                });
+            }
+        }
+        let c = source.counters;
+        edits.push(Edit::Counters {
+            next_table: c.next_table,
+            next_family: c.next_family,
+            next_tablet: c.next_tablet,
+            next_sst: copier.sst_ids.load(Ordering::Relaxed),
+            next_blob_file: c.next_blob_file,
+            seqno_ceiling: seqno + 1,
+            // D271: every default timestamp handed out is at or below the allocator's `H`.
+            ts_floor: copier.shared.clock.last_ts().max(c.ts_floor),
+        });
+        edits
+    }
+}
 
 /// The source extents a backup copies (`edits` the snapshot catalog's): the SSTs in
 /// `verbatim`, with the bytes each uses, and every extent of the blob files `kept` keeps.
@@ -425,44 +424,151 @@ fn writer_options(
     o
 }
 
-/// Merges `sources` in key order and writes every entry with a seqno at or below `seqno`
-/// into new SSTs of `pager`; returns the sink holding them and their blob references. Values
-/// are written as they are: a blob pointer keeps naming its blob file, which the copy holds
-/// under the same id.
-fn copy_at(
-    shared: &Shared,
-    pager: &Arc<Pager>,
-    sst_ids: &Arc<AtomicU64>,
-    options: SstWriterOptions,
-    sources: Vec<Source>,
+/// A backup's writes into the copy: what every step of [`copy_into`] shares.
+struct Copier<'a> {
+    shared: &'a Shared,
+    pager: &'a Arc<Pager>,
+    /// The ids of the copy's new SSTs.
+    sst_ids: Arc<AtomicU64>,
+    /// The snapshot's seqno: nothing above it is copied.
     seqno: pigeonhole_format::Seqno,
-    closing: &dyn Fn() -> Result<()>,
-) -> Result<SstSink> {
-    let mut sink = SstSink::new(
-        Arc::clone(pager),
-        Arc::clone(sst_ids),
-        options,
-        shared.picker.target_sst_bytes,
-    );
-    if sources.is_empty() {
-        return Ok(sink);
-    }
-    let mut merged = MergingCursor::new(sources);
-    merged.seek_to_first()?;
-    let mut n = 0u64;
-    while merged.valid() {
-        n += 1;
-        if n.is_multiple_of(CLOSE_CHECK_EVERY) {
-            closing()?;
+    /// The new SSTs' creation time.
+    created: u64,
+    /// Fails once the engine is closing (or a reader's writer restarted).
+    closing: &'a dyn Fn() -> Result<()>,
+}
+
+impl Copier<'_> {
+    /// Phase 1: every slot's memtable entries at or below the snapshot into level-0 SSTs of
+    /// the copy (a flush, in effect), while the snapshot (`view`) pins the memtables. Returns
+    /// their edits.
+    fn memtables(&self, view: &crate::snapshot::View, source: &Catalog) -> Result<Vec<Edit>> {
+        let all = ScanFilter::all();
+        let mut mem_edits = Vec::new();
+        for t in source.tablets() {
+            for f in source.family_ids_of(t.table) {
+                (self.closing)()?;
+                let (Some(meta), Some(set)) = (source.family(f), view.memtables(t.shard, t.id, f))
+                else {
+                    continue;
+                };
+                let mut sources = Vec::new();
+                mem_sources(set, &all, &mut sources);
+                let options = writer_options(&meta.options, t.table, f, t.id, self.created);
+                let mut sink = self.copy_at(options, sources)?;
+                mem_edits.extend(sink.take_edits(t.id, f, 0));
+            }
         }
-        let (_, _, s, _) = split_suffix(merged.key())?;
-        if s <= seqno {
-            sink.add(merged.key(), merged.value())?;
-        }
-        merged.next()?;
+        Ok(mem_edits)
     }
-    sink.cut()?;
-    Ok(sink)
+
+    /// The SSTs holding commits above the snapshot, rewritten without them (their blob
+    /// references count in the copy's): each once however many tablets share it, unclamped,
+    /// its values written as they are. Returns their edits, under every slot that listed
+    /// the source SST.
+    fn rewrite(
+        &self,
+        src: &pigeonhole_io::FileRef,
+        source: &Catalog,
+        rewrite: BTreeMap<SstId, (Arc<SstMeta>, Vec<Slot>)>,
+    ) -> Result<Vec<Edit>> {
+        let all = ScanFilter::all();
+        // Reads of SSTs the copy rewrites: kept off the engine's cache, which they would only
+        // churn.
+        let rewrite_cache = Arc::new(BlockCache::new(4 << 20, 1));
+        let mut rewritten = Vec::new();
+        for (meta, slots) in rewrite.into_values() {
+            (self.closing)()?;
+            let (tablet, family, _) = slots[0];
+            let (Some(info), Some(t)) = (source.family(family), source.tablet(tablet)) else {
+                return Err(Error::Corruption(format!(
+                    "backup: SST {:?} is under an unknown tablet or family",
+                    meta.id
+                )));
+            };
+            let reader = Arc::new(SstReader::open(
+                src.clone(),
+                &meta,
+                Arc::clone(&rewrite_cache),
+                Priority::Low,
+            )?);
+            let sources = vec![Source::Sst(
+                reader.iter(all.clone(), ReadOptions::default()).into(),
+            )];
+            let options = writer_options(&info.options, t.table, family, tablet, self.created);
+            let mut sink = self.copy_at(options, sources)?;
+            for (out, refs) in sink.outputs.drain(..).zip(sink.refs.drain(..)) {
+                for &(tablet, family, level) in &slots {
+                    rewritten.push(Edit::AddSst {
+                        tablet,
+                        family,
+                        level,
+                        meta: out.clone(),
+                    });
+                }
+                rewritten.push(Edit::SstBlobRefs { sst: out.id, refs });
+            }
+        }
+        Ok(rewritten)
+    }
+
+    /// Fills every reserved extent from the source (`moved`: source extent to copy), in the
+    /// copy's order so its writes are sequential. A kept SST's bytes are the ones it uses
+    /// (`verbatim_len`); any other extent is copied whole.
+    fn extents(
+        &self,
+        src: &pigeonhole_io::FileRef,
+        moved: &HashMap<ExtentRef, ExtentRef>,
+        verbatim_len: &HashMap<ExtentRef, u64>,
+    ) -> Result<()> {
+        let mut order: Vec<(&ExtentRef, &ExtentRef)> = moved.iter().collect();
+        order.sort_by_key(|(_, to)| **to);
+        let mut buf = vec![0u8; COPY_CHUNK];
+        for (from, to) in order {
+            (self.closing)()?;
+            let len = verbatim_len.get(from).copied().unwrap_or(from.len());
+            let mut at = 0;
+            while at < len {
+                let n = (len - at).min(COPY_CHUNK as u64) as usize;
+                src.read_at(&mut buf[..n], from.offset() + at)?;
+                self.pager.write(*to, at, &buf[..n])?;
+                at += n as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Merges `sources` in key order and writes every entry with a seqno at or below the
+    /// snapshot's into new SSTs of the copy; returns the sink holding them and their blob
+    /// references. Values are written as they are: a blob pointer keeps naming its blob file,
+    /// which the copy holds under the same id.
+    fn copy_at(&self, options: SstWriterOptions, sources: Vec<Source>) -> Result<SstSink> {
+        let mut sink = SstSink::new(
+            Arc::clone(self.pager),
+            Arc::clone(&self.sst_ids),
+            options,
+            self.shared.picker.target_sst_bytes,
+        );
+        if sources.is_empty() {
+            return Ok(sink);
+        }
+        let mut merged = MergingCursor::new(sources);
+        merged.seek_to_first()?;
+        let mut n = 0u64;
+        while merged.valid() {
+            n += 1;
+            if n.is_multiple_of(CLOSE_CHECK_EVERY) {
+                (self.closing)()?;
+            }
+            let (_, _, s, _) = split_suffix(merged.key())?;
+            if s <= self.seqno {
+                sink.add(merged.key(), merged.value())?;
+            }
+            merged.next()?;
+        }
+        sink.cut()?;
+        Ok(sink)
+    }
 }
 
 /// A region `shrink` cleared for `big` (`Pager::clear_for`), held until `big` moves in;
@@ -538,9 +644,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         shared.pager.truncate_tail()?;
         // What this round retires stays allocated until the call ends if a view keeps
         // retired extents from being reclaimed now, or a snapshot (or a backup), or a
-        // reader process's slot, will once this round retires more. Its commit must not grow the file then: the space would
-        // stay past the end, and the next round would plan to move the manifest out of it
-        // again (#1098).
+        // reader process's slot, will once this round retires more. Its commit must not
+        // grow the file then: the space would stay past the end, and the next round would
+        // plan to move the manifest out of it again (#1098).
         let pinned = shared.pager.stats().retired_bytes > 0
             || !shared.live_seqnos.list().is_empty()
             || shared.shm.oldest_reader_pin().is_some();
@@ -557,202 +663,24 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             break;
         }
         let view = shared.view.load_full();
-        let catalog = Arc::clone(&view.catalog);
         let root = shared
             .manifest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .root();
-        // Every SST by extent, with a family that references it (for its cache priority).
-        // Where it is referenced is decided again at commit time (`Moves::edits`).
-        let mut by_extent: HashMap<(u64, u8), (FamilyId, Arc<SstMeta>)> = HashMap::new();
-        for ((_, family), list) in catalog.ssts.iter() {
-            for (_, meta) in list.iter() {
-                by_extent
-                    .entry((meta.extent.page, meta.extent.size_class))
-                    .or_insert_with(|| (*family, Arc::clone(meta)));
-            }
-        }
+        let mut round = Round::new(shared, Arc::clone(&view.catalog), root, manifest_stays);
         #[cfg(feature = "test-hooks")]
         shared
             .hooks
             .sites
             .run(crate::engine::hooks::HookSite::ShrinkRelocates);
-        // Every blob extent by extent: its file and position in the file's extent list.
-        let mut blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)> = HashMap::new();
-        for (id, b) in catalog.blob_files.iter() {
-            for (i, e) in b.extents.iter().enumerate() {
-                blob_by_extent.insert((e.page, e.size_class), (*id, i));
-            }
-        }
-        let mut moves = Moves {
-            pager: Arc::clone(&shared.pager),
-            list: Vec::new(),
-            blobs: Vec::new(),
-        };
-        let mut readers = Vec::new();
-        // Rewrite the manifest snapshot, to below this extent.
-        let mut rewrite: Option<ExtentRef> = None;
-        let mut claimed: Vec<SstId> = Vec::new();
-        // An extent retired since the catalog was read: the plan is stale, so a round with
-        // nothing to move plans again instead of stopping.
-        let mut stale = false;
-        let roots: Vec<ExtentRef> = [root.snapshot, root.log].into_iter().flatten().collect();
-        let relocate = |extent: ExtentRef, to: Target| match to {
-            Target::Below(limit) => shared.pager.relocate_below(extent, limit),
-            Target::Into(region) => shared.pager.relocate_into(extent, region),
-        };
-        let mut move_to = |extent: ExtentRef, to: Target| -> Result<Moved> {
-            if roots.contains(&extent) {
-                // The manifest's own extents move by a snapshot rewrite: below the limit
-                // while pinned, else into the lowest free space. Never into a held region:
-                // a root never runs out of room, so none is cleared for one.
-                let (Target::Below(limit), false) = (to, manifest_stays) else {
-                    return Ok(Moved::Skipped);
-                };
-                rewrite = Some(match rewrite {
-                    Some(r) if r.page > limit.page => r,
-                    _ => limit,
-                });
-                return Ok(Moved::Yes);
-            }
-            if let Some(&(blob_file, index)) = blob_by_extent.get(&(extent.page, extent.size_class))
-            {
-                // A blob extent (#231): blob files are never written once published, so a
-                // copy needs no claim; the commit replaces the extent at its position if the
-                // file still has it there.
-                return match relocate(extent, to) {
-                    Ok(target) => {
-                        moves.blobs.push((blob_file, index, extent, target));
-                        Ok(Moved::Yes)
-                    }
-                    Err(pigeonhole_pager::Error::NoSpace) => Ok(Moved::NoSpace),
-                    // Dropped (blob GC, `drop_table`) since the catalog was read.
-                    Err(_) if !shared.pager.is_live(extent) => {
-                        stale = true;
-                        Ok(Moved::Skipped)
-                    }
-                    Err(e) => Err(e.into()),
-                };
-            }
-            let Some((family, meta)) = by_extent.get(&(extent.page, extent.size_class)) else {
-                // Not named by the manifest: an output in flight (decision D60).
-                return Ok(Moved::Skipped);
-            };
-            {
-                let mut busy = shared
-                    .busy_ssts
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if busy.contains(&meta.id) {
-                    return Ok(Moved::Skipped);
-                }
-                busy.insert(meta.id);
-            }
-            claimed.push(meta.id);
-            let target = match relocate(extent, to) {
-                Ok(t) => t,
-                // No room: it stays, and the smaller ones past it may still move.
-                Err(pigeonhole_pager::Error::NoSpace) => return Ok(Moved::NoSpace),
-                // A compaction that committed after the catalog was read retired it (the
-                // view held here keeps it from being reclaimed, so it is not reused).
-                Err(_) if !shared.pager.is_live(extent) => {
-                    stale = true;
-                    return Ok(Moved::Skipped);
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let id = SstId(shared.sst_ids.fetch_add(1, Ordering::Relaxed));
-            let mut new_meta = (**meta).clone();
-            new_meta.id = id;
-            new_meta.extent = target;
-            moves.list.push((meta.id, new_meta.clone()));
-            let priority = catalog
-                .family(*family)
-                .map_or(pigeonhole_cache::Priority::Normal, |m| {
-                    SstSet::priority(m.options.cache_priority)
-                });
-            let r = SstReader::open(
-                shared.pager.data_file().clone(),
-                &new_meta,
-                Arc::clone(&shared.cache),
-                priority,
-            )?;
-            readers.push((id, Arc::new(r)));
-            Ok(Moved::Yes)
-        };
-        // Whether an extent can be moved out of a region cleared for a larger one: the
-        // manifest's, a blob extent, or an SST no compaction held when the round began (a
-        // copy: `Pager::clear_for` calls this under the allocator's lock; a claim taken
-        // since makes that move a no-op).
-        let busy: std::collections::HashSet<SstId> = shared
-            .busy_ssts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let movable = |e: ExtentRef| {
-            roots.contains(&e)
-                || blob_by_extent.contains_key(&(e.page, e.size_class))
-                || by_extent
-                    .get(&(e.page, e.size_class))
-                    .is_some_and(|(_, m)| !busy.contains(&m.id))
-        };
-        let mut failed = None;
-        for extent in plan {
-            let to = match &held {
-                Some(h) if h.big == extent => Target::Into(h.region),
-                _ => Target::Below(extent),
-            };
-            match move_to(extent, to) {
-                Ok(Moved::Yes) => {
-                    if matches!(to, Target::Into(_)) {
-                        // The region is the large extent's now (releasing it is a no-op).
-                        held = None;
-                    }
-                }
-                Ok(Moved::NoSpace) if matches!(to, Target::Into(_)) => {
-                    // An occupant's old extent is still in the region: a pinned version
-                    // keeps it from being reclaimed. Wait (held) without clearing more.
-                    wasted = true;
-                }
-                Ok(Moved::NoSpace) if held.is_none() && !wasted => {
-                    // Small extents fragment every aligned hole of its class below it. Clear
-                    // one region (for the largest such extent that has one) and hold it; the
-                    // extent moves in once the occupants' old extents are reclaimed.
-                    let Some(clearing) = shared.pager.clear_for(extent, movable) else {
-                        continue;
-                    };
-                    crate::shard::trace!(
-                        "shrink: clearing {:?} of {:?} for {extent:?}",
-                        clearing.region,
-                        clearing.occupants
-                    );
-                    held = Some(Held {
-                        pager: Arc::clone(&shared.pager),
-                        big: extent,
-                        region: clearing.region,
-                    });
-                    for occupant in clearing.occupants {
-                        if let Err(e) = move_to(occupant, Target::Below(extent)) {
-                            failed = Some(e);
-                            break;
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => failed = Some(e),
-            }
-            if failed.is_some() {
-                break;
-            }
-        }
-        if let Some(e) = failed {
-            unclaim(shared, &claimed);
+        if let Err(e) = round.relocate(plan, &mut held, &mut wasted) {
+            unclaim(shared, &round.claimed);
             return Err(e);
         }
-        if moves.list.is_empty() && moves.blobs.is_empty() && rewrite.is_none() {
-            unclaim(shared, &claimed);
-            if stale {
+        if round.is_empty() {
+            unclaim(shared, &round.claimed);
+            if round.stale {
                 continue;
             }
             break;
@@ -762,10 +690,280 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             .hooks
             .sites
             .run(crate::engine::hooks::HookSite::ShrinkCommits);
-        // The edits are computed against the catalog at commit time, not the one read
-        // above: a compaction or `drop_table` that committed meanwhile removed an SST (its
-        // copy is abandoned), and a trivial move changed its level (the copy goes to the
-        // current one).
+        let committed = round.commit(pinned, &mut manifest_stays);
+        drop(view);
+        // On an error the targets are the manifest's to abandon (`begin` does, for a
+        // refused request, and `Moves` does for a request dropped unrun) or already named
+        // (a commit whose view publish failed).
+        committed?;
+    }
+    // A region still held is free space again before the tail is cut.
+    drop(held);
+    if !shared.closing.load(Ordering::Acquire) {
+        // What the last round's moves retired.
+        shared.reclaim();
+        shared.pager.truncate_tail()?;
+    }
+    Ok(shrunk())
+}
+
+/// One round of [`shrink`]: the catalog it plans against, and the moves it has made.
+struct Round<'a> {
+    shared: &'a Shared,
+    catalog: Arc<Catalog>,
+    /// The manifest's own extents (its snapshot and log).
+    roots: Vec<ExtentRef>,
+    /// The manifest stays where it is this round ([`shrink`]'s `manifest_stays`).
+    manifest_stays: bool,
+    /// Every SST by extent, with a family that references it (for its cache priority).
+    /// Where it is referenced is decided again at commit time ([`Moves::edits`]).
+    by_extent: HashMap<(u64, u8), (FamilyId, Arc<SstMeta>)>,
+    /// Every blob extent by extent: its file and position in the file's extent list.
+    blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)>,
+    moves: Moves,
+    /// Readers of the SST copies, for the commit's view.
+    readers: Vec<(SstId, Arc<SstReader>)>,
+    /// Rewrite the manifest snapshot, to below this extent.
+    rewrite: Option<ExtentRef>,
+    /// The SSTs this round claimed (`busy_ssts`), released whatever happens.
+    claimed: Vec<SstId>,
+    /// An extent retired since the catalog was read: the plan is stale, so a round with
+    /// nothing to move plans again instead of stopping.
+    stale: bool,
+}
+
+impl<'a> Round<'a> {
+    fn new(
+        shared: &'a Shared,
+        catalog: Arc<Catalog>,
+        root: pigeonhole_pager::Root,
+        manifest_stays: bool,
+    ) -> Self {
+        let mut by_extent: HashMap<(u64, u8), (FamilyId, Arc<SstMeta>)> = HashMap::new();
+        for ((_, family), list) in catalog.ssts.iter() {
+            for (_, meta) in list.iter() {
+                by_extent
+                    .entry((meta.extent.page, meta.extent.size_class))
+                    .or_insert_with(|| (*family, Arc::clone(meta)));
+            }
+        }
+        let mut blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)> = HashMap::new();
+        for (id, b) in catalog.blob_files.iter() {
+            for (i, e) in b.extents.iter().enumerate() {
+                blob_by_extent.insert((e.page, e.size_class), (*id, i));
+            }
+        }
+        Self {
+            shared,
+            catalog,
+            roots: [root.snapshot, root.log].into_iter().flatten().collect(),
+            manifest_stays,
+            by_extent,
+            blob_by_extent,
+            moves: Moves {
+                pager: Arc::clone(&shared.pager),
+                list: Vec::new(),
+                blobs: Vec::new(),
+            },
+            readers: Vec::new(),
+            rewrite: None,
+            claimed: Vec::new(),
+            stale: false,
+        }
+    }
+
+    /// Moves each extent of `plan`, below itself or into the held region cleared for it;
+    /// for one with no room, clears a region (`held`) for it, unless one went unused this
+    /// call (`wasted`).
+    fn relocate(
+        &mut self,
+        plan: Vec<ExtentRef>,
+        held: &mut Option<Held>,
+        wasted: &mut bool,
+    ) -> Result<()> {
+        // Whether an extent can be moved out of a region cleared for a larger one: the
+        // manifest's, a blob extent, or an SST no compaction held when the round began (a
+        // copy: `Pager::clear_for` calls this under the allocator's lock; a claim taken
+        // since makes that move a no-op).
+        let busy: HashSet<SstId> = self
+            .shared
+            .busy_ssts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for extent in plan {
+            let to = match held {
+                Some(h) if h.big == extent => Target::Into(h.region),
+                _ => Target::Below(extent),
+            };
+            match self.move_to(extent, to)? {
+                Moved::Yes => {
+                    if matches!(to, Target::Into(_)) {
+                        // The region is the large extent's now (releasing it is a no-op).
+                        *held = None;
+                    }
+                }
+                Moved::NoSpace if matches!(to, Target::Into(_)) => {
+                    // An occupant's old extent is still in the region: a pinned version
+                    // keeps it from being reclaimed. Wait (held) without clearing more.
+                    *wasted = true;
+                }
+                Moved::NoSpace if held.is_none() && !*wasted => {
+                    // Small extents fragment every aligned hole of its class below it. Clear
+                    // one region (for the largest such extent that has one) and hold it; the
+                    // extent moves in once the occupants' old extents are reclaimed.
+                    let Some(clearing) = self
+                        .shared
+                        .pager
+                        .clear_for(extent, |e| self.movable(e, &busy))
+                    else {
+                        continue;
+                    };
+                    crate::shard::trace!(
+                        "shrink: clearing {:?} of {:?} for {extent:?}",
+                        clearing.region,
+                        clearing.occupants
+                    );
+                    *held = Some(Held {
+                        pager: Arc::clone(&self.shared.pager),
+                        big: extent,
+                        region: clearing.region,
+                    });
+                    for occupant in clearing.occupants {
+                        self.move_to(occupant, Target::Below(extent))?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Nothing to commit: no SST or blob extent moved, and no manifest rewrite.
+    fn is_empty(&self) -> bool {
+        self.moves.list.is_empty() && self.moves.blobs.is_empty() && self.rewrite.is_none()
+    }
+
+    /// Whether `e` can move out of a cleared region (see [`Round::relocate`]).
+    fn movable(&self, e: ExtentRef, busy: &HashSet<SstId>) -> bool {
+        self.roots.contains(&e)
+            || self.blob_by_extent.contains_key(&(e.page, e.size_class))
+            || self
+                .by_extent
+                .get(&(e.page, e.size_class))
+                .is_some_and(|(_, m)| !busy.contains(&m.id))
+    }
+
+    fn relocate_one(
+        &self,
+        extent: ExtentRef,
+        to: Target,
+    ) -> std::result::Result<ExtentRef, pigeonhole_pager::Error> {
+        match to {
+            Target::Below(limit) => self.shared.pager.relocate_below(extent, limit),
+            Target::Into(region) => self.shared.pager.relocate_into(extent, region),
+        }
+    }
+
+    /// Moves `extent` to `to`: the manifest's by a snapshot rewrite, a blob extent by a copy,
+    /// an SST by a claimed copy with a reader for the commit's view.
+    fn move_to(&mut self, extent: ExtentRef, to: Target) -> Result<Moved> {
+        if self.roots.contains(&extent) {
+            // The manifest's own extents move by a snapshot rewrite: below the limit while
+            // pinned, else into the lowest free space. Never into a held region: a root
+            // never runs out of room, so none is cleared for one.
+            let (Target::Below(limit), false) = (to, self.manifest_stays) else {
+                return Ok(Moved::Skipped);
+            };
+            self.rewrite = Some(match self.rewrite {
+                Some(r) if r.page > limit.page => r,
+                _ => limit,
+            });
+            return Ok(Moved::Yes);
+        }
+        let key = (extent.page, extent.size_class);
+        if let Some(&(blob_file, index)) = self.blob_by_extent.get(&key) {
+            // A blob extent (#231): blob files are never written once published, so a copy
+            // needs no claim; the commit replaces the extent at its position if the file
+            // still has it there.
+            return match self.relocate_one(extent, to) {
+                Ok(target) => {
+                    self.moves.blobs.push((blob_file, index, extent, target));
+                    Ok(Moved::Yes)
+                }
+                Err(pigeonhole_pager::Error::NoSpace) => Ok(Moved::NoSpace),
+                // Dropped (blob GC, `drop_table`) since the catalog was read.
+                Err(_) if !self.shared.pager.is_live(extent) => {
+                    self.stale = true;
+                    Ok(Moved::Skipped)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
+        let Some((family, meta)) = self.by_extent.get(&key).cloned() else {
+            // Not named by the manifest: an output in flight (decision D60).
+            return Ok(Moved::Skipped);
+        };
+        {
+            let mut busy = self
+                .shared
+                .busy_ssts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if busy.contains(&meta.id) {
+                return Ok(Moved::Skipped);
+            }
+            busy.insert(meta.id);
+        }
+        self.claimed.push(meta.id);
+        let target = match self.relocate_one(extent, to) {
+            Ok(t) => t,
+            // No room: it stays, and the smaller ones past it may still move.
+            Err(pigeonhole_pager::Error::NoSpace) => return Ok(Moved::NoSpace),
+            // A compaction that committed after the catalog was read retired it (the view
+            // held here keeps it from being reclaimed, so it is not reused).
+            Err(_) if !self.shared.pager.is_live(extent) => {
+                self.stale = true;
+                return Ok(Moved::Skipped);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let id = SstId(self.shared.sst_ids.fetch_add(1, Ordering::Relaxed));
+        let mut new_meta = (*meta).clone();
+        new_meta.id = id;
+        new_meta.extent = target;
+        self.moves.list.push((meta.id, new_meta.clone()));
+        let priority = self
+            .catalog
+            .family(family)
+            .map_or(pigeonhole_cache::Priority::Normal, |m| {
+                SstSet::priority(m.options.cache_priority)
+            });
+        let r = SstReader::open(
+            self.shared.pager.data_file().clone(),
+            &new_meta,
+            Arc::clone(&self.shared.cache),
+            priority,
+        )?;
+        self.readers.push((id, Arc::new(r)));
+        Ok(Moved::Yes)
+    }
+
+    /// Commits the round's moves. The edits are computed against the catalog at commit time,
+    /// not the one the round read: a compaction or `drop_table` that committed meanwhile
+    /// removed an SST (its copy is abandoned), and a trivial move changed its level (the
+    /// copy goes to the current one). Sets `manifest_stays` if a pinned rewrite found no room
+    /// below the manifest's extents. The claims are released either way.
+    fn commit(self, pinned: bool, manifest_stays: &mut bool) -> Result<()> {
+        let Self {
+            shared,
+            roots,
+            mut moves,
+            readers,
+            rewrite,
+            claimed,
+            ..
+        } = self;
         let (req, waiter) =
             ManifestReq::with_waiter(ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 Ok(moves.edits(catalog))
@@ -787,27 +985,14 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .root();
             // Still where they were: the rewrite found no room below them.
-            manifest_stays |= [now.snapshot, now.log]
+            *manifest_stays |= [now.snapshot, now.log]
                 .into_iter()
                 .flatten()
                 .any(|e| roots.contains(&e));
         }
         unclaim(shared, &claimed);
-        drop(view);
-        drop(catalog);
-        // On an error the targets are the manifest's to abandon (`begin` does, for a
-        // refused request, and `Moves` does for a request dropped unrun) or already named
-        // (a commit whose view publish failed).
-        committed?;
+        committed.map(|_| ())
     }
-    // A region still held is free space again before the tail is cut.
-    drop(held);
-    if !shared.closing.load(Ordering::Acquire) {
-        // What the last round's moves retired.
-        shared.reclaim();
-        shared.pager.truncate_tail()?;
-    }
-    Ok(shrunk())
 }
 
 /// Shrink's relocated copies, `(old SST, its copy)` and `(blob file, extent index, old
