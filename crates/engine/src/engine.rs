@@ -1882,23 +1882,26 @@ impl Engine {
 
     /// Looks up a table by name. A replica's state table (D315 PR 3) isn't found.
     pub fn table(&self, name: &str) -> Option<Arc<TableInfo>> {
-        if self.inner.forked() || is_reserved_name(name) {
+        if self.inner.forked() {
             return None;
         }
         // In a writer, looked up under the view's guard: a row read checks its table's entry
         // on every call, and cloning the catalog's `Arc` was a reference count every reader
-        // thread wrote (#709).
-        if !self.inner.is_reader() {
-            return self
-                .inner
+        // thread wrote (#709). The state table is told by its id after the lookup, not by
+        // its name's prefix before it: an id compare is all a hit pays (a prefix check cost
+        // `wide-row-pages` 1.3%).
+        let found = if self.inner.is_reader() {
+            self.inner.catalog().table_by_name(name).cloned()
+        } else {
+            self.inner
                 .shared
                 .view
                 .load()
                 .catalog
                 .table_by_name(name)
-                .cloned();
-        }
-        self.inner.catalog().table_by_name(name).cloned()
+                .cloned()
+        };
+        found.filter(|t| !is_reserved_table(t.id))
     }
 
     /// The table with id `id` (ICR 0092): [`Engine::table`] by id, for a handle that knows
