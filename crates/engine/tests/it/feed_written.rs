@@ -747,3 +747,70 @@ fn a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered() {
         close_real(&db, &mut shard);
     }
 }
+
+/// #1417: the blocking wait, held back by the SYNCED hold, parks on the hold list rather than
+/// polling every millisecond (it polls a few times in 500 ms, not about 500), and the hold's
+/// release wakes it: a `GroupSync` commit's sync covers the held record. On the real VFS, as
+/// the async test above.
+#[test]
+fn a_held_blocking_wait_parks_until_the_hold_lets_go() {
+    use pigeonhole_engine::{FeedSpec, FeedStart, Next};
+    let dir = TempDir::new("blocking-hold");
+    let vfs = real_vfs();
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(Duration::from_secs(600)));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    let mut feed = db
+        .feed(FeedSpec {
+            tables: vec![t.id],
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+        })
+        .unwrap();
+    let held = drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(
+        db.feed_frontier(true) < held.seqno,
+        "held until a sync covers it"
+    );
+    let before = feed.polls();
+    assert!(matches!(
+        feed.wait(Duration::from_millis(500)).unwrap(),
+        Next::Pending
+    ));
+    let polls = feed.polls() - before;
+    assert!(
+        polls < 20,
+        "{polls} polls while held: it re-polled instead of parking"
+    );
+    // A waiter on another thread; the hold's release wakes it.
+    let waiter = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let got = match feed.wait(Duration::from_secs(60)).unwrap() {
+            Next::Commit(c) => c.seqno,
+            other => panic!("{other:?}"),
+        };
+        (got, start.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"b"), Some(Durability::GroupSync))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    let (got, took) = waiter.join().unwrap();
+    assert_eq!(got, held.seqno);
+    assert!(
+        took < Duration::from_secs(10),
+        "woken by the release, not the 600 s backstop: {took:?}"
+    );
+    close_real(&db, &mut shard);
+}

@@ -1132,6 +1132,12 @@ fn release_catalog(shared: &Shared) {
         }
     }
     shared.shm.publish_catalog_hold(u64::MAX);
+    // A feed of every table the hold kept back waits on the feed's hold list, as for the
+    // shard's WRITTEN/SYNCED holds: the release is stored first, then the list is woken
+    // (its fence pairs with `wait_for_hold`'s), so the release is never missed (#1417).
+    if let Some(feed) = &shared.feed {
+        feed.wake_hold_waiters();
+    }
 }
 
 /// Finishes a commit whose root commit returned `result`: publishes the view, retires what
