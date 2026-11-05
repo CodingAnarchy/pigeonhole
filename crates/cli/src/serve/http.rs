@@ -35,17 +35,33 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let data = proto::data_server::DataServer::new(DataGrpc(Arc::clone(&shared)))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(usize::MAX);
+    let txns = proto::transactions_server::TransactionsServer::new(super::grpc::TxnGrpc(
+        Arc::clone(&shared),
+    ))
+    .max_decoding_message_size(limits.max_request_bytes)
+    .max_encoding_message_size(usize::MAX);
+    let snapshots = proto::snapshots_server::SnapshotsServer::new(super::grpc::SnapshotGrpc(
+        Arc::clone(&shared),
+    ))
+    .max_decoding_message_size(limits.max_request_bytes)
+    .max_encoding_message_size(usize::MAX);
+    let prepay = || axum::middleware::from_fn_with_state(Arc::clone(&shared), super::grpc::prepay);
     let shed = Arc::clone(&shared);
     let limited = axum::Router::new()
         .route("/v1/{service}/{method}", post(call))
         .route_service(
             "/pigeonhole.v1.Data/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(data),
+        )
+        .route_service(
+            "/pigeonhole.v1.Transactions/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(txns),
+        )
+        .route_service(
+            "/pigeonhole.v1.Snapshots/{*method}",
             tower::ServiceBuilder::new()
-                .layer(axum::middleware::from_fn_with_state(
-                    Arc::clone(&shared),
-                    super::grpc::prepay,
-                ))
-                .service(data),
+                .layer(prepay())
+                .service(snapshots),
         )
         .with_state(Arc::clone(&shared))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
@@ -112,7 +128,8 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
     if caller.scope < Scope::Read {
         return ApiError::permission_denied("read metrics").into_response();
     }
-    let text = shared.metrics.render(&shared.router.service.db);
+    let mut text = shared.metrics.render(&shared.router.service.db);
+    super::service::render_sessions(&mut text, &shared.router.service.sessions);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
@@ -170,6 +187,10 @@ async fn call(
         Ok(ServiceReply::CheckAndMutate(r)) => json(&r),
         Ok(ServiceReply::MutateReturning(r)) => json(&r),
         Ok(ServiceReply::Scan(pages)) => stream(&headers, pages),
+        Ok(ServiceReply::Begin(r)) => json(&r),
+        Ok(ServiceReply::Commit(r)) => json(&r),
+        Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
+        Ok(ServiceReply::Empty(r)) => json(&r),
         Err(e) => e.into_response(),
     }
 }
@@ -280,6 +301,14 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Data", "Batch") => ServiceOp::Batch(parse(body)?),
         ("Data", "MutateReturning") => ServiceOp::MutateReturning(parse(body)?),
         ("Data", "Scan") => ServiceOp::Scan(parse(body)?),
+        ("Transactions", "Begin") => ServiceOp::Begin(parse(body)?),
+        ("Transactions", "Get") => ServiceOp::TxnGet(parse(body)?),
+        ("Transactions", "GetRow") => ServiceOp::TxnGetRow(parse(body)?),
+        ("Transactions", "Write") => ServiceOp::TxnWrite(parse(body)?),
+        ("Transactions", "Commit") => ServiceOp::Commit(parse(body)?),
+        ("Transactions", "Abort") => ServiceOp::Abort(parse(body)?),
+        ("Snapshots", "Open") => ServiceOp::OpenSnapshot(parse(body)?),
+        ("Snapshots", "Release") => ServiceOp::ReleaseSnapshot(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

@@ -1997,6 +1997,34 @@ impl Transaction {
         result
     }
 
+    /// The sequence number of the snapshot the transaction reads at (ICR 0118): every read
+    /// sees the commits up to it and none after. It's the same number
+    /// [`Snapshot::seqno`](crate::Snapshot::seqno) gives for a snapshot taken at that
+    /// moment, so the two can be compared.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// let first = t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    ///
+    /// let txn = db.transaction()?;
+    /// assert!(txn.snapshot_seqno() >= first.seqno, "it sees the commit before it");
+    /// let later = t.mutate(b"row").put("f", b"q", b"w").commit()?;
+    /// assert!(txn.snapshot_seqno() < later.seqno, "and not the one after");
+    /// # drop(txn);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_seqno(&self) -> u64 {
+        self.txn.snapshot().seqno()
+    }
+
     /// Reads a cell at the transaction's snapshot and records the read: a commit that writes
     /// this cell, or deletes its family or row, makes the transaction conflict; one that writes
     /// another cell of the row doesn't (D275).
