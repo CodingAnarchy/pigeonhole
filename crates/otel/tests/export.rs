@@ -213,9 +213,11 @@ fn total(c: &Collected) -> f64 {
 }
 
 /// Metrics a workload on this platform may leave without values: io_uring's off Linux's
-/// io_uring backend, and the counters nothing in the workload can move.
+/// io_uring backend, and feed lag without a watched feed.
 fn may_be_empty(db: &Pigeonhole, name: &str) -> bool {
-    name.starts_with("pigeonhole.io.") && db.io_rings().is_none()
+    (name.starts_with("pigeonhole.io.") && db.io_rings().is_none())
+        // Reported only for the feeds a test watches.
+        || name == "pigeonhole.feed.lag"
 }
 
 #[test]
@@ -225,8 +227,11 @@ fn every_documented_metric_is_reported_with_its_kind_unit_and_attributes() {
     let t = table(&db, "t");
     let sdk = Sdk::new();
     let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    let feed = t.feed().open().unwrap();
+    metrics.watch_feed("indexer", feed.progress());
     workload(&db, &t);
     let got = sdk.collect();
+    drop(feed);
     for m in pigeonhole_otel::metrics() {
         // The SDK leaves an instrument without values out of the export entirely.
         if may_be_empty(&db, m.name) && !got.contains_key(m.name) {
@@ -290,6 +295,63 @@ fn every_documented_metric_is_reported_with_its_kind_unit_and_attributes() {
     assert_eq!(total(&got["pigeonhole.failed"]), 0.0);
     drop(metrics);
     drop(t);
+    db.close().unwrap();
+}
+
+/// D316 A4: a watched feed's lag is the commits it hasn't read. It grows while the
+/// subscriber doesn't read, and drops to 0 once it reads everything. Writes to a table the
+/// feed doesn't carry leave a feed that keeps reading at 0, since the reader's position
+/// moves past them too. A dropped feed stops reporting.
+#[test]
+fn a_watched_feed_reports_its_lag() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("lag.phdb"), options()).unwrap();
+    let fed = table(&db, "fed");
+    let other = table(&db, "other");
+    let sdk = Sdk::new();
+    let metrics = pigeonhole_otel::register(&db, &sdk.meter());
+    let mut feed = fed.feed().open().unwrap();
+    metrics.watch_feed("indexer", feed.progress());
+    let lag = |sdk: &Sdk| -> Option<f64> {
+        // Past the 100 ms a reading is reused for, so each collection reads afresh.
+        std::thread::sleep(Duration::from_millis(150));
+        let got = sdk.collect();
+        let c = got.get("pigeonhole.feed.lag")?;
+        let p = c
+            .points
+            .iter()
+            .find(|p| p.attrs.get("pigeonhole.feed.name").map(String::as_str) == Some("indexer"))?;
+        Some(p.value)
+    };
+    let commit = |t: &Table, i: u32| {
+        t.mutate(&i.to_be_bytes())
+            .put("f", b"q", b"v")
+            .durability(Durability::GroupSync)
+            .commit()
+            .unwrap();
+    };
+    for i in 0..10 {
+        commit(&fed, i);
+    }
+    assert!(lag(&sdk).unwrap() >= 10.0, "an unread feed lags");
+    let mut read = 0;
+    while feed.try_next().unwrap().is_some() {
+        read += 1;
+    }
+    assert_eq!(read, 10);
+    assert_eq!(lag(&sdk), Some(0.0), "a feed that read everything");
+    for i in 0..10 {
+        commit(&other, i);
+    }
+    assert!(
+        feed.try_next().unwrap().is_none(),
+        "nothing for the feed's table"
+    );
+    assert_eq!(lag(&sdk), Some(0.0), "writes to another table, read past");
+    drop(feed);
+    assert_eq!(lag(&sdk), None, "a dropped feed stops reporting");
+    drop(metrics);
+    drop((fed, other));
     db.close().unwrap();
 }
 

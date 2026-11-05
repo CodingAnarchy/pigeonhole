@@ -1419,6 +1419,18 @@ impl Engine {
         }
     }
 
+    /// Makes each root commit wait `delay` after its feed intent is appended, before it
+    /// writes anything (zero: no wait), widening the window in which a crash leaves an intent
+    /// whose superblock never landed (D315 amendment, #1504). A hold seam: the commit then
+    /// goes on as always. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn delay_root_intent(&self, delay: std::time::Duration) {
+        if let Some(f) = &self.inner.shared.feed {
+            let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+            f.root_intent_delay_nanos.store(nanos, Ordering::Relaxed);
+        }
+    }
+
     /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
     /// it: shards' manifest requests queue up (their pumps find it held and leave) until
     /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).

@@ -586,6 +586,8 @@ impl Service {
                     max_catch_up: limits.max_catch_up,
                     quiet: limits.feed_quiet,
                     stream_idle: limits.stream_idle,
+                    client_events: limits.feed_client_events,
+                    client_bytes: limits.feed_client_bytes,
                 },
             ),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),

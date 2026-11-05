@@ -270,6 +270,15 @@ impl OpenedPager {
         self.superblock.sequence
     }
 
+    /// The newest valid superblock's checksum (FORMAT §8.2: its bytes 120..128, the xxh3-64
+    /// of bytes 0..120), before any root commit of this open: what a change feed's
+    /// [`Pager::on_root_intent`] recorded for the commit that wrote it (D315 amendment).
+    pub fn checksum(&self) -> u64 {
+        let mut page = [0u8; PAGE_SIZE];
+        self.superblock.encode(&mut page);
+        u64::from_le_bytes(page[120..128].try_into().expect("8 bytes"))
+    }
+
     /// Whether the last writer closed cleanly. The flag stays set until the next root
     /// commit, which clears it.
     pub fn clean_shutdown(&self) -> bool {
@@ -365,6 +374,7 @@ impl OpenedPager {
                 ahead_nanos: AtomicU64::new(0),
                 side: SideSyncs::default(),
                 root_observer: OnceLock::new(),
+                root_intent: OnceLock::new(),
                 frontier: AtomicU64::new(frontier),
             }),
         })
@@ -442,6 +452,18 @@ struct Inner {
     /// Called with the new superblock's sequence after each successful root commit
     /// ([`Pager::on_root_commit`], D310).
     root_observer: OnceLock<RootObserver>,
+    /// Called with the new superblock's sequence and checksum before each root commit
+    /// writes anything ([`Pager::on_root_intent`], D315 amendment, #1504).
+    root_intent: OnceLock<RootIntent>,
+}
+
+/// A root-intent hook ([`Pager::on_root_intent`]).
+struct RootIntent(Box<dyn Fn(u64, u64) + Send + Sync>);
+
+impl fmt::Debug for RootIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RootIntent")
+    }
 }
 
 /// A root-commit observer ([`Pager::on_root_commit`]).
@@ -742,6 +764,12 @@ impl Inner {
         sb.encode(&mut page);
         page[EXTENSION_AREA].copy_from_slice(&st.extension.0[..]);
         drop(st);
+        // Before the commit writes anything (its first sync, the superblock), with no pager
+        // lock held: the hook records the commit it is about to make (D315 amendment).
+        if let Some(intent) = self.root_intent.get() {
+            let checksum = u64::from_le_bytes(page[120..128].try_into().expect("8 bytes"));
+            (intent.0)(sequence, checksum);
+        }
         Ok(PendingCommit {
             page,
             slot,
@@ -1026,6 +1054,34 @@ impl Pager {
     /// ```
     pub fn on_root_commit(&self, observer: Box<dyn Fn(u64) + Send + Sync>) -> bool {
         self.inner.root_observer.set(RootObserver(observer)).is_ok()
+    }
+
+    /// Sets the one hook every later root commit calls before it writes anything, with the
+    /// new superblock's `sequence` and checksum (FORMAT §8.2: the xxh3-64 of its bytes
+    /// 0..120), on the committing thread with no pager lock held (D315 amendment, #1504). A
+    /// commit that then fails poisons the pager, so the hook's last call may name a root that
+    /// never landed: the superblock decides. It can't fail the commit. Returns `false` if a
+    /// hook was already set.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use pigeonhole_io::{VfsRef, sim::SimVfs};
+    /// use pigeonhole_pager::Pager;
+    ///
+    /// # fn main() -> pigeonhole_pager::Result<()> {
+    /// let vfs: VfsRef = SimVfs::new(3);
+    /// let pager = Pager::create(&vfs, "/db/data.phdb".as_ref())?;
+    /// let seen = Arc::new(Mutex::new(None));
+    /// let s = Arc::clone(&seen);
+    /// assert!(pager.on_root_intent(Box::new(move |seq, sum| *s.lock().unwrap() = Some((seq, sum)))));
+    /// pager.commit_root(pager.root())?;
+    /// let (seq, _checksum) = seen.lock().unwrap().expect("called");
+    /// assert_eq!(seq, pager.sequence());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn on_root_intent(&self, hook: Box<dyn Fn(u64, u64) + Send + Sync>) -> bool {
+        self.inner.root_intent.set(RootIntent(hook)).is_ok()
     }
 
     /// The file's feature sets (D269): as of the last commit, or the last reload for a

@@ -173,7 +173,7 @@ pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Sn
 pub use error::{Error, ErrorCode, Result};
 pub use feed::{
     CatalogChange, CatalogEdit, Change, ChangeKind, Commit, Feed, FeedBuilder, FeedEvent,
-    FeedPosition, FeedToken,
+    FeedPosition, FeedProgress, FeedToken,
 };
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
@@ -197,7 +197,8 @@ pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
 pub use write::{
-    CommitInfo, CommitTicket, Durability, Incremented, RowMutation, Transaction, WriteBatch,
+    CommitInfo, CommitTicket, Durability, Incremented, Returned, RowMutation, Transaction,
+    WriteBatch,
 };
 
 pub use merge::{MergeError, MergeOperator};

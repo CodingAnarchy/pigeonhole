@@ -373,13 +373,15 @@ u1   profile  name       1761030000000000  Ada
   - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
   - Every event's `token` resumes right after it, from any server process. A stream that delivers nothing for about 10 s, while its position moved past commits its `prefix` skipped, sends a `progress` event with the new token.
   - Streams on the same tables share one subscription in the server: the database wakes and reads for it once, whatever the number of subscribers.
+  - **Each stream buffers up to 64 events, or 256 KiB of encoded events, whichever is less,** that its client hasn't taken yet. An event larger than 256 KiB is still sent, alone. A server holds at most `--max-streams` × 256 KiB of these buffers (64 MiB at the default 256 streams). This memory is separate from `--feed-ring-bytes` and `--inflight-bytes`. A client that takes nothing fills its buffer; after `--stream-idle-ms` more it gets the buffered events, then `DeadlineExceeded`, and resumes from the last event's token.
 - **Limits:**
   - `--max-request-bytes` (16 MiB): the largest request.
   - `--inflight-bytes` (256 MiB): request bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC.
   - `--max-concurrent` (1,024 requests): more are refused at once with `Overloaded`, never queued.
   - `--max-scans` (64): scans streaming at once, refused past that the same way. A scan's pages count against `--inflight-bytes` until they're handed to the connection, and at most half the blocking threads read scan pages at once.
-  - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page before ending the stream.
+  - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page, or a feed stream with a full buffer waits for its client to take an event, before ending the stream.
   - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
+  - **128 streams per connection:** one HTTP/2 connection carries at most 128 streams at once (scans, feed streams and calls alike). A client that opens more on one connection doesn't get an error: the extra streams wait until earlier ones end, and a feed stream may never end. Open another connection for each 128 concurrent streams. With tonic, that means another `Channel`, because one `Channel` is one connection.
   - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
   - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. Each commit also carries its resume token (about 45 + 16 × shards bytes). This is outside `--inflight-bytes`; `/metrics` reports what's in use.
   - `--backup-dir`: where `Admin.Backup` writes, and where downloads are kept for resumes. It must exist; put it on a disk with room for a copy or two of the database, not tmpfs. There's no default: without it, backups are off. `--max-backups` (1) runs that many at once.

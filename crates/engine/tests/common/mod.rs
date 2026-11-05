@@ -511,6 +511,8 @@ pub struct Stats {
     pub returning: usize,
     pub returning_fast: u64,
     pub returning_full: u64,
+    /// Previous values checked against the model (D314 amendment 1).
+    pub previous_checked: usize,
     pub commits: usize,
     pub cross_shard: usize,
     pub batched: usize,
@@ -1452,8 +1454,20 @@ enum Kind {
         row: Vec<u8>,
         cells: Vec<(String, Vec<u8>, Timestamp)>,
         values: Option<Vec<ReturnedCell>>,
+        /// The columns it asked for as they were before it (D314 amendment 1), and what
+        /// the engine returned for them.
+        previous_of: Vec<(String, Vec<u8>)>,
+        previous: Option<Vec<PreviousCell>>,
     },
 }
+
+/// One previous value a returning commit returned (D314 amendment 1): family, qualifier,
+/// the version's timestamp and payload (an error as text).
+type PreviousCell = (
+    FamilyId,
+    Vec<u8>,
+    Result<Option<(Timestamp, Vec<u8>)>, String>,
+);
 
 /// One cell a returning commit returned (D314): family, qualifier, timestamp, value (an
 /// error as text).
@@ -3961,6 +3975,12 @@ impl World {
             }
             self.engine_seqnos.push(seqno);
             self.check_returned(&c, m, ts)?;
+            if let Kind::Returning {
+                previous: Some(p), ..
+            } = &c.kind
+            {
+                self.stats.previous_checked += p.len();
+            }
             c.seqno = Some(seqno);
             c.commit_ts = Some(ts);
             c.acked = true;
@@ -4455,6 +4475,7 @@ impl World {
         let mut still = Vec::new();
         for mut inf in self.in_flight.drain(..) {
             let mut returned = None;
+            let mut previous: Option<Vec<PreviousCell>> = None;
             let outcome = match &mut inf.pending {
                 Pending::Poll(pc) => match poll_commit(pc) {
                     Poll::Ready(r) => Some(Outcome::Commit(r)),
@@ -4462,8 +4483,31 @@ impl World {
                 },
                 Pending::Returning(pr) => {
                     let mut cx = Context::from_waker(Waker::noop());
-                    match Pin::new(pr).poll(&mut cx) {
+                    match Pin::new(&mut *pr).poll(&mut cx) {
                         Poll::Ready(r) => Some(Outcome::Commit(r.map(|(info, cells)| {
+                            previous = Some(
+                                pr.take_previous()
+                                    .into_iter()
+                                    .map(|p| {
+                                        let v = p
+                                            .value
+                                            .map(|c| {
+                                                c.map(|c| {
+                                                    let payload =
+                                                        match pigeonhole_format::value::decode_value(
+                                                            c.stored(),
+                                                        ) {
+                                                            Ok(v) => value_bytes(v),
+                                                            Err(_) => c.stored().to_vec(),
+                                                        };
+                                                    (c.timestamp(), payload)
+                                                })
+                                            })
+                                            .map_err(|e| e.to_string());
+                                        (p.family, p.qualifier, v)
+                                    })
+                                    .collect(),
+                            );
                             returned = Some(
                                 cells
                                     .into_iter()
@@ -4491,8 +4535,18 @@ impl World {
                 }
                 Pending::Ready(o) => o.take(),
             };
-            if let (Some(v), Kind::Returning { values, .. }) = (returned, &mut inf.commit.kind) {
-                *values = Some(v);
+            if let Kind::Returning {
+                values,
+                previous: prev,
+                ..
+            } = &mut inf.commit.kind
+            {
+                if let Some(v) = returned {
+                    *values = Some(v);
+                }
+                if let Some(p) = previous {
+                    *prev = Some(p);
+                }
             }
             match outcome {
                 Some(o) => resolved.push((inf, o)),
@@ -4706,14 +4760,50 @@ impl World {
             .filter(|o| op_table(o) == table && op_row(o) == row)
             .collect();
         let cells = returning_cells(&ops).unwrap_or_default();
+        // Half the returning commits also ask for the previous value of each column they
+        // write, and of one they may not (D314 amendment 1).
+        let mut previous_of: Vec<(String, Vec<u8>)> = Vec::new();
+        if rng.chance(500_000) {
+            for o in &ops {
+                let col = match o {
+                    ModelOp::Put {
+                        family, qualifier, ..
+                    }
+                    | ModelOp::Incr {
+                        family, qualifier, ..
+                    }
+                    | ModelOp::DeleteCell {
+                        family, qualifier, ..
+                    }
+                    | ModelOp::DeleteColumn {
+                        family, qualifier, ..
+                    } => (family.clone(), qualifier.clone()),
+                    _ => continue,
+                };
+                if !previous_of.contains(&col) {
+                    previous_of.push(col);
+                }
+            }
+            if let Some((f, _)) = previous_of.first().cloned() {
+                let col = (f, b"q0".to_vec());
+                if !previous_of.contains(&col) {
+                    previous_of.push(col);
+                }
+            }
+        }
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
         self.stats.returning += 1;
         self.trace.push(format!(
-            "returning {durability:?} ts={now} {}{} [{}]{}",
+            "returning {durability:?} ts={now} {}{}{} [{}]{}",
             text(&row),
             if alone { "" } else { " (batched)" },
+            if previous_of.is_empty() {
+                String::new()
+            } else {
+                format!(" previous of {} columns", previous_of.len())
+            },
             ops.iter().map(show).collect::<Vec<_>>().join("; "),
             if armed { " (crash armed)" } else { "" }
         ));
@@ -4722,7 +4812,16 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
         };
         let engine = Arc::clone(&self.store().engine);
-        let pending = match engine.submit_returning(batch, Some(durability)) {
+        let request: Vec<(FamilyId, Vec<u8>)> = previous_of
+            .iter()
+            .filter_map(|(f, q)| {
+                self.store()
+                    .family_ids
+                    .get(&(table.clone(), f.clone()))
+                    .map(|id| (*id, q.clone()))
+            })
+            .collect();
+        let pending = match engine.submit_returning_previous(batch, Some(durability), request) {
             Ok(p) => Pending::Returning(p),
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
@@ -4742,6 +4841,8 @@ impl World {
                     row,
                     cells,
                     values: None,
+                    previous_of,
+                    previous: None,
                 },
             },
             armed,
@@ -4762,6 +4863,8 @@ impl World {
             row,
             cells,
             values: Some(values),
+            previous_of,
+            previous,
         } = &c.kind
         else {
             return Ok(());
@@ -4782,6 +4885,60 @@ impl World {
                 );
             };
             got.push((family, cell));
+        }
+        // D314 amendment 1: each previous value is the column's newest visible version at
+        // the model seqno below the commit's, with the TTL judged at its timestamp.
+        let previous = previous.as_deref().unwrap_or_default();
+        if previous.len() != previous_of.len() {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "returning commit at model seqno {m}: {} previous values for {} asked",
+                    previous.len(),
+                    previous_of.len()
+                ),
+            );
+        }
+        for ((family, qualifier), (id, q, v)) in previous_of.iter().zip(previous) {
+            if name_of(*id).as_deref() != Some(family.as_str()) || q != qualifier {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "previous value of {family}:{} out of order",
+                        text(qualifier)
+                    ),
+                );
+            }
+            let want = match self.model.try_read_row(
+                table,
+                row,
+                &[family.as_str()],
+                0,
+                m.saturating_sub(1),
+                ts,
+            ) {
+                Ok(cs) => cs
+                    .into_iter()
+                    .filter(|x| &x.qualifier == qualifier)
+                    .max_by_key(|x| x.ts)
+                    .map(|x| (x.ts, x.value)),
+                Err(e) => return fail(FailureClass::Protocol, format!("model: {e:?}")),
+            };
+            let ok = match v {
+                Ok(g) => *g == want,
+                Err(_) => self.cfg.faults.io_error_ppm > 0,
+            };
+            if !ok {
+                return fail(
+                    FailureClass::LiveReadMismatch,
+                    format!(
+                        "returning commit at model seqno {m}: previous {}/{family}:{} \
+                         returned {v:?}, the model's newest before it is {want:?}",
+                        text(row),
+                        text(qualifier)
+                    ),
+                );
+            }
         }
         for (family, (_, qualifier, cts, v)) in &got {
             let want = match self

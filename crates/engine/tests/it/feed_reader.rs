@@ -1133,3 +1133,766 @@ fn a_position_s_catalog_part_covers_a_change_only_once_delivered() {
     drop(r);
     db.close().unwrap();
 }
+
+/// D316 A4 (#1523; perf287's L1, feed1248's P1): a progress sink follows the feed's covered
+/// position, so a caught-up feed reads as caught up even when the database's seqnos moved
+/// past it with nothing for it to deliver. Here that's three `None` commits to a table the
+/// feed doesn't carry (no fed record) and an aborted cross-shard round, whose id seqno no
+/// record holds. Once the feed drains, the sink is the visible seqno: before a flush and
+/// after one.
+#[test]
+fn a_progress_sink_reaches_the_visible_seqno_on_a_caught_up_feed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let vfs = SimVfs::new(3111);
+    let (a, b) = {
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let t = tables(&db);
+        db.close().unwrap();
+        t
+    };
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(&vfs, Some(feed(1 << 20)))).unwrap();
+    // A visible feed of `a` alone, so a caught-up position is the visible seqno.
+    let mut r = db
+        .feed(FeedSpec {
+            durable: false,
+            ..spec(&[&a], FeedStart::Now)
+        })
+        .unwrap();
+    let sink = Arc::new(AtomicU64::new(0));
+    r.set_progress(Arc::clone(&sink));
+    let commit = |shards: &mut [EngineShard], t: &TableInfo, row: &[u8], d: Durability| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t, row, b"v");
+        drive(shards, db.submit(wb, Some(d)).unwrap())
+            .unwrap()
+            .seqno
+    };
+    let fed = commit(&mut shards, &a, b"fed", Durability::Buffered);
+    for i in 0..3u8 {
+        commit(&mut shards, &b, &[b'n', i], Durability::None);
+    }
+    // An aborted cross-shard round (as `aborted_round`): validation fails on a's shard after
+    // b's shard wrote its PREPARE, and the round's id seqno is never applied.
+    let mut txn = db.begin().unwrap();
+    txn.get(a.id, a.families[0].id, b"r", b"q").unwrap();
+    commit(&mut shards, &a, b"r", Durability::Buffered);
+    for (t, row) in [(&a, &b"r"[..]), (&b, &b"t"[..])] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                row,
+                b"q",
+                None,
+                ValueRef::Bytes(b"t"),
+            )
+            .unwrap();
+    }
+    let pc = txn.submit(Some(Durability::Buffered)).unwrap();
+    assert!(matches!(
+        drive(&mut shards, pc),
+        Err(pigeonhole_engine::Error::Conflict)
+    ));
+    let got: Vec<Seqno> = drain(&mut r, &mut shards).iter().map(|c| c.seqno).collect();
+    assert_eq!(got.first(), Some(&fed), "{got:?}");
+    let visible = db.visible_seqno();
+    assert!(
+        visible > *got.last().unwrap(),
+        "seqnos past the feed's last commit: {got:?}"
+    );
+    assert_eq!(
+        sink.load(Ordering::Relaxed),
+        visible,
+        "a caught-up feed covers up to the visible seqno"
+    );
+    let flush = db.submit_flush().unwrap();
+    drive(&mut shards, flush).unwrap();
+    assert!(drain(&mut r, &mut shards).is_empty());
+    assert_eq!(
+        sink.load(Ordering::Relaxed),
+        db.visible_seqno(),
+        "after the flush"
+    );
+}
+
+/// D315 amendment (#1504, simp724's R1-R4): a process crash around a root commit's
+/// superblock write never expires a durable feed. Held at each point with a seam, then
+/// crashed, reopened and resumed from a token taken before:
+/// - between the intent and the superblock: the root never landed, and the open cuts the
+///   intent (with a create's `Catalog` entry) off, so a create never happened and isn't
+///   delivered;
+/// - between the superblock and the Root entry (#1504's own window): the root landed, and
+///   the open adopts the intent as its Root, so a create is delivered once.
+///
+/// For a flush's root and a catalog change's alike.
+#[test]
+fn a_process_crash_around_a_root_commit_never_expires_a_durable_feed() {
+    use pigeonhole_io::sim::CrashKind;
+    for (i, (landed, create)) in [(false, false), (true, false), (false, true), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let what = format!("superblock landed {landed}, create {create}");
+        let vfs = SimVfs::new(3190 + i as u64);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+        let s1 = single(&db, &a, b"before", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, s1);
+        let token = r.token();
+        drop(r);
+        let hold = Duration::from_millis(1500);
+        if landed {
+            db.delay_root_observer(hold);
+        } else {
+            db.delay_root_intent(hold);
+        }
+        let commit = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                if create {
+                    let _ = db.create_table("c", &[("g".into(), FamilyOptions::default())]);
+                } else {
+                    let _ = db.flush();
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        vfs.crash(CrashKind::Process);
+        commit.join().unwrap();
+        drop(db);
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        assert_eq!(
+            db.table("c").is_some(),
+            create && landed,
+            "{what}: the create happened iff its superblock landed"
+        );
+        let a = db.table("a").unwrap();
+        let s2 = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+        let mut got = Vec::new();
+        loop {
+            match r.wait(WAIT).unwrap() {
+                Next::Commit(c) => {
+                    got.push(format!("c{}", c.seqno));
+                    if c.seqno == s2 {
+                        break;
+                    }
+                }
+                Next::Catalog(ev) => got.push(format!("catalog{}", ev.edits.len())),
+                Next::Expired(e) => panic!("{what}: the durable feed expired: {e:?}"),
+                Next::Pending => panic!("{what}: nothing within {WAIT:?}: {got:?}"),
+            }
+        }
+        let catalogs = got.iter().filter(|g| g.starts_with("catalog")).count();
+        assert_eq!(
+            catalogs,
+            usize::from(create && landed),
+            "{what}: the create delivered once iff it happened: {got:?}"
+        );
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// D315 amendment (#1504): a trailing `RootIntent` whose sequence is the superblock's but
+/// whose checksum isn't (another root of that sequence, such as one an older build wrote
+/// without the feed) is never adopted: the open leaves it, and a token from before expires
+/// rather than skipping that root's commits. Mutation-checked: adopting on the sequence
+/// alone resumes the token.
+#[test]
+fn an_intent_naming_another_root_of_its_sequence_is_never_adopted() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry};
+    use pigeonhole_io::Vfs;
+    let vfs = SimVfs::new(3195);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    // The last session's last entry is its close's Root at the superblock's sequence N.
+    // Forge what a session leaves when it crashed after its intent for N, before its
+    // superblock, and a build without the feed then wrote another root N: in place of that
+    // Root entry, an intent for N with another checksum. Adopting it on the sequence alone
+    // would make a clean chain that silently skips root N.
+    let last = match sidecar_entries(&vfs).last() {
+        Some(FeedEntry::Root { sequence, .. }) => *sequence,
+        other => panic!("{other:?}"),
+    };
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let f = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut bytes = Vec::new();
+    FeedEntry::RootIntent {
+        sequence: last,
+        checksum: 0xdead_beef,
+    }
+    .encode(&mut bytes);
+    // A Root entry and an intent have the same framed length, and the Root is the last
+    // entry: the file's last bytes.
+    let at = f.len().unwrap() - bytes.len() as u64;
+    f.write_at(&bytes, at).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    assert!(matches!(
+        sidecar_entries(&vfs).last(),
+        Some(FeedEntry::RootIntent { .. })
+    ));
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "an intent that names another root is a break, never adopted"
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's R4 on #1504 (D315 amendment): around a root commit, a power loss either
+/// expires a durable feed or keeps its whole history: never a silent gap. The intent is not
+/// synced, so a power loss can lose it (the sim's power crash keeps only synced data) or,
+/// on a real device, tear it; both read as a torn tail, cut off. A root whose superblock
+/// landed then has no entry, so the chain breaks and the token expires; one that didn't has
+/// nothing to lose. An intent mid-file (a build that doesn't resolve intents opened and
+/// appended after the crash) breaks the chain too. Whatever happens, a feed that resumes
+/// delivers every durable commit after its token.
+#[test]
+fn a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry};
+    use pigeonhole_io::Vfs;
+    use pigeonhole_io::sim::CrashKind;
+    #[derive(Debug, Clone, Copy)]
+    enum Damage {
+        /// The sim's power crash, held between the intent and the superblock.
+        PowerBeforeSuperblock,
+        /// The sim's power crash, held between the superblock and the Root entry.
+        PowerAfterSuperblock,
+        /// The trailing intent cut in half (a torn write), then a process crash.
+        TornIntent,
+        /// A Session entry appended after the trailing intent, as an older build's open does.
+        IntentMidFile,
+    }
+    for (i, damage) in [
+        Damage::PowerBeforeSuperblock,
+        Damage::PowerAfterSuperblock,
+        Damage::TornIntent,
+        Damage::IntentMidFile,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let vfs = SimVfs::new(3200 + i as u64);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let s1 = single(&db, &a, b"before", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, s1);
+        let token = r.token();
+        drop(r);
+        let mid = single(&db, &a, b"mid", Durability::Sync);
+        let hold = Duration::from_millis(1500);
+        match damage {
+            Damage::PowerBeforeSuperblock => db.delay_root_intent(hold),
+            _ => db.delay_root_observer(hold),
+        }
+        let flush = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let _ = db.flush();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        match damage {
+            Damage::PowerBeforeSuperblock | Damage::PowerAfterSuperblock => {
+                vfs.crash(CrashKind::Power)
+            }
+            Damage::TornIntent | Damage::IntentMidFile => {
+                // The intent is the sidecar's last entry now, its superblock written.
+                let path = format!("{DB}{FEED_SUFFIX}");
+                let f = vfs
+                    .open(
+                        Path::new(&path),
+                        pigeonhole_io::OpenOptions::read_write_create(),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(
+                        sidecar_entries(&vfs).last(),
+                        Some(FeedEntry::RootIntent { .. })
+                    ),
+                    "{damage:?}: held with the intent last"
+                );
+                let len = f.len().unwrap();
+                if matches!(damage, Damage::TornIntent) {
+                    f.set_len(len - 12).unwrap();
+                } else {
+                    let mut bytes = Vec::new();
+                    FeedEntry::Session {
+                        session: 0x5e55,
+                        opened_at: 0,
+                        retention_bytes: 1 << 20,
+                        retention_age_secs: 0,
+                        streams: 2,
+                        tables: pigeonhole_format::feed::FeedTables::All,
+                    }
+                    .encode(&mut bytes);
+                    f.write_at(&bytes, len).unwrap();
+                }
+                drop(f);
+                vfs.crash(CrashKind::Process);
+            }
+        }
+        flush.join().unwrap();
+        drop(db);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let a = db.table("a").unwrap();
+        let s2 = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+        let mut got = Vec::new();
+        let expired = loop {
+            match r.wait(WAIT).unwrap() {
+                Next::Commit(c) => {
+                    got.push(c.seqno);
+                    if c.seqno == s2 {
+                        break false;
+                    }
+                }
+                Next::Expired(_) => break true,
+                other => panic!("{damage:?}: {other:?} after {got:?}"),
+            }
+        };
+        if !expired {
+            assert!(
+                got.contains(&mid) && got.ends_with(&[s2]),
+                "{damage:?}: resumed, so with the whole history: {got:?} (mid {mid}, after {s2})"
+            );
+        }
+        // Where the root landed and its entry was lost, torn or buried, the token must
+        // expire: resuming would skip that session's later roots unseen.
+        if !matches!(damage, Damage::PowerBeforeSuperblock) {
+            assert!(expired, "{damage:?}: a root whose entry is gone is a break");
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// Rewrites the sidecar as `f` maps its entries (after the header), for forged cases.
+fn rewrite_sidecar(
+    vfs: &Arc<SimVfs>,
+    f: impl FnOnce(Vec<pigeonhole_format::feed::FeedEntry>) -> Vec<pigeonhole_format::feed::FeedEntry>,
+) {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
+    use pigeonhole_io::Vfs;
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let file = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut head = [0u8; FeedHeader::LEN];
+    file.read_at(&mut head, 0).unwrap();
+    let mut bytes = head.to_vec();
+    for e in f(sidecar_entries(vfs)) {
+        e.encode(&mut bytes);
+    }
+    file.set_len(0).unwrap();
+    file.write_at(&bytes, 0).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A catalog edit for a forged `Catalog` entry.
+fn forged_create(id: u32) -> pigeonhole_format::manifest::Edit {
+    pigeonhole_format::manifest::Edit::CreateTable {
+        table: pigeonhole_format::TableId(id),
+        name: format!("forged{id}"),
+    }
+}
+
+/// simp724's F1 on #1526: a lone `Catalog` entry at the sidecar's end, for the root one past
+/// the superblock's (a power loss kept it and lost its intent, or the intent's append
+/// failed and the commit too), is cut off by the next open, as its intent would be. The
+/// root never landed. A feed of every table then goes on to the changes after it.
+/// Mutation-checked: without the cut, the entry is followed by the new session's, and the
+/// reader expires (the next test's rule) instead of delivering the later create.
+#[test]
+fn a_lone_trailing_catalog_entry_past_the_superblock_is_cut() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3211);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    rewrite_sidecar(&vfs, |mut entries| {
+        let (session, last) = match entries.last() {
+            Some(FeedEntry::Root { session, sequence }) => (*session, *sequence),
+            other => panic!("{other:?}"),
+        };
+        entries.push(FeedEntry::Catalog {
+            session,
+            sequence: last + 1,
+            seqno_ceiling: s1 + 1,
+            timestamp: 0,
+            edits: vec![forged_create(900)],
+            names: Vec::new(),
+        });
+        entries
+    });
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let s2 = single(&db, &c, b"c", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    let mut got = Vec::new();
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Catalog(ev) => got.push(format!("{:?}", ev.edits[0])),
+            Next::Commit(cm) if cm.seqno == s2 => break,
+            Next::Commit(_) => {}
+            other => panic!("the lone entry cut, the feed goes on: {other:?} after {got:?}"),
+        }
+    }
+    assert_eq!(got.len(), 1, "the real create only: {got:?}");
+    assert!(got[0].contains("\"c\""), "{got:?}");
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's F1 on #1526: a `Catalog` entry followed by neither its Root nor its own intent
+/// can never get its Root. The chain doesn't break on it (it is the session's own), so a
+/// reader that waited there would deliver every later commit and no later catalog change: a
+/// silent gap. It expires instead. Mutation-checked: waiting there, as for a pending one,
+/// passes the later create silently.
+#[test]
+fn a_catalog_entry_that_can_never_get_its_root_expires_a_feed_of_every_table() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3212);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    // Before the session's last Root entry: an orphan Catalog of a root that never landed.
+    rewrite_sidecar(&vfs, |mut entries| {
+        let at = entries.len() - 1;
+        let (session, last) = match &entries[at] {
+            FeedEntry::Root { session, sequence } => (*session, *sequence),
+            other => panic!("{other:?}"),
+        };
+        entries.insert(
+            at,
+            FeedEntry::Catalog {
+                session,
+                sequence: last + 7,
+                seqno_ceiling: s1 + 1,
+                timestamp: 0,
+                edits: vec![forged_create(901)],
+                names: Vec::new(),
+            },
+        );
+        entries
+    });
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    single(&db, &c, b"c", Durability::GroupSync);
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Expired(_) => break,
+            Next::Commit(_) => {}
+            other => panic!("an unrootable catalog entry must expire the feed: {other:?}"),
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's R1 and F2 on #1526 (FORMAT §10.4's torn rule): a Root entry mid-file that
+/// fails its CRC (a power loss tore its overwrite in place) is the end of the history, and
+/// the open cuts there, later roots and all: the superblock is past the cut, so the chain
+/// breaks and a token from before expires. Never a cut that continues silently.
+#[test]
+fn a_damaged_root_entry_mid_file_expires_rather_than_cuts_silently() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, decode_entries_at};
+    use pigeonhole_io::Vfs;
+    let vfs = SimVfs::new(3213);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    // Several roots after the token, each recorded with an intent overwritten in place.
+    for i in 0..3u8 {
+        single(&db, &a, &[b'f', i], Durability::GroupSync);
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let f = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut bytes = vec![0u8; f.len().unwrap() as usize];
+    f.read_at(&mut bytes, 0).unwrap();
+    let (entries, _) = decode_entries_at(&bytes[FeedHeader::LEN..]);
+    let roots: Vec<usize> = entries
+        .iter()
+        .filter(|(_, e)| matches!(e, FeedEntry::Root { .. }))
+        .map(|(at, _)| *at)
+        .collect();
+    assert!(roots.len() >= 4, "{entries:?}");
+    // A Root entry with roots after it: flip a payload byte, its CRC now fails.
+    let at = FeedHeader::LEN + roots[roots.len() - 3] + 8 + 3;
+    f.write_at(&[bytes[at] ^ 0xff], at as u64).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    let a = db.table("a").unwrap();
+    single(&db, &a, b"after", Durability::GroupSync);
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Expired(_) => break,
+            Next::Commit(_) => {}
+            other => panic!("a damaged Root entry mid-file must expire: {other:?}"),
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// #1417 (D315's catalog hold): an async feed of every table that a catalog change's hold
+/// keeps back (`held`: the frontier is below the watermark) waits on the feed's hold list,
+/// and the change's release wakes it. Without that wake it slept until some other hold let
+/// go, which a workload of only `GroupSync` commits may never do.
+#[test]
+fn a_catalog_change_s_release_wakes_a_feed_it_held_back() {
+    let vfs = SimVfs::new(3221);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // The create's root commit waits in its observer, its hold up meanwhile.
+    db.delay_root_observer(Duration::from_millis(600));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    // A commit at or above the hold's ceiling: visible, but held from the feed's frontier.
+    let s = single(&db, &a, b"held", Durability::GroupSync);
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        r.poll_next(&mut cx).is_pending(),
+        "held back by the create's hold"
+    );
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the hold's release never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // And it then delivers: the create, then the commit.
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        match r.wait(WAIT).unwrap() {
+            Next::Catalog(_) => got.push("catalog".to_string()),
+            Next::Commit(c) => got.push(format!("c{}", c.seqno)),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(got, ["catalog".to_string(), format!("c{s}")]);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's W1 on #1533: when a catalog change's hold freezes (its Root write fails, so the
+/// session's sidecar appends stop), the change's release still wakes the hold list, so an
+/// async feed of every table it kept back re-polls and expires, on a quiet database with no
+/// other write to wake it. Mutation-checked: without the wake on the frozen path the feed
+/// is never woken.
+#[test]
+fn a_frozen_catalog_hold_wakes_the_feed_it_keeps_back_to_expire() {
+    let vfs = SimVfs::new(3223);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // The create's intent is written; its root commit then waits in the observer, the hold up.
+    db.delay_root_observer(Duration::from_millis(600));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _ = db.create_table("c", &[("g".into(), FamilyOptions::default())]);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    single(&db, &a, b"held", Durability::GroupSync);
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    {
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            r.poll_next(&mut cx).is_pending(),
+            "held back by the create's hold"
+        );
+    }
+    // The observer's Root write fails: the session's appends stop, the hold freezes.
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    create.join().unwrap();
+    vfs.set_faults(FaultPlan::none());
+    db.delay_root_observer(Duration::ZERO);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the frozen hold's release never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cx = std::task::Context::from_waker(&waker);
+    match r.poll_next(&mut cx) {
+        std::task::Poll::Ready(Ok(Next::Expired(_))) => {}
+        other => panic!(
+            "woken, it expires: {:?}",
+            other.map(|n| n.map(|n| format!("{n:?}")))
+        ),
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// The next catalog change, waiting at most `within`; panics on a commit or anything else.
+fn catalog_within(r: &mut FeedReader, within: Duration) -> pigeonhole_engine::CatalogEvent {
+    let start = std::time::Instant::now();
+    match r.wait(within).unwrap() {
+        Next::Catalog(ev) => ev.clone(),
+        other => panic!(
+            "no catalog change within {within:?} ({:?}): {other:?}",
+            start.elapsed()
+        ),
+    }
+}
+
+/// #1515's follow-up (D315): on an idle database, a feed of every table delivers each
+/// catalog change at once, though no seqno moves: a create, then a drop, with no commit
+/// anywhere. A blocking wait is woken by the change's release; the poll that follows loads
+/// the sidecar though the frontier didn't move. Mutation-checked: without the idle load, the
+/// drop waits for the next commit.
+#[test]
+fn a_feed_of_every_table_delivers_catalog_changes_on_an_idle_database() {
+    let vfs = SimVfs::new(3231);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let _ = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // Waiting before the change: it must wake the wait, not only be seen by a later call.
+    let creator = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    let ev = catalog_within(&mut r, Duration::from_secs(3));
+    let c = creator.join().unwrap().id;
+    assert!(
+        matches!(ev.edits[0], pigeonhole_format::manifest::Edit::CreateTable { table, .. } if table == c)
+    );
+    let dropper = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            db.drop_table(c).unwrap();
+        })
+    };
+    let ev = catalog_within(&mut r, Duration::from_secs(3));
+    dropper.join().unwrap();
+    assert!(
+        matches!(ev.edits[..], [pigeonhole_format::manifest::Edit::DropTable { table }] if table == c)
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
+/// The async form of the test above: a pending `poll_next` on a feed of every table is woken
+/// by a catalog change on an idle database, and the next poll delivers it.
+#[test]
+fn an_async_feed_of_every_table_is_woken_by_a_catalog_change_on_an_idle_database() {
+    let vfs = SimVfs::new(3232);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let _ = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    catalog_within(&mut r, Duration::from_secs(3));
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    {
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(r.poll_next(&mut cx).is_pending());
+    }
+    db.drop_table(c.id).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drop never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cx = std::task::Context::from_waker(&waker);
+    match r.poll_next(&mut cx) {
+        Poll::Ready(Ok(Next::Catalog(ev))) => assert!(matches!(
+            ev.edits[..],
+            [pigeonhole_format::manifest::Edit::DropTable { .. }]
+        )),
+        other => panic!("{:?}", other.map(|n| n.map(|n| format!("{n:?}")))),
+    }
+    drop(r);
+    db.close().unwrap();
+}

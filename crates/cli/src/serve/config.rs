@@ -133,6 +133,9 @@ pub(crate) struct Limits {
     pub feed_ring_bytes: usize,
     /// How long a quiet feed stream waits before a progress event (ICR 0112: about 10 s).
     pub feed_quiet: Duration,
+    /// A feed client's buffer: events and their encoded bytes (not flags; tests shrink them).
+    pub feed_client_events: usize,
+    pub feed_client_bytes: usize,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
     pub leases: Leases,
@@ -150,6 +153,8 @@ impl ServeArgs {
             max_catch_up: self.max_catch_up.max(1),
             feed_ring_bytes: self.feed_ring_bytes.max(1 << 16),
             feed_quiet: Duration::from_secs(10),
+            feed_client_events: super::feed::CLIENT_EVENTS,
+            feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
             leases: Leases {

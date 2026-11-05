@@ -181,6 +181,20 @@ pub enum FeedEntry {
         /// resumed after the drop of a table older than the feed still names it.
         names: Vec<(TableId, String)>,
     },
+    /// Type 5 (D315 amendment, #1504): a feeding session's root commit about to happen,
+    /// appended (not synced) before the new superblock is written, and overwritten in place
+    /// by that commit's [`FeedEntry::Root`] once it is durable: the same length, so one
+    /// write. A trailing intent the session never overwrote tells the next open whether the
+    /// root landed (its superblock has this `sequence` and `checksum`: adopt it as the Root)
+    /// or not (its `sequence` is one past the superblock's: cut it off), so a process crash
+    /// between the superblock write and the Root entry no longer looks like a gap.
+    RootIntent {
+        /// The new root's sequence.
+        sequence: u64,
+        /// The new superblock's checksum (FORMAT §8.2: xxh3-64 of bytes 0..120), which tells
+        /// this root from another of the same sequence (an older build's, say).
+        checksum: u64,
+    },
     /// An entry type this build does not know, written by a newer one (its checksum
     /// passed). A reader treats it as the end of the history before it. So is a `Catalog`
     /// entry with an edit this build can't decode: never a torn entry, which a writer would
@@ -229,6 +243,11 @@ impl FeedEntry {
             FeedEntry::Unfed { sequence } => {
                 p.push(3);
                 p.extend_from_slice(&sequence.to_le_bytes());
+            }
+            FeedEntry::RootIntent { sequence, checksum } => {
+                p.push(5);
+                p.extend_from_slice(&sequence.to_le_bytes());
+                p.extend_from_slice(&checksum.to_le_bytes());
             }
             FeedEntry::Catalog {
                 session,
@@ -304,6 +323,10 @@ impl FeedEntry {
                 sequence: r.u64()?,
             },
             3 => FeedEntry::Unfed { sequence: r.u64()? },
+            5 => FeedEntry::RootIntent {
+                sequence: r.u64()?,
+                checksum: r.u64()?,
+            },
             4 => {
                 let (session, sequence, seqno_ceiling, timestamp) =
                     (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
@@ -363,6 +386,13 @@ impl FeedEntry {
 /// and the length of the valid prefix of `bytes` (where a writer truncates before
 /// appending).
 pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
+    let (entries, end) = decode_entries_at(bytes);
+    (entries.into_iter().map(|(_, e)| e).collect(), end)
+}
+
+/// [`decode_entries`], each entry with the offset of its frame in `bytes`: where a writer
+/// cuts the file, or overwrites an entry in place (D315 amendment).
+pub fn decode_entries_at(bytes: &[u8]) -> (Vec<(usize, FeedEntry)>, usize) {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(head) = bytes.get(pos..pos + 8) {
@@ -376,7 +406,7 @@ pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
         let Ok(entry) = FeedEntry::decode_payload(payload) else {
             break;
         };
-        out.push(entry);
+        out.push((pos, entry));
         pos += 8 + len;
     }
     (out, pos)

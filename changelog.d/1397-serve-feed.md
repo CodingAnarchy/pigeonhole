@@ -4,3 +4,4 @@
   - A stream that starts from a token, a snapshot or the oldest commit, or falls behind, reads on its own until it catches up. Its events and tokens are the same either way.
   - Quiet streams send progress events and keepalives.
   - New flags: `--max-streams` (256), `--max-feed-hubs` (32), `--max-catch-up` (16) and `--feed-ring-bytes` (256 MiB, in all).
+  - Each stream buffers up to 64 events (256 KiB at most) its client hasn't taken, so events that are ready go out together. Under load, this halves the server CPU each subscriber costs per commit. A client connection carries at most 128 streams: open another connection for more.

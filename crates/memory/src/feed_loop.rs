@@ -69,6 +69,36 @@ struct Saved {
 }
 
 impl Saved {
+    /// When the first pending namespace falls due (µs), given `min_age`.
+    fn next_due(&self, min_age: u64) -> Option<u64> {
+        self.pending
+            .values()
+            .map(|t| t.saturating_add(min_age))
+            .min()
+    }
+
+    /// The namespaces due at `now`.
+    fn due(&self, min_age: u64, now: u64) -> Vec<String> {
+        self.pending
+            .iter()
+            .filter(|(_, at)| at.saturating_add(min_age) <= now)
+            .map(|(ns, _)| ns.clone())
+            .collect()
+    }
+
+    /// Notes a commit's new memories: each namespace keeps its oldest pending time.
+    fn note(&mut self, events: &[MemoryEvent]) {
+        for e in events {
+            if let MemoryEvent::Remembered(id) = e {
+                let at = self
+                    .pending
+                    .entry(id.namespace().to_owned())
+                    .or_insert(id.created_us());
+                *at = (*at).min(id.created_us());
+            }
+        }
+    }
+
     /// Version 1: a version byte, the generation (8), the token (len u32 + bytes), the count
     /// (u32), then each (len u16 + namespace, µs u64). Little endian.
     fn encode_at(&self, generation: u64) -> Vec<u8> {
@@ -244,28 +274,37 @@ impl ConsolidateLoop {
             // order the two save in.
             self.save()?;
         }
+        let (events, interrupted) = self.read_events(timeout)?;
+        let (passes, failed, stopped) = self.run_due_passes((self.clock)())?;
+        let token = self.save()?;
+        Ok(LoopStep {
+            events,
+            passes,
+            failed,
+            stopped,
+            interrupted,
+            next_due: self.next_due(),
+            token,
+        })
+    }
+
+    /// Step 1: reads events until `timeout` (real time), until the first pending namespace
+    /// falls due (on the loop's clock), or until an interrupt. How many events it read, and
+    /// whether an interrupt ended it.
+    fn read_events(&mut self, timeout: Duration) -> Result<(usize, bool)> {
         let min_age = self.min_age_us();
         let mut events = 0usize;
-        let mut interrupted = false;
-        // 1. Read events until `timeout` (real time), until the first pending namespace
-        //    falls due (on the loop's clock), or until an interrupt.
         let started = std::time::Instant::now();
         loop {
             let (_, saved) = self.state.as_ref().expect("started");
             let now = (self.clock)();
             let mut wait = timeout.saturating_sub(started.elapsed());
-            if let Some(due) = saved
-                .pending
-                .values()
-                .map(|t| t.saturating_add(min_age))
-                .min()
-            {
+            if let Some(due) = saved.next_due(min_age) {
                 wait = wait.min(Duration::from_micros(due.saturating_sub(now)));
             }
             // In slices, so an interrupt (`LoopInterrupter`) ends the wait within one.
             if self.interrupt.swap(false, Ordering::AcqRel) {
-                interrupted = true;
-                break;
+                return Ok((events, true));
             }
             let sliced = wait > INTERRUPT_SLICE;
             let (watch, _) = self.state.as_mut().expect("started");
@@ -285,34 +324,30 @@ impl ConsolidateLoop {
                 if sliced {
                     continue;
                 }
-                break;
+                return Ok((events, false));
             };
             events += commit.events.len();
             let (_, saved) = self.state.as_mut().expect("started");
-            for e in &commit.events {
-                if let MemoryEvent::Remembered(id) = e {
-                    let at = saved
-                        .pending
-                        .entry(id.namespace().to_owned())
-                        .or_insert(id.created_us());
-                    *at = (*at).min(id.created_us());
-                }
-            }
+            saved.note(&commit.events);
             if started.elapsed() >= timeout {
-                break;
+                return Ok((events, false));
             }
         }
-        // 2. The passes that are due.
-        let now = (self.clock)();
-        let due: Vec<String> = {
-            let (_, saved) = self.state.as_ref().expect("started");
-            saved
-                .pending
-                .iter()
-                .filter(|(_, at)| at.saturating_add(min_age) <= now)
-                .map(|(ns, _)| ns.clone())
-                .collect()
-        };
+    }
+
+    /// Step 2: runs the passes due at `now`, and moves each namespace's pending time on.
+    /// The passes that ran, failed and stopped.
+    #[allow(clippy::type_complexity)]
+    fn run_due_passes(
+        &mut self,
+        now: u64,
+    ) -> Result<(
+        Vec<(String, ConsolidatePass)>,
+        Vec<(String, Error)>,
+        Vec<(String, ConsolidatePass)>,
+    )> {
+        let (_, saved) = self.state.as_ref().expect("started");
+        let due = saved.due(self.min_age_us(), now);
         let (mut passes, mut failed, mut stopped) = (Vec::new(), Vec::new(), Vec::new());
         for ns in due {
             let r = self
@@ -344,30 +379,11 @@ impl ConsolidateLoop {
             };
             let (_, saved) = self.state.as_mut().expect("started");
             match next {
-                Some(at) => {
-                    saved.pending.insert(ns, at);
-                }
-                None => {
-                    saved.pending.remove(&ns);
-                }
-            }
+                Some(at) => saved.pending.insert(ns, at),
+                None => saved.pending.remove(&ns),
+            };
         }
-        // 3. Save.
-        let token = self.save()?;
-        let (_, saved) = self.state.as_ref().expect("started");
-        Ok(LoopStep {
-            events,
-            passes,
-            failed,
-            stopped,
-            interrupted,
-            next_due: saved
-                .pending
-                .values()
-                .map(|t| t.saturating_add(min_age))
-                .min(),
-            token,
-        })
+        Ok((passes, failed, stopped))
     }
 
     /// A handle that ends this loop's waits early, from another thread: see
@@ -380,9 +396,7 @@ impl ConsolidateLoop {
     /// before the first step or when nothing is pending.
     pub fn next_due(&self) -> Option<u64> {
         let min_age = self.min_age_us();
-        self.state
-            .as_ref()
-            .and_then(|(_, s)| s.pending.values().map(|t| t.saturating_add(min_age)).min())
+        self.state.as_ref().and_then(|(_, s)| s.next_due(min_age))
     }
 
     /// Runs steps until `stop` is set, each waiting up to a second for new memories.

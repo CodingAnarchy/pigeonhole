@@ -745,6 +745,7 @@ impl Shared {
         // pigeonhole, follows a recovery).
         if let Some(feed) = &self.feed {
             feed.wake_hold_waiters();
+            feed.wake_catalog_waiters();
         }
     }
 
@@ -1236,9 +1237,30 @@ pub(crate) struct Returning {
     pub out: ReturnSlot,
 }
 
-/// Where a returning commit's values go: each counter cell it incremented, in the order
-/// the batch first incremented it (D314).
-pub(crate) type ReturnSlot = Arc<Mutex<Option<Vec<crate::engine::Returned>>>>;
+/// Where a returning commit's values go (D314): the committer's request, and what the
+/// shard leaves for it after the commit's apply.
+pub(crate) type ReturnSlot = Arc<Mutex<ReturnState>>;
+
+/// A returning commit's request and results (D314).
+#[derive(Debug, Default)]
+pub(crate) struct ReturnState {
+    /// Each counter cell the commit incremented, in the order the batch first wrote it;
+    /// `None` until the shard folds them.
+    pub cells: Option<Vec<crate::engine::Returned>>,
+    /// The commit's request for previous values (D314 amendment 1), boxed so a commit that
+    /// makes none carries one null pointer (#1517).
+    pub previous: Option<Box<PreviousState>>,
+}
+
+/// A returning commit's request for previous values, and the shard's answer.
+#[derive(Debug)]
+pub(crate) struct PreviousState {
+    /// The columns of the commit's row whose values just before the commit to read: the
+    /// committer's, taken by the shard.
+    pub of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `of`, in its order, as it was just before the commit.
+    pub values: Vec<crate::engine::Previous>,
+}
 
 /// One counter cell a returning commit incremented, as the shard reads it from the batch.
 #[derive(Debug)]
@@ -6421,6 +6443,126 @@ impl ShardState {
             .ok_or_else(|| Error::Corruption("a counter cell is not an i64".into()))
     }
 
+    /// D314 amendment 1: each column of `previous_of` (of the commit's one row) as it was
+    /// just before the commit at `seqno`: its newest visible version at `seqno - 1`, with a
+    /// TTL judged at the commit's own timestamp. Every seqno below `seqno` that writes the
+    /// row has been applied here (the returning member waited for undecided shares on its
+    /// row), so concurrent swaps of one cell each see the one before. A point read through
+    /// the view, as [`read_cell`](Self::read_cell): with explicit timestamps an older source
+    /// can hold a newer version than the active memtable, so there is no memtable walk.
+    #[cold]
+    #[inline(never)]
+    fn previous_values(
+        &self,
+        bytes: &Bytes,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) -> Vec<crate::engine::Previous> {
+        let row = bytes
+            .batch()
+            .ok()
+            .and_then(|b| b.iter().flatten().next().map(|m| (m.table, m.row.to_vec())));
+        previous_of
+            .into_iter()
+            .map(|(family, qualifier)| {
+                let value = match &row {
+                    Some((table, row)) => self.read_before(
+                        *table,
+                        family,
+                        row,
+                        &qualifier,
+                        seqno.saturating_sub(1),
+                        commit_ts,
+                    ),
+                    None => Ok(None),
+                };
+                crate::engine::Previous {
+                    family,
+                    qualifier,
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    /// The newest visible version of one column at `seqno`, with the family's TTL judged at
+    /// `now`, as a get at that snapshot returns it (a separated value read out).
+    fn read_before(
+        &self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+        seqno: Seqno,
+        now: Timestamp,
+    ) -> Result<Option<crate::read::CellData>> {
+        let (view, mems) = self.shared.flushed_roots.read(|flushed| {
+            let view = self.shared.view.load_full();
+            let mems = view
+                .tablets()
+                .route(table, row)
+                .and_then(|(tablet, _)| self.memtables.get(&(tablet, family)))
+                .map(|slot| slot.readers(self.id, flushed))
+                .unwrap_or_default();
+            (view, mems)
+        });
+        let Some((tablet, _)) = view.tablets().route(table, row) else {
+            return Ok(None);
+        };
+        let Some(meta) = view.catalog.family(family) else {
+            return Ok(None);
+        };
+        let mut resolver = crate::read::take_scan_resolver();
+        let filled = self.point_sources_into(
+            &view,
+            &mems,
+            tablet,
+            family,
+            row,
+            qualifier,
+            resolver.cursor_mut().sources_mut(),
+        );
+        if filled.is_err() || resolver.cursor_mut().sources().is_empty() {
+            crate::read::give_back(resolver);
+            return filled.map(|()| None);
+        }
+        let mut opts = ResolveOptions::new(seqno, now);
+        opts.ttl_micros = meta.options.ttl_micros;
+        opts.versions = 1;
+        opts.merge = meta.merge_op.clone();
+        opts.counter = meta.options.kind.is_aggregate();
+        let mut col = Vec::with_capacity(row.len() + qualifier.len() + 24);
+        encode_row_prefix(&mut col, row)?;
+        encode_key_after_row(&mut col, qualifier, 0, 0, Kind::Put)?;
+        col.truncate(col.len() - SUFFIX_LEN);
+        let blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
+        resolver.cursor_mut().reset();
+        resolver.reset(opts);
+        let found = (|| -> Result<Option<(Timestamp, Vec<u8>)>> {
+            resolver.seek_column(row, qualifier)?;
+            let next = resolver.next_cell();
+            let Some(cell) = next.map_err(|e| crate::read::read_error(e, meta))? else {
+                return Ok(None);
+            };
+            if !cell.key.starts_with(&col) || cell.key.len() != col.len() + SUFFIX_LEN {
+                return Ok(None);
+            }
+            Ok(Some((cell.ts, cell.value.to_vec())))
+        })();
+        crate::read::give_back(resolver);
+        let found = found?;
+        crate::read::ResolverBlobs::check(blobs.as_ref())?;
+        let Some((ts, value)) = found else {
+            return Ok(None);
+        };
+        let stored = match view.ssts.read_blob(&value)? {
+            Some(v) => v.to_vec(),
+            None => value,
+        };
+        Ok(Some(crate::read::CellData::from_stored(ts, stored)))
+    }
+
     /// The fold of `c` at `seqno` from the active memtable alone, and the operands it folded:
     /// `None` unless the walk reaches a `Put` base or a delete of the column before leaving
     /// the memtable, and no family marker of the row (a row or family delete) lies between
@@ -7622,8 +7764,15 @@ impl ShardState {
                     if applied.is_ok()
                         && let Reply::Returning(r) = &m.reply
                     {
-                        let values = self.fold_returning(&m.bytes, m.seqno, m.commit_ts);
-                        *r.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(values);
+                        // One lock scope (simp724's N1 on #1517): the committer locks the
+                        // slot only at its reply, so holding it across the reads contends
+                        // with nothing.
+                        let mut out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
+                        out.cells = Some(self.fold_returning(&m.bytes, m.seqno, m.commit_ts));
+                        if let Some(p) = out.previous.as_deref_mut() {
+                            let of = std::mem::take(&mut p.of);
+                            p.values = self.previous_values(&m.bytes, of, m.seqno, m.commit_ts);
+                        }
                     }
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);

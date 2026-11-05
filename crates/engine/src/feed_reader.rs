@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole_compaction::blob_pointer;
-use pigeonhole_format::feed::{FeedEntry, FeedHeader, FeedTables, decode_entries};
+use pigeonhole_format::feed::{
+    FeedEntry, FeedHeader, FeedTables, decode_entries, decode_entries_at,
+};
 use pigeonhole_format::wal::{BatchRef, WalRecord};
 use pigeonhole_format::{FamilyId, Kind, Lsn, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::OpenOptions;
@@ -44,11 +46,6 @@ const TOKEN_VERSION: u8 = 1;
 /// resuming every table from it would skip them. A build that doesn't know this version
 /// refuses the token as not one (`InvalidArgument`), never misreading it.
 const TOKEN_VERSION_ALL: u8 = 2;
-
-/// How long a waiting reader sleeps when the frontier is held by the change feed's own
-/// holds (a lazy flush or background sync to come) or a stream's next segment header is not
-/// on disk yet: the wait is bounded, never a spin.
-const HELD_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Where a feed starts.
 #[derive(Debug, Clone)]
@@ -316,6 +313,10 @@ pub struct FeedReader {
     /// Every commit with a key at or below this was delivered, skipped or precedes the
     /// start.
     delivered: Seqno,
+    /// Where [`position`](Self::position)'s seqno is published, for a metrics exporter on
+    /// another thread (`set_progress`, D316 A4, ICR 0116): a `fetch_max` at the end of every
+    /// poll, on the feed's own thread. `None` until one's set.
+    progress: Option<Arc<AtomicU64>>,
     /// The frontier as of the last poll.
     frontier: Seqno,
     /// The frontier the streams were last read to their ends under (#1448): while the
@@ -324,6 +325,8 @@ pub struct FeedReader {
     read_through: Option<Seqno>,
     /// Polls that read the streams (an inspection count for tests).
     stream_reads: u64,
+    /// Polls of any kind (an inspection count for tests, #1417).
+    polls: u64,
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
@@ -349,6 +352,11 @@ pub struct FeedReader {
     /// ceiling that its view doesn't reflect, and must still deliver that change.
     catalog_bound: Seqno,
     sidecar_pos: u64,
+    /// The writer's `Feed::catalog_roots` as of the last sidecar load: a change means a
+    /// catalog change's entry is rooted that this feed hasn't loaded, though no seqno moved.
+    catalog_roots_seen: u64,
+    /// The sidecar, once opened ([`FeedReader::load_catalog`]).
+    sidecar_file: Option<pigeonhole_io::FileRef>,
     dropped_tables: HashSet<TableId>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
@@ -391,6 +399,16 @@ pub(crate) struct Origin {
     pub(crate) shm: ShmRegion,
     pub(crate) view: ViewFn,
     pub(crate) writer: Option<Arc<crate::feed::Feed>>,
+}
+
+/// Whether a `Catalog` sidecar entry's root landed, as the entries after it say (D315
+/// amendment): its Root entry follows (`Yes`), its intent follows or nothing does yet
+/// (`Pending`: read it again next time), or something else follows (`Never`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rooted {
+    Yes,
+    Pending,
+    Never,
 }
 
 /// Which catalog changes are before a feed of every table's start, at open (D315), beside
@@ -495,9 +513,11 @@ impl FeedReader {
             streams: Vec::with_capacity(shared.shards),
             history,
             delivered: 0,
+            progress: None,
             frontier: 0,
             read_through: None,
             stream_reads: 0,
+            polls: 0,
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
@@ -517,6 +537,8 @@ impl FeedReader {
             catalog_seq: 0,
             catalog_bound: 0,
             sidecar_pos: 0,
+            catalog_roots_seen: 0,
+            sidecar_file: None,
             dropped_tables: HashSet::new(),
             out_catalog: CatalogEvent::default(),
         };
@@ -662,51 +684,111 @@ impl FeedReader {
 
     /// The next whole commit, waiting up to `timeout` for one. Waits on the watermark the
     /// feed follows (never spins): a commit wakes it once its seqno passes; where the feed's
-    /// own holds keep the frontier back, it looks again every millisecond.
+    /// own holds, or a catalog change's, keep the frontier back, it waits on the feed's hold
+    /// list, which their release wakes (#1417), bounded by the hold's interval. A reader
+    /// process, with no hold list, backs off from 50 µs to 5 ms.
     pub fn wait(&mut self, timeout: Duration) -> Result<Next<'_>> {
         let deadline = Instant::now() + timeout;
+        // Whether this call left a waker on the feed's hold list: taken back on the way out,
+        // so releases don't keep waking a waiter that isn't waiting (as `poll_next` does).
+        let mut on_hold_list = false;
         loop {
-            let polled = self.poll()?;
+            let polled = match self.poll() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.leave_hold_list(on_hold_list);
+                    return Err(e);
+                }
+            };
             let Polled::Pending { held } = polled else {
+                self.leave_hold_list(on_hold_list);
                 self.backoff = READER_BACKOFF_MIN;
                 return Ok(self.lend(polled));
             };
             let now = Instant::now();
             if now >= deadline {
+                self.leave_hold_list(on_hold_list);
                 return Ok(Next::Pending);
             }
             let mut park = deadline - now;
-            if self.writer.is_none() {
+            let target = self.frontier.saturating_add(1);
+            let waker = || std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+            match &self.writer {
                 // A reader process watches shared memory: a bounded backoff, never a spin.
-                park = park.min(self.backoff);
-                self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
-            } else if held {
-                park = park.min(HELD_BACKOFF);
-            } else {
-                let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
-                let target = self.frontier.saturating_add(1);
-                let waiters = if self.durable {
-                    &self.shared.durable_waiters
-                } else {
-                    &self.shared.waiters
-                };
-                waiters.register(self.key, target, Wake::Task(waker));
-                // A publish that missed the registration is seen here.
+                None => {
+                    park = park.min(self.backoff);
+                    self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
+                }
+                // The feed's own holds (or a catalog change's) keep the frontier below the
+                // watermark: park on the hold list, which their release wakes, rather than
+                // poll every millisecond (#1417).
+                Some(feed) if held => {
+                    feed.wait_for_hold(self.key, &waker());
+                    on_hold_list = true;
+                    // A releaser's store before its wake, re-checked after the
+                    // registration's fence, so a wake that found the list empty is seen here.
+                    if self.catalog_wake_missed(feed) {
+                        continue;
+                    }
+                }
+                Some(feed) => {
+                    let waiters = if self.durable {
+                        &self.shared.durable_waiters
+                    } else {
+                        &self.shared.waiters
+                    };
+                    waiters.register(self.key, target, Wake::Task(waker()));
+                    // A feed of every table waits for catalog changes too, which move no
+                    // seqno: their release wakes the catalog list.
+                    if self.tables.is_empty() {
+                        feed.wait_for_catalog(self.key, &waker());
+                        on_hold_list = true;
+                        if self.catalog_wake_missed(feed) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some(feed) = &self.writer {
+                // A publish or a release that missed the registration is seen here.
                 if self.shm.written_seqno(self.durable, self.tables.is_empty()) >= target {
                     continue;
                 }
-                // The feed's holds may pass the watermark later than the publish that
-                // wakes this: bound the sleep by the hold's interval.
-                if let Some(feed) = &self.writer {
-                    let hold = if self.durable {
-                        feed.sync_interval_nanos
-                    } else {
-                        feed.flush_interval_nanos
-                    };
-                    park = park.min(Duration::from_nanos(hold));
-                }
+                // A backstop, either way: a hold may pass the watermark later than the
+                // publish that wakes this, and a wake may be lost to a racing drain. Bound
+                // the sleep by the hold's interval.
+                let hold = if self.durable {
+                    feed.sync_interval_nanos
+                } else {
+                    feed.flush_interval_nanos
+                };
+                park = park.min(Duration::from_nanos(hold));
             }
             std::thread::park_timeout(park);
+        }
+    }
+
+    /// Whether a catalog change may have been rooted since this feed last loaded the sidecar:
+    /// the writer's count moved, or (a reader process) unknown.
+    fn catalog_moved(&self) -> bool {
+        self.writer
+            .as_ref()
+            .is_none_or(|feed| feed.catalog_roots() != self.catalog_roots_seen)
+    }
+
+    /// Whether a feed of every table, just registered on the hold list, must poll again
+    /// rather than park: a frozen catalog hold (simp724's W2 on #1533) or a catalog change
+    /// rooted since its last load, each stored before `release_catalog`'s wake, re-checked
+    /// after the registration's fence.
+    fn catalog_wake_missed(&self, feed: &crate::feed::Feed) -> bool {
+        self.tables.is_empty()
+            && (feed.appends_stopped() || feed.catalog_roots() != self.catalog_roots_seen)
+    }
+
+    /// Takes this reader's waker off the feed's hold list, if `on` (it left one there).
+    fn leave_hold_list(&self, on: bool) {
+        if on && let Some(feed) = &self.writer {
+            feed.forget_hold_waiter(self.key);
         }
     }
 
@@ -756,6 +838,11 @@ impl FeedReader {
                 // this when it lets one go.
                 feed.wait_for_hold(self.key, cx.waker());
                 on_hold_list = true;
+                // As in `wait`: a releaser's store before its wake, re-checked after the
+                // registration's fence (simp724's W2 on #1533).
+                if self.catalog_wake_missed(&feed) {
+                    continue;
+                }
             } else {
                 let waiters = if self.durable {
                     &self.shared.durable_waiters
@@ -763,6 +850,14 @@ impl FeedReader {
                     &self.shared.waiters
                 };
                 waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
+                // As in `wait`: a feed of every table waits for catalog changes too.
+                if self.tables.is_empty() {
+                    feed.wait_for_catalog(self.key, cx.waker());
+                    on_hold_list = true;
+                    if self.catalog_wake_missed(&feed) {
+                        continue;
+                    }
+                }
             }
             // A publish or a release that missed the registration is seen here.
             if self.shm.written_seqno(self.durable, self.tables.is_empty()) < target {
@@ -832,6 +927,16 @@ impl FeedReader {
                 0
             },
         }
+    }
+
+    /// Publishes [`position`](Self::position)'s seqno into `sink` from now on, as a
+    /// `fetch_max` at the end of every poll (D316 A4, ICR 0116): it moves past commits that
+    /// carry nothing for the feed and past seqnos no record holds, even while the feed waits,
+    /// so a caught-up feed reads as caught up. `fetch_max`, so a resubscribe's new reader,
+    /// whose position can start lower, never moves it back. Stores the current one at once.
+    pub fn set_progress(&mut self, sink: Arc<AtomicU64>) {
+        sink.fetch_max(self.position().seqno, Ordering::Relaxed);
+        self.progress = Some(sink);
     }
 
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
@@ -954,7 +1059,21 @@ impl FeedReader {
         Ok(Ok(starts))
     }
 
+    /// One poll ([`poll_inner`](Self::poll_inner)), then the position published to the
+    /// progress sink, if one is set ([`set_progress`](Self::set_progress), D316 A4): on
+    /// every path out, a commit, `Pending`, an expiry or an error, so a waiting feed's
+    /// position keeps up with the frontier it passes. One `fetch_max` a poll, on the feed's
+    /// own thread; nothing on the commit path.
     fn poll(&mut self) -> Result<Polled> {
+        self.polls += 1;
+        let polled = self.poll_inner();
+        if let Some(p) = &self.progress {
+            p.fetch_max(self.position().seqno, Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_inner(&mut self) -> Result<Polled> {
         if let Some(e) = &self.failed {
             return Err(Error::Corruption(format!(
                 "the change feed stopped at an earlier error: {e}"
@@ -1017,6 +1136,15 @@ impl FeedReader {
             if self.shm.is_stale() {
                 return Err(Error::SnapshotExpired);
             }
+            // A catalog change moves no seqno: a feed of every table loads the sidecar here
+            // too, when the writer counted a new one (in a reader process, which has no count
+            // to look at, on each of its backoff's polls), and delivers it if it's due.
+            if self.tables.is_empty() && self.catalog_moved() {
+                self.load_catalog(None)?;
+                if let Some(p) = self.emit()?.polled() {
+                    return Ok(p);
+                }
+            }
             return Ok(self.pending_state());
         }
         self.stream_reads += 1;
@@ -1074,6 +1202,12 @@ impl FeedReader {
     #[cfg(feature = "test-hooks")]
     pub fn stream_reads(&self) -> u64 {
         self.stream_reads
+    }
+
+    /// Polls of any kind since the reader opened (#1417).
+    #[cfg(feature = "test-hooks")]
+    pub fn polls(&self) -> u64 {
+        self.polls
     }
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.
@@ -1616,11 +1750,26 @@ impl FeedReader {
     /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
     /// later changes are passed over.
     fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
-        let path = crate::feed::sidecar_path(&self.shared.path);
-        let file = match self.shared.vfs.open(&path, OpenOptions::read()) {
-            Ok(f) => f,
-            Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+        // Before the file is read: a change counted after this is loaded next time.
+        if let Some(feed) = &self.writer {
+            self.catalog_roots_seen = feed.catalog_roots();
+        }
+        // Opened once and kept: an idle reader process's poll then costs one length check
+        // (simp724's N1 on #1539). The sidecar is only ever appended to, cut or overwritten in
+        // place, never replaced by another file.
+        let file = match &self.sidecar_file {
+            Some(f) => Arc::clone(f),
+            None => {
+                let path = crate::feed::sidecar_path(&self.shared.path);
+                match self.shared.vfs.open(&path, OpenOptions::read()) {
+                    Ok(f) => {
+                        self.sidecar_file = Some(Arc::clone(&f));
+                        f
+                    }
+                    Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                }
+            }
         };
         let len = file.len()?;
         let from = self.sidecar_pos.max(FeedHeader::LEN as u64);
@@ -1638,12 +1787,41 @@ impl FeedReader {
             }
         }
         // Up to the first torn entry: the rest is read again once it's whole.
-        let (entries, used) = decode_entries(&bytes);
+        let (entries, used) = decode_entries_at(&bytes);
         self.sidecar_pos = from + used as u64;
+        // A catalog change counts once its root commit's Root entry follows it (D315
+        // amendment): its entry is appended with the commit's intent, before the commit
+        // writes, and a commit that then fails is cut off at the next open, so until the
+        // Root is there, it may never have happened. Read from it again next time.
+        // A Catalog entry with neither its Root nor its own intent after it can never get its
+        // Root: its commit didn't land, and no open resolved it (simp724's F1 on #1526).
+        // Waiting there would deliver later commits without the changes after it: expire.
+        let rooted: Vec<Rooted> = (0..entries.len())
+            .map(
+                |i| match (&entries[i].1, entries.get(i + 1).map(|e| &e.1)) {
+                    (
+                        FeedEntry::Catalog {
+                            session, sequence, ..
+                        },
+                        Some(FeedEntry::Root {
+                            session: s,
+                            sequence: q,
+                        }),
+                    ) if s == session && q == sequence => Rooted::Yes,
+                    (
+                        FeedEntry::Catalog { sequence, .. },
+                        Some(FeedEntry::RootIntent { sequence: q, .. }),
+                    ) if q == sequence => Rooted::Pending,
+                    // The end of what's whole so far: its intent may still be on its way.
+                    (FeedEntry::Catalog { .. }, None) => Rooted::Pending,
+                    _ => Rooted::Never,
+                },
+            )
+            .collect();
         // The start's catalog reflects a prefix of the changes, in order: once one isn't
         // reflected, no later one is.
         let mut reflecting = true;
-        for e in entries {
+        for (i, (at, e)) in entries.into_iter().enumerate() {
             let FeedEntry::Catalog {
                 session,
                 sequence,
@@ -1657,6 +1835,20 @@ impl FeedReader {
             };
             if !self.history.holds(session) {
                 continue;
+            }
+            match rooted[i] {
+                Rooted::Yes => {}
+                Rooted::Pending => {
+                    self.sidecar_pos = from + at as u64;
+                    break;
+                }
+                Rooted::Never => {
+                    self.expired = Some(expiry(format!(
+                        "the catalog change of root {sequence} never got its Root entry, and \
+                         a later entry follows it: later catalog changes can't be delivered"
+                    )));
+                    break;
+                }
             }
             let before_start = seqno_ceiling <= self.catalog_bound
                 || match start {
@@ -1806,6 +1998,11 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                     broken = true;
                 }
             }
+            // A root commit's intent (D315 amendment) is overwritten by its Root entry once
+            // the commit is durable, and an open resolves one a crash left at the end. One
+            // still here is either the live session's commit in progress, after everything
+            // the chain reads, or an older one no open could decide: fail closed.
+            FeedEntry::RootIntent { .. } => broken = true,
             // A newer build's entry may mean a break: fail closed (simp724's nit on #1316).
             FeedEntry::Unknown(_) | _ => broken = true,
         }
