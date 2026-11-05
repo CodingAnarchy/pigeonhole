@@ -1063,7 +1063,7 @@ fn a_feed_event_stream_yields_a_catalog_change_then_its_commit() {
     };
     match next() {
         FeedEvent::Catalog(change) => assert!(
-            matches!(&change.edits()[..], [CatalogEdit::TableCreated { table, families, .. }]
+            matches!(change.edits(), [CatalogEdit::TableCreated { table, families, .. }]
                 if table == "t" && families.len() == 1 && families[0].name == "f"),
             "{change:?}"
         ),
