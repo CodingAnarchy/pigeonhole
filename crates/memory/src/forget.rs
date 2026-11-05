@@ -472,6 +472,11 @@ impl Store {
     /// pass over a large store kept flushed memtables from being reused, so writers waited
     /// for room (#1477, #1506). A pass needs no single snapshot: each nominated memory is
     /// evaluated again in its own transaction before it's deleted ([`Store::forget_with`]).
+    ///
+    /// **`f` must not commit.** A page's iterator, and so its view, is alive while `f` runs:
+    /// a commit there could wait for memtable room that only this page's view holds, until
+    /// the write-stall timeout (#1497's trap, perf287 on #1519). `f` only nominates; the
+    /// deletions run after the scan returns.
     fn scan_memories(
         &self,
         after: Option<&[u8]>,
