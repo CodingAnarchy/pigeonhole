@@ -997,3 +997,144 @@ fn a_resume_passes_over_what_its_start_did() {
         db.close().unwrap();
     }
 }
+
+/// D315 amendment (#1504, simp724's R1-R4): a process crash around a root commit's
+/// superblock write never expires a durable feed. Held at each point with a seam, then
+/// crashed, reopened and resumed from a token taken before:
+/// - between the intent and the superblock: the root never landed, and the open cuts the
+///   intent (with a create's `Catalog` entry) off, so a create never happened and isn't
+///   delivered;
+/// - between the superblock and the Root entry (#1504's own window): the root landed, and
+///   the open adopts the intent as its Root, so a create is delivered once.
+///
+/// For a flush's root and a catalog change's alike.
+#[test]
+fn a_process_crash_around_a_root_commit_never_expires_a_durable_feed() {
+    use pigeonhole_io::sim::CrashKind;
+    for (i, (landed, create)) in [(false, false), (true, false), (false, true), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let what = format!("superblock landed {landed}, create {create}");
+        let vfs = SimVfs::new(3190 + i as u64);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+        let s1 = single(&db, &a, b"before", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, s1);
+        let token = r.token();
+        drop(r);
+        let hold = Duration::from_millis(1500);
+        if landed {
+            db.delay_root_observer(hold);
+        } else {
+            db.delay_root_intent(hold);
+        }
+        let commit = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                if create {
+                    let _ = db.create_table("c", &[("g".into(), FamilyOptions::default())]);
+                } else {
+                    let _ = db.flush();
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        vfs.crash(CrashKind::Process);
+        commit.join().unwrap();
+        drop(db);
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        assert_eq!(
+            db.table("c").is_some(),
+            create && landed,
+            "{what}: the create happened iff its superblock landed"
+        );
+        let a = db.table("a").unwrap();
+        let s2 = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+        let mut got = Vec::new();
+        loop {
+            match r.wait(WAIT).unwrap() {
+                Next::Commit(c) => {
+                    got.push(format!("c{}", c.seqno));
+                    if c.seqno == s2 {
+                        break;
+                    }
+                }
+                Next::Catalog(ev) => got.push(format!("catalog{}", ev.edits.len())),
+                Next::Expired(e) => panic!("{what}: the durable feed expired: {e:?}"),
+                Next::Pending => panic!("{what}: nothing within {WAIT:?}: {got:?}"),
+            }
+        }
+        let catalogs = got.iter().filter(|g| g.starts_with("catalog")).count();
+        assert_eq!(
+            catalogs,
+            usize::from(create && landed),
+            "{what}: the create delivered once iff it happened: {got:?}"
+        );
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// D315 amendment (#1504): a trailing `RootIntent` whose sequence is the superblock's but
+/// whose checksum isn't (another root of that sequence, such as one an older build wrote
+/// without the feed) is never adopted: the open leaves it, and a token from before expires
+/// rather than skipping that root's commits. Mutation-checked: adopting on the sequence
+/// alone resumes the token.
+#[test]
+fn an_intent_naming_another_root_of_its_sequence_is_never_adopted() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry};
+    use pigeonhole_io::Vfs;
+    let vfs = SimVfs::new(3195);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    // The last session's last entry is its close's Root at the superblock's sequence N.
+    // Forge what a session leaves when it crashed after its intent for N, before its
+    // superblock, and a build without the feed then wrote another root N: in place of that
+    // Root entry, an intent for N with another checksum. Adopting it on the sequence alone
+    // would make a clean chain that silently skips root N.
+    let last = match sidecar_entries(&vfs).last() {
+        Some(FeedEntry::Root { sequence, .. }) => *sequence,
+        other => panic!("{other:?}"),
+    };
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let f = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut bytes = Vec::new();
+    FeedEntry::RootIntent {
+        sequence: last,
+        checksum: 0xdead_beef,
+    }
+    .encode(&mut bytes);
+    // A Root entry and an intent have the same framed length, and the Root is the last
+    // entry: the file's last bytes.
+    let at = f.len().unwrap() - bytes.len() as u64;
+    f.write_at(&bytes, at).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    assert!(matches!(
+        sidecar_entries(&vfs).last(),
+        Some(FeedEntry::RootIntent { .. })
+    ));
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "an intent that names another root is a break, never adopted"
+    );
+    drop(r);
+    db.close().unwrap();
+}

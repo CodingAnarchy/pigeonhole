@@ -475,6 +475,11 @@ pub(crate) struct Feed {
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
+    /// A hold seam (`Engine::delay_root_intent`, D315 amendment): nanoseconds each root
+    /// commit waits after its intent is appended, before it writes anything, widening the
+    /// window between the intent and the superblock. 0 (the default) waits nothing.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) root_intent_delay_nanos: AtomicU64,
 }
 
 /// A catalog change staged for its root commit's `Catalog` sidecar entry (D315).
@@ -539,6 +544,8 @@ impl Feed {
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            root_intent_delay_nanos: AtomicU64::new(0),
         }
     }
 
@@ -777,6 +784,14 @@ impl Feed {
             crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
             *sidecar = None;
             self.appends_stopped.store(true, Ordering::Release);
+        }
+        drop(sidecar);
+        #[cfg(feature = "test-hooks")]
+        {
+            let delay = self.root_intent_delay_nanos.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(delay));
+            }
         }
     }
 
