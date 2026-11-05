@@ -396,6 +396,9 @@ pub(crate) struct Locks {
     pub _writer: WriterLock,
     /// `None` for a true read-only open, which takes no presence (#1348).
     pub presence: Option<Presence>,
+    /// Whether `_writer` is the writer byte taken shared (a true read-only open, #1348): a
+    /// handover's reopen must ask for the same open (simp724's G1 on #1570).
+    pub shared: bool,
     /// The handle the locks were taken on; a reopen takes its shm region and presence on it.
     pub file: pigeonhole_io::FileRef,
 }

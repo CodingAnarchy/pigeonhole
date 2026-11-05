@@ -948,6 +948,19 @@ impl Engine {
         //    run beside one another, and a writer can't start under one, nor one under a
         //    running writer.
         let (file, writer_lock) = match held.as_ref() {
+            // The handover's lock must be the one this open takes: a shared one for a
+            // read-only open, an exclusive one otherwise (simp724's G1 on #1570).
+            Some(locks) if locks.shared != options.read_only => {
+                return Err(Error::InvalidArgument(format!(
+                    "a handover holds the writer lock {}, but the open is {}",
+                    if locks.shared { "shared" } else { "exclusive" },
+                    if options.read_only {
+                        "read-only"
+                    } else {
+                        "writable"
+                    },
+                )));
+            }
             Some(locks) => (locks.file.clone(), None),
             None => {
                 let mut open_opts = OpenOptions::read();
@@ -1131,6 +1144,7 @@ impl Engine {
             *held = Some(Locks {
                 _writer: writer_lock.expect("taken at step 1 when there is no handover"),
                 presence,
+                shared: options.read_only,
                 file: file.clone(),
             });
         }
