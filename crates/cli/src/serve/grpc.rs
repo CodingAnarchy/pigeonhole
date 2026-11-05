@@ -18,10 +18,12 @@ use axum::middleware::Next;
 use axum::response::Response as HttpResponse;
 use futures_core::Stream;
 use tokio::sync::OwnedSemaphorePermit;
+use tonic::codegen::http;
 use tonic::{Request, Response, Status};
 
 use super::Shared;
 use super::errors::ApiError;
+use super::feed::Out;
 use super::proto::{self, data_server::Data};
 use super::service::{ScanPages, ServiceOp, ServiceReply};
 
@@ -238,34 +240,111 @@ impl proto::transactions_server::Transactions for TxnGrpc {
 }
 
 /// `Feed` over gRPC (D313 R2): the fan-out's events, an error as the stream's final status.
+///
+/// Routed by hand rather than through the generated `FeedServer`, for its codec: a ring entry
+/// sent to every client with no prefix is written as the bytes it was encoded to once, not
+/// built and encoded again per subscriber (perf287's profile on #1536). The wire format is
+/// the generated one; `Feed` has the one RPC.
 #[derive(Debug, Clone)]
-pub(crate) struct FeedGrpc(pub(crate) Arc<Shared>);
+pub(crate) struct FeedGrpc {
+    pub(crate) shared: Arc<Shared>,
+    /// `--max-request-bytes`, for decoding the request.
+    pub(crate) max_request_bytes: usize,
+}
 
 struct GrpcEvents(super::feed::FeedEvents);
 
 impl Stream for GrpcEvents {
-    type Item = Result<proto::FeedEvent, Status>;
+    type Item = Result<Out, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0)
-            .poll_next(cx)
+            .poll_out(cx)
             .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
     }
 }
 
-#[tonic::async_trait]
-impl proto::feed_server::Feed for FeedGrpc {
-    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<proto::FeedEvent, Status>> + Send>>;
+/// `Feed.Subscribe`'s codec: requests are decoded as the generated codec does, and events
+/// written by [`Out::encode`].
+struct FeedCodec;
 
-    async fn subscribe(
-        &self,
-        req: Request<proto::SubscribeRequest>,
-    ) -> Result<Response<Self::SubscribeStream>, Status> {
-        match call(&self.0, req, ServiceOp::Subscribe).await? {
-            ServiceReply::Feed(events) => Ok(Response::new(Box::pin(GrpcEvents(events)))),
-            _ => Err(unexpected()),
-        }
+impl tonic::codec::Codec for FeedCodec {
+    type Encode = Out;
+    type Decode = proto::SubscribeRequest;
+    type Encoder = OutEncoder;
+    type Decoder = tonic_prost::ProstDecoder<proto::SubscribeRequest>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        OutEncoder
     }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        tonic_prost::ProstDecoder::default()
+    }
+}
+
+struct OutEncoder;
+
+impl tonic::codec::Encoder for OutEncoder {
+    type Item = Out;
+    type Error = Status;
+
+    fn encode(&mut self, item: Out, dst: &mut tonic::codec::EncodeBuf<'_>) -> Result<(), Status> {
+        // The buffer grows as needed: as for the generated codec, encoding can't run out.
+        item.encode(dst)
+            .map_err(|e| Status::internal(format!("encoding a feed event: {e}")))
+    }
+}
+
+struct SubscribeSvc(Arc<Shared>);
+
+impl tonic::server::ServerStreamingService<proto::SubscribeRequest> for SubscribeSvc {
+    type Response = Out;
+    type ResponseStream = GrpcEvents;
+    type Future = tonic::codegen::BoxFuture<Response<GrpcEvents>, Status>;
+
+    fn call(&mut self, req: Request<proto::SubscribeRequest>) -> Self::Future {
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            match call(&shared, req, ServiceOp::Subscribe).await? {
+                ServiceReply::Feed(events) => Ok(Response::new(GrpcEvents(events))),
+                _ => Err(unexpected()),
+            }
+        })
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for FeedGrpc
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        if req.uri().path() != "/pigeonhole.v1.Feed/Subscribe" {
+            return Box::pin(async {
+                Ok(Status::unimplemented("no such method in pigeonhole.v1.Feed").into_http())
+            });
+        }
+        let svc = SubscribeSvc(Arc::clone(&self.shared));
+        let max = self.max_request_bytes;
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(FeedCodec)
+                .apply_max_message_size_config(Some(max), Some(usize::MAX));
+            Ok(grpc.server_streaming(svc, req).await)
+        })
+    }
+}
+
+impl tonic::server::NamedService for FeedGrpc {
+    const NAME: &'static str = proto::feed_server::SERVICE_NAME;
 }
 
 /// `Admin` over gRPC (D313 ticket 6).

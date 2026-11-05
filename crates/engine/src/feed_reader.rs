@@ -27,9 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole_compaction::blob_pointer;
-use pigeonhole_format::feed::{
-    FeedEntry, FeedHeader, FeedTables, decode_entries, decode_entries_at,
-};
+use pigeonhole_format::feed::{FeedEntry, FeedHeader, FeedTables, decode_entries_at};
 use pigeonhole_format::wal::{BatchRef, WalRecord};
 use pigeonhole_format::{FamilyId, Kind, Lsn, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::OpenOptions;
@@ -1899,19 +1897,12 @@ fn writer_session(shared: &Shared) -> Result<(u64, FeedTables)> {
             "the writer's change feed is off: subscribe to a writer that feeds".into(),
         )
     };
-    let path = crate::feed::sidecar_path(&shared.path);
-    let file = match shared.vfs.open(&path, OpenOptions::read()) {
-        Ok(f) => f,
-        Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Err(off()),
-        Err(e) => return Err(e.into()),
+    let entries = match crate::feed::read_sidecar(&shared.vfs, &shared.path, shared.pager.db_id()) {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return Err(off()),
+        Err(Error::Io(e)) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Err(off()),
+        Err(e) => return Err(e),
     };
-    let mut bytes = vec![0u8; file.len()? as usize];
-    file.read_at(&mut bytes, 0)?;
-    match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == shared.pager.db_id() => {}
-        _ => return Err(off()),
-    }
-    let entries = decode_entries(&bytes[FeedHeader::LEN..]).0;
     for e in entries.iter().rev() {
         match e {
             FeedEntry::Session {
@@ -1942,15 +1933,8 @@ fn writer_session(shared: &Shared) -> Result<(u64, FeedTables)> {
 /// entry could hide another session's root commits, so a gap breaks the chain), with no
 /// feed-off open between.
 fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<History> {
-    let path = crate::feed::sidecar_path(&shared.path);
-    let file = shared.vfs.open(&path, OpenOptions::read())?;
-    let len = file.len()?;
-    let mut bytes = vec![0u8; len as usize];
-    file.read_at(&mut bytes, 0)?;
-    let entries = match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == shared.pager.db_id() => decode_entries(&bytes[FeedHeader::LEN..]).0,
-        _ => Vec::new(),
-    };
+    let entries = crate::feed::read_sidecar(&shared.vfs, &shared.path, shared.pager.db_id())?
+        .unwrap_or_default();
     Ok(History {
         sessions: chain(&entries, current, tables),
     })
@@ -1958,8 +1942,7 @@ fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<His
 
 /// [`read_history`]'s rule over the sidecar's entries.
 fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
-    // (id, feeds the tables, streams, chained to the previous)
-    let mut sessions: Vec<(u64, bool, u32, bool)> = Vec::new();
+    let mut sessions: Vec<Link> = Vec::new();
     let mut last_seq: Option<u64> = None;
     let mut broken = true;
     for e in entries {
@@ -1979,12 +1962,17 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                     tables.iter().all(|&t| fed.contains(t))
                 };
                 let chained = !broken && last_seq == Some(*opened_at);
-                sessions.push((*session, feeds, *streams, chained));
+                sessions.push(Link {
+                    session: *session,
+                    feeds,
+                    streams: *streams,
+                    chained,
+                });
                 last_seq = Some(*opened_at);
                 broken = false;
             }
             FeedEntry::Root { session, sequence } => {
-                let ours = sessions.last().is_some_and(|s| s.0 == *session);
+                let ours = sessions.last().is_some_and(|s| s.session == *session);
                 if !ours || last_seq.map(|l| l + 1) != Some(*sequence) {
                     broken = true;
                 }
@@ -1994,7 +1982,7 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
             // A catalog change (D315) is appended just before its root commit's Root entry,
             // which carries the chain: one of another session breaks it.
             FeedEntry::Catalog { session, .. } => {
-                if sessions.last().is_none_or(|s| s.0 != *session) {
+                if sessions.last().is_none_or(|s| s.session != *session) {
                     broken = true;
                 }
             }
@@ -2007,21 +1995,31 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
             FeedEntry::Unknown(_) | _ => broken = true,
         }
     }
-    let Some(pos) = sessions.iter().rposition(|s| s.0 == current) else {
+    let Some(pos) = sessions.iter().rposition(|s| s.session == current) else {
         return vec![current];
     };
-    let streams = sessions[pos].2;
+    let streams = sessions[pos].streams;
     let mut run = Vec::new();
     for (i, s) in sessions[..=pos].iter().enumerate().rev() {
-        if !s.1 || s.2 != streams {
+        if !s.feeds || s.streams != streams {
             break;
         }
-        run.push(s.0);
-        if !s.3 || i == 0 {
+        run.push(s.session);
+        if !s.chained || i == 0 {
             break;
         }
     }
     run
+}
+
+/// One session in [`chain`]'s walk of the sidecar.
+struct Link {
+    session: u64,
+    /// It fed every table the feed follows.
+    feeds: bool,
+    streams: u32,
+    /// It chains to the session before it.
+    chained: bool,
 }
 
 #[cfg(test)]

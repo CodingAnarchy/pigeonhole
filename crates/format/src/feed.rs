@@ -216,10 +216,10 @@ impl FeedEntry {
                 tables,
             } => {
                 p.push(1);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&opened_at.to_le_bytes());
-                p.extend_from_slice(&retention_bytes.to_le_bytes());
-                p.extend_from_slice(&retention_age_secs.to_le_bytes());
+                put_u64s(
+                    &mut p,
+                    &[*session, *opened_at, *retention_bytes, *retention_age_secs],
+                );
                 p.extend_from_slice(&streams.to_le_bytes());
                 match tables {
                     FeedTables::All => {
@@ -237,8 +237,7 @@ impl FeedEntry {
             }
             FeedEntry::Root { session, sequence } => {
                 p.push(2);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&sequence.to_le_bytes());
+                put_u64s(&mut p, &[*session, *sequence]);
             }
             FeedEntry::Unfed { sequence } => {
                 p.push(3);
@@ -246,8 +245,7 @@ impl FeedEntry {
             }
             FeedEntry::RootIntent { sequence, checksum } => {
                 p.push(5);
-                p.extend_from_slice(&sequence.to_le_bytes());
-                p.extend_from_slice(&checksum.to_le_bytes());
+                put_u64s(&mut p, &[*sequence, *checksum]);
             }
             FeedEntry::Catalog {
                 session,
@@ -258,10 +256,7 @@ impl FeedEntry {
                 names,
             } => {
                 p.push(4);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&sequence.to_le_bytes());
-                p.extend_from_slice(&seqno_ceiling.to_le_bytes());
-                p.extend_from_slice(&timestamp.to_le_bytes());
+                put_u64s(&mut p, &[*session, *sequence, *seqno_ceiling, *timestamp]);
                 p.extend_from_slice(&(edits.len() as u32).to_le_bytes());
                 for e in edits {
                     e.encode(&mut p);
@@ -379,6 +374,13 @@ impl FeedEntry {
             return Err(Error::Corrupt { what: WHAT });
         }
         Ok(entry)
+    }
+}
+
+/// `vals`, little-endian, in order.
+fn put_u64s(p: &mut Vec<u8>, vals: &[u64]) {
+    for v in vals {
+        p.extend_from_slice(&v.to_le_bytes());
     }
 }
 
