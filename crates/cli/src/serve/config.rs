@@ -51,6 +51,21 @@ pub(crate) struct ServeArgs {
     /// outlives its request's slot in `--max-concurrent`, so it has its own cap.
     #[arg(long, value_name = "N", default_value_t = 64)]
     pub max_scans: usize,
+    /// Feed streams (`Feed.Subscribe`) at once; more are refused at once (`Overloaded`).
+    #[arg(long, value_name = "N", default_value_t = 256)]
+    pub max_streams: usize,
+    /// Distinct table sets subscribed at once: each is one engine subscription, shared by
+    /// every stream on it. A stream on another set past this is refused (`Overloaded`).
+    #[arg(long, value_name = "N", default_value_t = 32)]
+    pub max_feed_hubs: usize,
+    /// Feed streams reading their own catch-up feed at once (one that started from a token
+    /// or a snapshot, or fell behind the shared one); the rest wait their turn.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub max_catch_up: usize,
+    /// Bytes of recent commits each table set's shared feed keeps for its streams. Outside
+    /// `--inflight-bytes`: up to `--max-feed-hubs` times this in all.
+    #[arg(long, value_name = "BYTES", default_value_t = 64 << 20)]
+    pub feed_ring_bytes: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
     /// server has submitted always answers its real outcome, however long it takes.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
@@ -101,6 +116,12 @@ pub(crate) struct Limits {
     pub inflight_bytes: usize,
     pub max_concurrent: usize,
     pub max_scans: usize,
+    pub max_streams: usize,
+    pub max_feed_hubs: usize,
+    pub max_catch_up: usize,
+    pub feed_ring_bytes: usize,
+    /// How long a quiet feed stream waits before a progress event (ICR 0112: about 10 s).
+    pub feed_quiet: Duration,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
     pub leases: Leases,
@@ -113,6 +134,11 @@ impl ServeArgs {
             inflight_bytes: self.inflight_bytes.max(self.max_request_bytes),
             max_concurrent: self.max_concurrent.max(1),
             max_scans: self.max_scans.max(1),
+            max_streams: self.max_streams.max(1),
+            max_feed_hubs: self.max_feed_hubs.max(1),
+            max_catch_up: self.max_catch_up.max(1),
+            feed_ring_bytes: self.feed_ring_bytes.max(1 << 16),
+            feed_quiet: Duration::from_secs(10),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
             leases: Leases {

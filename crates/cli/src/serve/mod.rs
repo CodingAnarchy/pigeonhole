@@ -1,8 +1,9 @@
 //! `phdb serve` (D313, #1397): one process serving a database over gRPC and HTTP/JSON on one
 //! port, as ICR 0112 specifies. So far: the skeleton (the listener, TLS, tokens and scopes,
 //! limits, health, metrics, shutdown, thread placement, D317's Router seam), the `Data`
-//! service with `Scan`'s stream, and `Transactions` and `Snapshots` on the session table
-//! (`sessions`); the other services follow.
+//! service with `Scan`'s stream, `Transactions` and `Snapshots` on the session table
+//! (`sessions`), and `Feed.Subscribe` on a shared fan-out (`feed`); the other services
+//! follow.
 //!
 //! Startup checks everything it can before opening the database: the tokens, the TLS files
 //! and the bind rule. The database opens on the main thread, so the engine pins its shards
@@ -21,6 +22,7 @@ mod auth;
 mod config;
 mod convert;
 mod errors;
+mod feed;
 mod grpc;
 mod http;
 mod listener;
@@ -76,7 +78,7 @@ impl Shared {
         started: std::time::Instant,
         reply: &Result<service::ServiceReply, errors::ApiError>,
     ) {
-        if let Ok(service::ServiceReply::Scan(_)) = reply {
+        if let Ok(service::ServiceReply::Scan(_) | service::ServiceReply::Feed(_)) = reply {
             return;
         }
         self.metrics.count(
