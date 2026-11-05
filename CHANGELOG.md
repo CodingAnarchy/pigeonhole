@@ -4,6 +4,14 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-05
+
+A correctness fix for the async nearest-neighbour search. Upgrade if you combine it with a value filter and a column limit. The file format and the shared-memory layout are unchanged, so a 1.1.1 writer and 1.1.0 reader processes work together, and files move freely between 1.1.0 and 1.1.1.
+
+### Fixed
+- **An async nearest-neighbour search with a value filter and a column limit** (`Nearest::run_async`, `run_within_async`) now returns what the sync search returns. It counted the columns the filter dropped toward `column_limit`, so a row whose first columns failed the filter came back short or empty. Present since 1.1.0, which added `run_async`. 1.0.x has no async search.
+- **`pigeonhole-engine`: a `ScanCursor` whose reader moves to the next row before reading all of the current one's cells** no longer hands out the rest of that row as if it were the next row (the same key again). It's present since 1.0.0, but only when calling `pigeonhole-engine`'s `ScanCursor` directly: every `pigeonhole` reader (scans, row streams, Arrow, the Python and Ruby bindings) reads each row to its end first, so none of them reached it.
+
 ## [1.1.0] - 2026-11-04
 
 Pigeonhole 1.1.0 is the first feature release of the 1.x line. Files stay in format 4, and the public API only grows (`cargo semver-checks` against 1.0.1 finds no breaking change). It adds:
@@ -745,7 +753,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
 [1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v1.0.0
