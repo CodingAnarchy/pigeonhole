@@ -53,6 +53,11 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
   - **It is complete only when its last page's `next` is empty** (simp724's D2 on #1510). A stream can end cleanly with a `next`: a `page_bytes` too small for anything returns an empty page with its position. Resume from it with a larger `page_bytes`.
   - **Without a `snapshot_id`, each page reads at its own snapshot** (simp724's D1 on #1510). A row is never torn, but rows can change between pages, so the stream isn't one point in time. Pin a snapshot (`Snapshots.Open`) for that.
   - **A client that stops reading for `--stream-idle-ms`** ends its stream with `DeadlineExceeded` (`REQUEST`): resume from the last page's `next` (perf287's G2 on #1510).
+- **`Feed.Subscribe`'s stream** (D313 R2):
+  - **Every event's `token` resumes just after it**, as an in-process feed's does, whether the event is a commit or a progress event. A progress event's token covers the commits the stream's prefix passed over.
+  - **Streams on the same table set and visibility share one engine subscription.** Past `--max-feed-hubs` distinct sets, a subscription on a new set is `Overloaded`, and so is one past `--max-streams` streams. Both are retry-safe once others end.
+  - **A stream that falls behind** the shared feed's recent history (`--feed-ring-bytes`, a total across table sets), or starts from a token, a snapshot or the oldest commit, reads on its own until it catches up. Its events and tokens are the same either way. At most `--max-catch-up` do so at once; the rest wait their turn.
+  - **An idle stream stays open:** HTTP/2 pings, and SSE keepalive comments (`: keepalive`) every 15 s.
 - **`Last-Event-ID`** on `Feed.Subscribe` or `Memory.Watch` resumes after that token, and takes precedence over the body's `resume`. So an SSE client reconnects natively.
 - **Progress events** (`Progress`, in `FeedEvent` and `MemoryEvent`) carry only a token. The server sends one after a quiet interval (about 10 s), when the stream's position has moved past commits its filters skipped, and never more often than events. A filtered or quiet stream's latest token then stays within the history's retention, so a reconnect doesn't get `FeedExpired` for having missed nothing (perf287's S2).
 - **`Admin.BackupDownload`** is `application/octet-stream`: the backup file's bytes. Over gRPC it's chunks of up to 1 MiB, each with its `backup_id` and `offset`, and the last with `total` and `sha256`. The server keeps the backup for a few minutes after the stream ends or breaks, so a client resumes with `backup_id` and `offset` (over HTTP, `Range: bytes=<offset>-` with `?backup_id=`), and checks the SHA-256 before relying on the copy (perf287's S4).
@@ -100,7 +105,7 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `TransactionFinished` (a call other than `Commit` on a transaction that received `Commit`; the message names the outcome) | `FAILED_PRECONDITION` | 409 | that call did nothing; the transaction's outcome is `Commit`'s | no: send `Commit` for the outcome |
 | `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
-| `DeadlineExceeded` (only before a write was submitted, B3; or a `Data.Scan` whose client took no page for `--stream-idle-ms`, resumable from its last page's `next`) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
+| `DeadlineExceeded` (only before a write was submitted, B3; or a server stream (`Data.Scan`, `Feed.Subscribe`) whose client took no message for `--stream-idle-ms`, resumable from its last page's `next` or its last event's `token`) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
 A code an older client doesn't know follows its `retry_safe` and `retry_from`.

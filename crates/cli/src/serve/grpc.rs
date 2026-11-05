@@ -237,6 +237,37 @@ impl proto::transactions_server::Transactions for TxnGrpc {
     }
 }
 
+/// `Feed` over gRPC (D313 R2): the fan-out's events, an error as the stream's final status.
+#[derive(Debug, Clone)]
+pub(crate) struct FeedGrpc(pub(crate) Arc<Shared>);
+
+struct GrpcEvents(super::feed::FeedEvents);
+
+impl Stream for GrpcEvents {
+    type Item = Result<proto::FeedEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::feed_server::Feed for FeedGrpc {
+    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<proto::FeedEvent, Status>> + Send>>;
+
+    async fn subscribe(
+        &self,
+        req: Request<proto::SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        match call(&self.0, req, ServiceOp::Subscribe).await? {
+            ServiceReply::Feed(events) => Ok(Response::new(Box::pin(GrpcEvents(events)))),
+            _ => Err(unexpected()),
+        }
+    }
+}
+
 /// `Snapshots` over gRPC (D313 §3).
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotGrpc(pub(crate) Arc<Shared>);

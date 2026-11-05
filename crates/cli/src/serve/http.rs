@@ -24,7 +24,7 @@ use super::auth::Scope;
 use super::errors::ApiError;
 use super::grpc::DataGrpc;
 use super::proto;
-use super::service::{ScanPages, ServiceOp, ServiceReply};
+use super::service::{ServiceOp, ServiceReply};
 
 /// The whole router: gRPC and HTTP/JSON behind the concurrency limit and load shedding,
 /// and beside them, outside the limit, health and metrics: a probe or a scrape under
@@ -40,6 +40,9 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     ))
     .max_decoding_message_size(limits.max_request_bytes)
     .max_encoding_message_size(usize::MAX);
+    let feeds = proto::feed_server::FeedServer::new(super::grpc::FeedGrpc(Arc::clone(&shared)))
+        .max_decoding_message_size(limits.max_request_bytes)
+        .max_encoding_message_size(usize::MAX);
     let snapshots = proto::snapshots_server::SnapshotsServer::new(super::grpc::SnapshotGrpc(
         Arc::clone(&shared),
     ))
@@ -56,6 +59,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .route_service(
             "/pigeonhole.v1.Transactions/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(txns),
+        )
+        .route_service(
+            "/pigeonhole.v1.Feed/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(feeds),
         )
         .route_service(
             "/pigeonhole.v1.Snapshots/{*method}",
@@ -130,6 +137,7 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
     }
     let mut text = shared.metrics.render(&shared.router.service.db);
     super::service::render_sessions(&mut text, &shared.router.service.sessions);
+    super::service::render_feeds(&mut text, &shared.router.service.feeds);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
@@ -172,10 +180,21 @@ async fn call(
         }
     };
     let started = Instant::now();
-    let op = match decode(&service, &method, &body) {
+    let mut op = match decode(&service, &method, &body) {
         Ok(op) => op,
         Err(e) => return e.into_response(),
     };
+    // An SSE client reconnects with `Last-Event-ID`, the last event's `id:` (its token): it
+    // takes precedence over the body's `resume` (ICR 0112).
+    if let ServiceOp::Subscribe(r) = &mut op
+        && let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok())
+    {
+        match serde_json::from_value::<proto::SubscribeRequest>(serde_json::json!({ "resume": id }))
+        {
+            Ok(parsed) => r.start = parsed.start,
+            Err(_) => return ApiError::invalid("Last-Event-ID isn't a feed token").into_response(),
+        }
+    }
     let rpc = op.index();
     let reply = shared.router.dispatch(op, &caller, Some(budget)).await;
     shared.count(rpc, started, &reply);
@@ -187,6 +206,7 @@ async fn call(
         Ok(ServiceReply::CheckAndMutate(r)) => json(&r),
         Ok(ServiceReply::MutateReturning(r)) => json(&r),
         Ok(ServiceReply::Scan(pages)) => stream(&headers, pages),
+        Ok(ServiceReply::Feed(events)) => stream(&headers, events),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
@@ -195,8 +215,50 @@ async fn call(
     }
 }
 
-/// A scan's pages as server-sent events or NDJSON (ICR 0112).
-fn stream(headers: &HeaderMap, pages: ScanPages) -> Response {
+/// A message of a server stream: its JSON, and its SSE `id:` if it has one.
+trait Event: Serialize {
+    fn sse_id(&self) -> Option<String> {
+        None
+    }
+}
+
+impl Event for proto::ScanPage {}
+
+impl Event for proto::FeedEvent {
+    /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112).
+    fn sse_id(&self) -> Option<String> {
+        Some(base64(&self.token))
+    }
+}
+
+/// Standard base64, padded: the proto3 JSON mapping's bytes.
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= c.len() {
+                char::from(A[(n >> shift) as usize & 63])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// How long an SSE stream may be silent before a keepalive comment.
+const SSE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A server stream's messages as server-sent events or NDJSON (ICR 0112).
+fn stream<S, T>(headers: &HeaderMap, items: S) -> Response
+where
+    S: Stream<Item = Result<T, ApiError>> + Send + Unpin + 'static,
+    T: Event + Send + 'static,
+{
     let sse = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -206,7 +268,12 @@ fn stream(headers: &HeaderMap, pages: ScanPages) -> Response {
     } else {
         "application/x-ndjson"
     };
-    let mut resp = Body::from_stream(Lines { pages, sse }).into_response();
+    let mut resp = Body::from_stream(Lines {
+        items,
+        sse,
+        keepalive: Box::pin(tokio::time::sleep(SSE_KEEPALIVE)),
+    })
+    .into_response();
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     resp.headers_mut()
@@ -214,20 +281,41 @@ fn stream(headers: &HeaderMap, pages: ScanPages) -> Response {
     resp
 }
 
-/// Each page as one SSE event (`data:` its JSON) or one NDJSON line; an error as an
-/// `event: error` or a `{"error": ErrorDetail}` line, after which the scan has ended.
-struct Lines {
-    pages: ScanPages,
+/// Each message as one SSE event (`data:` its JSON, and `id:` for a feed event) or one
+/// NDJSON line; an error as an `event: error` or a `{"error": ErrorDetail}` line, after which
+/// the stream has ended. A silent SSE stream sends a keepalive comment every
+/// `SSE_KEEPALIVE`, so proxies keep it open.
+struct Lines<S> {
+    items: S,
     sse: bool,
+    keepalive: Pin<Box<tokio::time::Sleep>>,
 }
 
-impl Stream for Lines {
+impl<S, T> Stream for Lines<S>
+where
+    S: Stream<Item = Result<T, ApiError>> + Unpin,
+    T: Event,
+{
     type Item = Result<Bytes, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let sse = self.sse;
-        Pin::new(&mut self.pages).poll_next(cx).map(|item| {
+        let polled = Pin::new(&mut self.items).poll_next(cx);
+        if polled.is_pending() {
+            if sse && self.keepalive.as_mut().poll(cx).is_ready() {
+                let next = tokio::time::Instant::now() + SSE_KEEPALIVE;
+                self.keepalive.as_mut().reset(next);
+                return Poll::Ready(Some(Ok(Bytes::from_static(b": keepalive\n\n"))));
+            }
+            return Poll::Pending;
+        }
+        if sse {
+            let next = tokio::time::Instant::now() + SSE_KEEPALIVE;
+            self.keepalive.as_mut().reset(next);
+        }
+        polled.map(|item| {
             item.map(|page| {
+                let id = page.as_ref().ok().and_then(Event::sse_id);
                 let (event, body) = match page {
                     Ok(page) => (None, serde_json::to_vec(&page)),
                     Err(e) => (
@@ -248,6 +336,11 @@ impl Stream for Lines {
                 });
                 let mut out = Vec::with_capacity(body.len() + 24);
                 if sse {
+                    if let Some(id) = id {
+                        out.extend_from_slice(b"id: ");
+                        out.extend_from_slice(id.as_bytes());
+                        out.push(b'\n');
+                    }
                     if let Some(event) = event {
                         out.extend_from_slice(b"event: ");
                         out.extend_from_slice(event.as_bytes());
@@ -309,6 +402,7 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Transactions", "Abort") => ServiceOp::Abort(parse(body)?),
         ("Snapshots", "Open") => ServiceOp::OpenSnapshot(parse(body)?),
         ("Snapshots", "Release") => ServiceOp::ReleaseSnapshot(parse(body)?),
+        ("Feed", "Subscribe") => ServiceOp::Subscribe(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

@@ -30,6 +30,11 @@ fn limits() -> Limits {
         inflight_bytes: 16 << 20,
         max_concurrent: 64,
         max_scans: 4,
+        max_streams: 16,
+        max_feed_hubs: 8,
+        max_catch_up: 4,
+        feed_ring_bytes: 1 << 20,
+        feed_quiet: Duration::from_secs(10),
         request_timeout: Duration::from_secs(5),
         stream_idle: Duration::from_secs(5),
         leases: super::sessions::Leases {
@@ -45,6 +50,11 @@ fn limits() -> Limits {
 
 impl Server {
     fn start(tokens: &str, limits: Limits) -> Self {
+        Self::start_with(tokens, limits, 1)
+    }
+
+    /// A server on a database of `shards` shards, its change feed on for every table.
+    fn start_with(tokens: &str, limits: Limits, shards: usize) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -58,7 +68,10 @@ impl Server {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Pigeonhole::open(
             dir.join("t.phdb"),
-            Options::default().create_if_missing(true).shards(1),
+            Options::default()
+                .create_if_missing(true)
+                .shards(shards)
+                .change_feed(pigeonhole::FeedRetention::bytes(64 << 20)),
         )
         .unwrap();
         db.table("t")
@@ -1472,5 +1485,498 @@ fn a_write_list_that_fails_partway_buffers_none_of_it() {
         assert_eq!(status, 200, "{rpc}: {body}");
         assert_eq!(cell(&s, "p1", None), None, "{rpc}");
         assert_eq!(cell(&s, "p2", None), None, "{rpc}");
+    }
+}
+
+// ---- Feed.Subscribe (D313 ticket 5, R2) ----
+
+/// A feed subscription straight through the service: events are taken only when polled.
+fn direct_feed(s: &Server, req: proto::SubscribeRequest) -> super::feed::FeedEvents {
+    match s
+        .block_on(s.shared.router.service.call(
+            ServiceOp::Subscribe(req),
+            &Caller::anonymous(),
+            None,
+        ))
+        .unwrap()
+    {
+        super::service::ServiceReply::Feed(events) => events,
+        _ => unreachable!(),
+    }
+}
+
+/// The next event within `wait`.
+fn next_event(
+    s: &Server,
+    events: &mut super::feed::FeedEvents,
+    wait: Duration,
+) -> Option<Result<proto::FeedEvent, super::errors::ApiError>> {
+    use futures_core::Stream as _;
+    s.block_on(async {
+        tokio::time::timeout(
+            wait,
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut *events).poll_next(cx)),
+        )
+        .await
+    })
+    .ok()
+    .flatten()
+}
+
+fn subscribe(tables: &[&str], prefix: &[u8]) -> proto::SubscribeRequest {
+    proto::SubscribeRequest {
+        tables: tables.iter().map(|t| (*t).to_owned()).collect(),
+        prefix: prefix.to_vec().into(),
+        ..Default::default()
+    }
+}
+
+/// Commits a put of `row`'s `f:q` in table `t`.
+fn write_row(s: &Server, row: &[u8]) -> u64 {
+    let t = s
+        .shared
+        .router
+        .service
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno
+}
+
+/// A commit event's (seqno, rows), or `None` for a progress event.
+fn commit_of(e: &proto::FeedEvent) -> Option<(u64, Vec<Vec<u8>>)> {
+    match &e.event {
+        Some(proto::feed_event::Event::Commit(c)) => Some((
+            c.seqno,
+            c.changes.iter().map(|ch| ch.row.to_vec()).collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// Every commit event until none arrives for `quiet`.
+fn drain(
+    s: &Server,
+    events: &mut super::feed::FeedEvents,
+    quiet: Duration,
+) -> Vec<(u64, Vec<Vec<u8>>, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Some(e) = next_event(s, events, quiet) {
+        let e = e.unwrap();
+        if let Some((seqno, rows)) = commit_of(&e) {
+            out.push((seqno, rows, e.token.to_vec()));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_feed_streams_commits_under_its_prefix_and_resumes_from_a_token() {
+    let s = Server::start("", limits());
+    let mut events = direct_feed(&s, subscribe(&["t"], b"a"));
+    let a1 = write_row(&s, b"a1");
+    write_row(&s, b"b1"); // passed over: no row under the prefix
+    let a2 = write_row(&s, b"a2");
+    let got = drain(&s, &mut events, Duration::from_millis(300));
+    assert_eq!(
+        got.iter()
+            .map(|(n, r, _)| (*n, r.clone()))
+            .collect::<Vec<_>>(),
+        [(a1, vec![b"a1".to_vec()]), (a2, vec![b"a2".to_vec()])]
+    );
+    // From the first event's token: the stream starts right after it, on its own feed, and
+    // rejoins the shared one once it reaches it.
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(
+                got[0].2.clone().into(),
+            )),
+            ..subscribe(&["t"], b"a")
+        },
+    );
+    let a3 = write_row(&s, b"a3");
+    let again = drain(&s, &mut resumed, Duration::from_millis(300));
+    assert_eq!(
+        again.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+        [a2, a3],
+        "after a1, once each"
+    );
+    assert!(
+        s.shared
+            .router
+            .service
+            .feeds
+            .stats
+            .rejoined
+            .load(Ordering::Relaxed)
+            >= 1
+    );
+    let text = s.shared.metrics.render(&s.shared.router.service.db);
+    let mut text = text;
+    super::service::render_feeds(&mut text, &s.shared.router.service.feeds);
+    assert!(text.contains("pigeonhole_serve_feed_hubs 1"), "{text}");
+}
+
+#[test]
+fn a_quiet_feed_moves_its_token_with_a_progress_event() {
+    let mut l = limits();
+    l.feed_quiet = Duration::from_millis(150);
+    let s = Server::start("", l);
+    let mut events = direct_feed(&s, subscribe(&["t"], b"a"));
+    write_row(&s, b"b1");
+    // Only commits outside the prefix: after a quiet interval, a progress event carries the
+    // token past them (perf287's S2), the token of the last commit it covers.
+    let e = next_event(&s, &mut events, Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(e.event, Some(proto::feed_event::Event::Progress(_))),
+        "{e:?}"
+    );
+    // Resuming from it starts after b1.
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(e.token.clone())),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    let b2 = write_row(&s, b"b2");
+    let got = drain(&s, &mut resumed, Duration::from_millis(300));
+    assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [b2]);
+}
+
+#[test]
+fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
+    // feed1248's (2) on ticket 5: a client that falls off the ring, where the commits around
+    // its position are ones its prefix passes over, goes on from its own token and rejoins
+    // with nothing missed or repeated.
+    let mut l = limits();
+    l.feed_ring_bytes = 2048; // a few entries
+    let s = Server::start("", l);
+    let mut slow = direct_feed(&s, subscribe(&["t"], b"a"));
+    let mut want = vec![write_row(&s, b"a0")];
+    let first = next_event(&s, &mut slow, Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(commit_of(&first).unwrap().0, want[0]);
+    // While it takes nothing: two commits it passes over, then enough to push them off.
+    write_row(&s, b"b1");
+    write_row(&s, b"b2");
+    for i in 0..40u32 {
+        let row = if i % 3 == 0 {
+            format!("a{i}")
+        } else {
+            format!("b{i}")
+        };
+        let n = write_row(&s, row.as_bytes());
+        if i % 3 == 0 {
+            want.push(n);
+        }
+    }
+    let rest = drain(&s, &mut slow, Duration::from_millis(500));
+    assert_eq!(
+        rest.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+        want[1..],
+        "every commit under the prefix, once, in order"
+    );
+    let stats = &s.shared.router.service.feeds.stats;
+    assert!(
+        stats.fell_behind.load(Ordering::Relaxed) >= 1,
+        "it fell off the ring"
+    );
+}
+
+#[test]
+fn feed_streams_match_a_direct_feed_across_fall_offs() {
+    // feed1248's (6): each client's stream, ring and own-stream catch-up alike, delivers
+    // exactly what a direct FeedStream on the same spec does. Seeded; prints the seed.
+    let seed: u64 = std::env::var("PHDB_FEED_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("feed_streams_match_a_direct_feed_across_fall_offs seed={seed}");
+    let mut rng = seed | 1;
+    let mut rand = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    let mut l = limits();
+    l.feed_ring_bytes = 2048;
+    l.max_catch_up = 2;
+    let s = Server::start_with("", l, 2);
+    let prefixes: [&[u8]; 4] = [b"", b"a", b"b", b"ab"];
+    let t = s
+        .shared
+        .router
+        .service
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    let mut direct: Vec<pigeonhole::Feed> = prefixes
+        .iter()
+        .map(|p| t.feed().prefix(p).open().unwrap())
+        .collect();
+    let mut clients: Vec<super::feed::FeedEvents> = prefixes
+        .iter()
+        .map(|p| direct_feed(&s, subscribe(&["t"], p)))
+        .collect();
+    let mut got: Vec<Vec<u64>> = vec![Vec::new(); prefixes.len()];
+    for round in 0..30 {
+        for _ in 0..rand(8) {
+            let mut m = t.mutate(&[b'a' + rand(3) as u8, b'a' + rand(3) as u8]);
+            for _ in 0..1 + rand(2) {
+                m = m.put("f", format!("q{}", rand(4)).as_bytes(), &[0u8; 64]);
+            }
+            m.commit().unwrap();
+        }
+        // Some clients read now; others stall this round (and may fall off the ring). In
+        // rounds 10 to 14 every client stalls, so more fall off than there are catch-up slots.
+        for (i, c) in clients.iter_mut().enumerate() {
+            let stall = (10..15).contains(&round) || rand(2) == 0;
+            if !stall || round == 29 {
+                for (n, _, _) in drain(
+                    &s,
+                    c,
+                    Duration::from_millis(if round == 29 { 600 } else { 20 }),
+                ) {
+                    got[i].push(n);
+                }
+            }
+        }
+    }
+    for (i, d) in direct.iter_mut().enumerate() {
+        let mut want = Vec::new();
+        while let Some(c) = d.next(Duration::from_millis(100)).unwrap() {
+            want.push(c.seqno());
+        }
+        assert_eq!(got[i], want, "prefix {:?}, seed {seed}", prefixes[i]);
+    }
+    let stats = &s.shared.router.service.feeds.stats;
+    let (fell, rejoined, waits) = (
+        stats.fell_behind.load(Ordering::Relaxed),
+        stats.rejoined.load(Ordering::Relaxed),
+        stats.catch_up_waits.load(Ordering::Relaxed),
+    );
+    eprintln!("fell behind {fell}, rejoined {rejoined}, catch-up waits {waits}");
+    assert!(
+        fell > 0 && rejoined > 0,
+        "the run took clients off the ring and back, seed {seed}"
+    );
+    drop(t);
+}
+
+#[test]
+fn feed_streams_over_http_carry_their_token_as_the_sse_id_and_resume_from_it() {
+    let s = Server::start("", limits());
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_millis(800)))
+        .build()
+        .into();
+    // A stream doesn't end on its own: write first, read what arrives before the timeout.
+    let read = |last_event_id: Option<&str>| -> String {
+        let mut req = agent
+            .post(format!("{}/v1/Feed/Subscribe", s.url))
+            .header("Accept", "text/event-stream");
+        if let Some(id) = last_event_id {
+            req = req.header("Last-Event-ID", id);
+        }
+        let body = json!({"tables": ["t"], "from_oldest": true});
+        let mut resp = req.send_json(&body).unwrap();
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut resp.body_mut().as_reader(), &mut text);
+        text
+    };
+    let first = write_row(&s, b"r1");
+    let second = write_row(&s, b"r2");
+    let text = read(None);
+    let events: Vec<&str> = text
+        .split("\n\n")
+        .filter(|e| e.starts_with("id: "))
+        .collect();
+    assert!(events.len() >= 2, "{text}");
+    let id = events[0]
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("id: ")
+        .unwrap();
+    let data: Json = serde_json::from_str(
+        events[0]
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["token"], id, "the id is the event's token");
+    assert_eq!(data["commit"]["seqno"], first.to_string());
+    // Last-Event-ID wins over the body's from_oldest: the stream starts after r1.
+    let text = read(Some(id));
+    let data: Json =
+        serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap()).unwrap();
+    assert_eq!(data["commit"]["seqno"], second.to_string(), "{text}");
+}
+
+#[test]
+fn feed_streams_and_hubs_are_capped() {
+    let mut l = limits();
+    l.max_streams = 2;
+    l.max_feed_hubs = 1;
+    let s = Server::start("", l);
+    s.shared
+        .router
+        .service
+        .db
+        .table("u")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let _a = direct_feed(&s, subscribe(&["t"], b""));
+    // Another table set needs a second hub.
+    let e = s
+        .block_on(s.shared.router.service.call(
+            ServiceOp::Subscribe(subscribe(&["u"], b"")),
+            &Caller::anonymous(),
+            None,
+        ))
+        .unwrap_err();
+    assert!(e.message.contains("--max-feed-hubs"), "{e:?}");
+    // The same set shares the hub; a third stream is past --max-streams.
+    let _b = direct_feed(&s, subscribe(&["t"], b"x"));
+    let e = s
+        .block_on(s.shared.router.service.call(
+            ServiceOp::Subscribe(subscribe(&["t"], b"")),
+            &Caller::anonymous(),
+            None,
+        ))
+        .unwrap_err();
+    assert!(e.message.contains("--max-streams"), "{e:?}");
+    let e = s.block_on(s.shared.router.service.call(
+        ServiceOp::Subscribe(subscribe(&[], b"")),
+        &Caller::anonymous(),
+        None,
+    ));
+    assert!(e.is_err());
+}
+
+#[test]
+fn catch_up_streams_past_the_cap_wait_their_turn() {
+    // perf287's (2) on ticket 5: at most --max-catch-up clients read their own feed at once;
+    // the rest wait, and are counted, then deliver everything all the same.
+    let mut l = limits();
+    l.max_catch_up = 1;
+    let s = Server::start("", l);
+    let written: Vec<u64> = (0..5)
+        .map(|i| write_row(&s, format!("r{i}").as_bytes()))
+        .collect();
+    let oldest = || proto::SubscribeRequest {
+        start: Some(proto::subscribe_request::Start::FromOldest(true)),
+        ..subscribe(&["t"], b"")
+    };
+    let mut first = direct_feed(&s, oldest());
+    let mut second = direct_feed(&s, oldest());
+    let feeds = &s.shared.router.service.feeds;
+    wait_for("the second waits for the one slot", || {
+        feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
+    });
+    for events in [&mut first, &mut second] {
+        let got = drain(&s, events, Duration::from_millis(300));
+        assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), written);
+    }
+}
+
+#[test]
+fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
+    // simp724's F1 on #1518: with one catch-up slot, clients resuming from a token on a table
+    // nobody writes must still get back on the ring, as other tables' writes move the
+    // feed's position, and hand the slot on, so none starves.
+    let mut l = limits();
+    l.max_catch_up = 1;
+    let s = Server::start("", l);
+    let db = &s.shared.router.service.db;
+    db.table("u")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let u = db.table("u").unwrap().open().unwrap();
+    // A token on `t` from an earlier stream.
+    let mut first = direct_feed(&s, subscribe(&["t"], b""));
+    let r1 = write_row(&s, b"r1");
+    let token = next_event(&s, &mut first, Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .token;
+    drop(first);
+    let resume = || proto::SubscribeRequest {
+        start: Some(proto::subscribe_request::Start::Resume(token.clone())),
+        ..subscribe(&["t"], b"")
+    };
+    let mut a = direct_feed(&s, resume());
+    let mut b = direct_feed(&s, resume());
+    let mut c = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::FromOldest(true)),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    // Only `u` is written: `t` stays quiet.
+    for i in 0..20u32 {
+        u.mutate(&i.to_be_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let feeds = &s.shared.router.service.feeds;
+    // The Oldest client delivers r1 first; then all three are on the ring.
+    let got_c = drain(&s, &mut c, Duration::from_millis(300));
+    assert_eq!(got_c.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r1]);
+    wait_for("all three rejoin the ring, the slot handed on", || {
+        feeds.stats.rejoined.load(Ordering::Relaxed) >= 3 && feeds.gauges().catching_up == 0
+    });
+    // A write to `t` reaches each once.
+    let r2 = write_row(&s, b"r2");
+    for events in [&mut a, &mut b, &mut c] {
+        let got = drain(&s, events, Duration::from_millis(300));
+        assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r2]);
+    }
+    drop(u);
+}
+
+#[test]
+fn a_now_subscriber_gets_a_write_made_right_after_it_subscribed() {
+    // simp724's F5 on #1518: a Now start's position and its `after` are taken together at
+    // subscribe, so a commit pushed before the client's task first runs is still its.
+    let s = Server::start("", limits());
+    // A subscriber that keeps the hub warm.
+    let _keep = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"warm");
+    for i in 0..100u32 {
+        let row = format!("n{i:03}");
+        let mut c = direct_feed(&s, subscribe(&["t"], row.as_bytes()));
+        let n = write_row(&s, row.as_bytes());
+        let e = next_event(&s, &mut c, Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("round {i}: the write never arrived"))
+            .unwrap();
+        assert_eq!(commit_of(&e).map(|(s, _)| s), Some(n), "round {i}");
     }
 }

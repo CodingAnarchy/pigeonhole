@@ -340,7 +340,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions` and `Snapshots` over gRPC and HTTP/JSON. The change feed, schema and the other services follow; ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots` and the change feed (`Feed.Subscribe`) over gRPC and HTTP/JSON. Schema and the other services follow; ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
@@ -356,17 +356,24 @@ u1   profile  name       1761030000000000  Ada
   - **`NotFound` for a `txn_id` you sent `Commit` to** (after a restart, or once its record expires) means the outcome is unknown: check an operation id the transaction wrote before retrying ([recovery](recovery.md)).
   - A read token may begin, read and commit a transaction without writes; writing needs a write token.
 - **Pinned snapshots** (`Snapshots.Open`, `Release`) make reads agree across requests: pass the `snapshot_id` as `GetRequest.snapshot_id`, or as `Selection.snapshot_id` for `MultiGet`, `ReadRow` and `Scan`. Each read renews the snapshot's lease (`--snapshot-idle-ms`, 60 s; at most `--snapshot-lifetime-ms`, 10 min). A held snapshot holds back version and blob GC, so release it when done. Reads already running when it's released finish; later ones, and a scan's later pages, get `NotFound`.
+- **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each (the database needs `Options::change_feed` on for them).
+  - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
+  - Every event's `token` resumes right after it, from any server process. A stream that delivers nothing for about 10 s, while its position moved past commits its `prefix` skipped, sends a `progress` event with the new token.
+  - Streams on the same tables share one subscription in the server: the database wakes and reads for it once, whatever the number of subscribers.
 - **Limits:**
   - `--max-request-bytes` (16 MiB): the largest request.
   - `--inflight-bytes` (256 MiB): request bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC.
   - `--max-concurrent` (1,024 requests): more are refused at once with `Overloaded`, never queued.
   - `--max-scans` (64): scans streaming at once, refused past that the same way. A scan's pages count against `--inflight-bytes` until they're handed to the connection, and at most half the blocking threads read scan pages at once.
   - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page before ending the stream.
+  - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
+  - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
+  - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. Each commit also carries its resume token (about 45 + 16 × shards bytes). This is outside `--inflight-bytes`; `/metrics` reports what's in use.
   - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
   - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
   - A write the server has submitted always answers its real outcome.
 - **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts.
-- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (a scan's runs to the end of its stream), open sessions by kind, and the oldest open session's age.
+- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (a scan's runs to the end of its stream), open sessions by kind, the oldest open session's age, and the feed's shared subscriptions, their memory, and the streams that fell behind or are catching up.
 - **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown. A read may be retried; one that failed on `Io` says so (`retry_from: REQUEST`). `MergeFailed` doesn't: a merge operator that fails on stored data fails the same way again.
 
 ## Exit status
