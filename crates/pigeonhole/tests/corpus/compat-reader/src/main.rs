@@ -150,6 +150,18 @@ fn check(src: &Path, tmp: &Path) -> Result<Outcome, String> {
         ))
     };
 
+    // 1.1.0 resumes the entry's feed first, where the entry asks for it, in an open with the
+    // feed on (it doesn't inherit the feed from the sidecar, as later builds do). Not every
+    // feed entry can: a 1.2 session that changed the catalog left Catalog entries (type 4),
+    // which 1.1.0 doesn't know, and its feed expires there, fail closed.
+    #[cfg(feature = "v1_1")]
+    if src.join("feed-resumes-by-1.1.0.txt").exists() {
+        let fed = options().change_feed(pigeonhole::FeedRetention::bytes(4 << 20));
+        let db = Pigeonhole::open(&path, fed).map_err(|e| format!("feed open: {e}"))?;
+        feed_resumes(&db, src)?;
+        db.close().map_err(|e| format!("feed close: {e}"))?;
+    }
+
     let db = match Pigeonhole::open(&path, options()) {
         Ok(db) => db,
         Err(err) if err.code() == ErrorCode::UnsupportedFeature => {
@@ -196,6 +208,81 @@ fn check(src: &Path, tmp: &Path) -> Result<Outcome, String> {
     }
     db.close().map_err(|e| format!("close: {e}"))?;
     Ok(Outcome::Passed)
+}
+
+/// 1.1.0 (the first release with the change feed, D310) resumes a newer build's feed: for an
+/// entry that stored a table feed's token (`feed_tokens`/`events`, `tests/corpus.rs`), the
+/// commits it delivers after that token, up to the stored last seqno, are the ones the
+/// generating build listed in `expected-extra.txt` (every field but the value's hash, which
+/// would need a hash crate here). A newer build's sidecar entry this release doesn't know
+/// would end the history and expire the feed, so this is the check that a newer build's
+/// sidecar, after clean closes, holds only entries 1.1.0 reads (the D315 amendment's
+/// `RootIntent`, overwritten in place, #1504).
+#[cfg(feature = "v1_1")]
+fn feed_resumes(db: &Pigeonhole, src: &Path) -> Result<(), String> {
+    let Ok(expected) = std::fs::read_to_string(src.join("expected-extra.txt")) else {
+        return Ok(());
+    };
+    let Ok(tokens) = db.table("feed_tokens").and_then(|b| b.open()) else {
+        return Ok(());
+    };
+    let Some(stored) = tokens
+        .get(b"events", "t", b"token")
+        .map_err(|e| format!("feed token: {e}"))?
+    else {
+        return Ok(());
+    };
+    let token = pigeonhole::FeedToken::from_bytes(stored.value());
+    let last = tokens
+        .get(b"events", "t", b"last")
+        .map_err(|e| format!("feed last: {e}"))?
+        .and_then(|c| c.as_i64())
+        .ok_or("feed: no stored last seqno")? as u64;
+    let events = db
+        .table("events")
+        .and_then(|b| b.open())
+        .map_err(|e| format!("feed table: {e}"))?;
+    let mut feed = events
+        .feed()
+        .resume(&token)
+        .open()
+        .map_err(|e| format!("feed open: {e}"))?;
+    let mut got = Vec::new();
+    loop {
+        let c = feed
+            .next(std::time::Duration::from_secs(30))
+            .map_err(|e| format!("feed: {e}"))?
+            .ok_or_else(|| format!("feed: stopped before seqno {last}"))?;
+        for ch in c.changes() {
+            got.push(format!(
+                "{}\t{}\t{}\t{:?}\t{}\t{}\t{}",
+                c.seqno(),
+                ch.table(),
+                ch.family(),
+                ch.kind(),
+                hex(ch.row()),
+                hex(ch.qualifier()),
+                ch.timestamp()
+            ));
+        }
+        if c.seqno() >= last {
+            break;
+        }
+    }
+    // The generating build's lines, less the value field.
+    let want: Vec<String> = expected
+        .lines()
+        .map(|l| l.splitn(8, '\t').take(7).collect::<Vec<_>>().join("\t"))
+        .collect();
+    if got != want {
+        let at = got.iter().zip(&want).position(|(g, w)| g != w);
+        return Err(format!(
+            "feed: {} lines resumed, {} expected; first difference at {at:?}",
+            got.len(),
+            want.len()
+        ));
+    }
+    Ok(())
 }
 
 fn main() {

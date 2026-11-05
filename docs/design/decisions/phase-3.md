@@ -4411,6 +4411,23 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 
 PR 3 adds an in-process two-database replication test with process and power-loss crashes on both sides.
 
+**Amendment, 2026-11-04 (#1504; the owner's call for 1.2.0; the design is agreed with simp724, including R1–R4; FORMAT §10.4 type 5).** A process crash between a root commit's superblock write and its sidecar Root entry made the next open see a gap, and expire every durable feed. The fix is a `RootIntent` entry `{sequence, checksum}` (type 5, the same framed length as a Root entry):
+- **Before the commit writes anything:** the pager's intent hook appends the commit's staged `Catalog` entry, if any, then the intent, unsynced. A failed append ends the session's appends, but never the commit (R3).
+- **After the commit:** the root-commit observer overwrites that intent in place with its Root entry (R2: only an intent this session appended, at the offset it remembered; otherwise it appends). This is the sidecar's only write in place. In steady state the file holds only the entries it did before, so a 1.1 reader still reads a 1.2 sidecar after clean closes.
+- **The open** resolves a trailing intent of the last session, before it appends:
+  - if the superblock it read has the intent's sequence and checksum, the open adopts it, overwriting it with that session's Root;
+  - if the superblock is one sequence behind, the open cuts the intent off, with its root's Catalog entry;
+  - otherwise it leaves it, and `chain` fails closed on it, as on any intent it reads.
+- **A Catalog entry** counts only once its root's Root entry follows it. Until then the root may never have landed, and a reader reads from it again next time. The Catalog entry and the intent go in one write. The open also cuts a lone trailing Catalog entry for the root one past the superblock's. A reader expires on a Catalog entry followed by neither its Root nor its own intent, which would otherwise park it silently (simp724's F1 on #1526).
+- **A 1.1 build (the owner's call, 2026-11-05: accepted, documented in FORMAT §13 and the 1.2.0 changelog)** expires a feed whose history runs across a 1.2 session that changed the schema with the feed on. 1.1 doesn't know the Catalog entries (type 4) that session recorded, and an unknown entry ends the history. That's fail closed, with no data effect. Sessions without schema changes, and the intents, which clean closes overwrite, stay readable by 1.1 (the `feed_root_intent` corpus entry, resumed by `compat-reader-1.1`).
+- **Only a power loss** in that window can still expire a durable feed. The intent isn't synced, so a power loss can lose or tear it, which reads as a torn tail. #1509 is that half (Post-1.0).
+
+**Testing (the amendment).** In `it::feed_reader`:
+- `a_process_crash_around_a_root_commit_never_expires_a_durable_feed`: held before and after the superblock, for a flush's root and a create's.
+- `an_intent_naming_another_root_of_its_sequence_is_never_adopted`.
+- `a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history` (R4: lost, torn, mid-file).
+- Mutation-checked for the checksum test, the cut, the adoption, and an observer that appends instead of overwriting.
+
 <a id="d316"></a>
 ## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
 

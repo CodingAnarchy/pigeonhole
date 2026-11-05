@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole_compaction::blob_pointer;
-use pigeonhole_format::feed::{FeedEntry, FeedHeader, FeedTables, decode_entries};
+use pigeonhole_format::feed::{
+    FeedEntry, FeedHeader, FeedTables, decode_entries, decode_entries_at,
+};
 use pigeonhole_format::wal::{BatchRef, WalRecord};
 use pigeonhole_format::{FamilyId, Kind, Lsn, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::OpenOptions;
@@ -395,6 +397,16 @@ pub(crate) struct Origin {
     pub(crate) shm: ShmRegion,
     pub(crate) view: ViewFn,
     pub(crate) writer: Option<Arc<crate::feed::Feed>>,
+}
+
+/// Whether a `Catalog` sidecar entry's root landed, as the entries after it say (D315
+/// amendment): its Root entry follows (`Yes`), its intent follows or nothing does yet
+/// (`Pending`: read it again next time), or something else follows (`Never`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rooted {
+    Yes,
+    Pending,
+    Never,
 }
 
 /// Which catalog changes are before a feed of every table's start, at open (D315), beside
@@ -1666,12 +1678,41 @@ impl FeedReader {
             }
         }
         // Up to the first torn entry: the rest is read again once it's whole.
-        let (entries, used) = decode_entries(&bytes);
+        let (entries, used) = decode_entries_at(&bytes);
         self.sidecar_pos = from + used as u64;
+        // A catalog change counts once its root commit's Root entry follows it (D315
+        // amendment): its entry is appended with the commit's intent, before the commit
+        // writes, and a commit that then fails is cut off at the next open, so until the
+        // Root is there, it may never have happened. Read from it again next time.
+        // A Catalog entry with neither its Root nor its own intent after it can never get its
+        // Root: its commit didn't land, and no open resolved it (simp724's F1 on #1526).
+        // Waiting there would deliver later commits without the changes after it: expire.
+        let rooted: Vec<Rooted> = (0..entries.len())
+            .map(
+                |i| match (&entries[i].1, entries.get(i + 1).map(|e| &e.1)) {
+                    (
+                        FeedEntry::Catalog {
+                            session, sequence, ..
+                        },
+                        Some(FeedEntry::Root {
+                            session: s,
+                            sequence: q,
+                        }),
+                    ) if s == session && q == sequence => Rooted::Yes,
+                    (
+                        FeedEntry::Catalog { sequence, .. },
+                        Some(FeedEntry::RootIntent { sequence: q, .. }),
+                    ) if q == sequence => Rooted::Pending,
+                    // The end of what's whole so far: its intent may still be on its way.
+                    (FeedEntry::Catalog { .. }, None) => Rooted::Pending,
+                    _ => Rooted::Never,
+                },
+            )
+            .collect();
         // The start's catalog reflects a prefix of the changes, in order: once one isn't
         // reflected, no later one is.
         let mut reflecting = true;
-        for e in entries {
+        for (i, (at, e)) in entries.into_iter().enumerate() {
             let FeedEntry::Catalog {
                 session,
                 sequence,
@@ -1685,6 +1726,20 @@ impl FeedReader {
             };
             if !self.history.holds(session) {
                 continue;
+            }
+            match rooted[i] {
+                Rooted::Yes => {}
+                Rooted::Pending => {
+                    self.sidecar_pos = from + at as u64;
+                    break;
+                }
+                Rooted::Never => {
+                    self.expired = Some(expiry(format!(
+                        "the catalog change of root {sequence} never got its Root entry, and \
+                         a later entry follows it: later catalog changes can't be delivered"
+                    )));
+                    break;
+                }
             }
             let before_start = seqno_ceiling <= self.catalog_bound
                 || match start {
@@ -1834,6 +1889,11 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                     broken = true;
                 }
             }
+            // A root commit's intent (D315 amendment) is overwritten by its Root entry once
+            // the commit is durable, and an open resolves one a crash left at the end. One
+            // still here is either the live session's commit in progress, after everything
+            // the chain reads, or an older one no open could decide: fail closed.
+            FeedEntry::RootIntent { .. } => broken = true,
             // A newer build's entry may mean a break: fail closed (simp724's nit on #1316).
             FeedEntry::Unknown(_) | _ => broken = true,
         }

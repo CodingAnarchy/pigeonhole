@@ -35,6 +35,14 @@ Catalog changes (`create_table` with its family options, `add_family`, `drop_tab
 
 **2b, starts:** an `Oldest` or `After` start passes over the changes with a ceiling at or below its bound in every sidecar load, not only in the entries at open. The hold doesn't bound visible seqnos, so a start past a change's ceiling can come before the change's entry is appended. A token of a feed of every table carries that bound after its last delivered change's sequence (the unreleased token version 2 grows by 8 bytes), so a resume passes over what its start did (simp724's F1b). It doesn't use the token's delivered seqno instead: a `Now` start can be past the ceiling of a change its view doesn't reflect yet, and it delivers that change.
 
+## Amendment: a root commit's intent (#1504)
+**Internal crates only. No public API changes.**
+- **pigeonhole-pager:** `Pager::on_root_intent(hook)` runs before each root commit writes, with the new superblock's sequence and checksum. `OpenedPager::checksum()` returns the opened superblock's checksum.
+- **pigeonhole-format:** `FeedEntry::RootIntent { sequence, checksum }` is type 5, and `decode_entries_at` gives each entry's offset.
+- **pigeonhole-engine:** the sidecar logic. See D315's amendment and FORMAT §10.4.
+
+**Test seam:** a hidden `Engine::delay_root_intent` (`test-hooks`).
+
 ## Amendment: a feed's position and a table's feed id (for #1518)
 `phdb serve`'s feed hubs (D313 ticket 5, #1518) share one engine feed per table set and move clients between their own streams and the hub's ring. To rejoin exactly, they need a stream's covered position, and a key that tells a re-created table from the old one (simp724's F1 and F4 on #1518). The coordinator chose hidden accessors, approved 2026-11-04 and recorded in numbers.md.
 - **pigeonhole** (`#[doc(hidden)]`, so outside the stable API and the public-API snapshot; not behind `__unstable-hooks`, since production `phdb serve` uses them):
