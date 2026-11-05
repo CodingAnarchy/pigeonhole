@@ -253,13 +253,6 @@ impl CopyPlan {
         (plan, kept_refs)
     }
 
-    /// The `SstBlobRefs` edits of the kept SSTs.
-    fn verbatim_refs(&self) -> impl Iterator<Item = &Edit> {
-        self.edits.iter().filter(
-            |e| matches!(e, Edit::SstBlobRefs { sst, .. } if self.verbatim.contains_key(sst)),
-        )
-    }
-
     /// The blob files the copy references and the bytes it references in each (their
     /// `live_bytes`): the kept SSTs' recorded references and the new SSTs' (`new_refs`, the
     /// edits of phase 1 and the rewrites). Files nothing references (values of commits above
@@ -270,7 +263,10 @@ impl CopyPlan {
         new_refs: impl Iterator<Item = &'e Edit>,
     ) -> Result<HashMap<BlobFileId, u64>> {
         let mut live: HashMap<BlobFileId, u64> = HashMap::new();
-        for e in self.verbatim_refs().chain(new_refs) {
+        let kept = self.edits.iter().filter(
+            |e| matches!(e, Edit::SstBlobRefs { sst, .. } if self.verbatim.contains_key(sst)),
+        );
+        for e in kept.chain(new_refs) {
             if let Edit::SstBlobRefs { refs, .. } = e {
                 for (blob, bytes) in refs {
                     *live.entry(*blob).or_default() += bytes;
@@ -682,7 +678,7 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             unclaim(shared, &round.claimed);
             return Err(e);
         }
-        if round.moves.list.is_empty() && round.moves.blobs.is_empty() && round.rewrite.is_none() {
+        if round.is_empty() {
             unclaim(shared, &round.claimed);
             if round.stale {
                 continue;
@@ -843,6 +839,11 @@ impl<'a> Round<'a> {
         Ok(())
     }
 
+    /// Nothing to commit: no SST or blob extent moved, and no manifest rewrite.
+    fn is_empty(&self) -> bool {
+        self.moves.list.is_empty() && self.moves.blobs.is_empty() && self.rewrite.is_none()
+    }
+
     /// Whether `e` can move out of a cleared region (see [`Round::relocate`]).
     fn movable(&self, e: ExtentRef, busy: &HashSet<SstId>) -> bool {
         self.roots.contains(&e)
@@ -956,15 +957,13 @@ impl<'a> Round<'a> {
     fn commit(self, pinned: bool, manifest_stays: &mut bool) -> Result<()> {
         let Self {
             shared,
-            catalog,
             roots,
-            moves,
+            mut moves,
             readers,
             rewrite,
             claimed,
             ..
         } = self;
-        let mut moves = moves;
         let (req, waiter) =
             ManifestReq::with_waiter(ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 Ok(moves.edits(catalog))
@@ -992,7 +991,6 @@ impl<'a> Round<'a> {
                 .any(|e| roots.contains(&e));
         }
         unclaim(shared, &claimed);
-        drop(catalog);
         committed.map(|_| ())
     }
 }
