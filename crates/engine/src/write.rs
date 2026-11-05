@@ -787,6 +787,11 @@ fn wait_reply_spinning<T: Send>(
 /// instead on a thread that drives a shard, which may be the one holding the watermark, and
 /// with `OutcomeUnknown` once visibility can no longer advance (the close finished, or a
 /// shard died): the commit was acknowledged by its shard, but never became visible here.
+///
+/// Always inlined: a plain commit's wait and a conditional commit's both call it, and with
+/// two callers in one binary LTO outlined it out of the commit path (+56 instructions per
+/// commit on `commit-one`, #1566).
+#[inline(always)]
 pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,
