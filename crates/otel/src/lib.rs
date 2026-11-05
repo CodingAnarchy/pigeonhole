@@ -821,7 +821,7 @@ static SPECS: &[Spec] = &[
         false,
         "{commit}",
         [attr::FEED_NAME],
-        "Commits between the database's visible seqno and a watched feed's position (Registration::watch_feed): near 0 while the feed keeps up, growing while its subscriber falls behind.",
+        "Seqnos between the database's visible seqno and a watched feed's covered position (Registration::watch_feed): about one a commit, so near 0 while the feed keeps up and growing while its subscriber falls behind or after it failed.",
         |s, out| for (name, lag) in &s.feed_lags {
             out.push((
                 Value::U(*lag),
@@ -1154,7 +1154,7 @@ impl State {
         let positions: Vec<_> = self
             .feeds
             .iter()
-            .map(|(n, p)| (n.clone(), p.delivered_seqno()))
+            .map(|(n, p)| (n.clone(), p.covered_seqno()))
             .collect();
         let visible = db.visible_seqno();
         let feed_lags = positions

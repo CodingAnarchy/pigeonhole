@@ -150,6 +150,9 @@ struct Sub {
     delivered: Vec<(Seqno, u32)>,
     /// The seqno its stream of deliveries is past (its start, or its token's).
     last: Seqno,
+    /// The current reader's last `position()` (ICR 0114 amendment): it never goes back, and
+    /// never passes a commit not yet delivered.
+    position: Seqno,
 }
 
 struct Run {
@@ -254,6 +257,13 @@ impl Run {
             sub.delivered.retain(|&(s, _)| s <= last);
             sub.last = last;
         }
+        sub.position = r.position().seqno;
+        assert_eq!(
+            sub.position,
+            r.delivered(),
+            "seed {}: before a poll, the start",
+            self.seed
+        );
         sub.reader = Some(r);
     }
 
@@ -363,6 +373,14 @@ impl Run {
                 if sub.process {
                     self.vfs.enter_process(READER);
                 }
+                // The position before this poll: every commit at or below it is covered.
+                let before = r.position().seqno;
+                assert!(
+                    before >= sub.position,
+                    "seed {seed}: the position went back from {} to {before}",
+                    sub.position
+                );
+                sub.position = before;
                 let next = r.try_next();
                 self.vfs.enter_process(WRITER);
                 let next = match next {
@@ -381,8 +399,24 @@ impl Run {
                     Next::Commit(c) => c.clone(),
                     Next::Pending => {
                         // M1 at this frontier: every surviving commit at or below it past
-                        // the subscriber's start was delivered.
+                        // the subscriber's start was delivered. The position too: it is
+                        // the frontier of the read pass that found nothing (ICR 0114).
                         let frontier = r.frontier();
+                        let position = r.position().seqno;
+                        assert!(
+                            position <= frontier,
+                            "seed {seed}: position {position} past the frontier {frontier}"
+                        );
+                        for (tag, m) in &self.made {
+                            if m.seqno != 0 && m.seqno > sub.last && m.seqno <= position {
+                                assert!(
+                                    sub.delivered.iter().any(|d| d.1 == *tag),
+                                    "seed {seed}: commit {tag} (seqno {}) at or below the \
+                                     position {position} never delivered",
+                                    m.seqno
+                                );
+                            }
+                        }
                         let got: HashSet<u32> = sub.delivered.iter().map(|d| d.1).collect();
                         for (tag, m) in &self.made {
                             if m.seqno != 0 && m.seqno > sub.last && m.seqno <= frontier {
@@ -402,6 +436,9 @@ impl Run {
                             "seed {seed}: expired without cause (durable {}): {e:?}",
                             sub.durable
                         )
+                    }
+                    Next::Catalog(e) => {
+                        panic!("seed {seed}: a catalog event in a per-table feed: {e:?}")
                     }
                 };
                 let tag = tag_of(&c, seed);
@@ -428,6 +465,13 @@ impl Run {
                 assert_eq!(rows, want, "seed {seed}: commit {tag} not whole");
                 let prev = sub.delivered.last().map_or(sub.last, |d| d.0);
                 assert!(c.seqno > prev, "seed {seed}: {} after {prev}", c.seqno);
+                // The position before this poll said every commit at or below it was
+                // covered: this one is above it.
+                assert!(
+                    c.seqno > before,
+                    "seed {seed}: commit {} delivered at or below the position {before}",
+                    c.seqno
+                );
                 // Nothing surviving between the two was skipped.
                 for (t, m) in &self.made {
                     assert!(
@@ -657,6 +701,7 @@ fn run(seed: u64) {
             token: None,
             delivered: Vec::new(),
             last: 0,
+            position: 0,
         })
         .collect(),
         window_expiries: 0,

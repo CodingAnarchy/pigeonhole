@@ -100,9 +100,10 @@ impl Engine {
     /// The change feed's frontier (D310): the highest seqno every commit at or below which
     /// is applied, in its stream file (the written watermark, shm `WRITTEN`) and, with
     /// `durable`, durable at its level. Without the feed it equals the visible (or durable)
-    /// seqno, since nothing is held unwritten.
+    /// seqno, since nothing is held unwritten. A feed of some tables' frontier: a feed of
+    /// every table's is also below a catalog change's hold (D315).
     pub fn feed_frontier(&self, durable: bool) -> pigeonhole_format::Seqno {
-        self.inner.shared.shm.written_seqno(durable)
+        self.inner.shared.shm.written_seqno(durable, false)
     }
 
     /// Subscribes to the committed changes of some tables (D310): a [`FeedReader`] that

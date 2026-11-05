@@ -1038,7 +1038,7 @@ impl Pigeonhole {
 
     /// The highest seqno a new snapshot may include now: every commit at or below it is
     /// visible (D316 A4, ICR 0116). Cheap: a few atomic loads, no snapshot taken. Against a
-    /// feed's [`FeedProgress::delivered_seqno`](crate::FeedProgress::delivered_seqno), it is
+    /// feed's [`FeedProgress::covered_seqno`](crate::FeedProgress::covered_seqno), it is
     /// the feed's lag in commits.
     pub fn visible_seqno(&self) -> u64 {
         self.engine().visible_seqno()
