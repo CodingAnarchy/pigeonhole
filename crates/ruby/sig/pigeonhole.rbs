@@ -250,6 +250,23 @@ module Pigeonhole
     def commit: () -> Integer
     def commit_if: (Condition condition) -> Integer?
     def commit_returning: () -> Incremented
+    def return_current: (name family, String qualifier) -> self
+    def commit_if_returning: (Condition condition) -> Checked
+  end
+
+  # What Mutation#commit_if_returning returns: whether the condition held, with the row
+  # either way.
+  class Checked
+    attr_reader returned: Incremented?
+    attr_reader seen: Seen?
+    def initialize: (Incremented? returned, Seen? seen) -> void
+    def applied?: () -> bool
+    def inspect: () -> String
+  end
+
+  # The row as a failed Mutation#commit_if_returning's condition saw it.
+  class Seen
+    def current: (name family, String qualifier) -> Cell?
   end
 
   # The counter cells a Mutation#commit_returning wrote, after its commit, and the columns
@@ -258,6 +275,7 @@ module Pigeonhole
     def seqno: () -> Integer
     def value: (name family, String qualifier, ?ts: Integer?) -> Integer?
     def previous: (name family, String qualifier) -> Cell?
+    def current: (name family, String qualifier) -> Cell?
     def to_h: () -> Hash[[String, String, Integer], Integer?]
     def size: () -> Integer
     def inspect: () -> String

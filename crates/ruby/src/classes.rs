@@ -48,9 +48,30 @@ pub(crate) struct MutationState {
     pub(crate) row: Vec<u8>,
     /// `None` once committed.
     pub(crate) ops: Mutex<Option<Vec<Op>>>,
-    /// The columns `return_previous` asked for: family and qualifier (ICR 0113).
-    pub(crate) previous: Mutex<Vec<(String, Vec<u8>)>>,
+    /// The columns `return_previous` and `return_current` asked for (ICR 0113).
+    pub(crate) asked: Mutex<Asked>,
     pub(crate) durability: Mutex<Option<Durability>>,
+}
+
+/// A column: family and qualifier.
+pub(crate) type Column = (String, Vec<u8>);
+
+/// The columns a mutation's `return_previous` and `return_current` asked for (ICR 0113).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Asked {
+    pub(crate) previous: Vec<Column>,
+    pub(crate) current: Vec<Column>,
+}
+
+impl Asked {
+    /// Whether `return_current` asked for the column, or it's `condition`'s (always
+    /// reported).
+    pub(crate) fn has_current(&self, family: &str, q: &[u8], condition: Option<&Column>) -> bool {
+        self.current
+            .iter()
+            .chain(condition)
+            .any(|(f, cq)| f == family && cq == q)
+    }
 }
 
 /// `Pigeonhole::Mutation`.
@@ -85,14 +106,21 @@ pub(crate) struct Snapshot(pub(crate) ForkSafe<Mutex<Option<pigeonhole::Snapshot
 pub(crate) struct Cell(pub(crate) pigeonhole::Cell);
 
 /// `Pigeonhole::Incremented` (also `Pigeonhole::Returned`): the counter cells a
-/// `Mutation#commit_returning` wrote, after its commit (D314), and the columns
-/// `return_previous` asked for, as they were before it, with those requests. Plain data: no
-/// handle, so nothing to guard across a fork.
+/// `Mutation#commit_returning` (or an applied `commit_if_returning`) wrote, after its commit
+/// (D314), and the columns `return_previous` and `return_current` asked for, with those
+/// requests and the condition's column. Plain data: no handle, so nothing to guard across a
+/// fork.
 #[magnus::wrap(class = "Pigeonhole::Incremented", free_immediately, size)]
 pub(crate) struct Incremented(
     pub(crate) pigeonhole::Incremented,
-    pub(crate) Vec<(String, Vec<u8>)>,
+    pub(crate) Asked,
+    pub(crate) Option<Column>,
 );
+
+/// `Pigeonhole::Seen`: the row as a failed `Mutation#commit_if_returning`'s condition saw it
+/// (D314 amendment 2). Plain data.
+#[magnus::wrap(class = "Pigeonhole::Seen", free_immediately, size)]
+pub(crate) struct Seen(pub(crate) pigeonhole::Seen);
 
 /// `Pigeonhole::Row`.
 #[magnus::wrap(class = "Pigeonhole::Row", free_immediately, size)]

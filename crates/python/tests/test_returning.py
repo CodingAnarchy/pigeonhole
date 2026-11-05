@@ -270,3 +270,157 @@ def test_return_previous_works_on_the_async_form(leases):
 
     r = asyncio.run(go())
     assert r.previous("s", b"holder").value == b"a"
+
+
+# ---- commit_if_returning (#1446 PR 2, D314 amendment 2, ICR 0113) ----
+# Mirrors crates/pigeonhole/tests/commit_if_returning.rs.
+
+
+@pytest.fixture
+def ck(db):
+    return (
+        db.table("ck")
+        .family("s")
+        .family("c", ph.Family.counter())
+        .family("b", ph.Family(blob_threshold=64))
+        .create()
+    )
+
+
+def test_both_outcomes_report_the_row(ck):
+    ck.mutate(b"r").put("s", b"state", b"packed").put("s", b"note", b"fragile").incr(
+        "c", b"n", 5
+    ).commit()
+    packed = ph.Condition.equals("s", b"state", b"packed")
+    r = (
+        ck.mutate(b"r")
+        .put("s", b"state", b"shipped")
+        .incr("c", b"n", 1)
+        .return_previous("s", b"state")
+        .return_current("s", b"note")
+        .commit_if_returning(packed)
+    )
+    assert isinstance(r, ph.Checked) and r.applied and r.seen is None
+    ret = r.returned
+    assert isinstance(ret, ph.Returned)
+    assert ret.current("s", b"state").value == b"shipped"  # the new value
+    assert ret.previous("s", b"state").value == b"packed"  # what it replaced
+    assert ret.current("s", b"note").value == b"fragile"
+    assert ret.value("c", b"n") == 6
+    with pytest.raises(ph.InvalidArgument) as e:
+        ret.current("s", b"other")  # neither asked for nor the condition's
+    assert not isinstance(e.value, ph.ReturnedValueError)
+    assert repr(r) == "Checked(applied=True)"
+    # Now it fails: "shipped" is not "packed", and nothing is written.
+    r = ck.mutate(b"r").put("s", b"state", b"lost").return_current("s", b"note").commit_if_returning(
+        packed
+    )
+    assert not r.applied and r.returned is None
+    seen = r.seen
+    assert isinstance(seen, ph.Seen)
+    assert seen.current("s", b"state").value == b"shipped"
+    assert seen.current("s", b"note").value == b"fragile"
+    with pytest.raises(ph.InvalidArgument):
+        seen.current("s", b"other")
+    assert ck.get(b"r", "s", b"state").value == b"shipped"
+
+
+def test_a_missing_cell_is_reported_missing(ck):
+    r = ck.mutate(b"m").put("s", b"q", b"v").commit_if_returning(ph.Condition.exists("s", b"q"))
+    assert not r.applied and r.seen.current("s", b"q") is None
+    r = ck.mutate(b"m").put("s", b"q", b"v").commit_if_returning(ph.Condition.absent("s", b"q"))
+    assert r.applied and r.returned.current("s", b"q").value == b"v"
+
+
+def test_a_separated_value_is_compared_and_returned_as_the_value(db, ck):
+    big = bytes([7]) * 5000
+    ck.mutate(b"r").put("b", b"q", big).commit()
+    db.flush()
+    r = ck.mutate(b"r").put("b", b"q", b"small").commit_if_returning(
+        ph.Condition.equals("b", b"q", b"other")
+    )
+    assert not r.applied and r.seen.current("b", b"q").value == big
+    assert (
+        ck.mutate(b"r")
+        .put("b", b"q", b"small")
+        .commit_if_returning(ph.Condition.equals("b", b"q", big))
+        .applied
+    )
+
+
+def test_a_compare_and_swap_loop_hands_out_each_value_once(ck):
+    """Each attempt swaps from the value it last saw; a failed one retries from its `Seen`,
+    with no extra read. Every value is taken by exactly one success."""
+    ck.mutate(b"seq").put("s", b"v", b"0").commit()
+    threads, each = 4, 25
+
+    def run():
+        got, seen = [], 0
+        while len(got) < each:
+            r = (
+                ck.mutate(b"seq")
+                .put("s", b"v", str(seen + 1).encode())
+                .commit_if_returning(ph.Condition.equals("s", b"v", str(seen).encode()))
+            )
+            if r.applied:
+                got.append(seen)
+                seen += 1
+            else:
+                seen = int(r.seen.current("s", b"v").value)
+        return got
+
+    results = []
+    workers = [threading.Thread(target=lambda: results.extend(run())) for _ in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert sorted(results) == list(range(threads * each))
+
+
+def test_an_empty_mutation_is_a_check_and_read(ck):
+    for row in [b"e/a", b"e/b"]:
+        ck.mutate(row).put("s", b"state", b"paid").commit()
+    for cond, want in [(b"paid", True), (b"packed", False)]:
+        c = ph.Condition.equals("s", b"state", cond)
+        assert (ck.mutate(b"e/a").commit_if(c) is not None) == want
+        r = ck.mutate(b"e/b").commit_if_returning(c)
+        assert r.applied == want
+        side = r.returned if r.applied else r.seen
+        assert side.current("s", b"state").value == b"paid"
+
+
+def test_return_current_is_refused_elsewhere(ck):
+    c = ph.Condition.equals("s", b"q", b"x")
+    with pytest.raises(ph.InvalidArgument, match="use a transaction"):
+        ck.mutate(b"r").put("s", b"q", b"a").return_current("s", b"q").commit()
+    with pytest.raises(ph.InvalidArgument):
+        ck.mutate(b"r").incr("c", b"n", 1).return_current("s", b"q").commit_returning()
+    with pytest.raises(ph.InvalidArgument):
+        ck.mutate(b"r").put("s", b"q", b"a").return_current("s", b"q").commit_if(c)
+    assert ck.get(b"r", "s", b"q") is None, "nothing committed"
+    with pytest.raises(ph.FamilyNotFound):
+        ck.mutate(b"r").put("s", b"q", b"a").return_current("nope", b"q").commit_if_returning(c)
+    m = ck.mutate(b"r").put("s", b"q", b"a")
+    m.commit()
+    with pytest.raises(ValueError, match="already committed"):
+        m.return_current("s", b"q")
+
+
+def test_the_async_form_returns_the_same(ck):
+    import asyncio
+
+    ck.mutate(b"r").put("s", b"q", b"a").commit()
+
+    async def go():
+        held = await ck.mutate(b"r").put("s", b"q", b"b").commit_if_returning_async(
+            ph.Condition.equals("s", b"q", b"a")
+        )
+        failed = await ck.mutate(b"r").put("s", b"q", b"c").commit_if_returning_async(
+            ph.Condition.equals("s", b"q", b"a")
+        )
+        return held, failed
+
+    held, failed = asyncio.run(go())
+    assert held.applied and held.returned.current("s", b"q").value == b"b"
+    assert not failed.applied and failed.seen.current("s", b"q").value == b"b"

@@ -447,6 +447,55 @@ module Pigeonhole
     # the columns `return_previous` asked for, as they were just before it. Concurrent
     # increments of one cell each get their own value.
     def commit_returning = native_commit_returning.freeze
+
+    # Asks `commit_if_returning` for the column `family`:`qualifier` as the commit left it
+    # (`returned.current`), or as the condition saw it when it didn't hold (`seen.current`)
+    # (D314 amendment 2). The condition's own column is always reported, so it needs no
+    # request. Other commits raise InvalidArgument for such a mutation: read and write in a
+    # transaction instead.
+    def return_current(family, qualifier)
+      native_return_current(family, qualifier)
+      self
+    end
+
+    # Commits only if `condition` holds, and returns a frozen Checked with the row either
+    # way: `applied?`, then `returned` (a Returned, with `current`, `previous` and the
+    # counters) when it applied, or `seen` (a Seen, with `current` as the condition saw it)
+    # when it didn't and nothing was written. A mutation with no writes is a check-and-read.
+    def commit_if_returning(condition)
+      r = native_commit_if_returning(condition).freeze
+      r.is_a?(Seen) ? Checked.new(nil, r) : Checked.new(r, nil)
+    end
+  end
+
+  # What Mutation#commit_if_returning returns: whether the condition held, with the row
+  # either way.
+  class Checked
+    # When it applied: the Returned, else nil.
+    attr_reader :returned
+    # When it didn't: the Seen, else nil.
+    attr_reader :seen
+
+    def initialize(returned, seen)
+      @returned = returned
+      @seen = seen
+      freeze
+    end
+
+    # Whether the condition held and the mutation committed.
+    def applied? = !@returned.nil?
+
+    def inspect = "#<Pigeonhole::Checked applied=#{applied?}>"
+  end
+
+  # The row as a failed Mutation#commit_if_returning's condition saw it.
+  class Seen
+    # The column as the condition saw it: its newest visible version then (a Cell), or nil
+    # if it had none. Raises InvalidArgument if neither `return_current` nor the condition
+    # named it. Nothing was written, so a read error here is an ordinary one.
+    def current(family, qualifier)
+      native_current(family, qualifier)
+    end
   end
 
   # The counter cells a Mutation#commit_returning incremented or set, after its commit.
@@ -467,6 +516,15 @@ module Pigeonhole
     # the commit applied: the commit succeeded then, so don't retry it.
     def previous(family, qualifier)
       native_previous(family, qualifier)
+    end
+
+    # After an applied Mutation#commit_if_returning: the column as of the commit (a Cell; the
+    # condition's own column is the new value, `previous` gives the old one), or nil if a
+    # read at the commit sees none. Raises InvalidArgument if neither `return_current` nor
+    # the condition named it, and ReturnedValueError if it couldn't be read after the commit
+    # applied: the commit succeeded then, so don't retry it.
+    def current(family, qualifier)
+      native_current(family, qualifier)
     end
   end
 
