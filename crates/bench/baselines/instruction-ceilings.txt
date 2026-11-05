@@ -307,7 +307,11 @@ short-scans 13068 0.3
 # commit-one 8589 -> 8590 (+0.01%), codegen drift on main after #1512 (D316 A2). #1512 sat
 # exactly at 8589, which zero commit-path cost left unchanged, and main's base build in #1515's
 # instructions job counted 8590 on code #1512 doesn't touch.
-commit-one 8590 0.3
+# Raised by D195 (#1566, D314 amendment 2): commit-one 8590 -> 8617 (+0.3%). The returning
+# check's own Reply variant is one more arm in the shard's apply and notify matches on every
+# commit: 8581 -> 8591 (+10, +0.12%) on run 42088494045 (571a5bf3), after #1566 removed the
+# rest (wait_visible kept inline). The highest times 1.003, as commit-async's.
+commit-one 8617 0.3
 commit-sixteen 36382 0.3
 flush 2087 0.3
 compact 2615 0.5
@@ -335,10 +339,16 @@ commit-incr-returning 17519 0.3
 commit-incr-returning-spread 34610 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
 # From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
-commit-put-previous 21668 0.3
-# D314 amendment 2 (#1446): compare-and-set-then-read, commit-overwrite through
-# commit_if_returning. Provisional until this PR's run measures it.
-commit-if-returning 99999 0.3
+# Raised by D195 (#1566, D314 amendment 2): 21668 -> 21731 (+0.29%). 21606 -> 21666 (+60,
+# +0.28%) on run 42088494045 (571a5bf3): RowMutation's request box now holds return_current's
+# columns too (48 bytes, not 24) and commit_returning refuses them. #1566 keeps the engine's
+# state main's (the check's own CheckSlot; read_before::<COLD>); x86 had shown +215 before.
+# The highest times 1.003.
+commit-put-previous 21731 0.3
+# D314 amendment 2 (#1446, #1566): compare-and-set-then-read, commit-overwrite through
+# commit_if_returning (the condition's read, then the cell again as of the commit). From run
+# 42088494045 on 571a5bf3 (29094): times 1.003.
+commit-if-returning 29182 0.3
 scan-narrow-q1 5053 0.3
 scan-wide-q10 1744 0.3
 scan-wide-q1 13395 0.3
