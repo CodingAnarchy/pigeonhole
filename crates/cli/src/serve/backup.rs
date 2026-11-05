@@ -176,11 +176,14 @@ impl Backups {
             .name("phdb-serve-backup".into())
             .spawn(move || {
                 let r = backup();
-                // The result first, then the permit: the next backup starts only once this
-                // one is handed over (simp724's H1 on #1527). A requester that's gone drops
-                // the result here, which for a fresh download gives up its reader.
-                let _ = tx.send(r);
+                // The permit before the result: a requester that has its result and asks
+                // again at once must find the slot free, not `Overloaded` (#1527's H1 sent
+                // first, and a client's next backup could be refused; the flake on #1549).
+                // A fresh download's copy needs no permit to stay safe: `finish` already
+                // made the requester its reader, so nothing can evict it before the handoff.
+                // A requester that's gone drops the result here, which gives that reader up.
                 drop(permit);
+                let _ = tx.send(r);
             })
             .map_err(|e| ApiError::internal(format!("a backup thread: {e}")))?;
         Ok(rx)
@@ -728,6 +731,35 @@ mod tests {
         b.sweep(Instant::now() + KEEP);
         assert!(b.lock().is_empty());
         assert!(!path.exists(), "the reaper deleted the copy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_frees_its_slot_before_its_requester_sees_the_result() {
+        // The flake on #1549: with --max-backups 1, a client that got its result and asked
+        // again at once was refused (`Overloaded`) while the finished backup's thread still
+        // held the permit. The permit is released before the result is sent, so the slot is
+        // free whenever a requester has its result, every time.
+        let dir = fresh("slot");
+        let rt = runtime();
+        let b = Backups::new(Some(&dir), 1).unwrap();
+        for i in 0..200 {
+            let (id, _) = download(&rt, &b, b"x").unwrap_or_else(|e| panic!("download {i}: {e:?}"));
+            assert_eq!(
+                b.running.available_permits(),
+                1,
+                "download {i}'s slot is free"
+            );
+            b.release(&id);
+            rt.block_on(b.on_backup_thread(|| Ok::<_, ApiError>(())))
+                .unwrap_or_else(|e| panic!("backup {i}: {e:?}"));
+            assert_eq!(
+                b.running.available_permits(),
+                1,
+                "backup {i}'s slot is free"
+            );
+            b.sweep(Instant::now() + KEEP);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
