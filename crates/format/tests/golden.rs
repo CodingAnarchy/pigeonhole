@@ -1122,3 +1122,46 @@ fn every_on_disk_golden_file_is_frozen() {
         missing.join("\n")
     );
 }
+
+/// D315 amendment (#1504): the sidecar's `RootIntent` entry, type 5. It is the length of a
+/// `Root` entry, framing included, so a root commit's observer overwrites its intent in
+/// place with one write; an older build that knows types 1-4 reads it as unknown, the end
+/// of the history before it, which it only ever meets after a crash (a clean session ends
+/// with every intent overwritten).
+#[test]
+fn feed_sidecar_root_intent() {
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, decode_entries};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 42,
+        },
+        FeedEntry::RootIntent {
+            sequence: 43,
+            checksum: 0x5eed_c0de_1234_abcd,
+        },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar_root_intent.bin", &file);
+    let bytes = golden("feed_sidecar_root_intent.bin");
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+
+    // The same framed length as the Root entry that overwrites it.
+    let (mut intent, mut root) = (Vec::new(), Vec::new());
+    entries[1].encode(&mut intent);
+    FeedEntry::Root {
+        session: 7,
+        sequence: 43,
+    }
+    .encode(&mut root);
+    assert_eq!(intent.len(), root.len());
+}

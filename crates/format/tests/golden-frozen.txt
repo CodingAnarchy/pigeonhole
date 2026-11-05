@@ -39,3 +39,4 @@ values_vector_half.bin 22 4fbba551c92de5da
 edit_put_family_vector_f16.bin 64 31cf5b488e9d740f
 feed_sidecar_catalog.bin 168 0d32b7094fc78ffd
 feed_sidecar_catalog_names.bin 177 af37dfee06a53778
+feed_sidecar_root_intent.bin 90 9d73f00dfdccabea
