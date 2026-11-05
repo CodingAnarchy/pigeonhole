@@ -370,6 +370,7 @@ pub pigeonhole::EngineMetrics::file_growth_nanos: u64
 pub pigeonhole::EngineMetrics::file_growths: u64
 pub pigeonhole::EngineMetrics::flush_failures: u64
 pub pigeonhole::EngineMetrics::flushes: u64
+pub pigeonhole::EngineMetrics::group_sync_nanos: u64
 pub pigeonhole::EngineMetrics::group_syncs: u64
 pub pigeonhole::EngineMetrics::memtable_bytes: u64
 pub pigeonhole::EngineMetrics::memtable_limit_bytes: u64

@@ -98,6 +98,7 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.commits` | `pigeonhole_commits_total` | counter | `{commit}` | `pigeonhole.durability` | Commits completed, by durability level. |
 | `pigeonhole.commit.engine_latency` | `pigeonhole_commit_engine_latency_seconds` | gauge | `s` | `pigeonhole.durability`, `pigeonhole.quantile` | Engine-side commit latency over the latency window: from a commit's submission to its resolution on its shard, excluding the caller's wake-up and the visibility wait. The upper bound of the quantile's bucket; reported for levels with commits in the window. |
 | `pigeonhole.group_syncs` | `pigeonhole_group_syncs_total` | counter | `{sync}` |  | Group syncs finished: each is one WAL sync covering the group_sync commits batched behind it. |
+| `pigeonhole.wal.group_sync.time` | `pigeonhole_wal_group_sync_time_seconds_total` | counter | `s` |  | Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits): not a sync commit's own sync, flush or checkpoint barrier syncs, or buffered commits. |
 | `pigeonhole.transactions` | `pigeonhole_transactions_total` | counter | `{transaction}` | `pigeonhole.outcome` | Transactions committed (outcome committed) and refused with Conflict (outcome conflict). |
 | `pigeonhole.transaction.retries` | `pigeonhole_transaction_retries_total` | counter | `{retry}` |  | Attempts Pigeonhole::transact retried. |
 | `pigeonhole.cross_shard.rounds` | `pigeonhole_cross_shard_rounds_total` | counter | `{round}` |  | Two-phase rounds of cross-shard commits decided. |
@@ -146,9 +147,7 @@ Counters are cumulative from registration. They stay monotonic across an automat
 - **Coverage:** the quantiles cover the commits of the last `latency_window`, whatever the collection interval, and are reported only for durability levels with commits in that window.
 - **Aggregation:** quantiles can't be aggregated across databases or instances (an average of p99s isn't a p99).
 
-**Coming in 1.2.0 (D316's A2–A4),** each in its own release note:
-- `pigeonhole.wal.group_sync.time`;
-- `pigeonhole.feed.lag`.
+**Coming in 1.2.0 (D316's A4):** `pigeonhole.feed.lag`, a watched feed's lag.
 
 ## What to alert on
 In Prometheus terms:
@@ -164,6 +163,8 @@ In Prometheus terms:
 | The feed is near its retention | `pigeonhole_feed_retained_size_bytes > 0.9 * pigeonhole_feed_retained_limit_bytes` | Slow subscribers start expiring with `FeedExpired`. |
 | An old reader snapshot | `pigeonhole_reader_seqno_lag > 1e6` | It holds back reclamation of the versions it can see. |
 | Commit latency | `pigeonhole_commit_engine_latency_seconds{pigeonhole_quantile="0.99"} > 0.01` | Engine-side p99 over the latency window. Pick the threshold from your own baseline. |
+
+The mean group sync time is `rate(pigeonhole_wal_group_sync_time_seconds_total[5m]) / rate(pigeonhole_group_syncs_total[5m])`, the WAL device's sync latency as the commits see it.
 
 The block cache's hit ratio is `rate(pigeonhole_block_cache_requests_total{pigeonhole_cache_result="hit"}[5m]) / rate(pigeonhole_block_cache_requests_total[5m])`.
 

@@ -209,6 +209,12 @@ pub struct Metrics {
     pub memtable_bytes: u64,
     /// The shards' memtable arenas' size, summed over shards (D316 A2).
     pub memtable_limit: u64,
+    /// Group syncs' in-flight time, summed over shards (D248's `sync_busy_nanos`): each
+    /// sync in flight adds its own time, so over the group syncs finished it's the mean sync
+    /// time even with several in flight. Group syncs only, those of groups with a
+    /// `GroupSync` member: a `Sync` commit's own sync isn't in it. Published at each group
+    /// sync's start and finish (D316 A3, ICR 0116).
+    pub group_sync_nanos: u64,
     /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
     /// compactions, summed over shards (D256). Its rise over an interval, divided by the
     /// interval, is how many threads' worth of pool work the store did; zero with the pool
@@ -3211,6 +3217,7 @@ impl Engine {
             let limit = s.memtable_limit.load(Ordering::Relaxed);
             m.memtable_limit += limit;
             m.memtable_bytes += limit.saturating_sub(s.memtable_free.load(Ordering::Relaxed));
+            m.group_sync_nanos += s.sync_busy_nanos.load(Ordering::Relaxed);
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
