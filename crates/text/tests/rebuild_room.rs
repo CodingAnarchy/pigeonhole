@@ -7,11 +7,11 @@
 //! prefix, `rebuild` per page of documents.
 //!
 //! A small arena on one shard and a short stall timeout: a repair and a rebuild that each
-//! rewrite the whole index never come near the timeout, and the index verifies.
+//! rewrite the whole index finish without `Busy`, and the index verifies.
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::*;
 use pigeonhole::{Options, Pigeonhole};
@@ -43,18 +43,13 @@ fn repair_and_rebuild_that_wait_for_arena_room_never_wait_out_the_stall_timeout(
                 .put(&i.to_be_bytes(), &text(&mut rng, 300))
                 .unwrap_or_else(|e| panic!("seed {seed}: put {i}: {e}"));
         }
-        let timed =
-            |what: &str, f: &dyn Fn() -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>| {
-                let start = Instant::now();
-                let stats = f().unwrap_or_else(|e| panic!("seed {seed}: {what}: {e}"));
-                (stats, start.elapsed())
-            };
-        let (repaired, took) = timed("repair", &|| index.repair());
+        // A commit that waited out the stall timeout fails with `Busy`: the regression shows
+        // as this error, never as a timing check, which a loaded runner could trip with no
+        // stall at all (perf287 on #1524).
+        let repaired = index
+            .repair()
+            .unwrap_or_else(|e| panic!("seed {seed}: repair: {e}"));
         assert_eq!(repaired.documents, u64::from(n), "seed {seed}");
-        assert!(
-            took < TIMEOUT,
-            "seed {seed}: the repair took {took:?}: a commit waited for room its own snapshot held"
-        );
         // New text written around the index, so the rebuild re-indexes every document.
         for i in 0..n {
             t.mutate(&i.to_be_bytes())
@@ -62,15 +57,13 @@ fn repair_and_rebuild_that_wait_for_arena_room_never_wait_out_the_stall_timeout(
                 .commit()
                 .unwrap();
         }
-        let (rebuilt, took) = timed("rebuild", &|| index.rebuild());
+        let rebuilt = index
+            .rebuild()
+            .unwrap_or_else(|e| panic!("seed {seed}: rebuild: {e}"));
         assert_eq!(rebuilt.documents, u64::from(n), "seed {seed}");
         assert!(
             rebuilt.changed > 0,
             "seed {seed}: the rebuild re-indexed nothing"
-        );
-        assert!(
-            took < TIMEOUT,
-            "seed {seed}: the rebuild took {took:?}: a commit waited for room its own snapshot held"
         );
         let v = index.verify().unwrap();
         assert!(v.is_consistent(), "seed {seed}: {v:?}");
