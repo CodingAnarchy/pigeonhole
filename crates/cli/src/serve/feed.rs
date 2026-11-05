@@ -1164,6 +1164,94 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_client_that_keeps_taking_outlasts_a_large_events_wait() {
+        // simp724's I1 on #1536: a large event waits for the whole buffer to drain. A client
+        // that takes an event every 200 ms, under the 250 ms idle limit, drains it in far
+        // more than 250 ms, and must not time out: the limit counts from its last take. On a
+        // paused clock (#1531), so the pacing and the limit are virtual time, whatever the
+        // runner's speed. The hub's task is stopped and the test pushes for it.
+        let (_, db, dir) = commits("slow", 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 16 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(3600),
+                stream_idle: Duration::from_millis(250),
+                client_events: CLIENT_EVENTS,
+                client_bytes: 4096,
+            },
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let mut direct = t.feed().open().unwrap();
+        let mut want = Vec::new();
+        rt.block_on(async {
+            let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            hub.task.abort();
+            let mut c = feeds
+                .subscribe(
+                    Spec {
+                        tables: vec![t.clone()],
+                        prefix: Vec::new(),
+                        visible: false,
+                        start: Start::Now,
+                    },
+                    Arc::clone(&slots).try_acquire_owned().unwrap(),
+                    |_| {},
+                )
+                .unwrap();
+            // 60 small commits, then one larger than the whole buffer, then a small one.
+            let rows = (0..60)
+                .map(|i| (format!("r{i:04}").into_bytes(), vec![b'v']))
+                .chain([
+                    (b"zbig".to_vec(), vec![7u8; 8192]),
+                    (b"zz".to_vec(), vec![b'v']),
+                ]);
+            for (row, value) in rows {
+                want.push(
+                    t.mutate(&row)
+                        .put("f", b"q", &value)
+                        .commit()
+                        .unwrap()
+                        .seqno,
+                );
+                let commit = direct
+                    .next(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .clone();
+                let token = Bytes::copy_from_slice(direct.token().as_bytes());
+                hub.push(commit, token, direct.position().seqno(), 16 << 20);
+            }
+            let mut got = Vec::new();
+            while got.len() < want.len() {
+                use futures_core::Stream as _;
+                let e = std::future::poll_fn(|cx| Pin::new(&mut c).poll_next(cx))
+                    .await
+                    .expect("the stream goes on")
+                    .unwrap_or_else(|e| panic!("after {} events: {e:?}", got.len()));
+                if let Some(proto::feed_event::Event::Commit(commit)) = e.event {
+                    got.push(commit.seqno);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            assert_eq!(got, want);
+            drop((c, hub));
+        });
+        drop(t);
+        drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
         // simp724's F5 on #1518, made deterministic: on a current-thread runtime the client's
         // task can't run until the test awaits, so the ring gets the commit first. The start

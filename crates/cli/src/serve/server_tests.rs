@@ -1308,8 +1308,13 @@ fn a_commit_whose_client_went_away_still_lands_and_is_recorded() {
 
 #[test]
 fn transaction_expired_comes_only_before_a_commit() {
+    // The test drives the expiry itself, with `sweep` at a chosen instant: the reaper runs
+    // on the wall clock and, with a short lease on a slow runner, can reap the expired
+    // marker before the test reads it (#1531). With a lease this long, it never does. The
+    // sweep's instant is past both the idle lease and `limits()`'s 300 s transaction
+    // lifetime, so either would expire them.
     let mut l = limits();
-    l.leases.txn_idle = Duration::from_millis(300);
+    l.leases.txn_idle = Duration::from_secs(600);
     let s = Server::start("", l);
     let idle = begin(&s, None);
     let committed = begin(&s, None);
@@ -1319,7 +1324,12 @@ fn transaction_expired_comes_only_before_a_commit() {
         None,
     );
     assert_eq!(status, 200, "{body}");
-    std::thread::sleep(Duration::from_millis(450));
+    let lapsed = std::time::Instant::now() + Duration::from_secs(601);
+    assert_eq!(
+        s.shared.router.service.sessions.sweep(lapsed),
+        2,
+        "both lapse"
+    );
     // The idle one expired before any Commit: safe to start again from Begin.
     let (status, e) = s.rpc("Transactions/Commit", &json!({"txn_id": idle}), None);
     assert_eq!(
@@ -1746,53 +1756,6 @@ fn a_feed_clients_buffer_is_bounded_by_bytes_too() {
 }
 
 #[test]
-fn a_slow_feed_client_that_keeps_taking_outlasts_a_large_events_wait() {
-    // simp724's I1 on #1536: a large event waits for the whole buffer to drain. A client
-    // taking an event every 60 ms (under the 250 ms idle limit) drains it in well over
-    // 250 ms, and must not time out: the limit counts from its last take. The writes run on
-    // their own thread, so the client takes from the first event on.
-    let mut l = limits();
-    l.stream_idle = Duration::from_millis(250);
-    l.feed_client_bytes = 4096;
-    let s = Server::start("", l);
-    let mut slow = direct_feed(&s, subscribe(&["t"], b""));
-    let t = s
-        .shared
-        .router
-        .service
-        .db
-        .table("t")
-        .unwrap()
-        .open()
-        .unwrap();
-    let writer = std::thread::spawn(move || {
-        let mut want: Vec<u64> = (0..60)
-            .map(|i| {
-                t.mutate(format!("r{i:04}").as_bytes())
-                    .put("f", b"q", b"v")
-                    .commit()
-                    .unwrap()
-                    .seqno
-            })
-            .collect();
-        // Larger than the whole buffer: it goes alone, once every earlier event is taken.
-        for (row, value) in [(&b"zbig"[..], &[7u8; 8192][..]), (b"zz", b"v")] {
-            want.push(t.mutate(row).put("f", b"q", value).commit().unwrap().seqno);
-        }
-        want
-    });
-    let mut got = Vec::new();
-    while got.len() < 62 {
-        match next_event(&s, &mut slow, Duration::from_secs(5)) {
-            Some(Ok(e)) => got.extend(commit_of(&e).map(|(n, _)| n)),
-            other => panic!("after {} events: {other:?}", got.len()),
-        }
-        std::thread::sleep(Duration::from_millis(60));
-    }
-    assert_eq!(got, writer.join().unwrap());
-}
-
-#[test]
 fn grpc_feed_events_match_the_services_shared_encoding_or_not() {
     // Encode-once (#1397 ticket 5): a client with no prefix gets each ring entry as bytes
     // encoded once for all such clients; a prefixed one gets its own message. Over the wire
@@ -2054,6 +2017,8 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     // asks for it. With a deeper one it could buffer all five, rejoin and free the slot
     // first.
     l.feed_client_events = 1;
+    // Not an idle-limit test: out of reach of a slow runner (#1531).
+    l.stream_idle = Duration::from_secs(600);
     let s = Server::start("", l);
     let written: Vec<u64> = (0..5)
         .map(|i| write_row(&s, format!("r{i}").as_bytes()))
@@ -2068,20 +2033,25 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
-    // The second gets its slot only once the first has rejoined the ring (up to a
-    // REJOIN_TICK after it caught up). So collect until every commit is in or a long
-    // deadline passes, never stopping at a quiet spell: a slow runner can pause longer than
-    // any short window (#1527's CI on macOS).
-    for events in [&mut first, &mut second] {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut got = Vec::new();
-        while got.len() < written.len() && std::time::Instant::now() < deadline {
-            if let Some(e) = next_event(&s, events, Duration::from_millis(200)) {
-                got.extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+    // Either client may hold the slot: their tasks race for it. Whichever does gets it back
+    // only once it has caught up and rejoined the ring (up to a REJOIN_TICK later), and
+    // with a one-event buffer it catches up only as its events are taken. So take from both
+    // streams in turn, never one to the end first: reading the waiting one first would
+    // starve the holder (#1531: on Windows CI, nothing moved for 10 s). Collect until every
+    // commit is in, or a long deadline passes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut got = [Vec::new(), Vec::new()];
+    while got.iter().any(|g| g.len() < written.len()) && std::time::Instant::now() < deadline {
+        for (i, events) in [&mut first, &mut second].into_iter().enumerate() {
+            if got[i].len() < written.len()
+                && let Some(e) = next_event(&s, events, Duration::from_millis(50))
+            {
+                got[i].extend(commit_of(&e.unwrap()).map(|(n, _)| n));
             }
         }
-        assert_eq!(got, written);
     }
+    assert_eq!(got[0], written, "the first stream");
+    assert_eq!(got[1], written, "the second stream");
 }
 
 #[test]
