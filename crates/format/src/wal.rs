@@ -688,7 +688,8 @@ impl BatchBuilder {
         }
     }
 
-    /// Marks the batch as a primary's logged mutations ([`BatchBuilder::logged`]).
+    /// Marks the batch as a primary's logged mutations (a replica's apply, D315 PR 3): a mark
+    /// for the engine, not encoded, kept in the padding after the count.
     pub fn mark_logged(&mut self) {
         self.logged = true;
     }
