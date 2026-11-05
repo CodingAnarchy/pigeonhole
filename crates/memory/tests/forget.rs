@@ -171,6 +171,53 @@ fn uses_raise_retention_and_passes_are_bounded_and_resumable() {
     db.close().unwrap();
 }
 
+/// #1507: a pass reads its scan in pages of 256 rows, each with its own short-lived view.
+/// Over 600 memories (three pages, the last one short) it examines each exactly once; with
+/// a bound that stops it partway into the second page, the resumed pass examines the rest,
+/// none twice; and the memories it keeps are exactly the used one.
+#[test]
+fn a_pass_over_several_scan_pages_sees_every_memory_once() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "m", StoreOptions::new()).unwrap();
+    let mut all = Vec::new();
+    for i in 0..600 {
+        all.push(
+            store
+                .remember("a", Memory::new(format!("note {i}")).importance(0.0))
+                .unwrap(),
+        );
+    }
+    for _ in 0..3 {
+        store.mark_used(&[all[0].id().clone()]).unwrap();
+    }
+    let t = now();
+    let whole = ForgetPolicy::new().min_retention(0.1).max_per_pass(10_000);
+    let bounded = ForgetPolicy::new().min_retention(0.1).max_per_pass(300);
+    let first = store.forget().policy(&bounded).now_us(t).run().unwrap();
+    assert_eq!(first.deleted, 300);
+    let resume = first
+        .resume
+        .clone()
+        .expect("a pass stopped by its bound resumes");
+    let second = store
+        .forget()
+        .policy(&whole)
+        .after(&resume)
+        .now_us(t)
+        .run()
+        .unwrap();
+    assert_eq!(
+        first.examined + second.examined,
+        600,
+        "{first:?} then {second:?}"
+    );
+    assert_eq!((second.deleted, second.resume.clone()), (299, None));
+    assert_eq!(ids(&store), vec![all[0].id().clone()]);
+    check(&store, "paged passes");
+    db.close().unwrap();
+}
+
 /// A memory due under `policy`, a transaction that re-evaluated it (`forget_in`), then
 /// `race` committed in between: the forget's commit conflicts, and a retry keeps the memory.
 fn race(name: &str, race: impl FnOnce(&Store, &MemoryId)) {

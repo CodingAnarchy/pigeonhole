@@ -303,7 +303,11 @@ counter 8661 0.5
 rows 18847 0.3
 level-scans 13814 0.6
 short-scans 13068 0.3
-commit-one 8589 0.3
+# Raised by D195 (owner decision, 2026-10-09; up to about 0.5% per shape, with its reason):
+# commit-one 8589 -> 8590 (+0.01%), codegen drift on main after #1512 (D316 A2). #1512 sat
+# exactly at 8589, which zero commit-path cost left unchanged, and main's base build in #1515's
+# instructions job counted 8590 on code #1512 doesn't touch.
+commit-one 8590 0.3
 commit-sixteen 36382 0.3
 flush 2087 0.3
 compact 2615 0.5
