@@ -1036,6 +1036,14 @@ impl Pigeonhole {
         Arc::ptr_eq(&self.db, &other.db)
     }
 
+    /// The highest seqno a new snapshot may include now: every commit at or below it is
+    /// visible (D316 A4, ICR 0116). Cheap: a few atomic loads, no snapshot taken. Against a
+    /// feed's [`FeedProgress::covered_seqno`](crate::FeedProgress::covered_seqno), it is
+    /// the feed's lag in commits.
+    pub fn visible_seqno(&self) -> u64 {
+        self.engine().visible_seqno()
+    }
+
     /// Whether the database was closed ([`close`](Self::close), through this handle or any
     /// clone of it): every operation then fails with
     /// [`ErrorCode::Closed`](crate::ErrorCode::Closed). Cheap (one atomic load): a library

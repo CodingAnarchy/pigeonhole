@@ -1866,6 +1866,12 @@ impl Engine {
         self.inner.drop_table(table)
     }
 
+    /// The highest seqno a new snapshot may include now: every commit at or below it is
+    /// applied on every shard (D316 A4, ICR 0116). One Acquire load per shard plus two.
+    pub fn visible_seqno(&self) -> Seqno {
+        self.inner.shared.shm.visible_seqno()
+    }
+
     // ---- writes ----
 
     /// The writer default durability.

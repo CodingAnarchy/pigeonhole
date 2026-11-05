@@ -1133,3 +1133,85 @@ fn a_position_s_catalog_part_covers_a_change_only_once_delivered() {
     drop(r);
     db.close().unwrap();
 }
+
+/// D316 A4 (#1523; perf287's L1, feed1248's P1): a progress sink follows the feed's covered
+/// position, so a caught-up feed reads as caught up even when the database's seqnos moved
+/// past it with nothing for it to deliver. Here that's three `None` commits to a table the
+/// feed doesn't carry (no fed record) and an aborted cross-shard round, whose id seqno no
+/// record holds. Once the feed drains, the sink is the visible seqno: before a flush and
+/// after one.
+#[test]
+fn a_progress_sink_reaches_the_visible_seqno_on_a_caught_up_feed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let vfs = SimVfs::new(3111);
+    let (a, b) = {
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let t = tables(&db);
+        db.close().unwrap();
+        t
+    };
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(&vfs, Some(feed(1 << 20)))).unwrap();
+    // A visible feed of `a` alone, so a caught-up position is the visible seqno.
+    let mut r = db
+        .feed(FeedSpec {
+            durable: false,
+            ..spec(&[&a], FeedStart::Now)
+        })
+        .unwrap();
+    let sink = Arc::new(AtomicU64::new(0));
+    r.set_progress(Arc::clone(&sink));
+    let commit = |shards: &mut [EngineShard], t: &TableInfo, row: &[u8], d: Durability| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t, row, b"v");
+        drive(shards, db.submit(wb, Some(d)).unwrap())
+            .unwrap()
+            .seqno
+    };
+    let fed = commit(&mut shards, &a, b"fed", Durability::Buffered);
+    for i in 0..3u8 {
+        commit(&mut shards, &b, &[b'n', i], Durability::None);
+    }
+    // An aborted cross-shard round (as `aborted_round`): validation fails on a's shard after
+    // b's shard wrote its PREPARE, and the round's id seqno is never applied.
+    let mut txn = db.begin().unwrap();
+    txn.get(a.id, a.families[0].id, b"r", b"q").unwrap();
+    commit(&mut shards, &a, b"r", Durability::Buffered);
+    for (t, row) in [(&a, &b"r"[..]), (&b, &b"t"[..])] {
+        txn.batch()
+            .put(
+                t.id,
+                t.families[0].id,
+                row,
+                b"q",
+                None,
+                ValueRef::Bytes(b"t"),
+            )
+            .unwrap();
+    }
+    let pc = txn.submit(Some(Durability::Buffered)).unwrap();
+    assert!(matches!(
+        drive(&mut shards, pc),
+        Err(pigeonhole_engine::Error::Conflict)
+    ));
+    let got: Vec<Seqno> = drain(&mut r, &mut shards).iter().map(|c| c.seqno).collect();
+    assert_eq!(got.first(), Some(&fed), "{got:?}");
+    let visible = db.visible_seqno();
+    assert!(
+        visible > *got.last().unwrap(),
+        "seqnos past the feed's last commit: {got:?}"
+    );
+    assert_eq!(
+        sink.load(Ordering::Relaxed),
+        visible,
+        "a caught-up feed covers up to the visible seqno"
+    );
+    let flush = db.submit_flush().unwrap();
+    drive(&mut shards, flush).unwrap();
+    assert!(drain(&mut r, &mut shards).is_empty());
+    assert_eq!(
+        sink.load(Ordering::Relaxed),
+        db.visible_seqno(),
+        "after the flush"
+    );
+}
