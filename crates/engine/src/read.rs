@@ -1227,7 +1227,10 @@ impl ScanCursor {
         &self.row
     }
 
-    /// The next cell of the current row, or `None` when the row is done.
+    /// The next cell of the current row, or `None` when the row is done. `#[inline]`: a row
+    /// page walk (`pigeonhole`'s `RowPages`) inlines it, and without the hint an unrelated
+    /// change to this crate tipped it out of line (+1.3% `wide-row-pages` on #1562).
+    #[inline]
     pub fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>> {
         let mut qual = std::mem::take(&mut self.qual_buf);
         qual.clear();

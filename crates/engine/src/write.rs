@@ -50,9 +50,6 @@ pub struct WriteBatch {
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
-    /// Whether it holds a primary's logged mutations ([`push_logged`](Self::push_logged),
-    /// D315 PR 3): routed as logged, never converted or prepared again.
-    pub(crate) logged: bool,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -107,7 +104,6 @@ impl Default for WriteBatch {
             builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
-            logged: false,
         }
     }
 }
@@ -306,10 +302,17 @@ impl WriteBatch {
         ts: Timestamp,
         stored: &[u8],
     ) -> crate::Result<()> {
-        self.logged = true;
+        self.builder.mark_logged();
         self.builder
             .push(table, family, kind, row, qualifier, Some(ts), stored)?;
         Ok(())
+    }
+
+    /// Whether it holds a primary's logged mutations ([`push_logged`](Self::push_logged),
+    /// D315 PR 3): routed as logged, never converted or prepared again. The mark is the
+    /// builder's (`BatchBuilder::is_logged`), in its padding, so the batch doesn't grow.
+    pub(crate) fn logged(&self) -> bool {
+        self.builder.is_logged()
     }
 
     /// Mutations so far.
@@ -326,7 +329,6 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.builder.clear();
         self.row_deletes.clear();
-        self.logged = false;
     }
 
     /// The encoded mutations (row deletes excluded until expanded).

@@ -1972,7 +1972,7 @@ impl Engine {
         state: &[u8],
         max_ts: Timestamp,
     ) -> Result<CommitInfo> {
-        if batch.is_empty() || !batch.logged || !batch.row_deletes.is_empty() {
+        if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
             return Err(Error::InvalidArgument(
                 "a replicated run is a non-empty batch of logged mutations".to_owned(),
             ));
@@ -4940,7 +4940,7 @@ impl Inner {
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
-        if batch.logged {
+        if batch.logged() {
             return route_logged(batch, view);
         }
         if self.replica.load(Ordering::Relaxed) {

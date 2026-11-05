@@ -626,6 +626,10 @@ pub struct BatchBuilder {
     /// `count u32 LE` followed by the encoded mutations.
     buf: Vec<u8>,
     count: u32,
+    /// A mark for the engine, not encoded: the batch holds a primary's logged mutations (a
+    /// replica's apply, D315 PR 3). Here rather than beside the builder, so it sits in the
+    /// padding after `count` and a batch moved by value on every commit doesn't grow.
+    logged: bool,
 }
 
 impl Default for BatchBuilder {
@@ -633,6 +637,7 @@ impl Default for BatchBuilder {
         Self {
             buf: vec![0; 4],
             count: 0,
+            logged: false,
         }
     }
 }
@@ -676,7 +681,21 @@ impl BatchBuilder {
     pub fn with_capacity(bytes: usize) -> Self {
         let mut buf = Vec::with_capacity(4 + bytes);
         buf.extend_from_slice(&[0; 4]);
-        Self { buf, count: 0 }
+        Self {
+            buf,
+            count: 0,
+            logged: false,
+        }
+    }
+
+    /// Marks the batch as a primary's logged mutations ([`BatchBuilder::logged`]).
+    pub fn mark_logged(&mut self) {
+        self.logged = true;
+    }
+
+    /// Whether [`mark_logged`](Self::mark_logged) marked it (since the last `clear`).
+    pub fn is_logged(&self) -> bool {
+        self.logged
     }
 
     /// Appends one mutation. `ts == None` means "use the commit timestamp". `value` is an
@@ -777,6 +796,7 @@ impl BatchBuilder {
         self.buf.truncate(4);
         self.buf.fill(0);
         self.count = 0;
+        self.logged = false;
     }
 }
 
