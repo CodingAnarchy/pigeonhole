@@ -40,9 +40,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     ))
     .max_decoding_message_size(limits.max_request_bytes)
     .max_encoding_message_size(usize::MAX);
-    let feeds = proto::feed_server::FeedServer::new(super::grpc::FeedGrpc(Arc::clone(&shared)))
-        .max_decoding_message_size(limits.max_request_bytes)
-        .max_encoding_message_size(usize::MAX);
+    let feeds = super::grpc::FeedGrpc {
+        shared: Arc::clone(&shared),
+        max_request_bytes: limits.max_request_bytes,
+    };
     let snapshots = proto::snapshots_server::SnapshotsServer::new(super::grpc::SnapshotGrpc(
         Arc::clone(&shared),
     ))
