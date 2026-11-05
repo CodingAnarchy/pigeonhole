@@ -1099,6 +1099,12 @@ impl Pigeonhole {
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
     /// is applied, possibly before its fsync (D227): a power loss can remove what it read.
+    ///
+    /// While it lives, it keeps the memtables it saw in memory, flushed ones included. Don't
+    /// hold one across a commit on the same thread: a commit that waits for memtable room
+    /// would wait on room only this snapshot keeps, and fail with `Busy` after the write-stall
+    /// timeout. Copy out what you read, drop the snapshot, then commit (the user guide's
+    /// transactions page, #1497).
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.db.snapshot(&self.cached)
     }
