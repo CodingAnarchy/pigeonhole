@@ -247,6 +247,9 @@ struct FeedChildReport {
     delivered: Vec<(u32, u64)>,
     expired: u64,
     errors: u64,
+    /// 1 if the drain's deadline stopped it short of the parent's seqno.
+    #[serde(default)]
+    drain_timeouts: u64,
     secs: f64,
     /// User + system CPU seconds over the run (Linux), `None` elsewhere.
     cpu_secs: Option<f64>,
@@ -267,6 +270,7 @@ pub(crate) struct FeedChildrenReport {
     pub(crate) hist: Histogram,
     pub(crate) expired: u64,
     pub(crate) errors: u64,
+    pub(crate) drain_timeouts: u64,
     pub(crate) cpu_per_sec: Option<f64>,
     pub(crate) wakeups_per_sec: Option<f64>,
 }
@@ -325,6 +329,7 @@ impl FeedChildren {
             hist: Histogram::new(),
             expired: 0,
             errors: 0,
+            drain_timeouts: 0,
             cpu_per_sec: Some(0.0),
             wakeups_per_sec: Some(0.0),
         };
@@ -339,6 +344,7 @@ impl FeedChildren {
             out.hist.merge(&Histogram::from_sparse(&r.delivered));
             out.expired += r.expired;
             out.errors += r.errors;
+            out.drain_timeouts += r.drain_timeouts;
             let secs = r.secs.max(1e-9);
             out.cpu_per_sec = out.cpu_per_sec.zip(r.cpu_secs).map(|(a, c)| a + c / secs);
             out.wakeups_per_sec = out
@@ -420,6 +426,7 @@ pub fn child_feed(path: &Path) -> Result<(), String> {
         delivered: followed.hist.to_sparse(),
         expired: followed.expired,
         errors: followed.errors,
+        drain_timeouts: followed.drain_timeouts,
         secs,
         cpu_secs: cpu0.zip(cpu_secs()).map(|(a, b)| b - a),
         wakeups: wake0.zip(wakeups()).map(|(a, b)| b.saturating_sub(a)),

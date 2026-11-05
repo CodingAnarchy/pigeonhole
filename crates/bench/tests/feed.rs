@@ -86,10 +86,15 @@ fn a_run_reports_its_feed_subscribers_and_the_feed_s_syncs() {
         "{f}"
     );
     assert_eq!(
-        (f["expired"].as_u64(), f["errors"].as_u64()),
-        (Some(0), Some(0)),
+        (
+            f["expired"].as_u64(),
+            f["errors"].as_u64(),
+            f["drain_timeouts"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0)),
         "{f}"
     );
+    assert!(f["drain_ms"].is_u64(), "{f}");
     // Buffered commits on a durable feed: the feed's own syncs ran, and no group sync.
     assert!(f["background_syncs"].as_u64().unwrap() >= 1, "{f}");
     assert_eq!(f["group_syncs"].as_u64(), Some(0), "{f}");

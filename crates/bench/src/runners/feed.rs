@@ -43,10 +43,16 @@ impl Stop {
         self.through.get().is_some()
     }
 
-    fn done(&self, covered: u64) -> bool {
-        self.through
-            .get()
-            .is_some_and(|&(through, deadline)| covered >= through || Instant::now() >= deadline)
+    /// `None` to go on; else whether the deadline ended it (with `through` not covered).
+    fn ended(&self, covered: u64) -> Option<bool> {
+        let &(through, deadline) = self.through.get()?;
+        if covered >= through {
+            Some(false)
+        } else if Instant::now() >= deadline {
+            Some(true)
+        } else {
+            None
+        }
     }
 }
 
@@ -63,6 +69,8 @@ pub(crate) struct Followed {
     pub(crate) hist: Histogram,
     pub(crate) expired: u64,
     pub(crate) errors: u64,
+    /// 1 if the drain's deadline stopped it before it covered the phase's last commit.
+    pub(crate) drain_timeouts: u64,
 }
 
 /// Follows `feed` until `stop` says so, recording each commit's delivery latency. An expired
@@ -73,7 +81,11 @@ pub(crate) fn follow(
     stop: &Stop,
 ) -> Followed {
     let mut out = Followed::default();
-    while !stop.done(feed.progress().covered_seqno()) {
+    loop {
+        if let Some(timed_out) = stop.ended(feed.progress().covered_seqno()) {
+            out.drain_timeouts = u64::from(timed_out);
+            return out;
+        }
         match feed.next(POLL) {
             Ok(Some(c)) => {
                 let late = now_micros().saturating_sub(c.timestamp());
@@ -96,7 +108,6 @@ pub(crate) fn follow(
             }
         }
     }
-    out
 }
 
 /// The feed's counters at a point, to subtract.
@@ -201,11 +212,12 @@ impl Running {
         let after = Counters::read(&self.db);
         // The phase's writers are done: every subscriber delivers through the last commit.
         let through = self.db.visible_seqno();
+        let drained = Instant::now();
         self.stop.drain(through);
         if let Some(r) = &mut self.readers {
             r.drain(through);
         }
-        let (mut expired, mut errors) = (0, 0);
+        let (mut expired, mut errors, mut drain_timeouts) = (0, 0, 0);
         let mut join = |handles: Vec<JoinHandle<Followed>>| -> Result<(u32, Histogram), String> {
             let n = handles.len() as u32;
             let mut hist = Histogram::new();
@@ -214,6 +226,7 @@ impl Running {
                 hist.merge(&f.hist);
                 expired += f.expired;
                 errors += f.errors;
+                drain_timeouts += f.drain_timeouts;
             }
             Ok((n, hist))
         };
@@ -230,6 +243,7 @@ impl Running {
             visible_delivery: LatencyStats::of(&visible),
             expired,
             errors,
+            drain_timeouts,
             background_syncs: after.background.saturating_sub(self.before.background),
             group_syncs: after.group.saturating_sub(self.before.group),
             sidecar_syncs: after.sidecar.saturating_sub(self.before.sidecar),
@@ -246,7 +260,9 @@ impl Running {
             report.reader_wakeups_per_sec = f.wakeups_per_sec;
             report.expired += f.expired;
             report.errors += f.errors;
+            report.drain_timeouts += f.drain_timeouts;
         }
+        report.drain_ms = drained.elapsed().as_millis() as u64;
         Ok(report)
     }
 }
