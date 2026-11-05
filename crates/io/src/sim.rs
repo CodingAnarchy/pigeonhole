@@ -317,6 +317,8 @@ struct SimState {
     /// Deferred file-system operations (directory syncs) are not picked by `complete_io`
     /// or the background device while set ([`SimVfs::hold_dir_syncs`]).
     hold_vfs: bool,
+    /// Whether deferred file syncs are held back ([`SimVfs::hold_file_syncs`]).
+    hold_file_syncs: bool,
 }
 
 /// A deferred operation: `job` runs it on its file and resolves its completion.
@@ -325,6 +327,9 @@ struct InFlight {
     /// A write or sync submitted inside an `inline_io` scope (a background worker's slice,
     /// D284): [`SimVfs::inline_writes_in_flight`] counts these.
     inline_write: bool,
+    /// A file sync (`submit_sync_data` or `submit_sync_all`), which
+    /// [`SimVfs::hold_file_syncs`] holds back.
+    file_sync: bool,
     /// The submitting thread, in owner-reaps mode: the only one that completes it.
     owner: Option<std::thread::ThreadId>,
     target: Target,
@@ -512,11 +517,17 @@ impl SimState {
         self.gc();
     }
 
-    /// Whether an in-flight operation may be picked by the device (not a held directory sync).
+    /// Whether an in-flight operation may be picked by the device (not a held directory or
+    /// file sync).
     fn has_eligible_io(&self) -> bool {
-        self.in_flight
-            .iter()
-            .any(|op| !(self.hold_vfs && matches!(op.target, Target::Vfs { .. })))
+        self.in_flight.iter().any(|op| !self.held(op))
+    }
+
+    /// Whether `op` is held back from the device: a directory sync under
+    /// [`SimVfs::hold_dir_syncs`], or a file sync under [`SimVfs::hold_file_syncs`].
+    fn held(&self, op: &InFlight) -> bool {
+        (self.hold_vfs && matches!(op.target, Target::Vfs { .. }))
+            || (self.hold_file_syncs && op.file_sync)
     }
 
     fn crash(&mut self, kind: CrashKind) {
@@ -616,6 +627,7 @@ impl SimVfs {
                 closing: HashSet::new(),
                 crashes: 0,
                 hold_vfs: false,
+                hold_file_syncs: false,
             }),
             io_submitted: Condvar::new(),
         })
@@ -831,6 +843,15 @@ impl SimVfs {
         self.io_submitted.notify_all();
     }
 
+    /// Holds deferred file syncs (`File::submit_sync_data`, `File::submit_sync_all`) back
+    /// while `on`, as [`SimVfs::hold_dir_syncs`] does directory syncs: neither
+    /// [`SimVfs::complete_io`] nor the background device picks them (a thread blocked on one
+    /// still runs it). A test hook for a sync kept in flight while more is written.
+    pub fn hold_file_syncs(&self, on: bool) {
+        self.state().hold_file_syncs = on;
+        self.io_submitted.notify_all();
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()
@@ -892,11 +913,13 @@ impl SimVfs {
             .expect("spawn the simulated I/O thread")
     }
 
-    /// Runs `run` on `file` now, or defers it (see [`SimVfs::set_deferred_io`]).
+    /// Runs `run` on `file` now, or defers it (see [`SimVfs::set_deferred_io`]). `file_sync`:
+    /// a sync, which [`SimVfs::hold_file_syncs`] holds back.
     fn submit<T: Send + 'static>(
         &self,
         file: &SimFile,
         write: bool,
+        file_sync: bool,
         run: impl FnOnce(&SimFile) -> Result<T> + Send + 'static,
     ) -> Completion<T> {
         // An operation a WAL foreground call submits stays its, wherever it runs.
@@ -936,6 +959,7 @@ impl SimVfs {
         st.in_flight.push(InFlight {
             id,
             inline_write: write && crate::own::in_inline_io(),
+            file_sync,
             owner,
             target: Target::File {
                 node: file.node,
@@ -983,6 +1007,7 @@ impl SimVfs {
         st.in_flight.push(InFlight {
             id,
             inline_write: false,
+            file_sync: false,
             owner,
             target: Target::Vfs {
                 crashes,
@@ -1004,12 +1029,9 @@ impl SimVfs {
             let i = match id {
                 Some(id) => st.in_flight.iter().position(|op| op.id == id),
                 None => {
-                    // While directory syncs are held, the device picks among the rest.
-                    let held = st.hold_vfs;
+                    // While syncs are held, the device picks among the rest.
                     let eligible: Vec<usize> = (0..st.in_flight.len())
-                        .filter(|&i| {
-                            !(held && matches!(st.in_flight[i].target, Target::Vfs { .. }))
-                        })
+                        .filter(|&i| !st.held(&st.in_flight[i]))
                         .collect();
                     if eligible.is_empty() {
                         None
@@ -1304,7 +1326,7 @@ impl File for SimFile {
         if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
-        self.vfs.submit(self, false, move |f| {
+        self.vfs.submit(self, false, false, move |f| {
             f.read_at(&mut buf, offset).map(|()| buf)
         })
     }
@@ -1313,8 +1335,9 @@ impl File for SimFile {
         if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
-        self.vfs
-            .submit(self, true, move |f| f.write_at(&buf, offset).map(|()| buf))
+        self.vfs.submit(self, true, false, move |f| {
+            f.write_at(&buf, offset).map(|()| buf)
+        })
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -1322,7 +1345,7 @@ impl File for SimFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
-        self.vfs.submit(self, true, SimFile::sync_data)
+        self.vfs.submit(self, true, true, SimFile::sync_data)
     }
 
     fn sync_all(&self) -> Result<()> {
@@ -1330,7 +1353,7 @@ impl File for SimFile {
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
-        self.vfs.submit(self, true, SimFile::sync_all)
+        self.vfs.submit(self, true, true, SimFile::sync_all)
     }
 
     fn len(&self) -> Result<u64> {
