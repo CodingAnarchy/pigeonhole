@@ -697,3 +697,322 @@ fn the_async_budgeted_nearest_search_equals_the_sync_one() {
     }
     db.close().unwrap();
 }
+
+/// #1286 (ICR 0122): a page's parts, to compare a sync and an async read.
+#[cfg(feature = "async")]
+type Summary = (Vec<Cell>, u64, Option<u64>, Option<Vec<u8>>);
+
+#[cfg(feature = "async")]
+fn scan_summary(p: &pigeonhole::ScanPage) -> Summary {
+    (
+        cells_of(p.rows()),
+        p.bytes(),
+        p.next_bytes(),
+        p.resume().map(ScanPosition::to_bytes),
+    )
+}
+
+#[cfg(feature = "async")]
+fn keys_summary(p: &pigeonhole::KeysPage) -> Summary {
+    (
+        cells_of(p.rows()),
+        p.bytes(),
+        p.next_bytes(),
+        p.resume().map(KeysPosition::to_bytes),
+    )
+}
+
+/// #1286: `read_within_async` gives `read_within`'s page, over the D308 cases. Each case is
+/// read at budgets across row and column boundaries, then followed page by page to the end.
+/// The cases: versions, column limits, families named out of id order (simp724's A3), a
+/// value filter with one and three versions and with a column limit (Q, A1), `limit`, and a
+/// key set with a missing key.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_page_is_the_sync_page() {
+    use pigeonhole::doc_support::block_on;
+    use pigeonhole::{Scan, ValueFilter};
+    let (db, t) = db("async-equal");
+    let snap = db.snapshot().unwrap();
+    // `d` is family g's second column (q3), so a column limit of 1 counts a failing column
+    // first unless only passing columns count (simp724's A1).
+    let b = || ValueFilter::Prefix(b"d".to_vec());
+    type Case = for<'a> fn(Scan<'a>, &dyn Fn() -> ValueFilter) -> Scan<'a>;
+    let cases: [(&str, Case); 9] = [
+        ("plain", |s, _| s),
+        ("versions 3", |s, _| s.versions(3)),
+        ("column limit 2", |s, _| s.column_limit(2)),
+        ("versions 3, column limit 1", |s, _| {
+            s.versions(3).column_limit(1)
+        }),
+        ("families g, f", |s, _| s.family("g").family("f")),
+        ("value filter", |s, b| s.value_filter(b())),
+        ("value filter, versions 3", |s, b| {
+            s.versions(3).value_filter(b())
+        }),
+        ("value filter, column limit 1", |s, b| {
+            s.column_limit(1).value_filter(b())
+        }),
+        ("limit 7", |s, _| s.limit(7)),
+    ];
+    for (name, case) in cases {
+        let scan = || case(t.scan_prefix(b"r").snapshot(&snap), &b);
+        for budget in [0, 1, 20, 37, 100, 250, 600, 2000, 1 << 30] {
+            let sync = scan_summary(&scan().read_within(budget).unwrap());
+            let fut = scan_summary(&block_on(scan().read_within_async(budget)).unwrap());
+            assert_eq!(fut, sync, "{name}, budget {budget}");
+        }
+        // Page by page to the end, both resumed from the sync page's position.
+        let mut at: Option<ScanPosition> = None;
+        let mut pages = 0;
+        loop {
+            let s = || match &at {
+                Some(p) => scan().resume_after(p),
+                None => scan(),
+            };
+            let sync = s().read_within(150).unwrap();
+            let fut = block_on(s().read_within_async(150)).unwrap();
+            assert_eq!(
+                scan_summary(&fut),
+                scan_summary(&sync),
+                "{name}, page {pages}"
+            );
+            pages += 1;
+            match sync.resume() {
+                Some(p) => at = Some(p.clone()),
+                None => break,
+            }
+            assert!(pages < 500, "{name}: no end");
+        }
+    }
+    // A key set, a missing key among them.
+    let mut keys: Vec<Vec<u8>> = (0..60u32)
+        .step_by(3)
+        .map(|i| format!("r{i:03}").into_bytes())
+        .collect();
+    keys.push(b"r0005".to_vec());
+    let set = KeySet::from_unsorted(keys.iter());
+    type KeysCase = fn(pigeonhole::KeysRead<'_>) -> pigeonhole::KeysRead<'_>;
+    let cases: [(&str, KeysCase); 4] = [
+        ("plain", |k| k),
+        ("versions 3", |k| k.versions(3)),
+        ("families g, f", |k| k.family("g").family("f")),
+        ("value filter, column limit 1", |k| {
+            k.column_limit(1)
+                .value_filter(ValueFilter::Prefix(b"d".to_vec()))
+        }),
+    ];
+    for (name, case) in cases {
+        let read = || case(t.keys(&set).snapshot(&snap));
+        for budget in [0, 20, 100, 600, 1 << 30] {
+            let sync = keys_summary(&read().read_within(budget).unwrap());
+            let fut = keys_summary(&block_on(read().read_within_async(budget)).unwrap());
+            assert_eq!(fut, sync, "keys {name}, budget {budget}");
+        }
+        let mut at: Option<KeysPosition> = None;
+        loop {
+            let r = || match &at {
+                Some(p) => read().resume_after(p),
+                None => read(),
+            };
+            let sync = r().read_within(120).unwrap();
+            let fut = block_on(r().read_within_async(120)).unwrap();
+            assert_eq!(keys_summary(&fut), keys_summary(&sync), "keys {name}");
+            match sync.resume() {
+                Some(p) => at = Some(p.clone()),
+                None => break,
+            }
+        }
+    }
+    // The refusals are the sync ones.
+    let other = db
+        .table("u")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    other.mutate(b"x").put("f", b"q", b"v").commit().unwrap();
+    let from_other = other.scan_prefix(b"").read_within(1).unwrap();
+    let pos = from_other.resume().expect("cut").clone();
+    let e = block_on(
+        t.scan_prefix(b"r")
+            .resume_after(&pos)
+            .read_within_async(100),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    db.close().unwrap();
+}
+
+/// Polls `fut` to completion with a no-op waker: its output, and how often it was `Pending`.
+#[cfg(feature = "async")]
+fn poll_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {
+    use std::task::{Context, Poll, Waker};
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut pending = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => return (r, pending),
+            Poll::Pending => pending += 1,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still pending after 60 s"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// #1286, simp724's A2: separated values are read before the value filter and the visitor,
+/// as the sync read's lanes hand them over: the async pages equal the sync ones.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_page_reads_separated_values() {
+    use pigeonhole::ValueFilter;
+    use pigeonhole::doc_support::block_on;
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-async-blob", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Pigeonhole::open(dir.join("b.phdb"), Options::default().shards(2)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("b", Family::default().blob_threshold(64))
+        .create_if_missing()
+        .unwrap();
+    for i in 0..40u32 {
+        let mut m = t.mutate(format!("r{i:02}").as_bytes());
+        for c in 0..3u8 {
+            let v = vec![b'a' + c; 100 + (i as usize * 13) % 300];
+            m = m.put("b", &[b'q', c], &v);
+        }
+        m.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let filters = [None, Some(ValueFilter::Prefix(b"b".to_vec()))];
+    for filter in filters {
+        for budget in [0, 150, 600, 3000, 1 << 30] {
+            let scan = || {
+                let s = t.scan_prefix(b"r");
+                match &filter {
+                    Some(f) => s.value_filter(f.clone()),
+                    None => s,
+                }
+            };
+            let sync = scan_summary(&scan().read_within(budget).unwrap());
+            let fut = scan_summary(&block_on(scan().read_within_async(budget)).unwrap());
+            assert_eq!(fut, sync, "filter {filter:?}, budget {budget}");
+        }
+    }
+    db.close().unwrap();
+}
+
+/// #1286: a poll yields after a bounded number of cells or value bytes, a value filter's
+/// misses included, so a wide row never holds the executor; and the page is the sync one.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_page_yields_within_a_wide_row() {
+    use pigeonhole::ValueFilter;
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-async-wide", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Pigeonhole::open(dir.join("w.phdb"), Options::default().shards(1)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    // One row of 12,288 small cells (3 polls' worth by cells), 1% matching a filter.
+    for chunk in (0..12_288u32).collect::<Vec<_>>().chunks(2_048) {
+        let mut m = t.mutate(b"wide");
+        for &i in chunk {
+            let v: &[u8] = if i % 100 == 0 { b"keep" } else { b"drop" };
+            m = m.put("f", format!("q{i:05}").as_bytes(), v);
+        }
+        m.commit().unwrap();
+    }
+    // One row of 48 values of 64 KiB: 3 MiB, 3 polls' worth by bytes.
+    let mut m = t.mutate(b"wide2");
+    for i in 0..48u32 {
+        m = m.put("f", format!("q{i:02}").as_bytes(), &vec![b'x'; 64 << 10]);
+    }
+    m.commit().unwrap();
+    db.flush().unwrap();
+    for (name, row, filter) in [
+        ("cells", &b"wide"[..], None),
+        (
+            "filtered cells",
+            b"wide",
+            Some(ValueFilter::Equals(b"keep".to_vec())),
+        ),
+        ("bytes", b"wide2", None),
+    ] {
+        let scan = || {
+            let s = t.scan_prefix(row).family("f");
+            match &filter {
+                Some(f) => s.value_filter(f.clone()),
+                None => s,
+            }
+        };
+        let sync = scan_summary(&scan().read_within(1 << 30).unwrap());
+        let (got, pending) = poll_counting(scan().read_within_async(1 << 30));
+        assert_eq!(scan_summary(&got.unwrap()), sync, "{name}");
+        assert!(pending >= 2, "{name}: {pending} yields");
+    }
+    db.close().unwrap();
+}
+
+/// #1286: from a cold block cache (a reopen), the async read fetches what it can predict
+/// and counts what it reads synchronously; its page is the sync one.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_page_from_a_cold_cache_counts_its_synchronous_reads() {
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-async-cold", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let open = || Pigeonhole::open(dir.join("c.phdb"), Options::default().shards(1)).unwrap();
+    let db = open();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    // Rows wide enough that a row's cells span several blocks.
+    for i in 0..30u32 {
+        let mut m = t.mutate(format!("r{i:02}").as_bytes());
+        for c in 0..200u32 {
+            m = m.put("f", format!("q{c:03}").as_bytes(), &[b'v'; 100]);
+        }
+        m.commit().unwrap();
+    }
+    db.flush().unwrap();
+    drop(t);
+    db.close().unwrap();
+    let db = open();
+    let t = db.table("t").unwrap().open().unwrap();
+    let before = db.engine_metrics();
+    let (got, _) = poll_counting(t.scan_prefix(b"r").read_within_async(1 << 30));
+    let after = db.engine_metrics();
+    let got = got.unwrap();
+    assert!(
+        after.async_sync_reads > before.async_sync_reads,
+        "a row's later blocks, read synchronously, are counted"
+    );
+    let sync = t.scan_prefix(b"r").read_within(1 << 30).unwrap();
+    assert_eq!(scan_summary(&got), scan_summary(&sync));
+    db.close().unwrap();
+}
+
+/// #1286: the async reads' futures are `Send`, so a multi-threaded executor can run them
+/// (compile-time).
+#[cfg(feature = "async")]
+#[allow(dead_code)]
+fn read_within_async_is_send(t: &Table, keys: &KeySet) {
+    fn send<T: Send>(_: T) {}
+    send(t.scan_prefix(b"").read_within_async(1));
+    send(t.keys(keys).read_within_async(1));
+}

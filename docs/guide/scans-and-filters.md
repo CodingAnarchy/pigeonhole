@@ -159,6 +159,10 @@ let page = t
   - A multi-get's `KeysPosition` names the last key, not an index, so a key set rebuilt between pages resumes at the right key.
   - Pass the same `snapshot` to every page for one consistent read.
 - **The cost:** the read runs inside the engine's bounded-read path, and reads about the budget plus one column. A traversal takes a budget too: `Traverse::byte_budget` ([graphs](graphs.md#traversal-hops-inside-the-engine)).
+- **Async:** `read_within_async(bytes)` (the `async` feature) gives the same page as a future that never blocks on a block it can fetch (#1286), on a scan or a multi-get.
+  - A row's position is read from the block cache, and its missing blocks are fetched asynchronously.
+  - A row's cells past its first block that miss the cache, and separated values, are read synchronously and counted in `EngineMetrics::async_sync_reads` ([Async](async.md)).
+  - A poll yields after a bounded number of cells or value bytes (a value filter's misses count too), so a wide row never holds the executor.
 
 ```rust
 # use pigeonhole::*;

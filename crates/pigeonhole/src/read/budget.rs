@@ -164,6 +164,16 @@ macro_rules! page {
         }
 
         impl $name {
+            /// A page with nothing in it, to resume from nowhere.
+            fn empty() -> Self {
+                Self {
+                    rows: Vec::new(),
+                    bytes: 0,
+                    next_bytes: None,
+                    resume: None,
+                }
+            }
+
             /// The page's rows, in key order. A row the budget cut holds the columns that fit.
             pub fn rows(&self) -> &[Row] {
                 &self.rows
@@ -328,20 +338,35 @@ struct Read {
     table: pigeonhole_engine::TableId,
 }
 
-fn read(
-    core: &TableCore,
-    sel: &mut Selection,
+/// What a page reads: its input, the resume inside a row, and the row limit.
+struct Plan {
     input: ReadInput,
     resume: InRow,
-    budget: u64,
     row_limit: Option<usize>,
-) -> Result<Read> {
+}
+
+/// The read's table, snapshot and spec.
+fn start(
+    core: &TableCore,
+    sel: &mut Selection,
+    plan: Plan,
+) -> Result<(
+    Arc<pigeonhole_engine::TableInfo>,
+    pigeonhole_engine::Snapshot,
+    ReduceSpec,
+    Option<usize>,
+)> {
     let (info, snapshot, families) = sel.start(core)?;
-    let mut spec = ReduceSpec::new(input);
+    let mut spec = ReduceSpec::new(plan.input);
     let mut r = sel.spec.clone();
     r.families = families.into_vec();
     spec.read = r;
-    spec.resume = resume;
+    spec.resume = plan.resume;
+    Ok((info, snapshot, spec, plan.row_limit))
+}
+
+fn read(core: &TableCore, sel: &mut Selection, plan: Plan, budget: u64) -> Result<Read> {
+    let (info, snapshot, spec, row_limit) = start(core, sel, plan)?;
     let table = core.info.id;
     // Two reducer types, so a read without a row limit runs the budget's code alone (#1284).
     let page = match row_limit {
@@ -370,6 +395,58 @@ fn read(
             .0
             .into_page(),
     };
+    Ok(assemble(&info, table, page))
+}
+
+/// [`read`] on the engine's async bounded read (#1286): the same page.
+#[cfg(feature = "async")]
+async fn read_async(
+    core: &TableCore,
+    sel: &mut Selection,
+    plan: Plan,
+    budget: u64,
+) -> Result<Read> {
+    let (info, snapshot, spec, row_limit) = start(core, sel, plan)?;
+    let table = core.info.id;
+    let page = match row_limit {
+        None => {
+            let pending = core.with(|e| {
+                e.reduce_async(
+                    &snapshot,
+                    table,
+                    &spec,
+                    CopyValue,
+                    ByteBudget::new(budget, size as SizeFn),
+                )
+            })?;
+            pending.await?.into_page()
+        }
+        Some(n) => {
+            let pending = core.with(|e| {
+                e.reduce_async(
+                    &snapshot,
+                    table,
+                    &spec,
+                    CopyValue,
+                    ByteBudget::new(budget, size as SizeFn).with_rows(n),
+                )
+            })?;
+            pending.await?.into_page()
+        }
+    };
+    Ok(assemble(&info, table, page))
+}
+
+/// The size function as a pointer, so an async read's future names its reducer's type.
+#[cfg(feature = "async")]
+type SizeFn = fn(&pigeonhole_engine::CellRef<'_>, &Vec<u8>) -> u64;
+
+/// A page's rows and their sizes, from the reducer's kept cells.
+fn assemble(
+    info: &Arc<pigeonhole_engine::TableInfo>,
+    table: TableId,
+    page: pigeonhole_engine::BytePage<Vec<u8>>,
+) -> Read {
     let last = page.items.last().map(|(k, _)| k.clone());
     let (mut rows, mut row_bytes) = (Vec::new(), Vec::new());
     let mut buf: Option<(RowBuf, u64)> = None;
@@ -380,7 +457,7 @@ fn read(
                 rows.push(Row::new(b));
                 row_bytes.push(n);
             }
-            let mut b = RowBuf::new(Arc::clone(&info), 1);
+            let mut b = RowBuf::new(Arc::clone(info), 1);
             b.key = key.row.clone();
             buf = Some((b, key.row.len() as u64));
         }
@@ -400,14 +477,14 @@ fn read(
         page.bytes,
         "the rows' sizes are the reducer's"
     );
-    Ok(Read {
+    Read {
         rows,
         row_bytes,
         last,
         overflow: page.overflow,
         cut_by_rows: page.cut_by_rows,
         table,
-    })
+    }
 }
 
 impl Read {
@@ -478,39 +555,32 @@ fn clamp(start: Bound<Vec<u8>>, position: Option<&Position>) -> (Bound<Vec<u8>>,
     }
 }
 
-/// [`Scan::read_within`](super::Scan::read_within).
-pub(super) fn scan(
+/// A scan page's plan: `None` when `limit` is 0 (an empty page, nothing read).
+fn scan_plan(
     core: &TableCore,
-    sel: &mut Selection,
     (start, end): (Bound<Vec<u8>>, Bound<Vec<u8>>),
     limit: Option<u64>,
-    after: Option<&ScanPosition>,
-    budget: u64,
-) -> Result<ScanPage> {
-    let given = after.map(|p| &p.0);
+    given: Option<&Position>,
+) -> Result<Option<Plan>> {
     if let Some(p) = given {
         p.check(core.info.id)?;
     }
     if limit == Some(0) {
-        return Ok(ScanPage {
-            rows: Vec::new(),
-            bytes: 0,
-            next_bytes: None,
-            resume: None,
-        });
+        return Ok(None);
     }
     let (lo, resume) = clamp(start, given);
     // The row limit runs in the reducer (#1280, perf287's N4 on #1281): the read stops at
     // whichever of the budget and `limit` comes first, reading no further.
     let row_limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-    let r = read(
-        core,
-        sel,
-        ReadInput::Ranges(vec![(lo, end)]),
+    Ok(Some(Plan {
+        input: ReadInput::Ranges(vec![(lo, end)]),
         resume,
-        budget,
         row_limit,
-    )?;
+    }))
+}
+
+/// A scan page from its read.
+fn scan_page(core: &TableCore, r: Read, given: Option<&Position>) -> ScanPage {
     let resume = if r.cut_by_rows {
         // `limit` stopped the read first: resume after its last row.
         r.last.as_ref().map(|l| Position {
@@ -521,23 +591,51 @@ pub(super) fn scan(
     } else {
         r.resume(given)
     };
-    Ok(ScanPage {
+    ScanPage {
         resume: resume.map(ScanPosition),
         next_bytes: r.overflow.as_ref().map(|o| o.bytes),
         bytes: r.row_bytes.iter().sum(),
         rows: r.rows,
-    })
+    }
 }
 
-/// [`KeysRead::read_within`](super::KeysRead::read_within).
-pub(super) fn keys(
+/// [`Scan::read_within`](super::Scan::read_within).
+pub(super) fn scan(
     core: &TableCore,
     sel: &mut Selection,
-    set: &KeySet,
-    after: Option<&KeysPosition>,
+    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    limit: Option<u64>,
+    after: Option<&ScanPosition>,
     budget: u64,
-) -> Result<KeysPage> {
+) -> Result<ScanPage> {
     let given = after.map(|p| &p.0);
+    let Some(plan) = scan_plan(core, range, limit, given)? else {
+        return Ok(ScanPage::empty());
+    };
+    let r = read(core, sel, plan, budget)?;
+    Ok(scan_page(core, r, given))
+}
+
+/// [`Scan::read_within_async`](super::Scan::read_within_async).
+#[cfg(feature = "async")]
+pub(super) async fn scan_async(
+    core: &TableCore,
+    sel: &mut Selection,
+    range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    limit: Option<u64>,
+    after: Option<&ScanPosition>,
+    budget: u64,
+) -> Result<ScanPage> {
+    let given = after.map(|p| &p.0);
+    let Some(plan) = scan_plan(core, range, limit, given)? else {
+        return Ok(ScanPage::empty());
+    };
+    let r = read_async(core, sel, plan, budget).await?;
+    Ok(scan_page(core, r, given))
+}
+
+/// A multi-get page's plan: `None` when no key is left from the position on.
+fn keys_plan(core: &TableCore, set: &KeySet, given: Option<&Position>) -> Result<Option<Plan>> {
     if let Some(p) = given {
         p.check(core.info.id)?;
     }
@@ -560,25 +658,54 @@ pub(super) fn keys(
         }
     };
     if from.is_empty() {
-        return Ok(KeysPage {
-            rows: Vec::new(),
-            bytes: 0,
-            next_bytes: None,
-            resume: None,
-        });
+        return Ok(None);
     }
-    let r = read(
-        core,
-        sel,
-        ReadInput::Keys(Arc::new(from)),
+    Ok(Some(Plan {
+        input: ReadInput::Keys(Arc::new(from)),
         resume,
-        budget,
-        None,
-    )?;
-    Ok(KeysPage {
+        row_limit: None,
+    }))
+}
+
+/// A multi-get page from its read.
+fn keys_page(r: Read, given: Option<&Position>) -> KeysPage {
+    KeysPage {
         resume: r.resume(given).map(KeysPosition),
         next_bytes: r.overflow.as_ref().map(|o| o.bytes),
         bytes: r.row_bytes.iter().sum(),
         rows: r.rows,
-    })
+    }
+}
+
+/// [`KeysRead::read_within`](super::KeysRead::read_within).
+pub(super) fn keys(
+    core: &TableCore,
+    sel: &mut Selection,
+    set: &KeySet,
+    after: Option<&KeysPosition>,
+    budget: u64,
+) -> Result<KeysPage> {
+    let given = after.map(|p| &p.0);
+    let Some(plan) = keys_plan(core, set, given)? else {
+        return Ok(KeysPage::empty());
+    };
+    let r = read(core, sel, plan, budget)?;
+    Ok(keys_page(r, given))
+}
+
+/// [`KeysRead::read_within_async`](super::KeysRead::read_within_async).
+#[cfg(feature = "async")]
+pub(super) async fn keys_async(
+    core: &TableCore,
+    sel: &mut Selection,
+    set: &KeySet,
+    after: Option<&KeysPosition>,
+    budget: u64,
+) -> Result<KeysPage> {
+    let given = after.map(|p| &p.0);
+    let Some(plan) = keys_plan(core, set, given)? else {
+        return Ok(KeysPage::empty());
+    };
+    let r = read_async(core, sel, plan, budget).await?;
+    Ok(keys_page(r, given))
 }

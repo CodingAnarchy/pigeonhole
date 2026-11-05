@@ -1094,6 +1094,23 @@ where
     })
 }
 
+/// perf287's N1 on #1264: an excluded start skips its row before the resume could apply, so
+/// a resume in that row is refused (a sync or an async bounded read).
+pub(crate) fn refuse_excluded_resume(spec: &ReduceSpec) -> Result<()> {
+    if let (Some((row, _)), ReadInput::Ranges(ranges)) = (&spec.resume, &spec.input)
+        && ranges
+            .iter()
+            .any(|(start, _)| matches!(start, Bound::Excluded(s) if s == row))
+    {
+        return Err(Error::InvalidArgument(
+            "a resume in a row that a range's excluded start skips: start the range at the \
+             row, included"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The groups, sequential or fanned out, merged into one reducer and handed back unfinished,
 /// for a caller that takes its result in another form (traversal's `DedupeLimit::into_nodes`,
 /// D304).
@@ -1116,18 +1133,7 @@ where
         .as_ref()
         .map(|r| Resume::new(table, families, r))
         .transpose()?;
-    // perf287's N1 on #1264: an excluded start skips its row before the resume could apply.
-    if let (Some((row, _)), ReadInput::Ranges(ranges)) = (&spec.resume, &spec.input)
-        && ranges
-            .iter()
-            .any(|(start, _)| matches!(start, Bound::Excluded(s) if s == row))
-    {
-        return Err(Error::InvalidArgument(
-            "a resume in a row that a range's excluded start skips: start the range at the \
-             row, included"
-                .to_owned(),
-        ));
-    }
+    refuse_excluded_resume(spec)?;
     let groups = work(snapshot, table, &spec.input)?;
     let abort = AtomicBool::new(false);
     let ctx = Ctx {

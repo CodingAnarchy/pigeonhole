@@ -608,6 +608,21 @@ impl<'t> KeysRead<'t> {
         )
     }
 
+    /// [`read_within`](KeysRead::read_within) as a future that never blocks on a block it
+    /// can fetch (#1286, ICR 0122): the same page, as [`Scan::read_within_async`] gives a
+    /// scan's.
+    #[cfg(feature = "async")]
+    pub async fn read_within_async(mut self, bytes: u64) -> Result<KeysPage> {
+        budget::keys_async(
+            self.core,
+            &mut self.sel,
+            &self.keys,
+            self.after.as_ref(),
+            bytes,
+        )
+        .await
+    }
+
     selection_methods!();
 
     /// Up to `n` versions of each column (0: all retained).
@@ -1790,6 +1805,45 @@ impl<'t> Scan<'t> {
             self.after.as_ref(),
             bytes,
         )
+    }
+
+    /// [`read_within`](Scan::read_within) as a future that never blocks on a block it can
+    /// fetch (#1286, ICR 0122): the same page, with the same resume rules, `limit` and table
+    /// check. The scan's rows are positioned from the block cache and their missing blocks
+    /// fetched asynchronously; a row's cells past its first block that miss the cache, and
+    /// separated values, are read synchronously (counted in
+    /// [`EngineMetrics::async_sync_reads`](crate::EngineMetrics::async_sync_reads)). A poll
+    /// yields after a bounded number of cells or value bytes, so a wide row never holds the
+    /// executor.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("docs")?.family("text", Family::default()).create_if_missing()?;
+    /// for i in 0..100u32 {
+    ///     t.mutate(format!("doc:{i:03}").as_bytes()).put("text", b"body", &[b'x'; 200]).commit()?;
+    /// }
+    /// let page = pigeonhole::doc_support::block_on(t.scan_prefix(b"doc:").read_within_async(2048))?;
+    /// assert_eq!(page.rows().len(), 9);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn read_within_async(mut self, bytes: u64) -> Result<ScanPage> {
+        let range = (self.start, self.end);
+        budget::scan_async(
+            &self.core,
+            &mut self.sel,
+            range,
+            self.limit,
+            self.after.as_ref(),
+            bytes,
+        )
+        .await
     }
 
     /// `InvalidArgument` when a [`resume_after`](Scan::resume_after) position is set: only

@@ -2879,6 +2879,75 @@ impl Engine {
         })
     }
 
+    /// [`reduce_into`](Self::reduce_into) as a future that never blocks on a block it can
+    /// fetch (#1286, ICR 0122): `visitor` and `reducer` driven over one range or a key set on
+    /// the polling task, as [`nearest_async`](Self::nearest_async) drives its search, in one
+    /// pass in cell order (no fan-out: D296 rev 1.2 makes that the merged result). It
+    /// resolves to the reducer, unfinished (a byte budget's
+    /// [`into_page`](crate::ByteBudget::into_page)). A poll yields after
+    /// [`REDUCE_POLL_CELLS`](crate::REDUCE_POLL_CELLS) cells or
+    /// [`REDUCE_POLL_BYTES`](crate::REDUCE_POLL_BYTES) value bytes; the read's value
+    /// predicate is tested by the read itself, so its misses count, and the column limit with
+    /// it. A row's cells past its first block that miss the cache, and separated values, are
+    /// read synchronously (counted in `async_sync_reads`).
+    pub fn reduce_async<V, R>(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: &crate::ReduceSpec,
+        visitor: V,
+        reducer: R,
+    ) -> Result<crate::PendingReduce<V, R>>
+    where
+        V: CellVisitor<Item = R::Item>,
+        R: Reducer,
+    {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
+        read::reduce::refuse_excluded_resume(spec)?;
+        // The predicate is tested in the driver, so its misses count toward a poll's bound
+        // (#1237's rule), and the column limit leaves the read with it: the resolver counts
+        // only the columns that pass (simp724's A1 on #1286).
+        let mut read = spec.read.clone();
+        let predicate = read
+            .value
+            .take()
+            .map(|p| (p, std::mem::take(&mut read.columns_per_row)));
+        let parts = read::reduce_async::Read {
+            visitor,
+            reducer,
+            families: families.iter().copied().collect(),
+            predicate,
+            table,
+            resume: spec.resume.clone(),
+        };
+        match &spec.input {
+            crate::ReadInput::Ranges(ranges) => {
+                let [(lo, hi)] = ranges.as_slice() else {
+                    return Err(Error::InvalidArgument(
+                        "an async bounded read reads one range".into(),
+                    ));
+                };
+                let mut scan = ScanSpec::new(lo.clone(), hi.clone());
+                scan.read = read;
+                let cursor = self.scan_async(snapshot, table, scan)?;
+                crate::PendingReduce::scan(cursor, parts)
+            }
+            crate::ReadInput::Keys(keys) => {
+                let cursor = crate::KeyCursor::over(
+                    snapshot.clone(),
+                    table,
+                    families.into_vec(),
+                    read,
+                    self.inner.shared.vfs.now_micros(),
+                    Arc::clone(keys),
+                    Arc::clone(&self.inner.shared),
+                )?;
+                crate::PendingReduce::keys(cursor, Arc::clone(keys), parts)
+            }
+        }
+    }
+
     /// [`Engine::scan`] for an async scan: its rows are polled with
     /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
     pub fn scan_async(

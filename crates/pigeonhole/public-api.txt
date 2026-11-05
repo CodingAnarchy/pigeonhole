@@ -548,6 +548,7 @@ pub fn pigeonhole::KeysRead<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::KeysRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
 pub fn pigeonhole::KeysRead<'t>::read(self) -> pigeonhole::Result<pigeonhole::KeyRows<'t>>
 pub fn pigeonhole::KeysRead<'t>::read_within(self, u64) -> pigeonhole::Result<pigeonhole::KeysPage>
+pub async fn pigeonhole::KeysRead<'t>::read_within_async(self, u64) -> pigeonhole::Result<pigeonhole::KeysPage>
 pub fn pigeonhole::KeysRead<'t>::resume_after(self, &pigeonhole::KeysPosition) -> Self
 pub fn pigeonhole::KeysRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::KeysRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
@@ -879,6 +880,7 @@ pub fn pigeonhole::Scan<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8
 pub fn pigeonhole::Scan<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::Scan<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
 pub fn pigeonhole::Scan<'t>::read_within(self, u64) -> pigeonhole::Result<pigeonhole::ScanPage>
+pub async fn pigeonhole::Scan<'t>::read_within_async(self, u64) -> pigeonhole::Result<pigeonhole::ScanPage>
 pub fn pigeonhole::Scan<'t>::resume_after(self, &pigeonhole::ScanPosition) -> Self
 pub fn pigeonhole::Scan<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::Scan<'t>::stream(self) -> pigeonhole::nonblocking::RowStream<'t>
