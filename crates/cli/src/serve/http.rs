@@ -40,6 +40,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     ))
     .max_decoding_message_size(limits.max_request_bytes)
     .max_encoding_message_size(usize::MAX);
+    let admin = proto::admin_server::AdminServer::new(super::grpc::AdminGrpc(Arc::clone(&shared)))
+        .max_decoding_message_size(limits.max_request_bytes)
+        .max_encoding_message_size(usize::MAX);
+    let schema =
+        proto::schema_server::SchemaServer::new(super::grpc::SchemaGrpc(Arc::clone(&shared)))
+            .max_decoding_message_size(limits.max_request_bytes)
+            .max_encoding_message_size(usize::MAX);
     let feeds = proto::feed_server::FeedServer::new(super::grpc::FeedGrpc(Arc::clone(&shared)))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(usize::MAX);
@@ -59,6 +66,15 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .route_service(
             "/pigeonhole.v1.Transactions/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(txns),
+        )
+        .route("/v1/tables", get(tables))
+        .route_service(
+            "/pigeonhole.v1.Admin/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(admin),
+        )
+        .route_service(
+            "/pigeonhole.v1.Schema/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(schema),
         )
         .route_service(
             "/pigeonhole.v1.Feed/{*method}",
@@ -114,6 +130,26 @@ fn error_response(headers: &HeaderMap, e: ApiError) -> Response {
     e.into_response()
 }
 
+/// `GET /v1/tables`: `Schema.ListTables` for curl (ICR 0112), with read scope.
+async fn tables(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let caller = match shared.caller(auth_header(&headers)) {
+        Ok(c) => c,
+        Err(_) => return ApiError::unauthenticated().into_response(),
+    };
+    let op = ServiceOp::ListTables(proto::ListTablesRequest {});
+    let rpc = op.index();
+    let started = Instant::now();
+    let reply = shared.router.dispatch(op, &caller, None).await;
+    shared.count(rpc, started, &reply);
+    match reply {
+        Ok(ServiceReply::Tables(r)) => json(&r),
+        Ok(_) => {
+            ApiError::internal("the service answered with another RPC's reply").into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
     // Liveness only, with no token: whether the database is open and not failed.
     let ok = !shared.router.service.db.is_failed();
@@ -135,9 +171,7 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
     if caller.scope < Scope::Read {
         return ApiError::permission_denied("read metrics").into_response();
     }
-    let mut text = shared.metrics.render(&shared.router.service.db);
-    super::service::render_sessions(&mut text, &shared.router.service.sessions);
-    super::service::render_feeds(&mut text, &shared.router.service.feeds);
+    let text = shared.router.service.metrics_text();
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
@@ -153,7 +187,12 @@ async fn call(
     Path((service, method)): Path<(String, String)>,
     req: Request,
 ) -> Response {
+    // Liveness answers without a token, as `GET /v1/health` does.
+    if (service.as_str(), method.as_str()) == ("Admin", "Health") {
+        return health(State(shared)).await;
+    }
     let headers = req.headers().clone();
+    let query = req.uri().query().unwrap_or("").to_owned();
     let caller = match shared.caller(auth_header(&headers)) {
         Ok(c) => c,
         Err(_) => return ApiError::unauthenticated().into_response(),
@@ -184,6 +223,29 @@ async fn call(
         Ok(op) => op,
         Err(e) => return e.into_response(),
     };
+    // A download resumes with `Range: bytes=<offset>-` and `?backup_id=` (ICR 0112), which
+    // win over the body's fields.
+    if let ServiceOp::BackupDownload(r) = &mut op {
+        if let Some(id) = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("backup_id="))
+        {
+            r.backup_id = id.to_owned();
+        }
+        if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+            match range
+                .strip_prefix("bytes=")
+                .and_then(|r| r.strip_suffix('-'))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                Some(offset) => r.offset = offset,
+                None => {
+                    return ApiError::invalid("a download's Range is `bytes=<offset>-`")
+                        .into_response();
+                }
+            }
+        }
+    }
     // An SSE client reconnects with `Last-Event-ID`, the last event's `id:` (its token): it
     // takes precedence over the body's `resume` (ICR 0112).
     if let ServiceOp::Subscribe(r) = &mut op
@@ -207,6 +269,12 @@ async fn call(
         Ok(ServiceReply::MutateReturning(r)) => json(&r),
         Ok(ServiceReply::Scan(pages)) => stream(&headers, pages),
         Ok(ServiceReply::Feed(events)) => stream(&headers, events),
+        Ok(ServiceReply::Tables(r)) => json(&r),
+        Ok(ServiceReply::Table(r)) => json(&r),
+        Ok(ServiceReply::Info(r)) => json(&r),
+        Ok(ServiceReply::Backup(r)) => json(&r),
+        Ok(ServiceReply::Metrics(r)) => json(&r),
+        Ok(ServiceReply::Download(d)) => download(d),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
@@ -359,6 +427,53 @@ where
     }
 }
 
+/// `Admin.BackupDownload` over HTTP (ICR 0112): the file's bytes from the offset, with the
+/// download's id and the whole file's SHA-256 as headers (both known before the first
+/// byte), and `206` plus `Content-Range` for a resume. An error partway ends the body early;
+/// the client's SHA-256 check catches a short copy.
+fn download(d: super::backup::Download) -> Response {
+    struct Data(super::backup::Download);
+    impl Stream for Data {
+        type Item = Result<Bytes, std::io::Error>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.0).poll_next(cx).map(|item| {
+                item.map(|r| {
+                    r.map(|c| c.data)
+                        .map_err(|e| std::io::Error::other(e.message))
+                })
+            })
+        }
+    }
+    let (total, offset) = (d.total, d.offset);
+    let id = d.id.clone();
+    let sha: String = d.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    let mut resp = Body::from_stream(Data(d)).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&(total - offset).to_string()) {
+        h.insert(header::CONTENT_LENGTH, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&id) {
+        h.insert("x-pigeonhole-backup-id", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&sha) {
+        h.insert("x-pigeonhole-backup-sha256", v);
+    }
+    if offset > 0 {
+        if let Ok(v) = HeaderValue::from_str(&format!(
+            "bytes {offset}-{}/{total}",
+            total.saturating_sub(1)
+        )) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
+    resp
+}
+
 /// The body's length from `Content-Length`; 0 with neither it nor `Transfer-Encoding`.
 fn content_length(headers: &HeaderMap) -> Result<usize, ApiError> {
     match headers.get(header::CONTENT_LENGTH) {
@@ -403,6 +518,16 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Snapshots", "Open") => ServiceOp::OpenSnapshot(parse(body)?),
         ("Snapshots", "Release") => ServiceOp::ReleaseSnapshot(parse(body)?),
         ("Feed", "Subscribe") => ServiceOp::Subscribe(parse(body)?),
+        ("Schema", "ListTables") => ServiceOp::ListTables(parse(body)?),
+        ("Schema", "CreateTable") => ServiceOp::CreateTable(parse(body)?),
+        ("Schema", "DropTable") => ServiceOp::DropTable(parse(body)?),
+        ("Schema", "DescribeTable") => ServiceOp::DescribeTable(parse(body)?),
+        ("Admin", "Info") => ServiceOp::Info(parse(body)?),
+        ("Admin", "Flush") => ServiceOp::Flush(parse(body)?),
+        ("Admin", "Compact") => ServiceOp::Compact(parse(body)?),
+        ("Admin", "Backup") => ServiceOp::Backup(parse(body)?),
+        ("Admin", "BackupDownload") => ServiceOp::BackupDownload(parse(body)?),
+        ("Admin", "Metrics") => ServiceOp::Metrics(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

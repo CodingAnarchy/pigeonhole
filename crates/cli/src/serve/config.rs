@@ -108,6 +108,11 @@ pub(crate) struct ServeArgs {
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
+    /// Where `Admin.Backup` writes, and where downloads are kept for resumes. Without it the
+    /// server takes no backups to disk (`Admin.BackupDownload` still streams one, through a
+    /// private directory in the system's temporary directory).
+    #[arg(long, value_name = "DIR")]
+    pub backup_dir: Option<PathBuf>,
 }
 
 /// What the flags leave the server to do.

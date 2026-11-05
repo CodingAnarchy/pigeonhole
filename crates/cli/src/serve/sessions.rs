@@ -540,6 +540,11 @@ impl Drop for SnapshotGuard {
     }
 }
 
+/// 128 random bits, as 32 hex characters: an id nobody can guess (a backup download's).
+pub(crate) fn random_hex() -> Result<String, ApiError> {
+    Ok(hex(&new_id()?))
+}
+
 /// 128 random bits from the operating system (rustls's ring provider).
 fn new_id() -> Result<Id, ApiError> {
     let mut id = [0u8; 16];

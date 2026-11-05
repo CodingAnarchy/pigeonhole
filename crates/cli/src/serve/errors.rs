@@ -269,6 +269,18 @@ impl ApiError {
         )
     }
 
+    /// Something this server doesn't do as configured (a backup to disk without
+    /// `--backup-dir`): the engine's `Unsupported` code, not applied, no retry.
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(
+            "Unsupported",
+            ErrorCode::Unsupported as u32,
+            message,
+            tonic::Code::Unimplemented,
+            StatusCode::NOT_IMPLEMENTED,
+        )
+    }
+
     /// A commit whose outcome the server couldn't learn (its task ended without one).
     pub(crate) fn outcome_unknown(message: impl Into<String>) -> Self {
         Self::new(

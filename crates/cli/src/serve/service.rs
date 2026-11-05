@@ -51,6 +51,16 @@ pub(crate) enum ServiceOp {
     OpenSnapshot(proto::OpenSnapshotRequest),
     ReleaseSnapshot(proto::ReleaseSnapshotRequest),
     Subscribe(proto::SubscribeRequest),
+    ListTables(proto::ListTablesRequest),
+    CreateTable(proto::CreateTableRequest),
+    DropTable(proto::DropTableRequest),
+    DescribeTable(proto::DescribeTableRequest),
+    Info(proto::Empty),
+    Flush(proto::Empty),
+    Compact(proto::Empty),
+    Backup(proto::BackupRequest),
+    BackupDownload(proto::BackupDownloadRequest),
+    Metrics(proto::Empty),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -71,6 +81,12 @@ pub(crate) enum ServiceReply {
     OpenSnapshot(proto::OpenSnapshotResponse),
     Empty(proto::Empty),
     Feed(super::feed::FeedEvents),
+    Tables(proto::ListTablesResponse),
+    Table(proto::TableResponse),
+    Info(proto::InfoResponse),
+    Backup(proto::BackupResponse),
+    Download(super::backup::Download),
+    Metrics(proto::MetricsResponse),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -141,6 +157,16 @@ impl ServiceOp {
             Self::OpenSnapshot(_) => 14,
             Self::ReleaseSnapshot(_) => 15,
             Self::Subscribe(_) => FEED,
+            Self::ListTables(_) => 17,
+            Self::CreateTable(_) => 18,
+            Self::DropTable(_) => 19,
+            Self::DescribeTable(_) => 20,
+            Self::Info(_) => 21,
+            Self::Flush(_) => 22,
+            Self::Compact(_) => 23,
+            Self::Backup(_) => 24,
+            Self::BackupDownload(_) => DOWNLOAD,
+            Self::Metrics(_) => 26,
         }
     }
 
@@ -164,7 +190,18 @@ impl ServiceOp {
             | Self::Abort(_)
             | Self::OpenSnapshot(_)
             | Self::ReleaseSnapshot(_)
-            | Self::Subscribe(_) => Scope::Read,
+            | Self::Subscribe(_)
+            | Self::ListTables(_)
+            | Self::DescribeTable(_)
+            | Self::Info(_)
+            | Self::Metrics(_) => Scope::Read,
+            // Maintenance and backups: admin (ICR 0112's Admin).
+            Self::Flush(_) | Self::Compact(_) | Self::Backup(_) | Self::BackupDownload(_) => {
+                Scope::Admin
+            }
+            // Dropping a table drops its data: admin, as ICR 0112's Schema says.
+            Self::DropTable(_) => Scope::Admin,
+            Self::CreateTable(_) => Scope::Write,
             Self::Mutate(_)
             | Self::CheckAndMutate(_)
             | Self::Batch(_)
@@ -192,6 +229,13 @@ impl ServiceOp {
             Self::OpenSnapshot(r) => r.encoded_len(),
             Self::ReleaseSnapshot(r) => r.encoded_len(),
             Self::Subscribe(r) => r.encoded_len(),
+            Self::ListTables(r) => r.encoded_len(),
+            Self::CreateTable(r) => r.encoded_len(),
+            Self::DropTable(r) => r.encoded_len(),
+            Self::DescribeTable(r) => r.encoded_len(),
+            Self::Info(_) | Self::Flush(_) | Self::Compact(_) | Self::Metrics(_) => 0,
+            Self::Backup(r) => r.encoded_len(),
+            Self::BackupDownload(r) => r.encoded_len(),
         }
     }
 }
@@ -203,7 +247,10 @@ pub(crate) const SCAN: usize = 7;
 /// `Feed.Subscribe`'s index in `RPCS`: counted when its stream ends, as a scan's is.
 pub(crate) const FEED: usize = 16;
 
-pub(crate) const RPCS: [&str; 17] = [
+/// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
+pub(crate) const DOWNLOAD: usize = 25;
+
+pub(crate) const RPCS: [&str; 27] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -221,6 +268,16 @@ pub(crate) const RPCS: [&str; 17] = [
     "Snapshots.Open",
     "Snapshots.Release",
     "Feed.Subscribe",
+    "Schema.ListTables",
+    "Schema.CreateTable",
+    "Schema.DropTable",
+    "Schema.DescribeTable",
+    "Admin.Info",
+    "Admin.Flush",
+    "Admin.Compact",
+    "Admin.Backup",
+    "Admin.BackupDownload",
+    "Admin.Metrics",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -482,6 +539,8 @@ pub(crate) struct Service {
     streams: Arc<Semaphore>,
     /// The feed fan-out's hubs (D313 R2).
     pub(crate) feeds: Arc<super::feed::Feeds>,
+    /// `--backup-dir`, and the backup downloads kept for resumes.
+    backups: Arc<super::backup::Backups>,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -514,6 +573,7 @@ impl Service {
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             sessions: super::sessions::Sessions::new(limits.leases),
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
+            backups: super::backup::Backups::new(None),
             feeds: super::feed::Feeds::new(
                 db.clone(),
                 super::feed::FeedLimits {
@@ -528,6 +588,12 @@ impl Service {
             limits,
             metrics,
         }
+    }
+
+    /// Takes backups to disk in `dir` (`--backup-dir`); without one, `Backup` is refused.
+    pub(crate) fn backup_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.backups = super::backup::Backups::new(dir);
+        self
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -643,6 +709,86 @@ impl Service {
                 self.open_snapshot(&r, caller)
                     .map(ServiceReply::OpenSnapshot)
             }
+            ServiceOp::ListTables(_) => {
+                drop(budget);
+                let mut tables = self.db.tables();
+                tables.sort();
+                Ok(ServiceReply::Tables(proto::ListTablesResponse { tables }))
+            }
+            ServiceOp::CreateTable(r) => {
+                let reply = self.create_table(r).await.map(ServiceReply::Table);
+                drop(budget);
+                reply
+            }
+            ServiceOp::DropTable(r) => {
+                drop(budget);
+                self.drop_table(r.name)
+                    .await
+                    .map(|()| ServiceReply::Empty(proto::Empty {}))
+            }
+            ServiceOp::Info(_) => {
+                drop(budget);
+                let db = self.db.clone();
+                let info = self.blocking(move || Ok(db.info()?)).await?;
+                let mut tables = self.db.tables();
+                tables.sort();
+                Ok(ServiceReply::Info(proto::InfoResponse {
+                    path: self.db.path().display().to_string(),
+                    file_bytes: info.file_bytes,
+                    free_bytes: info.free_bytes.unwrap_or(0),
+                    tables,
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                }))
+            }
+            ServiceOp::Flush(_) => {
+                drop(budget);
+                self.db.flush_async().await?;
+                Ok(ServiceReply::Empty(proto::Empty {}))
+            }
+            ServiceOp::Compact(_) => {
+                drop(budget);
+                self.db.compact_async().await?;
+                Ok(ServiceReply::Empty(proto::Empty {}))
+            }
+            ServiceOp::Backup(r) => {
+                drop(budget);
+                let path = self.backups.target(&r.path)?;
+                let db = self.db.clone();
+                let bytes = self
+                    .blocking(move || {
+                        // A path in a subdirectory gets it: plain components only, so it
+                        // stays inside --backup-dir.
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                ApiError::internal(format!("the backup's directory: {e}"))
+                            })?;
+                        }
+                        if r.durable {
+                            db.backup_durable(&path)?;
+                        } else {
+                            db.backup(&path)?;
+                        }
+                        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+                        Ok(len)
+                    })
+                    .await?;
+                Ok(ServiceReply::Backup(proto::BackupResponse { bytes }))
+            }
+            ServiceOp::BackupDownload(r) => {
+                drop(budget);
+                self.backup_download(r).await.map(ServiceReply::Download)
+            }
+            ServiceOp::Metrics(_) => {
+                drop(budget);
+                Ok(ServiceReply::Metrics(proto::MetricsResponse {
+                    text: self.metrics_text(),
+                }))
+            }
+            ServiceOp::DescribeTable(r) => {
+                drop(budget);
+                let table = self.table(&r.name).await?;
+                Ok(ServiceReply::Table(describe(&table)))
+            }
             ServiceOp::Subscribe(r) => self
                 .subscribe(r, caller, budget)
                 .await
@@ -678,6 +824,180 @@ impl Service {
             m
         });
         Ok(table)
+    }
+
+    /// `Schema.CreateTable`: the table with its families, created, or with `if_missing`
+    /// opened with the families it lacks added. The service's handle for the name is
+    /// replaced, so later calls (and feed hubs, keyed by its id) use this table.
+    async fn create_table(
+        &self,
+        r: proto::CreateTableRequest,
+    ) -> Result<proto::TableResponse, ApiError> {
+        if r.name.is_empty() {
+            return Err(ApiError::invalid("a table needs a name"));
+        }
+        let families = r
+            .families
+            .iter()
+            .map(|f| Ok((f.name.clone(), convert::family_in(f)?)))
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let db = self.db.clone();
+        let (name, if_missing) = (r.name.clone(), r.if_missing);
+        let table = self
+            .blocking(move || {
+                let mut b = db.table(&name)?;
+                for (n, f) in families {
+                    b = b.family(&n, f);
+                }
+                Ok(if if_missing {
+                    b.create_if_missing()?
+                } else {
+                    b.create()?
+                })
+            })
+            .await?;
+        self.tables.rcu(|m| {
+            let mut m = HashMap::clone(m);
+            m.insert(r.name.clone(), table.clone());
+            m
+        });
+        Ok(describe(&table))
+    }
+
+    /// `Schema.DropTable`: the table and its data go, and so does the service's handle for
+    /// the name. A table created again under it is a new table, with a new id: its feed hubs
+    /// are new too, and those on the old one end with their engine feeds.
+    async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+        let db = self.db.clone();
+        let owned = name.clone();
+        let dropped = self.blocking(move || Ok(db.drop_table(&owned)?)).await;
+        // Whatever the outcome, the next use resolves the name again.
+        self.tables.rcu(|m| {
+            let mut m = HashMap::clone(m);
+            m.remove(&name);
+            m
+        });
+        dropped
+    }
+
+    /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
+    pub(crate) fn metrics_text(&self) -> String {
+        let mut text = self.metrics.render(&self.db);
+        render_sessions(&mut text, &self.sessions);
+        render_feeds(&mut text, &self.feeds);
+        text
+    }
+
+    /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
+    /// from an offset, streamed in chunks of up to 1 MiB on its own task. It holds a
+    /// `--max-streams` slot until it ends, and each send waits at most `--stream-idle-ms`.
+    async fn backup_download(
+        &self,
+        r: proto::BackupDownloadRequest,
+    ) -> Result<super::backup::Download, ApiError> {
+        use super::backup::{self, Kept};
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        let (id, kept) = if r.backup_id.is_empty() {
+            let (id, path) = self.backups.new_download()?;
+            let (db, p, durable) = (self.db.clone(), path.clone(), r.durable);
+            let digest = self
+                .blocking(move || {
+                    let taken = if durable {
+                        db.backup_durable(&p)
+                    } else {
+                        db.backup(&p)
+                    };
+                    if let Err(e) = taken {
+                        let _ = std::fs::remove_file(&p);
+                        return Err(e.into());
+                    }
+                    backup::digest(&p)
+                })
+                .await?;
+            let kept = Kept {
+                path,
+                total: digest.0,
+                sha256: digest.1,
+            };
+            self.backups.keep(&id, kept.clone());
+            (id, kept)
+        } else {
+            (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
+        };
+        if r.offset > kept.total {
+            self.backups.release(&id);
+            return Err(ApiError::invalid(format!(
+                "offset {} is past the backup's {} bytes",
+                r.offset, kept.total
+            )));
+        }
+        let (tx, rx) = mpsc::channel(1);
+        let (backups, pool, idle) = (
+            Arc::clone(&self.backups),
+            Arc::clone(&self.blocking),
+            self.limits.stream_idle,
+        );
+        let metrics = Arc::clone(&self.metrics);
+        let started = Instant::now();
+        let (task_id, task_kept, start) = (id.clone(), kept.clone(), r.offset);
+        tokio::spawn(async move {
+            let mut at = start;
+            let outcome: Result<(), ApiError> = async {
+                loop {
+                    let path = task_kept.path.clone();
+                    let data = blocking(&pool, move || backup::read_chunk(&path, at)).await?;
+                    let next = at + data.len() as u64;
+                    let last = next >= task_kept.total;
+                    let chunk = proto::BackupChunk {
+                        data: data.into(),
+                        total: if last { task_kept.total } else { 0 },
+                        backup_id: task_id.clone(),
+                        offset: at,
+                        sha256: if last {
+                            task_kept.sha256.to_vec().into()
+                        } else {
+                            Default::default()
+                        },
+                    };
+                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
+                        Ok(Ok(())) => {}
+                        // The client went away; it resumes with the id.
+                        Ok(Err(_)) => return Ok(()),
+                        Err(_) => {
+                            return Err(ApiError::deadline(
+                                "the client took no backup chunk for --stream-idle-ms; resume                                  with backup_id and the offset it reached",
+                            ));
+                        }
+                    }
+                    if last {
+                        return Ok(());
+                    }
+                    at = next;
+                }
+            }
+            .await;
+            metrics.count(
+                DOWNLOAD,
+                outcome.as_ref().err().map(|e| e.code.as_str()),
+                started.elapsed(),
+            );
+            if let Err(e) = outcome {
+                let _ = tx.try_send(Err(e));
+            }
+            backups.release(&task_id);
+            drop(slot);
+        });
+        Ok(super::backup::Download {
+            id,
+            total: kept.total,
+            sha256: kept.sha256,
+            offset: r.offset,
+            chunks: rx,
+        })
     }
 
     /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.
@@ -1500,6 +1820,19 @@ async fn room<'a>(
                 idle.as_millis()
             )))
         }
+    }
+}
+
+/// A table as `Schema` describes it: its families with every option as stored.
+fn describe(t: &Table) -> proto::TableResponse {
+    proto::TableResponse {
+        name: t.name().to_owned(),
+        families: t
+            .families()
+            .into_iter()
+            .filter_map(|f| t.family_info(f))
+            .map(|i| convert::family_out(&i))
+            .collect(),
     }
 }
 
