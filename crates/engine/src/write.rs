@@ -50,6 +50,9 @@ pub struct WriteBatch {
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
+    /// Whether it holds a primary's logged mutations ([`push_logged`](Self::push_logged),
+    /// D315 PR 3): routed as logged, never converted or prepared again.
+    pub(crate) logged: bool,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -104,6 +107,7 @@ impl Default for WriteBatch {
             builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
+            logged: false,
         }
     }
 }
@@ -284,6 +288,30 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Appends one mutation exactly as a primary logged it (D315 PR 3: a replica's apply):
+    /// its kind, explicit timestamp and stored value (tag byte first, as the feed delivers
+    /// it; empty for deletes). The batch is then routed as logged: counter writes aren't
+    /// prepared and HLL or bloom inputs aren't converted again, and a merge may carry its
+    /// timestamp in any family. Not for a batch that also holds ordinary writes: the first
+    /// call marks the whole batch. Not part of the stable API.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_logged(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Timestamp,
+        stored: &[u8],
+    ) -> crate::Result<()> {
+        self.logged = true;
+        self.builder
+            .push(table, family, kind, row, qualifier, Some(ts), stored)?;
+        Ok(())
+    }
+
     /// Mutations so far.
     pub fn len(&self) -> usize {
         self.builder.len() + self.row_deletes.len()
@@ -298,6 +326,7 @@ impl WriteBatch {
     pub fn clear(&mut self) {
         self.builder.clear();
         self.row_deletes.clear();
+        self.logged = false;
     }
 
     /// The encoded mutations (row deletes excluded until expanded).

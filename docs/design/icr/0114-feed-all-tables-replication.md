@@ -59,8 +59,34 @@ Catalog changes (`create_table` with its family options, `add_family`, `drop_tab
   - `it::feed_reader` covers other tables' writes, and a pending commit and catalog change.
   - `tests/feed.rs` covers the public form and `feed_id`.
 
-## PR 3: replication apply (to come)
-`apply_replicated` and `apply_catalog`: the primary's commits, applied with their original timestamps and ids.
+## PR 3: replication apply
+Everything here is hidden (`#[doc(hidden)]`), behind the feature `__unstable-replication`, and not part of the stable API (the coordinator, 2026-11-05: no new ICR). The owner chose where the token lives on 2026-11-05: option (A), a reserved state table with `ro_compat` bit 0 (FORMAT §8.2, §9).
+
+- **pigeonhole** (hidden, behind the feature):
+  - **`Feed::replicated() -> Option<ReplicatedEvent>`** gives the last event delivered as a replica applies it: changes with the primary's ids and stored values, the event's stream position before and after it, and the feed's token right after it. `ReplicatedEvent::{is_catalog, token}`.
+  - **`Pigeonhole::apply_replicated(&[ReplicatedEvent], &FeedToken)`** applies a run of commits and stores the token in the same commit as the run's last change: one atomic `GroupSync` commit, cross-shard if it has to be.
+    - **The split:** a run whose commits write one cell at one timestamp twice is split there, since one commit can't hold both (two entries at one seqno read in no set order). Each part is committed with the token of its own last event, so a crash between parts resumes after the last committed one.
+    - **Refused** with `InvalidArgument`: an empty run, a catalog change in it, events that don't chain, a run that doesn't start where the last apply ended (a gap or an overlap), or a token that isn't the last event's.
+    - **The run bound:** none in the API. It's a later `phdb` replica loop's option (#755).
+  - **`Pigeonhole::apply_catalog(&ReplicatedEvent, &FeedToken)`** applies a catalog change with the primary's ids (counters raised past them, a local tablet per created table), then stores the token. These are two commits (the manifest's, then the state cell's). A change already applied as it stands is passed over, so a retry after a crash between them is safe.
+  - **`Pigeonhole::replicated_token() -> Option<FeedToken>`** is the token stored with the last event applied: the primary's feed resumes from it.
+  - **The first apply** needs a database with no tables of its own, and records where it starts before it applies anything. Bootstrapping a replica from a primary's snapshot is a later change.
+- **pigeonhole-engine** (internal, additive):
+  - `WriteBatch::push_logged`: a mutation exactly as the primary logged it. Such a batch is routed by `route_logged` (out of line, one branch in `route`), with no conversion, preparation or new-write checks.
+  - `Engine::{apply_replicated, store_replication_state, replication_state, apply_catalog}`.
+  - The clock's timestamp floor is raised to the largest timestamp a run applies.
+  - Reserved ids and names: `pigeonhole-format`'s `manifest::{REPLICA_TABLE, REPLICA_FAMILY, REPLICA_TABLET, REPLICA_TABLE_NAME, RESERVED_PREFIX, RO_COMPAT_REPLICA}`.
+- **Behaviour every build of 1.2 has, feature or not** (the state table only exists on a replica):
+  - The reserved table is hidden from `tables()`, `info()`, `table(name)` and every feed, including its creation as a catalog event.
+  - It can't be dropped, and its tablet is never split or merged.
+  - **New:** `create_table` refuses names starting with `__pigeonhole.` (`InvalidArgument`).
+- **Tests:**
+  - `tests/replication.rs`:
+    - a replica matches its primary across creates, drops, puts, every delete kind and counter increments;
+    - the refusals;
+    - the same-cell split (mutation-checked);
+    - a resume from the token after process crashes and power losses, including a power loss inside an apply. A state stored in a commit of its own fails it (mutation-checked).
+  - The corpus entry `replica` opens read-only, and only read-only, with 1.0.0 and 1.1.0 (compat readers), and passes the offline check.
 
 ## Callers changed
 None for PR 1 or PR 2: they're additive. `phdb mcp`'s `feed_poll` still names its tables. A feed of every table there is the bindings' and CLI's to add, after #1397's design.

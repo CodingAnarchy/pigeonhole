@@ -363,7 +363,7 @@ impl ManifestWriter {
         }
     }
 
-    /// Sets the `incompat` feature bits `edits` need in both superblock pages, before the
+    /// Sets the `incompat` (and `ro_compat`) feature bits `edits` need in both superblock pages, before the
     /// commit that writes them (D294; FORMAT §8.2): a family of a kind added after 1.0 needs
     /// its kind's bit, so a build that does not know the kind refuses the file at open
     /// instead of meeting the family. Called under the writer's exclusion with no root commit
@@ -385,12 +385,22 @@ impl ManifestWriter {
             Edit::PutFamily { options, .. } => bits | options.kind.required_incompat(),
             _ => bits,
         });
+        // A replica's state table (D315 PR 3): builds that don't know it open the file
+        // read-only.
+        let needed_ro = if edits.iter().any(|e| {
+            matches!(e, Edit::CreateTable { table, .. } if *table == pigeonhole_format::manifest::REPLICA_TABLE)
+        }) {
+            pigeonhole_format::manifest::RO_COMPAT_REPLICA
+        } else {
+            0
+        };
         let features = self.pager.features();
-        if needed & !features.incompat == 0 {
+        if needed & !features.incompat == 0 && needed_ro & !features.ro_compat == 0 {
             return Ok(());
         }
         let flagged = Features {
             incompat: features.incompat | needed,
+            ro_compat: features.ro_compat | needed_ro,
             ..features
         };
         self.pager.set_features(flagged).map_err(|e| {
@@ -973,13 +983,14 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // A catalog change with the change feed on (D315): its ceiling is held from the feed's
     // frontier, under the allocator's lock, until its `Catalog` sidecar entry is appended
     // (in the root-commit observer, before the Root entry), and its edits are staged for it.
+    // A replica's state table (D315 PR 3) is no feed's: its creation is never an event.
     let catalog_edits: Vec<Edit> = edits
         .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                Edit::CreateTable { .. } | Edit::PutFamily { .. } | Edit::DropTable { .. }
-            )
+        .filter(|e| match e {
+            Edit::CreateTable { table, .. }
+            | Edit::PutFamily { table, .. }
+            | Edit::DropTable { table } => *table != pigeonhole_format::manifest::REPLICA_TABLE,
+            _ => false,
         })
         .cloned()
         .collect();

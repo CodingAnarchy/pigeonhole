@@ -4442,6 +4442,25 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - `a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history` (R4: lost, torn, mid-file).
 - Mutation-checked for the checksum test, the cut, the adoption, and an observer that appends instead of overwriting.
 
+**Amendment, 2026-11-05: PR 3 as built (the owner chose (A) for the token; ro_compat bit 0 from the ledger; ICR 0114's PR 3 section; simp724's R1–R5).**
+- **Where the token lives.** A reserved table `__pigeonhole.replication` (TableId `u32::MAX`, FamilyId `u32::MAX`, TabletId `u64::MAX`; FORMAT §9's rule). It's created by the first apply, which sets `ro_compat` bit 0 before the commit that creates it (§8.2). Builds without the bit open a replica read-only, so none can drop the state or write into the mirror.
+  - **R1:** the counters never reach the reserved ids (a `debug_assert`).
+  - **R2:** the tablet is never split or merged.
+  - **R3:** the table is hidden from listings, lookups and every feed (its creation is no catalog event), it can't be dropped, and `__pigeonhole.` names are refused at creation.
+  - **R4:** `check` accepts it (the corpus entry), and a backup keeps it.
+  - **R5:** the token goes in the run's commit.
+- **Run-batched, per #755's (a).** `apply_replicated(run, token)` is one atomic `GroupSync` commit of a whole run, token included, not one commit per primary commit as §3 first said. The exactly-once argument is unchanged: the commit and its token are durable together or not at all.
+- **One exception splits a run:** two of its commits writing one cell at one timestamp. One commit can't hold both, since two entries at one seqno read in no set order (the memtable links duplicates). So the run is split there, each part with the token of its own last event, and a crash between parts resumes after the last committed one. A hot counter (every increment at `COUNTER_TS`) splits on every commit: correct but slow, and folding a counter's increments within a run is a later optimization.
+- **Applying.** Each change is pushed exactly as logged (`WriteBatch::push_logged`: kind, explicit timestamp, stored value) and routed without conversion (`route_logged`): an HLL or bloom input is already its state, and a counter write is already prepared. Blobs arrive resolved, and the replica separates them into its own files. The clock's floor is raised to the largest timestamp applied.
+- **Continuity.** Each event carries its stream position before and after (delivered seqno, catalog sequence). A run must chain, and start where the stored state ends: anything else is a gap or an overlap, refused. The first apply needs a database with no tables of its own, and records its start before it applies anything. Bootstrapping from a primary's snapshot is a later change.
+- **Catalog changes** apply between runs (`apply_catalog`), in two commits (the manifest's, then the state cell's). A change already applied as it stands is passed over, so the retry after a crash between them is safe.
+- **Testing.** `tests/replication.rs`:
+  - a replica matches its primary;
+  - the refusals;
+  - the same-cell split (mutation-checked);
+  - resumes after process crashes and power losses, including one inside an apply (mutation-checked: a state committed apart fails it).
+  - The corpus entry `replica` opens read-only, and only read-only, with 1.0.0 and 1.1.0.
+
 <a id="d316"></a>
 ## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
 

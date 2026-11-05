@@ -1312,8 +1312,13 @@ impl FeedReader {
                 let m = m?;
                 // The table first, then the row: a mutation outside is skipped by its
                 // lengths, never copied (§2.7).
-                // An empty list is every table (D315).
-                let followed = tables.is_empty() || tables.binary_search(&m.table).is_ok();
+                // An empty list is every table (D315), but a replica's state table: a
+                // commit only to it is passed over (D315 PR 3).
+                let followed = if tables.is_empty() {
+                    m.table != pigeonhole_format::manifest::REPLICA_TABLE
+                } else {
+                    tables.binary_search(&m.table).is_ok()
+                };
                 if !followed || !m.row.starts_with(prefix) {
                     continue;
                 }

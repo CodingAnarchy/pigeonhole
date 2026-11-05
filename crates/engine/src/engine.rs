@@ -1866,9 +1866,9 @@ impl Engine {
         self.inner.add_family(table, name, options)
     }
 
-    /// Looks up a table by name.
+    /// Looks up a table by name. A replica's state table (D315 PR 3) isn't found.
     pub fn table(&self, name: &str) -> Option<Arc<TableInfo>> {
-        if self.inner.forked() {
+        if self.inner.forked() || is_reserved_name(name) {
             return None;
         }
         // In a writer, looked up under the view's guard: a row read checks its table's entry
@@ -1901,16 +1901,26 @@ impl Engine {
         self.inner.catalog().table(id).cloned()
     }
 
-    /// Every table.
+    /// Every table, but a replica's state table (D315 PR 3).
     pub fn tables(&self) -> Vec<Arc<TableInfo>> {
         if self.inner.forked() {
             return Vec::new();
         }
-        self.inner.catalog().tables().cloned().collect()
+        self.inner
+            .catalog()
+            .tables()
+            .filter(|t| !is_reserved_table(t.id))
+            .cloned()
+            .collect()
     }
 
-    /// Drops a table and all its data.
+    /// Drops a table and all its data. A replica's state table (D315 PR 3) is refused.
     pub fn drop_table(&self, table: TableId) -> Result<()> {
+        if is_reserved_table(table) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be dropped".to_owned(),
+            ));
+        }
         self.inner.drop_table(table)
     }
 
@@ -1925,6 +1935,78 @@ impl Engine {
     /// catalog change is one create, one family added, or one drop).
     pub fn apply_catalog(&self, edits: &[pigeonhole_format::manifest::Edit]) -> Result<()> {
         self.inner.apply_catalog(edits)
+    }
+
+    /// Commits a run of a primary's changes (D315 PR 3): `batch` holds them as logged
+    /// ([`WriteBatch::push_logged`]), and `state` (the primary's feed token and position after
+    /// them) goes in the replica's state cell in the same commit, so the two are durable
+    /// together or not at all. One atomic `GroupSync` commit, cross-shard if it has to be.
+    ///
+    /// The first apply creates the reserved state table ([`REPLICA_TABLE`]), which flags
+    /// the file `ro_compat` bit 0 (builds that don't know it open it read-only). The
+    /// timestamp floor is raised to `max_ts`, the largest timestamp applied, so a later
+    /// default timestamp here sorts after every replicated one.
+    ///
+    /// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
+    pub fn apply_replicated(
+        &self,
+        mut batch: WriteBatch,
+        state: &[u8],
+        max_ts: Timestamp,
+    ) -> Result<CommitInfo> {
+        if batch.is_empty() || !batch.logged || !batch.row_deletes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a replicated run is a non-empty batch of logged mutations".to_owned(),
+            ));
+        }
+        self.push_replication_state(&mut batch, state)?;
+        self.inner.shared.clock.seed_ts(max_ts);
+        self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// Commits only the replica's state cell (D315 PR 3): after an applied catalog change,
+    /// whose own commit is the manifest's.
+    pub fn store_replication_state(&self, state: &[u8]) -> Result<CommitInfo> {
+        let mut batch = WriteBatch::new();
+        self.push_replication_state(&mut batch, state)?;
+        self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// The replica's state cell, as the last apply stored it; `None` before the first.
+    pub fn replication_state(&self) -> Result<Option<Vec<u8>>> {
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let cell = self.get_latest(
+            pigeonhole_format::manifest::REPLICA_TABLE,
+            pigeonhole_format::manifest::REPLICA_FAMILY,
+            REPLICA_STATE_ROW,
+            REPLICA_STATE_QUALIFIER,
+        )?;
+        Ok(cell.map(|c| c.stored().get(1..).unwrap_or_default().to_vec()))
+    }
+
+    /// Appends the state cell to `batch`, creating the state table first if this is the
+    /// first apply.
+    fn push_replication_state(&self, batch: &mut WriteBatch, state: &[u8]) -> Result<()> {
+        self.inner.ensure_replica_table()?;
+        let mut stored = Vec::with_capacity(1 + state.len());
+        stored.push(pigeonhole_format::value::ValueTag::Bytes as u8);
+        stored.extend_from_slice(state);
+        batch.push_logged(
+            pigeonhole_format::manifest::REPLICA_TABLE,
+            pigeonhole_format::manifest::REPLICA_FAMILY,
+            Kind::Put,
+            REPLICA_STATE_ROW,
+            REPLICA_STATE_QUALIFIER,
+            REPLICA_STATE_TS,
+            &stored,
+        )
     }
 
     /// The highest seqno a new snapshot may include now: every commit at or below it is
@@ -4515,6 +4597,12 @@ impl Inner {
         if name.is_empty() {
             return Err(Error::InvalidArgument("empty table name".to_owned()));
         }
+        if is_reserved_name(name) {
+            return Err(Error::InvalidArgument(format!(
+                "table names starting with {} are reserved",
+                pigeonhole_format::manifest::RESERVED_PREFIX
+            )));
+        }
         let mut seen = HashSet::new();
         for (fname, options) in families {
             if fname.is_empty() {
@@ -4560,11 +4648,57 @@ impl Inner {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Creates a replica's reserved state table if it isn't there (D315 PR 3): its one family
+    /// keeps one version, and its one tablet is reserved too. `flag_features` sets
+    /// `ro_compat` bit 0 before the commit that creates it.
+    fn ensure_replica_table(&self) -> Result<()> {
+        use pigeonhole_format::manifest::{
+            REPLICA_FAMILY, REPLICA_FAMILY_NAME, REPLICA_TABLE, REPLICA_TABLE_NAME, REPLICA_TABLET,
+        };
+        if self.catalog().table(REPLICA_TABLE).is_some() {
+            return Ok(());
+        }
+        let mut options = FamilyOptions::default();
+        options.max_versions = 1;
+        self.catalog_change(move |catalog| {
+            if catalog.table(REPLICA_TABLE).is_some() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![
+                Edit::CreateTable {
+                    table: REPLICA_TABLE,
+                    name: REPLICA_TABLE_NAME.to_owned(),
+                },
+                Edit::PutFamily {
+                    table: REPLICA_TABLE,
+                    family: REPLICA_FAMILY,
+                    name: REPLICA_FAMILY_NAME.to_owned(),
+                    options: options.clone(),
+                },
+                Edit::PutTablet {
+                    tablet: REPLICA_TABLET,
+                    table: REPLICA_TABLE,
+                    start: Vec::new(),
+                    end: None,
+                },
+            ])
+        })?;
+        Ok(())
+    }
+
     fn apply_catalog(&self, edits: &[Edit]) -> Result<()> {
         let bad =
             |what: String| Error::InvalidArgument(format!("a replicated catalog change: {what}"));
         // A drop: as `drop_table` does it (its blob files, the shards' tablets).
         if let [Edit::DropTable { table }] = edits {
+            if is_reserved_table(*table) {
+                return Err(bad(format!("table id {} is reserved", table.0)));
+            }
+            // Already dropped: a replica's retry after a crash between the change and its
+            // token (D315 PR 3).
+            if self.catalog().table(*table).is_none() {
+                return Ok(());
+            }
             return self.drop_table(*table);
         }
         if edits.is_empty()
@@ -4581,6 +4715,28 @@ impl Inner {
                 check_merge_operator(options, &self.options.merge_operators)?;
             }
         }
+        // Already applied as it stands: a replica's retry after a crash between the change
+        // and its token (D315 PR 3).
+        let catalog = self.catalog();
+        let applied = edits.iter().all(|e| match e {
+            Edit::CreateTable { table, name } => {
+                catalog.table(*table).is_some_and(|t| t.name == *name)
+            }
+            Edit::PutFamily {
+                table,
+                family,
+                name,
+                ..
+            } => catalog
+                .table(*table)
+                .and_then(|t| t.family(name))
+                .is_some_and(|f| f.id == *family),
+            _ => false,
+        });
+        drop(catalog);
+        if applied {
+            return Ok(());
+        }
         let edits = edits.to_vec();
         self.catalog_change(move |catalog| {
             let mut out = Vec::with_capacity(edits.len() + 1);
@@ -4589,8 +4745,8 @@ impl Inner {
             for e in &edits {
                 match e {
                     Edit::CreateTable { table, name } => {
-                        if is_reserved_table(*table) {
-                            return Err(bad(format!("table id {} is reserved", table.0)));
+                        if is_reserved_table(*table) || is_reserved_name(name) {
+                            return Err(bad(format!("table {name} (id {}) is reserved", table.0)));
                         }
                         if catalog.table(*table).is_some() || created.contains(table) {
                             return Err(bad(format!("table id {} is in use", table.0)));
@@ -4724,6 +4880,9 @@ impl Inner {
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
+        if batch.logged {
+            return route_logged(batch, view);
+        }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
             let info = catalog
@@ -6040,15 +6199,66 @@ fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> R
         .or_else(|e| refuse(e.to_string()))
 }
 
+/// A replica's state cell (D315 PR 3): its row and qualifier in [`REPLICA_TABLE`], at one
+/// fixed timestamp in a family that keeps one version, so the newest apply's is the one read.
+///
+/// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
+const REPLICA_STATE_ROW: &[u8] = b"replication";
+/// See [`REPLICA_STATE_ROW`].
+const REPLICA_STATE_QUALIFIER: &[u8] = b"state";
+/// See [`REPLICA_STATE_ROW`].
+const REPLICA_STATE_TS: Timestamp = 1;
+
+/// Routes a replica's batch of a primary's logged mutations (D315 PR 3,
+/// [`WriteBatch::push_logged`]): each family must exist in its table here, with its merge
+/// operator registered for a merge; nothing is converted, prepared or checked as a new write
+/// would be, since the primary did that before it logged them. Out of line: `route` calls it
+/// only for such a batch.
+#[inline(never)]
+fn route_logged(batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
+    let catalog = &view.catalog;
+    let mut shards = Shards::new();
+    for m in batch.batch().iter() {
+        let m = m?;
+        let Some(meta) = catalog.family(m.family) else {
+            return Err(Error::FamilyNotFound(format!("family {}", m.family.0)));
+        };
+        if meta.table != m.table {
+            return Err(Error::FamilyNotFound(format!(
+                "family {} is not in table {}",
+                m.family.0, m.table.0
+            )));
+        }
+        if m.kind == Kind::Merge && meta.merge == MergeKind::Unknown {
+            return Err(Error::UnknownMergeOperator(
+                meta.options.merge_operator.clone(),
+            ));
+        }
+        let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
+            return Err(Error::TableNotFound(format!("table {}", m.table.0)));
+        };
+        if !shards.contains(&shard) {
+            shards.push(shard);
+        }
+    }
+    Ok((batch.builder, shards))
+}
+
 /// The ids reserved for a replica's own state (D315 PR 3; simp724's R1): never allocated (the
 /// counters count up from 1 and never reach them), never applied from a primary.
-fn is_reserved_table(table: TableId) -> bool {
-    table.0 == u32::MAX
+pub(crate) fn is_reserved_table(table: TableId) -> bool {
+    table == pigeonhole_format::manifest::REPLICA_TABLE
 }
 
 /// See [`is_reserved_table`].
 fn is_reserved_family(family: FamilyId) -> bool {
-    family.0 == u32::MAX
+    family == pigeonhole_format::manifest::REPLICA_FAMILY
+}
+
+/// A table name the engine keeps for itself (D315 PR 3): refused at creation, not found by
+/// name.
+fn is_reserved_name(name: &str) -> bool {
+    name.starts_with(pigeonhole_format::manifest::RESERVED_PREFIX)
 }
 
 fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {

@@ -183,8 +183,10 @@ impl Engine {
             *tablets.entry(t.table).or_default() += 1;
         }
 
+        // A replica's state table (D315 PR 3) isn't listed.
         let mut tables: Vec<TableStorage> = catalog
             .tables()
+            .filter(|t| !crate::engine::is_reserved_table(t.id))
             .map(|t| TableStorage {
                 info: Arc::clone(t),
                 tablets: tablets.get(&t.id).copied().unwrap_or(0),

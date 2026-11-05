@@ -15,8 +15,9 @@
 //! `refused-by-1.0.0.txt` (D294: it names the `incompat` bits it uses, which 1.0.0 lacks)
 //! must be refused by a release that lacks any of them, for exactly the ones it lacks: opening
 //! it, read-write or read-only, fails the entry. A release that knows all of them (1.1.0
-//! knows bit 0) must open it read-write, and a refusal fails the entry. Exits 1 if any entry
-//! fails.
+//! knows bit 0) must open it read-write, and a refusal fails the entry. An entry with a
+//! `read-only-by-releases.txt` (a replica's state, `ro_compat` bit 0, D315 PR 3) must open
+//! read-only, and only read-only. Exits 1 if any entry fails.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +78,9 @@ fn hex(b: &[u8]) -> String {
 /// format of `expected.txt`.
 fn contents(db: &Pigeonhole) -> Result<Vec<String>, String> {
     let mut tables = db.tables();
+    // A replica's state table (D315 PR 3): newer builds hide it, older ones list it
+    // (FORMAT §13), so it isn't in `expected.txt`.
+    tables.retain(|t| !t.starts_with("__pigeonhole."));
     tables.sort();
     let mut lines = Vec::new();
     for name in tables {
@@ -321,6 +325,26 @@ fn main() {
             .filter(|&b| b != 0);
         let must_refuse = unknown.map(|bits| format!("incompatible feature bits {bits})"));
         let outcome = check(src, &scratch.join(&name));
+        // An entry using `ro_compat` bits no published release knows (a replica's state,
+        // D315 PR 3): it must open read-only, and only read-only.
+        if src.join("read-only-by-releases.txt").exists() {
+            match outcome {
+                Ok(Outcome::ReadOnly) => println!("{name}: read-only, as it must be"),
+                Ok(Outcome::Passed) => {
+                    println!("{name}: FAILED: opened read-write, but must open read-only");
+                    failed += 1;
+                }
+                Ok(Outcome::Refused(why)) => {
+                    println!("{name}: FAILED: refused, but must open read-only: {why}");
+                    failed += 1;
+                }
+                Err(why) => {
+                    println!("{name}: FAILED: {why}");
+                    failed += 1;
+                }
+            }
+            continue;
+        }
         if marked.is_some() && must_refuse.is_none() {
             match outcome {
                 Ok(Outcome::Passed) => println!("{name}: ok (incompat bits {RELEASE} reads)"),

@@ -227,7 +227,15 @@ struct Entry {
     /// with the marker file [`FEED_RESUMES`] (the D315 amendment: a 1.2 sidecar after clean
     /// closes holds only entries 1.1.0 reads, when no session changed the catalog).
     feed_resumes_by_1_1: bool,
+    /// The `ro_compat` feature bits the entry uses that the published releases lack: each
+    /// must open it read-only and only read-only (marker file [`READ_ONLY_BY`]).
+    read_only_by: u64,
 }
+
+/// The marker file of an entry the published releases must open read-only
+/// ([`Entry::read_only_by`]): it holds those `ro_compat` bits (decimal). The compat
+/// readers fail the entry if it opens read-write.
+const READ_ONLY_BY: &str = "read-only-by-releases.txt";
 
 /// The marker file of an entry whose stored feed token 1.1.0 must resume
 /// ([`Entry::feed_resumes_by_1_1`]).
@@ -239,7 +247,8 @@ fn same(o: Options) -> Options {
 }
 
 fn entries() -> Vec<Entry> {
-    vec![
+    #[allow(unused_mut)]
+    let mut entries = vec![
         Entry {
             name: "empty",
             shards: 1,
@@ -251,6 +260,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "values",
@@ -263,6 +273,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "counters",
@@ -275,6 +286,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "blobs",
@@ -287,6 +299,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "merge",
@@ -299,6 +312,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "wal_crash",
@@ -311,6 +325,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "families",
@@ -323,6 +338,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "wal_ops",
@@ -335,6 +351,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "checkpoints",
@@ -347,6 +364,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "aggregates",
@@ -359,6 +377,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "vectors",
@@ -371,6 +390,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "text",
@@ -384,6 +404,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "memory",
@@ -396,6 +417,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed",
@@ -408,6 +430,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_crash",
@@ -420,6 +443,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_sessions",
@@ -432,6 +456,7 @@ fn entries() -> Vec<Entry> {
             then: Some(write_feed_session),
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "returning",
@@ -444,6 +469,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_catalog",
@@ -456,6 +482,7 @@ fn entries() -> Vec<Entry> {
             then: None,
             then_options: same,
             feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_root_intent",
@@ -468,8 +495,77 @@ fn entries() -> Vec<Entry> {
             then: Some(write_feed_commits),
             then_options: feed_options,
             feed_resumes_by_1_1: true,
+            read_only_by: 0,
         },
-    ]
+    ];
+    // A replica (D315 PR 3): its state table, and `ro_compat` bit 0, which every published
+    // release lacks, so each opens it read-only.
+    #[cfg(feature = "__unstable-replication")]
+    entries.push(Entry {
+        name: "replica",
+        shards: 2,
+        options: same,
+        write: write_replica,
+        crash: false,
+        refused_by_1_0_0: 0,
+        extra: None,
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: pigeonhole_format::manifest::RO_COMPAT_REPLICA,
+    });
+    entries
+}
+
+/// A replica of a small primary (D315 PR 3): the primary's feed of every table applied with
+/// the primary's ids, a catalog change and a run at a time, its token stored with each.
+#[cfg(feature = "__unstable-replication")]
+fn write_replica(db: &Pigeonhole) {
+    let vfs = SimVfs::new(77);
+    let primary = Pigeonhole::open(
+        "/primary/data.phdb",
+        sim_options(&vfs, 2).change_feed(pigeonhole::FeedRetention::bytes(4 << 20)),
+    )
+    .unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    let t = primary
+        .table("mirrored")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    for i in 0..20u64 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put_at("f", b"q", T0 + i, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    t.mutate(b"r03")
+        .delete_cell("f", b"q", T0 + 3)
+        .commit()
+        .unwrap();
+    let mut run = Vec::new();
+    while feed
+        .next_event(Duration::from_millis(200))
+        .unwrap()
+        .is_some()
+    {
+        let ev = feed.replicated().unwrap();
+        if ev.is_catalog() {
+            db.apply_catalog(&ev, ev.token()).unwrap();
+        } else {
+            run.push(ev);
+            if run.len() == 4 {
+                db.apply_replicated(&run, run[3].token()).unwrap();
+                run.clear();
+            }
+        }
+    }
+    if let Some(last) = run.last() {
+        db.apply_replicated(&run, last.token()).unwrap();
+    }
+    drop(feed);
+    primary.close().unwrap();
 }
 
 /// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise, `f64`,
@@ -1748,6 +1844,14 @@ fn generate_corpus() {
         }
         for (name, bytes) in &files {
             frozen.push(frozen_line(&format!("{}/{name}", e.name), bytes));
+        }
+        if e.read_only_by != 0 {
+            let marker = format!("{}\n", e.read_only_by);
+            std::fs::write(dir.join(READ_ONLY_BY), &marker).unwrap();
+            frozen.push(frozen_line(
+                &format!("{}/{READ_ONLY_BY}", e.name),
+                marker.as_bytes(),
+            ));
         }
         if e.refused_by_1_0_0 != 0 {
             let marker = format!("{}\n", e.refused_by_1_0_0);
