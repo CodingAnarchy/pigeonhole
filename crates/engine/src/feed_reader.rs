@@ -677,7 +677,9 @@ impl FeedReader {
 
     /// The next whole commit, waiting up to `timeout` for one. Waits on the watermark the
     /// feed follows (never spins): a commit wakes it once its seqno passes; where the feed's
-    /// own holds keep the frontier back, it looks again every millisecond.
+    /// own holds, or a catalog change's, keep the frontier back, it waits on the feed's hold
+    /// list, which their release wakes (#1417), bounded by the hold's interval. A reader
+    /// process, with no hold list, backs off from 50 µs to 5 ms.
     pub fn wait(&mut self, timeout: Duration) -> Result<Next<'_>> {
         let deadline = Instant::now() + timeout;
         // Whether this call left a waker on the feed's hold list: taken back on the way out,
