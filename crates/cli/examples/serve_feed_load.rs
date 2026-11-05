@@ -2,10 +2,11 @@
 //!
 //! It creates a database with the change feed on and two tables (`busy`, written, and
 //! `tiny`, never written), starts `phdb serve` on it as its own process, and for each
-//! scenario opens that many idle `Feed.Subscribe` streams over gRPC, then runs a put loop
-//! (`Data.Mutate` on `busy`) for a fixed time. Per scenario it prints the commit throughput,
-//! put latency p50/p99/p99.9, the server process's CPU per put (Linux, from `/proc`), and
-//! the events the subscribers received.
+//! scenario opens that many idle `Feed.Subscribe` streams over gRPC (64 to a connection),
+//! then runs a put loop (`Data.Mutate` on `busy`) for a fixed time. Per scenario it prints
+//! the commit throughput, put latency p50/p99/p99.9, the server process's CPU per put (Linux,
+//! from `/proc`), and the events the subscribers received. With `--durability 2` (Buffered,
+//! so fsync doesn't set the pace), add `--visible`: a durable feed sees only synced commits.
 //!
 //! The scenarios:
 //! - 0, 1, 16 and 256 subscribers on `busy` (D310's bar: N subscribers cost no more than one);
@@ -65,7 +66,15 @@ struct Args {
     /// Durability of the puts: 0 the writer default, else the `Durability` enum's number.
     #[arg(long, default_value_t = 0)]
     durability: i32,
+    /// Subscribe to visible feeds (commits as they become visible) rather than durable ones.
+    /// Needed with `--durability 2` (Buffered): a durable feed delivers only synced commits.
+    #[arg(long)]
+    visible: bool,
 }
+
+/// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
+/// (`listener::MAX_STREAMS`), and a subscribe past that waits for a stream forever.
+const STREAMS_PER_CONNECTION: usize = 64;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -198,11 +207,19 @@ async fn run(
     let subscribers = tables.len();
     let events = Arc::new(AtomicU64::new(0));
     let mut subs = Vec::with_capacity(subscribers);
-    for set in tables {
-        let mut client = FeedClient::new(channel.clone());
+    let url = format!("http://127.0.0.1:{}", args.port);
+    let mut connections = Vec::new();
+    for (i, set) in tables.iter().enumerate() {
+        // A connection of its own for each `STREAMS_PER_CONNECTION` subscribers: the
+        // writers keep `channel`.
+        if i % STREAMS_PER_CONNECTION == 0 {
+            connections.push(connect(&url).await?);
+        }
+        let mut client = FeedClient::new(connections[i / STREAMS_PER_CONNECTION].clone());
         let mut stream = client
             .subscribe(proto::SubscribeRequest {
                 tables: set.clone(),
+                visible: args.visible,
                 ..Default::default()
             })
             .await?

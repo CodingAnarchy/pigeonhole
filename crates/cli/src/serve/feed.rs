@@ -55,7 +55,21 @@ pub(crate) struct FeedLimits {
     pub quiet: Duration,
     /// How long a client may leave an event untaken (`--stream-idle-ms`, perf287's G2).
     pub stream_idle: Duration,
+    /// Events a client's connection may hold untaken ([`CLIENT_EVENTS`]), and their encoded
+    /// bytes ([`CLIENT_BYTES`]): the per-client buffer.
+    pub client_events: usize,
+    pub client_bytes: usize,
 }
+
+/// Events buffered per client. More than one lets the gRPC encoder pack every event that is
+/// ready into one HTTP/2 frame: with one, each event cost every subscriber its own stream
+/// poll, its own trips through the connection's shared lock and its own frame (#1397's
+/// acceptance, ticket 5).
+pub(crate) const CLIENT_EVENTS: usize = 64;
+
+/// Encoded bytes buffered per client, at most: the bound on a client's buffer however large
+/// its commits. An event larger than this is still sent, alone.
+pub(crate) const CLIENT_BYTES: usize = 256 << 10;
 
 /// Where a client starts.
 pub(crate) enum Start {
@@ -400,7 +414,10 @@ impl Feeds {
             Start::Now => self.db.durable_snapshot()?.seqno(),
             _ => 0,
         };
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(self.limits.client_events.max(1));
+        let budget = Arc::new(Semaphore::new(
+            self.limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS),
+        ));
         let (end_tx, end_rx) = oneshot::channel();
         let client = Client {
             feeds: Arc::clone(self),
@@ -410,6 +427,7 @@ impl Feeds {
             prefix: spec.prefix,
             visible: spec.visible,
             tx,
+            budget,
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
@@ -504,7 +522,9 @@ struct Client {
     tables: Vec<Table>,
     prefix: Vec<u8>,
     visible: bool,
-    tx: mpsc::Sender<proto::FeedEvent>,
+    tx: mpsc::Sender<(proto::FeedEvent, OwnedSemaphorePermit)>,
+    /// The client's buffer's free bytes: each event in its channel holds its encoded size.
+    budget: Arc<Semaphore>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -758,7 +778,24 @@ impl Client {
 
     async fn send(&self, event: proto::FeedEvent, pos: &mut Position) -> Result<(), ApiError> {
         let token = event.token.to_vec();
-        match tokio::time::timeout(self.feeds.limits.stream_idle, self.tx.send(event)).await {
+        // Room in the client's buffer, then a place in its channel, both inside the idle
+        // limit: a client that takes nothing fills its buffer and then times out.
+        let bytes = prost::Message::encoded_len(&event).clamp(
+            1,
+            self.feeds
+                .limits
+                .client_bytes
+                .clamp(1, Semaphore::MAX_PERMITS),
+        );
+        let budget = Arc::clone(&self.budget);
+        let queued = async {
+            let room = budget
+                .acquire_many_owned(u32::try_from(bytes).unwrap_or(u32::MAX))
+                .await
+                .map_err(|_| ())?;
+            self.tx.send((event, room)).await.map_err(|_| ())
+        };
+        match tokio::time::timeout(self.feeds.limits.stream_idle, queued).await {
             Ok(Ok(())) => {
                 pos.sent = token;
                 pos.last_event = Instant::now();
@@ -814,7 +851,7 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 /// A client's events, then its error if it failed.
 #[derive(Debug)]
 pub(crate) struct FeedEvents {
-    events: mpsc::Receiver<proto::FeedEvent>,
+    events: mpsc::Receiver<(proto::FeedEvent, OwnedSemaphorePermit)>,
     end: Option<oneshot::Receiver<ApiError>>,
 }
 
@@ -823,7 +860,8 @@ impl Stream for FeedEvents {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.events.poll_recv(cx) {
-            Poll::Ready(Some(e)) => return Poll::Ready(Some(Ok(e))),
+            // Taken: its bytes go back to the client's buffer.
+            Poll::Ready(Some((e, _room))) => return Poll::Ready(Some(Ok(e))),
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => {}
         }
@@ -935,6 +973,8 @@ mod tests {
                 max_catch_up: 1,
                 quiet: Duration::from_secs(10),
                 stream_idle: Duration::from_secs(5),
+                client_events: CLIENT_EVENTS,
+                client_bytes: CLIENT_BYTES,
             },
         );
         let slots = Arc::new(Semaphore::new(8));
@@ -1002,6 +1042,8 @@ mod tests {
                 max_catch_up: 1,
                 quiet: Duration::from_secs(10),
                 stream_idle: Duration::from_secs(5),
+                client_events: CLIENT_EVENTS,
+                client_bytes: CLIENT_BYTES,
             },
         );
         let slots = Arc::new(Semaphore::new(1));

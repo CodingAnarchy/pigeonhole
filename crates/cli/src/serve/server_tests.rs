@@ -35,6 +35,8 @@ fn limits() -> Limits {
         max_catch_up: 4,
         feed_ring_bytes: 1 << 20,
         feed_quiet: Duration::from_secs(10),
+        feed_client_events: super::feed::CLIENT_EVENTS,
+        feed_client_bytes: super::feed::CLIENT_BYTES,
         request_timeout: Duration::from_secs(5),
         stream_idle: Duration::from_secs(5),
         leases: super::sessions::Leases {
@@ -1656,6 +1658,8 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     // with nothing missed or repeated.
     let mut l = limits();
     l.feed_ring_bytes = 2048; // a few entries
+    // A one-event buffer: a client that takes nothing stops reading the ring at once.
+    l.feed_client_events = 1;
     let s = Server::start("", l);
     let mut slow = direct_feed(&s, subscribe(&["t"], b"a"));
     let mut want = vec![write_row(&s, b"a0")];
@@ -1690,6 +1694,57 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     );
 }
 
+/// A client that takes nothing: its buffer fills, then the stream ends with
+/// `DeadlineExceeded` after `--stream-idle-ms`. The events it buffered come first, in order.
+fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Vec<u64>, Vec<u64>) {
+    let mut l = limits();
+    l.stream_idle = Duration::from_millis(300);
+    l.feed_client_events = client_events;
+    l.feed_client_bytes = client_bytes;
+    let s = Server::start("", l);
+    let mut stalled = direct_feed(&s, subscribe(&["t"], b""));
+    let written: Vec<u64> = (0..writes)
+        .map(|i| write_row(&s, format!("r{i:04}").as_bytes()))
+        .collect();
+    std::thread::sleep(Duration::from_millis(900));
+    let mut got = Vec::new();
+    loop {
+        match next_event(&s, &mut stalled, Duration::from_secs(5)) {
+            Some(Ok(e)) => got.extend(commit_of(&e).map(|(n, _)| n)),
+            Some(Err(e)) => {
+                assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+                assert!(e.message.contains("--stream-idle-ms"), "{e:?}");
+                break;
+            }
+            None => panic!("the stream ends with an error, after {} events", got.len()),
+        }
+    }
+    assert!(next_event(&s, &mut stalled, Duration::from_secs(1)).is_none());
+    (got, written)
+}
+
+#[test]
+fn a_feed_client_that_takes_nothing_fills_its_buffer_then_times_out() {
+    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, super::feed::CLIENT_BYTES, 100);
+    assert_eq!(
+        got,
+        written[..super::feed::CLIENT_EVENTS],
+        "the full buffer, in order"
+    );
+}
+
+#[test]
+fn a_feed_clients_buffer_is_bounded_by_bytes_too() {
+    // About 100 bytes an event: a 1 KiB buffer holds far fewer than 64 of them.
+    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, 1024, 100);
+    assert!(
+        !got.is_empty() && got.len() < 16,
+        "{} events buffered",
+        got.len()
+    );
+    assert_eq!(got, written[..got.len()], "in order");
+}
+
 #[test]
 fn feed_streams_match_a_direct_feed_across_fall_offs() {
     // feed1248's (6): each client's stream, ring and own-stream catch-up alike, delivers
@@ -1713,6 +1768,8 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
     };
     let mut l = limits();
     l.feed_ring_bytes = 2048;
+    // One-event buffers, so a stalled round takes clients off the ring.
+    l.feed_client_events = 1;
     l.max_catch_up = 2;
     let s = Server::start_with("", l, 2);
     let prefixes: [&[u8]; 4] = [b"", b"a", b"b", b"ab"];
