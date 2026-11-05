@@ -1,0 +1,2 @@
+### Fixed
+- **An async nearest-neighbour search with a value filter and a column limit** (`run_async`, `run_within_async`) now returns what the sync search returns. It counted the columns the filter dropped toward `column_limit`, so a row whose first columns failed the filter came back short or empty. A scan whose reader stops a row early also no longer hands out the rest of that row as if it were the next row.

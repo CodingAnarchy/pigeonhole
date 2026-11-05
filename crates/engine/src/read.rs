@@ -1121,11 +1121,12 @@ impl ScanCursor {
             self.recycle_lanes();
             return Ok(Some(false));
         }
-        // Drop whatever is left of the current row.
+        // Drop whatever is left of the current row. A lane whose cell was handed out last
+        // still holds it (pending, in this row) with the rest of the row behind it unread:
+        // it is skipped with the others, never left to hand that rest out as a next row
+        // (a reader that stops a row early: an async search at its column limit, #1286).
         if self.in_row {
-            if let Some(i) = self.last_lane.take() {
-                self.lanes[i].pending = false;
-            }
+            self.last_lane = None;
             self.skip_current_row()?;
             self.in_row = false;
         }

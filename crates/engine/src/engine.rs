@@ -2836,6 +2836,15 @@ impl Engine {
             .value
             .take()
             .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
+        // The read's column limit counts only the columns that pass the predicate (the
+        // resolver counts a column when its newest version passes), so it leaves the read
+        // with the predicate, and the search counts the passing columns itself (simp724's A1
+        // on #1286).
+        let column_limit = if filter.is_some() {
+            std::mem::take(&mut read.columns_per_row)
+        } else {
+            0
+        };
         Ok(match &spec.input {
             crate::ReadInput::Ranges(ranges) => {
                 let [(lo, hi)] = ranges.as_slice() else {
@@ -2846,7 +2855,7 @@ impl Engine {
                 let mut scan = ScanSpec::new(lo.clone(), hi.clone());
                 scan.read = read;
                 let cursor = self.scan_async(snapshot, table, scan)?;
-                read::knn::PendingNearest::scan(cursor, query, k, filter)
+                read::knn::PendingNearest::scan(cursor, query, k, filter, column_limit)
             }
             crate::ReadInput::Keys(keys) => {
                 let cursor = crate::KeyCursor::over(
@@ -2858,7 +2867,14 @@ impl Engine {
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
-                read::knn::PendingNearest::keys(cursor, Arc::clone(keys), query, k, filter)
+                read::knn::PendingNearest::keys(
+                    cursor,
+                    Arc::clone(keys),
+                    query,
+                    k,
+                    filter,
+                    column_limit,
+                )
             }
         })
     }
