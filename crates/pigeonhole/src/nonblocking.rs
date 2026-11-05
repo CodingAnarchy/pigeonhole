@@ -640,6 +640,13 @@ impl FeedStream {
         self.feed.token()
     }
 
+    /// How far the stream has covered its history: [`Feed::position`](crate::Feed::position).
+    /// Not part of the stable API.
+    #[doc(hidden)]
+    pub fn position(&self) -> crate::FeedPosition {
+        self.feed.position()
+    }
+
     /// The feed back, for its blocking calls.
     pub fn into_inner(self) -> crate::Feed {
         self.feed
@@ -687,6 +694,13 @@ impl FeedEventStream {
     /// after the last event it yielded.
     pub fn token(&self) -> crate::FeedToken {
         self.feed.token()
+    }
+
+    /// How far the stream has covered its history: [`Feed::position`](crate::Feed::position).
+    /// Not part of the stable API.
+    #[doc(hidden)]
+    pub fn position(&self) -> crate::FeedPosition {
+        self.feed.position()
     }
 
     /// The feed back, for its blocking calls.

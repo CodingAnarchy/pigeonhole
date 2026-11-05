@@ -43,6 +43,22 @@ Catalog changes (`create_table` with its family options, `add_family`, `drop_tab
 
 **Test seam:** a hidden `Engine::delay_root_intent` (`test-hooks`).
 
+## Amendment: a feed's position and a table's feed id (for #1518)
+`phdb serve`'s feed hubs (D313 ticket 5, #1518) share one engine feed per table set and move clients between their own streams and the hub's ring. To rejoin exactly, they need a stream's covered position, and a key that tells a re-created table from the old one (simp724's F1 and F4 on #1518). The coordinator chose hidden accessors, approved 2026-11-04 and recorded in numbers.md.
+- **pigeonhole** (`#[doc(hidden)]`, so outside the stable API and the public-API snapshot; not behind `__unstable-hooks`, since production `phdb serve` uses them):
+  - `Feed::position()`, `nonblocking::FeedStream::position()` and `FeedEventStream::position()` return a `FeedPosition` with `seqno()` and `catalog_sequence()`. Every commit of the feed's tables at or below `seqno` was delivered or passed over, or precedes the start. In a feed of every table, a catalog change was delivered or passed over iff its sequence is at most `catalog_sequence`. The seqno says nothing about catalog changes: a `Now` or snapshot start can be past the ceiling of an unpublished change it still delivers (simp724's P1 on #1520). The parts are independent, so one position covers another iff both are at least as large (`FeedPosition::covers`). Neither part goes back, across a recovery's or a writer restart's resubscribe too.
+  - `Table::feed_id()` returns the engine's table id. Ids are never reused.
+- **pigeonhole-engine** (internal): `FeedReader::position() -> FeedPosition { seqno, catalog }`, with `seqno = max(delivered, min(F, k - 1, c - 1))`:
+  - F is the frontier of the last complete read pass;
+  - k is the smallest key read but not yet delivered;
+  - c is the ceiling of the next catalog change loaded but not yet delivered, in a feed of every table.
+
+  It is at least `delivered()`, which already follows other tables' records (passed over with no changes). It also covers the seqnos no record holds, and carries the catalog sequence.
+- **Tests:**
+  - `feed_model` checks, across reopens, power losses and reader processes, that the position never goes back and never passes an undelivered commit.
+  - `it::feed_reader` covers other tables' writes, and a pending commit and catalog change.
+  - `tests/feed.rs` covers the public form and `feed_id`.
+
 ## PR 3: replication apply (to come)
 `apply_replicated` and `apply_catalog`: the primary's commits, applied with their original timestamps and ids.
 

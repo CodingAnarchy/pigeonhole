@@ -143,6 +143,34 @@ pub enum Next<'a> {
     Catalog(&'a CatalogEvent),
 }
 
+/// How far a feed has covered its history ([`FeedReader::position`], ICR 0114 amendment):
+/// a seqno for its commits, and in a feed of every table a sequence for its catalog changes.
+/// Each part only grows, and they are independent: one position covers another iff both
+/// parts are at least as large ([`FeedPosition::covers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct FeedPosition {
+    /// Every commit of the spec at or below it is covered.
+    pub seqno: Seqno,
+    /// A feed of every table: every catalog change with a root sequence at or below it was
+    /// delivered or passed over (0 for none, and in a feed of some tables).
+    pub catalog: u64,
+}
+
+impl FeedPosition {
+    /// Whether this position covers everything `other` does: both parts at least as large.
+    pub fn covers(&self, other: &FeedPosition) -> bool {
+        self.seqno >= other.seqno && self.catalog >= other.catalog
+    }
+
+    /// The position covering what both do, part by part.
+    pub fn join(self, other: FeedPosition) -> FeedPosition {
+        FeedPosition {
+            seqno: self.seqno.max(other.seqno),
+            catalog: self.catalog.max(other.catalog),
+        }
+    }
+}
+
 /// A catalog change a feed of every table delivers (D315): one manifest commit's catalog
 /// edits, from its `Catalog` sidecar entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -770,6 +798,42 @@ impl FeedReader {
     /// feed's start).
     pub fn delivered(&self) -> Seqno {
         self.delivered
+    }
+
+    /// How far this feed has covered its history (ICR 0114 amendment; simp724's F1 on #1518):
+    /// every commit of its spec at or below [`FeedPosition::seqno`] was delivered, passed
+    /// over or precedes its start, and in a feed of every table a catalog change was
+    /// delivered or passed over iff its sequence is at most [`FeedPosition::catalog`]: changes
+    /// go in sequence order, and those passed over at the start are a prefix. The seqno says
+    /// nothing about catalog changes (simp724's P1 on #1520): a `Now` or snapshot start can be
+    /// past the ceiling of a change not yet published, which it still delivers.
+    ///
+    /// It is at least [`delivered`](Self::delivered), which follows every record of the
+    /// feed's streams, other tables' included (passed over with no changes), and it also
+    /// covers the seqnos no record holds: once a whole read pass under a frontier F finds
+    /// nothing left to deliver below it, every commit up to F is covered (M1: every record at
+    /// or below F was read). An undecided round needs no term: the frontier never passes an
+    /// undecided apply seqno. It never goes back: a record read later is above the frontier
+    /// of every earlier pass. Before the first poll it is the start's bound, or a token's
+    /// delivered seqno.
+    pub fn position(&self) -> FeedPosition {
+        let mut seqno = self.read_through.unwrap_or(0);
+        if let Some((&key, _)) = self.ready.first_key_value() {
+            seqno = seqno.min(key.saturating_sub(1));
+        }
+        if self.tables.is_empty()
+            && let Some(ev) = self.catalog.front()
+        {
+            seqno = seqno.min(ev.seqno_ceiling.saturating_sub(1));
+        }
+        FeedPosition {
+            seqno: seqno.max(self.delivered),
+            catalog: if self.tables.is_empty() {
+                self.catalog_seq
+            } else {
+                0
+            },
+        }
     }
 
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last

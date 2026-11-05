@@ -998,6 +998,142 @@ fn a_resume_passes_over_what_its_start_did() {
     }
 }
 
+/// ICR 0114 amendment (simp724's F1 on #1518): a feed's position moves while only other
+/// tables write, and is never below `delivered`. Before the first poll it is the start.
+#[test]
+fn a_position_moves_while_other_tables_write() {
+    let vfs = SimVfs::new(3181);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    assert_eq!(
+        r.position().seqno,
+        r.delivered(),
+        "the start, before a poll"
+    );
+    let s1 = single(&db, &a, b"a1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let mut last = 0;
+    for i in 0..3u8 {
+        last = single(&db, &b, &[b'b', i], Durability::GroupSync);
+    }
+    // A durable feed's frontier follows the syncs: poll until it's past `b`'s commits.
+    let deadline = std::time::Instant::now() + WAIT;
+    while r.position().seqno < last {
+        assert!(matches!(r.try_next().unwrap(), Next::Pending));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the position stayed at {:?}",
+            r.position()
+        );
+        std::thread::yield_now();
+    }
+    assert!(r.position().seqno >= r.delivered());
+    assert_eq!(
+        r.position().catalog,
+        0,
+        "a feed of some tables has no catalog position"
+    );
+    // The next commit of the feed's own is above it.
+    let s2 = single(&db, &a, b"a2", Durability::GroupSync);
+    assert!(s2 > r.position().seqno);
+    assert_eq!(next(&mut r).seqno, s2);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// ICR 0114 amendment: a feed of every table's position never passes a commit read and not
+/// yet delivered, nor a catalog change loaded and not yet delivered; once the change is
+/// delivered, its sequence is the position's catalog part.
+#[test]
+fn a_position_never_passes_what_is_still_to_deliver() {
+    let vfs = SimVfs::new(3182);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let a1 = single(&db, &a, b"a1", Durability::GroupSync);
+    let a2 = single(&db, &a, b"a2", Durability::GroupSync);
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let c1 = single(&db, &c, b"c1", Durability::GroupSync);
+    // Wait until the frontier covers all of it, so one poll reads everything.
+    let deadline = std::time::Instant::now() + WAIT;
+    while db.feed_frontier(true) < c1 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let got = match r.wait(WAIT).unwrap() {
+        Next::Commit(cm) => cm.seqno,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(got, a1);
+    assert_eq!(r.position().seqno, a1, "a2 is read and not delivered");
+    assert_eq!(next(&mut r).seqno, a2);
+    let p = r.position();
+    let sequence = match r.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => {
+            assert!(
+                p.seqno < ev.seqno_ceiling,
+                "{p:?} past the change at {}",
+                ev.seqno_ceiling
+            );
+            ev.sequence
+        }
+        other => panic!("the create: {other:?}"),
+    };
+    let p = r.position();
+    assert_eq!(p.catalog, sequence);
+    assert!(p.seqno < c1, "c1 is still to deliver: {p:?}");
+    assert_eq!(next(&mut r).seqno, c1);
+    assert!(r.position().covers(&p) && r.position() != p);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's P1 on #1520 (ICR 0114 amendment): a feed of every table's position states its
+/// catalog changes by sequence only. A `Now` start past the ceiling of a change not yet
+/// published (F1b's race) has a seqno at or above that ceiling while the change is still to
+/// deliver: the catalog part stays below its sequence until it is delivered.
+#[test]
+fn a_position_s_catalog_part_covers_a_change_only_once_delivered() {
+    let vfs = SimVfs::new(3183);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    db.delay_root_observer(Duration::from_millis(800));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let s = single(&db, &a, b"past", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let before = r.position();
+    assert!(before.seqno >= s, "{before:?}");
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let (ceiling, sequence) = match r.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => (ev.seqno_ceiling, ev.sequence),
+        other => panic!("the change its view didn't reflect: {other:?}"),
+    };
+    assert!(
+        ceiling <= s,
+        "the start must be past the change: {ceiling} > {s}"
+    );
+    assert!(
+        before.catalog < sequence,
+        "the change was covered by sequence before it was delivered: {before:?}"
+    );
+    let after = r.position();
+    assert_eq!(after.catalog, sequence);
+    assert!(after.covers(&before));
+    drop(r);
+    db.close().unwrap();
+}
+
 /// D315 amendment (#1504, simp724's R1-R4): a process crash around a root commit's
 /// superblock write never expires a durable feed. Held at each point with a seam, then
 /// crashed, reopened and resumed from a token taken before:

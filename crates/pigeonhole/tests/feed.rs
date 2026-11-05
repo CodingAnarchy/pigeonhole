@@ -905,3 +905,45 @@ fn a_feed_of_every_table_from_a_snapshot_starts_with_the_changes_it_did_not_see(
     drop((from_before, from_after, a, c));
     db.close().unwrap();
 }
+
+/// ICR 0114 amendment (for `phdb serve`'s hubs, #1518): `Feed::position` covers every
+/// delivered commit and moves while only other tables write, and a table created again
+/// under its old name has another `feed_id`.
+#[test]
+fn a_feed_s_position_and_a_table_s_feed_id() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("pos.phdb"), fed()).unwrap();
+    let (a, b) = tables(&db);
+    let mut feed = a.feed().open().unwrap();
+    let start = feed.position();
+    let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    assert_eq!(next(&mut feed).seqno(), s1.seqno);
+    assert!(feed.position().seqno() >= s1.seqno);
+    assert!(feed.position().covers(&start));
+    let other = b.mutate(b"r2").put("f", b"q", b"2").commit().unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while feed.position().seqno() < other.seqno {
+        assert!(feed.try_next().unwrap().is_none(), "nothing of a's");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            feed.position()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(feed.position().catalog_sequence(), 0);
+
+    let id = b.feed_id();
+    assert_ne!(id, a.feed_id());
+    drop(b);
+    db.drop_table("b").unwrap();
+    let b = db
+        .table("b")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    assert_ne!(b.feed_id(), id, "ids are never reused");
+    drop((feed, a, b));
+    db.close().unwrap();
+}
