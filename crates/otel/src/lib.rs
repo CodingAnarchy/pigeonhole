@@ -371,6 +371,15 @@ static SPECS: &[Spec] = &[
         |s, out| one(out, s.e.group_syncs)
     ),
     spec!(
+        "pigeonhole.wal.group_sync.time",
+        Counter,
+        true,
+        "s",
+        [],
+        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits): not a sync commit's own sync, flush or checkpoint barrier syncs, or buffered commits.",
+        |s, out| out.push((seconds(s.e.group_sync_nanos), Vec::new()))
+    ),
+    spec!(
         "pigeonhole.transactions",
         Counter,
         false,
@@ -990,6 +999,7 @@ counters!(EngineRest {
     cross_rounds: |r: &Raw| r.m.cross_shard.rounds,
     cross_failed_fast: |r: &Raw| r.m.cross_shard.failed_fast,
     group_syncs: |r: &Raw| r.m.group_syncs,
+    group_sync_nanos: |r: &Raw| r.m.group_sync_nanos,
     feed_background_syncs: |r: &Raw| r.m.feed_background_syncs,
     feed_sidecar_syncs: |r: &Raw| r.m.feed_sidecar_syncs,
     row_hits: |r: &Raw| r.row.hits,

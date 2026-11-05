@@ -168,6 +168,15 @@ pub struct EngineMetrics {
     /// cost on its own: set the `feed_*` syncs beside it. Its rise over an interval, against
     /// the `GroupSync` commits', is the commits each sync carried.
     pub group_syncs: u64,
+    /// Nanoseconds the group syncs were in flight, summed over shards (ICR 0116): each
+    /// sync adds its own duration, so its rise over an interval, divided by
+    /// [`group_syncs`](Self::group_syncs)', is the mean group sync time, even with several
+    /// syncs in flight at once. It covers group syncs only, the ones `group_syncs` counts
+    /// (those of groups with a `GroupSync` commit): a `Sync` commit's own sync, flushes' and
+    /// checkpoints' barrier syncs, and `Buffered` and `None` commits aren't in it. It's
+    /// current as of the last time a group sync started or finished on its shard, so a
+    /// sync still in flight counts from then (perf287 and cli692 on #1521).
+    pub group_sync_nanos: u64,
     /// Syncs the change feed submitted on its own (D310): fed `Buffered` or `None` commits
     /// waited longer than the feed's sync interval for one and no commit's sync covered
     /// them. What a durable feed costs in syncs beyond the commits' own. 0 while the feed is
@@ -384,6 +393,7 @@ impl EngineMetrics {
             shard_busy_nanos: m.shard_busy_nanos,
             memtable_bytes: m.memtable_bytes,
             memtable_limit_bytes: m.memtable_limit,
+            group_sync_nanos: m.group_sync_nanos,
             reader_slots_active: m.reader_slots.0,
             reader_slots: m.reader_slots.1,
             reader_slots_reclaimed: m.reader_slots_reclaimed,
@@ -627,6 +637,7 @@ mod tests {
         m.stalls = (5, 6);
         m.memtable_bytes = 41;
         m.memtable_limit = 42;
+        m.group_sync_nanos = 43;
         m.room_stalls = (31, 32);
         m.pacing_stalls = (33, 34);
         m.block_cache = (7, 8);
@@ -653,6 +664,7 @@ mod tests {
         );
         assert_eq!((e.write_stalls, e.write_stall_nanos), (5, 6));
         assert_eq!((e.memtable_bytes, e.memtable_limit_bytes), (41, 42));
+        assert_eq!(e.group_sync_nanos, 43);
         assert_eq!((e.room_stalls, e.room_stall_nanos), (31, 32));
         assert_eq!((e.pacing_stalls, e.pacing_stall_nanos), (33, 34));
         assert_eq!((e.block_cache_hits, e.block_cache_misses), (7, 8));

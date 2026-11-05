@@ -11,8 +11,12 @@
   - **The first version** published at the end of every batch (perf287's option (a)). It cost 10–13 instructions per commit on the single-commit callgrind shapes, which put `commit-one` and `commit-async` over their ceilings, since `commit-one`'s ceiling was base + 1. The coordinator asked for this cold-path version instead (#1512).
   - **pigeonhole-engine** (internal, additive): `Metrics::memtable_bytes` and `Metrics::memtable_limit`.
   - **pigeonhole-otel:** `pigeonhole.memtable.size` and `pigeonhole.memtable.limit` (D316).
-- **A3, group-sync time** (a later PR): `EngineMetrics::wal_sync_nanos`, summing the shards' existing `sync_busy_nanos` (D248) with no new atomic. It's exported as `pigeonhole.wal.group_sync.time`.
-- **A4, feed lag** (a later PR): `Feed::progress() -> FeedProgress`, a cheap `Clone + Send` handle to the last delivered seqno, stored once per delivered batch, and `Pigeonhole::visible_seqno()`. `pigeonhole-otel` gains `Registration::watch_feed(name, progress)`, exported as `pigeonhole.feed.lag`.
+- **A3, group-sync time:** `EngineMetrics::group_sync_nanos`, named to pair with `group_syncs` (D316 rev 2 called it `wal_sync_nanos`). It sums the shards' existing `sync_busy_nanos` (D248), with no new atomic and no new clock read, so the commit path is unchanged. It covers group syncs only, the ones `group_syncs` counts (groups with a `GroupSync` commit): a `Sync` commit's own sync isn't in it (cli692). It's current as of the last time a group sync started or finished on its shard (perf287, cli692). It's exported as `pigeonhole.wal.group_sync.time`. The engine adds `Metrics::group_sync_nanos`.
+- **A4, feed lag:**
+  - **pigeonhole (semver, additive):** `Feed::progress() -> FeedProgress`, a cheap `Clone + Send + Sync` handle with `delivered_seqno()` and `is_live()` (the feed's drop clears it; `Feed` gains a `Drop` impl, and its fields are private); and `Pigeonhole::visible_seqno()`.
+  - **pigeonhole-engine (internal, additive):** `FeedReader::set_progress(Arc<AtomicU64>)` and `Engine::visible_seqno()`.
+  - **Where the publish is:** the engine's reader publishes its delivered position as it moves, with one relaxed store per commit it reads, on the subscriber's thread. Its position moves past commits that carry nothing for the feed's tables inside a blocking wait, so a caught-up feed reads near-zero lag even while other tables are written. A publish at `next`'s return would go stale for a whole wait. `Feed` re-attaches the sink whenever it resubscribes.
+  - **pigeonhole-otel:** `Registration::watch_feed(name, progress)`, exported as `pigeonhole.feed.lag{pigeonhole.feed.name}`, the visible seqno less the feed's position. A dropped feed stops reporting.
 
 ## Why
 #1458 lists memtable bytes, WAL sync time and feed lag among the signals operators need, and the engine exported none of them (D316's gaps). Memtable bytes against the limit is the early warning for `room` stalls, before the commits wait.
