@@ -76,13 +76,7 @@ pub fn scan_to_arrow<'t>(
     scan: Scan<'t>,
     options: &ArrowOptions,
 ) -> pigeonhole::Result<ArrowScan<'t>> {
-    let rows = scan.iter()?;
-    Ok(ArrowScan {
-        rows,
-        builder: Builder::new(options.clone()),
-        carry: None,
-        done: false,
-    })
+    Ok(ArrowScan::from_rows(scan.iter()?, options))
 }
 
 /// A scan's cells as Arrow batches: an [`Iterator`] and a [`RecordBatchReader`]. See the
@@ -98,6 +92,21 @@ pub struct ArrowScan<'t> {
     /// iterator moves on) and the next cell's index.
     carry: Option<(Row, usize)>,
     done: bool,
+}
+
+impl<'t> ArrowScan<'t> {
+    /// The cells of a scan already started, `rows`, as a stream of Arrow batches: what
+    /// [`scan_to_arrow`] does after starting its scan (ICR 0120). For a caller that started
+    /// the scan itself, so its start errors came out where it started it, and the batches
+    /// read at the snapshot it took. The batches begin at `rows`' next row.
+    pub fn from_rows(rows: RowIter<'t>, options: &ArrowOptions) -> Self {
+        ArrowScan {
+            rows,
+            builder: Builder::new(options.clone()),
+            carry: None,
+            done: false,
+        }
+    }
 }
 
 impl ArrowScan<'_> {

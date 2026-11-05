@@ -16,6 +16,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+# `ArrowStream.to_pyarrow()` (#1480). The stream itself needs no dependency: any Arrow
+# PyCapsule consumer (Polars, DuckDB, pyarrow) takes it.
+arrow = ["pyarrow>=18"]
+
 [project.urls]
 Repository = "https://github.com/CodingAnarchy/pigeonhole"
 Documentation = "https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/python.md"

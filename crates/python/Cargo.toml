@@ -19,6 +19,8 @@ doctest = false
 pigeonhole = { workspace = true }
 # `pigeonhole.memory` (D311 T6).
 pigeonhole-memory = { workspace = true }
+# `ScanIter.to_arrow()` (#1480, ICR 0120): the batches and the Arrow C stream.
+pigeonhole-arrow = { workspace = true, features = ["ffi"] }
 pyo3 = { version = "0.30.1", features = ["abi3-py311"] }
 
 [lints]

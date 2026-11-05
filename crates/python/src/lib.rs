@@ -9,6 +9,7 @@
 
 use pyo3::prelude::*;
 
+mod arrow;
 mod budget;
 mod convert;
 mod db;
@@ -40,6 +41,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<read::Row>()?;
     m.add_class::<read::Snapshot>()?;
     m.add_class::<read::ScanIter>()?;
+    m.add_class::<arrow::ArrowStream>()?;
     m.add_class::<vector::VectorSpec>()?;
     m.add_class::<walk::Hop>()?;
     m.add_class::<walk::Traversal>()?;

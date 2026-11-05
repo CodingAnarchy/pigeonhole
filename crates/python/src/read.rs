@@ -237,6 +237,8 @@ pub(crate) struct ScanIter {
     rows: Mutex<Option<pigeonhole::RowIter<'static>>>,
     buffered: VecDeque<pigeonhole::Row>,
     chunk: usize,
+    /// Whether `__next__` ever ran: `to_arrow` takes an unread scan only (ICR 0120).
+    read: bool,
 }
 
 impl ScanIter {
@@ -248,6 +250,7 @@ impl ScanIter {
             rows: Mutex::new(Some(scan.iter().or_py()?)),
             buffered: VecDeque::new(),
             chunk,
+            read: false,
         })
     }
 }
@@ -266,6 +269,50 @@ impl ScanIter {
         self.buffered.clear();
     }
 
+    /// The scan's cells as Arrow batches (#1480, ICR 0120), one Arrow row per cell in
+    /// `pigeonhole-arrow`'s schema, for pyarrow, Polars or DuckDB: an `ArrowStream`. Only on
+    /// a scan not yet iterated; the stream takes the scan, so iterating this one afterwards
+    /// ends at once. A batch closes at `batch_cells` cells or `batch_bytes` bytes of keys and
+    /// values, so memory stays bounded by a batch.
+    #[pyo3(name = "to_arrow", signature = (*, batch_cells=8192, batch_bytes=8388608, row_dictionary=false, utf8_keys=false, typed_values=false, ts="timestamp", vector_dim=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn arrow(
+        &mut self,
+        batch_cells: usize,
+        batch_bytes: usize,
+        row_dictionary: bool,
+        utf8_keys: bool,
+        typed_values: bool,
+        ts: &str,
+        vector_dim: Option<u32>,
+    ) -> PyResult<crate::arrow::ArrowStream> {
+        let options = crate::arrow::options(
+            batch_cells,
+            batch_bytes,
+            row_dictionary,
+            utf8_keys,
+            typed_values,
+            ts,
+            vector_dim,
+        )?;
+        if self.read {
+            return Err(PyValueError::new_err(
+                "to_arrow() takes a scan not yet iterated: start a new scan",
+            ));
+        }
+        let rows = self
+            .rows
+            .lock()
+            .expect("not poisoned")
+            .take()
+            .ok_or_else(|| {
+                PyValueError::new_err("to_arrow() takes an open scan: this one was closed")
+            })?;
+        Ok(crate::arrow::ArrowStream::new(
+            pigeonhole_arrow::ArrowScan::from_rows(rows, &options),
+        ))
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -281,6 +328,7 @@ impl ScanIter {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Row>> {
+        self.read = true;
         if self.buffered.is_empty() {
             let chunk = self.chunk;
             let rows = &self.rows;

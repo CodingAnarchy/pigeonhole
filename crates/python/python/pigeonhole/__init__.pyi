@@ -221,7 +221,39 @@ class ScanIter:
     def __iter__(self) -> ScanIter: ...
     def __next__(self) -> Row: ...
     def close(self) -> None: ...
+    def to_arrow(
+        self,
+        *,
+        batch_cells: int = 8192,
+        batch_bytes: int = 8388608,
+        row_dictionary: bool = False,
+        utf8_keys: bool = False,
+        typed_values: bool = False,
+        ts: Literal["timestamp", "uint64"] = "timestamp",
+        vector_dim: int | None = None,
+    ) -> ArrowStream:
+        """The scan's cells as Arrow batches, one Arrow row per cell; only on a scan not yet
+        iterated."""
     def __enter__(self) -> ScanIter: ...
+    def __exit__(
+        self,
+        ty: type[BaseException] | None,
+        value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
+
+@final
+class ArrowStream:
+    """A scan's cells as Arrow batches, for one consumer (the Arrow PyCapsule protocol)."""
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object: ...
+    def __arrow_c_schema__(self) -> object: ...
+    @property
+    def schema_names(self) -> list[str]: ...
+    def to_pyarrow(self) -> Any:
+        """A `pyarrow.RecordBatchReader` over the stream (needs pyarrow)."""
+    def close(self) -> None: ...
+    def __enter__(self) -> ArrowStream: ...
     def __exit__(
         self,
         ty: type[BaseException] | None,
