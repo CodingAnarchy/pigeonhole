@@ -303,7 +303,19 @@ pub(crate) fn spawn_feed(db: &Path, n: usize) -> Result<FeedChildren, String> {
 }
 
 impl FeedChildren {
-    /// Closes every child's stdin and merges their reports.
+    /// Tells every child to stop once its feed covers `through` (bounded by
+    /// [`DRAIN_WAIT`](super::feed::DRAIN_WAIT)): the seqno on its stdin, which then closes.
+    pub(crate) fn drain(&mut self, through: u64) {
+        for (_, stdin, _) in &mut self.children {
+            if let Some(mut s) = stdin.take() {
+                // A child that already exited reports anyway, or fails `stop`.
+                let _ = writeln!(s, "{through}");
+            }
+        }
+    }
+
+    /// Closes every child's stdin (a child not told to [`drain`](Self::drain) stops at
+    /// once) and merges their reports.
     pub(crate) fn stop(mut self) -> Result<FeedChildrenReport, String> {
         for (_, stdin, _) in &mut self.children {
             drop(stdin.take());
@@ -374,7 +386,9 @@ fn wakeups() -> Option<u64> {
 }
 
 /// `phdb-bench reader --feed`: attaches to `path` with `Pigeonhole::open_reader`, follows the
-/// `bench` table's durable feed from now until stdin closes, then prints its report: the
+/// `bench` table's durable feed from now until stdin closes (and its feed covers the seqno
+/// written there, if any, for at most 30 s), then prints
+/// its report: the
 /// delivery latencies (wall clock minus each commit's timestamp), and its CPU and wakeups
 /// over the run, so a backoff's idle cost is measured beside its latency.
 pub fn child_feed(path: &Path) -> Result<(), String> {
@@ -388,13 +402,13 @@ pub fn child_feed(path: &Path) -> Result<(), String> {
     let table = reader.table("bench").map_err(|e| e.to_string())?;
     let open = || table.feed().open();
     let feed = open().map_err(|e| e.to_string())?;
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(super::feed::Stop::default());
     {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut sink);
-            stop.store(true, Ordering::Release);
+            let mut sink = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut sink);
+            stop.drain(sink.trim().parse().unwrap_or(0));
         });
     }
     let (cpu0, wake0) = (cpu_secs(), wakeups());
