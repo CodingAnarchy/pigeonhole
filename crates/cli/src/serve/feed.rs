@@ -26,13 +26,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
 use pigeonhole::{Commit, FeedToken, Snapshot, Table};
+use prost::bytes::Bytes;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::convert;
@@ -97,14 +98,46 @@ struct HubKey {
 }
 
 /// One commit in a hub's ring.
-struct Entry {
+pub(crate) struct Entry {
     commit: Commit,
     /// The hub feed's token right after this commit.
-    token: Vec<u8>,
+    token: Bytes,
     /// The hub feed's position just before it (`Feed::position`): every commit of the spec
     /// at or below it came before this one.
     prev: u64,
     bytes: usize,
+    /// The commit as a client with no prefix gets it, encoded once for every such client on
+    /// the ring: `None` if it has no change to send. Filled by the first client to send it.
+    encoded: OnceLock<Option<Bytes>>,
+}
+
+impl Entry {
+    fn new(commit: Commit, token: Bytes, prev: u64, bytes: usize) -> Self {
+        Entry {
+            commit,
+            token,
+            prev,
+            bytes,
+            encoded: OnceLock::new(),
+        }
+    }
+
+    /// The `FeedEvent` a client with no prefix sends for this commit, encoded.
+    fn encoded(&self) -> Option<&Bytes> {
+        self.encoded
+            .get_or_init(|| {
+                filtered(&self.commit, b"")
+                    .map(|c| prost::Message::encode_to_vec(&self.event(c)).into())
+            })
+            .as_ref()
+    }
+
+    fn event(&self, c: proto::FeedCommit) -> proto::FeedEvent {
+        proto::FeedEvent {
+            token: self.token.clone(),
+            event: Some(proto::feed_event::Event::Commit(c)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -120,7 +153,7 @@ struct Ring {
     /// none (so it follows other tables' writes too), and the token taken with it: one pair,
     /// from one poll (simp724's F1 on #1518).
     passed: u64,
-    passed_token: Vec<u8>,
+    passed_token: Bytes,
     /// The shared feed ended (an error): clients move to their own streams.
     failed: bool,
 }
@@ -165,19 +198,15 @@ impl Hub {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, commit: Commit, token: Vec<u8>, position: u64, total: usize) {
+    fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
         let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
         let bytes = entry_bytes(&commit, &token);
         let mut r = self.ring();
         let prev = r.passed;
         r.passed = position.max(commit.seqno());
         r.passed_token = token.clone();
-        r.entries.push_back(Arc::new(Entry {
-            commit,
-            token,
-            prev,
-            bytes,
-        }));
+        r.entries
+            .push_back(Arc::new(Entry::new(commit, token, prev, bytes)));
         r.bytes += bytes;
         // Always keep the newest: a client at the head needs its boundary.
         while r.bytes > limit && r.entries.len() > 1 {
@@ -192,7 +221,7 @@ impl Hub {
     }
 
     /// The hub's feed found nothing at `position`: the ring holds everything up to it.
-    fn note_passed(&self, position: u64, token: impl FnOnce() -> Vec<u8>) {
+    fn note_passed(&self, position: u64, token: impl FnOnce() -> Bytes) {
         let mut r = self.ring();
         if position > r.passed {
             r.passed = position;
@@ -333,7 +362,7 @@ impl Feeds {
         };
         let mut stream = FeedStream::new(open(tables, visible, &Start::Snapshot(snapshot))?);
         let start_seqno = stream.position().seqno();
-        let start_token = stream.token().as_bytes().to_vec();
+        let start_token = token_of(&stream);
         let (head, _) = watch::channel(0);
         let limit = self.limits.ring_bytes;
         let stats = Arc::clone(&self.stats);
@@ -352,7 +381,7 @@ impl Feeds {
                             && let Some(hub) = weak.upgrade()
                         {
                             let at = stream.position().seqno();
-                            hub.note_passed(at, || stream.token().as_bytes().to_vec());
+                            hub.note_passed(at, || token_of(&stream));
                         }
                         polled
                     })
@@ -361,7 +390,7 @@ impl Feeds {
                     match item {
                         Some(Ok(commit)) => {
                             let at = stream.position().seqno();
-                            hub.push(commit, stream.token().as_bytes().to_vec(), at, limit);
+                            hub.push(commit, token_of(&stream), at, limit);
                         }
                         // An expiry, `Closed`, damage: each client goes on from its own
                         // token on its own stream, and the engine decides each (feed1248's
@@ -485,6 +514,11 @@ fn open(tables: &[Table], visible: bool, start: &Start) -> Result<pigeonhole::Fe
     Ok(b.open()?)
 }
 
+/// A stream's token right after what it has read, as the bytes events carry.
+fn token_of(stream: &FeedStream) -> Bytes {
+    Bytes::copy_from_slice(stream.token().as_bytes())
+}
+
 /// A feed stream's next item, as a future.
 async fn next(stream: &mut FeedStream) -> Option<pigeonhole::Result<Commit>> {
     std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
@@ -493,7 +527,7 @@ async fn next(stream: &mut FeedStream) -> Option<pigeonhole::Result<Commit>> {
 /// Where a client starts, as `subscribe` found it.
 enum Begin {
     /// On the ring at `at`, its position `seqno` and the token with it.
-    Ring { at: u64, seqno: u64, token: Vec<u8> },
+    Ring { at: u64, seqno: u64, token: Bytes },
     /// On its own feed (opened to check the start), and that start as a token. Boxed: the
     /// feed is large, and a client begins once.
     Own(Box<pigeonhole::Feed>, FeedToken),
@@ -525,7 +559,7 @@ struct Client {
     tables: Vec<Table>,
     prefix: Vec<u8>,
     visible: bool,
-    tx: mpsc::Sender<(proto::FeedEvent, OwnedSemaphorePermit)>,
+    tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
     /// The client's buffer's free bytes: each event in its channel holds its encoded size.
     budget: Arc<Semaphore>,
     /// Poked each time the client takes an event: a send waiting for room starts its
@@ -536,9 +570,9 @@ struct Client {
 /// A client's position: the last commit it covered and the token right after it.
 struct Position {
     seqno: Option<u64>,
-    token: Vec<u8>,
+    token: Bytes,
     /// The token of the last event sent, to tell whether a progress event would say more.
-    sent: Vec<u8>,
+    sent: Bytes,
     last_event: Instant,
 }
 
@@ -566,7 +600,7 @@ impl Client {
                     }
                 };
                 let stream = FeedStream::new(feed);
-                let token = stream.token().as_bytes().to_vec();
+                let token = token_of(&stream);
                 // A position from the start: a token or the oldest start can rejoin as soon
                 // as the ring covers it, without waiting for a commit (simp724's F1).
                 pos = Position {
@@ -619,16 +653,17 @@ impl Client {
         let hub = self.hub();
         // Subscribed before the first look at the ring, so no commit after it is missed.
         let mut head = hub.head.subscribe();
+        // Reused across wakes: one allocation per client, not one per commit.
+        let mut batch: Vec<Arc<Entry>> = Vec::with_capacity(64);
         loop {
-            let (batch, behind, failed) = {
+            let (behind, failed) = {
                 let r = hub.ring();
                 if at < r.base {
-                    (Vec::new(), true, r.failed)
+                    (true, r.failed)
                 } else {
-                    let from = (at - r.base) as usize;
-                    let batch: Vec<Arc<Entry>> =
-                        r.entries.iter().skip(from).take(64).cloned().collect();
-                    (batch, false, r.failed)
+                    let from = ((at - r.base) as usize).min(r.entries.len());
+                    batch.extend(r.entries.range(from..).take(64).cloned());
+                    (false, r.failed)
                 }
             };
             if behind || (failed && batch.is_empty()) {
@@ -641,7 +676,7 @@ impl Client {
                 let feed = open(
                     &self.tables,
                     self.visible,
-                    &Start::Token(FeedToken::from_bytes(pos.token.clone())),
+                    &Start::Token(FeedToken::from_bytes(pos.token.to_vec())),
                 )?;
                 return Ok(Source::Own(Box::new(FeedStream::new(feed)), slot));
             }
@@ -672,9 +707,9 @@ impl Client {
                 }
                 continue;
             }
-            for e in batch {
+            for e in batch.drain(..) {
                 at += 1;
-                self.cover(&e.commit, &e.token, pos).await?;
+                self.cover_entry(&e, pos).await?;
             }
         }
     }
@@ -716,7 +751,7 @@ impl Client {
                 () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
                 item = next(&mut stream) => match item {
                     Some(Ok(commit)) => {
-                        let token = stream.token().as_bytes().to_vec();
+                        let token = token_of(&stream);
                         self.cover(&commit, &token, pos).await?;
                         pos.seqno = Some(stream.position().seqno());
                     }
@@ -729,7 +764,7 @@ impl Client {
                     let at = stream.position().seqno();
                     if pos.seqno.is_none_or(|s| at > s) {
                         pos.seqno = Some(at);
-                        pos.token = stream.token().as_bytes().to_vec();
+                        pos.token = token_of(&stream);
                     }
                     if pos.last_event.elapsed() >= self.feeds.limits.quiet {
                         self.progress(pos).await?;
@@ -744,25 +779,40 @@ impl Client {
     async fn cover(
         &self,
         commit: &Commit,
-        token: &[u8],
+        token: &Bytes,
         pos: &mut Position,
     ) -> Result<(), ApiError> {
         pos.seqno = Some(commit.seqno());
-        pos.token = token.to_vec();
+        pos.token = token.clone();
         if commit.seqno() <= self.after {
             return Ok(());
         }
         if let Some(c) = filtered(commit, &self.prefix) {
             self.send(
-                proto::FeedEvent {
-                    token: token.to_vec().into(),
+                Out::Event(proto::FeedEvent {
+                    token: token.clone(),
                     event: Some(proto::feed_event::Event::Commit(c)),
-                },
+                }),
                 pos,
             )
             .await?;
         }
         Ok(())
+    }
+
+    /// Covers one entry of the ring. A client with no prefix sends the entry itself: its
+    /// event is encoded once, for every such client (perf287's profile on #1536: building
+    /// and encoding the same event per subscriber was two thirds of the feed's CPU).
+    async fn cover_entry(&self, e: &Arc<Entry>, pos: &mut Position) -> Result<(), ApiError> {
+        if !self.prefix.is_empty() {
+            return self.cover(&e.commit, &e.token, pos).await;
+        }
+        pos.seqno = Some(e.commit.seqno());
+        pos.token = e.token.clone();
+        if e.commit.seqno() <= self.after || e.encoded().is_none() {
+            return Ok(());
+        }
+        self.send(Out::Shared(Arc::clone(e)), pos).await
     }
 
     /// A progress event, if the position moved since the last event and the stream was quiet.
@@ -773,20 +823,20 @@ impl Client {
             return Ok(());
         }
         self.send(
-            proto::FeedEvent {
-                token: pos.token.clone().into(),
+            Out::Event(proto::FeedEvent {
+                token: pos.token.clone(),
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
-            },
+            }),
             pos,
         )
         .await
     }
 
-    async fn send(&self, event: proto::FeedEvent, pos: &mut Position) -> Result<(), ApiError> {
-        let token = event.token.to_vec();
+    async fn send(&self, event: Out, pos: &mut Position) -> Result<(), ApiError> {
+        let token = event.token().clone();
         // Room in the client's buffer, then a place in its channel, both inside the idle
         // limit: a client that takes nothing fills its buffer and then times out.
-        let bytes = prost::Message::encoded_len(&event).clamp(
+        let bytes = event.encoded_len().clamp(
             1,
             self.feeds
                 .limits
@@ -872,16 +922,70 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 /// A client's events, then its error if it failed.
 #[derive(Debug)]
 pub(crate) struct FeedEvents {
-    events: mpsc::Receiver<(proto::FeedEvent, OwnedSemaphorePermit)>,
+    events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
     /// Poked on each take, for a send waiting for room.
     taken: Arc<Notify>,
     end: Option<oneshot::Receiver<ApiError>>,
 }
 
-impl Stream for FeedEvents {
-    type Item = Result<proto::FeedEvent, ApiError>;
+/// An event as it leaves a client: its own, or a ring entry encoded once for every client
+/// with no prefix.
+pub(crate) enum Out {
+    Event(proto::FeedEvent),
+    /// An entry whose `encoded()` is `Some`.
+    Shared(Arc<Entry>),
+}
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl Out {
+    fn token(&self) -> &Bytes {
+        match self {
+            Out::Event(e) => &e.token,
+            Out::Shared(e) => &e.token,
+        }
+    }
+
+    /// Its size on the wire, for the client's buffer.
+    fn encoded_len(&self) -> usize {
+        match self {
+            Out::Event(e) => prost::Message::encoded_len(e),
+            Out::Shared(e) => e.encoded().map_or(0, Bytes::len),
+        }
+    }
+
+    /// The event as a message (HTTP, which renders JSON, and tests).
+    pub(crate) fn into_proto(self) -> proto::FeedEvent {
+        match self {
+            Out::Event(e) => e,
+            Out::Shared(e) => {
+                let c = filtered(&e.commit, b"").unwrap_or_default();
+                e.event(c)
+            }
+        }
+    }
+
+    /// Writes the event's encoding to `buf` (gRPC): a shared entry's bytes as they are.
+    pub(crate) fn encode(
+        &self,
+        buf: &mut impl prost::bytes::BufMut,
+    ) -> Result<(), prost::EncodeError> {
+        match self {
+            Out::Event(e) => prost::Message::encode(e, buf),
+            Out::Shared(e) => {
+                if let Some(b) = e.encoded() {
+                    buf.put_slice(b);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl FeedEvents {
+    /// The next event as it left the client, then the client's error if it failed.
+    pub(crate) fn poll_out(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Out, ApiError>>> {
         match self.events.poll_recv(cx) {
             // Taken: its bytes go back to the client's buffer.
             Poll::Ready(Some((e, room))) => {
@@ -902,6 +1006,15 @@ impl Stream for FeedEvents {
         };
         self.end = None;
         Poll::Ready(out)
+    }
+}
+
+impl Stream for FeedEvents {
+    type Item = Result<proto::FeedEvent, ApiError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_out(cx)
+            .map(|item| item.map(|r| r.map(Out::into_proto)))
     }
 }
 
@@ -950,12 +1063,8 @@ mod tests {
         };
         let mut prev = start;
         for c in commits {
-            r.entries.push_back(Arc::new(Entry {
-                commit: c.clone(),
-                token: Vec::new(),
-                prev,
-                bytes: 0,
-            }));
+            r.entries
+                .push_back(Arc::new(Entry::new(c.clone(), Bytes::new(), prev, 0)));
             prev = c.seqno();
         }
         for _ in 0..evicted {
@@ -1097,7 +1206,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .clone();
-            let token = direct.token().as_bytes().to_vec();
+            let token = Bytes::copy_from_slice(direct.token().as_bytes());
             hub.push(commit, token, direct.position().seqno(), 1 << 20);
             assert_eq!(seqnos(&mut c, Duration::from_secs(1)).await, [n]);
             drop((c, hub));

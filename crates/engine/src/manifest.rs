@@ -1139,8 +1139,6 @@ fn release_catalog(shared: &Shared) {
     // `wait_for_hold`'s), so the release is never missed (#1417). And when the hold froze:
     // that feed re-polls and expires, as the stopped appends say (simp724's W1 on #1533).
     feed.wake_hold_waiters();
-    // And the idle feeds of every table waiting for a catalog change (simp724's P1 on #1539).
-    feed.wake_catalog_waiters();
 }
 
 /// Finishes a commit whose root commit returned `result`: publishes the view, retires what

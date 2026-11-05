@@ -1793,6 +1793,69 @@ fn a_slow_feed_client_that_keeps_taking_outlasts_a_large_events_wait() {
 }
 
 #[test]
+fn grpc_feed_events_match_the_services_shared_encoding_or_not() {
+    // Encode-once (#1397 ticket 5): a client with no prefix gets each ring entry as bytes
+    // encoded once for all such clients; a prefixed one gets its own message. Over the wire
+    // both are exactly what a direct subscriber sees, tokens included.
+    let s = Server::start("", limits());
+    let url = s.url.clone();
+    let grpc = |prefix: &[u8]| {
+        let req = subscribe(&["t"], prefix);
+        let url = url.clone();
+        s.block_on(async move {
+            let channel = tonic::transport::Channel::from_shared(url)
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            proto::feed_client::FeedClient::new(channel)
+                .subscribe(req)
+                .await
+                .unwrap()
+                .into_inner()
+        })
+    };
+    let mut all = grpc(b"");
+    let mut under_a = grpc(b"a");
+    let mut direct = direct_feed(&s, subscribe(&["t"], b""));
+    for row in [&b"a1"[..], b"b1", b"a2"] {
+        write_row(&s, row);
+    }
+    let take = |stream: &mut tonic::Streaming<proto::FeedEvent>, n: usize| {
+        s.block_on(async {
+            let mut out = Vec::new();
+            while out.len() < n {
+                let e = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if commit_of(&e).is_some() {
+                    out.push(e);
+                }
+            }
+            out
+        })
+    };
+    let want: Vec<proto::FeedEvent> = (0..3)
+        .map(|_| {
+            next_event(&s, &mut direct, Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(take(&mut all, 3), want, "no prefix: the shared encoding");
+    let a: Vec<proto::FeedEvent> = take(&mut under_a, 2);
+    assert_eq!(
+        a.iter().map(|e| commit_of(e).unwrap()).collect::<Vec<_>>(),
+        [&want[0], &want[2]].map(|e| commit_of(e).unwrap()),
+        "a prefix: its own messages"
+    );
+    assert_eq!(a[0].token, want[0].token);
+    assert_eq!(a[1].token, want[2].token);
+}
+
+#[test]
 fn feed_streams_match_a_direct_feed_across_fall_offs() {
     // feed1248's (6): each client's stream, ring and own-stream catch-up alike, delivers
     // exactly what a direct FeedStream on the same spec does. Seeded; prints the seed.

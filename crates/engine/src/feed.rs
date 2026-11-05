@@ -73,7 +73,7 @@ pub(crate) struct Sidecar {
     /// The `RootIntent` this session appended for the root commit in progress, and where:
     /// its Root entry overwrites exactly that one (simp724's R2 on #1504). Root commits
     /// never overlap, so one.
-    intent: Option<(u64, u64, bool)>,
+    intent: Option<(u64, u64)>,
 }
 
 impl Sidecar {
@@ -487,18 +487,9 @@ pub(crate) struct Feed {
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,
-    /// Feeds of every table waiting for a catalog change, which moves no seqno, by reader
-    /// key (the idle-catalog fix after #1515): woken by `manifest::release_catalog` and on
-    /// close, never by the shards' settles, so an idle feed of every table costs the shards
-    /// nothing (simp724's P1 on #1539).
-    catalog_waiters: Mutex<FastMap<u64, std::task::Waker>>,
-    /// Whether `catalog_waiters` may be non-empty.
-    has_catalog_waiters: std::sync::atomic::AtomicBool,
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
     /// observer waits before it records the root, widening the window between a durable
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
-    /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
-    catalog_roots: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
     /// A hold seam (`Engine::delay_root_intent`, D315 amendment): nanoseconds each root
@@ -568,9 +559,6 @@ impl Feed {
             catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
-            catalog_waiters: Mutex::default(),
-            has_catalog_waiters: std::sync::atomic::AtomicBool::new(false),
-            catalog_roots: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
@@ -731,53 +719,15 @@ impl Feed {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Registers `waker` (reader `key`, a feed of every table) to be woken when a catalog
-    /// change's hold is released, as [`wait_for_hold`](Self::wait_for_hold) for the shards'
-    /// holds: the caller re-checks [`catalog_roots`](Self::catalog_roots) afterwards.
-    pub(crate) fn wait_for_catalog(&self, key: u64, waker: &std::task::Waker) {
+    /// Forgets reader `key`'s waker (the reader is dropped).
+    pub(crate) fn forget_hold_waiter(&self, key: u64) {
         let mut w = self
-            .catalog_waiters
+            .hold_waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        w.insert(key, waker.clone());
-        self.has_catalog_waiters.store(true, Ordering::SeqCst);
-        drop(w);
-        // Pairs with the fence in `wake_catalog_waiters`.
-        std::sync::atomic::fence(Ordering::SeqCst);
-    }
-
-    /// Forgets reader `key`'s wakers, on both lists (the reader is dropped, or delivered).
-    pub(crate) fn forget_hold_waiter(&self, key: u64) {
-        for (list, flag) in [
-            (&self.hold_waiters, &self.has_hold_waiters),
-            (&self.catalog_waiters, &self.has_catalog_waiters),
-        ] {
-            let mut w = list.lock().unwrap_or_else(PoisonError::into_inner);
-            if w.remove(&key).is_some() && w.is_empty() {
-                flag.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-    /// After a catalog change's hold is released (`release_catalog`, its Root entry and
-    /// `catalog_roots` stored first): wakes every feed of every table waiting for one, as
-    /// [`wake_hold_waiters`](Self::wake_hold_waiters) does for the shards' holds.
-    #[inline(never)]
-    pub(crate) fn wake_catalog_waiters(&self) {
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.has_catalog_waiters.load(Ordering::SeqCst) {
-            return;
-        }
-        let woken: Vec<std::task::Waker> = {
-            let mut w = self
-                .catalog_waiters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.has_catalog_waiters.store(false, Ordering::SeqCst);
-            w.drain().map(|(_, waker)| waker).collect()
-        };
-        for waker in woken {
-            waker.wake();
+        w.remove(&key);
+        if w.is_empty() {
+            self.has_hold_waiters.store(false, Ordering::SeqCst);
         }
     }
 
@@ -851,7 +801,7 @@ impl Feed {
         FeedEntry::RootIntent { sequence, checksum }.encode(&mut bytes);
         let appended = s
             .append_bytes(&bytes)
-            .map(|()| s.intent = Some((sequence, at, catalog.is_some())));
+            .map(|()| s.intent = Some((sequence, at)));
         if let Err(e) = appended {
             crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
             *sidecar = None;
@@ -895,14 +845,8 @@ impl Feed {
                 session: self.session,
                 sequence,
             };
-            // Whether this root carries a catalog change: its Catalog entry is in the file and
-            // now rooted, for a feed of every table to load (`catalog_roots`).
-            let mut catalog = staged.is_some();
             let written = match s.intent.take() {
-                Some((seq, at, with_catalog)) if seq == sequence && staged.is_none() => {
-                    catalog = with_catalog;
-                    s.overwrite(at, &root)
-                }
+                Some((seq, at)) if seq == sequence && staged.is_none() => s.overwrite(at, &root),
                 _ => staged
                     .map(|c| FeedEntry::Catalog {
                         session: self.session,
@@ -922,21 +866,9 @@ impl Feed {
                 self.appends_stopped.store(true, Ordering::Release);
                 return;
             }
-            if catalog {
-                // After the Root entry is written, before `release_catalog` wakes the hold
-                // list: a feed of every table that sees the count move loads the sidecar.
-                self.catalog_roots.fetch_add(1, Ordering::Release);
-            }
             Arc::clone(&s.file)
         };
         self.request_sidecar_sync(file);
-    }
-
-    /// How many of this session's catalog changes have their Root entry written (D315): a
-    /// feed of every table in this process loads the sidecar when it moves, though no seqno
-    /// did (a catalog change on an idle database).
-    pub(crate) fn catalog_roots(&self) -> u64 {
-        self.catalog_roots.load(Ordering::Acquire)
     }
 
     /// Stages a catalog change for its root commit's `Catalog` entry (D315), before that
