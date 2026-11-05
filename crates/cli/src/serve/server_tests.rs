@@ -84,7 +84,8 @@ impl Server {
         let shared = Arc::new(Shared {
             router: Router::single(
                 Service::new(db, limits, 2, Arc::clone(&metrics))
-                    .backup_dir(Some(dir.join("backups"))),
+                    .backups(Some(&dir.join("backups")), 1)
+                    .unwrap(),
             ),
             tokens: Tokens::parse(tokens, "test").unwrap(),
             limits,
@@ -2431,4 +2432,61 @@ fn a_backup_download_streams_resumes_and_checks_out() {
         .read_to_vec()
         .unwrap();
     assert_eq!(tail, body[100..]);
+}
+
+#[test]
+fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
+    // simp724's C1 on #1527: a create whose cache update ran after a drop and a newer create
+    // could leave the name on the dropped table. Creates and drops are now serialized with
+    // their cache updates (`Service::schema`), so whatever the order, a table that exists
+    // takes writes. A smoke test only: the race's window (between a create's blocking call
+    // and its cache update) is too small to hit without a hold, so it passes without the
+    // lock too. The fix holds by construction.
+    let s = Server::start("", limits());
+    let service = &s.shared.router.service;
+    let caller = Caller::anonymous();
+    let create = || {
+        ServiceOp::CreateTable(proto::CreateTableRequest {
+            name: "c".into(),
+            families: vec![proto::FamilySpec {
+                name: "f".into(),
+                ..Default::default()
+            }],
+            if_missing: true,
+        })
+    };
+    let drop_c = || ServiceOp::DropTable(proto::DropTableRequest { name: "c".into() });
+    let put_c = || {
+        ServiceOp::Mutate(proto::MutateRequest {
+            writes: serde_json::from_value(json!({"row": {"table": "c", "row": b64(b"r")},
+                "writes": [{"put": {"family": "f", "qualifier": b64(b"q"), "value": {"bytes": b64(b"v")}}}]}))
+            .unwrap(),
+            durability: 0,
+        })
+    };
+    for round in 0..30 {
+        s.block_on(async {
+            let (a, b, c) = tokio::join!(
+                service.call(create(), &caller, None),
+                service.call(drop_c(), &caller, None),
+                service.call(create(), &caller, None),
+            );
+            // A drop of a table not there yet fails; the creates always succeed.
+            assert!(
+                a.is_ok() && c.is_ok(),
+                "round {round}: {:?} {:?}",
+                a.err(),
+                c.err()
+            );
+            let _ = b;
+        });
+        if service.db.tables().iter().any(|t| t == "c") {
+            let put = s.block_on(service.call(put_c(), &caller, None));
+            assert!(
+                put.is_ok(),
+                "round {round}: the cache is on a dropped table: {:?}",
+                put.err()
+            );
+        }
+    }
 }

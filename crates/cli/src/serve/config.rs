@@ -108,11 +108,16 @@ pub(crate) struct ServeArgs {
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
-    /// Where `Admin.Backup` writes, and where downloads are kept for resumes. Without it the
-    /// server takes no backups to disk (`Admin.BackupDownload` still streams one, through a
-    /// private directory in the system's temporary directory).
+    /// Where `Admin.Backup` writes, and (in `.phdb-serve-downloads`, the server's own, mode
+    /// 0700) where `Admin.BackupDownload` keeps its copies for resumes. It must exist.
+    /// Without it the server takes no backups. Put it on a disk with room for a copy or two
+    /// of the database, not tmpfs.
     #[arg(long, value_name = "DIR")]
     pub backup_dir: Option<PathBuf>,
+    /// Backups running at once (`Backup` and fresh downloads), each on a thread of its own;
+    /// more are refused (`Overloaded`).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub max_backups: usize,
 }
 
 /// What the flags leave the server to do.

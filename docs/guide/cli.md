@@ -357,15 +357,17 @@ u1   profile  name       1761030000000000  Ada
   - A read token may begin, read and commit a transaction without writes; writing needs a write token.
 - **Schema:**
   - `Schema.ListTables` (also `GET /v1/tables`) and `DescribeTable` need read scope, `CreateTable` write scope, and `DropTable` admin scope (it drops the data).
-  - `CreateTable` takes each family's options as `FamilySpec`, and with `if_missing` opens an existing table and adds only the families it lacks.
+  - `CreateTable` takes each family's options as `FamilySpec`, and with `if_missing` opens an existing table and adds only the families it lacks (adding families is additive, so write scope does it too).
   - `DescribeTable` returns every option as stored, so its output creates the same table again.
 - **Admin:**
   - `Admin.Health` needs no token;
   - `Info` (path, sizes, tables, version) and `Metrics` (the `/metrics` text) need read scope;
   - `Flush`, `Compact`, `Backup` and `BackupDownload` need admin scope.
-- **Backups:**
-  - `Admin.Backup` writes a consistent backup inside `--backup-dir`, which is off without the flag.
-  - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. The file is kept for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). Check the SHA-256 before relying on the copy.
+- **Backups** need `--backup-dir`; without it they're off.
+  - `Admin.Backup` writes a consistent backup inside it, at a path relative to it that doesn't exist yet and doesn't lead out of it through a link.
+  - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
+  - **Allow for the silence before the first byte:** the server backs up and hashes first. A stream that ends without its final chunk (the one with the size and SHA-256) is incomplete: resume it. Check the SHA-256 before relying on the copy.
+  - **One at a time:** backups run one at a time by default (`--max-backups`), off the threads reads use.
 - **Pinned snapshots** (`Snapshots.Open`, `Release`) make reads agree across requests: pass the `snapshot_id` as `GetRequest.snapshot_id`, or as `Selection.snapshot_id` for `MultiGet`, `ReadRow` and `Scan`. Each read renews the snapshot's lease (`--snapshot-idle-ms`, 60 s; at most `--snapshot-lifetime-ms`, 10 min). A held snapshot holds back version and blob GC, so release it when done. Reads already running when it's released finish; later ones, and a scan's later pages, get `NotFound`.
 - **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each (the database needs `Options::change_feed` on for them).
   - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
@@ -380,7 +382,7 @@ u1   profile  name       1761030000000000  Ada
   - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
   - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
   - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. Each commit also carries its resume token (about 45 + 16 × shards bytes). This is outside `--inflight-bytes`; `/metrics` reports what's in use.
-  - `--backup-dir`: where `Admin.Backup` writes, and where downloads are kept for resumes (else a private directory in the system's temporary directory). There's no default: without it, backups to disk are off.
+  - `--backup-dir`: where `Admin.Backup` writes, and where downloads are kept for resumes. It must exist; put it on a disk with room for a copy or two of the database, not tmpfs. There's no default: without it, backups are off. `--max-backups` (1) runs that many at once.
   - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
   - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
   - A write the server has submitted always answers its real outcome.

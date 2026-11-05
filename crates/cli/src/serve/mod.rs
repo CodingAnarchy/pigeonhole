@@ -193,7 +193,8 @@ pub(crate) fn run(
                 placement.blocking_threads,
                 Arc::clone(&metrics),
             )
-            .backup_dir(args.backup_dir.clone()),
+            .backups(args.backup_dir.as_deref(), args.max_backups)
+            .map_err(|e| Failure::usage(&e))?,
         ),
         tokens,
         limits,

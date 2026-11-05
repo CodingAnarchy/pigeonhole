@@ -541,6 +541,9 @@ pub(crate) struct Service {
     pub(crate) feeds: Arc<super::feed::Feeds>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
     backups: Arc<super::backup::Backups>,
+    /// Held across a table's create or drop and the cache update after it, so the cache ends
+    /// at the live table whatever the order (simp724's C1 on #1527).
+    schema: tokio::sync::Mutex<()>,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -573,7 +576,8 @@ impl Service {
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             sessions: super::sessions::Sessions::new(limits.leases),
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
-            backups: super::backup::Backups::new(None),
+            backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
+            schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
                 super::feed::FeedLimits {
@@ -590,10 +594,16 @@ impl Service {
         }
     }
 
-    /// Takes backups to disk in `dir` (`--backup-dir`); without one, `Backup` is refused.
-    pub(crate) fn backup_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
-        self.backups = super::backup::Backups::new(dir);
-        self
+    /// Takes backups in `dir` (`--backup-dir`), at most `max_backups` at once. Without a
+    /// directory, `Backup` and `BackupDownload` are refused. Fails at startup if the
+    /// directory, or its download directory, isn't usable.
+    pub(crate) fn backups(
+        mut self,
+        dir: Option<&std::path::Path>,
+        max_backups: usize,
+    ) -> Result<Self, String> {
+        self.backups = super::backup::Backups::new(dir, max_backups)?;
+        Ok(self)
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -752,17 +762,12 @@ impl Service {
             }
             ServiceOp::Backup(r) => {
                 drop(budget);
-                let path = self.backups.target(&r.path)?;
-                let db = self.db.clone();
+                let (db, backups) = (self.db.clone(), Arc::clone(&self.backups));
+                // On a thread of its own, one backup at a time (perf287's D1 on #1527).
                 let bytes = self
-                    .blocking(move || {
-                        // A path in a subdirectory gets it: plain components only, so it
-                        // stays inside --backup-dir.
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                ApiError::internal(format!("the backup's directory: {e}"))
-                            })?;
-                        }
+                    .backups
+                    .on_backup_thread(move || {
+                        let path = backups.prepare_target(&r.path)?;
                         if r.durable {
                             db.backup_durable(&path)?;
                         } else {
@@ -809,6 +814,11 @@ impl Service {
 
     /// The table `name`, opened on first use. A miss opens it on the blocking pool (an open
     /// is a sync call, D196) and swaps in a new map.
+    ///
+    /// Its `or_insert` never displaces a handle a create put in. Creates and drops are
+    /// serialized with their cache updates (`schema`), so the only stale entry it can leave
+    /// is a handle resolved just before a drop, for a name with no table: its errors match
+    /// the catalog, and the next create replaces it.
     async fn table(&self, name: &str) -> Result<Table, ApiError> {
         if let Some(t) = self.tables.load().get(name) {
             return Ok(t.clone());
@@ -841,6 +851,7 @@ impl Service {
             .iter()
             .map(|f| Ok((f.name.clone(), convert::family_in(f)?)))
             .collect::<Result<Vec<_>, ApiError>>()?;
+        let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let (name, if_missing) = (r.name.clone(), r.if_missing);
         let table = self
@@ -868,6 +879,7 @@ impl Service {
     /// the name. A table created again under it is a new table, with a new id: its feed hubs
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+        let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let owned = name.clone();
         let dropped = self.blocking(move || Ok(db.drop_table(&owned)?)).await;
@@ -904,8 +916,11 @@ impl Service {
         let (id, kept) = if r.backup_id.is_empty() {
             let (id, path) = self.backups.new_download()?;
             let (db, p, durable) = (self.db.clone(), path.clone(), r.durable);
+            // The backup and its hash: minutes for a large database, so on a thread of its
+            // own, never the blocking pool (perf287's D1 on #1527).
             let digest = self
-                .blocking(move || {
+                .backups
+                .on_backup_thread(move || {
                     let taken = if durable {
                         db.backup_durable(&p)
                     } else {
