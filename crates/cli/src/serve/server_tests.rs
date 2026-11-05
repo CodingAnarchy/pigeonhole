@@ -1901,9 +1901,19 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
+    // The second gets its slot only once the first has rejoined the ring (up to a
+    // REJOIN_TICK after it caught up). So collect until every commit is in or a long
+    // deadline passes, never stopping at a quiet spell: a slow runner can pause longer than
+    // any short window (#1527's CI on macOS).
     for events in [&mut first, &mut second] {
-        let got = drain(&s, events, Duration::from_millis(300));
-        assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), written);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got = Vec::new();
+        while got.len() < written.len() && std::time::Instant::now() < deadline {
+            if let Some(e) = next_event(&s, events, Duration::from_millis(200)) {
+                got.extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+            }
+        }
+        assert_eq!(got, written);
     }
 }
 

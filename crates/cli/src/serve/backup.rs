@@ -9,9 +9,12 @@
 //! - **`BackupDownload`** takes a fresh backup into `<backup-dir>/.phdb-serve-downloads`
 //!   (mode 0700, never a link), hashes it, and streams its bytes. The file is kept for
 //!   `KEEP` after its last reader, so a broken download resumes from an offset with its
-//!   `backup_id`; then the reaper deletes it. At most `KEPT_MAX` are kept: a fresh download
-//!   at the cap evicts the oldest unread one, or is `Overloaded` if all are being read. A
-//!   resume is never refused. Leftovers from a crash are deleted at startup.
+//!   `backup_id`; then the reaper deletes it. At most `KEPT_MAX` are kept, counting copies
+//!   still being written (so that's the most on disk at once): a fresh download at the cap
+//!   evicts the oldest unread one, or is `Overloaded` if none can go. A resume is never
+//!   refused. A copy belongs to this table from the start, not to the request, so a client
+//!   that gives up mid-backup leaves an unread copy the reaper deletes. Leftovers from a
+//!   crash are deleted at startup.
 //! - **Backups run on a thread of their own,** never the blocking pool that scan pages and
 //!   `Sync` commits share, and at most `--max-backups` at once (perf287's D1).
 
@@ -22,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::errors::ApiError;
 
@@ -48,6 +51,9 @@ pub(crate) struct Kept {
 
 struct Entry {
     kept: Kept,
+    /// Written and hashed: until then the backup thread owns it, and it counts against
+    /// `KEPT_MAX` but is neither read, evicted nor reaped.
+    ready: bool,
     readers: usize,
     last_used: Instant,
 }
@@ -129,59 +135,43 @@ impl Backups {
             )));
         }
         let parent = path.parent().unwrap_or(dir);
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ApiError::internal(format!("the backup's directory: {e}")))?;
-        let resolved = parent
-            .canonicalize()
-            .map_err(|e| ApiError::internal(format!("the backup's directory: {e}")))?;
-        if !resolved.starts_with(dir) {
-            return Err(ApiError::invalid(format!(
+        let outside = || {
+            ApiError::invalid(format!(
                 "{relative} leads outside --backup-dir through a link"
-            )));
+            ))
+        };
+        let io = |e: std::io::Error| ApiError::internal(format!("the backup's directory: {e}"));
+        // Before creating anything: the deepest part that exists already must resolve inside
+        // the directory, so a link can't make the server create directories elsewhere
+        // (simp724's N1 on #1527).
+        let mut existing = parent;
+        while !existing.exists() {
+            existing = existing.parent().unwrap_or(dir);
+        }
+        if !existing.canonicalize().map_err(io)?.starts_with(dir) {
+            return Err(outside());
+        }
+        std::fs::create_dir_all(parent).map_err(io)?;
+        if !parent.canonicalize().map_err(io)?.starts_with(dir) {
+            return Err(outside());
         }
         Ok(path)
     }
 
-    /// A new download's file, not yet written, under a fresh id. At `KEPT_MAX` copies the
-    /// oldest unread one goes; with every copy being read, a fresh download is `Overloaded`.
-    pub(crate) fn new_download(&self) -> Result<(String, PathBuf), ApiError> {
-        let dir = self.dir()?.join(DOWNLOADS);
-        {
-            let mut kept = self.lock();
-            while kept.len() >= KEPT_MAX {
-                let oldest = kept
-                    .iter()
-                    .filter(|(_, e)| e.readers == 0)
-                    .min_by_key(|(_, e)| e.last_used)
-                    .map(|(id, _)| id.clone());
-                let Some(id) = oldest else {
-                    return Err(ApiError::overloaded(format!(
-                        "the server keeps at most {KEPT_MAX} backup downloads, all being read: \
-                         resume one, or try again later"
-                    )));
-                };
-                if let Some(e) = kept.remove(&id) {
-                    let _ = std::fs::remove_file(&e.kept.path);
-                }
-            }
-        }
-        let id = super::sessions::random_hex()?;
-        let path = dir.join(format!("{id}.phdb"));
-        Ok((id, path))
+    /// One of `--max-backups`, or `Overloaded`.
+    fn permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        Arc::clone(&self.running).try_acquire_owned().map_err(|_| {
+            ApiError::overloaded("the server is already taking a backup (--max-backups)")
+        })
     }
 
-    /// Runs `backup` on a thread of its own, holding one of `--max-backups`: never a
-    /// blocking-pool thread (perf287's D1). Past the limit, `Overloaded`.
-    pub(crate) async fn on_backup_thread<T: Send + 'static>(
-        &self,
+    /// Runs `backup` on a thread of its own, holding `permit`: never a blocking-pool thread
+    /// (perf287's D1).
+    fn spawn<T: Send + 'static>(
+        permit: OwnedSemaphorePermit,
         backup: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
-    ) -> Result<T, ApiError> {
-        let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is already taking a backup (--max-backups)",
-            ));
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    ) -> Result<oneshot::Receiver<Result<T, ApiError>>, ApiError> {
+        let (tx, rx) = oneshot::channel();
         std::thread::Builder::new()
             .name("phdb-serve-backup".into())
             .spawn(move || {
@@ -190,27 +180,122 @@ impl Backups {
                 let _ = tx.send(r);
             })
             .map_err(|e| ApiError::internal(format!("a backup thread: {e}")))?;
+        Ok(rx)
+    }
+
+    /// Runs `backup` (an `Admin.Backup`) on its own thread, one of `--max-backups`.
+    pub(crate) async fn on_backup_thread<T: Send + 'static>(
+        &self,
+        backup: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let rx = Self::spawn(self.permit()?, backup)?;
         rx.await
             .unwrap_or_else(|_| Err(ApiError::internal("the backup's thread ended early")))
     }
 
-    /// Keeps a written download's file under `id`, for one reader now.
-    pub(crate) fn keep(self: &Arc<Self>, id: &str, kept: Kept) {
+    /// A fresh download's copy: `take` writes the backup to the path given, on its own thread,
+    /// and the copy is hashed there too. Returns its id and file, with the caller as its
+    /// reader.
+    ///
+    /// The copy belongs to the table from the start, never to the request (perf287's E1,
+    /// simp724's N3 on #1527): it's reserved before the backup, counting against `KEPT_MAX`
+    /// while it's written (E3), and the backup thread marks it ready, or deletes it if the
+    /// backup fails, whether or not the request is still there. A client that gave up leaves
+    /// an unread copy, which the reaper deletes after `KEEP`. The `--max-backups` permit is
+    /// taken before anything is evicted for the copy (E2).
+    pub(crate) async fn fresh_download(
+        self: &Arc<Self>,
+        take: impl FnOnce(&Path) -> Result<(), ApiError> + Send + 'static,
+    ) -> Result<(String, Kept), ApiError> {
+        let permit = self.permit()?;
+        let (id, path) = self.reserve()?;
         self.start_reaper();
-        self.lock().insert(
-            id.to_owned(),
+        let me = Arc::clone(self);
+        let (tid, tpath) = (id.clone(), path.clone());
+        let rx = Self::spawn(permit, move || {
+            // Discards the copy unless it's finished: a failed backup, or a panic in one.
+            struct Pending(Arc<Backups>, String, bool);
+            impl Drop for Pending {
+                fn drop(&mut self) {
+                    if !self.2 {
+                        self.0.discard(&self.1);
+                    }
+                }
+            }
+            let mut pending = Pending(me, tid, false);
+            take(&tpath)?;
+            let (total, sha256) = digest(&tpath)?;
+            pending.0.finish(&pending.1, total, sha256);
+            pending.2 = true;
+            Ok(())
+        })?;
+        rx.await
+            .unwrap_or_else(|_| Err(ApiError::internal("the backup's thread ended early")))?;
+        let kept = self.open(&id)?;
+        Ok((id, kept))
+    }
+
+    /// A new copy's id and file, reserved (not ready) in the table. At `KEPT_MAX` copies,
+    /// counting those being written, the oldest ready unread one goes; with none to evict, a
+    /// fresh download is `Overloaded`.
+    fn reserve(&self) -> Result<(String, PathBuf), ApiError> {
+        let dir = self.dir()?.join(DOWNLOADS);
+        let id = super::sessions::random_hex()?;
+        let path = dir.join(format!("{id}.phdb"));
+        let mut kept = self.lock();
+        while kept.len() >= KEPT_MAX {
+            let oldest = kept
+                .iter()
+                .filter(|(_, e)| e.ready && e.readers == 0)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(id, _)| id.clone());
+            let Some(old) = oldest else {
+                return Err(ApiError::overloaded(format!(
+                    "the server keeps at most {KEPT_MAX} backup downloads, all in use: \
+                     resume one, or try again later"
+                )));
+            };
+            if let Some(e) = kept.remove(&old) {
+                let _ = std::fs::remove_file(&e.kept.path);
+            }
+        }
+        kept.insert(
+            id.clone(),
             Entry {
-                kept,
-                readers: 1,
+                kept: Kept {
+                    path: path.clone(),
+                    total: 0,
+                    sha256: [0; 32],
+                },
+                ready: false,
+                readers: 0,
                 last_used: Instant::now(),
             },
         );
+        Ok((id, path))
+    }
+
+    /// The backup thread wrote and hashed copy `id`: it's ready, with no reader yet.
+    fn finish(&self, id: &str, total: u64, sha256: [u8; 32]) {
+        if let Some(e) = self.lock().get_mut(id) {
+            e.kept.total = total;
+            e.kept.sha256 = sha256;
+            e.ready = true;
+            e.last_used = Instant::now();
+        }
+    }
+
+    /// Copy `id` won't be finished: it goes, and its file.
+    fn discard(&self, id: &str) {
+        if let Some(e) = self.lock().remove(id) {
+            let _ = std::fs::remove_file(&e.kept.path);
+        }
     }
 
     /// The kept download `id`, for one more reader.
     pub(crate) fn open(&self, id: &str) -> Result<Kept, ApiError> {
         let mut kept = self.lock();
-        let e = kept.get_mut(id).ok_or_else(|| {
+        let e = kept.get_mut(id).filter(|e| e.ready).ok_or_else(|| {
             ApiError::not_found("no such backup download (it expired): start again")
         })?;
         e.readers += 1;
@@ -232,7 +317,9 @@ impl Backups {
             let mut kept = self.lock();
             let old: Vec<String> = kept
                 .iter()
-                .filter(|(_, e)| e.readers == 0 && now.duration_since(e.last_used) >= KEEP)
+                .filter(|(_, e)| {
+                    e.ready && e.readers == 0 && now.duration_since(e.last_used) >= KEEP
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             old.iter()
@@ -287,10 +374,16 @@ fn prepare_downloads(path: &Path) -> Result<(), String> {
             }
         }
         Err(_) => {
-            let mut b = std::fs::DirBuilder::new();
             #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-            b.create(path).map_err(bad)?;
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(path)
+                    .map_err(bad)?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(path).map_err(bad)?;
         }
     }
     #[cfg(unix)]
@@ -411,6 +504,10 @@ mod tests {
             std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
             let e = b.prepare_target("out/a.phdb").unwrap_err();
             assert!(e.message.contains("outside"), "{e:?}");
+            // Nor is a directory made out there on the way (simp724's N1).
+            let e = b.prepare_target("out/new/a.phdb").unwrap_err();
+            assert!(e.message.contains("outside"), "{e:?}");
+            assert!(!outside.join("new").exists(), "nothing created outside");
             let _ = std::fs::remove_dir_all(&outside);
         }
         let none = Backups::new(None, 1).unwrap();
@@ -418,7 +515,7 @@ mod tests {
             none.prepare_target("a.phdb").unwrap_err().code,
             "Unsupported"
         );
-        assert_eq!(none.new_download().unwrap_err().code, "Unsupported");
+        assert_eq!(none.reserve().unwrap_err().code, "Unsupported");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -453,49 +550,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fresh download whose "backup" writes `bytes`, run to its end.
+    fn download(
+        rt: &tokio::runtime::Runtime,
+        b: &Arc<Backups>,
+        bytes: &'static [u8],
+    ) -> Result<(String, Kept), ApiError> {
+        rt.block_on(b.fresh_download(move |p| {
+            std::fs::write(p, bytes).map_err(|e| ApiError::internal(e.to_string()))
+        }))
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn kept_downloads_are_capped_and_kept_until_unread_for_keep() {
         let dir = fresh("kept");
+        let rt = runtime();
         let b = Backups::new(Some(&dir), 1).unwrap();
         let mut ids = Vec::new();
         for _ in 0..KEPT_MAX {
-            let (id, path) = b.new_download().unwrap();
-            std::fs::write(&path, b"backup").unwrap();
-            let (total, sha256) = digest(&path).unwrap();
-            assert_eq!(total, 6);
-            b.keep(
-                &id,
-                Kept {
-                    path,
-                    total,
-                    sha256,
-                },
-            );
+            let (id, kept) = download(&rt, &b, b"backup").unwrap();
+            assert_eq!(kept.total, 6);
+            assert_eq!(digest(&kept.path).unwrap().1, kept.sha256);
             ids.push(id);
         }
         // All being read: a fresh download is refused, a resume isn't (perf287's D2).
-        assert_eq!(b.new_download().unwrap_err().code, "Overloaded");
+        assert_eq!(download(&rt, &b, b"x").unwrap_err().code, "Overloaded");
         b.open(&ids[0]).unwrap();
         // One unread: the fresh download evicts it.
         b.release(&ids[1]);
-        let (_, fresh_path) = b.new_download().unwrap();
+        let (newest, _) = download(&rt, &b, b"x").unwrap();
         assert!(b.open(&ids[1]).is_err(), "the unread copy was evicted");
-        drop(fresh_path);
+        b.release(&newest);
         // Kept while read, however long; then KEEP after the last reader.
         b.sweep(Instant::now() + KEEP * 2);
         assert!(b.open(&ids[0]).is_ok());
-        b.release(&ids[0]);
-        b.release(&ids[0]);
-        b.release(&ids[0]);
+        for _ in 0..3 {
+            b.release(&ids[0]);
+        }
         b.sweep(Instant::now());
         assert!(b.open(&ids[0]).is_ok(), "unread for less than KEEP");
         b.release(&ids[0]);
         b.sweep(Instant::now() + KEEP);
         assert_eq!(b.open(&ids[0]).unwrap_err().code, "NotFound");
+        // A failed backup leaves nothing behind.
+        let e = rt
+            .block_on(b.fresh_download(|_| Err(ApiError::internal("disk full"))))
+            .unwrap_err();
+        assert_eq!(e.message, "disk full");
+        // (The sweep above reaped every unread copy; the failed one is discarded, file and all.)
+        assert!(b.lock().is_empty(), "a failed backup leaves no copy");
+        assert_eq!(std::fs::read_dir(dir.join(DOWNLOADS)).unwrap().count(), 0);
         assert_eq!(
             read_chunk(&dir.join("missing"), 0).unwrap_err().code,
             "Internal"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_given_up_mid_backup_leaves_a_copy_the_reaper_deletes() {
+        // perf287's E1 and simp724's N3 on #1527: the client goes (its request future is
+        // dropped) while the backup is still being written. The copy is the table's, not the
+        // request's: the backup thread finishes it, nobody reads it, and the reaper deletes it.
+        let dir = fresh("given-up");
+        let rt = runtime();
+        let b = Backups::new(Some(&dir), 1).unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (written, done) = std::sync::mpsc::channel::<PathBuf>();
+        rt.block_on(async {
+            let request = b.fresh_download(move |p| {
+                let _ = wait.recv();
+                std::fs::write(p, b"backup").map_err(|e| ApiError::internal(e.to_string()))?;
+                let _ = written.send(p.to_owned());
+                Ok(())
+            });
+            tokio::pin!(request);
+            assert!(
+                futures_poll(&mut request).is_none(),
+                "the backup is running"
+            );
+        });
+        // The request is gone; the copy is reserved, so it counts against the cap (E3).
+        assert_eq!(b.lock().len(), 1);
+        go.send(()).unwrap();
+        let path = done.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The thread marks it ready once it's hashed, just after writing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !b.lock().values().any(|e| e.ready) {
+            assert!(Instant::now() < deadline, "the copy was never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(b.lock().values().all(|e| e.readers == 0), "nobody reads it");
+        b.sweep(Instant::now() + KEEP);
+        assert!(b.lock().is_empty());
+        assert!(!path.exists(), "the reaper deleted the copy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

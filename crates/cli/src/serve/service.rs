@@ -907,39 +907,26 @@ impl Service {
         &self,
         r: proto::BackupDownloadRequest,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup::{self, Kept};
+        use super::backup;
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
             ));
         };
         let (id, kept) = if r.backup_id.is_empty() {
-            let (id, path) = self.backups.new_download()?;
-            let (db, p, durable) = (self.db.clone(), path.clone(), r.durable);
-            // The backup and its hash: minutes for a large database, so on a thread of its
-            // own, never the blocking pool (perf287's D1 on #1527).
-            let digest = self
-                .backups
-                .on_backup_thread(move || {
-                    let taken = if durable {
-                        db.backup_durable(&p)
+            let (db, durable) = (self.db.clone(), r.durable);
+            // The backup and its hash run on a thread of their own, never the blocking pool
+            // (perf287's D1), and the copy is the table's from the start (E1).
+            self.backups
+                .fresh_download(move |p| {
+                    if durable {
+                        db.backup_durable(p)?;
                     } else {
-                        db.backup(&p)
-                    };
-                    if let Err(e) = taken {
-                        let _ = std::fs::remove_file(&p);
-                        return Err(e.into());
+                        db.backup(p)?;
                     }
-                    backup::digest(&p)
+                    Ok(())
                 })
-                .await?;
-            let kept = Kept {
-                path,
-                total: digest.0,
-                sha256: digest.1,
-            };
-            self.backups.keep(&id, kept.clone());
-            (id, kept)
+                .await?
         } else {
             (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
         };
