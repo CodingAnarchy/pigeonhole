@@ -7,11 +7,11 @@
 //! now dropped once the members are copied out.
 //!
 //! A small arena on one shard and a short stall timeout: inserts that keep splitting lists
-//! while the arena fills never take near the timeout, and the index verifies.
+//! while the arena fills never fail with `Busy`, and the index verifies.
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pigeonhole::{Element, Metric, Options, Pigeonhole, VectorSpec};
 use pigeonhole_vector::{Index, IndexOptions};
@@ -37,25 +37,19 @@ fn splits_that_wait_for_arena_room_never_wait_out_the_stall_timeout() {
         let index =
             Index::create(&db, "v", spec, IndexOptions::new().target_list_len(512)).unwrap();
         let mut rng = common::Rng::new(seed);
-        let mut longest = Duration::ZERO;
         for i in 0..1_600u32 {
             let v: Vec<f32> = (0..dim).map(|_| rng.unit()).collect();
-            let t = Instant::now();
             index
                 .insert_f32(&i.to_be_bytes(), &v)
                 .unwrap_or_else(|e| panic!("seed {seed}: insert {i}: {e}"));
-            longest = longest.max(t.elapsed());
         }
         let stats = index
             .verify()
             .unwrap_or_else(|e| panic!("seed {seed}: verify: {e}"));
         assert_eq!(stats.vectors, 1_600, "seed {seed}");
         assert!(stats.list_lens.len() > 1, "seed {seed}: no list ever split");
-        assert!(
-            longest < TIMEOUT / 2,
-            "seed {seed}: an insert took {longest:?}: a split's commit waited for room its own \
-             snapshot held"
-        );
+        // No wall-clock bound: on main the first split's commit fails with `Busy` above, and
+        // a bound would only flake on a loaded runner (simp724 on #1513).
         drop(index);
         db.close().unwrap();
     }
