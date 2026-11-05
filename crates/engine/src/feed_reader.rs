@@ -142,16 +142,31 @@ pub enum Next<'a> {
 }
 
 /// How far a feed has covered its history ([`FeedReader::position`], ICR 0114 amendment):
-/// a seqno, and in a feed of every table the last catalog change delivered. Positions of one
-/// spec compare as `(seqno, catalog)`: catalog sequences follow ceiling order, since root
-/// commits never overlap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// a seqno for its commits, and in a feed of every table a sequence for its catalog changes.
+/// Each part only grows, and they are independent: one position covers another iff both
+/// parts are at least as large ([`FeedPosition::covers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FeedPosition {
     /// Every commit of the spec at or below it is covered.
     pub seqno: Seqno,
-    /// A feed of every table: the root sequence of the last catalog change delivered (0 for
-    /// none, and in a feed of some tables).
+    /// A feed of every table: every catalog change with a root sequence at or below it was
+    /// delivered or passed over (0 for none, and in a feed of some tables).
     pub catalog: u64,
+}
+
+impl FeedPosition {
+    /// Whether this position covers everything `other` does: both parts at least as large.
+    pub fn covers(&self, other: &FeedPosition) -> bool {
+        self.seqno >= other.seqno && self.catalog >= other.catalog
+    }
+
+    /// The position covering what both do, part by part.
+    pub fn join(self, other: FeedPosition) -> FeedPosition {
+        FeedPosition {
+            seqno: self.seqno.max(other.seqno),
+            catalog: self.catalog.max(other.catalog),
+        }
+    }
 }
 
 /// A catalog change a feed of every table delivers (D315): one manifest commit's catalog
@@ -785,9 +800,11 @@ impl FeedReader {
 
     /// How far this feed has covered its history (ICR 0114 amendment; simp724's F1 on #1518):
     /// every commit of its spec at or below [`FeedPosition::seqno`] was delivered, passed
-    /// over or precedes its start, and in a feed of every table so was every catalog change
-    /// with a ceiling at or below it. A change with ceiling `seqno + 1` was delivered iff its
-    /// sequence is at most [`FeedPosition::catalog`].
+    /// over or precedes its start, and in a feed of every table a catalog change was
+    /// delivered or passed over iff its sequence is at most [`FeedPosition::catalog`]: changes
+    /// go in sequence order, and those passed over at the start are a prefix. The seqno says
+    /// nothing about catalog changes (simp724's P1 on #1520): a `Now` or snapshot start can be
+    /// past the ceiling of a change not yet published, which it still delivers.
     ///
     /// It is at least [`delivered`](Self::delivered), which follows every record of the
     /// feed's streams, other tables' included (passed over with no changes), and it also

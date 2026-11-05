@@ -354,6 +354,15 @@ static SPECS: &[Spec] = &[
         |s, out| one(out, s.e.group_syncs)
     ),
     spec!(
+        "pigeonhole.wal.group_sync.time",
+        Counter,
+        true,
+        "s",
+        [],
+        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits): not a sync commit's own sync, flush or checkpoint barrier syncs, or buffered commits.",
+        |s, out| out.push((seconds(s.e.group_sync_nanos), Vec::new()))
+    ),
+    spec!(
         "pigeonhole.transactions",
         Counter,
         false,
@@ -486,6 +495,24 @@ static SPECS: &[Spec] = &[
         [],
         "Time the engine-owned shard threads spent working, summed over shards; its rate is how many shards' worth of work the database did.",
         |s, out| out.push((seconds(s.e.shard_busy_nanos), Vec::new()))
+    ),
+    spec!(
+        "pigeonhole.memtable.size",
+        Gauge,
+        false,
+        "By",
+        [],
+        "Memtable arena bytes in use, summed over shards: live memtables in whole chunks, and flushed ones a snapshot or read still holds. Near the limit, commits wait for room.",
+        |s, out| one(out, s.m.memtable_bytes)
+    ),
+    spec!(
+        "pigeonhole.memtable.limit",
+        Gauge,
+        false,
+        "By",
+        [],
+        "The memtable arenas' size, summed over shards: Options::memtable_budget (per shard, rounded up to 2 MiB) times the shard count.",
+        |s, out| one(out, s.m.memtable_limit_bytes)
     ),
     // Caches.
     spec!(
@@ -941,6 +968,7 @@ counters!(EngineRest {
     cross_rounds: |r: &Raw| r.m.cross_shard.rounds,
     cross_failed_fast: |r: &Raw| r.m.cross_shard.failed_fast,
     group_syncs: |r: &Raw| r.m.group_syncs,
+    group_sync_nanos: |r: &Raw| r.m.group_sync_nanos,
     feed_background_syncs: |r: &Raw| r.m.feed_background_syncs,
     feed_sidecar_syncs: |r: &Raw| r.m.feed_sidecar_syncs,
     row_hits: |r: &Raw| r.row.hits,

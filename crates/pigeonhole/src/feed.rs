@@ -226,7 +226,7 @@ pub enum CatalogEdit {
 
 /// How far a feed has covered its history ([`Feed::position`]). Not part of the stable API.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FeedPosition {
     seqno: u64,
     catalog: u64,
@@ -238,11 +238,16 @@ impl FeedPosition {
         self.seqno
     }
 
-    /// A feed of every table: the root sequence of the last catalog change delivered (0 for
-    /// none, and in a feed of some tables). Positions of one feed compare as `(seqno,
-    /// catalog_sequence)`.
+    /// A feed of every table: every catalog change with a root sequence at or below it was
+    /// delivered or passed over (0 for none, and in a feed of some tables).
     pub fn catalog_sequence(&self) -> u64 {
         self.catalog
+    }
+
+    /// Whether this position covers everything `other` does, both parts at least as large:
+    /// the parts are independent, so positions aren't totally ordered.
+    pub fn covers(&self, other: &FeedPosition) -> bool {
+        self.seqno >= other.seqno && self.catalog >= other.catalog
     }
 }
 
@@ -722,13 +727,14 @@ impl Feed {
     /// How far the feed has covered its history (ICR 0114 amendment), for a server that
     /// fans one feed out to many clients (`phdb serve`'s hubs): every commit of the feed's
     /// tables at or below [`FeedPosition::seqno`] was delivered or passed over, or precedes
-    /// its start, including the seqnos no commit of its tables holds (it moves while only other tables are written). In a feed of every table,
-    /// so was every catalog change with a ceiling at or below it, and one with the next
-    /// ceiling was delivered iff its sequence is at most
-    /// [`FeedPosition::catalog_sequence`]. It never goes back. Not part of the stable API.
+    /// its start, including the seqnos no commit of its tables holds (it moves while only
+    /// other tables are written). In a feed of every table, a catalog change was delivered
+    /// or passed over iff its sequence is at most [`FeedPosition::catalog_sequence`]; the
+    /// seqno says nothing about catalog changes. Neither part ever goes back. Not part of the
+    /// stable API.
     #[doc(hidden)]
     pub fn position(&self) -> FeedPosition {
-        let p = self.covered.max(self.reader.position());
+        let p = self.covered.join(self.reader.position());
         FeedPosition {
             seqno: p.seqno,
             catalog: p.catalog,
@@ -764,7 +770,7 @@ impl Feed {
         let (reader, generation) = subscribe(&self.db, spec)?;
         // Nothing of the spec lies undelivered between the token and the old reader's
         // position, so it stays covered.
-        self.covered = self.covered.max(self.reader.position());
+        self.covered = self.covered.join(self.reader.position());
         self.reader = reader;
         self.generation = generation;
         Ok(())

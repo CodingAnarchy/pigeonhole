@@ -1086,7 +1086,50 @@ fn a_position_never_passes_what_is_still_to_deliver() {
     assert_eq!(p.catalog, sequence);
     assert!(p.seqno < c1, "c1 is still to deliver: {p:?}");
     assert_eq!(next(&mut r).seqno, c1);
-    assert!(r.position() > p);
+    assert!(r.position().covers(&p) && r.position() != p);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's P1 on #1520 (ICR 0114 amendment): a feed of every table's position states its
+/// catalog changes by sequence only. A `Now` start past the ceiling of a change not yet
+/// published (F1b's race) has a seqno at or above that ceiling while the change is still to
+/// deliver: the catalog part stays below its sequence until it is delivered.
+#[test]
+fn a_position_s_catalog_part_covers_a_change_only_once_delivered() {
+    let vfs = SimVfs::new(3183);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    db.delay_root_observer(Duration::from_millis(800));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let s = single(&db, &a, b"past", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let before = r.position();
+    assert!(before.seqno >= s, "{before:?}");
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let (ceiling, sequence) = match r.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => (ev.seqno_ceiling, ev.sequence),
+        other => panic!("the change its view didn't reflect: {other:?}"),
+    };
+    assert!(
+        ceiling <= s,
+        "the start must be past the change: {ceiling} > {s}"
+    );
+    assert!(
+        before.catalog < sequence,
+        "the change was covered by sequence before it was delivered: {before:?}"
+    );
+    let after = r.position();
+    assert_eq!(after.catalog, sequence);
+    assert!(after.covers(&before));
     drop(r);
     db.close().unwrap();
 }

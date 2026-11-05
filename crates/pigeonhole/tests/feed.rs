@@ -919,7 +919,7 @@ fn a_feed_s_position_and_a_table_s_feed_id() {
     let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
     assert_eq!(next(&mut feed).seqno(), s1.seqno);
     assert!(feed.position().seqno() >= s1.seqno);
-    assert!(feed.position() >= start);
+    assert!(feed.position().covers(&start));
     let other = b.mutate(b"r2").put("f", b"q", b"2").commit().unwrap();
     let deadline = std::time::Instant::now() + WAIT;
     while feed.position().seqno() < other.seqno {
