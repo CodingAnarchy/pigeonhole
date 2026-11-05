@@ -399,3 +399,66 @@ fn a_reader_process_delivers_a_separated_value() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// D315 PR 2b: a feed of every table in a reader process delivers the writer's catalog
+/// changes from the sidecar, each in its place among the commits, as the writer's own feed
+/// does; and a start now passes over the changes the reader's view already reflects.
+#[test]
+fn a_reader_process_feed_of_every_table_delivers_catalog_changes() {
+    use pigeonhole_format::manifest::Edit;
+    let vfs = SimVfs::new(4131);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _b) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let c = (*w
+        .db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap())
+    .clone();
+    w.settle();
+    let s1 = w.commit(&[(&c, b"c1")]);
+    w.db.drop_table(c.id).unwrap();
+    w.settle();
+    let s2 = w.commit(&[(&a, b"a2")]);
+    vfs.enter_process(READER);
+    let mut got = Vec::new();
+    for _ in 0..1000 {
+        match feed.try_next().unwrap() {
+            Next::Commit(cm) => got.push(format!("c{}", cm.seqno)),
+            Next::Catalog(ev) => got.push(
+                ev.edits
+                    .iter()
+                    .map(|e| match e {
+                        Edit::CreateTable { name, .. } => format!("+{name}"),
+                        Edit::PutFamily { name, .. } => format!("/{name}"),
+                        Edit::DropTable { table } => {
+                            let name = ev.names.iter().find(|(t, _)| t == table);
+                            format!("-{}", name.map_or("?", |(_, n)| n.as_str()))
+                        }
+                        other => panic!("{other:?}"),
+                    })
+                    .collect::<String>(),
+            ),
+            Next::Pending if got.len() == 4 => break,
+            Next::Pending => std::thread::yield_now(),
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            "+c/g".to_string(),
+            format!("c{s1}"),
+            "-c".into(),
+            format!("c{s2}")
+        ]
+    );
+    drop(feed);
+    vfs.enter_process(WRITER);
+    w.close();
+}
