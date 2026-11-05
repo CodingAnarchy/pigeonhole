@@ -220,9 +220,10 @@ impl Pigeonhole {
     /// commits only (a catalog change goes through [`apply_catalog`](Self::apply_catalog)).
     ///
     /// One atomic `GroupSync` commit, unless two of the run's commits write the same cell
-    /// at the same timestamp (one commit can't hold both): it then splits there, each part
-    /// committed with the token of its own last event, so a crash between parts resumes after
-    /// the last one committed. Refused with `InvalidArgument`: an empty run, a catalog
+    /// at the same timestamp (one commit can't hold both), or the run is larger than a
+    /// commit should carry (a quarter of one shard's memtable share, at least 64 KiB): it
+    /// then splits there, between primary commits, each part committed with the token of its
+    /// own last event, so a crash between parts resumes after the last one committed. Refused with `InvalidArgument`: an empty run, a catalog
     /// change in it, a gap or an overlap, or a `token` that isn't the last event's. Not part
     /// of the stable API.
     #[doc(hidden)]
@@ -251,20 +252,31 @@ impl Pigeonhole {
         let mut cells: HashSet<Cell<'_>> = HashSet::new();
         let mut max_ts = 0;
         let mut part_end: Option<&ReplicatedEvent> = None;
+        let cap = self.engine().max_replicated_part_bytes();
+        let mut part_bytes = 0;
         for event in run {
             let Body::Commit { changes, .. } = &event.body else {
                 unreachable!("checked above");
             };
-            // A cell and timestamp this part already writes: commit the part first.
+            let bytes: usize = changes
+                .iter()
+                .map(|c| c.row.len() + c.qualifier.len() + c.stored.len() + 32)
+                .sum();
+            // A cell and timestamp this part already writes, or a part this event would take
+            // past the byte cap (simp724's S1): commit the part first. One event is never
+            // split: a primary commit applies whole.
             if let Some(end) = part_end
-                && changes.iter().any(|c| {
-                    cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
-                })
+                && (part_bytes + bytes > cap
+                    || changes.iter().any(|c| {
+                        cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
+                    }))
             {
                 self.commit_part(std::mem::take(&mut batch), end, max_ts)?;
                 cells.clear();
                 max_ts = 0;
+                part_bytes = 0;
             }
+            part_bytes += bytes;
             for c in changes {
                 batch.push_logged(
                     c.table,

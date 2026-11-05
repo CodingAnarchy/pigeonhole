@@ -1951,17 +1951,26 @@ fn check_entry(label: &str, src: &Path, extra: Option<fn(&Pigeonhole) -> String>
         (None, Ok(_)) => panic!("{label}: {EXTRA} without a check"),
         (_, Err(_)) => {}
     }
-    // Write on top, through a flush and a compaction.
-    let t = db
+    // Write on top, through a flush and a compaction. A replica (D315 PR 3; the entry with
+    // [`READ_ONLY_BY`]) takes only its primary's changes: a local table is refused, and the
+    // flush, compaction, check and reread still run.
+    let replica = src.join(READ_ONLY_BY).exists();
+    match db
         .table("corpus_writes")
         .unwrap()
         .family("f", Family::default())
         .create_if_missing()
-        .unwrap();
-    t.mutate(b"written")
-        .put("f", b"q", b"by this build")
-        .commit()
-        .unwrap();
+    {
+        Ok(t) => {
+            assert!(!replica, "{label}: a replica took a local table");
+            t.mutate(b"written")
+                .put("f", b"q", b"by this build")
+                .commit()
+                .unwrap();
+        }
+        Err(e) if replica && e.code() == pigeonhole::ErrorCode::ReadOnly => {}
+        Err(e) => panic!("{label}: create: {e}"),
+    }
     db.flush().unwrap();
     db.compact().unwrap();
     db.close().unwrap();
@@ -1976,7 +1985,7 @@ fn check_entry(label: &str, src: &Path, extra: Option<fn(&Pigeonhole) -> String>
         .into_iter()
         .partition(|l| !l.starts_with("corpus_writes\t"));
     assert_eq!(old, expected, "{label}: contents after the write");
-    assert_eq!(new.len(), 1, "{label}: {new:?}");
+    assert_eq!(new.len(), usize::from(!replica), "{label}: {new:?}");
     db.close().unwrap();
 }
 

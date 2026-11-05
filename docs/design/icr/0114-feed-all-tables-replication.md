@@ -67,6 +67,7 @@ Everything here is hidden (`#[doc(hidden)]`), behind the feature `__unstable-rep
   - **`Pigeonhole::apply_replicated(&[ReplicatedEvent], &FeedToken)`** applies a run of commits and stores the token in the same commit as the run's last change: one atomic `GroupSync` commit, cross-shard if it has to be.
     - **The split:** a run whose commits write one cell at one timestamp twice is split there, since one commit can't hold both (two entries at one seqno read in no set order). Each part is committed with the token of its own last event, so a crash between parts resumes after the last committed one.
     - **Refused** with `InvalidArgument`: an empty run, a catalog change in it, events that don't chain, a run that doesn't start where the last apply ended (a gap or an overlap), or a token that isn't the last event's.
+    - **The size split** (simp724's S1): a run is also split between primary commits so no part carries more than a quarter of one shard's memtable share (at least 64 KiB; `Engine::max_replicated_part_bytes`), so a large catch-up run never makes a commit the shards must stall on. A primary commit is never split.
     - **The run bound:** none in the API. It's a later `phdb` replica loop's option (#755).
   - **`Pigeonhole::apply_catalog(&ReplicatedEvent, &FeedToken)`** applies a catalog change with the primary's ids (counters raised past them, a local tablet per created table), then stores the token. These are two commits (the manifest's, then the state cell's). A change already applied as it stands is passed over, so a retry after a crash between them is safe.
   - **`Pigeonhole::replicated_token() -> Option<FeedToken>`** is the token stored with the last event applied: the primary's feed resumes from it.
@@ -80,6 +81,8 @@ Everything here is hidden (`#[doc(hidden)]`), behind the feature `__unstable-rep
   - The reserved table is hidden from `tables()`, `info()`, `table(name)` and every feed, including its creation as a catalog event.
   - It can't be dropped, and its tablet is never split or merged.
   - **New:** `create_table` refuses names starting with `__pigeonhole.` (`InvalidArgument`).
+  - **A replica takes only its primary's changes** (simp724's R6). Once the state table exists, every local write (commit, transaction, conditional or async), and every local `create_table`, `add_family` and `drop_table`, fails with `ReadOnly`. A local schema change would take the ids the primary assigns next and leave replication stuck "in use"; a local write would silently diverge the mirror. Promotion to a primary lifts it: that's a later change, with the `phdb` replica wiring.
+  - **The engine's feed open refuses the state table by id** (S2), so the hiding holds at every layer.
 - **Tests:**
   - `tests/replication.rs`:
     - a replica matches its primary across creates, drops, puts, every delete kind and counter increments;

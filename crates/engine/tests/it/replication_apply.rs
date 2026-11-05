@@ -165,3 +165,21 @@ fn a_replica_refuses_catalog_changes_it_cannot_apply_as_given() {
     invalid(replica.apply_catalog(&[]));
     replica.close().unwrap();
 }
+
+/// A replica's state table is no feed's at the engine layer too (simp724's S2 on #1562):
+/// naming its id in a feed is refused.
+#[test]
+fn a_feed_naming_the_replica_state_table_is_refused() {
+    let vfs = SimVfs::new(5103);
+    let db = open(&vfs, PRIMARY);
+    let e = db
+        .feed(FeedSpec {
+            tables: vec![pigeonhole_format::manifest::REPLICA_TABLE],
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+        })
+        .expect_err("refused");
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    db.close().unwrap();
+}

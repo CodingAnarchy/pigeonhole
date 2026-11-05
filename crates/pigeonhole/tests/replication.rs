@@ -193,7 +193,8 @@ fn a_replica_applies_a_primary_s_feed_and_matches_it() {
             .open()
             .is_err()
     );
-    let e = replica
+    // No name in its namespace can be made, anywhere (here on the primary).
+    let e = primary
         .table("__pigeonhole.mine")
         .unwrap()
         .family("f", Family::default())
@@ -356,4 +357,85 @@ fn a_replica_resumes_from_its_token_after_a_crash_with_nothing_twice_or_skipped(
         replica.close().unwrap();
         primary.close().unwrap();
     }
+}
+
+/// A replica takes only its primary's changes (simp724's R6 on #1562): once it has applied
+/// one, a local schema change would take the ids the primary assigns next, and a local
+/// write would silently diverge the mirror, so both are refused with `ReadOnly`; replication
+/// goes on.
+#[test]
+fn a_replica_refuses_local_writes_and_schema_changes() {
+    let (pv, rv) = (SimVfs::new(30), SimVfs::new(31));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    workload(&primary, 0);
+    apply(&replica, &ready(&mut feed), 4);
+    let read_only = |r: pigeonhole::Result<()>| {
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), ErrorCode::ReadOnly, "{e}");
+    };
+    read_only(
+        replica
+            .table("local")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .map(drop),
+    );
+    let t = replica.table("t").unwrap().open().unwrap();
+    read_only(t.mutate(b"local").put("a", b"q", b"v").commit().map(drop));
+    read_only(replica.drop_table("t"));
+    drop(t);
+    // Replication goes on, across a reopen too.
+    replica.close().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = replica.table("t").unwrap().open().unwrap();
+    read_only(t.mutate(b"local").put("a", b"q", b"v").commit().map(drop));
+    drop(t);
+    for step in 1..6 {
+        workload(&primary, step);
+    }
+    apply(&replica, &ready(&mut feed), 4);
+    assert_eq!(contents(&replica), contents(&primary));
+    drop(feed);
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// A run larger than a commit should carry splits by bytes (simp724's S1 on #1562), between
+/// primary commits, and still lands whole.
+#[test]
+fn a_large_run_splits_by_bytes() {
+    let (pv, rv) = (SimVfs::new(32), SimVfs::new(33));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("big")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    // 4 MiB of values over 2 shards: well past a quarter of one shard's memtable share.
+    let value = vec![7u8; 256 << 10];
+    for i in 0..16u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("f", b"q", &value)
+            .commit()
+            .unwrap();
+    }
+    let events = ready(&mut feed);
+    // The table's creation first, then the 16 commits as one run.
+    apply(&replica, &events[..1], 1);
+    let before = replica.visible_seqno();
+    apply(&replica, &events[1..], usize::MAX);
+    // A commit per part: 4 MiB against a 512 KiB cap is at least 8.
+    let commits = replica.visible_seqno() - before;
+    assert!(commits >= 8, "the run committed as {commits} commits");
+    assert_eq!(contents(&replica), contents(&primary));
+    assert_eq!(replica.replicated_token().unwrap(), Some(feed.token()));
+    drop((feed, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
 }

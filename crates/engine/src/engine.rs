@@ -477,6 +477,12 @@ pub(crate) struct Inner {
     /// Refuses writes, catalog changes and maintenance with `ReadOnly`: a reader process, or
     /// a writer opened read-only by `read_only_fallback` (ICR 0059), which writes nothing.
     read_only: bool,
+    /// Whether this database is a replica (D315 PR 3; simp724's R6): its state table exists.
+    /// Then only a primary's changes apply (logged batches, `apply_catalog`); local writes
+    /// and catalog changes are refused with `ReadOnly`, since they'd take the ids the
+    /// primary assigns next, or silently diverge the mirror. Set at open, and by the first
+    /// apply; promotion to a primary (a later change) clears it.
+    replica: AtomicBool,
     options: EngineOptions,
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
@@ -1699,6 +1705,11 @@ impl Engine {
                 .collect(),
             role: Role::Writer,
             read_only,
+            replica: AtomicBool::new(
+                catalog
+                    .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                    .is_some(),
+            ),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1830,6 +1841,7 @@ impl Engine {
             shared,
             role: Role::Reader,
             read_only: true,
+            replica: AtomicBool::new(false),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1853,6 +1865,7 @@ impl Engine {
         name: &str,
         families: &[(String, FamilyOptions)],
     ) -> Result<Arc<TableInfo>> {
+        self.inner.refuse_on_replica()?;
         self.inner.create_table(name, families)
     }
 
@@ -1863,6 +1876,7 @@ impl Engine {
         name: &str,
         options: FamilyOptions,
     ) -> Result<Arc<TableInfo>> {
+        self.inner.refuse_on_replica()?;
         self.inner.add_family(table, name, options)
     }
 
@@ -1921,6 +1935,7 @@ impl Engine {
                 "a replica's state table can't be dropped".to_owned(),
             ));
         }
+        self.inner.refuse_on_replica()?;
         self.inner.drop_table(table)
     }
 
@@ -1962,6 +1977,16 @@ impl Engine {
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
         self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// The most bytes of logged changes one replicated commit should carry (D315 PR 3;
+    /// simp724's S1): a quarter of one shard's share of the memtable budget, at least 64 KiB,
+    /// so a large catch-up run splits into commits a shard's arena takes without stalling.
+    pub fn max_replicated_part_bytes(&self) -> usize {
+        let share = self.inner.options.memtable_budget / self.inner.shared.shards.max(1) as u64;
+        usize::try_from(share / 4)
+            .unwrap_or(usize::MAX)
+            .max(64 << 10)
     }
 
     /// Commits only the replica's state cell (D315 PR 3): after an applied catalog change,
@@ -4658,6 +4683,8 @@ impl Inner {
         if self.catalog().table(REPLICA_TABLE).is_some() {
             return Ok(());
         }
+        // Before the table exists, so no local write gets in after it.
+        self.replica.store(true, Ordering::Relaxed);
         let mut options = FamilyOptions::default();
         options.max_versions = 1;
         self.catalog_change(move |catalog| {
@@ -4683,6 +4710,14 @@ impl Inner {
                 },
             ])
         })?;
+        Ok(())
+    }
+
+    /// `ReadOnly` on a replica (simp724's R6).
+    fn refuse_on_replica(&self) -> Result<()> {
+        if self.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
+        }
         Ok(())
     }
 
@@ -4882,6 +4917,9 @@ impl Inner {
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
         if batch.logged {
             return route_logged(batch, view);
+        }
+        if self.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
         }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
@@ -6197,6 +6235,12 @@ fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> R
     }
     v.check_components(params.metric)
         .or_else(|e| refuse(e.to_string()))
+}
+
+/// A replica refuses local writes and catalog changes (D315 PR 3; simp724's R6).
+#[cold]
+fn replica_refusal() -> Error {
+    Error::ReadOnly
 }
 
 /// A replica's state cell (D315 PR 3): its row and qualifier in [`REPLICA_TABLE`], at one

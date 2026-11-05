@@ -497,6 +497,12 @@ impl FeedReader {
         let mut tables = spec.tables;
         tables.sort_unstable();
         tables.dedup();
+        // A replica's state table (D315 PR 3; simp724's S2) is no feed's, at every layer.
+        if tables.contains(&pigeonhole_format::manifest::REPLICA_TABLE) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be fed".into(),
+            ));
+        }
         // Every table (D315): the session must feed every table, not a list of them.
         if tables.is_empty() && !matches!(fed, FeedTables::All) {
             return Err(Error::InvalidArgument(
