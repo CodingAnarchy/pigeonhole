@@ -19,6 +19,7 @@ use crate::args::Cli;
 use crate::exit::Failure;
 
 mod auth;
+mod backup;
 mod config;
 mod convert;
 mod errors;
@@ -78,7 +79,12 @@ impl Shared {
         started: std::time::Instant,
         reply: &Result<service::ServiceReply, errors::ApiError>,
     ) {
-        if let Ok(service::ServiceReply::Scan(_) | service::ServiceReply::Feed(_)) = reply {
+        if let Ok(
+            service::ServiceReply::Scan(_)
+            | service::ServiceReply::Feed(_)
+            | service::ServiceReply::Download(_),
+        ) = reply
+        {
             return;
         }
         self.metrics.count(
@@ -180,12 +186,16 @@ pub(crate) fn run(
     let limits = args.limits();
     let metrics = Arc::new(service::Metrics::default());
     let shared = Arc::new(Shared {
-        router: router::Router::single(service::Service::new(
-            db.clone(),
-            limits,
-            placement.blocking_threads,
-            Arc::clone(&metrics),
-        )),
+        router: router::Router::single(
+            service::Service::new(
+                db.clone(),
+                limits,
+                placement.blocking_threads,
+                Arc::clone(&metrics),
+            )
+            .backups(args.backup_dir.as_deref(), args.max_backups)
+            .map_err(|e| Failure::usage(&e))?,
+        ),
         tokens,
         limits,
         metrics,

@@ -800,3 +800,236 @@ pub(crate) fn row(r: pigeonhole::RowRef<'_>, q: Option<&proto::AggregateQuery>) 
 pub(crate) fn cell_bytes(c: &proto::Cell) -> u64 {
     (c.qualifier.len() + c.value.len() + 16) as u64
 }
+
+// ---- Schema (D313 ticket 6): families in and out ----
+
+fn element_in(e: i32) -> Result<Element> {
+    Ok(
+        match proto::Element::try_from(e).unwrap_or(proto::Element::Unspecified) {
+            proto::Element::F32 => Element::F32,
+            proto::Element::F16 => Element::F16,
+            proto::Element::Bf16 => Element::BF16,
+            proto::Element::I8 => Element::I8,
+            proto::Element::Bit => Element::Bit,
+            proto::Element::Unspecified => {
+                return Err(ApiError::invalid("a vector family needs its element type"));
+            }
+        },
+    )
+}
+
+fn metric_in(m: i32) -> Result<pigeonhole::Metric> {
+    use pigeonhole::Metric;
+    Ok(
+        match proto::Metric::try_from(m).unwrap_or(proto::Metric::Unspecified) {
+            proto::Metric::L2 => Metric::L2,
+            proto::Metric::Cosine => Metric::Cosine,
+            proto::Metric::InnerProduct => Metric::InnerProduct,
+            proto::Metric::Hamming => Metric::Hamming,
+            proto::Metric::Unspecified => {
+                return Err(ApiError::invalid("a vector family needs its metric"));
+            }
+        },
+    )
+}
+
+fn metric_out(m: pigeonhole::Metric) -> i32 {
+    use pigeonhole::Metric;
+    (match m {
+        Metric::L2 => proto::Metric::L2,
+        Metric::Cosine => proto::Metric::Cosine,
+        Metric::InnerProduct => proto::Metric::InnerProduct,
+        Metric::Hamming => proto::Metric::Hamming,
+        _ => proto::Metric::Unspecified,
+    }) as i32
+}
+
+/// A `FamilySpec` as the `Family` to create: unset options take the library's defaults.
+pub(crate) fn family_in(s: &proto::FamilySpec) -> Result<pigeonhole::Family> {
+    use pigeonhole::{Aggregation as A, BloomParams, Family, HistogramParams, QuantileParams};
+    use proto::family_spec::Kind;
+    let bad = |what: &str, e: pigeonhole::Error| {
+        ApiError::invalid(format!("family {}: {what}: {}", s.name, e.message()))
+    };
+    let narrow =
+        |what: &str| ApiError::invalid(format!("family {}: {what} is out of range", s.name));
+    let mut f = match &s.kind {
+        None => Family::default(),
+        Some(Kind::MergeOperator(op)) => Family::default().merge_operator(op),
+        Some(Kind::Vector(v)) => Family::vector(
+            pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
+                .map_err(|e| bad("the vector spec", e))?,
+        ),
+        Some(Kind::Aggregate(a)) => {
+            use proto::AggregationKind as K;
+            let kind = K::try_from(a.kind).unwrap_or(K::Unspecified);
+            Family::aggregate(match kind {
+                K::Sum => A::Sum,
+                K::Min => A::Min,
+                K::Max => A::Max,
+                K::Hll => A::Hll,
+                K::BitOr => A::BitOr,
+                K::BitAnd => A::BitAnd,
+                K::BitXor => A::BitXor,
+                K::MinF64 => A::MinF64,
+                K::MaxF64 => A::MaxF64,
+                K::SumF64 => A::SumF64,
+                K::MeanVar => A::MeanVar,
+                K::Set => A::Set,
+                K::Histogram => A::Histogram(
+                    HistogramParams::new(a.histogram_bounds.clone())
+                        .map_err(|e| bad("the histogram bounds", e))?,
+                ),
+                K::Quantiles => {
+                    let mut q = QuantileParams::default();
+                    if let Some(n) = a.quantile_mantissa_bits {
+                        q = q.mantissa_bits(u8::try_from(n).map_err(|_| narrow("mantissa_bits"))?);
+                    }
+                    if let Some(n) = a.quantile_max_buckets {
+                        q = q.max_buckets(u16::try_from(n).map_err(|_| narrow("max_buckets"))?);
+                    }
+                    A::Quantiles(q)
+                }
+                K::Bloom => A::Bloom(
+                    BloomParams::new(
+                        a.bloom_bits,
+                        u8::try_from(a.bloom_hashes).map_err(|_| narrow("bloom_hashes"))?,
+                    )
+                    .map_err(|e| bad("the bloom filter", e))?,
+                ),
+                K::Unspecified => {
+                    return Err(ApiError::invalid(format!(
+                        "family {}: an aggregate family needs its kind",
+                        s.name
+                    )));
+                }
+            })
+        }
+    };
+    if let Some(n) = s.max_versions {
+        f = f.max_versions(n);
+    }
+    // 0 is "no TTL", as `DescribeTable` reports it, so a described family creates again.
+    if let Some(us) = s.ttl_micros.filter(|&us| us > 0) {
+        f = f.ttl(std::time::Duration::from_micros(us));
+    }
+    if let Some(n) = s.bloom_bits {
+        f = f.bloom_bits(u8::try_from(n).map_err(|_| narrow("bloom_bits"))?);
+    }
+    if let Some(n) = s.blob_threshold {
+        f = f.blob_threshold(n);
+    }
+    if let Some(n) = s.block_size {
+        f = f.block_size(n);
+    }
+    if let Some(c) = &s.compression {
+        use proto::CompressionCodec as C;
+        f = match C::try_from(c.codec).unwrap_or(C::Unspecified) {
+            C::Unspecified => f,
+            C::None => f.compression(pigeonhole::Compression::None),
+            C::Lz4 => f.compression(pigeonhole::Compression::Lz4),
+            C::Zstd => f.compression(pigeonhole::Compression::Zstd(if c.zstd_level == 0 {
+                3
+            } else {
+                i8::try_from(c.zstd_level).map_err(|_| narrow("zstd_level"))?
+            })),
+        };
+    }
+    f = match proto::Priority::try_from(s.cache_priority).unwrap_or(proto::Priority::Unspecified) {
+        proto::Priority::Unspecified => f,
+        proto::Priority::Low => f.cache_priority(pigeonhole::Priority::Low),
+        proto::Priority::Normal => f.cache_priority(pigeonhole::Priority::Normal),
+        proto::Priority::High => f.cache_priority(pigeonhole::Priority::High),
+    };
+    f = match proto::CompactionStyle::try_from(s.compaction)
+        .unwrap_or(proto::CompactionStyle::Unspecified)
+    {
+        proto::CompactionStyle::Unspecified => f,
+        proto::CompactionStyle::Leveled => f.compaction(pigeonhole::Compaction::Leveled),
+        proto::CompactionStyle::Tiered => f.compaction(pigeonhole::Compaction::Tiered),
+        proto::CompactionStyle::FifoByTime => f.compaction(pigeonhole::Compaction::FifoByTime),
+    };
+    Ok(f)
+}
+
+/// A family as `DescribeTable` returns it: every option set, as stored.
+pub(crate) fn family_out(i: &pigeonhole::FamilyInfo) -> proto::FamilySpec {
+    use pigeonhole::Aggregation as A;
+    use proto::AggregationKind as K;
+    use proto::family_spec::Kind;
+    let kind = if let Some(a) = &i.aggregation {
+        let mut out = proto::Aggregation::default();
+        out.kind = match a {
+            A::Sum => K::Sum,
+            A::Min => K::Min,
+            A::Max => K::Max,
+            A::Hll => K::Hll,
+            A::BitOr => K::BitOr,
+            A::BitAnd => K::BitAnd,
+            A::BitXor => K::BitXor,
+            A::MinF64 => K::MinF64,
+            A::MaxF64 => K::MaxF64,
+            A::SumF64 => K::SumF64,
+            A::MeanVar => K::MeanVar,
+            A::Set => K::Set,
+            A::Histogram(p) => {
+                out.histogram_bounds = p.bounds();
+                K::Histogram
+            }
+            A::Quantiles(q) => {
+                out.quantile_mantissa_bits = Some(u32::from(q.get_mantissa_bits()));
+                out.quantile_max_buckets = Some(u32::from(q.get_max_buckets()));
+                K::Quantiles
+            }
+            A::Bloom(b) => {
+                out.bloom_bits = b.bits();
+                out.bloom_hashes = u32::from(b.hashes());
+                K::Bloom
+            }
+            _ => K::Unspecified,
+        } as i32;
+        Some(Kind::Aggregate(out))
+    } else if let Some(v) = &i.vector {
+        Some(Kind::Vector(proto::VectorSpec {
+            dim: v.dim(),
+            element: element_out(v.element()),
+            metric: metric_out(v.metric()),
+        }))
+    } else {
+        i.merge_operator.clone().map(Kind::MergeOperator)
+    };
+    let (codec, zstd_level) = match i.compression {
+        pigeonhole::Compression::None => (proto::CompressionCodec::None, 0),
+        pigeonhole::Compression::Lz4 => (proto::CompressionCodec::Lz4, 0),
+        pigeonhole::Compression::Zstd(l) => (proto::CompressionCodec::Zstd, i32::from(l)),
+        _ => (proto::CompressionCodec::Unspecified, 0),
+    };
+    proto::FamilySpec {
+        name: i.name.clone(),
+        kind,
+        max_versions: Some(i.max_versions),
+        ttl_micros: Some(
+            i.ttl
+                .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+        ),
+        bloom_bits: Some(u32::from(i.bloom_bits)),
+        blob_threshold: Some(i.blob_threshold),
+        compression: Some(proto::Compression {
+            codec: codec as i32,
+            zstd_level,
+        }),
+        block_size: Some(i.block_size),
+        cache_priority: match i.cache_priority {
+            pigeonhole::Priority::Low => proto::Priority::Low,
+            pigeonhole::Priority::Normal => proto::Priority::Normal,
+            pigeonhole::Priority::High => proto::Priority::High,
+            _ => proto::Priority::Unspecified,
+        } as i32,
+        compaction: match i.compaction {
+            pigeonhole::Compaction::Leveled => proto::CompactionStyle::Leveled,
+            pigeonhole::Compaction::Tiered => proto::CompactionStyle::Tiered,
+            pigeonhole::Compaction::FifoByTime => proto::CompactionStyle::FifoByTime,
+            _ => proto::CompactionStyle::Unspecified,
+        } as i32,
+    }
+}

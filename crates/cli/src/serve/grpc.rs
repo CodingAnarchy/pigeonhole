@@ -347,6 +347,113 @@ impl tonic::server::NamedService for FeedGrpc {
     const NAME: &'static str = proto::feed_server::SERVICE_NAME;
 }
 
+/// `Admin` over gRPC (D313 ticket 6).
+#[derive(Debug, Clone)]
+pub(crate) struct AdminGrpc(pub(crate) Arc<Shared>);
+
+struct GrpcChunks(super::backup::Download);
+
+impl Stream for GrpcChunks {
+    type Item = Result<proto::BackupChunk, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::admin_server::Admin for AdminGrpc {
+    /// Liveness, with no token: whether the database is open and not failed.
+    async fn health(
+        &self,
+        _req: Request<proto::Empty>,
+    ) -> Result<Response<proto::HealthResponse>, Status> {
+        let ok = !self.0.router.service.db.is_failed();
+        Ok(Response::new(proto::HealthResponse {
+            status: if ok { "ok" } else { "failed" }.into(),
+        }))
+    }
+
+    async fn info(
+        &self,
+        req: Request<proto::Empty>,
+    ) -> Result<Response<proto::InfoResponse>, Status> {
+        unary!(&self.0, req, Info, Info)
+    }
+
+    async fn flush(&self, req: Request<proto::Empty>) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Flush, Empty)
+    }
+
+    async fn compact(&self, req: Request<proto::Empty>) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Compact, Empty)
+    }
+
+    async fn backup(
+        &self,
+        req: Request<proto::BackupRequest>,
+    ) -> Result<Response<proto::BackupResponse>, Status> {
+        unary!(&self.0, req, Backup, Backup)
+    }
+
+    type BackupDownloadStream =
+        Pin<Box<dyn Stream<Item = Result<proto::BackupChunk, Status>> + Send>>;
+
+    async fn backup_download(
+        &self,
+        req: Request<proto::BackupDownloadRequest>,
+    ) -> Result<Response<Self::BackupDownloadStream>, Status> {
+        match call(&self.0, req, ServiceOp::BackupDownload).await? {
+            ServiceReply::Download(d) => Ok(Response::new(Box::pin(GrpcChunks(d)))),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn metrics(
+        &self,
+        req: Request<proto::Empty>,
+    ) -> Result<Response<proto::MetricsResponse>, Status> {
+        unary!(&self.0, req, Metrics, Metrics)
+    }
+}
+
+/// `Schema` over gRPC (D313 ticket 6).
+#[derive(Debug, Clone)]
+pub(crate) struct SchemaGrpc(pub(crate) Arc<Shared>);
+
+#[tonic::async_trait]
+impl proto::schema_server::Schema for SchemaGrpc {
+    async fn list_tables(
+        &self,
+        req: Request<proto::ListTablesRequest>,
+    ) -> Result<Response<proto::ListTablesResponse>, Status> {
+        unary!(&self.0, req, ListTables, Tables)
+    }
+
+    async fn create_table(
+        &self,
+        req: Request<proto::CreateTableRequest>,
+    ) -> Result<Response<proto::TableResponse>, Status> {
+        unary!(&self.0, req, CreateTable, Table)
+    }
+
+    async fn drop_table(
+        &self,
+        req: Request<proto::DropTableRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, DropTable, Empty)
+    }
+
+    async fn describe_table(
+        &self,
+        req: Request<proto::DescribeTableRequest>,
+    ) -> Result<Response<proto::TableResponse>, Status> {
+        unary!(&self.0, req, DescribeTable, Table)
+    }
+}
+
 /// `Snapshots` over gRPC (D313 §3).
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotGrpc(pub(crate) Arc<Shared>);

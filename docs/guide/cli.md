@@ -340,7 +340,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots` and the change feed (`Feed.Subscribe`) over gRPC and HTTP/JSON. Schema and the other services follow; ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots`, the change feed (`Feed.Subscribe`), `Schema` and `Admin` over gRPC and HTTP/JSON. Graph, vector, text and memory follow; ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
@@ -355,6 +355,19 @@ u1   profile  name       1761030000000000  Ada
   - **Leases:** a transaction idle for `--txn-idle-ms` (30 s), or older than `--txn-lifetime-ms` (5 min), expires. Before any `Commit`, that's `TransactionExpired`: nothing was written, so begin again. A call in flight never expires.
   - **`NotFound` for a `txn_id` you sent `Commit` to** (after a restart, or once its record expires) means the outcome is unknown: check an operation id the transaction wrote before retrying ([recovery](recovery.md)).
   - A read token may begin, read and commit a transaction without writes; writing needs a write token.
+- **Schema:**
+  - `Schema.ListTables` (also `GET /v1/tables`) and `DescribeTable` need read scope, `CreateTable` write scope, and `DropTable` admin scope (it drops the data).
+  - `CreateTable` takes each family's options as `FamilySpec`, and with `if_missing` opens an existing table and adds only the families it lacks (adding families is additive, so write scope does it too).
+  - `DescribeTable` returns every option as stored, so its output creates the same table again.
+- **Admin:**
+  - `Admin.Health` needs no token;
+  - `Info` (path, sizes, tables, version) and `Metrics` (the `/metrics` text) need read scope;
+  - `Flush`, `Compact`, `Backup` and `BackupDownload` need admin scope.
+- **Backups** need `--backup-dir`; without it they're off.
+  - `Admin.Backup` writes a consistent backup inside it, at a path relative to it that doesn't exist yet and doesn't lead out of it through a link.
+  - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
+  - **Allow for the silence before the first byte:** the server backs up and hashes first. A stream that ends without its final chunk (the one with the size and SHA-256) is incomplete: resume it. Check the SHA-256 before relying on the copy.
+  - **One at a time:** backups run one at a time by default (`--max-backups`), off the threads reads use.
 - **Pinned snapshots** (`Snapshots.Open`, `Release`) make reads agree across requests: pass the `snapshot_id` as `GetRequest.snapshot_id`, or as `Selection.snapshot_id` for `MultiGet`, `ReadRow` and `Scan`. Each read renews the snapshot's lease (`--snapshot-idle-ms`, 60 s; at most `--snapshot-lifetime-ms`, 10 min). A held snapshot holds back version and blob GC, so release it when done. Reads already running when it's released finish; later ones, and a scan's later pages, get `NotFound`.
 - **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each (the database needs `Options::change_feed` on for them).
   - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
@@ -372,6 +385,7 @@ u1   profile  name       1761030000000000  Ada
   - **128 streams per connection:** one HTTP/2 connection carries at most 128 streams at once (scans, feed streams and calls alike). A client that opens more on one connection doesn't get an error: the extra streams wait until earlier ones end, and a feed stream may never end. Open another connection for each 128 concurrent streams. With tonic, that means another `Channel`, because one `Channel` is one connection.
   - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
   - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. Each commit also carries its resume token (about 45 + 16 × shards bytes) and its encoded copy for gRPC streams with no `prefix`, which counts too. So the ring holds about half as many commits as their own size would suggest. Size `--feed-ring-bytes` to about twice the commits you want streams to catch up from. This is outside `--inflight-bytes`; `/metrics` reports what's in use.
+  - `--backup-dir`: where `Admin.Backup` writes, and where downloads are kept for resumes. It must exist; put it on a disk with room for a copy or two of the database, not tmpfs. There's no default: without it, backups are off. `--max-backups` (1) runs that many at once.
   - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
   - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
   - A write the server has submitted always answers its real outcome.
