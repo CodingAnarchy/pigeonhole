@@ -726,9 +726,10 @@ impl Feed {
         self.appends_stopped.load(Ordering::Acquire)
     }
 
-    /// Marks the catalog hold frozen; `true` the first time (the caller then takes it).
-    pub(crate) fn freeze_catalog_hold(&self) -> bool {
-        !self.catalog_hold_frozen.swap(true, Ordering::AcqRel)
+    /// Marks the catalog hold frozen for the rest of the session: the hold `release_catalog`
+    /// would have let go stays up.
+    pub(crate) fn freeze_catalog_hold(&self) {
+        self.catalog_hold_frozen.store(true, Ordering::Release);
     }
 
     /// Whether the catalog hold is frozen for the rest of the session.

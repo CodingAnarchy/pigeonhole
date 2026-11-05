@@ -813,10 +813,11 @@ fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
 
 /// simp724 on #1493 (D315 2b): once the session's sidecar appends stop, no catalog change
 /// can get its `Catalog` entry, so the catalog hold freezes at the first change's ceiling
-/// for the rest of the session: no feed's frontier passes a change it can't deliver. A
-/// feed of every table expires; a table's feed delivers what is below the frozen ceiling
-/// and nothing at or above it, and writes go on. Two ways in: the change's own `Catalog`
-/// append fails, or an earlier plain Root append did.
+/// for the rest of the session. A feed of every table in the writer's process expires; a
+/// table's feed carries on, since only a feed of every table's frontier reads the hold
+/// (simp724's F2 on #1515); writes go on. Two ways in: the change's own `Catalog` append
+/// fails, or an earlier plain Root append did. The freeze itself, which a feed of every
+/// table in a reader process waits at, is `feed_reader_process`'s.
 #[test]
 fn a_stopped_sidecar_freezes_the_catalog_hold() {
     for catalog_append_fails in [true, false] {
@@ -846,9 +847,10 @@ fn a_stopped_sidecar_freezes_the_catalog_hold() {
         );
         vfs.set_faults(FaultPlan::none());
         let above = single(&db, &a, b"above", Durability::GroupSync);
-        assert!(
-            matches!(one.wait(Duration::from_millis(200)).unwrap(), Next::Pending),
-            "{catalog_append_fails}: nothing at or above the frozen ceiling"
+        assert_eq!(
+            next(&mut one).seqno,
+            above,
+            "{catalog_append_fails}: a table's feed doesn't wait for the hold"
         );
         loop {
             match all.wait(WAIT).unwrap() {
@@ -863,12 +865,64 @@ fn a_stopped_sidecar_freezes_the_catalog_hold() {
             .create_table("d", &[("g".into(), FamilyOptions::default())])
             .unwrap();
         single(&db, &t, b"d", Durability::GroupSync);
-        single(&db, &a, b"later", Durability::GroupSync);
-        assert!(
-            matches!(one.wait(Duration::from_millis(200)).unwrap(), Next::Pending),
-            "{catalog_append_fails}: still nothing at or above the frozen ceiling"
-        );
+        let later = single(&db, &a, b"later", Durability::GroupSync);
+        assert_eq!(next(&mut one).seqno, later);
         drop((all, one));
         db.close().unwrap();
     }
+}
+
+/// simp724's F1 on #1515 (D315 2b): an `After(s)` start passes over a catalog change with a
+/// ceiling at or below `s` even when the change's `Catalog` entry is appended after the
+/// feed opened. The catalog hold bounds a feed of every table's frontier, not visible
+/// seqnos, so a commit at or above the ceiling can be visible, and a snapshot taken, while
+/// the root observer is still to append. Mutation-checked: applying the bound only to the
+/// entries in the file at open delivers the change.
+#[test]
+fn an_after_start_passes_over_a_change_whose_entry_lands_after_it() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3171);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    db.delay_root_observer(Duration::from_millis(800));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    // The create holds its ceiling and waits in the observer; a commit after it is visible.
+    std::thread::sleep(Duration::from_millis(200));
+    let s = single(&db, &a, b"past", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::After(s))).unwrap();
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let ceiling = sidecar_entries(&vfs)
+        .iter()
+        .find_map(|e| match e {
+            FeedEntry::Catalog {
+                seqno_ceiling,
+                edits,
+                ..
+            } if edits.iter().any(|e| {
+                matches!(e, pigeonhole_format::manifest::Edit::CreateTable { name, .. } if name == "c")
+            }) =>
+            {
+                Some(*seqno_ceiling)
+            }
+            _ => None,
+        })
+        .expect("the create's entry");
+    assert!(
+        ceiling <= s,
+        "the start must be past the change: {ceiling} > {s}"
+    );
+    let after = single(&db, &a, b"after", Durability::GroupSync);
+    match r.wait(WAIT).unwrap() {
+        Next::Commit(c) => assert_eq!(c.seqno, after),
+        other => panic!("only the commit after the start: {other:?}"),
+    }
+    drop(r);
+    db.close().unwrap();
 }

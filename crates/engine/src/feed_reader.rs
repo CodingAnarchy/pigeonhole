@@ -312,6 +312,12 @@ pub struct FeedReader {
     /// are passed over (a commit routed before a drop can be logged after it).
     catalog: VecDeque<CatalogEvent>,
     catalog_seq: u64,
+    /// A `Bound` start's bound (`Oldest`, `After`; 0 for the others): every catalog change
+    /// with a ceiling at or below it is before the start, in every load, not only in the
+    /// entries already in the file at open. The hold doesn't bound visible seqnos, so a
+    /// start past a change's ceiling can come before its entry is appended (simp724's F1 on
+    /// #1515).
+    catalog_bound: Seqno,
     sidecar_pos: u64,
     dropped_tables: HashSet<TableId>,
     out_catalog: CatalogEvent,
@@ -357,12 +363,12 @@ pub(crate) struct Origin {
     pub(crate) writer: Option<Arc<crate::feed::Feed>>,
 }
 
-/// Which catalog changes are before a feed of every table's start (D315).
+/// Which catalog changes are before a feed of every table's start, at open (D315), beside
+/// the reader's `catalog_bound` for `Oldest` and `After`.
 #[derive(Clone, Copy)]
 enum CatalogStart<'a> {
-    /// Those with a ceiling at or below a seqno: `Oldest`, `After`.
-    Bound(Seqno),
-    /// Those the start's catalog reflects: `Now` (the view's), `Snapshot` (its view's).
+    /// Those the start's catalog reflects: `Now` (the view's), `Snapshot` (its view's). Its
+    /// view was loaded before the sidecar was read, so no later entry can be reflected.
     Reflected(&'a crate::catalog::Catalog),
 }
 
@@ -391,7 +397,6 @@ const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
 /// takes them as removed (the bound a reader snapshot waits for its view too).
 const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 
-/// What one poll left.
 /// What `emit` delivered.
 enum Emitted {
     Nothing,
@@ -409,6 +414,7 @@ impl Emitted {
     }
 }
 
+/// What one poll left.
 enum Polled {
     Commit,
     Catalog,
@@ -479,6 +485,7 @@ impl FeedReader {
             blob_wait: None,
             catalog: VecDeque::new(),
             catalog_seq: 0,
+            catalog_bound: 0,
             sidecar_pos: 0,
             dropped_tables: HashSet::new(),
             out_catalog: CatalogEvent::default(),
@@ -531,7 +538,7 @@ impl FeedReader {
                         }
                         this.shm
                             .visible_seqno()
-                            .max(this.shm.written_seqno(this.durable))
+                            .max(this.shm.written_seqno(this.durable, this.tables.is_empty()))
                             .max(this.writer.as_ref().map_or(0, |f| f.checkpoint_key()))
                     }
                     FeedStart::After(seqno) => seqno,
@@ -606,7 +613,11 @@ impl FeedReader {
         if this.tables.is_empty() && this.expired.is_none() {
             let start = match &start_catalog {
                 Some(catalog) => Some(CatalogStart::Reflected(catalog)),
-                None => (!token_start).then_some(CatalogStart::Bound(this.delivered)),
+                None if token_start => None,
+                None => {
+                    this.catalog_bound = this.delivered;
+                    None
+                }
             };
             this.load_catalog(start)?;
         }
@@ -651,7 +662,7 @@ impl FeedReader {
                 };
                 waiters.register(self.key, target, Wake::Task(waker));
                 // A publish that missed the registration is seen here.
-                if self.shm.written_seqno(self.durable) >= target {
+                if self.shm.written_seqno(self.durable, self.tables.is_empty()) >= target {
                     continue;
                 }
                 // The feed's holds may pass the watermark later than the publish that
@@ -724,7 +735,7 @@ impl FeedReader {
                 waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
             }
             // A publish or a release that missed the registration is seen here.
-            if self.shm.written_seqno(self.durable) < target {
+            if self.shm.written_seqno(self.durable, self.tables.is_empty()) < target {
                 return Poll::Pending;
             }
         }
@@ -915,7 +926,7 @@ impl FeedReader {
         let checkpoints: Vec<Lsn> = (0..self.streams.len())
             .map(|s| Lsn(self.shm.feed_marks(s as u32).checkpoint))
             .collect();
-        let frontier = self.shm.written_seqno(self.durable);
+        let frontier = self.shm.written_seqno(self.durable, self.tables.is_empty());
         // Reader processes: where a test restarts the writer between the stale check above
         // and the reads below (simp724's B2).
         #[cfg(feature = "test-hooks")]
@@ -1577,14 +1588,14 @@ impl FeedReader {
             if !self.history.holds(session) {
                 continue;
             }
-            let before_start = match start {
-                Some(CatalogStart::Bound(bound)) => seqno_ceiling <= bound,
-                Some(CatalogStart::Reflected(catalog)) => {
-                    reflecting = reflecting && reflects(catalog, &edits);
-                    reflecting
-                }
-                None => sequence <= self.catalog_seq,
-            };
+            let before_start = seqno_ceiling <= self.catalog_bound
+                || match start {
+                    Some(CatalogStart::Reflected(catalog)) => {
+                        reflecting = reflecting && reflects(catalog, &edits);
+                        reflecting
+                    }
+                    None => sequence <= self.catalog_seq,
+                };
             if before_start {
                 self.note_drops(&edits);
                 self.catalog_seq = self.catalog_seq.max(sequence);

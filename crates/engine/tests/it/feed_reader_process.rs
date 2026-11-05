@@ -462,3 +462,65 @@ fn a_reader_process_feed_of_every_table_delivers_catalog_changes() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// simp724 on #1493 and F2 on #1515 (D315 2b): once the writer's sidecar appends stop, the
+/// next catalog change's hold stays up for the rest of the session. A feed of every table in
+/// a reader process, which can't see the stop, waits at it: nothing at or above that
+/// change's ceiling, even after a later change (which takes no hold of its own). A table's
+/// feed doesn't read the hold and carries on. Mutation-checked: without `release_catalog`'s
+/// freeze, and with a later change taking its own hold.
+#[test]
+fn a_reader_process_feed_of_every_table_waits_at_a_frozen_hold() {
+    use pigeonhole_io::sim::FaultPlan;
+    let vfs = SimVfs::new(4132);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _b) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut all = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    let mut one = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let below = w.commit(&[(&a, b"below")]);
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    w.db.create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    w.settle();
+    assert_eq!(vfs.scheduled_fired(), 1, "the Catalog append failed");
+    vfs.set_faults(FaultPlan::none());
+    let above = w.commit(&[(&a, b"above")]);
+    let d = (*w
+        .db
+        .create_table("d", &[("g".into(), FamilyOptions::default())])
+        .unwrap())
+    .clone();
+    w.settle();
+    let later = w.commit(&[(&d, b"later")]);
+    vfs.enter_process(READER);
+    let mut got_one = Vec::new();
+    let mut got_all = Vec::new();
+    for _ in 0..200 {
+        got_one.extend(ready(&mut one).unwrap().into_iter().map(|(s, _)| s));
+        loop {
+            match all.try_next().unwrap() {
+                Next::Commit(c) => got_all.push(c.seqno),
+                Next::Catalog(e) => panic!("a change with no entry: {e:?}"),
+                Next::Pending => break,
+                Next::Expired(e) => panic!("expired: {e:?}"),
+            }
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(got_one, [below, above], "a table's feed carries on");
+    assert_eq!(
+        got_all,
+        [below],
+        "nothing at or above the frozen ceiling ({later})"
+    );
+    drop((all, one));
+    vfs.enter_process(WRITER);
+    w.close();
+}

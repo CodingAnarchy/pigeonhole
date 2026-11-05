@@ -1173,7 +1173,7 @@ const FEED_ALL_TOKEN: (&str, &[u8]) = ("feed_tokens", b"all");
 
 /// D315: a feed of every table's token from before the first commit, then commits among
 /// catalog changes: a table created with two families, a family added to it, and two tables
-/// dropped, one from before the token. The check resumes a feed of every table from the
+/// dropped, one from before the token, beside a table from before the token that survives. The check resumes a feed of every table from the
 /// token and lists every event: the commits, and each catalog change with its names.
 fn write_feed_catalog(db: &Pigeonhole) {
     let tokens = db
@@ -1186,6 +1186,12 @@ fn write_feed_catalog(db: &Pigeonhole) {
         .table("events")
         .unwrap()
         .family("e", Family::default())
+        .create()
+        .unwrap();
+    let kept = db
+        .table("kept")
+        .unwrap()
+        .family("k", Family::default())
         .create()
         .unwrap();
     let token = db.feed().open().unwrap().token();
@@ -1232,6 +1238,12 @@ fn write_feed_catalog(db: &Pigeonhole) {
                 .commit()
                 .unwrap();
         }
+        if i % 4 == 1 {
+            kept.mutate(row.as_bytes())
+                .put_at("k", b"kept", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
         if let Some(late) = &late
             && i % 3 == 0
         {
@@ -1264,7 +1276,10 @@ fn write_feed_catalog(db: &Pigeonhole) {
 /// Every event after the stored all-tables token, up to the stored last seqno: each commit's
 /// changes, as `feed_extra` lists them, and each catalog change's edits with their names and
 /// a family's kind and version limit. The token table's own commit is left out (the token's
-/// bytes are this database's).
+/// bytes are this database's). A change to a table dropped by the time of the check has its
+/// table and family listed as `(dropped)`: whether a feed names those commits isn't frozen
+/// (ai1249 on #1515), so a later build that names them still passes. The catalog lines name
+/// every table.
 fn feed_catalog_extra(db: &Pigeonhole) -> String {
     use pigeonhole::{CatalogEdit, FeedEvent};
     let tokens = db.table(FEED_ALL_TOKEN.0).unwrap().open().unwrap();
@@ -1285,6 +1300,7 @@ fn feed_catalog_extra(db: &Pigeonhole) -> String {
             f.name, f.counter, f.max_versions
         )
     };
+    let live = db.tables();
     let mut feed = db.feed().resume(&token).open().unwrap();
     let mut out = String::new();
     loop {
@@ -1321,6 +1337,11 @@ fn feed_catalog_extra(db: &Pigeonhole) -> String {
             if ch.table() == FEED_ALL_TOKEN.0 {
                 continue;
             }
+            let (table, family) = if live.iter().any(|t| t == ch.table()) {
+                (ch.table(), ch.family())
+            } else {
+                ("(dropped)", "(dropped)")
+            };
             let value = match ch.value() {
                 Some(Value::Bytes(b)) => format!(
                     "bytes:{}:{:016x}",
@@ -1333,8 +1354,8 @@ fn feed_catalog_extra(db: &Pigeonhole) -> String {
             out.push_str(&format!(
                 "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{value}\n",
                 c.seqno(),
-                ch.table(),
-                ch.family(),
+                table,
+                family,
                 ch.kind(),
                 hex(ch.row()),
                 hex(ch.qualifier()),

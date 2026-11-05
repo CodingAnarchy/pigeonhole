@@ -780,6 +780,26 @@ fn feed_sidecar_catalog_names() {
     assert!(decoded.is_empty(), "{decoded:?}");
     assert_eq!(end, 0, "the reader stops at the damaged entry");
 
+    // A names count of 0, which the encoder never writes (no names, no count): one entry,
+    // one encoding (simp724's N1 on #1515). Without it the same entry decodes.
+    let entry = |count: Option<u32>| {
+        let mut payload = vec![4u8];
+        for v in [1u64, 44, 2000, 1_767_225_600_000_003] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(c) = count {
+            payload.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut log = Vec::new();
+        log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+        log.extend_from_slice(&payload);
+        decode_entries(&log).0
+    };
+    assert!(entry(Some(0)).is_empty(), "a zero count is damage");
+    assert!(matches!(&entry(None)[..], [FeedEntry::Catalog { names, .. }] if names.is_empty()));
+
     // The trailer is framed by the entry, never read as one more edit (simp724): a decoder
     // that expects an edit where the names start fails closed. Emulated by claiming one
     // more edit than the entry holds, with a valid CRC.

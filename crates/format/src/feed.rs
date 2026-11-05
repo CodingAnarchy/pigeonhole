@@ -328,8 +328,10 @@ impl FeedEntry {
                     r.u32()? as usize
                 };
                 // Each pair takes at least 5 bytes (a u32 and a varint length): a count the
-                // payload can't hold is damage, and never sizes an allocation.
-                if n > r.remaining() / 5 {
+                // payload can't hold is damage, and never sizes an allocation. A count of 0
+                // is never written (no names, no count), so it's damage too: each entry has
+                // one encoding (simp724's N1 on #1515).
+                if n > r.remaining() / 5 || (n == 0 && rest.len() != r.remaining()) {
                     return Err(Error::Corrupt { what: WHAT });
                 }
                 let mut names = Vec::with_capacity(n);
