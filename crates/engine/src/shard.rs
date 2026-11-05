@@ -392,8 +392,13 @@ pub(crate) fn bucket_floor(b: usize) -> u64 {
 /// handle they live on.
 #[derive(Debug)]
 pub(crate) struct Locks {
+    /// Exclusive, or shared for a true read-only open (#1348).
     pub _writer: WriterLock,
-    pub presence: Presence,
+    /// `None` for a true read-only open, which takes no presence (#1348).
+    pub presence: Option<Presence>,
+    /// Whether `_writer` is the writer byte taken shared (a true read-only open, #1348): a
+    /// handover's reopen must ask for the same open (simp724's G1 on #1570).
+    pub shared: bool,
     /// The handle the locks were taken on; a reopen takes its shm region and presence on it.
     pub file: pigeonhole_io::FileRef,
 }
@@ -1046,8 +1051,12 @@ impl Shared {
         } else {
             let locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
             match &*locks {
-                Some(locks) => locks.presence.try_become_last()?,
-                None => false,
+                Some(Locks {
+                    presence: Some(presence),
+                    ..
+                }) => presence.try_become_last()?,
+                // No presence (a true read-only open, #1348): no region to remove.
+                _ => false,
             }
         };
         if self.no_writes {

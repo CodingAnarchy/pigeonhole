@@ -290,6 +290,8 @@ struct SimState {
     random_draws: u64,
     /// Mutating operations recorded since [`SimVfs::record_ops`], if recording.
     trace: Option<Vec<SimOp>>,
+    /// Whether the files sit on read-only media ([`SimVfs::set_read_only_media`]).
+    read_only_media: bool,
     shm: BTreeMap<(Option<PathBuf>, String), SharedRegion>,
     nanos: u64,
     /// Whether `submit_*` defers its operation (see [`SimVfs::set_deferred_io`]).
@@ -601,6 +603,7 @@ impl SimVfs {
                 writes_injected: 0,
                 random_draws: 0,
                 trace: None,
+                read_only_media: false,
                 shm: BTreeMap::new(),
                 nanos: 0,
                 deferred: false,
@@ -714,6 +717,14 @@ impl SimVfs {
     /// ```
     pub fn record_ops(&self) {
         self.state().trace = Some(Vec::new());
+    }
+
+    /// Puts the files on read-only media (a read-only mount), or takes them off it: while on,
+    /// opening a file for writing or creating one, removing a file and syncing a directory
+    /// fail with `Other` ("read-only media"). Reads, byte-range locks and shared memory are
+    /// unaffected, as on a real read-only mount (#1348).
+    pub fn set_read_only_media(&self, on: bool) {
+        self.state().read_only_media = on;
     }
 
     /// The mutating operations recorded since [`SimVfs::record_ops`], in the order they
@@ -1401,6 +1412,9 @@ impl Vfs for SimVfs {
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
         let process = self.current_process();
         let mut st = self.state();
+        if st.read_only_media && (opts.write || opts.create || opts.create_new) {
+            return Err(Error::new(ErrorKind::Other, "open: read-only media"));
+        }
         let id = match st.names.get(path) {
             Some(_) if opts.create_new => {
                 return Err(Error::new(ErrorKind::AlreadyExists, "open"));
@@ -1430,6 +1444,9 @@ impl Vfs for SimVfs {
 
     fn remove(&self, path: &Path) -> Result<()> {
         let mut st = self.state();
+        if st.read_only_media {
+            return Err(Error::new(ErrorKind::Other, "remove: read-only media"));
+        }
         if st.names.remove(path).is_none() {
             return Err(Error::new(ErrorKind::NotFound, "remove"));
         }
@@ -1462,6 +1479,9 @@ impl Vfs for SimVfs {
 
     fn sync_dir(&self, dir: &Path) -> Result<()> {
         let mut st = self.state();
+        if st.read_only_media {
+            return Err(Error::new(ErrorKind::Other, "sync_dir: read-only media"));
+        }
         st.durable_names.retain(|p, _| p.parent() != Some(dir));
         let entries: Vec<(PathBuf, u64)> = st
             .names

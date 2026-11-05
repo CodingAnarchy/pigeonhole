@@ -39,7 +39,8 @@ A database has one writer process at a time and any number of reader processes (
 - **No writer running:** `phdb` opens the database read-only (`Options::read_only`) in the writer's place for the length of the command, then closes it.
   - It writes nothing to the database's files. In particular it starts no change-feed session (`Options::change_feed`), so your application's stored feed tokens stay valid across it.
   - If the last writer crashed, the open **replays its WAL into memory**, so the command sees every commit, and leaves the WAL for your application's next open to replay and checkpoint. A WAL too large to replay in memory fails with `ReadOnly`: open the database once with your application, or with `phdb shell` (without `--read-only`), to checkpoint it.
-  - While `phdb` holds the writer lock, your application can't open as the writer: its open fails with `WriterLocked` until `phdb` exits.
+  - It opens the files read-only and takes the writer lock shared (#1348), so it works on read-only media (a mounted backup, a read-only container layer), and several such commands can run at once. While any holds the lock, your application can't open as the writer: its open fails with `WriterLocked` until they exit.
+  - It creates no shared memory; the replayed WAL lives in the command's own memory, up to `memtable_budget` (64 MiB by default). On Linux and macOS that memory is committed only as the replay touches it; on Windows the whole budget is committed when the database opens.
 - **A writer is running:** `phdb` opens as a reader process. It sees everything the writer has committed and changes nothing.
 
 The commands that write (`load`, `compact`, `shell` without `--read-only`, `mcp` without `--read-only`) open writable as the writer when no writer runs.

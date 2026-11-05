@@ -384,7 +384,7 @@ Byte-range locks on single bytes at absolute file offsets (decision D3; refined 
 
 | Offset | Byte | Held |
 |---|---|---|
-| 8192 | writer | exclusive by the one writer; a second writer fails with `WriterLocked` |
+| 8192 | writer | exclusive by the one writer; a second writer fails with `WriterLocked`. Shared by each true read-only open (`Options::read_only`, #1348), which takes no presence and creates no shared memory: read-only opens run together, and a writer's exclusive lock and a read-only open's shared one exclude each other |
 | 8193 | presence | shared by every process with the database open; a process that can upgrade it to exclusive at close is the last one. A process that cannot releases its shared lock and tries the exclusive lock a few more times (1, 2, 4 and 8 ms later), so two processes closing at once do not both conclude another is still open (#150 item 4.7). Both may conclude they are last; the cleanup that follows is idempotent |
 | 8194 | shm-init | exclusive while a process creates, validates or rebuilds the shared-memory region |
 | 2^62 + i | reader slot *i* | exclusive by the reader process that owns shared-memory reader slot *i* (§11.5), from before it claims the slot until after it frees it (layout version 3, #693). Far beyond any file's end, so it never covers data (Windows' locks are mandatory) |
