@@ -1804,3 +1804,95 @@ fn a_frozen_catalog_hold_wakes_the_feed_it_keeps_back_to_expire() {
     drop(r);
     db.close().unwrap();
 }
+
+/// The next catalog change, waiting at most `within`; panics on a commit or anything else.
+fn catalog_within(r: &mut FeedReader, within: Duration) -> pigeonhole_engine::CatalogEvent {
+    let start = std::time::Instant::now();
+    match r.wait(within).unwrap() {
+        Next::Catalog(ev) => ev.clone(),
+        other => panic!(
+            "no catalog change within {within:?} ({:?}): {other:?}",
+            start.elapsed()
+        ),
+    }
+}
+
+/// #1515's follow-up (D315): on an idle database, a feed of every table delivers each
+/// catalog change at once, though no seqno moves: a create, then a drop, with no commit
+/// anywhere. A blocking wait is woken by the change's release; the poll that follows loads
+/// the sidecar though the frontier didn't move. Mutation-checked: without the idle load, the
+/// drop waits for the next commit.
+#[test]
+fn a_feed_of_every_table_delivers_catalog_changes_on_an_idle_database() {
+    let vfs = SimVfs::new(3231);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let _ = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // Waiting before the change: it must wake the wait, not only be seen by a later call.
+    let creator = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    let ev = catalog_within(&mut r, Duration::from_secs(3));
+    let c = creator.join().unwrap().id;
+    assert!(
+        matches!(ev.edits[0], pigeonhole_format::manifest::Edit::CreateTable { table, .. } if table == c)
+    );
+    let dropper = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            db.drop_table(c).unwrap();
+        })
+    };
+    let ev = catalog_within(&mut r, Duration::from_secs(3));
+    dropper.join().unwrap();
+    assert!(
+        matches!(ev.edits[..], [pigeonhole_format::manifest::Edit::DropTable { table }] if table == c)
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
+/// The async form of the test above: a pending `poll_next` on a feed of every table is woken
+/// by a catalog change on an idle database, and the next poll delivers it.
+#[test]
+fn an_async_feed_of_every_table_is_woken_by_a_catalog_change_on_an_idle_database() {
+    let vfs = SimVfs::new(3232);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let _ = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    catalog_within(&mut r, Duration::from_secs(3));
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    {
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(r.poll_next(&mut cx).is_pending());
+    }
+    db.drop_table(c.id).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drop never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cx = std::task::Context::from_waker(&waker);
+    match r.poll_next(&mut cx) {
+        Poll::Ready(Ok(Next::Catalog(ev))) => assert!(matches!(
+            ev.edits[..],
+            [pigeonhole_format::manifest::Edit::DropTable { .. }]
+        )),
+        other => panic!("{:?}", other.map(|n| n.map(|n| format!("{n:?}")))),
+    }
+    drop(r);
+    db.close().unwrap();
+}
