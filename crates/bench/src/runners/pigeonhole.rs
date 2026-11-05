@@ -1881,6 +1881,8 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         row_cache_misses: rc.misses,
         row_cache_fills: rc.fills,
         row_cache_write_throughs: rc.write_throughs,
+        block_cache_deferred_evictions: im("block_cache_deferred_evictions"),
+        row_cache_deferred_evictions: im("row_cache_deferred_evictions"),
         xshard_rounds: m.cross_shard.rounds,
         xshard_refused_rounds: im("cross_shard.refused_rounds"),
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
@@ -1914,6 +1916,8 @@ pub(crate) const INTERNAL_NAMES: &[&str] = &[
     "visibility_woken",
     "visibility_contended",
     "reader_pin_view_lag",
+    "block_cache_deferred_evictions",
+    "row_cache_deferred_evictions",
     "cross_shard.refused_rounds",
     "cross_shard.refused_moved",
     "cross_shard.refused_room",
