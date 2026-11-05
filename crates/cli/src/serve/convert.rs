@@ -170,8 +170,17 @@ fn typed(kind: &value::Kind) -> Result<Typed<'_>> {
     })
 }
 
+/// When an aggregate's input is checked against a vector: a transaction decodes the input
+/// first, so a vector with malformed elements still raises the element error, as it always
+/// did (the coordinator on #1555's N1); a mutation refuses a vector input before decoding it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorInput {
+    RefuseFirst,
+    DecodeFirst,
+}
+
 /// One write, checked and decoded.
-fn txn_op(w: &proto::Write) -> Result<TxnOp<'_>> {
+fn txn_op(w: &proto::Write, aggregate: VectorInput) -> Result<TxnOp<'_>> {
     Ok(
         match w
             .op
@@ -192,16 +201,21 @@ fn txn_op(w: &proto::Write) -> Result<TxnOp<'_>> {
             },
             write::Op::Aggregate(a) => {
                 let kind = value_of(a.input.as_ref())?;
-                if matches!(kind, value::Kind::Vector(_)) {
-                    return Err(ApiError::invalid(
-                        "an aggregate input is an i64, u64, f64 or bytes",
-                    ));
+                let refuse =
+                    || ApiError::invalid("an aggregate input is an i64, u64, f64 or bytes");
+                let vector = matches!(kind, value::Kind::Vector(_));
+                if vector && aggregate == VectorInput::RefuseFirst {
+                    return Err(refuse());
+                }
+                let input = typed(kind)?;
+                if vector {
+                    return Err(refuse());
                 }
                 TxnOp::Aggregate {
                     family: &a.family,
                     qualifier: &a.qualifier,
                     ts: a.timestamp,
-                    input: typed(kind)?,
+                    input,
                 }
             }
             write::Op::Merge(g) => TxnOp::Merge {
@@ -226,7 +240,10 @@ fn txn_op(w: &proto::Write) -> Result<TxnOp<'_>> {
 
 /// Checks and decodes a row's `writes` for a transaction, buffering nothing.
 pub(crate) fn txn_ops(writes: &[proto::Write]) -> Result<Vec<TxnOp<'_>>> {
-    writes.iter().map(txn_op).collect()
+    writes
+        .iter()
+        .map(|w| txn_op(w, VectorInput::DecodeFirst))
+        .collect()
 }
 
 /// Buffers one decoded op through `$call!(method, args...)`, the target's way of calling
@@ -317,7 +334,7 @@ pub(crate) fn mutation<'t>(
     writes: &[proto::Write],
 ) -> Result<RowMutation<'t>> {
     for w in writes {
-        let op = txn_op(w)?;
+        let op = txn_op(w, VectorInput::RefuseFirst)?;
         macro_rules! on_mutation {
             ($method:ident, $($a:expr),*) => {
                 m = m.$method($($a),*)
@@ -357,7 +374,7 @@ pub(crate) fn batch(
             }
             _ => {}
         }
-        let op = txn_op(w)?;
+        let op = txn_op(w, VectorInput::RefuseFirst)?;
         macro_rules! on_batch {
             ($method:ident, $($a:expr),*) => {{
                 b.$method(table, row, $($a),*);
