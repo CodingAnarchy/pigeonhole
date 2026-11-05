@@ -718,6 +718,12 @@ impl FeedReader {
                 Some(feed) if held => {
                     feed.wait_for_hold(self.key, &waker());
                     on_hold_list = true;
+                    // A frozen catalog hold's releaser stores `appends_stopped`, then wakes
+                    // the list: re-checked after the registration's fence, so a wake that
+                    // found the list empty is seen here (simp724's W2 on #1533).
+                    if self.tables.is_empty() && feed.appends_stopped() {
+                        continue;
+                    }
                 }
                 Some(_) => {
                     let waiters = if self.durable {
@@ -800,6 +806,11 @@ impl FeedReader {
                 // this when it lets one go.
                 feed.wait_for_hold(self.key, cx.waker());
                 on_hold_list = true;
+                // As in `wait`: a frozen catalog hold's `appends_stopped`, stored before its
+                // wake, is re-checked after the registration's fence (simp724's W2 on #1533).
+                if self.tables.is_empty() && feed.appends_stopped() {
+                    continue;
+                }
             } else {
                 let waiters = if self.durable {
                     &self.shared.durable_waiters
