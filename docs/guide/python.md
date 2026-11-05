@@ -324,7 +324,7 @@ The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutin
   - Cancelled while it waits for room (an async commit waits when its shard has too many in flight), nothing is written.
   - Once it's submitted, it may still land, and the task can't tell which happened. To keep the outcome, await `asyncio.shield(m.commit_async())`.
 - **How it runs:** one `pigeonhole-asyncio` thread per process hands results to the event loops. The engine's threads never take the GIL to do it. Any asyncio loop works, uvloop included.
-- **Not yet async:** the memory store's calls (a follow-up), and reads outside a transaction.
+- **Not yet async:** the memory store's calls (#1479's second PR), and reads outside a transaction. Until then, call them through `asyncio.to_thread`.
 
 ```python
 import asyncio
