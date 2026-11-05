@@ -23,9 +23,12 @@
 //! it's built. Wall-clock timestamps would change the SSTs' encoding and block boundaries,
 //! and with them the counts (#1305). (The files still differ in bytes no search reads.)
 //!
-//! **Shapes.** Each runs 50 queries of one kind ([`QUERIES`]; 25 for the phrases,
-//! [`PHRASE_QUERIES`]) per iteration, at top 10 unless noted, over the warm index (a pass of
-//! every query runs before measuring). Counted per search. Two independent builds of the
+//! **Shapes.** Each searches 50 queries of one kind once ([`QUERIES`]; 25 for the phrases,
+//! [`PHRASE_QUERIES`]), at top 10 unless noted, over the warm index (a pass of every query
+//! runs before measuring). Counted per search. One pass, whatever `ITERATIONS` says: the
+//! instructions script passes 4, sized for shapes a thousand times cheaper, and at 4 passes
+//! the text shapes took 20 minutes a side on a slow runner and the job hit its 60-minute
+//! timeout (run 42124772524). A warm search counts the same on every pass, so one is enough. Two independent builds of the
 //! index count within 4 instructions per search of each other on `text-term-hub` (about 66
 //! million each, on arm), and base and head agree to 0.0% on CI.
 //! - `text-term-rare`: one term of rank 1,000 or more;
@@ -69,9 +72,8 @@ use pigeonhole_text::{Fuzziness, Index, IndexOptions, Query, Source};
 const DOCS: usize = 100_000;
 /// The vocabulary: `w0` to `w49999`.
 const VOCAB: usize = 50_000;
-/// Queries per shape: 50, each searched once per iteration (the job's 4: 200 searches). A
-/// hub search is about 72 million instructions on CI, so this bounds the job's added
-/// valgrind time.
+/// Queries per shape: 50, each searched once. A hub search is about 72 million
+/// instructions on CI, so this bounds the job's added valgrind time.
 const QUERIES: usize = 50;
 /// Queries per phrase shape: 25. A phrase search is about 140 million instructions (both
 /// terms' positions are read), and at 50 the two phrase shapes were over half the text
@@ -392,7 +394,11 @@ fn main() {
         }
         return;
     }
-    let iters: usize = args.next().map_or(4, |s| s.parse().expect("ITERATIONS"));
+    // `ITERATIONS` is accepted for the script's contract, but a run makes one pass: see the
+    // module doc.
+    let iters: usize = args
+        .next()
+        .map_or(1, |s| s.parse::<usize>().expect("ITERATIONS").min(1));
     let base = args.next().map_or_else(std::env::temp_dir, PathBuf::from);
     let dir =
         std::env::var_os("TEXTSHAPES_INDEX").map_or_else(|| base.join(INDEX_DIR), PathBuf::from);
