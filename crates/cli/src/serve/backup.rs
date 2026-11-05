@@ -176,8 +176,11 @@ impl Backups {
             .name("phdb-serve-backup".into())
             .spawn(move || {
                 let r = backup();
-                drop(permit);
+                // The result first, then the permit: the next backup starts only once this
+                // one is handed over (simp724's H1 on #1527). A requester that's gone drops
+                // the result here, which for a fresh download gives up its reader.
                 let _ = tx.send(r);
+                drop(permit);
             })
             .map_err(|e| ApiError::internal(format!("a backup thread: {e}")))?;
         Ok(rx)
@@ -225,14 +228,19 @@ impl Backups {
             let mut pending = Pending(me, tid, false);
             take(&tpath)?;
             let (total, sha256) = digest(&tpath)?;
-            pending.0.finish(&pending.1, total, sha256);
+            let kept = pending.0.finish(&pending.1, total, sha256);
             pending.2 = true;
-            Ok(())
+            let kept = kept.ok_or_else(|| ApiError::internal("the backup's copy vanished"))?;
+            Ok(Handoff {
+                backups: Arc::clone(&pending.0),
+                id: pending.1.clone(),
+                kept: Some(kept),
+            })
         })?;
-        rx.await
+        let handoff = rx
+            .await
             .unwrap_or_else(|_| Err(ApiError::internal("the backup's thread ended early")))?;
-        let kept = self.open(&id)?;
-        Ok((id, kept))
+        Ok((id, handoff.take()))
     }
 
     /// A new copy's id and file, reserved (not ready) in the table. At `KEPT_MAX` copies,
@@ -275,14 +283,18 @@ impl Backups {
         Ok((id, path))
     }
 
-    /// The backup thread wrote and hashed copy `id`: it's ready, with no reader yet.
-    fn finish(&self, id: &str, total: u64, sha256: [u8; 32]) {
-        if let Some(e) = self.lock().get_mut(id) {
-            e.kept.total = total;
-            e.kept.sha256 = sha256;
-            e.ready = true;
-            e.last_used = Instant::now();
-        }
+    /// The backup thread wrote and hashed copy `id`: it's ready, and its requester is its
+    /// reader from this moment, so no other download can evict it before the requester has
+    /// it (simp724's H1, perf287's nit on #1527). `None` if it's gone.
+    fn finish(&self, id: &str, total: u64, sha256: [u8; 32]) -> Option<Kept> {
+        let mut kept = self.lock();
+        let e = kept.get_mut(id)?;
+        e.kept.total = total;
+        e.kept.sha256 = sha256;
+        e.ready = true;
+        e.readers = 1;
+        e.last_used = Instant::now();
+        Some(e.kept.clone())
     }
 
     /// Copy `id` won't be finished: it goes, and its file.
@@ -291,7 +303,32 @@ impl Backups {
             let _ = std::fs::remove_file(&e.kept.path);
         }
     }
+}
 
+/// A finished copy on its way to its requester, who is its reader. Dropped untaken (the
+/// requester went away), it gives that reader up, so the reaper deletes the copy after
+/// `KEEP` unread.
+struct Handoff {
+    backups: Arc<Backups>,
+    id: String,
+    kept: Option<Kept>,
+}
+
+impl Handoff {
+    fn take(mut self) -> Kept {
+        self.kept.take().expect("taken once")
+    }
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if self.kept.is_some() {
+            self.backups.release(&self.id);
+        }
+    }
+}
+
+impl Backups {
     /// The kept download `id`, for one more reader.
     pub(crate) fn open(&self, id: &str) -> Result<Kept, ApiError> {
         let mut kept = self.lock();
@@ -615,6 +652,43 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_copy_is_its_requesters_before_another_download_can_evict_it() {
+        // simp724's H1 on #1527: between the backup thread finishing a copy and its
+        // requester opening it, another fresh download at KEPT_MAX must not evict it (its
+        // requester would get NotFound for its own download). The copy is finished with its
+        // requester as reader; a handoff dropped untaken gives that reader up.
+        let dir = fresh("handoff");
+        let b = Backups::new(Some(&dir), KEPT_MAX + 1).unwrap();
+        let mut handoffs = Vec::new();
+        for _ in 0..KEPT_MAX {
+            let (id, path) = b.reserve().unwrap();
+            std::fs::write(&path, b"backup").unwrap();
+            let kept = b.finish(&id, 6, [0; 32]).unwrap();
+            // Finished, not yet taken by its requester.
+            handoffs.push(Handoff {
+                backups: Arc::clone(&b),
+                id,
+                kept: Some(kept),
+            });
+        }
+        assert_eq!(
+            b.reserve().unwrap_err().code,
+            "Overloaded",
+            "nothing finished-but-untaken is evicted"
+        );
+        // The first requester takes its copy; the second went away.
+        let first = handoffs.remove(0);
+        let first_id = first.id.clone();
+        let kept = first.take();
+        drop(handoffs);
+        assert_eq!(b.open(&first_id).unwrap().path, kept.path);
+        // The given-up copy is unread now: the next fresh download evicts it, not the first.
+        let (_, _) = b.reserve().unwrap();
+        assert!(b.open(&first_id).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_download_given_up_mid_backup_leaves_a_copy_the_reaper_deletes() {
         // perf287's E1 and simp724's N3 on #1527: the client goes (its request future is
         // dropped) while the backup is still being written. The copy is the table's, not the
@@ -641,13 +715,16 @@ mod tests {
         assert_eq!(b.lock().len(), 1);
         go.send(()).unwrap();
         let path = done.recv_timeout(Duration::from_secs(5)).unwrap();
-        // The thread marks it ready once it's hashed, just after writing.
+        // The thread marks it ready once it's hashed, just after writing, for its requester;
+        // the requester is gone, so the handoff gives that reader up: nobody reads it.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !b.lock().values().any(|e| e.ready) {
-            assert!(Instant::now() < deadline, "the copy was never finished");
+        while !b.lock().values().any(|e| e.ready && e.readers == 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the copy was never finished and given up"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(b.lock().values().all(|e| e.readers == 0), "nobody reads it");
         b.sweep(Instant::now() + KEEP);
         assert!(b.lock().is_empty());
         assert!(!path.exists(), "the reaper deleted the copy");
