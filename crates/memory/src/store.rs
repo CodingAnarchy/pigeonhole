@@ -1546,23 +1546,54 @@ fn verify(
     ivf: bool,
     ivf_index: Option<&pigeonhole_vector::Index>,
 ) -> Result<StoreStats> {
-    let mut st = StoreStats::default();
-    // Per namespace: memories with an embedding, and the counter's value (D311 T8).
-    let mut embedded: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    // The rows of memories with an embedding: the ids the IVF index must hold (#1427).
-    let mut embedded_rows: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut counters: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
-    let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-    let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-    let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut superseded_by: Vec<Vec<u8>> = Vec::new();
+    let mut v = Scanned::default();
     rows.scan_all(s, |key, row| {
+        v.row(key, row, model.is_some(), ivf, ivf_index.is_some())
+    })?;
+    v.check_rows();
+    v.st.text_index_inconsistent = !text_ok;
+    if ivf {
+        v.check_ivf(s, ivf_index)?;
+    }
+    Ok(v.st)
+}
+
+/// A link as `(from, to, value)`.
+type LinkKey = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// What [`verify`]'s scan collects, and the stats it's counted so far.
+#[derive(Default)]
+struct Scanned {
+    st: StoreStats,
+    /// Per namespace: memories with an embedding (D311 T8).
+    embedded: BTreeMap<Vec<u8>, i64>,
+    /// The rows of memories with an embedding: the ids the IVF index must hold (#1427).
+    embedded_rows: BTreeSet<Vec<u8>>,
+    /// Per namespace: the embedded counter's value.
+    counters: BTreeMap<Vec<u8>, i64>,
+    texts: BTreeMap<Vec<u8>, String>,
+    links: BTreeSet<LinkKey>,
+    /// Backlinks, keyed the way their link is.
+    backlinks: BTreeSet<LinkKey>,
+    dedups: Vec<(Vec<u8>, Vec<u8>)>,
+    superseded_by: Vec<Vec<u8>>,
+}
+
+impl Scanned {
+    /// One row of the scan.
+    fn row(
+        &mut self,
+        key: &[u8],
+        row: &pigeonhole::RowRef<'_>,
+        has_model: bool,
+        ivf: bool,
+        ivf_ids: bool,
+    ) -> Result<()> {
         if key == GLOBAL {
             return Ok(());
         }
-        if MemoryId::from_row(key).is_some() {
-            st.memories += 1;
+        if let Some(id) = MemoryId::from_row(key) {
+            self.st.memories += 1;
             let mut has_text = false;
             let mut has_emb = false;
             for e in row.iter() {
@@ -1571,17 +1602,21 @@ fn verify(
                         has_text = true;
                         let text = std::str::from_utf8(e.cell.value())
                             .map_err(|_| corrupt("a memory's text"))?;
-                        texts.insert(key.to_vec(), normalize(text));
+                        self.texts.insert(key.to_vec(), normalize(text));
                     }
                     EMB => has_emb = true,
                     META if e.qualifier == SUPERSEDED_BY => {
-                        superseded_by.push(e.cell.value().to_vec());
+                        self.superseded_by.push(e.cell.value().to_vec());
                     }
                     LINKS => {
-                        links.insert((key.to_vec(), e.qualifier.to_vec(), e.cell.value().to_vec()));
+                        self.links.insert((
+                            key.to_vec(),
+                            e.qualifier.to_vec(),
+                            e.cell.value().to_vec(),
+                        ));
                     }
                     BACKLINKS => {
-                        backlinks.insert((
+                        self.backlinks.insert((
                             e.qualifier.to_vec(),
                             key.to_vec(),
                             e.cell.value().to_vec(),
@@ -1591,84 +1626,100 @@ fn verify(
                 }
             }
             if !has_text {
-                st.no_content += 1;
+                self.st.no_content += 1;
             }
-            if model.is_some() && !has_emb {
-                st.missing_embeddings += 1;
+            if has_model && !has_emb {
+                self.st.missing_embeddings += 1;
             }
-            if has_emb && ivf_index.is_some() {
-                embedded_rows.insert(key.to_vec());
-            }
-            if has_emb && let Some(id) = MemoryId::from_row(key) {
-                *embedded
+            if has_emb {
+                if ivf_ids {
+                    self.embedded_rows.insert(key.to_vec());
+                }
+                *self
+                    .embedded
                     .entry(id.namespace().as_bytes().to_vec())
                     .or_default() += 1;
             }
-        } else if ivf && let Some(ns) = key.strip_suffix(COUNT_TAG) {
+            return Ok(());
+        }
+        if ivf && let Some(ns) = key.strip_suffix(COUNT_TAG) {
             let n = row
                 .get(STATS, EMBEDDED)
                 .and_then(|c| c.as_i64())
                 .unwrap_or(0);
-            counters.insert(ns.to_vec(), n);
+            self.counters.insert(ns.to_vec(), n);
         } else if let Some(c) = row.get(META, RID) {
-            dedups.push((key.to_vec(), c.value().to_vec()));
+            self.dedups.push((key.to_vec(), c.value().to_vec()));
         } else {
             return Err(corrupt("a row that is neither a memory nor a dedup row"));
         }
         Ok(())
-    })?;
-    for (key, target) in &dedups {
-        let ok = texts.get(target).is_some_and(|norm| {
-            key.windows(2)
-                .position(|w| w == DEDUP_TAG)
-                .is_some_and(|at| {
-                    std::str::from_utf8(&key[..at])
-                        .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
-                })
-        });
-        if !ok {
-            st.stale_dedup += 1;
-        }
     }
-    // Each link must have its backlink, and the reverse; both ends live.
-    st.broken_links += links.symmetric_difference(&backlinks).count() as u64;
-    for (from, to, _) in &links {
-        if !texts.contains_key(from) || !texts.contains_key(to) {
-            st.broken_links += 1;
+
+    /// The checks across rows: dedup rows, links and supersessions.
+    fn check_rows(&mut self) {
+        let texts = &self.texts;
+        for (key, target) in &self.dedups {
+            let ok = texts.get(target).is_some_and(|norm| {
+                key.windows(2)
+                    .position(|w| w == DEDUP_TAG)
+                    .is_some_and(|at| {
+                        std::str::from_utf8(&key[..at])
+                            .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
+                    })
+            });
+            if !ok {
+                self.st.stale_dedup += 1;
+            }
         }
+        // Each link must have its backlink, and the reverse; both ends live.
+        self.st.broken_links += self.links.symmetric_difference(&self.backlinks).count() as u64;
+        for (from, to, _) in &self.links {
+            if !texts.contains_key(from) || !texts.contains_key(to) {
+                self.st.broken_links += 1;
+            }
+        }
+        self.st.dangling_superseded = self
+            .superseded_by
+            .iter()
+            .filter(|s| !texts.contains_key(*s))
+            .count() as u64;
     }
-    st.dangling_superseded = superseded_by
-        .iter()
-        .filter(|s| !texts.contains_key(*s))
-        .count() as u64;
-    st.text_index_inconsistent = !text_ok;
-    if ivf {
+
+    /// The IVF checks: counters against the embedded memories, and the index's ids.
+    fn check_ivf(
+        &mut self,
+        s: &pigeonhole::Snapshot,
+        ivf_index: Option<&pigeonhole_vector::Index>,
+    ) -> Result<()> {
+        let (embedded, counters) = (&self.embedded, &self.counters);
         let all: BTreeSet<&Vec<u8>> = embedded.keys().chain(counters.keys()).collect();
-        st.ivf_counter_drift = all
+        self.st.ivf_counter_drift = all
             .into_iter()
             .filter(|ns| {
                 embedded.get(*ns).copied().unwrap_or(0) != counters.get(*ns).copied().unwrap_or(0)
             })
             .count() as u64;
-        if let Some(index) = ivf_index {
-            // Both sides in ascending byte order: a merge walk counts each side's ids the
-            // other lacks, streaming the index's ids against the embedded memories' rows.
-            let mut rows = embedded_rows.iter().peekable();
-            let (mut missing, mut stale) = (0u64, 0u64);
-            index.ids_at(s, |id| {
-                while rows.next_if(|r| r.as_slice() < id).is_some() {
-                    missing += 1;
-                }
-                if rows.next_if(|r| r.as_slice() == id).is_none() {
-                    stale += 1;
-                }
-            })?;
-            st.ivf_missing = missing + rows.count() as u64;
-            st.ivf_stale = stale;
-            st.ivf_mismatched = st.ivf_missing + st.ivf_stale;
-        }
+        let Some(index) = ivf_index else {
+            return Ok(());
+        };
+        // Both sides in ascending byte order: a merge walk counts each side's ids the
+        // other lacks, streaming the index's ids against the embedded memories' rows.
+        let mut rows = self.embedded_rows.iter().peekable();
+        let (mut missing, mut stale) = (0u64, 0u64);
+        index.ids_at(s, |id| {
+            while rows.next_if(|r| r.as_slice() < id).is_some() {
+                missing += 1;
+            }
+            if rows.next_if(|r| r.as_slice() == id).is_none() {
+                stale += 1;
+            }
+        })?;
+        self.st.ivf_missing = missing + rows.count() as u64;
+        self.st.ivf_stale = stale;
+        self.st.ivf_mismatched = self.st.ivf_missing + self.st.ivf_stale;
+        Ok(())
     }
-    Ok(st)
 }
 
 /// Marks the memory at `old` superseded by the one at `new` since `valid_to`, with the

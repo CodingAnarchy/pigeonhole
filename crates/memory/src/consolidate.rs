@@ -342,52 +342,7 @@ impl<'a> Consolidate<'a> {
         p: &ConsolidatePolicy,
         now: u64,
     ) -> Result<(Vec<Vec<StoredMemory>>, Option<MemoryId>)> {
-        let cutoff = now.saturating_sub(p.min_age.as_micros().min(u64::MAX as u128) as u64);
-        // Enough for `max_groups` full groups, with room for those that don't fill.
-        let cap = p.max_groups.saturating_mul(p.max_group).saturating_mul(4);
-        let mut by_session: BTreeMap<Option<String>, Vec<StoredMemory>> = BTreeMap::new();
-        let mut seen = 0usize;
-        let mut last: Option<MemoryId> = None;
-        let mut capped = false;
-        let prefix = [self.ns.as_bytes(), MEMORY_TAG].concat();
-        // The namespace's memory rows end where `{ns}\0m` does: before `{ns}\0n`.
-        let mut end = prefix.clone();
-        *end.last_mut().expect("the tag") += 1;
-        // A rid starts with `u64::MAX − created_us`, big-endian, so memory rows sort newest
-        // first, and the first old enough is at the cutoff's key: start there, or after the
-        // resume position if that's further on.
-        let old_enough = [prefix.as_slice(), &(u64::MAX - cutoff).to_be_bytes()].concat();
-        let after = self.after.map(MemoryId::row).filter(|a| *a >= old_enough);
-        let start = match &after {
-            Some(a) => std::ops::Bound::Excluded(a.as_slice()),
-            None => std::ops::Bound::Included(old_enough.as_slice()),
-        };
-        let mut it = self
-            .store
-            .table()
-            .scan_bounds(start, std::ops::Bound::Excluded(end.as_slice()))
-            .iter()?;
-        while let Some(r) = it.next_ref()? {
-            let Some(id) = MemoryId::from_row(r.key()) else {
-                continue;
-            };
-            last = Some(id.clone());
-            if id.created_us() > cutoff {
-                continue;
-            }
-            let Some(m) = crate::store::read_memory(id, &r.to_owned())? else {
-                continue;
-            };
-            if m.kind != Kind::Episodic || m.consolidated || m.superseded_by.is_some() || m.pinned {
-                continue;
-            }
-            by_session.entry(m.session.clone()).or_default().push(m);
-            seen += 1;
-            if seen >= cap {
-                capped = true;
-                break;
-            }
-        }
+        let (by_session, stopped_at) = self.candidates(p, now)?;
         let similar = self.store.embedding_model().is_some();
         let mut groups = Vec::new();
         for (_, mut left) in by_session {
@@ -422,12 +377,67 @@ impl<'a> Consolidate<'a> {
         let resume = if groups.len() > p.max_groups {
             groups.truncate(p.max_groups);
             groups.last().map(|g| g[0].id.clone())
-        } else if capped {
-            last
         } else {
-            None
+            stopped_at
         };
         Ok((groups, resume))
+    }
+
+    /// [`groups`](Self::groups)' scan: the candidates by session, in id order, and the last
+    /// row it read if it stopped at its limit (`None` if it read them all).
+    #[allow(clippy::type_complexity)]
+    fn candidates(
+        &self,
+        p: &ConsolidatePolicy,
+        now: u64,
+    ) -> Result<(
+        BTreeMap<Option<String>, Vec<StoredMemory>>,
+        Option<MemoryId>,
+    )> {
+        let cutoff = now.saturating_sub(p.min_age.as_micros().min(u64::MAX as u128) as u64);
+        // Enough for `max_groups` full groups, with room for those that don't fill.
+        let cap = p.max_groups.saturating_mul(p.max_group).saturating_mul(4);
+        let mut by_session: BTreeMap<Option<String>, Vec<StoredMemory>> = BTreeMap::new();
+        let mut seen = 0usize;
+        let prefix = [self.ns.as_bytes(), MEMORY_TAG].concat();
+        // The namespace's memory rows end where `{ns}\0m` does: before `{ns}\0n`.
+        let mut end = prefix.clone();
+        *end.last_mut().expect("the tag") += 1;
+        // A rid starts with `u64::MAX − created_us`, big-endian, so memory rows sort newest
+        // first, and the first old enough is at the cutoff's key: start there, or after the
+        // resume position if that's further on.
+        let old_enough = [prefix.as_slice(), &(u64::MAX - cutoff).to_be_bytes()].concat();
+        let after = self.after.map(MemoryId::row).filter(|a| *a >= old_enough);
+        let start = match &after {
+            Some(a) => std::ops::Bound::Excluded(a.as_slice()),
+            None => std::ops::Bound::Included(old_enough.as_slice()),
+        };
+        let mut it = self
+            .store
+            .table()
+            .scan_bounds(start, std::ops::Bound::Excluded(end.as_slice()))
+            .iter()?;
+        while let Some(r) = it.next_ref()? {
+            let Some(id) = MemoryId::from_row(r.key()) else {
+                continue;
+            };
+            if id.created_us() > cutoff {
+                continue;
+            }
+            let Some(m) = crate::store::read_memory(id, &r.to_owned())? else {
+                continue;
+            };
+            if m.kind != Kind::Episodic || m.consolidated || m.superseded_by.is_some() || m.pinned {
+                continue;
+            }
+            let id = m.id.clone();
+            by_session.entry(m.session.clone()).or_default().push(m);
+            seen += 1;
+            if seen >= cap {
+                return Ok((by_session, Some(id)));
+            }
+        }
+        Ok((by_session, None))
     }
 
     /// One group's commit (S1): re-reads, the new memories, then the source policy, in one
@@ -520,25 +530,25 @@ impl<'a> Consolidate<'a> {
                 (SourcePolicy::Supersede, Some(new)) => {
                     supersede_in(&mut txn, t, &row, &new.row(), now);
                 }
-                (SourcePolicy::Delete, Some(new)) => {
-                    // What it superseded is superseded by the new memory instead (C3).
+                (SourcePolicy::Delete, _) => {
+                    // What it superseded is superseded by the new memory instead (C3). With
+                    // no new memory to take that over, a source that superseded others stays,
+                    // consolidated.
                     let older = superseded_by(&mut txn, store, &row)?;
+                    if first.is_none() && !older.is_empty() {
+                        txn.put(t, &row, META, CONSOLIDATED, b"1");
+                        continue;
+                    }
                     store.delete_in(&mut txn, &m.id)?;
                     // delete_in reads at the snapshot, so it doesn't see a link a returned
                     // memory makes to this one in this transaction: removed here.
                     for r in &results {
                         txn.delete_column(t, &r.row(), LINKS, &row);
                     }
-                    for (old, valid_to) in older {
-                        supersede_in(&mut txn, t, &old, &new.row(), valid_to);
-                    }
-                }
-                (SourcePolicy::Delete, None)
-                    if superseded_by(&mut txn, store, &row)?.is_empty() =>
-                {
-                    store.delete_in(&mut txn, &m.id)?;
-                    for r in &results {
-                        txn.delete_column(t, &r.row(), LINKS, &row);
+                    if let Some(new) = first {
+                        for (old, valid_to) in older {
+                            supersede_in(&mut txn, t, &old, &new.row(), valid_to);
+                        }
                     }
                 }
                 _ => {
