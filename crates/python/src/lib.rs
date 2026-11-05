@@ -65,3 +65,17 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
+
+/// Applies an optional builder setting: `b.maybe(opt, |b, v| b.method(v))` is `b` with
+/// `method(v)` when `opt` is `Some(v)`, and `b` unchanged otherwise. Every binding method
+/// that maps optional keyword arguments onto a Rust builder chains these, one per argument.
+pub(crate) trait Maybe: Sized {
+    fn maybe<T>(self, value: Option<T>, set: impl FnOnce(Self, T) -> Self) -> Self {
+        match value {
+            Some(v) => set(self, v),
+            None => self,
+        }
+    }
+}
+
+impl<B> Maybe for B {}

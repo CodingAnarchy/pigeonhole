@@ -1,5 +1,6 @@
 //! Databases (the writer and reader processes), batches and transactions.
 
+use crate::Maybe;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
@@ -244,27 +245,13 @@ pub(crate) fn open(
     feed_tables: Option<Vec<String>>,
 ) -> PyResult<Database> {
     let mut o = pigeonhole::Options::default().create_if_missing(create);
-    if let Some(n) = shards {
-        o = o.shards(n);
-    }
-    if let Some(d) = durability {
-        o = o.durability(d.into());
-    }
-    if let Some(n) = block_cache {
-        o = o.block_cache(n);
-    }
-    if let Some(n) = row_cache {
-        o = o.row_cache(n);
-    }
-    if let Some(n) = memtable_budget {
-        o = o.memtable_budget(n);
-    }
-    if let Some(d) = shm_dir {
-        o = o.shm_dir(d);
-    }
-    if let Some(b) = read_only_fallback {
-        o = o.read_only_fallback(b);
-    }
+    o = o.maybe(shards, |o, n| o.shards(n));
+    o = o.maybe(durability, |o, d| o.durability(d.into()));
+    o = o.maybe(block_cache, |o, n| o.block_cache(n));
+    o = o.maybe(row_cache, |o, n| o.row_cache(n));
+    o = o.maybe(memtable_budget, |o, n| o.memtable_budget(n));
+    o = o.maybe(shm_dir, |o, d| o.shm_dir(d));
+    o = o.maybe(read_only_fallback, |o, b| o.read_only_fallback(b));
     if change_feed_off {
         if change_feed.is_some() || feed_age.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -288,9 +275,7 @@ pub(crate) fn open(
         }
         (None, None) => {}
     }
-    if let Some(t) = feed_tables {
-        o = o.feed_tables(t);
-    }
+    o = o.maybe(feed_tables, |o, t| o.feed_tables(t));
     let db = py
         .detach(move || pigeonhole::Pigeonhole::open(path, o))
         .or_py()?;
@@ -369,9 +354,7 @@ impl Database {
     ) -> PyResult<Py<PyAny>> {
         let db = self.db()?;
         let mut policy = pigeonhole::RetryPolicy::default();
-        if let Some(n) = max_attempts {
-            policy = policy.max_attempts(n);
-        }
+        policy = policy.maybe(max_attempts, |policy, n| policy.max_attempts(n));
         if let Some(d) = deadline {
             policy = policy.deadline(convert::duration(d)?);
         }
@@ -505,15 +488,9 @@ pub(crate) fn open_reader(
     row_cache: Option<usize>,
 ) -> PyResult<Reader> {
     let mut o = pigeonhole::ReaderOptions::default();
-    if let Some(d) = shm_dir {
-        o = o.shm_dir(d);
-    }
-    if let Some(n) = block_cache {
-        o = o.block_cache(n);
-    }
-    if let Some(n) = row_cache {
-        o = o.row_cache(n);
-    }
+    o = o.maybe(shm_dir, |o, d| o.shm_dir(d));
+    o = o.maybe(block_cache, |o, n| o.block_cache(n));
+    o = o.maybe(row_cache, |o, n| o.row_cache(n));
     let r = py
         .detach(move || pigeonhole::Pigeonhole::open_reader(path, o))
         .or_py()?;

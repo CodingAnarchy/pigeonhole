@@ -1,6 +1,7 @@
 //! D308's byte-budgeted reads (#1308): a scan's or a multi-get's page within a byte budget,
 //! the positions to resume them from, and a nearest search's page.
 
+use crate::Maybe;
 use std::ops::Bound as KeyBound;
 
 use pigeonhole::KeySet;
@@ -222,24 +223,14 @@ pub(crate) fn scan_within(
                     ),
                 }
                 .versions(versions);
-                if let Some(f) = &families {
-                    s = s.families(f.iter().map(String::as_str));
-                }
-                if let Some(q) = &qp {
-                    s = s.qualifier_prefix(q);
-                }
-                if let Some(n) = limit {
-                    s = s.limit(n);
-                }
-                if let Some(n) = column_limit {
-                    s = s.column_limit(n);
-                }
-                if let Some(sn) = &snap {
-                    s = s.snapshot(sn);
-                }
-                if let Some(a) = &after {
-                    s = s.resume_after(a);
-                }
+                s = s.maybe(families.as_ref(), |s, f| {
+                    s.families(f.iter().map(String::as_str))
+                });
+                s = s.maybe(qp.as_ref(), |s, q| s.qualifier_prefix(q));
+                s = s.maybe(limit, |s, n| s.limit(n));
+                s = s.maybe(column_limit, |s, n| s.column_limit(n));
+                s = s.maybe(snap.as_ref(), |s, sn| s.snapshot(sn));
+                s = s.maybe(after.as_ref(), |s, a| s.resume_after(a));
                 s.read_within(bytes)
             })
         })
@@ -283,21 +274,13 @@ pub(crate) fn multi_get_within(
             let set = KeySet::from_unsorted(&given);
             either!(&h, |t| {
                 let mut r = t.keys(&set).versions(versions);
-                if let Some(f) = &families {
-                    r = r.families(f.iter().map(String::as_str));
-                }
-                if let Some(q) = &qp {
-                    r = r.qualifier_prefix(q);
-                }
-                if let Some(n) = column_limit {
-                    r = r.column_limit(n);
-                }
-                if let Some(s) = &snap {
-                    r = r.snapshot(s);
-                }
-                if let Some(a) = &after {
-                    r = r.resume_after(a);
-                }
+                r = r.maybe(families.as_ref(), |r, f| {
+                    r.families(f.iter().map(String::as_str))
+                });
+                r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                r = r.maybe(column_limit, |r, n| r.column_limit(n));
+                r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
+                r = r.maybe(after.as_ref(), |r, a| r.resume_after(a));
                 r.read_within(bytes)
             })
         })

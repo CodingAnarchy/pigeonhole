@@ -12,6 +12,7 @@
 //! running ends with the database's `Closed` (a forget or consolidation's open transaction is
 //! dropped whole).
 
+use crate::Maybe;
 use std::sync::{Arc, RwLock};
 
 use pigeonhole::ErrorCode;
@@ -423,9 +424,7 @@ impl ForgetPolicy {
         interval: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut p = mem::ForgetPolicy::new();
-        if let Some(r) = min_retention {
-            p = p.min_retention(r);
-        }
+        p = p.maybe(min_retention, |p, r| p.min_retention(r));
         if let Some(ages) = max_age {
             for (k, d) in ages.iter() {
                 p = p.max_age(kind(&k.extract::<String>()?)?, duration(&d)?);
@@ -434,12 +433,8 @@ impl ForgetPolicy {
         if let Some(d) = half_life {
             p = p.half_life(duration(d)?);
         }
-        if let Some(w) = use_weight {
-            p = p.use_weight(w);
-        }
-        if let Some(n) = max_per_pass {
-            p = p.max_per_pass(n);
-        }
+        p = p.maybe(use_weight, |p, w| p.use_weight(w));
+        p = p.maybe(max_per_pass, |p, n| p.max_per_pass(n));
         if let Some(d) = interval {
             p = p.interval(duration(d)?);
         }
@@ -520,18 +515,10 @@ impl ConsolidatePolicy {
         if let Some(d) = min_age {
             p = p.min_age(duration(d)?);
         }
-        if let Some(s) = group_similarity {
-            p = p.group_similarity(s);
-        }
-        if let Some(n) = min_group {
-            p = p.min_group(n);
-        }
-        if let Some(n) = max_group {
-            p = p.max_group(n);
-        }
-        if let Some(n) = max_groups {
-            p = p.max_groups(n);
-        }
+        p = p.maybe(group_similarity, |p, s| p.group_similarity(s));
+        p = p.maybe(min_group, |p, n| p.min_group(n));
+        p = p.maybe(max_group, |p, n| p.max_group(n));
+        p = p.maybe(max_groups, |p, n| p.max_groups(n));
         if let Some(s) = sources {
             p = p.sources(source_policy(s)?);
         }
@@ -645,21 +632,13 @@ fn build(
     pinned: bool,
 ) -> PyResult<mem::Memory> {
     let mut m = mem::Memory::new(text);
-    if let Some(e) = embedding {
-        m = m.embedding(e);
-    }
+    m = m.maybe(embedding, |m, e| m.embedding(e));
     if let Some(k) = kind_ {
         m = m.kind(kind(k)?);
     }
-    if let Some(i) = importance {
-        m = m.importance(i);
-    }
-    if let Some(s) = source {
-        m = m.source(s);
-    }
-    if let Some(s) = session {
-        m = m.session(s);
-    }
+    m = m.maybe(importance, |m, i| m.importance(i));
+    m = m.maybe(source, |m, s| m.source(s));
+    m = m.maybe(session, |m, s| m.session(s));
     if let Some(ls) = links {
         for l in ls.try_iter()? {
             let l = l?;
@@ -995,39 +974,17 @@ impl RecallArgs {
             .include_superseded(self.include_superseded)
             .with_signals(self.with_signals)
             .with_embeddings(self.with_embeddings);
-        if let Some(t) = self.text {
-            r = r.text(t);
-        }
-        if let Some(e) = self.embedding {
-            r = r.embedding(e);
-        }
-        if let Some(k) = self.k {
-            r = r.k(k);
-        }
-        if let Some(n) = self.candidates {
-            r = r.candidates(n);
-        }
-        if let Some(b) = self.byte_budget {
-            r = r.byte_budget(b);
-        }
-        if let Some(u) = self.now_us {
-            r = r.now_us(u);
-        }
-        if let Some(d) = self.half_life {
-            r = r.half_life(d);
-        }
-        if let Some(f) = self.fusion {
-            r = r.fusion(f);
-        }
-        if let Some(w) = self.weights {
-            r = r.weights(w);
-        }
-        if let Some(x) = self.expand {
-            r = r.expand(x);
-        }
-        if let Some(s) = self.session {
-            r = r.session(s);
-        }
+        r = r.maybe(self.text, |r, t| r.text(t));
+        r = r.maybe(self.embedding, |r, e| r.embedding(e));
+        r = r.maybe(self.k, |r, k| r.k(k));
+        r = r.maybe(self.candidates, |r, n| r.candidates(n));
+        r = r.maybe(self.byte_budget, |r, b| r.byte_budget(b));
+        r = r.maybe(self.now_us, |r, u| r.now_us(u));
+        r = r.maybe(self.half_life, |r, d| r.half_life(d));
+        r = r.maybe(self.fusion, |r, f| r.fusion(f));
+        r = r.maybe(self.weights, |r, w| r.weights(w));
+        r = r.maybe(self.expand, |r, x| r.expand(x));
+        r = r.maybe(self.session, |r, s| r.session(s));
         match &self.snapshot {
             Some(s) => r.snapshot(s).run_with_stats(),
             None => r.run_with_stats(),
@@ -1268,18 +1225,12 @@ impl Store {
         if let Some(n) = normalization {
             o = o.normalization(normalization_arg(n)?);
         }
-        if let Some(m) = embedding {
-            o = o.embedding(m.get().0.clone());
-        }
-        if let Some(p) = forget {
-            o = o.forget(p.get().0.clone());
-        }
+        o = o.maybe(embedding, |o, m| o.embedding(m.get().0.clone()));
+        o = o.maybe(forget, |o, p| o.forget(p.get().0.clone()));
         if let Some(d) = episodic_ttl {
             o = o.episodic_ttl(duration(d)?);
         }
-        if let Some(n) = near_dedup {
-            o = o.near_dedup(n.get().0);
-        }
+        o = o.maybe(near_dedup, |o, n| o.near_dedup(n.get().0));
         let p = db.get().db()?;
         let s = py
             .detach(move || mem::Store::create(&p, &name, o))
@@ -1612,15 +1563,9 @@ impl Store {
         let p = py
             .detach(move || {
                 let mut f = s.forget();
-                if let Some(p) = &policy {
-                    f = f.policy(p);
-                }
-                if let Some(a) = &after {
-                    f = f.after(a);
-                }
-                if let Some(u) = now_us {
-                    f = f.now_us(u);
-                }
+                f = f.maybe(policy.as_ref(), |f, p| f.policy(p));
+                f = f.maybe(after.as_ref(), |f, a| f.after(a));
+                f = f.maybe(now_us, |f, u| f.now_us(u));
                 f.run()
             })
             .or_mem()?;
@@ -1703,9 +1648,7 @@ impl Store {
         embedding: Option<Vec<f32>>,
     ) -> PyResult<Option<(MemoryId, f32)>> {
         let mut m = mem::Memory::new(text);
-        if let Some(e) = embedding {
-            m = m.embedding(e);
-        }
+        m = m.maybe(embedding, |m, e| m.embedding(e));
         let s = self.handle()?;
         Ok(py
             .detach(move || s.near_duplicate(&ns, &m))
@@ -1745,15 +1688,9 @@ impl Store {
         let c = PyConsolidator(consolidator);
         let out = py.detach(move || {
             let mut run = s.consolidate(&ns, &c);
-            if let Some(p) = &policy {
-                run = run.policy(p);
-            }
-            if let Some(a) = &after {
-                run = run.after(a);
-            }
-            if let Some(u) = now_us {
-                run = run.now_us(u);
-            }
+            run = run.maybe(policy.as_ref(), |run, p| run.policy(p));
+            run = run.maybe(after.as_ref(), |run, a| run.after(a));
+            run = run.maybe(now_us, |run, u| run.now_us(u));
             run.run()
         });
         match out {
