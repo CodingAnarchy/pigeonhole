@@ -1475,6 +1475,46 @@ fn reads_at_a_pinned_snapshot_agree_until_it_is_released() {
 }
 
 #[test]
+fn an_aggregate_vector_input_is_refused_as_each_path_always_refused_it() {
+    // The coordinator on #1555's N1: a transaction decodes an aggregate's input before it
+    // checks for a vector, so malformed vector elements get the element error; Mutate refuses
+    // a vector input before decoding it. Both are InvalidArgument; the messages differ.
+    let s = Server::start("", limits());
+    let bad = json!({"vector": {"element": "ELEMENT_F32", "dim": 2, "data": b64(&[0; 3])}});
+    let write = json!({"aggregate": {"family": "f", "qualifier": b64(b"q"), "input": bad}});
+    let id = begin(&s, None);
+    let rows = json!([{"row": {"table": "t", "row": b64(b"r")}, "writes": [write.clone()]}]);
+    let (status, e) = s.rpc(
+        "Transactions/Commit",
+        &json!({"txn_id": id, "rows": rows}),
+        None,
+    );
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{e}"
+    );
+    assert_eq!(
+        e["message"], "a vector of 2 elements needs 8 bytes of data, not 3",
+        "the element error, as before: {e}"
+    );
+    let (status, e) = s.post(
+        "Mutate",
+        &json!({"writes": {"row": {"table": "t", "row": b64(b"r")}, "writes": [write]}}),
+        None,
+    );
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{e}"
+    );
+    assert_eq!(
+        e["message"], "an aggregate input is an i64, u64, f64 or bytes",
+        "{e}"
+    );
+}
+
+#[test]
 fn a_write_list_that_fails_partway_buffers_none_of_it() {
     // simp724's T1 on #1511: two good writes, then a vector whose data doesn't fit its
     // dimension. The client gets InvalidArgument ("not applied"), so nothing may be buffered.
