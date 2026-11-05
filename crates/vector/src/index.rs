@@ -1963,7 +1963,6 @@ impl Index {
             if self.count(list)? <= self.max_list_len() {
                 return Ok(());
             }
-            let s0 = self.inner.db.snapshot()?;
             let mut layout = self.layout();
             if layout.list(list).is_none() {
                 layout = self.reload()?;
@@ -1971,7 +1970,13 @@ impl Index {
             let Some(current) = layout.list(list) else {
                 return Ok(());
             };
-            let (ids, points) = self.members(&s0, list)?;
+            // The 2-means input, read at a snapshot that is dropped before anything commits
+            // (#1497): `members` copies the ids and points out (owned), so nothing below
+            // reads through it. A snapshot held across this thread's own commits pins the
+            // memtables it saw, so a commit waiting for arena room would wait on room only
+            // its own snapshot keeps, until the stall timeout. The commits validate on their
+            // own reads (the list's version row and each moved vector, D306), not on it.
+            let (ids, points) = self.members(&self.inner.db.snapshot()?, list)?;
             if ids.len() as u64 <= self.max_list_len() {
                 return Ok(());
             }
@@ -2071,8 +2076,9 @@ impl Index {
             let Some(n) = layout.list(nbr) else {
                 continue;
             };
-            let s = inn.db.snapshot()?;
-            let (ids, points) = self.members(&s, nbr)?;
+            // Read at a snapshot dropped before this neighbour's transaction commits (#1497,
+            // as in `split`): the transaction validates on its own reads.
+            let (ids, points) = self.members(&inn.db.snapshot()?, nbr)?;
             let mut moves: Vec<(&[u8], u32)> = Vec::new();
             for (id, p) in ids.iter().zip(&points) {
                 let here = distance(&inn.cen, p, &n.centroid)?;
