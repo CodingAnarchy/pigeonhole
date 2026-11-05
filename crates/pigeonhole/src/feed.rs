@@ -224,6 +224,28 @@ pub enum CatalogEdit {
     },
 }
 
+/// How far a feed has covered its history ([`Feed::position`]). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FeedPosition {
+    seqno: u64,
+    catalog: u64,
+}
+
+impl FeedPosition {
+    /// Every commit of the feed's tables at or below it is covered.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+
+    /// A feed of every table: the root sequence of the last catalog change delivered (0 for
+    /// none, and in a feed of some tables). Positions of one feed compare as `(seqno,
+    /// catalog_sequence)`.
+    pub fn catalog_sequence(&self) -> u64 {
+        self.catalog
+    }
+}
+
 /// Where a [`Feed`] left off: [`FeedBuilder::resume`] continues after its last delivered
 /// commit, in this or a later open of the database. Opaque bytes, to store with the work
 /// the commits fed (`as_bytes`, `from_bytes`).
@@ -405,6 +427,7 @@ impl FeedBuilder {
                 commit: Commit::empty(),
                 event: None,
             },
+            covered: pigeonhole_engine::FeedPosition::default(),
             oldest_retained: None,
             failed: None,
         })
@@ -479,6 +502,10 @@ pub struct Feed {
     generation: u64,
     /// What the last call delivered, and the names that fill it.
     out: Delivery,
+    /// The position covered by the readers before the current one (a recovery's or a writer
+    /// restart's resubscribe starts the new one at the token's delivered seqno, which can
+    /// be below it).
+    covered: pigeonhole_engine::FeedPosition,
     oldest_retained: Option<u64>,
     /// The error that ended the feed, returned by every later call (simp724 on #1321): the
     /// reader had already moved past the commit it was delivering, so going on would skip
@@ -692,6 +719,22 @@ impl Feed {
         FeedToken(self.reader.token())
     }
 
+    /// How far the feed has covered its history (ICR 0114 amendment), for a server that
+    /// fans one feed out to many clients (`phdb serve`'s hubs): every commit of the feed's
+    /// tables at or below [`FeedPosition::seqno`] was delivered or passed over, or precedes
+    /// its start, including the seqnos no commit of its tables holds (it moves while only other tables are written). In a feed of every table,
+    /// so was every catalog change with a ceiling at or below it, and one with the next
+    /// ceiling was delivered iff its sequence is at most
+    /// [`FeedPosition::catalog_sequence`]. It never goes back. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn position(&self) -> FeedPosition {
+        let p = self.covered.max(self.reader.position());
+        FeedPosition {
+            seqno: p.seqno,
+            catalog: p.catalog,
+        }
+    }
+
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     pub fn oldest_retained(&self) -> Option<u64> {
         self.oldest_retained
@@ -719,6 +762,9 @@ impl Feed {
         let mut spec = self.spec.clone();
         spec.start = FeedStart::Token(self.reader.token());
         let (reader, generation) = subscribe(&self.db, spec)?;
+        // Nothing of the spec lies undelivered between the token and the old reader's
+        // position, so it stays covered.
+        self.covered = self.covered.max(self.reader.position());
         self.reader = reader;
         self.generation = generation;
         Ok(())

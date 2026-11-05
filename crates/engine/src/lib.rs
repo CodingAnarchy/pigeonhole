@@ -72,7 +72,7 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use feed_reader::{
-    CatalogEvent, Change, Commit, Expiry, FeedReader, FeedSpec, FeedStart, Next,
+    CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
 };
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
