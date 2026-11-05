@@ -33,8 +33,8 @@ mod walk;
 
 use classes::{
     Cell, Condition, Database, FamilyInfo, Feed, Incremented, KeysPosition, Mutation, Pages,
-    Reader, Row, RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder,
-    Transaction, VectorSpec, WriteBatch,
+    Reader, Row, RowPosition, ScanCursor, ScanPosition, ScanSpec, Seen, Snapshot, Table,
+    TableBuilder, Transaction, VectorSpec, WriteBatch,
 };
 
 /// Defines `Pigeonhole::<name>` with no allocator: instances come only from the library.
@@ -154,14 +154,26 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "native_commit_returning",
         method!(Mutation::commit_returning, 0),
     )?;
+    c.define_private_method(
+        "native_return_current",
+        method!(Mutation::return_current, 2),
+    )?;
+    c.define_private_method(
+        "native_commit_if_returning",
+        method!(Mutation::commit_if_returning, 1),
+    )?;
 
     let c = class(ruby, m, "Incremented")?;
     c.define_method("seqno", method!(Incremented::seqno, 0))?;
     c.define_private_method("native_previous", method!(Incremented::previous, 2))?;
+    c.define_private_method("native_current", method!(Incremented::current, 2))?;
     c.define_private_method("native_value", method!(Incremented::value, 3))?;
     c.define_method("to_h", method!(Incremented::to_h, 0))?;
     c.define_method("size", method!(Incremented::size, 0))?;
     c.define_method("inspect", method!(Incremented::inspect, 0))?;
+
+    let c = class(ruby, m, "Seen")?;
+    c.define_private_method("native_current", method!(Seen::current, 2))?;
 
     let c = class(ruby, m, "WriteBatch")?;
     writes!(c, WriteBatch);

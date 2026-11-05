@@ -160,10 +160,15 @@ with ph.open(path, create=True) as db:
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
 - **Increments that return the value (D314):** `mutate(row)....commit_returning()` commits like `commit` and returns an `Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts=None)` or `r[family, qualifier]`; iterating gives the keys `(family, qualifier, ts)`. `Table.incr_returning(...)` is the one-cell form and returns the new value. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `None` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts=0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `ph.ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its cause): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `Durability.GROUP_SYNC` (the default) or `SYNC` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
 - **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning()` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Cell`, or `None` if it had none.
-  - **A lease handoff, for example:** one commit takes the lease and says whom it displaced. That's an **unconditional takeover**: it doesn't check that the lease was free or expired. Taking it only then needs a condition, which is #1446.
+  - **A lease handoff, for example:** one commit takes the lease and says whom it displaced. That's an **unconditional takeover**: it doesn't check that the lease was free or expired. Taking it only then needs a condition: `commit_if_returning`, next.
   - The displaced holder finds out at its next guarded write. **Guard every holder write** with `commit_if(Condition.equals(family, holder_column, own_id))`, which returns `None` once another holder has taken over.
   - Optionally, an `incr` of an epoch counter in the same commit gives the new holder a fencing token (`r.value(...)`), so systems downstream can refuse an older holder's work.
   - **The rules:** only `commit_returning()` (and `commit_returning_async()`) takes such a mutation: `commit()` and `commit_if()` raise `InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Returned` is the same class as `Incremented`, under the name the Rust struct has had since 1.2.
+- **Compare and set, then read (#1446):** `commit_if_returning(condition)` is a `commit_if` that returns the row whichever way the condition goes (D314 amendment 2). It returns a frozen `Checked`: `applied`, then either `returned` (a `Returned`) when it committed, or `seen` (a `Seen`) when it didn't and nothing was written. `commit_if_returning_async` is the asyncio form.
+  - `returned.current(family, qualifier)` is a column as of the commit, so the condition's own column has the value this commit wrote. `previous` and the counters work as for `commit_returning`.
+  - `seen.current(family, qualifier)` is the column as the condition saw it: the value it compared, or `None` where it was missing. A compare-and-swap loop retries from it with no extra read.
+  - The condition's column is always reported. Ask for more with `return_current(family, qualifier)`. Only `commit_if_returning` takes it: `commit`, `commit_if` and `commit_returning` raise `InvalidArgument` ("use a transaction"), because a `get` after a commit may already see a later writer's. A mutation with no writes is a check-and-read.
+  - `current` raises `InvalidArgument` for a column that neither `return_current` nor the condition named. On `returned` it raises `ReturnedValueError` if the read failed after the commit applied. [Compare and set, then read](data-modeling.md#compare-and-set-then-read-commit_if_returning) has the details.
 - **`db.write_batch()`** spans rows and tables atomically. As a context manager, it commits on a clean exit and writes nothing if the block raises.
 - **`db.transaction()`** is optimistic: its reads see one snapshot, and `commit()` raises `Conflict` if a cell it read changed meanwhile.
 - **`db.transact(fn)`** runs `fn(txn)` and retries it on `Conflict` and `Busy`, with backoff. It returns what `fn` returned. `fn` may run more than once, so keep its side effects inside the transaction.
@@ -211,6 +216,21 @@ with ph.open(path, create=True) as db:
     # worker-3 finds out at its next write, which (like every holder write) is guarded.
     mine = ph.Condition.equals("s", b"holder", b"worker-3")
     assert leases.mutate(b"lease:42").put("s", b"beat", b"3").commit_if(mine) is None
+
+    # Compare and swap: take the next number, retrying from what a failed attempt saw.
+    leases.mutate(b"seq").put("s", b"v", b"41").commit()
+    seen = b"0"
+    while True:
+        n = int(seen)
+        r = (
+            leases.mutate(b"seq")
+            .put("s", b"v", str(n + 1).encode())
+            .commit_if_returning(ph.Condition.equals("s", b"v", seen))
+        )
+        if r.applied:
+            break
+        seen = r.seen.current("s", b"v").value
+    assert n == 41
 ```
 
 ## Vectors

@@ -38,6 +38,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<table::FamilyInfo>()?;
     m.add_class::<table::Mutation>()?;
     m.add_class::<table::Incremented>()?;
+    m.add_class::<table::Checked>()?;
+    m.add_class::<table::Seen>()?;
     // ICR 0113: `Returned`, the Rust struct's name since 1.2, is the same class.
     m.add("Returned", m.getattr("Incremented")?)?;
     m.add_class::<read::Cell>()?;
