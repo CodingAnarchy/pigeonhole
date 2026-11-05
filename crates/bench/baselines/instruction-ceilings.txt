@@ -324,7 +324,14 @@ commit-overwrite 10608 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
 # before treating a delta within 10 in the PR's base-vs-head table as cost.
-commit-at 9532 0.3
+# Raised by D195 (#1562, D315 PR 3; the coordinator handed the window over 2026-11-06):
+# commit-at 9532 -> 9573 (+0.43%). Main's base already counted 9530; the head counts 9544
+# (+14, +0.15%) on run 42111190703 (4724affb), the commit path's cost measured per function on
+# commit-one (+13: scratch A/B 42082814541): `Inner::route`'s +3 is simp724's R6, the replica
+# check that refuses local writes on a replica; Engine::commit +3 and Table::mutate +7 are
+# codegen (the batch's mark already sits in BatchBuilder's padding; one gate word instead cost
+# more, 7ba0fa75). commit-one, at 8603, stays under #1566's 8617. The highest times 1.003.
+commit-at 9573 0.3
 scan-narrow 1381 0.3
 scan-small 1358 0.3
 scan-wide 1279 0.3
