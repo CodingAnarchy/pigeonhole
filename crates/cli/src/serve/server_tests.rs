@@ -1514,6 +1514,279 @@ fn an_aggregate_vector_input_is_refused_as_each_path_always_refused_it() {
     );
 }
 
+// ---- Graph.Traverse and Vectors.Nearest (D313 ticket 7) ----
+
+/// `g`, an edge family `e`: a -> b, a -> c, b -> d, and c -> x:skip (an edge `qualifier_prefix`
+/// b"x" alone keeps).
+fn graph(s: &Server) -> pigeonhole::Table {
+    let db = &s.shared.router.service.db;
+    let g = db
+        .table("g")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    for (from, to) in [
+        (&b"a"[..], &b"b"[..]),
+        (b"a", b"c"),
+        (b"b", b"d"),
+        (b"c", b"x:skip"),
+    ] {
+        g.mutate(from).put("e", to, b"").commit().unwrap();
+    }
+    g
+}
+
+fn hops_of(r: &Json) -> Vec<Vec<String>> {
+    r["hops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            h["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn traverse_walks_an_edge_family_hop_by_hop() {
+    let s = Server::start("", limits());
+    let g = graph(&s);
+    let (status, r) = s.rpc(
+        "Graph/Traverse",
+        &json!({"table": "g", "family": "e", "seeds": [b64(b"a")], "hops": 2, "parents": true}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(
+        hops_of(&r),
+        [vec![b64(b"b"), b64(b"c")], vec![b64(b"d"), b64(b"x:skip")]]
+    );
+    // Each node's source, as an index into the previous hop (the seeds for hop 1).
+    assert_eq!(r["hops"][0]["parents"], json!([0, 0]));
+    assert_eq!(r["hops"][1]["parents"], json!([0, 1]));
+    // A uint64, so a string in proto3's JSON mapping.
+    assert_eq!(r["stats"]["edges"], json!("4"), "{r}");
+    // The edge selection: only qualifiers under `x`.
+    let (_, r) = s.rpc(
+        "Graph/Traverse",
+        &json!({"table": "g", "family": "e", "seeds": [b64(b"c")],
+                "qualifier_prefix": b64(b"x")}),
+        None,
+    );
+    assert_eq!(hops_of(&r), [vec![b64(b"x:skip")]]);
+    // At a pinned snapshot: an edge added after it isn't followed.
+    let (_, opened) = s.rpc("Snapshots/Open", &json!({}), None);
+    let id = opened["snapshot_id"].as_str().unwrap().to_owned();
+    g.mutate(b"d").put("e", b"later", b"").commit().unwrap();
+    let walk = |snapshot: Option<&str>| {
+        let mut req = json!({"table": "g", "family": "e", "seeds": [b64(b"b")], "hops": 2});
+        if let Some(id) = snapshot {
+            req["snapshot_id"] = json!(id);
+        }
+        hops_of(&s.rpc("Graph/Traverse", &req, None).1)
+    };
+    assert_eq!(walk(Some(&id)), [vec![b64(b"d")]]);
+    assert_eq!(walk(None), [vec![b64(b"d")], vec![b64(b"later")]]);
+    // A reply is byte-budgeted (simp724's L1 on #1565): a node counts its key and 16 bytes,
+    // so 20 bytes keep one of hop 1's two nodes, and the traversal ends there.
+    let (_, r) = s.rpc(
+        "Graph/Traverse",
+        &json!({"table": "g", "family": "e", "seeds": [b64(b"a")], "hops": 2,
+                "page_bytes": 20}),
+        None,
+    );
+    assert_eq!(hops_of(&r).len(), 1, "{r}");
+    assert_eq!(hops_of(&r)[0].len(), 1, "{r}");
+    assert_eq!(r["stats"]["cut_by_budget"], json!(true), "{r}");
+    // Over gRPC.
+    let got = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::graph_client::GraphClient::new(channel)
+            .traverse(proto::TraverseRequest {
+                table: "g".into(),
+                family: "e".into(),
+                seeds: vec![b"a".to_vec().into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    assert_eq!(got.hops.len(), 1);
+    assert_eq!(got.hops[0].nodes, [b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[test]
+fn traverse_refuses_what_it_cannot_walk() {
+    let s = Server::start("", limits());
+    graph(&s);
+    for (req, code) in [
+        (
+            json!({"table": "g", "family": "e", "seeds": []}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "g", "family": "e", "seeds": [b64(b"a")], "hops": 65}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "nope", "family": "e", "seeds": [b64(b"a")]}),
+            "TableNotFound",
+        ),
+        (
+            json!({"table": "g", "family": "nope", "seeds": [b64(b"a")]}),
+            "FamilyNotFound",
+        ),
+    ] {
+        let (status, e) = s.rpc("Graph/Traverse", &req, None);
+        assert_eq!(e["code"].as_str(), Some(code), "{req}: {status} {e}");
+    }
+}
+
+/// `v`, an `f32` L2 vector family `emb` of dim 2: rows a [0, 1], b [0, 2] and c [0, 3].
+fn vectors(s: &Server) -> pigeonhole::Table {
+    let db = &s.shared.router.service.db;
+    let spec =
+        pigeonhole::VectorSpec::new(2, pigeonhole::Element::F32, pigeonhole::Metric::L2).unwrap();
+    let v = db
+        .table("v")
+        .unwrap()
+        .family("emb", Family::vector(spec))
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    for (row, y) in [(&b"a"[..], 1.0f32), (b"b", 2.0), (b"c", 3.0)] {
+        v.mutate(row)
+            .put_vector_f32("emb", b"", &[0.0, y])
+            .commit()
+            .unwrap();
+    }
+    v
+}
+
+fn f32_query(xs: &[f32]) -> Json {
+    let data: Vec<u8> = xs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    json!({"element": "ELEMENT_F32", "dim": xs.len(), "data": b64(&data)})
+}
+
+fn rows_of(r: &Json) -> Vec<String> {
+    r["neighbours"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["row"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn nearest_ranks_a_ranges_or_a_key_lists_vectors() {
+    let s = Server::start("", limits());
+    vectors(&s);
+    let q = f32_query(&[0.0, 0.0]);
+    let (status, r) = s.rpc(
+        "Vectors/Nearest",
+        &json!({"table": "v", "family": "emb", "query": q, "k": 2}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(rows_of(&r), [b64(b"a"), b64(b"b")]);
+    assert!(
+        r["neighbours"][0]["distance"].as_f64().unwrap()
+            < r["neighbours"][1]["distance"].as_f64().unwrap()
+    );
+    // A key list, and a range.
+    let (_, r) = s.rpc(
+        "Vectors/Nearest",
+        &json!({"table": "v", "family": "emb", "query": q, "k": 5,
+                "keys": {"keys": [b64(b"c"), b64(b"b")]}}),
+        None,
+    );
+    assert_eq!(rows_of(&r), [b64(b"b"), b64(b"c")]);
+    let (_, r) = s.rpc(
+        "Vectors/Nearest",
+        &json!({"table": "v", "family": "emb", "query": q, "k": 5,
+                "range": {"prefix": b64(b"c")}}),
+        None,
+    );
+    assert_eq!(rows_of(&r), [b64(b"c")]);
+    // D308's budget: each neighbour is its 1-byte row, an empty qualifier and 16 bytes.
+    let (_, r) = s.rpc(
+        "Vectors/Nearest",
+        &json!({"table": "v", "family": "emb", "query": q, "k": 3, "page_bytes": 40}),
+        None,
+    );
+    assert_eq!(rows_of(&r), [b64(b"a"), b64(b"b")]);
+    assert_eq!(r["cut_by_budget"], json!(true), "{r}");
+}
+
+#[test]
+fn nearest_refuses_a_query_it_cannot_run() {
+    let s = Server::start("", limits());
+    vectors(&s);
+    let q = f32_query(&[0.0, 0.0]);
+    let half = json!({"element": "ELEMENT_F16", "dim": 2, "data": b64(&[0; 4])});
+    let i8q = json!({"element": "ELEMENT_I8", "dim": 2, "data": b64(&[0; 2])});
+    for (req, code) in [
+        (
+            json!({"table": "v", "family": "emb", "query": q, "k": 0}),
+            "InvalidArgument",
+        ),
+        // A ranking keeps `k` candidates before the reply's budget cuts it: k is capped.
+        (
+            json!({"table": "v", "family": "emb", "query": q, "k": 10_001}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "v", "family": "emb", "k": 1}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "v", "family": "emb", "query": half, "k": 1}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "v", "family": "emb", "query": i8q, "k": 1}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "v", "family": "f", "query": q, "k": 1}),
+            "InvalidArgument",
+        ),
+        (
+            json!({"table": "nope", "family": "emb", "query": q, "k": 1}),
+            "TableNotFound",
+        ),
+    ] {
+        let (status, e) = s.rpc("Vectors/Nearest", &req, None);
+        assert_eq!(e["code"].as_str(), Some(code), "{req}: {status} {e}");
+    }
+    // The IVF index's RPCs aren't served yet: Unsupported, over HTTP and gRPC alike.
+    let (_, e) = s.rpc("Vectors/Search", &json!({}), None);
+    assert_eq!(e["code"].as_str(), Some("Unsupported"), "{e}");
+    let err = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::vectors_client::VectorsClient::new(channel)
+            .search(proto::VectorSearchRequest::default())
+            .await
+            .unwrap_err()
+    });
+    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
+}
+
 #[test]
 fn a_write_list_that_fails_partway_buffers_none_of_it() {
     // simp724's T1 on #1511: two good writes, then a vector whose data doesn't fit its

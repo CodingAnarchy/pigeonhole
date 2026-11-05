@@ -33,6 +33,10 @@ message TraverseRequest {
   TimeRange time_range = 12;
   ValueFilter value_filter = 13;
   string snapshot_id = 14;
+  // Cut the traversal to this many bytes of nodes by D308's measure (a node counts its key
+  // and 16 bytes, plus 4 with `parents`): 0 is the server's default, 1 MiB, and the server
+  // caps it at 8 MiB. The hop it cuts keeps its in-budget prefix, and the traversal ends.
+  uint64 page_bytes = 15;
 }
 
 message TraverseResponse {
@@ -54,4 +58,6 @@ message TraverseStats {
   uint64 edges = 2;
   uint32 hops_cut = 3;
   bool cut_by_max_nodes = 4;
+  // `page_bytes` cut the last hop short: the traversal ended with it.
+  bool cut_by_budget = 5;
 }

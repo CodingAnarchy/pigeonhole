@@ -25,7 +25,8 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
 ## Conventions
 - **Keys and values are `bytes`.** Timestamps are microseconds since the Unix epoch.
 - **Vectors are one packed field** (`Vector.data`, little-endian elements or packed bits), not one field per element. That includes memory embeddings, in the store's element type.
-- **Every read that can return a lot is byte-budgeted:** `Scan`, `MultiGet` and `ReadRow` take `page_bytes` (0 is the server's default, 1 MiB, and the server caps it). Each page reports its own D308 size in `bytes`.
+- **A `Nearest` query is `f32`, `i8` or bit** (D313 ticket 7): an `f16` or `bf16` family takes an `f32` query, as `nearest_f32` does in Rust, and an `f16` or `bf16` query is `InvalidArgument`.
+- **Every read that can return a lot is byte-budgeted:** `Scan`, `MultiGet`, `ReadRow`, `Traverse` and `Nearest` take `page_bytes` (0 is the server's default, 1 MiB, and the server caps it). Each page reports its own D308 size in `bytes`.
 - **Ids the server hands out are opaque strings:** `txn_id`, `snapshot_id`. Clients store and return them, and never parse them. Their encoding (for example the partition and node, under D317) may change.
 - **Opaque positions are `bytes`:** a scan's or multi-get's `next`, a row page's `next`, a feed event's `token`. They're stateless: any server process resumes from them, now or after a restart. Feed tokens aren't comparable byte for byte across streams.
 - **`RoutingKey`** (D317's C1) on `Begin` and `Snapshots.Open` names a row (`table`, `row`) or a partition. A single-node server ignores it. A cluster with more than one partition requires it (`InvalidArgument`), so clients should send it from the start.

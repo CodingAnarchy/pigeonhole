@@ -15478,6 +15478,9 @@ impl serde::Serialize for TraverseRequest {
         if !self.snapshot_id.is_empty() {
             len += 1;
         }
+        if self.page_bytes != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TraverseRequest", len)?;
         if !self.table.is_empty() {
             struct_ser.serialize_field("table", &self.table)?;
@@ -15527,6 +15530,11 @@ impl serde::Serialize for TraverseRequest {
         if !self.snapshot_id.is_empty() {
             struct_ser.serialize_field("snapshot_id", &self.snapshot_id)?;
         }
+        if self.page_bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("page_bytes", ToString::to_string(&self.page_bytes).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -15560,6 +15568,8 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
             "valueFilter",
             "snapshot_id",
             "snapshotId",
+            "page_bytes",
+            "pageBytes",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15578,6 +15588,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
             TimeRange,
             ValueFilter,
             SnapshotId,
+            PageBytes,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15613,6 +15624,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                             "timeRange" | "time_range" => Ok(GeneratedField::TimeRange),
                             "valueFilter" | "value_filter" => Ok(GeneratedField::ValueFilter),
                             "snapshotId" | "snapshot_id" => Ok(GeneratedField::SnapshotId),
+                            "pageBytes" | "page_bytes" => Ok(GeneratedField::PageBytes),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15646,6 +15658,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                 let mut time_range__ = None;
                 let mut value_filter__ = None;
                 let mut snapshot_id__ = None;
+                let mut page_bytes__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Table => {
@@ -15745,6 +15758,14 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                             }
                             snapshot_id__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::PageBytes => {
+                            if page_bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("pageBytes"));
+                            }
+                            page_bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(TraverseRequest {
@@ -15762,6 +15783,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                     time_range: time_range__,
                     value_filter: value_filter__,
                     snapshot_id: snapshot_id__.unwrap_or_default(),
+                    page_bytes: page_bytes__.unwrap_or_default(),
                 })
             }
         }
@@ -15896,6 +15918,9 @@ impl serde::Serialize for TraverseStats {
         if self.cut_by_max_nodes {
             len += 1;
         }
+        if self.cut_by_budget {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TraverseStats", len)?;
         if self.rows != 0 {
             #[allow(clippy::needless_borrow)]
@@ -15913,6 +15938,9 @@ impl serde::Serialize for TraverseStats {
         if self.cut_by_max_nodes {
             struct_ser.serialize_field("cut_by_max_nodes", &self.cut_by_max_nodes)?;
         }
+        if self.cut_by_budget {
+            struct_ser.serialize_field("cut_by_budget", &self.cut_by_budget)?;
+        }
         struct_ser.end()
     }
 }
@@ -15929,6 +15957,8 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
             "hopsCut",
             "cut_by_max_nodes",
             "cutByMaxNodes",
+            "cut_by_budget",
+            "cutByBudget",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15937,6 +15967,7 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
             Edges,
             HopsCut,
             CutByMaxNodes,
+            CutByBudget,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15962,6 +15993,7 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
                             "edges" => Ok(GeneratedField::Edges),
                             "hopsCut" | "hops_cut" => Ok(GeneratedField::HopsCut),
                             "cutByMaxNodes" | "cut_by_max_nodes" => Ok(GeneratedField::CutByMaxNodes),
+                            "cutByBudget" | "cut_by_budget" => Ok(GeneratedField::CutByBudget),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15985,6 +16017,7 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
                 let mut edges__ = None;
                 let mut hops_cut__ = None;
                 let mut cut_by_max_nodes__ = None;
+                let mut cut_by_budget__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Rows => {
@@ -16017,6 +16050,12 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
                             }
                             cut_by_max_nodes__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::CutByBudget => {
+                            if cut_by_budget__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("cutByBudget"));
+                            }
+                            cut_by_budget__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(TraverseStats {
@@ -16024,6 +16063,7 @@ impl<'de> serde::Deserialize<'de> for TraverseStats {
                     edges: edges__.unwrap_or_default(),
                     hops_cut: hops_cut__.unwrap_or_default(),
                     cut_by_max_nodes: cut_by_max_nodes__.unwrap_or_default(),
+                    cut_by_budget: cut_by_budget__.unwrap_or_default(),
                 })
             }
         }
