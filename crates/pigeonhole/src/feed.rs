@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole_engine::{FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
@@ -307,7 +308,9 @@ impl FeedBuilder {
         for t in &self.tables {
             note_names(&mut names, &t.info);
         }
-        let (reader, generation) = subscribe(&self.db, spec.clone())?;
+        let (mut reader, generation) = subscribe(&self.db, spec.clone())?;
+        let reader_progress = Arc::new(AtomicU64::new(0));
+        reader.set_progress(Arc::clone(&reader_progress));
         Ok(Feed {
             db: self.db,
             spec,
@@ -321,6 +324,7 @@ impl FeedBuilder {
             },
             oldest_retained: None,
             failed: None,
+            progress: FeedProgress::attach(reader_progress),
         })
     }
 }
@@ -398,6 +402,47 @@ pub struct Feed {
     /// reader had already moved past the commit it was delivering, so going on would skip
     /// it.
     failed: Option<Error>,
+    /// Its position, published by the reader as it moves ([`Feed::progress`]).
+    progress: FeedProgress,
+}
+
+/// Where a [`Feed`] is, readable from any thread ([`Feed::progress`], D316 A4, ICR 0116): a
+/// cheap handle, cloned from the feed, that a metrics exporter keeps while the feed's own
+/// thread reads it. `pigeonhole-otel`'s `Registration::watch_feed` reports
+/// [`Pigeonhole::visible_seqno`](crate::Pigeonhole::visible_seqno) less
+/// [`delivered_seqno`](Self::delivered_seqno) as the feed's lag.
+#[derive(Debug, Clone)]
+pub struct FeedProgress {
+    delivered: Arc<AtomicU64>,
+    live: Arc<AtomicBool>,
+}
+
+impl FeedProgress {
+    fn attach(delivered: Arc<AtomicU64>) -> Self {
+        Self {
+            delivered,
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// The feed's position: every commit at or below this seqno was delivered, or carried
+    /// nothing for the feed's tables, or precedes its start. It moves as the feed reads,
+    /// past commits of other tables too, so a feed that keeps up stays near the database's
+    /// visible seqno even while it waits.
+    pub fn delivered_seqno(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the feed still exists: `false` once it was dropped.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.progress.live.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The longest single wait handed to the engine; a longer `next` waits again.
@@ -550,6 +595,13 @@ impl Feed {
         }
     }
 
+    /// A handle to the feed's position, for another thread (D316 A4, ICR 0116): it stays
+    /// current as the feed reads, and reports [`is_live`](FeedProgress::is_live) `false`
+    /// once the feed is dropped. Cheap: two `Arc` clones.
+    pub fn progress(&self) -> FeedProgress {
+        self.progress.clone()
+    }
+
     /// Where the feed is: [`FeedBuilder::resume`] continues after the last commit delivered.
     pub fn token(&self) -> FeedToken {
         FeedToken(self.reader.token())
@@ -581,7 +633,8 @@ impl Feed {
     fn resubscribe(&mut self) -> Result<()> {
         let mut spec = self.spec.clone();
         spec.start = FeedStart::Token(self.reader.token());
-        let (reader, generation) = subscribe(&self.db, spec)?;
+        let (mut reader, generation) = subscribe(&self.db, spec)?;
+        reader.set_progress(Arc::clone(&self.progress.delivered));
         self.reader = reader;
         self.generation = generation;
         Ok(())

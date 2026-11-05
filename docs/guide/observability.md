@@ -75,6 +75,16 @@ let _metrics = pigeonhole_otel::Config::new()
     .register(&db, &meter);
 ```
 
+**Watching a change feed's lag.** A feed's subscriber is the application's own, so it names the feeds it wants watched:
+
+```rust,ignore
+let mut feed = orders.feed().open()?;
+metrics.watch_feed("indexer", feed.progress());
+// The indexer's thread reads `feed` as usual; the exporter reads its position.
+```
+
+`pigeonhole.feed.lag{pigeonhole.feed.name="indexer"}` is then the commits between the database's visible seqno and the feed's position. It stays near 0 while the subscriber keeps up, even when the writes are to tables the feed doesn't carry, because the feed's position moves past those too. A durable feed (the default) delivers a commit once it's durable, so it also trails by any `Buffered` or `None` commits not yet synced, up to the feed's sync interval. Watch only named, long-lived subscribers: each name is a series. A dropped feed stops reporting.
+
 **Register in the writer process,** once per database. The writer's metrics already include what operators need about reader processes (`pigeonhole.reader_slots.*`, `pigeonhole.reader.seqno_lag`).
 
 **Keep the `Registration`.** It is `#[must_use]`: a bare `register(..);` drops it at once and reports nothing. Bind it to a named variable (`let _metrics = …`), not `_`. Dropping it stops reporting and releases its handle to the database. After a reopen, `registration.rebind(&new_db)` points it at the new handle and keeps every counter growing from where it was.
@@ -134,6 +144,7 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.feed.retained.size` | `pigeonhole_feed_retained_size_bytes` | gauge | `By` |  | WAL bytes the change feed retains. |
 | `pigeonhole.feed.retained.limit` | `pigeonhole_feed_retained_limit_bytes` | gauge | `By` |  | The change feed's retention limit; near it, slow subscribers start expiring. |
 | `pigeonhole.feed.held_blobs.size` | `pigeonhole_feed_held_blobs_size_bytes` | gauge | `By` |  | Blob bytes the change feed's retained history holds. |
+| `pigeonhole.feed.lag` | `pigeonhole_feed_lag` | gauge | `{commit}` | `pigeonhole.feed.name` | Commits between the database's visible seqno and a watched feed's position (Registration::watch_feed): near 0 while the feed keeps up, growing while its subscriber falls behind. |
 | `pigeonhole.failed` | `pigeonhole_failed_ratio` | gauge | `1` |  | 0 or 1: 1 once the instance has failed (Pigeonhole::is_failed). The first alert to set. |
 | `pigeonhole.recoveries` | `pigeonhole_recoveries_total` | counter | `{recovery}` |  | Automatic recoveries completed. |
 | `pigeonhole.recovery.gave_up` | `pigeonhole_recovery_gave_up_ratio` | gauge | `1` |  | 0 or 1: 1 once automatic recovery gave up. |
@@ -147,7 +158,6 @@ Counters are cumulative from registration. They stay monotonic across an automat
 **Coming in 1.2.0 (D316's A2–A4),** each in its own release note:
 - `pigeonhole.memtable.size` and `pigeonhole.memtable.limit`;
 - `pigeonhole.wal.group_sync.time`;
-- `pigeonhole.feed.lag`.
 
 ## What to alert on
 In Prometheus terms:

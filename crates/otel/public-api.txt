@@ -22,6 +22,7 @@ pub fn pigeonhole_otel::MetricInfo::prometheus_name(&self) -> alloc::string::Str
 pub struct pigeonhole_otel::Registration
 impl pigeonhole_otel::Registration
 pub fn pigeonhole_otel::Registration::rebind(&self, &pigeonhole::db::Pigeonhole)
+pub fn pigeonhole_otel::Registration::watch_feed(&self, impl core::convert::Into<alloc::string::String>, pigeonhole::feed::FeedProgress)
 impl core::fmt::Debug for pigeonhole_otel::Registration
 pub fn pigeonhole_otel::Registration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for pigeonhole_otel::Registration

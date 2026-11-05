@@ -426,8 +426,11 @@ impl pigeonhole::Feed
 pub fn pigeonhole::Feed::next(&mut self, core::time::Duration) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
 pub fn pigeonhole::Feed::oldest_retained(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Feed::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<&pigeonhole::Commit>>
+pub fn pigeonhole::Feed::progress(&self) -> pigeonhole::FeedProgress
 pub fn pigeonhole::Feed::token(&self) -> pigeonhole::FeedToken
 pub fn pigeonhole::Feed::try_next(&mut self) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
+impl core::ops::drop::Drop for pigeonhole::Feed
+pub fn pigeonhole::Feed::drop(&mut self)
 pub struct pigeonhole::FeedBuilder
 impl pigeonhole::FeedBuilder
 pub fn pigeonhole::FeedBuilder::from_oldest(self) -> Self
@@ -442,6 +445,10 @@ pub fn pigeonhole::FeedBuilder::visible(self) -> Self
 pub pigeonhole::FeedInfo::held_blob_bytes: u64
 pub pigeonhole::FeedInfo::retained_wal_bytes: u64
 pub pigeonhole::FeedInfo::retention_bytes: u64
+pub struct pigeonhole::FeedProgress
+impl pigeonhole::FeedProgress
+pub fn pigeonhole::FeedProgress::delivered_seqno(&self) -> u64
+pub fn pigeonhole::FeedProgress::is_live(&self) -> bool
 #[non_exhaustive] pub struct pigeonhole::FeedRetention
 pub pigeonhole::FeedRetention::age: core::option::Option<core::time::Duration>
 pub pigeonhole::FeedRetention::bytes: u64
@@ -632,6 +639,7 @@ pub fn pigeonhole::Pigeonhole::snapshot(&self) -> pigeonhole::Result<pigeonhole:
 pub fn pigeonhole::Pigeonhole::table(&self, &str) -> pigeonhole::Result<pigeonhole::TableBuilder<'_>>
 pub fn pigeonhole::Pigeonhole::tables(&self) -> alloc::vec::Vec<alloc::string::String>
 pub fn pigeonhole::Pigeonhole::transaction(&self) -> pigeonhole::Result<pigeonhole::Transaction>
+pub fn pigeonhole::Pigeonhole::visible_seqno(&self) -> u64
 pub fn pigeonhole::Pigeonhole::write_batch(&self) -> pigeonhole::WriteBatch
 impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::compact_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture

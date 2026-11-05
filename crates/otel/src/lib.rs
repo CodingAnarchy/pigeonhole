@@ -174,6 +174,22 @@ impl Registration {
     pub fn rebind(&self, db: &Pigeonhole) {
         self.shared.lock().rebind(db);
     }
+
+    /// Reports `progress`'s feed as `pigeonhole.feed.lag{pigeonhole.feed.name=name}`: the
+    /// commits between the database's visible seqno and the feed's position (D316 A4). A
+    /// feed that keeps up reads near 0, even when the database's writes are to tables the
+    /// feed doesn't carry. Watching another feed under the same name replaces the first.
+    /// It stops once the feed is dropped.
+    ///
+    /// The feeds watched are the names given here, so they're the series' bound: name each
+    /// subscriber of the application, never a per-request or per-user feed.
+    pub fn watch_feed(&self, name: impl Into<String>, progress: pigeonhole::FeedProgress) {
+        let name = name.into();
+        let mut state = self.shared.lock();
+        state.feeds.retain(|(n, _)| *n != name);
+        state.feeds.push((name, progress));
+        state.cached = None;
+    }
 }
 
 impl Drop for Registration {
@@ -200,6 +216,7 @@ mod attr {
     pub const BLOB_STATE: &str = "pigeonhole.blob.state";
     pub const THREAD_PINNED: &str = "pigeonhole.thread.pinned";
     pub const FEED_SYNC_KIND: &str = "pigeonhole.feed.sync.kind";
+    pub const FEED_NAME: &str = "pigeonhole.feed.name";
 }
 
 /// An instrument's kind.
@@ -771,6 +788,20 @@ static SPECS: &[Spec] = &[
             one(out, f.held_blob_bytes)
         }
     ),
+    spec!(
+        "pigeonhole.feed.lag",
+        Gauge,
+        false,
+        "{commit}",
+        [attr::FEED_NAME],
+        "Commits between the database's visible seqno and a watched feed's position (Registration::watch_feed): near 0 while the feed keeps up, growing while its subscriber falls behind.",
+        |s, out| for (name, lag) in &s.feed_lags {
+            out.push((
+                Value::U(*lag),
+                vec![KeyValue::new(attr::FEED_NAME, name.clone())],
+            ));
+        }
+    ),
     // Health.
     spec!(
         "pigeonhole.failed",
@@ -974,6 +1005,8 @@ struct Snapshot {
     /// Seconds, per durability and quantile, over the latency window.
     latency: [[Option<f64>; 3]; 4],
     storage_by_table: bool,
+    /// Each watched feed's lag in commits, by name.
+    feed_lags: Vec<(String, u64)>,
 }
 
 impl Snapshot {
@@ -1028,6 +1061,8 @@ struct State {
     last_handle: HandleCounters,
     /// Commit latency readings, oldest first, back to the window's start.
     latency: VecDeque<(Instant, [LatencyHistogram; 4])>,
+    /// The feeds `Registration::watch_feed` watches, by name.
+    feeds: Vec<(String, pigeonhole::FeedProgress)>,
 }
 
 impl State {
@@ -1041,6 +1076,7 @@ impl State {
             last_engine: Default::default(),
             last_handle: Default::default(),
             latency: VecDeque::new(),
+            feeds: Vec::new(),
         };
         // The window's first baseline, so the first collection already has an interval.
         state
@@ -1084,6 +1120,19 @@ impl State {
         );
         let hist = latency(&raw.m);
         let latency = self.quantiles(now, window, &hist);
+        // The visible seqno after each feed's position: a feed read meanwhile can only be
+        // further on, so the lag never reads below zero for long, and is clamped at it.
+        self.feeds.retain(|(_, p)| p.is_live());
+        let positions: Vec<_> = self
+            .feeds
+            .iter()
+            .map(|(n, p)| (n.clone(), p.delivered_seqno()))
+            .collect();
+        let visible = db.visible_seqno();
+        let feed_lags = positions
+            .into_iter()
+            .map(|(n, d)| (n, visible.saturating_sub(d)))
+            .collect();
         Some(Snapshot {
             at: now,
             e,
@@ -1095,6 +1144,7 @@ impl State {
             gave_up: recovery.gave_up,
             latency,
             storage_by_table,
+            feed_lags,
         })
     }
 
@@ -1269,6 +1319,7 @@ mod tests {
             last_engine: Default::default(),
             last_handle: Default::default(),
             latency: VecDeque::new(),
+            feeds: Vec::new(),
         }
     }
 

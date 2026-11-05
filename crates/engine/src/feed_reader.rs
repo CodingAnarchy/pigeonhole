@@ -259,6 +259,10 @@ pub struct FeedReader {
     /// Every commit with a key at or below this was delivered, skipped or precedes the
     /// start.
     delivered: Seqno,
+    /// Where `delivered` is published as it moves, for a metrics exporter on another
+    /// thread (`set_progress`, D316 A4, ICR 0116): one relaxed store per commit the reader
+    /// passes, delivered or skipped, on the reader's own thread. `None` until one's set.
+    progress: Option<Arc<AtomicU64>>,
     /// The frontier as of the last poll.
     frontier: Seqno,
     /// The frontier the streams were last read to their ends under (#1448): while the
@@ -377,6 +381,7 @@ impl FeedReader {
             streams: Vec::with_capacity(shared.shards),
             history,
             delivered: 0,
+            progress: None,
             frontier: 0,
             read_through: None,
             stream_reads: 0,
@@ -646,6 +651,22 @@ impl FeedReader {
     /// feed's start).
     pub fn delivered(&self) -> Seqno {
         self.delivered
+    }
+
+    /// Publishes [`delivered`](Self::delivered) into `sink` from now on, as it moves: past
+    /// each commit the reader passes, including commits that carry nothing for the feed,
+    /// so a caught-up feed's position keeps up with the database even while it waits
+    /// (D316 A4, ICR 0116). Stores the current position at once.
+    pub fn set_progress(&mut self, sink: Arc<AtomicU64>) {
+        sink.store(self.delivered, Ordering::Relaxed);
+        self.progress = Some(sink);
+    }
+
+    fn mark_delivered(&mut self, seqno: Seqno) {
+        self.delivered = seqno;
+        if let Some(p) = &self.progress {
+            p.store(seqno, Ordering::Relaxed);
+        }
     }
 
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
@@ -1138,7 +1159,7 @@ impl FeedReader {
                             let st = &mut self.streams[h.stream];
                             st.delivered_end = st.delivered_end.max(h.end);
                         }
-                        self.delivered = key;
+                        self.mark_delivered(key);
                         continue;
                     }
                     if !complete || shares.iter().any(|h| h.outside) {
@@ -1154,7 +1175,7 @@ impl FeedReader {
                     (ts, raws)
                 }
             };
-            self.delivered = key;
+            self.mark_delivered(key);
             if raws.is_empty() {
                 continue;
             }
