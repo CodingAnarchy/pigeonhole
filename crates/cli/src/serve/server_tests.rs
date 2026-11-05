@@ -2027,7 +2027,8 @@ fn vectors_client(s: &Server) -> proto::vectors_client::VectorsClient<tonic::tra
 fn verified(s: &Server, index: &str) -> Json {
     let (status, v) = s.rpc("Vectors/Verify", &json!({"index": index}), None);
     assert_eq!(status, 200, "{v}");
-    v["vectors"].clone()
+    // The JSON mapping leaves a zero count out.
+    json!(v["vectors"].as_str().unwrap_or("0"))
 }
 
 #[test]
@@ -2118,6 +2119,30 @@ fn a_bulk_load_fills_an_empty_index_over_grpc_and_http() {
     let (_, e) = post(ndjson(&[mixed]).as_bytes());
     assert_eq!(e["code"].as_str(), Some("InvalidArgument"), "{e}");
     assert_eq!(verified(&s, "ix3"), json!("2"));
+    // A vector of another dimension in a later message (ai1249's M1): the server ends the
+    // input there, so the vectors before it are written and searchable, not dropped with
+    // the crate's waiting batches.
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["name"] = json!("ix4");
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let mut second = bulk_message("", 0, 50, 12, 2);
+    second.items[10] = bulk_message("", 0, 60, 1, 3).items.remove(0);
+    let (_, e) = post(ndjson(&[bulk_message("ix4", 62, 0, 50, 2), second]).as_bytes());
+    assert_eq!(e["code"].as_str(), Some("InvalidArgument"), "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("vectors before it were loaded"),
+        "{e}"
+    );
+    assert_eq!(verified(&s, "ix4"), json!("60"));
+    let (_, r) = s.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix4", "query": f32_query(&[59.0, 0.0]), "k": 1}),
+        None,
+    );
+    assert_eq!(hit_ids(&r), [b64(b"v00059")]);
     // Every message's budget came back.
     assert_eq!(
         s.shared.router.service.inflight_available(),
@@ -2225,6 +2250,62 @@ fn a_slow_loader_holds_back_a_fast_client() {
     )
     .unwrap();
     assert_eq!(verified(&s, "ix2"), json!("1"));
+}
+
+#[test]
+fn a_shutdown_stops_a_running_load_between_messages() {
+    // The coordinator on #1580: a load can't hold the server past its grace period. Here
+    // the client sends one message, then nothing: the loader waits for the next, and the
+    // shutdown wakes it. The load ends with what it took, and its client hears Closed.
+    let s = Server::start("", limits());
+    assert_eq!(
+        s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
+            .0,
+        200
+    );
+    let messages = tonic::codegen::tokio_stream::StreamExt::chain(
+        tonic::codegen::tokio_stream::iter(vec![bulk_message("ix", 100, 0, 10, 2)]),
+        tonic::codegen::tokio_stream::pending(),
+    );
+    let mut client = vectors_client(&s);
+    let load = s
+        .runtime
+        .as_ref()
+        .unwrap()
+        .spawn(async move { client.bulk_load(messages).await });
+    let bulk = &s.shared.router.service.bulk;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while bulk.gauges.vectors.load(Ordering::Relaxed) < 10 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the load never took the message"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    bulk.stop();
+    let err = s.block_on(load).unwrap().unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert!(err.message().contains("interrupted"), "{err:?}");
+    assert_eq!(verified(&s, "ix"), json!("10"), "what it took is loaded");
+    assert_eq!(bulk.gauges.phase.load(Ordering::Relaxed), 0, "no load");
+    // No load starts once the server is stopping.
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["name"] = json!("ix2");
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let mut client = vectors_client(&s);
+    let err = s
+        .block_on(
+            client.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+                "ix2", 1, 0, 1, 2,
+            )])),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert_eq!(verified(&s, "ix2"), json!("0"));
+    assert_eq!(
+        s.shared.router.service.inflight_available(),
+        limits().inflight_bytes
+    );
 }
 
 // ---- Feed.Subscribe (D313 ticket 5, R2) ----

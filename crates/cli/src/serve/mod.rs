@@ -232,7 +232,14 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
-        listener::serve(listener, tls, http::router(Arc::clone(&shared)), shutdown_signal(), Duration::from_millis(args.shutdown_grace_ms)).await;
+        // At the signal, a running bulk load stops at its next message, so it ends within the
+        // grace period (the coordinator on #1580).
+        let stopping = Arc::clone(&shared);
+        let signal = async move {
+            shutdown_signal().await;
+            stopping.router.service.bulk.stop();
+        };
+        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms)).await;
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));

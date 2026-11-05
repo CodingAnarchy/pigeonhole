@@ -152,27 +152,49 @@ fn batch(
     })
 }
 
-/// The production loader: `bulk_load_*` for the first vector's element type. A vector of
-/// another type ends the input, as the crate does for one of another shape: the vectors
-/// before it are loaded, and the call fails with `InvalidArgument`.
+/// The production loader: `bulk_load_*` for the first vector's element type.
+///
+/// **Every failure leaves the index loaded up to the vector that failed** (ai1249's M1 on
+/// #1580). Each vector is checked against the index's spec here, by the crate's rule, before
+/// the crate sees it: a vector of another element type or dimension, or of another type than
+/// the first, ends the input there. The crate then writes and rebalances everything before
+/// it, as for a stream that ended, and the call fails with `InvalidArgument`. (The crate's
+/// own check would return at once instead, dropping the batches still waiting and skipping
+/// the rebalance.)
 pub(crate) fn load(
     index: &Index,
     expected: u64,
     input: &mut dyn Iterator<Item = Item>,
 ) -> Result<BulkStats, ApiError> {
-    let mut input = input.peekable();
-    let mixed = std::cell::Cell::new(false);
+    let spec = index.spec();
+    let refused = std::cell::RefCell::new(None::<String>);
+    let mut input = input
+        .map_while(|(id, e)| match misfit(&spec, &e) {
+            None => Some((id, e)),
+            Some(why) => {
+                *refused.borrow_mut() = Some(why);
+                None
+            }
+        })
+        // Fused: the crate reads on after its sample ends, and must not get past the misfit.
+        .fuse()
+        .peekable();
     macro_rules! typed {
         ($variant:ident, $load:ident) => {
             index.$load(
                 expected,
-                input.by_ref().map_while(|(id, e)| match e {
-                    Elements::$variant(x) => Some((id, x)),
-                    _ => {
-                        mixed.set(true);
-                        None
-                    }
-                }),
+                input
+                    .by_ref()
+                    .map_while(|(id, e)| match e {
+                        Elements::$variant(x) => Some((id, x)),
+                        _ => {
+                            *refused.borrow_mut() = Some(
+                                "a BulkLoad's vectors all have the first one's element type".into(),
+                            );
+                            None
+                        }
+                    })
+                    .fuse(),
             )?
         };
     }
@@ -185,13 +207,35 @@ pub(crate) fn load(
         Some((_, Elements::F16(_))) => typed!(F16, bulk_load_f16),
         Some((_, Elements::Bf16(_))) => typed!(Bf16, bulk_load_bf16),
     };
-    if mixed.get() {
-        return Err(ApiError::invalid(
-            "a BulkLoad's vectors all have the first one's element type; the vectors before \
-             the first of another were loaded",
-        ));
+    drop(input);
+    if let Some(why) = refused.into_inner() {
+        return Err(ApiError::invalid(format!(
+            "{why}; the vectors before it were loaded"
+        )));
     }
     Ok(stats)
+}
+
+/// Why `e` doesn't fit an index of `spec`, by the crate's rule (`Input::check`): its element,
+/// or `f32` into a half index, and its dimension (a bit vector's is 8 per byte).
+fn misfit(spec: &pigeonhole::VectorSpec, e: &Elements) -> Option<String> {
+    use pigeonhole::Element as E;
+    let (element, dim) = match e {
+        Elements::F32(x) => (E::F32, x.len()),
+        Elements::I8(x) => (E::I8, x.len()),
+        Elements::Bits(x) => (E::Bit, 8 * x.len()),
+        Elements::F16(x) => (E::F16, x.len()),
+        Elements::Bf16(x) => (E::BF16, x.len()),
+    };
+    let fits = element == spec.element()
+        || (element == E::F32 && matches!(spec.element(), E::F16 | E::BF16));
+    (!fits || dim != spec.dim() as usize).then(|| {
+        format!(
+            "the index holds vectors of {} {:?}, not {dim} {element:?}",
+            spec.dim(),
+            spec.element()
+        )
+    })
 }
 
 /// A running load's gauges (B3): its phase, and the vectors and message bytes handed to it.
@@ -215,6 +259,9 @@ pub(crate) struct BulkLoads {
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Set by `close` under `thread`'s lock: no load starts after it.
     closed: AtomicBool,
+    /// Set by `stop` when the server starts shutting down: a running load stops at its next
+    /// message, and no load starts.
+    stopping: Arc<Stop>,
     pub(crate) gauges: Arc<Gauges>,
 }
 
@@ -234,6 +281,7 @@ impl Default for BulkLoads {
             placement: None,
             thread: Mutex::new(None),
             closed: AtomicBool::new(false),
+            stopping: Arc::default(),
             gauges: Arc::default(),
         }
     }
@@ -263,6 +311,10 @@ impl BulkLoads {
         let placement = self.placement.clone();
         let gauges = Arc::clone(&self.gauges);
         let (expected, rx) = (op.expected, op.input);
+        let stopping = Arc::clone(&self.stopping);
+        if stopping.flag.load(Ordering::Acquire) {
+            return Err(closed());
+        }
         {
             let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
             if self.closed.load(Ordering::Acquire) {
@@ -285,6 +337,7 @@ impl BulkLoads {
                             failed: None,
                             ended: false,
                             gauges: &gauges,
+                            stopping: &stopping,
                         };
                         let r = loader(&index, expected, &mut input);
                         // The loader's own failure first; else the stream's.
@@ -306,9 +359,26 @@ impl BulkLoads {
             .unwrap_or_else(|_| Err(ApiError::internal("the bulk load's thread ended early")))
     }
 
+    /// Stops a running load at its next message and refuses new ones: called when the
+    /// server starts shutting down, so a load ends within the grace period and its client
+    /// hears `Closed` ("interrupted"). The load writes and rebalances what it took first.
+    pub(crate) fn stop(&self) {
+        self.stopping.flag.store(true, Ordering::Release);
+        let waker = self
+            .stopping
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
     /// Stops new loads and waits for a running one: called at shutdown, once the front-ends
     /// are gone (so a load's input has ended), before the indexes and the database close.
     pub(crate) fn close(&self) {
+        self.stop();
         let thread = {
             let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
             self.closed.store(true, Ordering::Release);
@@ -329,6 +399,34 @@ struct Input<'g> {
     failed: Option<ApiError>,
     ended: bool,
     gauges: &'g Gauges,
+    stopping: &'g Stop,
+}
+
+/// The shutdown flag, and the waker of a loader waiting for its next message. The loader
+/// can't be woken through the channel: the front-end holds its one slot while it waits for
+/// the client (the pump reserves room before it reads).
+#[derive(Default)]
+struct Stop {
+    flag: AtomicBool,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+/// Wakes the loader's thread from `park`.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// What the loader's wait for its next message ends with.
+enum Next {
+    Msg(Msg),
+    /// The front-end went away.
+    Gone,
+    /// The server is shutting down.
+    Stopped,
 }
 
 impl Iterator for Input<'_> {
@@ -345,24 +443,54 @@ impl Iterator for Input<'_> {
             if self.ended {
                 return None;
             }
-            match self.rx.blocking_recv() {
-                Some(Msg::Batch(b)) => {
+            match self.wait() {
+                // Between messages: a shutdown stops the load here.
+                Next::Stopped => self.end(Some(ApiError::from_code(
+                    pigeonhole::ErrorCode::Closed,
+                    "the server is shutting down: the load was interrupted, and the vectors \
+                     before were loaded",
+                ))),
+                Next::Msg(Msg::Batch(b)) => {
                     let g = self.gauges;
                     g.vectors.fetch_add(b.items.len() as u64, Ordering::Relaxed);
                     g.bytes.fetch_add(b.bytes, Ordering::Relaxed);
                     self.current = b.items.into_iter();
                     self.held = b.budget;
                 }
-                Some(Msg::End) => self.end(None),
-                Some(Msg::Failed(e)) => self.end(Some(e)),
+                Next::Msg(Msg::End) => self.end(None),
+                Next::Msg(Msg::Failed(e)) => self.end(Some(e)),
                 // The front-end went away without ending the stream: its client is gone.
-                None => self.end(Some(ApiError::invalid("the load's stream broke off"))),
+                Next::Gone => self.end(Some(ApiError::invalid("the load's stream broke off"))),
             }
         }
     }
 }
 
 impl Input<'_> {
+    /// The next message, or the shutdown flag, whichever comes first: the channel polled on
+    /// this thread, which parks until the front-end sends or `stop` wakes it. The waker is
+    /// registered before the flag is read, so a `stop` in between is seen.
+    fn wait(&mut self) -> Next {
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            *self
+                .stopping
+                .waker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+            if self.stopping.flag.load(Ordering::Acquire) {
+                return Next::Stopped;
+            }
+            match self.rx.poll_recv(&mut cx) {
+                std::task::Poll::Ready(Some(m)) => return Next::Msg(m),
+                std::task::Poll::Ready(None) => return Next::Gone,
+                // A spurious unpark only loops.
+                std::task::Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
     fn end(&mut self, failed: Option<ApiError>) {
         self.ended = true;
         self.failed = failed;
