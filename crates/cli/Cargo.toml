@@ -82,6 +82,8 @@ pigeonhole-format = { workspace = true }
 # `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
 ureq = { version = "3.5", default-features = false, features = ["json"] }
+# `serve`'s idle-limit tests on a paused clock, so a slow runner can't fire a deadline (#1531).
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
