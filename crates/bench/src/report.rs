@@ -573,6 +573,11 @@ pub struct FeedReport {
     pub expired: u64,
     /// Other errors subscribers saw.
     pub errors: u64,
+    /// Subscribers whose drain after the phase hit its 30 s bound before they covered the
+    /// phase's last commit, every subscriber counted: their rows miss the phase's tail, so
+    /// a latency row with any is biased low.
+    #[serde(default)]
+    pub drain_timeouts: u64,
     /// The feed's own syncs (`EngineMetrics::feed_background_syncs`).
     pub background_syncs: u64,
     /// Group syncs (`EngineMetrics::group_syncs`), feed or not.
@@ -585,6 +590,11 @@ pub struct FeedReport {
     pub retained_wal_peak: u64,
     /// The most blob bytes held for the history, sampled with it.
     pub held_blob_peak: u64,
+    /// Milliseconds from the phase's end until every subscriber had covered its last commit
+    /// (at most 30 s): about one *T_sync* plus a sync for a durable subscriber, so a slow
+    /// sync shows here (#1553's Windows run).
+    #[serde(default)]
+    pub drain_ms: u64,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
