@@ -658,7 +658,7 @@ impl Feed {
             let next = match self.reader.wait(left) {
                 Ok(next) => next,
                 Err(e) => {
-                    self.read_error(e, true)?;
+                    self.read_error(e)?;
                     continue;
                 }
             };
@@ -687,7 +687,7 @@ impl Feed {
             let next = match self.reader.try_next() {
                 Ok(next) => next,
                 Err(e) => {
-                    self.read_error(e, true)?;
+                    self.read_error(e)?;
                     continue;
                 }
             };
@@ -716,15 +716,15 @@ impl Feed {
             let next = match self.reader.poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(next)) => next,
-                // `Unsupported` in a reader process: not the feed's failure, so not kept. Tested
-                // before a recovery's swap (`read_error`), which a reader process never makes.
+                // The old engine failing under a recovery's swap: follow it and look again.
+                Poll::Ready(Err(_)) if swapped(&self.db, self.generation) => continue,
+                // `Unsupported` in a reader process: not the feed's failure, so not kept.
                 Poll::Ready(Err(e @ pigeonhole_engine::Error::Unsupported(_))) => {
                     return Poll::Ready(Err(e.into()));
                 }
-                Poll::Ready(Err(e)) => match self.read_error(e, false) {
-                    Ok(()) => continue,
-                    Err(e) => return Poll::Ready(Err(e)),
-                },
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(fail(&mut self.out.failed, e.into())));
+                }
             };
             return match step(&mut self.out, &self.db, self.generation, next, events) {
                 Ok(Step::Ready) => Poll::Ready(Ok(())),
@@ -736,11 +736,11 @@ impl Feed {
         }
     }
 
-    /// An error from the engine's reader: `Ok` to look again, after a reader process's writer
-    /// restarted (followed from the token, `follow_restart`) or under a recovery's swap (the
-    /// old engine failing: follow the recovery); else the feed's failure, kept.
-    fn read_error(&mut self, e: pigeonhole_engine::Error, follow_restart: bool) -> Result<()> {
-        if follow_restart && matches!(e, pigeonhole_engine::Error::SnapshotExpired) {
+    /// An error from the engine's reader in a blocking call: `Ok` to look again, after a
+    /// reader process's writer restarted (followed from the token) or under a recovery's swap
+    /// (the old engine failing: follow the recovery); else the feed's failure, kept.
+    fn read_error(&mut self, e: pigeonhole_engine::Error) -> Result<()> {
+        if matches!(e, pigeonhole_engine::Error::SnapshotExpired) {
             return self.resubscribe();
         }
         if swapped(&self.db, self.generation) {
