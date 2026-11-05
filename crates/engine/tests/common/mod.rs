@@ -575,11 +575,14 @@ pub struct Stats {
     /// Reads at a held snapshot checked against the model rebuilt for its view, because a
     /// compaction published after it purged something (`World::model_at`).
     pub reads_at_older_views: usize,
-    /// Puts in submitted commits with a value above the inline limit (`LARGE_VALUE`), into
-    /// families whose values may be separated (not an aggregate family's). Counted at submit,
-    /// where the engine separates them (`commit_separations`), so a conditional commit whose
-    /// condition fails pairs its separation with its put (seed 89 of the counters sweep on
-    /// #1566: 4 separations for 1 acknowledged large put).
+    /// Puts with a value above the inline limit (`LARGE_VALUE`), into families whose values
+    /// may be separated (not an aggregate family's), in commits whose submit the engine
+    /// accepted. That's where it separates them (`commit_separations`), so a conditional
+    /// commit whose condition fails still pairs its separation with its put (the counters
+    /// sweep's seed 89 on #1566: 4 separations for 1 acknowledged large put). A submit that is
+    /// refused, or fails on a crash before its blob is written, counts neither. The separation
+    /// counter is read at once after each accepted submit (the separation happens inside it),
+    /// so a crash before the next look can't lose it (seed 238: 2 puts and 0 separations).
     pub large_puts: usize,
     /// Values the engine separated into blob files at commit time (#230), summed across
     /// reopens (`Engine::commit_separations`): the path a deferred run must take as a plain
@@ -4773,7 +4776,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
-        self.stats.large_puts += large_puts(&ops);
+        let large = large_puts(&ops);
         self.trace.push(format!(
             "commit {durability:?} ts={now} shards={shards:?}{} [{}]{}",
             if alone { "" } else { " (batched)" },
@@ -4797,6 +4800,8 @@ impl World {
         };
         match self.store().engine.submit(batch, Some(durability)) {
             Ok(pc) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
                 self.in_flight.push(InFlight {
                     pending: Pending::Poll(pc),
                     commit,
@@ -4885,7 +4890,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
-        self.stats.large_puts += large_puts(&ops);
+        let large = large_puts(&ops);
         self.stats.returning += 1;
         self.trace.push(format!(
             "returning {durability:?} ts={now} {}{}{} [{}]{}",
@@ -4914,7 +4919,11 @@ impl World {
             })
             .collect();
         let pending = match engine.submit_returning_previous(batch, Some(durability), request) {
-            Ok(p) => Pending::Returning(p),
+            Ok(p) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                Pending::Returning(p)
+            }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
         self.in_flight.push(InFlight {
@@ -5221,7 +5230,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
-        self.stats.large_puts += large_puts(&ops);
+        let large = large_puts(&ops);
         let fam_id = self.store().family_ids[&(table.clone(), family.clone())];
         let engine = Arc::clone(&self.store().engine);
         let table_id = self.store().tables[&table].id;
@@ -5280,7 +5289,11 @@ impl World {
             }
         };
         let pending = match submitted {
-            Ok(p) => p,
+            Ok(p) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                p
+            }
             Err(e) => Pending::Ready(Some(Outcome::Cas(Err(e)))),
         };
         self.in_flight.push(InFlight {
@@ -5323,7 +5336,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
-        self.stats.large_puts += large_puts(&ops);
+        let large = large_puts(&ops);
         let store = self.store.as_ref().expect("store open");
         let mut txn = match store.engine.begin() {
             Ok(t) => t,
@@ -5508,7 +5521,11 @@ impl World {
             if armed { " (crash armed)" } else { "" }
         ));
         let pending = match txn.submit(Some(durability)) {
-            Ok(pc) => Pending::Poll(pc),
+            Ok(pc) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                Pending::Poll(pc)
+            }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
         // Every shard owning a read row is a participant with an empty PREPARE (D91).
