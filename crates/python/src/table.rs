@@ -1250,6 +1250,9 @@ fn condition_column(c: &pigeonhole::Condition) -> Option<Column> {
         | C::Value {
             family, qualifier, ..
         } => Some((family.clone(), qualifier.clone())),
+        // `Condition` is non-exhaustive. A variant added later that reads a column must be
+        // named here, or `current` treats its column as unasked: `InvalidArgument`, not
+        // `ReturnedValueError` (ai1249's nit on #1579).
         _ => None,
     }
 }
