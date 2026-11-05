@@ -8,10 +8,13 @@
 //!   number of clients, and the WAL is read once per hub. Hubs are keyed by the exact set,
 //!   never a union that grows: a wider feed resumed from a narrower token can miss the new
 //!   tables' commits its cursor had already passed (the reader filters as it reads).
-//! - **A client** is a task with a one-event channel to its connection. On the ring it takes
-//!   the entries after its position (each an `Arc`, so a send is a refcount), applies its
-//!   prefix, and encodes on its own task. A commit with no row under the prefix is passed
+//! - **A client** is a task with a buffered channel to its connection ([`CLIENT_EVENTS`],
+//!   [`CLIENT_BYTES`]). On the ring it takes the entries after its position (each an `Arc`,
+//!   so a send is a refcount); with a prefix, it filters and encodes on its own task. A commit with no row under the prefix is passed
 //!   over, as the engine's prefix feed does, and later covered by a progress event.
+//! - **Encoded once:** each entry is encoded by the hub for the clients with no prefix, and
+//!   those clients queue the entry itself. gRPC writes its bytes as they are (`Out::encode`);
+//!   the HTTP feed still renders JSON per subscriber (`Out::into_proto`).
 //! - **Off the ring:** a client that starts from a token, a snapshot or the oldest commit,
 //!   that falls off the ring's tail, or whose hub fails, reads its own `FeedStream` (same
 //!   tables, no prefix, so it sees the hub's exact commit sequence) from its own last token.
@@ -26,7 +29,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -105,38 +108,41 @@ pub(crate) struct Entry {
     /// The hub feed's position just before it (`Feed::position`): every commit of the spec
     /// at or below it came before this one.
     prev: u64,
+    /// Its share of `--feed-ring-bytes`: the commit, its token and `encoded`.
     bytes: usize,
     /// The commit as a client with no prefix gets it, encoded once for every such client on
-    /// the ring: `None` if it has no change to send. Filled by the first client to send it.
-    encoded: OnceLock<Option<Bytes>>,
+    /// the ring: `None` if it has no change to send. Encoded by the hub, before the entry is
+    /// pushed, so no client waits on another's encode (perf287's P2 on #1541).
+    encoded: Option<Bytes>,
 }
 
 impl Entry {
-    fn new(commit: Commit, token: Bytes, prev: u64, bytes: usize) -> Self {
+    /// An entry for `commit`, encoded for clients with no prefix and sized with that
+    /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
+    fn new(commit: Commit, token: Bytes) -> Self {
+        let encoded = filtered(&commit, b"")
+            .map(|c| prost::Message::encode_to_vec(&commit_event(token.clone(), c)).into());
+        let bytes = entry_bytes(&commit, &token) + encoded.as_ref().map_or(0, Bytes::len);
         Entry {
             commit,
             token,
-            prev,
+            prev: 0,
             bytes,
-            encoded: OnceLock::new(),
+            encoded,
         }
     }
 
     /// The `FeedEvent` a client with no prefix sends for this commit, encoded.
     fn encoded(&self) -> Option<&Bytes> {
-        self.encoded
-            .get_or_init(|| {
-                filtered(&self.commit, b"")
-                    .map(|c| prost::Message::encode_to_vec(&self.event(c)).into())
-            })
-            .as_ref()
+        self.encoded.as_ref()
     }
+}
 
-    fn event(&self, c: proto::FeedCommit) -> proto::FeedEvent {
-        proto::FeedEvent {
-            token: self.token.clone(),
-            event: Some(proto::feed_event::Event::Commit(c)),
-        }
+/// A commit event: `c` with the token right after it.
+fn commit_event(token: Bytes, c: proto::FeedCommit) -> proto::FeedEvent {
+    proto::FeedEvent {
+        token,
+        event: Some(proto::feed_event::Event::Commit(c)),
     }
 }
 
@@ -200,13 +206,15 @@ impl Hub {
 
     fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
         let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
-        let bytes = entry_bytes(&commit, &token);
+        // Encoded here, on the hub's task and outside the ring's lock.
+        let seqno = commit.seqno();
+        let mut entry = Entry::new(commit, token.clone());
+        let bytes = entry.bytes;
         let mut r = self.ring();
-        let prev = r.passed;
-        r.passed = position.max(commit.seqno());
-        r.passed_token = token.clone();
-        r.entries
-            .push_back(Arc::new(Entry::new(commit, token, prev, bytes)));
+        entry.prev = r.passed;
+        r.passed = position.max(seqno);
+        r.passed_token = token;
+        r.entries.push_back(Arc::new(entry));
         r.bytes += bytes;
         // Always keep the newest: a client at the head needs its boundary.
         while r.bytes > limit && r.entries.len() > 1 {
@@ -788,14 +796,8 @@ impl Client {
             return Ok(());
         }
         if let Some(c) = filtered(commit, &self.prefix) {
-            self.send(
-                Out::Event(proto::FeedEvent {
-                    token: token.clone(),
-                    event: Some(proto::feed_event::Event::Commit(c)),
-                }),
-                pos,
-            )
-            .await?;
+            self.send(Out::Event(commit_event(token.clone(), c)), pos)
+                .await?;
         }
         Ok(())
     }
@@ -958,7 +960,7 @@ impl Out {
             Out::Event(e) => e,
             Out::Shared(e) => {
                 let c = filtered(&e.commit, b"").unwrap_or_default();
-                e.event(c)
+                commit_event(e.token.clone(), c)
             }
         }
     }
@@ -1063,8 +1065,10 @@ mod tests {
         };
         let mut prev = start;
         for c in commits {
-            r.entries
-                .push_back(Arc::new(Entry::new(c.clone(), Bytes::new(), prev, 0)));
+            r.entries.push_back(Arc::new(Entry {
+                prev,
+                ..Entry::new(c.clone(), Bytes::new())
+            }));
             prev = c.seqno();
         }
         for _ in 0..evicted {
@@ -1213,6 +1217,52 @@ mod tests {
         });
         drop(t);
         drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shared_entry_is_the_exact_encoding_of_the_event_a_client_with_no_prefix_covers() {
+        // simp724's T1 on #1541: byte for byte, built here on its own, not through the
+        // entry's helpers.
+        let (commits, db, dir) = commits("encoded", 3);
+        for c in &commits {
+            let token = Bytes::from_static(b"the token right after it");
+            let e = Arc::new(Entry::new(c.clone(), token.clone()));
+            let want = prost::Message::encode_to_vec(&proto::FeedEvent {
+                token: token.clone(),
+                event: Some(proto::feed_event::Event::Commit(proto::FeedCommit {
+                    seqno: c.seqno(),
+                    timestamp: c.timestamp(),
+                    changes: c
+                        .changes()
+                        .iter()
+                        .map(|ch| proto::Change {
+                            table: ch.table().to_owned(),
+                            family: ch.family().to_owned(),
+                            kind: change_kind(ch.kind()) as i32,
+                            row: ch.row().to_vec().into(),
+                            qualifier: ch.qualifier().to_vec().into(),
+                            timestamp: ch.timestamp(),
+                            value: ch.value().map(convert::value_out),
+                        })
+                        .collect(),
+                })),
+            });
+            assert_eq!(e.encoded().map(|b| &b[..]), Some(&want[..]));
+            let mut wire = Vec::new();
+            Out::Shared(Arc::clone(&e)).encode(&mut wire).unwrap();
+            assert_eq!(wire, want, "the gRPC codec writes those bytes");
+            assert_eq!(Out::Shared(Arc::clone(&e)).encoded_len(), want.len());
+            // Counted in the ring's budget (R1, P1).
+            assert_eq!(e.bytes, entry_bytes(c, &token) + want.len());
+            let decoded = <proto::FeedEvent as prost::Message>::decode(&want[..]).unwrap();
+            assert_eq!(
+                Out::Shared(e).into_proto(),
+                decoded,
+                "and HTTP sees that event"
+            );
+        }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -360,6 +360,7 @@ u1   profile  name       1761030000000000  Ada
   - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
   - Every event's `token` resumes right after it, from any server process. A stream that delivers nothing for about 10 s, while its position moved past commits its `prefix` skipped, sends a `progress` event with the new token.
   - Streams on the same tables share one subscription in the server: the database wakes and reads for it once, whatever the number of subscribers.
+  - **Over gRPC, each commit is encoded once for every stream with no `prefix`,** and those streams send the same bytes. A stream with a `prefix` gets its own encoding of the rows that match. The HTTP feed (NDJSON or SSE) still renders each event as JSON per subscriber, so many subscribers cost more over HTTP than over gRPC.
   - **Each stream buffers up to 64 events, or 256 KiB of encoded events, whichever is less,** that its client hasn't taken yet. An event larger than 256 KiB is still sent, alone. A server holds at most `--max-streams` × 256 KiB of these buffers (64 MiB at the default 256 streams). This memory is separate from `--feed-ring-bytes` and `--inflight-bytes`. A client that takes nothing fills its buffer; after `--stream-idle-ms` more it gets the buffered events, then `DeadlineExceeded`, and resumes from the last event's token.
 - **Limits:**
   - `--max-request-bytes` (16 MiB): the largest request.
