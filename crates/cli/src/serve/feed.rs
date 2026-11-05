@@ -118,9 +118,10 @@ impl Ring {
 
     /// Where a client at position `seqno` rejoins: the index of the first entry after it.
     /// The client has covered every commit of the spec up to `seqno` (its own stream's
-    /// `position`), and the ring holds every one after the position before its first entry. So it rejoins only if that position is at most `seqno` (nothing
-    /// between them was evicted) and the hub's feed has passed `seqno` (nothing it will add
-    /// is one the client has): feed1248's (2) on ticket 5.
+    /// `position`), and the ring holds every one after the position before its first entry.
+    /// So it rejoins only if that position is at most `seqno` (nothing between them was
+    /// evicted) and the hub's feed has passed `seqno` (nothing it will add is one the client
+    /// has): feed1248's (2) on ticket 5.
     fn rejoin_at(&self, seqno: u64) -> Option<u64> {
         let covered_from = self.entries.front().map_or(self.start_seqno, |e| e.prev);
         if covered_from > seqno || self.passed < seqno {
@@ -385,6 +386,15 @@ impl Feeds {
         on_end: impl FnOnce(Option<&ApiError>) + Send + 'static,
     ) -> Result<FeedEvents, ApiError> {
         let hub = self.hub(&spec.tables, spec.visible)?;
+        // A Now start's place on the ring, then the database's seqno (simp724's F5 on
+        // #1518), in that order: everything at or past that head is newer than its `passed`,
+        // and whatever of it is at or below `after` predates the subscribe and is passed over.
+        // Taken here, not when the client's task first runs, so a commit pushed meanwhile
+        // (the caller's own write, say) is still the client's.
+        let ring_start = matches!(spec.start, Start::Now).then(|| {
+            let r = hub.ring();
+            (r.head(), r.passed, r.passed_token.clone())
+        });
         let after = match spec.start {
             Start::Now if spec.visible => self.db.snapshot()?.seqno(),
             Start::Now => self.db.durable_snapshot()?.seqno(),
@@ -405,17 +415,17 @@ impl Feeds {
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
         // client waiting for a catch-up slot holds bytes, not a view that pins memtables
         // (perf287's K1 on #1518).
-        let first = match spec.start {
-            Start::Now => None,
-            start => {
+        let begin = match (spec.start, ring_start) {
+            (Start::Now, Some((at, seqno, token))) => Begin::Ring { at, seqno, token },
+            (start, _) => {
                 let feed = open(&client.tables, client.visible, &start)?;
                 drop(start);
                 let token = feed.token();
-                Some((feed, token))
+                Begin::Own(Box::new(feed), token)
             }
         };
         tokio::spawn(async move {
-            let outcome = match client.run(first).await {
+            let outcome = match client.run(begin).await {
                 // The client went away: not a failure.
                 Err(_) if client.tx.is_closed() => Ok(()),
                 r => r,
@@ -457,6 +467,15 @@ fn open(tables: &[Table], visible: bool, start: &Start) -> Result<pigeonhole::Fe
 /// A feed stream's next item, as a future.
 async fn next(stream: &mut FeedStream) -> Option<pigeonhole::Result<Commit>> {
     std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
+}
+
+/// Where a client starts, as `subscribe` found it.
+enum Begin {
+    /// On the ring at `at`, its position `seqno` and the token with it.
+    Ring { at: u64, seqno: u64, token: Vec<u8> },
+    /// On its own feed (opened to check the start), and that start as a token. Boxed: the
+    /// feed is large, and a client begins once.
+    Own(Box<pigeonhole::Feed>, FeedToken),
 }
 
 /// How often a client on its own stream looks at its hub's ring for a place to rejoin.
@@ -502,15 +521,15 @@ impl Client {
         Arc::clone(&self.hub.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    async fn run(&self, first: Option<(pigeonhole::Feed, FeedToken)>) -> Result<(), ApiError> {
+    async fn run(&self, begin: Begin) -> Result<(), ApiError> {
         let mut pos;
-        let mut source = match first {
-            Some((feed, start)) => {
+        let mut source = match begin {
+            Begin::Own(feed, start) => {
                 // Opened at subscribe so a bad start fails the call. Waiting for a catch-up
                 // slot, it would hold an engine reader (and its shard wakers): drop it, and
                 // open it again from its start token once there's a slot.
                 let (feed, slot) = match Arc::clone(&self.feeds.catch_up).try_acquire_owned() {
-                    Ok(slot) => (feed, slot),
+                    Ok(slot) => (*feed, slot),
                     Err(_) => {
                         drop(feed);
                         let slot = self.catch_up_slot().await?;
@@ -532,17 +551,14 @@ impl Client {
                 };
                 Source::Own(Box::new(stream), slot)
             }
-            None => {
-                let hub = self.hub();
-                let r = hub.ring();
+            Begin::Ring { at, seqno, token } => {
                 pos = Position {
-                    seqno: Some(r.passed),
-                    token: r.passed_token.clone(),
-                    sent: Vec::new(),
+                    seqno: Some(seqno),
+                    sent: token.clone(),
+                    token,
                     last_event: Instant::now(),
                 };
-                pos.sent = pos.token.clone();
-                Source::Ring(r.head())
+                Source::Ring(at)
             }
         };
         loop {
@@ -562,9 +578,13 @@ impl Client {
             .stats
             .catch_up_waits
             .fetch_add(1, Ordering::Relaxed);
-        sem.acquire_owned()
-            .await
-            .map_err(|_| ApiError::internal("the catch-up slots closed"))
+        tokio::select! {
+            // A client that leaves while queued gives up its place.
+            () = self.tx.closed() => Err(ApiError::internal("the client went away")),
+            slot = sem.acquire_owned() => {
+                slot.map_err(|_| ApiError::internal("the catch-up slots closed"))
+            }
+        }
     }
 
     /// Reads the ring from `at` until the client must leave it: fallen off the tail, or the
@@ -603,6 +623,9 @@ impl Client {
                 let quiet =
                     tokio::time::sleep_until((pos.last_event + self.feeds.limits.quiet).into());
                 tokio::select! {
+                    // A client that went away ends here, even one whose prefix never
+                    // matches (it would otherwise hold its stream slot until a send failed).
+                    () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
                     changed = head.changed() => {
                         if changed.is_err() {
                             return Err(ApiError::internal("the feed's hub ended"));
@@ -664,6 +687,7 @@ impl Client {
             // client gives its catch-up slot back as soon as it can rejoin.
             let tick = tokio::time::sleep(REJOIN_TICK.min(self.feeds.limits.quiet));
             tokio::select! {
+                () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
                 item = next(&mut stream) => match item {
                     Some(Ok(commit)) => {
                         let token = stream.token().as_bytes().to_vec();
@@ -952,6 +976,62 @@ mod tests {
             assert!(feeds.stats.rejoined.load(Ordering::Relaxed) >= 1);
             assert_eq!(feeds.gauges().catching_up, 0);
             drop((a, b, first, second));
+        });
+        drop(t);
+        drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
+        // simp724's F5 on #1518, made deterministic: on a current-thread runtime the client's
+        // task can't run until the test awaits, so the ring gets the commit first. The start
+        // taken at subscribe still covers it; one read when the task first ran would not.
+        let (_, db, dir) = commits("now", 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(10),
+                stream_idle: Duration::from_secs(5),
+            },
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        rt.block_on(async {
+            let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            // The hub's own task stops; the test pushes for it.
+            hub.task.abort();
+            let mut direct = t.feed().open().unwrap();
+            let mut c = feeds
+                .subscribe(
+                    Spec {
+                        tables: vec![t.clone()],
+                        prefix: Vec::new(),
+                        visible: false,
+                        start: Start::Now,
+                    },
+                    Arc::clone(&slots).try_acquire_owned().unwrap(),
+                    |_| {},
+                )
+                .unwrap();
+            let n = t.mutate(b"x").put("f", b"q", b"v").commit().unwrap().seqno;
+            let commit = direct
+                .next(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .clone();
+            let token = direct.token().as_bytes().to_vec();
+            hub.push(commit, token, direct.position().seqno(), 1 << 20);
+            assert_eq!(seqnos(&mut c, Duration::from_secs(1)).await, [n]);
+            drop((c, hub));
         });
         drop(t);
         drop(rt);

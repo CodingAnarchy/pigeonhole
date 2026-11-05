@@ -1961,3 +1961,22 @@ fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
     }
     drop(u);
 }
+
+#[test]
+fn a_now_subscriber_gets_a_write_made_right_after_it_subscribed() {
+    // simp724's F5 on #1518: a Now start's position and its `after` are taken together at
+    // subscribe, so a commit pushed before the client's task first runs is still its.
+    let s = Server::start("", limits());
+    // A subscriber that keeps the hub warm.
+    let _keep = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"warm");
+    for i in 0..100u32 {
+        let row = format!("n{i:03}");
+        let mut c = direct_feed(&s, subscribe(&["t"], row.as_bytes()));
+        let n = write_row(&s, row.as_bytes());
+        let e = next_event(&s, &mut c, Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("round {i}: the write never arrived"))
+            .unwrap();
+        assert_eq!(commit_of(&e).map(|(s, _)| s), Some(n), "round {i}");
+    }
+}
