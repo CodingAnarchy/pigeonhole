@@ -483,6 +483,12 @@ pub(crate) struct Inner {
     /// primary assigns next, or silently diverge the mirror. Set at open, and by the first
     /// apply; promotion to a primary (a later change) clears it.
     replica: AtomicBool,
+    /// Set by `promote` (#1436, ICR 0125; simp724's P1), under the manifest exclusion, in the
+    /// catalog change that drops the state table: one way, it refuses every apply, state
+    /// store and `begin_replication` after it, so an apply racing the promote can't bring the
+    /// table, the bit or the gate back. In memory only: after a reopen the missing table
+    /// refuses them ("not a replica").
+    promoted: Arc<AtomicBool>,
     options: EngineOptions,
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
@@ -1613,6 +1619,19 @@ impl Engine {
             s.finish_replay();
         }
         if !no_writes {
+            // A promoted replica whose open came between its state table's drop and its bit's
+            // clearing (a crash): clear the bit now. Writer opens only, and never fatal
+            // (simp724 on #1436, ICR 0125).
+            let repaired = shared
+                .manifest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear_stale_replica_bit(&catalog, true);
+            if let Err(e) = repaired {
+                crate::shard::trace!("the stale replica bit's repair failed ({e}); next open");
+            }
+        }
+        if !no_writes {
             // Blob files a horizon held when the last session ended (no live bytes): held
             // again, against this session's heads, which is later than needed but never
             // earlier (D310).
@@ -1710,6 +1729,7 @@ impl Engine {
                     .table(pigeonhole_format::manifest::REPLICA_TABLE)
                     .is_some(),
             ),
+            promoted: Arc::new(AtomicBool::new(false)),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1842,6 +1862,7 @@ impl Engine {
             role: Role::Reader,
             read_only: true,
             replica: AtomicBool::new(false),
+            promoted: Arc::new(AtomicBool::new(false)),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -2000,6 +2021,36 @@ impl Engine {
         self.commit(batch, Some(Durability::GroupSync))
     }
 
+    /// Makes this database a replica (#1436, ICR 0125): creates the reserved state table
+    /// (flagging the file `ro_compat` bit 0, and refusing local writes from here, R6) and
+    /// stores `state` in it. `own_tables`: whether the database may already hold tables, as a
+    /// bootstrap copy of the primary does; the from-nothing first apply passes `false`, and a
+    /// table of the database's own then refuses it. Refused on a replica, and after `promote`.
+    pub fn begin_replication(&self, state: &[u8], own_tables: bool) -> Result<CommitInfo> {
+        self.inner.refuse_promoted()?;
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_some()
+        {
+            return Err(Error::InvalidArgument(
+                "already a replica: it has replication state".to_owned(),
+            ));
+        }
+        self.inner.ensure_replica_table(own_tables)?;
+        self.store_replication_state(state)
+    }
+
+    /// Turns a replica into a primary (#1436, ICR 0125) at what it applied last: drops the
+    /// state table and sets the one-way promoted state in one catalog change (an apply
+    /// racing it fails), then a second commit clears `ro_compat` bit 0 once the drop is
+    /// durable (FORMAT §8.2; an open after a crash between them clears it), then lifts R6's
+    /// refusal. `InvalidArgument` unless it is a replica.
+    pub fn promote(&self) -> Result<()> {
+        self.inner.promote()
+    }
+
     /// The replica's state cell, as the last apply stored it; `None` before the first.
     pub fn replication_state(&self) -> Result<Option<Vec<u8>>> {
         if self
@@ -2019,10 +2070,21 @@ impl Engine {
         Ok(cell.map(|c| c.stored().get(1..).unwrap_or_default().to_vec()))
     }
 
-    /// Appends the state cell to `batch`, creating the state table first if this is the
-    /// first apply.
+    /// Appends the state cell to `batch`. Only `begin_replication` creates the state table
+    /// (simp724's P1 on #1436): an apply on a database that isn't a replica, or was promoted,
+    /// is refused.
     fn push_replication_state(&self, batch: &mut WriteBatch, state: &[u8]) -> Result<()> {
-        self.inner.ensure_replica_table()?;
+        self.inner.refuse_promoted()?;
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_none()
+        {
+            return Err(Error::InvalidArgument(
+                "not a replica: no replication state (begin_replication starts one)".to_owned(),
+            ));
+        }
         let mut stored = Vec::with_capacity(1 + state.len());
         stored.push(pigeonhole_format::value::ValueTag::Bytes as u8);
         stored.extend_from_slice(state);
@@ -3299,6 +3361,14 @@ impl Engine {
     /// `Sync` one survives a power loss here; a `Buffered` or `None` one may not).
     pub fn backup_durable(&self, dest: &Path) -> Result<()> {
         self.backup_of(dest, true)
+    }
+
+    /// As [`Engine::backup`], of `snapshot` (#1436, ICR 0125): the copy holds exactly what the
+    /// snapshot sees, so a feed opened `from_snapshot` on the same snapshot starts where the
+    /// copy ends (a replica's bootstrap).
+    pub fn backup_at(&self, snapshot: &Snapshot, dest: &Path) -> Result<()> {
+        let _guard = self.inner.enter_maintenance()?;
+        crate::maintenance::backup(&self.inner.shared, snapshot.clone(), dest)
     }
 
     fn backup_of(&self, dest: &Path, durable: bool) -> Result<()> {
@@ -4687,7 +4757,7 @@ impl Inner {
     /// Creates a replica's reserved state table if it isn't there (D315 PR 3): its one family
     /// keeps one version, and its one tablet is reserved too. `flag_features` sets
     /// `ro_compat` bit 0 before the commit that creates it.
-    fn ensure_replica_table(&self) -> Result<()> {
+    fn ensure_replica_table(&self, own_tables: bool) -> Result<()> {
         use pigeonhole_format::manifest::{
             REPLICA_FAMILY, REPLICA_FAMILY_NAME, REPLICA_TABLE, REPLICA_TABLE_NAME, REPLICA_TABLET,
         };
@@ -4698,13 +4768,14 @@ impl Inner {
         self.replica.store(true, Ordering::Relaxed);
         let mut options = FamilyOptions::default();
         options.max_versions = 1;
-        self.catalog_change(move |catalog| {
+        let created = self.catalog_change(move |catalog| {
             if catalog.table(REPLICA_TABLE).is_some() {
                 return Ok(Vec::new());
             }
             // A table of the database's own made since the first apply's check (a local
-            // create racing it): no replica here (simp724's note (a) on #1562).
-            if catalog.tables().any(|t| !is_reserved_table(t.id)) {
+            // create racing it): no replica here (simp724's note (a) on #1562). A bootstrap
+            // copy (`own_tables`) holds the primary's tables.
+            if !own_tables && catalog.tables().any(|t| !is_reserved_table(t.id)) {
                 return Err(Error::InvalidArgument(
                     "a replica's first apply needs a database with no tables of its own".to_owned(),
                 ));
@@ -4727,7 +4798,47 @@ impl Inner {
                     end: None,
                 },
             ])
+        });
+        if created.is_err() && self.catalog().table(REPLICA_TABLE).is_none() {
+            // Refused or failed: not a replica after all.
+            self.replica.store(false, Ordering::Relaxed);
+        }
+        created.map(drop)
+    }
+
+    /// `ReadOnly` once promoted (simp724's P1 on #1436).
+    fn refuse_promoted(&self) -> Result<()> {
+        if self.promoted.load(Ordering::Relaxed) {
+            return Err(Error::InvalidArgument(
+                "promoted: this database is no longer a replica".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn promote(&self) -> Result<()> {
+        use pigeonhole_format::manifest::REPLICA_TABLE;
+        let tablets = self.catalog().tablet_ids_of(REPLICA_TABLE);
+        let promoted = Arc::clone(&self.promoted);
+        self.catalog_change(move |catalog| {
+            if catalog.table(REPLICA_TABLE).is_none() {
+                return Err(Error::InvalidArgument(
+                    "not a replica: nothing to promote".to_owned(),
+                ));
+            }
+            // Under the manifest exclusion, with the drop: an apply after this is refused,
+            // and one committed before it is the drop's to remove.
+            promoted.store(true, Ordering::Relaxed);
+            Ok(vec![Edit::DropTable {
+                table: REPLICA_TABLE,
+            }])
         })?;
+        self.shared.broadcast(|| ShardMsg::DropTablets {
+            tablets: tablets.clone(),
+        });
+        // A commit after the durable drop: its `flag_features` clears the stale bit.
+        self.catalog_change(|catalog| Ok(vec![catalog.counters_edit()]))?;
+        self.replica.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -4740,6 +4851,7 @@ impl Inner {
     }
 
     fn apply_catalog(&self, edits: &[Edit]) -> Result<()> {
+        self.refuse_promoted()?;
         let bad =
             |what: String| Error::InvalidArgument(format!("a replicated catalog change: {what}"));
         // A drop: as `drop_table` does it (its blob files, the shards' tablets).

@@ -1503,6 +1503,19 @@ impl Pigeonhole {
         })
     }
 
+    /// As [`backup`](Self::backup), of `snapshot` (#1436, ICR 0125): the copy holds exactly
+    /// what the snapshot sees, so a feed opened [`from_snapshot`](crate::FeedBuilder::from_snapshot)
+    /// on it starts where the copy ends (a replica's bootstrap). `SnapshotExpired` for a
+    /// snapshot of another engine (before a recovery). Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn backup_at(&self, snapshot: &Snapshot, dest: impl AsRef<Path>) -> Result<()> {
+        self.db.check_snapshot(snapshot)?;
+        self.engine()
+            .backup_at(&snapshot.inner, dest.as_ref())
+            .map_err(Error::from)
+    }
+
     /// Returns free space at the end of the file to the filesystem and reports the bytes
     /// released. The file never shrinks by itself: space freed by compaction or by deleting
     /// rows is reused by later writes, but the file keeps its length. Call this after a

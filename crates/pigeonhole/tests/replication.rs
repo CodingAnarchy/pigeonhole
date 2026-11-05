@@ -439,3 +439,98 @@ fn a_large_run_splits_by_bytes() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// The bootstrap handshake (#1436, ICR 0125): a backup of one durable snapshot and a feed of
+/// every table opened from that snapshot meet exactly. Catalog changes before the snapshot
+/// are in the copy, never replayed; those after arrive as events (simp724's P2 note).
+#[test]
+fn a_backup_and_a_feed_from_one_snapshot_bootstrap_a_replica() {
+    let vfs = SimVfs::new(40);
+    let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+    for step in 0..6 {
+        workload(&primary, step);
+    }
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/p/copy.phdb").unwrap();
+    let mut feed = primary.feed().from_snapshot(&snap).open().unwrap();
+    // The bootstrap's token: the feed's, before it delivers anything.
+    let start = feed.token();
+    drop(snap);
+    // After the snapshot: more commits, a table created and one dropped.
+    for step in 6..14 {
+        workload(&primary, step);
+    }
+    let replica = Pigeonhole::open("/p/copy.phdb", options(&vfs)).unwrap();
+    // A copy holds the primary's tables: the from-nothing first apply refuses it.
+    let events = ready(&mut feed);
+    assert!(
+        events.iter().any(ReplicatedEvent::is_catalog),
+        "catalog changes after S"
+    );
+    replica.begin_replication(&start).unwrap();
+    // Already a replica: a second bootstrap is refused.
+    let e = replica.begin_replication(&start).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    apply(&replica, &events, 4);
+    assert_eq!(contents(&replica), contents(&primary));
+    drop(feed);
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// `promote` (#1436, ICR 0125): the replica becomes a primary at what it applied last. It
+/// returns the token it stopped at, takes writes, keeps its own feed going without a catalog
+/// event for the state table, clears `ro_compat` bit 0, and refuses any apply after it.
+#[test]
+fn a_promoted_replica_takes_writes_and_refuses_applies() {
+    let (pv, rv) = (SimVfs::new(41), SimVfs::new(42));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    for step in 0..4 {
+        workload(&primary, step);
+    }
+    apply(&replica, &ready(&mut feed), 4);
+    let mut own = replica.feed().open().unwrap();
+    let stopped = replica.promote().unwrap();
+    assert_eq!(stopped, Some(feed.token()));
+    assert_eq!(
+        replica.info().unwrap().features.ro_compat & 1,
+        0,
+        "the bit is cleared"
+    );
+    let e = replica.promote().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    // Writes are taken.
+    let t = replica.table("t").unwrap().open().unwrap();
+    t.mutate(b"local").put("a", b"q", b"v").commit().unwrap();
+    // No catalog event for the state table's drop on the replica's own feed.
+    while let Some(ev) = own.next_event(Duration::from_millis(200)).unwrap() {
+        assert!(!matches!(ev, FeedEvent::Catalog(_)), "{ev:?}");
+    }
+    // An apply after the promote is refused, and nothing comes back.
+    workload(&primary, 4);
+    let events = ready(&mut feed);
+    let first = events.iter().position(|e| !e.is_catalog()).unwrap();
+    let e = replica
+        .apply_replicated(&events[first..=first], events[first].token())
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    assert_eq!(replica.info().unwrap().features.ro_compat & 1, 0);
+    assert_eq!(replica.replicated_token().unwrap(), None);
+    drop((t, own, feed));
+    replica.close().unwrap();
+    // After a reopen: an ordinary database.
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    replica
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap()
+        .mutate(b"later")
+        .put("a", b"q", b"v")
+        .commit()
+        .unwrap();
+    replica.close().unwrap();
+    primary.close().unwrap();
+}

@@ -933,7 +933,7 @@ fn backup_below_an_ssts_commits_rewrites_it_without_them() {
     db.split_table(t.id, vec![b"row00050".to_vec()], &[0, 0])
         .unwrap();
     let at = db.snapshot().unwrap().at_seqno(before.seqno());
-    db.backup_at(at, Path::new("/db/copy.phdb")).unwrap();
+    db.backup_at(&at, Path::new("/db/copy.phdb")).unwrap();
     drop(before);
     db.close().unwrap();
     // Stored, not just hidden by the copy's seqno ceiling: its next commits take the seqnos

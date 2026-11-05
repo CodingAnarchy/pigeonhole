@@ -2034,6 +2034,22 @@ struct Link {
     chained: bool,
 }
 
+/// Where a token of a feed of every table stands (#1436, ICR 0125): its database, the last
+/// seqno delivered (or passed over), and the last catalog change delivered. A replica stores
+/// this as where its bootstrap copy starts. `InvalidArgument` for anything but such a token.
+pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
+    let bad = || Error::InvalidArgument("not a token of a feed of every table".into());
+    let (&version, rest) = token.split_first().ok_or_else(bad)?;
+    if version != TOKEN_VERSION_ALL || rest.len() < 16 + 4 + 8 + 8 + 16 {
+        return Err(bad());
+    }
+    let u64_at = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
+    let db_id: [u8; 16] = rest[..16].try_into().unwrap();
+    let delivered = u64_at(20);
+    let catalog = u64_at(rest.len() - 16);
+    Ok((db_id, delivered, catalog))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
