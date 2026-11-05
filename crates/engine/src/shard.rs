@@ -223,10 +223,10 @@ pub(crate) struct ShardMetrics {
     /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
     /// time, in nanoseconds, as of the last change in their number.
     pub sync_busy_nanos: AtomicU64,
-    /// Bytes of the shard's memtable arena taken by memtables, in whole chunks (partly
-    /// filled ones included), as of the shard's last batch (D316 A2, ICR 0116):
-    /// `ShardState::publish_arena` stores it only when it changed.
-    pub memtable_used: AtomicU64,
+    /// The shard's memtable arena's free bytes, which the arena stores itself whenever a
+    /// memtable takes chunks or a retired one gives them back (`ShardArena::set_free_sink`,
+    /// D316 A2, ICR 0116): never per commit. `Engine::metrics` reads it.
+    pub memtable_free: Arc<AtomicU64>,
     /// The arena's size, stored once when the shard starts (D316 A2).
     pub memtable_limit: AtomicU64,
     /// Client commits' in-flight time (D257, D262): the sum over the commits this shard
@@ -277,7 +277,7 @@ impl Default for ShardMetrics {
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
             sync_busy_nanos: AtomicU64::new(0),
-            memtable_used: AtomicU64::new(0),
+            memtable_free: Arc::new(AtomicU64::new(0)),
             memtable_limit: AtomicU64::new(0),
             commit_inflight_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
@@ -3339,9 +3339,6 @@ pub(crate) struct ShardState {
     /// Records `advance_checkpoint` popped in this batch (against `CHECKPOINT_POP_BUDGET`;
     /// `end_batch` resets it).
     checkpoint_pops: usize,
-    /// The memtable bytes `publish_arena` last stored in `ShardMetrics::memtable_used`, so a
-    /// batch that left them unchanged stores nothing (D316 A2, perf287's option (a)).
-    published_used: u64,
     /// Handler work left for the next batch, and its kick (#763).
     continuations: Continuations,
     /// A wake is armed for the stream's creation to settle (D211, `advance_checkpoint`).
@@ -3581,7 +3578,15 @@ impl ShardState {
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
         let shards = shared.shards;
         let cross = shards > 1;
-        let mut shard = Self {
+        // The arena keeps the shard's metrics' free bytes current itself, only as chunks
+        // are taken and given back (D316 A2): nothing per commit or per batch.
+        let mut arena = ShardArena::new(region, chunk_size);
+        let metrics = &shared.metrics[usize::from(id.0)];
+        metrics
+            .memtable_limit
+            .store(arena.region().len() as u64, Ordering::Relaxed);
+        arena.set_free_sink(Arc::clone(&metrics.memtable_free));
+        let shard = Self {
             cross,
             id,
             shared,
@@ -3592,7 +3597,7 @@ impl ShardState {
             cross_durable_at_close: false,
             stream_end: Lsn::default(),
             stream_durable_at_close: false,
-            arena: ShardArena::new(region, chunk_size),
+            arena,
             chunk_size,
             memtables: BTreeMap::new(),
             retired: Vec::new(),
@@ -3701,7 +3706,6 @@ impl ShardState {
             checkpoint_inflight: false,
             checkpoint_dirty: false,
             checkpoint_pops: 0,
-            published_used: u64::MAX,
             continuations: Continuations::default(),
             creation_wake: false,
             aborted: HashSet::new(),
@@ -3783,25 +3787,10 @@ impl ShardState {
         shard
     }
 
-    /// Publishes the arena's state at the end of each batch and at construction: the bytes
-    /// memtables take, for `EngineMetrics` (D316 A2, ICR 0116), stored only when they
-    /// changed since the last batch. That's one compare per group, and a relaxed store only
-    /// when a memtable took a chunk or a flush returned some.
-    ///
-    /// Test hook: also the arena's free bytes, largest free run, size and reserved room, as
-    /// one snapshot (`Engine::arena_free`, `Engine::arena_reserved`).
-    fn publish_arena(&mut self) {
-        let size = self.arena.region().len() as u64;
-        let used = size.saturating_sub(self.arena.free_bytes() as u64);
-        if used != self.published_used {
-            let m = &self.shared.metrics[usize::from(self.id.0)];
-            if self.published_used == u64::MAX {
-                // The first publish, at construction: the arena's size never changes.
-                m.memtable_limit.store(size, Ordering::Relaxed);
-            }
-            m.memtable_used.store(used, Ordering::Relaxed);
-            self.published_used = used;
-        }
+    /// Test hook: the arena's free bytes, largest free run, size and reserved room, as one
+    /// snapshot (`Engine::arena_free`, `Engine::arena_reserved`), from the shard's
+    /// construction on. Nothing without test hooks.
+    fn publish_arena(&self) {
         #[cfg(feature = "test-hooks")]
         {
             *self.shared.metrics[usize::from(self.id.0)]

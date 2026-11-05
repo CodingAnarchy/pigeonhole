@@ -114,8 +114,8 @@ pub struct EngineMetrics {
     /// (ICR 0116). It counts whole chunks, partly filled ones included, so it reads high by
     /// up to one chunk per live memtable. It also counts flushed memtables whose chunks
     /// aren't reusable yet, because a snapshot or an in-flight read still holds them: what
-    /// matters for room, which they take as surely as live ones (perf287 on #1512). It's
-    /// updated at the end of each shard's batch.
+    /// matters for room, which they take as surely as live ones (perf287 on #1512). The
+    /// arena updates it itself whenever chunks are taken or given back, never per commit.
     ///
     /// Against [`memtable_limit_bytes`](Self::memtable_limit_bytes), it shows how close the
     /// shards are to waiting for room, but only approximately. A commit can wait while this

@@ -204,8 +204,8 @@ pub struct Metrics {
     /// Its rise over an interval, divided by the interval, is how many shards' worth of
     /// work the store did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
-    /// Bytes of the shards' memtable arenas taken by memtables, in whole chunks, as of each
-    /// shard's last batch, summed over shards (D316 A2, ICR 0116).
+    /// Bytes of the shards' memtable arenas taken by memtables, in whole chunks, as of the
+    /// arenas' last chunk taken or given back, summed over shards (D316 A2, ICR 0116).
     pub memtable_bytes: u64,
     /// The shards' memtable arenas' size, summed over shards (D316 A2).
     pub memtable_limit: u64,
@@ -3208,8 +3208,9 @@ impl Engine {
             }
         }
         for s in &shared.metrics {
-            m.memtable_bytes += s.memtable_used.load(Ordering::Relaxed);
-            m.memtable_limit += s.memtable_limit.load(Ordering::Relaxed);
+            let limit = s.memtable_limit.load(Ordering::Relaxed);
+            m.memtable_limit += limit;
+            m.memtable_bytes += limit.saturating_sub(s.memtable_free.load(Ordering::Relaxed));
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
