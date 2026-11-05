@@ -1233,8 +1233,40 @@ pub(crate) enum Reply {
     /// A single-row commit that returns its incremented counters (D314): `Commit`'s reply,
     /// plus the cells to fold after its apply. Boxed: rare, and `Reply` rides every member.
     Returning(Box<Returning>),
+    /// A `check_and_mutate` that returns the row's state either way (D314 amendment 2,
+    /// #1446): `Check`'s reply, plus the slot the shard fills before it, at the check when the
+    /// condition fails or after the apply when it holds. Boxed, as `Returning` is.
+    CheckReturning(Box<CheckReturning>),
     /// Internal (2PC records): nothing to notify directly.
     None,
+}
+
+/// A returning check's reply (D314 amendment 2): `Check`'s notifier and the slot.
+#[derive(Debug)]
+pub(crate) struct CheckReturning {
+    pub notifier: Notifier<Result<(bool, Option<CommitInfo>)>>,
+    pub out: CheckSlot,
+}
+
+/// Where a returning check's values go (D314 amendment 2). Its own type, so a returning
+/// commit's [`ReturnState`] and [`PreviousState`] stay as small as before it (#1566: their
+/// extra fields cost `commit-put-previous` on x86).
+pub(crate) type CheckSlot = Arc<Mutex<CheckState>>;
+
+/// A returning check's request and results (D314 amendment 2).
+#[derive(Debug, Default)]
+pub(crate) struct CheckState {
+    /// Each counter cell an applied check incremented, as [`ReturnState::cells`].
+    pub cells: Option<Vec<crate::engine::Returned>>,
+    /// The columns whose values just before an applied check to read.
+    pub previous_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `previous_of`, in its order, when the check applied.
+    pub previous: Vec<crate::engine::Previous>,
+    /// The columns to report as they are: the condition's own column first. As of the
+    /// commit when the check applies, or as the condition saw them when it fails.
+    pub current_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `current_of`, in its order.
+    pub current: Vec<crate::engine::Previous>,
 }
 
 /// A returning commit's reply (D314): `Commit`'s notifier, and the slot the shard fills with
@@ -1324,6 +1356,7 @@ impl Reply {
                 .notifier
                 .notify(outcome.map(|info| Settled { info, batch })),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
+            Reply::CheckReturning(r) => r.notifier.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
     }
@@ -1888,6 +1921,17 @@ impl Member {
     /// Whether the member needs a conditional check against the applied state.
     fn conditional(&self) -> bool {
         self.predicate.is_some() || self.validate.is_some()
+    }
+}
+
+/// The column a predicate tests.
+fn predicate_column(predicate: &Predicate) -> (FamilyId, &[u8]) {
+    match predicate {
+        Predicate::Exists { family, qualifier }
+        | Predicate::Absent { family, qualifier }
+        | Predicate::Value {
+            family, qualifier, ..
+        } => (*family, qualifier.as_slice()),
     }
 }
 
@@ -5827,6 +5871,96 @@ impl ShardState {
         })
     }
 
+    /// A returning check that applied (D314 amendment 2): its counters folded, its previous
+    /// values at the seqno below it, and its reported columns as of the commit (at its seqno,
+    /// with TTL at its timestamp), all under one lock of the slot. The row is the check's,
+    /// so a check that writes nothing still reads it.
+    #[cold]
+    #[inline(never)]
+    fn fill_applied_check(
+        &mut self,
+        slot: &CheckSlot,
+        bytes: &Bytes,
+        table: TableId,
+        row: &[u8],
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) {
+        let mut out = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        out.cells = Some(self.fold_returning(bytes, seqno, commit_ts));
+        let of = std::mem::take(&mut out.previous_of);
+        out.previous = self.column_values(table, row, of, seqno.saturating_sub(1), commit_ts);
+        let of = std::mem::take(&mut out.current_of);
+        out.current = self.column_values(table, row, of, seqno, commit_ts);
+    }
+
+    /// Each of `columns` of `row`, its newest visible version at `seqno` with TTL judged at
+    /// `now`.
+    fn column_values(
+        &self,
+        table: TableId,
+        row: &[u8],
+        columns: Vec<(FamilyId, Vec<u8>)>,
+        seqno: Seqno,
+        now: Timestamp,
+    ) -> Vec<crate::engine::Previous> {
+        columns
+            .into_iter()
+            .map(|(family, qualifier)| crate::engine::Previous {
+                value: self.read_before::<true>(table, family, row, &qualifier, seqno, now),
+                family,
+                qualifier,
+            })
+            .collect()
+    }
+
+    /// [`evaluate`](Self::evaluate) for a returning check (D314 amendment 2): the condition's
+    /// column read once, as a cell, both matched and reported (simp724's S2 on #1446), so a
+    /// blob, a counter's fold or a TTL can't make them disagree. When the condition fails,
+    /// the slot gets every reported column as the check saw it, read with the same view and
+    /// the same `now`, before the reply (the second place the slot is filled, S3).
+    #[cold]
+    #[inline(never)]
+    fn check_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        out: &CheckSlot,
+    ) -> Result<bool> {
+        let (family, qualifier) = predicate_column(predicate);
+        let now = self.shared.vfs.now_micros();
+        let cell = self.read_before::<true>(table, family, row, qualifier, u64::MAX, now)?;
+        let holds = match predicate {
+            Predicate::Exists { .. } => cell.is_some(),
+            Predicate::Absent { .. } => cell.is_none(),
+            Predicate::Value { predicate, .. } => cell
+                .as_ref()
+                .is_some_and(|c| crate::read::predicate_matches(predicate, c.stored())),
+        };
+        if holds {
+            return Ok(true);
+        }
+        let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+        let of = std::mem::take(&mut out.current_of);
+        out.current = of
+            .into_iter()
+            .map(|(f, q)| {
+                let value = if f == family && q == qualifier {
+                    Ok(cell.clone())
+                } else {
+                    self.read_before::<true>(table, f, row, &q, u64::MAX, now)
+                };
+                crate::engine::Previous {
+                    family: f,
+                    qualifier: q,
+                    value,
+                }
+            })
+            .collect();
+        Ok(false)
+    }
+
     /// Whether a write above `snapshot` on this shard could change what `read` read
     /// (optimistic validation): for a family read, any entry of `(table, row, family)`; for a
     /// cell read, `cell_conflicts`. Reads of rows other shards own are theirs to check.
@@ -6476,7 +6610,7 @@ impl ShardState {
             .into_iter()
             .map(|(family, qualifier)| {
                 let value = match &row {
-                    Some((table, row)) => self.read_before(
+                    Some((table, row)) => self.read_before::<false>(
                         *table,
                         family,
                         row,
@@ -6497,7 +6631,13 @@ impl ShardState {
 
     /// The newest visible version of one column at `seqno`, with the family's TTL judged at
     /// `now`, as a get at that snapshot returns it (a separated value read out).
-    fn read_before(
+    ///
+    /// `COLD` changes nothing in the read: it makes the returning check's callers
+    /// (`::<true>`) their own instance, closures included, so `previous_values` (`::<false>`)
+    /// stays its only caller, as before #1566. Shared by three callers, LTO outlined it and
+    /// the generic `FlushedRoots::read` it calls, which cost `commit-put-previous` on x86
+    /// (the zero-cost-by-type pattern of #1284).
+    fn read_before<const COLD: bool>(
         &self,
         table: TableId,
         family: FamilyId,
@@ -7337,15 +7477,23 @@ impl ShardState {
                 continue;
             }
             if let Some((table, row, predicate)) = m.predicate.as_deref() {
-                match self.evaluate(*table, row, predicate) {
+                let evaluated = match &m.reply {
+                    Reply::CheckReturning(r) => {
+                        self.check_returning(*table, row, predicate, &r.out)
+                    }
+                    _ => self.evaluate(*table, row, predicate),
+                };
+                match evaluated {
                     Ok(true) => {}
                     Ok(false) => {
                         if m.share_wait != 0 {
                             // Writes nothing: the shares chained behind it go on (D267).
                             self.end_single_wait(m.share_wait, ctx);
                         }
-                        if let Reply::Check(n) = m.reply {
-                            n.notify(Ok((false, None)));
+                        match m.reply {
+                            Reply::Check(n) => n.notify(Ok((false, None))),
+                            Reply::CheckReturning(r) => r.notifier.notify(Ok((false, None))),
+                            _ => {}
                         }
                         continue;
                     }
@@ -7782,6 +7930,18 @@ impl ShardState {
                             let of = std::mem::take(&mut p.of);
                             p.values = self.previous_values(&m.bytes, of, m.seqno, m.commit_ts);
                         }
+                    } else if applied.is_ok()
+                        && let Reply::CheckReturning(r) = &m.reply
+                        && let Some((table, row, _)) = m.predicate.as_deref()
+                    {
+                        self.fill_applied_check(
+                            &r.out,
+                            &m.bytes,
+                            *table,
+                            row,
+                            m.seqno,
+                            m.commit_ts,
+                        );
                     }
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
@@ -8679,14 +8839,18 @@ impl ShardState {
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
             if !same && self.touched.contains_key(&h) {
-                let (family, qualifier) = match predicate {
-                    Predicate::Exists { family, qualifier }
-                    | Predicate::Absent { family, qualifier }
-                    | Predicate::Value {
-                        family, qualifier, ..
-                    } => (*family, qualifier.as_slice()),
-                };
+                let (family, qualifier) = predicate_column(predicate);
                 same = writes_cell(admitted.iter(), *table, row, family, qualifier);
+                // A returning check reports its columns as the condition saw them, so they
+                // count as read: an earlier member's write to one waits it for the next
+                // group, or it would report a state the row never had (simp724's S1 on #1446).
+                if !same && let Reply::CheckReturning(r) = &m.reply {
+                    let out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
+                    same = out
+                        .current_of
+                        .iter()
+                        .any(|(f, q)| writes_cell(admitted.iter(), *table, row, *f, q));
+                }
             }
         }
         same

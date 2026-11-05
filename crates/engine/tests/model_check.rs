@@ -260,9 +260,11 @@ fn deferred_io_runs_take_the_commit_time_separation_path() {
     // large value (#230) waits on the manifest writer; that wait runs the device (ICR 0028)
     // instead of parking, so deferred runs separate values at commit as plain runs do. The
     // engine counts the separations itself (`Engine::commit_separations`, #1233), so no
-    // flush, compaction or blob GC file is in the count. A seed whose runs acknowledge no
-    // large put into a family that separates (the aggregate families' values stay inline)
-    // tests nothing and is skipped; most must test.
+    // flush, compaction or blob GC file is in the count. Large puts count when the engine
+    // accepts their commit's submit, where it separates them, so a conditional commit whose
+    // condition fails still pairs its separation with its put. A seed whose runs submit no large put into a family that
+    // separates (the aggregate families' values stay inline) tests nothing and is skipped;
+    // most must test.
     let (mut tested, mut skipped) = (0u32, 0u32);
     for seed in seeds() {
         let share = |deferred: bool| {

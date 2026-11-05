@@ -513,6 +513,8 @@ pub struct Stats {
     pub returning_full: u64,
     /// Previous values checked against the model (D314 amendment 1).
     pub previous_checked: usize,
+    /// D314 amendment 2: reported columns of returning checks checked against the model.
+    pub current_checked: usize,
     pub commits: usize,
     pub cross_shard: usize,
     pub batched: usize,
@@ -573,8 +575,14 @@ pub struct Stats {
     /// Reads at a held snapshot checked against the model rebuilt for its view, because a
     /// compaction published after it purged something (`World::model_at`).
     pub reads_at_older_views: usize,
-    /// Puts in acknowledged commits with a value above the inline limit (`LARGE_VALUE`),
-    /// into families whose values may be separated (not an aggregate family's).
+    /// Puts with a value above the inline limit (`LARGE_VALUE`), into families whose values
+    /// may be separated (not an aggregate family's), in commits whose submit the engine
+    /// accepted. That's where it separates them (`commit_separations`), so a conditional
+    /// commit whose condition fails still pairs its separation with its put (the counters
+    /// sweep's seed 89 on #1566: 4 separations for 1 acknowledged large put). A submit that is
+    /// refused, or fails on a crash before its blob is written, counts neither. The separation
+    /// counter is read at once after each accepted submit (the separation happens inside it),
+    /// so a crash before the next look can't lose it (seed 238: 2 puts and 0 separations).
     pub large_puts: usize,
     /// Values the engine separated into blob files at commit time (#230), summed across
     /// reopens (`Engine::commit_separations`): the path a deferred run must take as a plain
@@ -1425,6 +1433,16 @@ enum CasPred {
     Equals(Vec<u8>),
 }
 
+/// A returning check (D314 amendment 2): the columns it reports (the condition's first),
+/// the model's newest version of each when it was submitted (nothing in flight, so what a
+/// failed condition must report), and what the engine reported.
+#[derive(Debug, Clone)]
+struct CasReturning {
+    current_of: Vec<(String, Vec<u8>)>,
+    want_seen: Vec<Option<(Timestamp, Vec<u8>)>>,
+    got: Option<Vec<PreviousCell>>,
+}
+
 /// How the client submitted a commit.
 #[derive(Debug, Clone)]
 enum Kind {
@@ -1438,6 +1456,8 @@ enum Kind {
         pred: CasPred,
         /// What the model said when the predicate was evaluated (nothing in flight).
         expected: bool,
+        /// A returning check's request and what it reported (D314 amendment 2).
+        returning: Option<Box<CasReturning>>,
     },
     /// A transaction: reads at the engine snapshot, then the batch. Each read is a
     /// `(table, row, family, qualifier)`: a `get` of one cell, or (no qualifier) a `get_row`
@@ -1468,6 +1488,29 @@ type PreviousCell = (
     Vec<u8>,
     Result<Option<(Timestamp, Vec<u8>)>, String>,
 );
+
+/// The engine's reported column values as the harness keeps them: each value decoded to
+/// its payload (the model's form), with its timestamp.
+fn engine_cells(values: Vec<pigeonhole_engine::Previous>) -> Vec<PreviousCell> {
+    values
+        .into_iter()
+        .map(|p| {
+            let v = p
+                .value
+                .map(|c| {
+                    c.map(|c| {
+                        let payload = match pigeonhole_format::value::decode_value(c.stored()) {
+                            Ok(v) => value_bytes(v),
+                            Err(_) => c.stored().to_vec(),
+                        };
+                        (c.timestamp(), payload)
+                    })
+                })
+                .map_err(|e| e.to_string());
+            (p.family, p.qualifier, v)
+        })
+        .collect()
+}
 
 /// One cell a returning commit returned (D314): family, qualifier, timestamp, value (an
 /// error as text).
@@ -1649,6 +1692,9 @@ enum Pending {
     /// A returning commit (D314): resolves as a plain commit, its values kept on the kind.
     Returning(pigeonhole_engine::PendingReturning),
     Check(pigeonhole_engine::PendingCheck),
+    /// A returning check (D314 amendment 2): resolves as a check, its reported columns kept
+    /// on the kind.
+    CheckReturning(pigeonhole_engine::PendingCheckReturning),
     /// Refused at submission: the outcome is known.
     Ready(Option<Outcome>),
 }
@@ -1877,13 +1923,6 @@ impl World {
             }
         }
         out
-    }
-
-    /// Counts an acknowledged commit's large puts, and the commit-time separations since the
-    /// last look (`Stats::large_puts`, `Stats::commit_separations`).
-    fn note_separations(&mut self, large: usize) {
-        self.stats.large_puts += large;
-        self.note_commit_separations();
     }
 
     /// Adds the open engine's commit-time separations since the last look to
@@ -3975,6 +4014,31 @@ impl World {
             }
             self.engine_seqnos.push(seqno);
             self.check_returned(&c, m, ts)?;
+            // D314 amendment 2: an applied returning check reports its columns as of the
+            // commit: the model's newest version of each at its model seqno.
+            if let Kind::Cas {
+                table,
+                row,
+                returning: Some(r),
+                ..
+            } = &c.kind
+            {
+                let mut want = Vec::new();
+                for (f, q) in &r.current_of {
+                    want.push(
+                        match self.model.try_read_row(table, row, &[f.as_str()], 0, m, ts) {
+                            Ok(cs) => cs
+                                .into_iter()
+                                .filter(|x| &x.qualifier == q)
+                                .max_by_key(|x| x.ts)
+                                .map(|x| (x.ts, x.value)),
+                            Err(e) => return fail(FailureClass::Protocol, format!("model: {e:?}")),
+                        },
+                    );
+                }
+                self.check_reported(r, &want, "an applied check")?;
+                self.stats.current_checked += r.current_of.len();
+            }
             if let Kind::Returning {
                 previous: Some(p), ..
             } = &c.kind
@@ -3985,7 +4049,7 @@ impl World {
             c.commit_ts = Some(ts);
             c.acked = true;
             self.stats.commits += 1;
-            self.note_separations(large_puts(&c.ops));
+            self.note_commit_separations();
             if c.shards.len() > 1 {
                 self.stats.cross_shard += 1;
             }
@@ -4331,6 +4395,15 @@ impl World {
                 match info {
                     Some(info) => successes.push((info.seqno, inf, Some(info))),
                     None => {
+                        // D314 amendment 2: a failed returning check reports its columns as
+                        // the condition saw them: the model's state at its submission.
+                        if let Kind::Cas {
+                            returning: Some(r), ..
+                        } = &inf.commit.kind
+                        {
+                            self.check_reported(r, &r.want_seen, "a failed check")?;
+                            self.stats.current_checked += r.current_of.len();
+                        }
                         self.stats.cas_refused += 1;
                         self.trace.push("  -> predicate false, not applied".into());
                         self.aborted.push(inf.commit);
@@ -4476,6 +4549,7 @@ impl World {
         for mut inf in self.in_flight.drain(..) {
             let mut returned = None;
             let mut previous: Option<Vec<PreviousCell>> = None;
+            let mut reported: Option<Vec<PreviousCell>> = None;
             let outcome = match &mut inf.pending {
                 Pending::Poll(pc) => match poll_commit(pc) {
                     Poll::Ready(r) => Some(Outcome::Commit(r)),
@@ -4533,6 +4607,16 @@ impl World {
                         Poll::Pending => None,
                     }
                 }
+                Pending::CheckReturning(pr) => {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    match Pin::new(pr).poll(&mut cx) {
+                        Poll::Ready(r) => Some(Outcome::Cas(r.map(|cr| {
+                            reported = Some(engine_cells(cr.current));
+                            (cr.applied, cr.info)
+                        }))),
+                        Poll::Pending => None,
+                    }
+                }
                 Pending::Ready(o) => o.take(),
             };
             if let Kind::Returning {
@@ -4547,6 +4631,15 @@ impl World {
                 if let Some(p) = previous {
                     *prev = Some(p);
                 }
+            }
+            if let (
+                Kind::Cas {
+                    returning: Some(r), ..
+                },
+                Some(got),
+            ) = (&mut inf.commit.kind, reported)
+            {
+                r.got = Some(got);
             }
             match outcome {
                 Some(o) => resolved.push((inf, o)),
@@ -4683,6 +4776,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        let large = large_puts(&ops);
         self.trace.push(format!(
             "commit {durability:?} ts={now} shards={shards:?}{} [{}]{}",
             if alone { "" } else { " (batched)" },
@@ -4706,6 +4800,8 @@ impl World {
         };
         match self.store().engine.submit(batch, Some(durability)) {
             Ok(pc) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
                 self.in_flight.push(InFlight {
                     pending: Pending::Poll(pc),
                     commit,
@@ -4794,6 +4890,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        let large = large_puts(&ops);
         self.stats.returning += 1;
         self.trace.push(format!(
             "returning {durability:?} ts={now} {}{}{} [{}]{}",
@@ -4822,7 +4919,11 @@ impl World {
             })
             .collect();
         let pending = match engine.submit_returning_previous(batch, Some(durability), request) {
-            Ok(p) => Pending::Returning(p),
+            Ok(p) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                Pending::Returning(p)
+            }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
         self.in_flight.push(InFlight {
@@ -4850,6 +4951,50 @@ impl World {
         });
         if alone {
             self.pending_advance = 2;
+        }
+        Ok(())
+    }
+
+    /// D314 amendment 2: a returning check's reported columns, in order, against `want`.
+    fn check_reported(
+        &self,
+        r: &CasReturning,
+        want: &[Option<(Timestamp, Vec<u8>)>],
+        what: &str,
+    ) -> Result<(), Fail> {
+        let Some(got) = &r.got else {
+            return fail(FailureClass::Protocol, format!("{what} reported nothing"));
+        };
+        if got.len() != r.current_of.len() {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "{what}: {} columns reported for {} asked",
+                    got.len(),
+                    r.current_of.len()
+                ),
+            );
+        }
+        for (((family, qualifier), (_, q, v)), w) in r.current_of.iter().zip(got).zip(want) {
+            if q != qualifier {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("{what}: {family}:{} reported out of order", text(qualifier)),
+                );
+            }
+            let ok = match v {
+                Ok(g) => g == w,
+                Err(_) => self.cfg.faults.io_error_ppm > 0,
+            };
+            if !ok {
+                return fail(
+                    FailureClass::LiveReadMismatch,
+                    format!(
+                        "{what} reported {family}:{} as {v:?}, the model has {w:?}",
+                        text(qualifier)
+                    ),
+                );
+            }
         }
         Ok(())
     }
@@ -5057,9 +5202,35 @@ impl World {
             CasPred::Absent => current.is_none(),
             CasPred::Equals(v) => current.as_ref().is_some_and(|c| &c.value == v),
         };
+        // Half the checks are returning checks (D314 amendment 2): they report the
+        // condition's column and one more of the row either way. Nothing is in flight, so a
+        // failed condition must report the model's state now.
+        let returning = rng.chance(500_000).then(|| {
+            let mut current_of = vec![(family.clone(), qualifier.clone())];
+            let other = (family.clone(), b"q0".to_vec());
+            if !current_of.contains(&other) {
+                current_of.push(other);
+            }
+            let want_seen = current_of
+                .iter()
+                .map(|(f, q)| {
+                    self.model
+                        .try_get(&table, &row, f, q, self.model.snapshot(), now)
+                        .ok()
+                        .flatten()
+                        .map(|c| (c.ts, c.value))
+                })
+                .collect();
+            Box::new(CasReturning {
+                current_of,
+                want_seen,
+                got: None,
+            })
+        });
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        let large = large_puts(&ops);
         let fam_id = self.store().family_ids[&(table.clone(), family.clone())];
         let engine = Arc::clone(&self.store().engine);
         let table_id = self.store().tables[&table].id;
@@ -5089,14 +5260,40 @@ impl World {
             Ok(b) => b,
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
         };
-        let pending = match engine.submit_check_and_mutate(
-            table_id,
-            &row,
-            &engine_pred,
-            batch,
-            Some(durability),
-        ) {
-            Ok(pc) => Pending::Check(pc),
+        let submitted = match &returning {
+            None => engine
+                .submit_check_and_mutate(table_id, &row, &engine_pred, batch, Some(durability))
+                .map(Pending::Check),
+            Some(r) => {
+                let ids: Vec<(FamilyId, Vec<u8>)> = r
+                    .current_of
+                    .iter()
+                    .map(|(f, q)| {
+                        (
+                            self.store().family_ids[&(table.clone(), f.clone())],
+                            q.clone(),
+                        )
+                    })
+                    .collect();
+                engine
+                    .submit_check_and_mutate_returning(
+                        table_id,
+                        &row,
+                        &engine_pred,
+                        batch,
+                        Some(durability),
+                        Vec::new(),
+                        ids,
+                    )
+                    .map(Pending::CheckReturning)
+            }
+        };
+        let pending = match submitted {
+            Ok(p) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                p
+            }
             Err(e) => Pending::Ready(Some(Outcome::Cas(Err(e)))),
         };
         self.in_flight.push(InFlight {
@@ -5117,6 +5314,7 @@ impl World {
                     qualifier,
                     pred,
                     expected,
+                    returning,
                 },
             },
             armed,
@@ -5138,6 +5336,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        let large = large_puts(&ops);
         let store = self.store.as_ref().expect("store open");
         let mut txn = match store.engine.begin() {
             Ok(t) => t,
@@ -5322,7 +5521,11 @@ impl World {
             if armed { " (crash armed)" } else { "" }
         ));
         let pending = match txn.submit(Some(durability)) {
-            Ok(pc) => Pending::Poll(pc),
+            Ok(pc) => {
+                self.stats.large_puts += large;
+                self.note_commit_separations();
+                Pending::Poll(pc)
+            }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
         // Every shard owning a read row is a participant with an empty PREPARE (D91).
@@ -5467,7 +5670,7 @@ impl World {
         }
         self.engine_seqnos.push(info.seqno);
         self.stats.commits += 1;
-        self.note_separations(large_puts(&ops));
+        self.note_commit_separations();
         let c = Committed {
             seqno: Some(info.seqno),
             ops,
@@ -6005,6 +6208,7 @@ fn run_with(
                             Pending::Poll(_) => "pending",
                             Pending::Returning(_) => "pending returning",
                             Pending::Check(_) => "pending check",
+                            Pending::CheckReturning(_) => "pending returning check",
                             Pending::Ready(_) => "ready",
                         };
                         format!(

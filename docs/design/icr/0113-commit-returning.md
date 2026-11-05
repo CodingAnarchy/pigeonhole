@@ -40,3 +40,23 @@ None: additive. The Python and Ruby bindings expose it (#1440, cli692):
   - Python: `Mutation.return_previous(family, qualifier) -> Mutation`, and `Incremented.previous(family, qualifier) -> Cell | None` (`InvalidArgument` for a column not asked for). `commit_returning_async()` takes the requests too.
   - Ruby: `Mutation#return_previous(family, qualifier) -> self`, and `Incremented#previous(family, qualifier) -> Cell?`, with the same errors.
   - Both refuse `commit` and `commit_if` on a mutation with requests, as the Rust API does.
+
+## Amendment 2: compare-and-set-then-read (#1446, D314 amendment 2)
+
+**Status:** Approved (the owner signed off the design on 2026-11-05).
+
+- **pigeonhole** (semver, additive):
+  - `RowMutation::commit_if_returning(self, &Condition) -> Result<Checked>`, and `commit_if_returning_async` (the `async` feature, `nonblocking::CheckReturningFuture`);
+  - `RowMutation::return_current(self, family, qualifier) -> Self`;
+  - `#[must_use] enum Checked { Applied(Returned), NotApplied(Seen) }` with `is_applied()`;
+  - `#[non_exhaustive] struct Seen` with `current(family, qualifier) -> Result<Option<Cell>>`. It has no seqno: the shard's applied state at the check can miss a cross-shard share whose seqno was allocated earlier but hadn't arrived, so no snapshot seqno is known to read the same columns. Being `#[non_exhaustive]`, it can gain one later with a guarantee that holds;
+  - `Returned::current(family, qualifier) -> Result<Option<Cell>>`.
+  
+  `return_current` is refused (`InvalidArgument`) by every commit except `commit_if_returning`.
+  A mutation that writes nothing is a check-and-read, as with plain `commit_if`: `Applied` (an empty commit) with the columns as they are when the condition holds, `NotApplied` when it fails. `return_previous`'s columns are reported only when it applies; when it doesn't, nothing changed, so their values are read through `return_current` and `Seen::current`.
+- **pigeonhole-engine** (additive):
+  - `Engine::check_and_mutate_returning`, `submit_check_and_mutate_returning` and `submit_check_and_mutate_returning_async`;
+  - `PendingCheckReturning`;
+  - `CheckReturned { applied, info, cells, previous, current }`.
+
+**Callers changed:** none; additive. The Python and Ruby bindings follow in cli692's PR 2.

@@ -2178,6 +2178,134 @@ impl Engine {
             .submit_check_and_mutate(table, row, predicate, batch, durability)
     }
 
+    /// [`check_and_mutate`](Engine::check_and_mutate) that returns the row's state either
+    /// way (D314 amendment 2, #1446): when the condition holds, the batch's incremented
+    /// counters (as [`commit_returning`](Self::commit_returning)), each of `previous_of` as
+    /// it was just before the commit, and each of `current_of` as of the commit; when it
+    /// fails, each of `current_of` as the condition saw it (the applied state). The
+    /// condition's own column is always reported, first.
+    /// Every family must be in `table`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_and_mutate_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<CheckReturned> {
+        self.inner
+            .shared
+            .refuse_blocking_on_driver("check_and_mutate")?;
+        self.submit_check_and_mutate_returning(
+            table,
+            row,
+            predicate,
+            batch,
+            durability,
+            previous_of,
+            current_of,
+        )?
+        .wait()
+    }
+
+    /// [`check_and_mutate_returning`](Self::check_and_mutate_returning) without waiting, as
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) submits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_check_and_mutate_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingCheckReturning> {
+        let out = self.check_slot(table, predicate, previous_of, current_of)?;
+        let reply = check_reply(&out);
+        let pending = self
+            .inner
+            .submit_check_with(table, row, predicate, batch, durability, reply)?;
+        Ok(PendingCheckReturning { pending, out })
+    }
+
+    /// [`submit_check_and_mutate_returning`](Self::submit_check_and_mutate_returning) for an
+    /// async check, admitted as
+    /// [`submit_check_and_mutate_async`](Self::submit_check_and_mutate_async) is (D210).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_check_and_mutate_returning_async(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingCheckReturning> {
+        let out = self.check_slot(table, predicate, previous_of, current_of)?;
+        let mut charge = match self.inner.fast_admit(Some((table, row)), &batch) {
+            FastAdmit::Wait(admit) => {
+                let inner = Arc::clone(&self.inner);
+                let (row, predicate) = (row.to_vec(), predicate.clone());
+                let slot = Arc::clone(&out);
+                let pending = PendingCheck::waiting(
+                    self.inner.shard_ref(ShardId(admit.shard() as u16)),
+                    admit,
+                    Box::new(move || {
+                        let reply = check_reply(&slot);
+                        inner.submit_check_with(table, &row, &predicate, batch, durability, reply)
+                    }),
+                );
+                return Ok(PendingCheckReturning { pending, out });
+            }
+            FastAdmit::Charged(charge) => charge,
+        };
+        let reply = check_reply(&out);
+        let pending = self
+            .inner
+            .submit_check_with(table, row, predicate, batch, durability, reply)?;
+        charge.attach(&pending.waiter);
+        Ok(PendingCheckReturning { pending, out })
+    }
+
+    /// A returning check's slot: its `previous_of` request, and its `current_of` with the
+    /// condition's own column first (deduped), once every family is checked to be `table`'s.
+    fn check_slot(
+        &self,
+        table: TableId,
+        predicate: &Predicate,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        mut current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<crate::shard::CheckSlot> {
+        let (family, qualifier) = match predicate {
+            Predicate::Exists { family, qualifier }
+            | Predicate::Absent { family, qualifier }
+            | Predicate::Value {
+                family, qualifier, ..
+            } => (*family, qualifier),
+        };
+        current_of.retain(|(f, q)| (*f, q) != (family, qualifier));
+        current_of.insert(0, (family, qualifier.clone()));
+        let view = self.inner.shared.view.load();
+        for (f, _) in previous_of.iter().chain(&current_of) {
+            if view.catalog.family(*f).is_none_or(|m| m.table != table) {
+                return Err(Error::FamilyNotFound(format!(
+                    "family {} is not in table {}",
+                    f.0, table.0
+                )));
+            }
+        }
+        Ok(Arc::new(Mutex::new(crate::shard::CheckState {
+            previous_of,
+            current_of,
+            ..Default::default()
+        })))
+    }
+
     /// [`submit`](Self::submit) for an async commit (D210): submitted at once while the
     /// shards' async commits in flight leave room, with its charge returned when it
     /// resolves; otherwise the pending commit holds the batch and its place in its shard's
@@ -4801,6 +4929,21 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingCheck> {
+        self.submit_check_with(table, row, predicate, batch, durability, Reply::Check)
+    }
+
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) with the reply `reply`
+    /// makes of the check's notifier: `Check`, or a returning check's (D314 amendment 2).
+    #[inline(always)]
+    fn submit_check_with(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        reply: impl FnOnce(CheckNotifier) -> Reply,
+    ) -> Result<PendingCheck> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -4843,7 +4986,7 @@ impl Inner {
             .submit(ShardMsg::Commit(CommitReq {
                 bytes: builder,
                 durability,
-                reply: Reply::Check(tx),
+                reply: reply(tx),
                 submitted_at,
                 validate: None,
                 predicate: Some(Box::new((table, row.to_vec(), predicate.clone()))),
@@ -6323,6 +6466,81 @@ pub struct Previous {
     /// or past the family's TTL at the commit's timestamp), or the error that kept the shard
     /// from reading it once the commit had applied.
     pub value: Result<Option<crate::read::CellData>>,
+}
+
+/// A returning check's outcome (D314 amendment 2): whether its condition held, and the
+/// row's state either way.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CheckReturned {
+    /// Whether the condition held and the batch applied.
+    pub applied: bool,
+    /// The commit, when it applied.
+    pub info: Option<CommitInfo>,
+    /// When it applied: the counters it incremented, as [`Engine::commit_returning`] returns.
+    pub cells: Vec<Returned>,
+    /// When it applied: each `previous_of` column as it was just before the commit.
+    pub previous: Vec<Previous>,
+    /// Each `current_of` column, the condition's own first: as of the commit when it
+    /// applied, as the condition saw it otherwise.
+    pub current: Vec<Previous>,
+}
+
+/// A submitted [`Engine::submit_check_and_mutate_returning`].
+#[derive(Debug)]
+pub struct PendingCheckReturning {
+    pending: PendingCheck,
+    out: crate::shard::CheckSlot,
+}
+
+impl PendingCheckReturning {
+    /// Waits for the check, as [`PendingCheck::wait`] does.
+    pub fn wait(self) -> Result<CheckReturned> {
+        let (applied, info) = self.pending.wait()?;
+        Ok(check_returned(&self.out, applied, info))
+    }
+}
+
+impl std::future::Future for PendingCheckReturning {
+    type Output = Result<CheckReturned>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.pending).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(r) => std::task::Poll::Ready(
+                r.map(|(applied, info)| check_returned(&this.out, applied, info)),
+            ),
+        }
+    }
+}
+
+/// A check's notifier: whether it applied, and its commit when it did.
+type CheckNotifier = pigeonhole_runtime::Notifier<Result<(bool, Option<CommitInfo>)>>;
+
+/// The reply a returning check's shard fills `out` for (D314 amendment 2).
+fn check_reply(out: &crate::shard::CheckSlot) -> impl FnOnce(CheckNotifier) -> Reply + use<> {
+    let out = Arc::clone(out);
+    move |notifier| Reply::CheckReturning(Box::new(crate::shard::CheckReturning { notifier, out }))
+}
+
+/// What the shard left in a returning check's slot (set before its reply).
+fn check_returned(
+    out: &crate::shard::CheckSlot,
+    applied: bool,
+    info: Option<CommitInfo>,
+) -> CheckReturned {
+    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+    CheckReturned {
+        applied,
+        info,
+        cells: out.cells.take().unwrap_or_default(),
+        previous: std::mem::take(&mut out.previous),
+        current: std::mem::take(&mut out.current),
+    }
 }
 
 /// A returning commit's batch touches one row (D314; simp724's B1 on #1453): the shard
