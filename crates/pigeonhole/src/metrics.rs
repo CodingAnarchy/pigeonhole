@@ -110,6 +110,24 @@ pub struct EngineMetrics {
     /// interval, divided by the interval, is how many shards' worth of work the database
     /// did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
+    /// Gauge: bytes of the memtable arenas that memtables take now, summed over shards
+    /// (ICR 0116). It counts whole chunks, partly filled ones included, so it reads high by
+    /// up to one chunk per live memtable. It also counts flushed memtables whose chunks
+    /// aren't reusable yet, because a snapshot or an in-flight read still holds them: what
+    /// matters for room, which they take as surely as live ones (perf287 on #1512). The
+    /// arena updates it itself whenever chunks are taken or given back, never per commit.
+    ///
+    /// Against [`memtable_limit_bytes`](Self::memtable_limit_bytes), it shows how close the
+    /// shards are to waiting for room, but only approximately. A commit can wait while this
+    /// reads well under the limit: room other commits have reserved but not yet written,
+    /// a cross-shard commit's share held until its decision, or a value too large for the
+    /// free chunks' longest run. Those waits are [`room_stalls`](Self::room_stalls), the
+    /// ground truth (cli692 on #1512).
+    pub memtable_bytes: u64,
+    /// Gauge: the memtable arenas' size, summed over shards (ICR 0116):
+    /// `Options::memtable_budget`, which is per shard, rounded up to 2 MiB, times the shard
+    /// count.
+    pub memtable_limit_bytes: u64,
     /// Gauge: reader processes attached ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)
     /// handles holding a slot), out of [`reader_slots`](Self::reader_slots).
     pub reader_slots_active: u64,
@@ -364,6 +382,8 @@ impl EngineMetrics {
             file_growth_nanos: m.file_growths.1,
             async_sync_reads: m.async_sync_reads,
             shard_busy_nanos: m.shard_busy_nanos,
+            memtable_bytes: m.memtable_bytes,
+            memtable_limit_bytes: m.memtable_limit,
             reader_slots_active: m.reader_slots.0,
             reader_slots: m.reader_slots.1,
             reader_slots_reclaimed: m.reader_slots_reclaimed,
@@ -605,6 +625,8 @@ mod tests {
         m.commit_latency_nanos[Durability::Sync as usize] = [10, 20, 30];
         m.commit_latency_buckets[Durability::Buffered as usize].0[7] = 9;
         m.stalls = (5, 6);
+        m.memtable_bytes = 41;
+        m.memtable_limit = 42;
         m.room_stalls = (31, 32);
         m.pacing_stalls = (33, 34);
         m.block_cache = (7, 8);
@@ -630,6 +652,7 @@ mod tests {
             (4, 10, 20, 30)
         );
         assert_eq!((e.write_stalls, e.write_stall_nanos), (5, 6));
+        assert_eq!((e.memtable_bytes, e.memtable_limit_bytes), (41, 42));
         assert_eq!((e.room_stalls, e.room_stall_nanos), (31, 32));
         assert_eq!((e.pacing_stalls, e.pacing_stall_nanos), (33, 34));
         assert_eq!((e.block_cache_hits, e.block_cache_misses), (7, 8));

@@ -189,7 +189,9 @@ fn crash_entries_survive_a_slow_root_observer() {
 }
 
 /// The marker file of an entry that 1.0.0 must refuse: it holds the `incompat` feature
-/// bits the refusal names (decimal). CI's 1.0.0 arm fails if such an entry opens, or if
+/// bits the entry uses (decimal), which 1.0.0 lacks. The name stays, since the frozen
+/// release corpora have it; what a release must do with the entry depends on which of those
+/// bits it reads. CI's 1.0.0 arm fails if such an entry opens, or if
 /// the refusal names other bits (`tests/corpus/compat-reader`), and its 1.1.0 arm, whose
 /// release reads bit 0, fails if one using only bit 0 doesn't open (`compat-reader-1.1`).
 const REFUSED_BY: &str = "refused-by-1.0.0.txt";

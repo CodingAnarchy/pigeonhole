@@ -375,6 +375,10 @@ pub struct ShardArena {
     free_count: usize,
     /// Retired memtables whose chunks some in-process handle still borrows.
     deferred: Vec<Retired>,
+    /// Where [`free_bytes`](Self::free_bytes) is mirrored for another thread
+    /// ([`set_free_sink`](Self::set_free_sink)): stored only when chunks are taken or given
+    /// back, so never per insert.
+    free_sink: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ShardArena {
@@ -401,6 +405,7 @@ impl ShardArena {
             free: vec![true; chunks],
             free_count: chunks,
             deferred: Vec::new(),
+            free_sink: None,
         }
     }
 
@@ -413,6 +418,27 @@ impl ShardArena {
     /// in-process handle of it is left (see [`ShardArena::reclaim`]).
     pub fn free_bytes(&self) -> usize {
         self.free_count * self.chunk_size
+    }
+
+    /// Mirrors [`free_bytes`](Self::free_bytes) into `sink` from now on, for a metrics
+    /// reader on another thread: a relaxed store each time chunks are taken (a memtable
+    /// filling its chunk) or given back (a retired memtable's runs). Inserts that fit in
+    /// their chunk store nothing. Stores the current value at once.
+    pub fn set_free_sink(&mut self, sink: Arc<std::sync::atomic::AtomicU64>) {
+        sink.store(
+            self.free_bytes() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.free_sink = Some(sink);
+    }
+
+    fn publish_free(&self) {
+        if let Some(s) = &self.free_sink {
+            s.store(
+                self.free_bytes() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     /// Usable bytes of the largest run of contiguous free chunks: the largest entry an
@@ -532,6 +558,7 @@ impl ShardArena {
                 self.free_count += 1;
             }
         }
+        self.publish_free();
         self.region.registry.forget(retired.root, &retired.pin);
     }
 
@@ -565,6 +592,7 @@ impl ShardArena {
                     self.free[c] = false;
                 }
                 self.free_count -= count;
+                self.publish_free();
                 return Ok(Run {
                     first: first as u32,
                     count: count as u32,

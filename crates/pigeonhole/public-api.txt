@@ -371,6 +371,8 @@ pub pigeonhole::EngineMetrics::file_growths: u64
 pub pigeonhole::EngineMetrics::flush_failures: u64
 pub pigeonhole::EngineMetrics::flushes: u64
 pub pigeonhole::EngineMetrics::group_syncs: u64
+pub pigeonhole::EngineMetrics::memtable_bytes: u64
+pub pigeonhole::EngineMetrics::memtable_limit_bytes: u64
 pub pigeonhole::EngineMetrics::pacing_stall_nanos: u64
 pub pigeonhole::EngineMetrics::pacing_stalls: u64
 pub pigeonhole::EngineMetrics::reader_pin_seqno_lag: u64
