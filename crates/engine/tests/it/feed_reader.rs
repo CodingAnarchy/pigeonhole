@@ -81,6 +81,7 @@ fn next(r: &mut FeedReader) -> Commit {
         Next::Commit(c) => c.clone(),
         Next::Pending => panic!("no commit within {WAIT:?} (frontier {})", r.frontier()),
         Next::Expired(e) => panic!("expired: {e:?}"),
+        Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
     }
 }
 
@@ -360,7 +361,7 @@ fn retention_passing_a_token_expires_it() {
     let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
     let expired = loop {
         match r.wait(WAIT).unwrap() {
-            Next::Commit(_) => continue,
+            Next::Commit(_) | Next::Catalog(_) => continue,
             Next::Pending => break false,
             Next::Expired(_) => break true,
         }
@@ -406,6 +407,7 @@ fn drain(r: &mut FeedReader, shards: &mut [EngineShard]) -> Vec<Commit> {
             Next::Commit(c) => got.push(c.clone()),
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
     panic!("never drained");
@@ -597,6 +599,7 @@ fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
             Next::Commit(c) => got.push(c.seqno),
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
 }
@@ -693,6 +696,10 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
         .create_table("c", &[("g".into(), FamilyOptions::default())])
         .unwrap();
     let s = single(&db, &c, b"c1", Durability::GroupSync);
+    match all.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => assert!(ev.seqno_ceiling <= s, "{ev:?}"),
+        _ => panic!("the create first"),
+    }
     assert_eq!(next(&mut all).seqno, s, "the hold was released");
 
     let entries = sidecar_entries(&vfs);
@@ -733,6 +740,12 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
     assert!(matches!(entries[drop_at + 1], FeedEntry::Root { .. }));
     // The frontier still moves past the drop.
     let later = single(&db, &c, b"c2", Durability::GroupSync);
+    match all.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => {
+            assert!(matches!(ev.edits[..], [Edit::DropTable { table }] if table == a.id))
+        }
+        _ => panic!("the drop first"),
+    }
     assert_eq!(next(&mut all).seqno, later);
     drop(all);
     db.close().unwrap();
@@ -741,8 +754,9 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
 /// simp724's B1 on #1493 (D315): a catalog change whose family needs a new incompat
 /// feature bit (the file's first aggregate family) makes the pager commit the bit's roots
 /// first; its `Catalog` entry still belongs to the root commit that holds its edits, the
-/// last before `create_table` returns, not to one of the bit's. Mutation-checked: staging
-/// before `flag_features` puts it on the bit's root.
+/// last before `create_table` returns, not to one of the bit's, so the bit's Root entries
+/// come before it. Mutation-checked: staging before `flag_features` puts it on the bit's
+/// root.
 #[test]
 fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
     use pigeonhole_format::feed::FeedEntry;
@@ -752,8 +766,21 @@ fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
     let agg = FamilyOptions::default()
         .merge_operator("pigeonhole.i64_min")
         .kind(FamilyKind::Min);
+    let before = sidecar_entries(&vfs).len();
     let t = db.create_table("agg", &[("m".into(), agg)]).unwrap();
     let entries = sidecar_entries(&vfs);
+    // simp724's nit: the bit's Root entries come first, then the create's Catalog entry.
+    let new = &entries[before..];
+    let at = new
+        .iter()
+        .position(|e| matches!(e, FeedEntry::Catalog { .. }))
+        .expect("the create's Catalog entry");
+    assert!(
+        new[..at]
+            .iter()
+            .any(|e| matches!(e, FeedEntry::Root { .. })),
+        "the feature bit's Root entries before the create's: {new:?}"
+    );
     let catalog = entries
         .iter()
         .filter_map(|e| match e {
@@ -781,5 +808,285 @@ fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
         [last_root],
         "the create's root, not a feature bit's: {entries:?}"
     );
+    db.close().unwrap();
+}
+
+/// simp724 on #1493 (D315 2b): once the session's sidecar appends stop, no catalog change
+/// can get its `Catalog` entry, so the catalog hold freezes at the first change's ceiling
+/// for the rest of the session. A feed of every table in the writer's process expires; a
+/// table's feed carries on, since only a feed of every table's frontier reads the hold
+/// (simp724's F2 on #1515); writes go on. Two ways in: the change's own `Catalog` append
+/// fails, or an earlier plain Root append did. The freeze itself, which a feed of every
+/// table in a reader process waits at, is `feed_reader_process`'s.
+#[test]
+fn a_stopped_sidecar_freezes_the_catalog_hold() {
+    for catalog_append_fails in [true, false] {
+        let vfs = SimVfs::new(3161);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut all = db.feed(spec(&[], FeedStart::Now)).unwrap();
+        let mut one = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let below = single(&db, &a, b"below", Durability::GroupSync);
+        assert_eq!(next(&mut one).seqno, below);
+        assert_eq!(next(&mut all).seqno, below);
+        let mut plan = FaultPlan::none();
+        plan.fail_on = Some("phdb-feed");
+        vfs.set_faults(plan);
+        if !catalog_append_fails {
+            // A flush's plain Root entry fails first.
+            single(&db, &a, b"flushed", Durability::GroupSync);
+            db.flush().unwrap();
+            assert_eq!(next(&mut one).seqno, below + 1);
+        }
+        db.create_table("c", &[("g".into(), FamilyOptions::default())])
+            .unwrap();
+        assert_eq!(
+            vfs.scheduled_fired(),
+            1,
+            "{catalog_append_fails}: one failed write"
+        );
+        vfs.set_faults(FaultPlan::none());
+        let above = single(&db, &a, b"above", Durability::GroupSync);
+        assert_eq!(
+            next(&mut one).seqno,
+            above,
+            "{catalog_append_fails}: a table's feed doesn't wait for the hold"
+        );
+        loop {
+            match all.wait(WAIT).unwrap() {
+                Next::Commit(c) => assert!(c.seqno < above, "{catalog_append_fails}: {c:?}"),
+                Next::Expired(_) => break,
+                other => panic!("{catalog_append_fails}: {other:?}"),
+            }
+        }
+        // Writes go on, and a later catalog change takes no hold of its own: one at a
+        // larger ceiling would let the frontier pass the frozen one.
+        let t = db
+            .create_table("d", &[("g".into(), FamilyOptions::default())])
+            .unwrap();
+        single(&db, &t, b"d", Durability::GroupSync);
+        let later = single(&db, &a, b"later", Durability::GroupSync);
+        assert_eq!(next(&mut one).seqno, later);
+        drop((all, one));
+        db.close().unwrap();
+    }
+}
+
+/// simp724's F1 on #1515 (D315 2b): an `After(s)` start passes over a catalog change with a
+/// ceiling at or below `s` even when the change's `Catalog` entry is appended after the
+/// feed opened. The catalog hold bounds a feed of every table's frontier, not visible
+/// seqnos, so a commit at or above the ceiling can be visible, and a snapshot taken, while
+/// the root observer is still to append. Mutation-checked: applying the bound only to the
+/// entries in the file at open delivers the change.
+#[test]
+fn an_after_start_passes_over_a_change_whose_entry_lands_after_it() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3171);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    db.delay_root_observer(Duration::from_millis(800));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    // The create holds its ceiling and waits in the observer; a commit after it is visible.
+    std::thread::sleep(Duration::from_millis(200));
+    let s = single(&db, &a, b"past", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::After(s))).unwrap();
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let ceiling = sidecar_entries(&vfs)
+        .iter()
+        .find_map(|e| match e {
+            FeedEntry::Catalog {
+                seqno_ceiling,
+                edits,
+                ..
+            } if edits.iter().any(|e| {
+                matches!(e, pigeonhole_format::manifest::Edit::CreateTable { name, .. } if name == "c")
+            }) =>
+            {
+                Some(*seqno_ceiling)
+            }
+            _ => None,
+        })
+        .expect("the create's entry");
+    assert!(
+        ceiling <= s,
+        "the start must be past the change: {ceiling} > {s}"
+    );
+    let after = single(&db, &a, b"after", Durability::GroupSync);
+    match r.wait(WAIT).unwrap() {
+        Next::Commit(c) => assert_eq!(c.seqno, after),
+        other => panic!("only the commit after the start: {other:?}"),
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's F1b on #1515 (D315 2b): a token resumes with its start's bound, so a resume
+/// passes over exactly what the start did. The race is F1's: a commit at or above a change's
+/// ceiling is visible while the change's entry isn't appended yet, and the token is taken
+/// then, before any poll.
+/// - **`After(s)` past the ceiling:** the start passes the change over, and so does the
+///   resume (with the bound reset, it delivered the change).
+/// - **`Now`:** the view doesn't reflect the change yet, so the feed delivers it, and so
+///   must a resume from a token taken before that. A bound taken from the token's
+///   delivered seqno would pass it over.
+#[test]
+fn a_resume_passes_over_what_its_start_did() {
+    use pigeonhole_format::feed::FeedEntry;
+    for after in [true, false] {
+        let vfs = SimVfs::new(3172);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        db.delay_root_observer(Duration::from_millis(800));
+        let create = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                    .unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let s = single(&db, &a, b"past", Durability::GroupSync);
+        let start = if after {
+            FeedStart::After(s)
+        } else {
+            FeedStart::Now
+        };
+        let token = db.feed(spec(&[], start)).unwrap().token();
+        create.join().unwrap();
+        db.delay_root_observer(Duration::ZERO);
+        let ceiling = sidecar_entries(&vfs)
+            .iter()
+            .find_map(|e| match e {
+                FeedEntry::Catalog {
+                    seqno_ceiling,
+                    edits,
+                    ..
+                } if edits.iter().any(|e| {
+                    matches!(e, pigeonhole_format::manifest::Edit::CreateTable { name, .. } if name == "c")
+                }) =>
+                {
+                    Some(*seqno_ceiling)
+                }
+                _ => None,
+            })
+            .expect("the create's entry");
+        assert!(
+            ceiling <= s,
+            "{after}: the start must be past the change: {ceiling} > {s}"
+        );
+        let later = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+        if !after {
+            match r.wait(WAIT).unwrap() {
+                Next::Catalog(ev) => assert_eq!(ev.seqno_ceiling, ceiling),
+                other => panic!("now: the change its view didn't reflect first: {other:?}"),
+            }
+        }
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(c) => assert_eq!(c.seqno, later, "{after}"),
+            other => panic!("{after}: the commit after: {other:?}"),
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// ICR 0114 amendment (simp724's F1 on #1518): a feed's position moves while only other
+/// tables write, and is never below `delivered`. Before the first poll it is the start.
+#[test]
+fn a_position_moves_while_other_tables_write() {
+    let vfs = SimVfs::new(3181);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    assert_eq!(
+        r.position().seqno,
+        r.delivered(),
+        "the start, before a poll"
+    );
+    let s1 = single(&db, &a, b"a1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let mut last = 0;
+    for i in 0..3u8 {
+        last = single(&db, &b, &[b'b', i], Durability::GroupSync);
+    }
+    // A durable feed's frontier follows the syncs: poll until it's past `b`'s commits.
+    let deadline = std::time::Instant::now() + WAIT;
+    while r.position().seqno < last {
+        assert!(matches!(r.try_next().unwrap(), Next::Pending));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the position stayed at {:?}",
+            r.position()
+        );
+        std::thread::yield_now();
+    }
+    assert!(r.position().seqno >= r.delivered());
+    assert_eq!(
+        r.position().catalog,
+        0,
+        "a feed of some tables has no catalog position"
+    );
+    // The next commit of the feed's own is above it.
+    let s2 = single(&db, &a, b"a2", Durability::GroupSync);
+    assert!(s2 > r.position().seqno);
+    assert_eq!(next(&mut r).seqno, s2);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// ICR 0114 amendment: a feed of every table's position never passes a commit read and not
+/// yet delivered, nor a catalog change loaded and not yet delivered; once the change is
+/// delivered, its sequence is the position's catalog part.
+#[test]
+fn a_position_never_passes_what_is_still_to_deliver() {
+    let vfs = SimVfs::new(3182);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let a1 = single(&db, &a, b"a1", Durability::GroupSync);
+    let a2 = single(&db, &a, b"a2", Durability::GroupSync);
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let c1 = single(&db, &c, b"c1", Durability::GroupSync);
+    // Wait until the frontier covers all of it, so one poll reads everything.
+    let deadline = std::time::Instant::now() + WAIT;
+    while db.feed_frontier(true) < c1 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let got = match r.wait(WAIT).unwrap() {
+        Next::Commit(cm) => cm.seqno,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(got, a1);
+    assert_eq!(r.position().seqno, a1, "a2 is read and not delivered");
+    assert_eq!(next(&mut r).seqno, a2);
+    let p = r.position();
+    let sequence = match r.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => {
+            assert!(
+                p.seqno < ev.seqno_ceiling,
+                "{p:?} past the change at {}",
+                ev.seqno_ceiling
+            );
+            ev.sequence
+        }
+        other => panic!("the create: {other:?}"),
+    };
+    let p = r.position();
+    assert_eq!(p.catalog, sequence);
+    assert!(p.seqno < c1, "c1 is still to deliver: {p:?}");
+    assert_eq!(next(&mut r).seqno, c1);
+    assert!(r.position() > p);
+    drop(r);
     db.close().unwrap();
 }

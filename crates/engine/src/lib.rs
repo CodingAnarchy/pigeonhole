@@ -71,7 +71,9 @@ pub use engine::{
     PendingReturning, Returned, Role, ShardStats, TableInfo, TableStorage,
 };
 pub use error::{Error, Result};
-pub use feed_reader::{Change, Commit, Expiry, FeedReader, FeedSpec, FeedStart, Next};
+pub use feed_reader::{
+    CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
+};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};

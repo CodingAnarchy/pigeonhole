@@ -397,6 +397,16 @@ fn entries() -> Vec<Entry> {
             extra: None,
             then: None,
         },
+        Entry {
+            name: "feed_catalog",
+            shards: 2,
+            options: feed_options,
+            write: write_feed_catalog,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_catalog_extra),
+            then: None,
+        },
     ]
 }
 
@@ -1149,6 +1159,207 @@ fn feed_extra(db: &Pigeonhole) -> String {
                         other => value_line(other),
                     }
                 )
+            ));
+        }
+        if c.seqno() >= last {
+            break;
+        }
+    }
+    out
+}
+
+/// Where `feed_catalog` keeps a feed of every table's token, stored as `FEED_TOKEN`'s is.
+const FEED_ALL_TOKEN: (&str, &[u8]) = ("feed_tokens", b"all");
+
+/// D315: a feed of every table's token from before the first commit, then commits among
+/// catalog changes: a table created with two families, a family added to it, and two tables
+/// dropped, one from before the token, beside a table from before the token that survives. The check resumes a feed of every table from the
+/// token and lists every event: the commits, and each catalog change with its names.
+fn write_feed_catalog(db: &Pigeonhole) {
+    let tokens = db
+        .table(FEED_ALL_TOKEN.0)
+        .unwrap()
+        .family("t", Family::default())
+        .create()
+        .unwrap();
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let kept = db
+        .table("kept")
+        .unwrap()
+        .family("k", Family::default())
+        .create()
+        .unwrap();
+    let token = db.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    let mut late = None;
+    for i in 0..120u64 {
+        match i {
+            30 => {
+                late = Some(
+                    db.table("late")
+                        .unwrap()
+                        .family("a", Family::default())
+                        .family("n", Family::counter())
+                        .create()
+                        .unwrap(),
+                )
+            }
+            60 => {
+                late = Some(
+                    db.table("late")
+                        .unwrap()
+                        .family("b", Family::default().max_versions(2))
+                        .open()
+                        .unwrap(),
+                )
+            }
+            90 => db.drop_table("events").unwrap(),
+            110 => {
+                late = None;
+                db.drop_table("late").unwrap();
+            }
+            _ => {}
+        }
+        let row = format!("r{:02}", i % 7);
+        let value = format!("event {i:03} ").repeat(40);
+        if i < 90 {
+            events
+                .mutate(row.as_bytes())
+                .put_at("e", b"what", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if i % 4 == 1 {
+            kept.mutate(row.as_bytes())
+                .put_at("k", b"kept", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if let Some(late) = &late
+            && i % 3 == 0
+        {
+            let family = if i >= 60 { "b" } else { "a" };
+            late.mutate(row.as_bytes())
+                .put_at(family, b"late", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if i % 50 == 49 {
+            db.flush().unwrap();
+        }
+    }
+    drop(events);
+    // A last commit after the final drop, so the check lists it: the token table's, which
+    // the listing leaves out.
+    let last = tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put("t", b"end", b"")
+        .commit()
+        .unwrap()
+        .seqno;
+    tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
+/// Every event after the stored all-tables token, up to the stored last seqno: each commit's
+/// changes, as `feed_extra` lists them, and each catalog change's edits with their names and
+/// a family's kind and version limit. The token table's own commit is left out (the token's
+/// bytes are this database's). A change to a table dropped by the time of the check has its
+/// table and family listed as `(dropped)`: whether a feed names those commits isn't frozen
+/// (ai1249 on #1515), so a later build that names them still passes. The catalog lines name
+/// every table.
+fn feed_catalog_extra(db: &Pigeonhole) -> String {
+    use pigeonhole::{CatalogEdit, FeedEvent};
+    let tokens = db.table(FEED_ALL_TOKEN.0).unwrap().open().unwrap();
+    let stored = tokens
+        .get(FEED_ALL_TOKEN.1, "t", b"token")
+        .unwrap()
+        .expect("the stored token");
+    let token = pigeonhole::FeedToken::from_bytes(stored.value());
+    let last = tokens
+        .get(FEED_ALL_TOKEN.1, "t", b"last")
+        .unwrap()
+        .expect("the stored last seqno")
+        .as_i64()
+        .unwrap() as u64;
+    let family = |f: &pigeonhole::FamilyInfo| {
+        format!(
+            "{}(counter={},max_versions={})",
+            f.name, f.counter, f.max_versions
+        )
+    };
+    let live = db.tables();
+    let mut feed = db.feed().resume(&token).open().unwrap();
+    let mut out = String::new();
+    loop {
+        let event = feed
+            .next_event(FEED_WAIT)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the feed stopped before seqno {last}"));
+        let c = match event {
+            FeedEvent::Catalog(change) => {
+                for e in change.edits() {
+                    let edit = match e {
+                        CatalogEdit::TableCreated {
+                            table, families, ..
+                        } => {
+                            let f: Vec<String> = families.iter().map(family).collect();
+                            format!("created\t{table}\t{}", f.join(","))
+                        }
+                        CatalogEdit::FamilyAdded {
+                            table, family: f, ..
+                        } => {
+                            format!("family\t{table}\t{}", family(f))
+                        }
+                        CatalogEdit::TableDropped { table, .. } => format!("dropped\t{table}"),
+                        other => panic!("an edit this check doesn't know: {other:?}"),
+                    };
+                    out.push_str(&format!("{}\tcatalog\t{edit}\n", change.seqno()));
+                }
+                continue;
+            }
+            FeedEvent::Commit(c) => c,
+            other => panic!("an event this check doesn't know: {other:?}"),
+        };
+        for ch in c.changes() {
+            if ch.table() == FEED_ALL_TOKEN.0 {
+                continue;
+            }
+            let (table, family) = if live.iter().any(|t| t == ch.table()) {
+                (ch.table(), ch.family())
+            } else {
+                ("(dropped)", "(dropped)")
+            };
+            let value = match ch.value() {
+                Some(Value::Bytes(b)) => format!(
+                    "bytes:{}:{:016x}",
+                    b.len(),
+                    pigeonhole_format::checksum::xxh3_64(b)
+                ),
+                Some(other) => value_line(other),
+                None => "-".to_owned(),
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{value}\n",
+                c.seqno(),
+                table,
+                family,
+                ch.kind(),
+                hex(ch.row()),
+                hex(ch.qualifier()),
+                ch.timestamp(),
             ));
         }
         if c.seqno() >= last {

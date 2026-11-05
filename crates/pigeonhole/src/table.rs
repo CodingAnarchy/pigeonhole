@@ -589,6 +589,15 @@ impl Table {
         self.core.family_info(family)
     }
 
+    /// The table's identity, as its change feed follows it (ICR 0114 amendment): ids are
+    /// never reused, so a table dropped and created again under the same name has another.
+    /// For a server that shares one feed among the clients of one set of tables
+    /// (`phdb serve`'s hubs). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn feed_id(&self) -> u64 {
+        u64::from(self.core.info.id.0)
+    }
+
     /// Starts a single-row atomic mutation.
     pub fn mutate<'t>(&'t self, row: &[u8]) -> RowMutation<'t> {
         RowMutation::new(self, row)
