@@ -68,6 +68,50 @@ for change in commit.changes() {
 - **`from_oldest()`:** the oldest history kept, across reopens too: it starts at the oldest earlier open whose history every shard still keeps whole. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
 - **`resume(&token)`:** after the last commit a feed delivered before it gave that token.
 
+## A feed of every table
+`Pigeonhole::feed()` follows every table, including tables created after it opened, as one stream of the whole database's commits. It needs the change feed on for every table: no `feed_tables` list in this open or in any earlier open its history spans. `next` gives its commits. `next_event` gives the same commits as `FeedEvent::Commit`, and the changes to the tables themselves as `FeedEvent::Catalog`, each in its place in commit order:
+
+```rust
+use pigeonhole::{CatalogEdit, Family, FeedEvent, FeedRetention, Options, Pigeonhole};
+use std::time::Duration;
+
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(
+    dir.join("app.phdb"),
+    Options::default().change_feed(FeedRetention::bytes(64 << 20)),
+)?;
+let mut feed = db.feed().open()?;
+let users = db.table("users")?.family("p", Family::default()).create()?;
+users.mutate(b"user:1").put("p", b"name", b"ada").commit()?;
+
+let wait = Duration::from_secs(5);
+match feed.next_event(wait)?.expect("the create") {
+    FeedEvent::Catalog(change) => match &change.edits()[0] {
+        CatalogEdit::TableCreated { table, families, .. } => {
+            assert_eq!((table.as_str(), families[0].name.as_str()), ("users", "p"));
+        }
+        other => panic!("{other:?}"),
+    },
+    other => panic!("{other:?}"),
+}
+match feed.next_event(wait)?.expect("the commit") {
+    FeedEvent::Commit(commit) => assert_eq!(commit.changes()[0].table(), "users"),
+    other => panic!("{other:?}"),
+}
+# drop(feed);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **A `CatalogChange`** holds the edits one catalog change made: `TableCreated` (with every family's options, as `FamilyInfo`), `FamilyAdded` and `TableDropped`, each naming its table. Its `seqno` places it: every commit below it came before the change, every commit at or above it comes after.
+- **Starts:** a feed opened now, or `from_snapshot`, passes over the changes its start already sees, so the tables that exist are not created again. A token resumes just past the last event, a commit or a catalog change.
+- **Tokens:** a feed of every table resumes only from a token of a feed of every table. A table's feed may resume from one: it follows part of what that feed did, from the same position.
+- **Names:** a change to a table dropped before the feed reached it comes with empty names, unless the feed delivered the table's creation.
+- **A sidecar failure** (the feed's `-feed` file can't be written) stops this session from recording catalog changes. The next catalog change then holds back every feed of the database, in every process, at its place in commit order, until the database reopens. A feed of every table in the writer's process expires at once. The others wait, and their tokens expire at the next open, as for any sidecar failure. Writes go on.
+- **Async:** `nonblocking::FeedEventStream` is `FeedStream` for events, and `Feed::poll_next_event` is the same one level down.
+
 ## Tokens
 Take `feed.token()` after handling a commit, and store it with what the commit fed, ideally in the same write. `FeedToken::as_bytes` and `FeedToken::from_bytes` round-trip it. Resuming continues exactly after the last commit delivered, so a crash between handling a commit and storing its token delivers that commit again, never skips it. Make your handling idempotent, or store the token atomically with its effect.
 

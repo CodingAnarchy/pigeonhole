@@ -9,6 +9,14 @@ pub struct pigeonhole::nonblocking::CommitFuture
 impl core::future::future::Future for pigeonhole::nonblocking::CommitFuture
 pub type pigeonhole::nonblocking::CommitFuture::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
 pub fn pigeonhole::nonblocking::CommitFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::FeedEventStream
+impl pigeonhole::nonblocking::FeedEventStream
+pub fn pigeonhole::nonblocking::FeedEventStream::into_inner(self) -> pigeonhole::Feed
+pub fn pigeonhole::nonblocking::FeedEventStream::new(pigeonhole::Feed) -> Self
+pub fn pigeonhole::nonblocking::FeedEventStream::token(&self) -> pigeonhole::FeedToken
+impl futures_core::stream::Stream for pigeonhole::nonblocking::FeedEventStream
+pub type pigeonhole::nonblocking::FeedEventStream::Item = core::result::Result<pigeonhole::FeedEvent, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::FeedEventStream::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
 pub struct pigeonhole::nonblocking::FeedStream
 impl pigeonhole::nonblocking::FeedStream
 pub fn pigeonhole::nonblocking::FeedStream::into_inner(self) -> pigeonhole::Feed
@@ -63,6 +71,15 @@ pub pigeonhole::Aggregation::Quantiles(pigeonhole::QuantileParams)
 pub pigeonhole::Aggregation::Set
 pub pigeonhole::Aggregation::Sum
 pub pigeonhole::Aggregation::SumF64
+#[non_exhaustive] pub enum pigeonhole::CatalogEdit
+#[non_exhaustive] pub pigeonhole::CatalogEdit::FamilyAdded
+pub pigeonhole::CatalogEdit::FamilyAdded::family: pigeonhole::FamilyInfo
+pub pigeonhole::CatalogEdit::FamilyAdded::table: alloc::string::String
+#[non_exhaustive] pub pigeonhole::CatalogEdit::TableCreated
+pub pigeonhole::CatalogEdit::TableCreated::families: alloc::vec::Vec<pigeonhole::FamilyInfo>
+pub pigeonhole::CatalogEdit::TableCreated::table: alloc::string::String
+#[non_exhaustive] pub pigeonhole::CatalogEdit::TableDropped
+pub pigeonhole::CatalogEdit::TableDropped::table: alloc::string::String
 #[non_exhaustive] pub enum pigeonhole::ChangeKind
 pub pigeonhole::ChangeKind::DeleteCell
 pub pigeonhole::ChangeKind::DeleteColumn
@@ -141,6 +158,9 @@ pub pigeonhole::FailureCause::DriverDropped = 2
 pub pigeonhole::FailureCause::Internal = 4
 pub pigeonhole::FailureCause::Io = 3
 pub pigeonhole::FailureCause::Panic = 1
+#[non_exhaustive] pub enum pigeonhole::FeedEvent
+pub pigeonhole::FeedEvent::Catalog(pigeonhole::CatalogChange)
+pub pigeonhole::FeedEvent::Commit(pigeonhole::Commit)
 #[non_exhaustive] pub enum pigeonhole::IoBackend
 pub pigeonhole::IoBackend::Auto
 pub pigeonhole::IoBackend::Pread
@@ -213,6 +233,11 @@ impl pigeonhole::BloomParams
 pub fn pigeonhole::BloomParams::bits(&self) -> u32
 pub fn pigeonhole::BloomParams::hashes(&self) -> u8
 pub fn pigeonhole::BloomParams::new(u32, u8) -> pigeonhole::Result<Self>
+pub struct pigeonhole::CatalogChange
+impl pigeonhole::CatalogChange
+pub fn pigeonhole::CatalogChange::edits(&self) -> &[pigeonhole::CatalogEdit]
+pub fn pigeonhole::CatalogChange::seqno(&self) -> u64
+pub fn pigeonhole::CatalogChange::timestamp(&self) -> u64
 pub struct pigeonhole::Cell
 impl pigeonhole::Cell
 pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
@@ -424,10 +449,13 @@ pub fn pigeonhole::FamilyStorage::ssts(&self) -> u64
 pub struct pigeonhole::Feed
 impl pigeonhole::Feed
 pub fn pigeonhole::Feed::next(&mut self, core::time::Duration) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
+pub fn pigeonhole::Feed::next_event(&mut self, core::time::Duration) -> pigeonhole::Result<core::option::Option<&pigeonhole::FeedEvent>>
 pub fn pigeonhole::Feed::oldest_retained(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Feed::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<&pigeonhole::Commit>>
+pub fn pigeonhole::Feed::poll_next_event(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<&pigeonhole::FeedEvent>>
 pub fn pigeonhole::Feed::token(&self) -> pigeonhole::FeedToken
 pub fn pigeonhole::Feed::try_next(&mut self) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
+pub fn pigeonhole::Feed::try_next_event(&mut self) -> pigeonhole::Result<core::option::Option<&pigeonhole::FeedEvent>>
 pub struct pigeonhole::FeedBuilder
 impl pigeonhole::FeedBuilder
 pub fn pigeonhole::FeedBuilder::from_oldest(self) -> Self
