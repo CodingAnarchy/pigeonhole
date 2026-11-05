@@ -575,8 +575,11 @@ pub struct Stats {
     /// Reads at a held snapshot checked against the model rebuilt for its view, because a
     /// compaction published after it purged something (`World::model_at`).
     pub reads_at_older_views: usize,
-    /// Puts in acknowledged commits with a value above the inline limit (`LARGE_VALUE`),
-    /// into families whose values may be separated (not an aggregate family's).
+    /// Puts in submitted commits with a value above the inline limit (`LARGE_VALUE`), into
+    /// families whose values may be separated (not an aggregate family's). Counted at submit,
+    /// where the engine separates them (`commit_separations`), so a conditional commit whose
+    /// condition fails pairs its separation with its put (seed 89 of the counters sweep on
+    /// #1566: 4 separations for 1 acknowledged large put).
     pub large_puts: usize,
     /// Values the engine separated into blob files at commit time (#230), summed across
     /// reopens (`Engine::commit_separations`): the path a deferred run must take as a plain
@@ -1917,13 +1920,6 @@ impl World {
             }
         }
         out
-    }
-
-    /// Counts an acknowledged commit's large puts, and the commit-time separations since the
-    /// last look (`Stats::large_puts`, `Stats::commit_separations`).
-    fn note_separations(&mut self, large: usize) {
-        self.stats.large_puts += large;
-        self.note_commit_separations();
     }
 
     /// Adds the open engine's commit-time separations since the last look to
@@ -4050,7 +4046,7 @@ impl World {
             c.commit_ts = Some(ts);
             c.acked = true;
             self.stats.commits += 1;
-            self.note_separations(large_puts(&c.ops));
+            self.note_commit_separations();
             if c.shards.len() > 1 {
                 self.stats.cross_shard += 1;
             }
@@ -4777,6 +4773,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        self.stats.large_puts += large_puts(&ops);
         self.trace.push(format!(
             "commit {durability:?} ts={now} shards={shards:?}{} [{}]{}",
             if alone { "" } else { " (batched)" },
@@ -4888,6 +4885,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        self.stats.large_puts += large_puts(&ops);
         self.stats.returning += 1;
         self.trace.push(format!(
             "returning {durability:?} ts={now} {}{}{} [{}]{}",
@@ -5223,6 +5221,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        self.stats.large_puts += large_puts(&ops);
         let fam_id = self.store().family_ids[&(table.clone(), family.clone())];
         let engine = Arc::clone(&self.store().engine);
         let table_id = self.store().tables[&table].id;
@@ -5324,6 +5323,7 @@ impl World {
         let armed = self.arm(rng);
         let shards = self.shards_of(&ops);
         self.stats.submitted += 1;
+        self.stats.large_puts += large_puts(&ops);
         let store = self.store.as_ref().expect("store open");
         let mut txn = match store.engine.begin() {
             Ok(t) => t,
@@ -5653,7 +5653,7 @@ impl World {
         }
         self.engine_seqnos.push(info.seqno);
         self.stats.commits += 1;
-        self.note_separations(large_puts(&ops));
+        self.note_commit_separations();
         let c = Committed {
             seqno: Some(info.seqno),
             ops,
