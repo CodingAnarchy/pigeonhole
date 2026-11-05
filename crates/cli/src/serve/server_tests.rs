@@ -2017,8 +2017,7 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     // asks for it. With a deeper one it could buffer all five, rejoin and free the slot
     // first.
     l.feed_client_events = 1;
-    // The test reads the streams one after the other, so the second waits for as long as
-    // the first takes to read: not an idle client. Out of reach of a slow runner (#1531).
+    // Not an idle-limit test: out of reach of a slow runner (#1531).
     l.stream_idle = Duration::from_secs(600);
     let s = Server::start("", l);
     let written: Vec<u64> = (0..5)
@@ -2034,20 +2033,25 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
-    // The second gets its slot only once the first has rejoined the ring (up to a
-    // REJOIN_TICK after it caught up). So collect until every commit is in or a long
-    // deadline passes, never stopping at a quiet spell: a slow runner can pause longer than
-    // any short window (#1527's CI on macOS).
-    for events in [&mut first, &mut second] {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut got = Vec::new();
-        while got.len() < written.len() && std::time::Instant::now() < deadline {
-            if let Some(e) = next_event(&s, events, Duration::from_millis(200)) {
-                got.extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+    // Either client may hold the slot: their tasks race for it. Whichever does gets it back
+    // only once it has caught up and rejoined the ring (up to a REJOIN_TICK later), and
+    // with a one-event buffer it catches up only as its events are taken. So take from both
+    // streams in turn, never one to the end first: reading the waiting one first would
+    // starve the holder (#1531: on Windows CI, nothing moved for 10 s). Collect until every
+    // commit is in, or a long deadline passes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut got = [Vec::new(), Vec::new()];
+    while got.iter().any(|g| g.len() < written.len()) && std::time::Instant::now() < deadline {
+        for (i, events) in [&mut first, &mut second].into_iter().enumerate() {
+            if got[i].len() < written.len()
+                && let Some(e) = next_event(&s, events, Duration::from_millis(50))
+            {
+                got[i].extend(commit_of(&e.unwrap()).map(|(n, _)| n));
             }
         }
-        assert_eq!(got, written);
     }
+    assert_eq!(got[0], written, "the first stream");
+    assert_eq!(got[1], written, "the second stream");
 }
 
 #[test]
