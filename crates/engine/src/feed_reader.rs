@@ -352,6 +352,9 @@ pub struct FeedReader {
     /// ceiling that its view doesn't reflect, and must still deliver that change.
     catalog_bound: Seqno,
     sidecar_pos: u64,
+    /// The writer's `Feed::catalog_roots` as of the last sidecar load: a change means a
+    /// catalog change's entry is rooted that this feed hasn't loaded, though no seqno moved.
+    catalog_roots_seen: u64,
     dropped_tables: HashSet<TableId>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
@@ -532,6 +535,7 @@ impl FeedReader {
             catalog_seq: 0,
             catalog_bound: 0,
             sidecar_pos: 0,
+            catalog_roots_seen: 0,
             dropped_tables: HashSet::new(),
             out_catalog: CatalogEvent::default(),
         };
@@ -718,20 +722,28 @@ impl FeedReader {
                 Some(feed) if held => {
                     feed.wait_for_hold(self.key, &waker());
                     on_hold_list = true;
-                    // A frozen catalog hold's releaser stores `appends_stopped`, then wakes
-                    // the list: re-checked after the registration's fence, so a wake that
-                    // found the list empty is seen here (simp724's W2 on #1533).
-                    if self.tables.is_empty() && feed.appends_stopped() {
+                    // A releaser's store before its wake, re-checked after the
+                    // registration's fence, so a wake that found the list empty is seen here.
+                    if self.catalog_wake_missed(feed) {
                         continue;
                     }
                 }
-                Some(_) => {
+                Some(feed) => {
                     let waiters = if self.durable {
                         &self.shared.durable_waiters
                     } else {
                         &self.shared.waiters
                     };
                     waiters.register(self.key, target, Wake::Task(waker()));
+                    // A feed of every table waits for catalog changes too, which move no
+                    // seqno: their release wakes the hold list.
+                    if self.tables.is_empty() {
+                        feed.wait_for_hold(self.key, &waker());
+                        on_hold_list = true;
+                        if self.catalog_wake_missed(feed) {
+                            continue;
+                        }
+                    }
                 }
             }
             if let Some(feed) = &self.writer {
@@ -751,6 +763,23 @@ impl FeedReader {
             }
             std::thread::park_timeout(park);
         }
+    }
+
+    /// Whether a catalog change may have been rooted since this feed last loaded the sidecar:
+    /// the writer's count moved, or (a reader process) unknown.
+    fn catalog_moved(&self) -> bool {
+        self.writer
+            .as_ref()
+            .is_none_or(|feed| feed.catalog_roots() != self.catalog_roots_seen)
+    }
+
+    /// Whether a feed of every table, just registered on the hold list, must poll again
+    /// rather than park: a frozen catalog hold (simp724's W2 on #1533) or a catalog change
+    /// rooted since its last load, each stored before `release_catalog`'s wake, re-checked
+    /// after the registration's fence.
+    fn catalog_wake_missed(&self, feed: &crate::feed::Feed) -> bool {
+        self.tables.is_empty()
+            && (feed.appends_stopped() || feed.catalog_roots() != self.catalog_roots_seen)
     }
 
     /// Takes this reader's waker off the feed's hold list, if `on` (it left one there).
@@ -806,9 +835,9 @@ impl FeedReader {
                 // this when it lets one go.
                 feed.wait_for_hold(self.key, cx.waker());
                 on_hold_list = true;
-                // As in `wait`: a frozen catalog hold's `appends_stopped`, stored before its
-                // wake, is re-checked after the registration's fence (simp724's W2 on #1533).
-                if self.tables.is_empty() && feed.appends_stopped() {
+                // As in `wait`: a releaser's store before its wake, re-checked after the
+                // registration's fence (simp724's W2 on #1533).
+                if self.catalog_wake_missed(&feed) {
                     continue;
                 }
             } else {
@@ -818,6 +847,14 @@ impl FeedReader {
                     &self.shared.waiters
                 };
                 waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
+                // As in `wait`: a feed of every table waits for catalog changes too.
+                if self.tables.is_empty() {
+                    feed.wait_for_hold(self.key, cx.waker());
+                    on_hold_list = true;
+                    if self.catalog_wake_missed(&feed) {
+                        continue;
+                    }
+                }
             }
             // A publish or a release that missed the registration is seen here.
             if self.shm.written_seqno(self.durable, self.tables.is_empty()) < target {
@@ -1095,6 +1132,15 @@ impl FeedReader {
         if self.read_through == Some(frontier) && self.held.is_empty() {
             if self.shm.is_stale() {
                 return Err(Error::SnapshotExpired);
+            }
+            // A catalog change moves no seqno: a feed of every table loads the sidecar here
+            // too, when the writer counted a new one (in a reader process, which has no count
+            // to look at, on each of its backoff's polls), and delivers it if it's due.
+            if self.tables.is_empty() && self.catalog_moved() {
+                self.load_catalog(None)?;
+                if let Some(p) = self.emit()?.polled() {
+                    return Ok(p);
+                }
             }
             return Ok(self.pending_state());
         }
@@ -1701,6 +1747,10 @@ impl FeedReader {
     /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
     /// later changes are passed over.
     fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
+        // Before the file is read: a change counted after this is loaded next time.
+        if let Some(feed) = &self.writer {
+            self.catalog_roots_seen = feed.catalog_roots();
+        }
         let path = crate::feed::sidecar_path(&self.shared.path);
         let file = match self.shared.vfs.open(&path, OpenOptions::read()) {
             Ok(f) => f,

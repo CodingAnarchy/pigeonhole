@@ -73,7 +73,7 @@ pub(crate) struct Sidecar {
     /// The `RootIntent` this session appended for the root commit in progress, and where:
     /// its Root entry overwrites exactly that one (simp724's R2 on #1504). Root commits
     /// never overlap, so one.
-    intent: Option<(u64, u64)>,
+    intent: Option<(u64, u64, bool)>,
 }
 
 impl Sidecar {
@@ -490,6 +490,8 @@ pub(crate) struct Feed {
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
     /// observer waits before it records the root, widening the window between a durable
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
+    /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
+    catalog_roots: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
     /// A hold seam (`Engine::delay_root_intent`, D315 amendment): nanoseconds each root
@@ -559,6 +561,7 @@ impl Feed {
             catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
+            catalog_roots: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
@@ -801,7 +804,7 @@ impl Feed {
         FeedEntry::RootIntent { sequence, checksum }.encode(&mut bytes);
         let appended = s
             .append_bytes(&bytes)
-            .map(|()| s.intent = Some((sequence, at)));
+            .map(|()| s.intent = Some((sequence, at, catalog.is_some())));
         if let Err(e) = appended {
             crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
             *sidecar = None;
@@ -845,8 +848,14 @@ impl Feed {
                 session: self.session,
                 sequence,
             };
+            // Whether this root carries a catalog change: its Catalog entry is in the file and
+            // now rooted, for a feed of every table to load (`catalog_roots`).
+            let mut catalog = staged.is_some();
             let written = match s.intent.take() {
-                Some((seq, at)) if seq == sequence && staged.is_none() => s.overwrite(at, &root),
+                Some((seq, at, with_catalog)) if seq == sequence && staged.is_none() => {
+                    catalog = with_catalog;
+                    s.overwrite(at, &root)
+                }
                 _ => staged
                     .map(|c| FeedEntry::Catalog {
                         session: self.session,
@@ -866,9 +875,21 @@ impl Feed {
                 self.appends_stopped.store(true, Ordering::Release);
                 return;
             }
+            if catalog {
+                // After the Root entry is written, before `release_catalog` wakes the hold
+                // list: a feed of every table that sees the count move loads the sidecar.
+                self.catalog_roots.fetch_add(1, Ordering::Release);
+            }
             Arc::clone(&s.file)
         };
         self.request_sidecar_sync(file);
+    }
+
+    /// How many of this session's catalog changes have their Root entry written (D315): a
+    /// feed of every table in this process loads the sidecar when it moves, though no seqno
+    /// did (a catalog change on an idle database).
+    pub(crate) fn catalog_roots(&self) -> u64 {
+        self.catalog_roots.load(Ordering::Acquire)
     }
 
     /// Stages a catalog change for its root commit's `Catalog` entry (D315), before that
