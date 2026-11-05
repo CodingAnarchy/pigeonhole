@@ -71,9 +71,23 @@ pub struct Change {
     qualifier: Vec<u8>,
     /// The stored value (its tag byte first); empty for deletes.
     stored: Vec<u8>,
+    /// The engine's ids of its table and family (a replica applies by them, D315).
+    ids: (TableId, FamilyId),
 }
 
 impl Change {
+    /// The engine's ids of its table and family.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn ids(&self) -> (TableId, FamilyId) {
+        self.ids
+    }
+
+    /// The stored value, its tag byte first; empty for deletes.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn stored(&self) -> &[u8] {
+        &self.stored
+    }
+
     /// The table's name. Empty only for a family created after the feed opened whose table
     /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
@@ -176,9 +190,18 @@ pub struct CatalogChange {
     seqno: u64,
     ts: u64,
     edits: Vec<CatalogEdit>,
+    /// The change as the engine recorded it, with its ids and root sequence (a replica applies
+    /// it, D315).
+    raw: CatalogEvent,
 }
 
 impl CatalogChange {
+    /// The change as the engine recorded it, with its ids.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn raw(&self) -> &CatalogEvent {
+        &self.raw
+    }
+
     /// Where it falls in commit order: every commit with a lower [`Commit::seqno`] came
     /// before it, every commit at or above it comes after.
     pub fn seqno(&self) -> u64 {
@@ -420,6 +443,7 @@ impl FeedBuilder {
         let (mut reader, generation) = subscribe(&self.db, spec.clone())?;
         let reader_progress = Arc::new(AtomicU64::new(0));
         reader.set_progress(Arc::clone(&reader_progress));
+        let start = stream_position(&reader);
         Ok(Feed {
             db: self.db,
             // Only ever resubscribed from its own token: the start isn't kept, so a snapshot
@@ -438,6 +462,7 @@ impl FeedBuilder {
                 failed: None,
             },
             covered: pigeonhole_engine::FeedPosition::default(),
+            span: (start, start),
             progress: FeedProgress::attach(reader_progress),
         })
     }
@@ -450,6 +475,23 @@ fn note_names(names: &mut Names, info: &pigeonhole_engine::TableInfo) {
         names
             .entry((info.id, f.id))
             .or_insert_with(|| (Arc::clone(&table), Arc::from(f.name.as_str())));
+    }
+}
+
+/// Where a feed's stream is, as its token records it (D315 PR 3): every commit at or below
+/// `seqno` delivered or passed over, and every catalog change through `catalog`. Two
+/// deliveries of one feed chain when one's end is the next one's start, and a feed resumed
+/// from a token taken after a delivery starts at that delivery's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct StreamPosition {
+    pub(crate) seqno: u64,
+    pub(crate) catalog: u64,
+}
+
+fn stream_position(reader: &FeedReader) -> StreamPosition {
+    StreamPosition {
+        seqno: reader.delivered(),
+        catalog: reader.position().catalog,
     }
 }
 
@@ -515,6 +557,9 @@ pub struct Feed {
     /// restart's resubscribe starts the new one at the token's delivered seqno, which can
     /// be below it).
     covered: pigeonhole_engine::FeedPosition,
+    /// The stream's position before and after the last delivery (D315 PR 3): a replica checks
+    /// that the runs it applies chain, each starting where the last ended.
+    span: (StreamPosition, StreamPosition),
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
 }
@@ -663,7 +708,10 @@ impl Feed {
                 }
             };
             match step(&mut self.out, &self.db, self.generation, next, events)? {
-                Step::Ready => return Ok(true),
+                Step::Ready => {
+                    self.note_delivery();
+                    return Ok(true);
+                }
                 // A catalog change a commits-only call passes over, or a superseded
                 // reader's expiry: look again (the engine returns at once if more is ready).
                 Step::Again => continue,
@@ -692,7 +740,10 @@ impl Feed {
                 }
             };
             return match step(&mut self.out, &self.db, self.generation, next, events)? {
-                Step::Ready => Ok(true),
+                Step::Ready => {
+                    self.note_delivery();
+                    Ok(true)
+                }
                 Step::Again => continue,
                 Step::Pending => Ok(false),
             };
@@ -727,7 +778,10 @@ impl Feed {
                 }
             };
             return match step(&mut self.out, &self.db, self.generation, next, events) {
-                Ok(Step::Ready) => Poll::Ready(Ok(())),
+                Ok(Step::Ready) => {
+                    self.note_delivery();
+                    Poll::Ready(Ok(()))
+                }
                 Ok(Step::Again) => continue,
                 // The engine's `poll_next` returns `Poll::Pending` instead.
                 Ok(Step::Pending) => Poll::Pending,
@@ -747,6 +801,27 @@ impl Feed {
             return Ok(());
         }
         Err(fail(&mut self.out.failed, e.into()))
+    }
+
+    /// The last event [`next_event`](Self::next_event) (or its try and poll forms) delivered,
+    /// as a replica applies it (D315 PR 3): its changes with the primary's ids, its position
+    /// span, and the feed's token right after it. Call it before the feed's next call, which
+    /// moves both. `None` before any event. Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn replicated(&self) -> Option<crate::replication::ReplicatedEvent> {
+        let event = self.out.event.as_ref()?;
+        Some(crate::replication::ReplicatedEvent::new(
+            event,
+            self.span,
+            self.token(),
+        ))
+    }
+
+    /// A delivery happened: the span from the last one's end to the stream's position now.
+    fn note_delivery(&mut self) {
+        let after = stream_position(&self.reader);
+        self.span = (self.span.1, after);
     }
 
     /// The error that ended the feed, again.
@@ -954,6 +1029,7 @@ fn catalog_change(names: &mut Names, ev: &CatalogEvent) -> CatalogChange {
         seqno: ev.seqno_ceiling,
         ts: ev.timestamp,
         edits,
+        raw: ev.clone(),
     }
 }
 
@@ -995,6 +1071,7 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
         if let Some(slot) = out.changes.get_mut(i) {
             slot.table = table;
             slot.family = family;
+            slot.ids = key;
             slot.kind = kind;
             slot.ts = ch.ts;
             for (to, from) in [
@@ -1014,6 +1091,7 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
                 row: ch.row.clone(),
                 qualifier: ch.qualifier.clone(),
                 stored: ch.value.clone(),
+                ids: key,
             });
         }
     }
