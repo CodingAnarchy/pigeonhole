@@ -37,3 +37,6 @@ None: additive. The Python and Ruby bindings expose it (#1440, cli692):
   - `Engine::submit_returning_previous(..) -> Result<PendingReturning>`, plus `PendingReturning::take_previous(&mut self) -> Vec<Previous>` once it resolves.
   - `Previous` (`#[non_exhaustive]`: `family`, `qualifier`, `value: Result<Option<CellData>>`).
 - **Bindings** (cli692's PR 2): Python `Returned = Incremented` and Ruby `Pigeonhole::Returned = Pigeonhole::Incremented`, keeping the classes' identity. A failed previous-value read raises `ReturnedValueError`, as a counter's does.
+  - Python: `Mutation.return_previous(family, qualifier) -> Mutation`, and `Incremented.previous(family, qualifier) -> Cell | None` (`InvalidArgument` for a column not asked for). `commit_returning_async()` takes the requests too.
+  - Ruby: `Mutation#return_previous(family, qualifier) -> self`, and `Incremented#previous(family, qualifier) -> Cell?`, with the same errors.
+  - Both refuse `commit` and `commit_if` on a mutation with requests, as the Rust API does.

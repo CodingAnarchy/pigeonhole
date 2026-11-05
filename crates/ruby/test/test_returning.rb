@@ -128,4 +128,76 @@ class TestReturning < Minitest::Test
                 .flat_map(&:value)
     assert_equal (1..200).to_a, got.sort
   end
+
+  # ---- return_previous (#1445, ICR 0113 amendment) ----
+
+  def leases
+    @leases ||= db.table("leases").family("s").family("n", Pigeonhole::Family.counter).create
+  end
+
+  # The guide's example: an unconditional takeover says whom it displaced, with a fencing
+  # epoch, and the displaced holder's next guarded write finds it lost the lease (simp724's
+  # L1 and L2 on #1552).
+  def test_a_lease_handoff_returns_the_holder_it_replaced
+    mine = Pigeonhole::Condition.equals("s", "holder", "worker-3")
+    leases.mutate("lease:42").put("s", "holder", "worker-3").incr("n", "epoch", 1).commit
+    refute_nil leases.mutate("lease:42").put("s", "beat", "1").commit_if(mine)
+    r = leases.mutate("lease:42")
+              .put("s", "holder", "worker-7")
+              .incr("n", "epoch", 1)
+              .return_previous("s", "holder")
+              .commit_returning
+    old = r.previous("s", "holder")
+    assert_instance_of Pigeonhole::Cell, old
+    assert_equal "worker-3", old.value
+    assert_equal 2, r.value("n", "epoch"), "the new holder's fencing token"
+    assert_equal "worker-7", leases.get("lease:42", "s", "holder").value
+    # The displaced holder's guarded write: refused, nothing written.
+    assert_nil leases.mutate("lease:42").put("s", "beat", "2").commit_if(mine)
+    assert_equal "1", leases.get("lease:42", "s", "beat").value
+    # A column with nothing before the commit.
+    r = leases.mutate("lease:43").put(:s, "holder", "worker-1").return_previous(:s, "holder").commit_returning
+    assert_nil r.previous("s", "holder")
+  end
+
+  def test_previous_values_sit_beside_the_counters
+    leases.mutate("r").put("s", "state", "packed").incr("n", "v", 4).commit
+    r = leases.mutate("r")
+              .put("s", "state", "shipped")
+              .incr("n", "v", 1)
+              .return_previous("s", "state")
+              .return_previous("n", "v")
+              .return_previous("s", "state") # a repeat is one request
+              .commit_returning
+    assert_equal 5, r.value("n", "v")
+    assert_equal "packed", r.previous("s", "state").value
+    assert_equal 4, r.previous("n", "v").as_int
+    assert_equal 1, r.size # the counters only
+  end
+
+  def test_return_previous_is_refused_outside_commit_returning
+    condition = Pigeonhole::Condition.absent("s", "x")
+    [->(m) { m.commit }, ->(m) { m.commit_if(condition) }].each do |commit|
+      m = leases.mutate("r").put("s", "x", "1").return_previous("s", "x")
+      assert_raises(Pigeonhole::InvalidArgument) { commit.call(m) }
+    end
+    assert_nil leases.get("r", "s", "x"), "nothing was written"
+    # A mutation that writes nothing.
+    assert_raises(Pigeonhole::InvalidArgument) do
+      leases.mutate("r").return_previous("s", "x").commit_returning
+    end
+    # A column the mutation didn't ask for is the caller's mistake, not a failed read.
+    r = leases.mutate("r").put("s", "x", "1").return_previous("s", "x").commit_returning
+    e = assert_raises(Pigeonhole::InvalidArgument) { r.previous("s", "other") }
+    refute_kind_of Pigeonhole::ReturnedValueError, e
+    # Asking after the commit.
+    m = leases.mutate("r").put("s", "x", "2")
+    m.commit_returning
+    assert_raises(Pigeonhole::SpentError) { m.return_previous("s", "x") }
+  end
+
+  def test_returned_is_incremented
+    assert_same Pigeonhole::Incremented, Pigeonhole::Returned
+    assert_kind_of Pigeonhole::Returned, leases.mutate("r").incr("n", "v", 1).commit_returning
+  end
 end

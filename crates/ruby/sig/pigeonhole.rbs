@@ -246,19 +246,25 @@ module Pigeonhole
     def put_vector: (name family, String qualifier, vector_in vector, ?ts: Integer?) -> self
     def delete: (?name? family, ?String? qualifier, ?ts: Integer?) -> self
     def durability: (durability durability) -> self
+    def return_previous: (name family, String qualifier) -> self
     def commit: () -> Integer
     def commit_if: (Condition condition) -> Integer?
     def commit_returning: () -> Incremented
   end
 
-  # The counter cells a Mutation#commit_returning wrote, after its commit.
+  # The counter cells a Mutation#commit_returning wrote, after its commit, and the columns
+  # return_previous asked for, as they were before it.
   class Incremented
     def seqno: () -> Integer
     def value: (name family, String qualifier, ?ts: Integer?) -> Integer?
+    def previous: (name family, String qualifier) -> Cell?
     def to_h: () -> Hash[[String, String, Integer], Integer?]
     def size: () -> Integer
     def inspect: () -> String
   end
+
+  # Incremented's name since 1.2 (ICR 0113): the same class.
+  class Returned = Incremented
 
   # Writes to any rows and tables, committed atomically.
   class WriteBatch

@@ -152,3 +152,121 @@ def test_a_failed_commit_and_a_failed_read_after_it_raise_apart(db, t):
     with pytest.raises(ph.Closed) as e:
         t.incr_returning(b"r", "n", b"a", 1)
     assert not isinstance(e.value, ph.ReturnedValueError)
+
+
+# ---- return_previous (#1445, ICR 0113 amendment) ----
+
+
+@pytest.fixture
+def leases(db):
+    return db.table("leases").family("s").family("n", ph.Family.counter()).create()
+
+
+def test_a_lease_handoff_returns_the_holder_it_replaced(leases):
+    """The guide's example: an unconditional takeover says whom it displaced, with a fencing
+    epoch, and the displaced holder's next guarded write finds it lost the lease (simp724's
+    L1 and L2 on #1552)."""
+    mine = ph.Condition.equals("s", b"holder", b"worker-3")
+    leases.mutate(b"lease:42").put("s", b"holder", b"worker-3").incr("n", b"epoch", 1).commit()
+    assert leases.mutate(b"lease:42").put("s", b"beat", b"1").commit_if(mine) is not None
+    r = (
+        leases.mutate(b"lease:42")
+        .put("s", b"holder", b"worker-7")
+        .incr("n", b"epoch", 1)
+        .return_previous("s", b"holder")
+        .commit_returning()
+    )
+    old = r.previous("s", b"holder")
+    assert isinstance(old, ph.Cell) and old.value == b"worker-3"
+    assert r.value("n", b"epoch") == 2, "the new holder's fencing token"
+    assert leases.get(b"lease:42", "s", b"holder").value == b"worker-7"
+    # The displaced holder's guarded write: refused, nothing written.
+    assert leases.mutate(b"lease:42").put("s", b"beat", b"2").commit_if(mine) is None
+    assert leases.get(b"lease:42", "s", b"beat").value == b"1"
+    # A column with nothing before the commit.
+    r = (
+        leases.mutate(b"lease:43")
+        .put("s", "holder", b"worker-1")
+        .return_previous("s", "holder")
+        .commit_returning()
+    )
+    assert r.previous("s", b"holder") is None
+
+
+def test_previous_values_sit_beside_the_counters(leases):
+    leases.mutate(b"r").put("s", b"state", b"packed").incr("n", b"v", 4).commit()
+    r = (
+        leases.mutate(b"r")
+        .put("s", b"state", b"shipped")
+        .incr("n", b"v", 1)
+        .return_previous("s", b"state")
+        .return_previous("n", b"v")
+        .return_previous("s", b"state")  # a repeat is one request
+        .commit_returning()
+    )
+    assert r.value("n", b"v") == 5
+    assert r.previous("s", b"state").value == b"packed"
+    assert r.previous("n", b"v").as_int() == 4
+    assert len(r) == 1  # the counters only: previous values aren't keys
+
+
+def test_return_previous_is_refused_outside_commit_returning(leases):
+    condition = ph.Condition.absent("s", b"x")
+    for commit in [lambda m: m.commit(), lambda m: m.commit_if(condition)]:
+        m = leases.mutate(b"r").put("s", b"x", b"1").return_previous("s", b"x")
+        with pytest.raises(ph.InvalidArgument):
+            commit(m)
+    assert leases.get(b"r", "s", b"x") is None, "nothing was written"
+    # A mutation that writes nothing.
+    with pytest.raises(ph.InvalidArgument):
+        leases.mutate(b"r").return_previous("s", b"x").commit_returning()
+    # A column the mutation didn't ask for is the caller's mistake, not a failed read.
+    r = leases.mutate(b"r").put("s", b"x", b"1").return_previous("s", b"x").commit_returning()
+    with pytest.raises(ph.InvalidArgument) as e:
+        r.previous("s", b"other")
+    assert not isinstance(e.value, ph.ReturnedValueError)
+    # Asking after the commit.
+    m = leases.mutate(b"r").put("s", b"x", b"2")
+    m.commit_returning()
+    with pytest.raises(ValueError, match="already committed"):
+        m.return_previous("s", b"x")
+
+
+def test_returned_is_incremented(leases):
+    assert ph.Returned is ph.Incremented
+    r = leases.mutate(b"r").incr("n", b"v", 1).commit_returning()
+    assert isinstance(r, ph.Returned)
+
+
+def test_the_async_commits_refuse_a_mutation_with_requests(leases):
+    """ai1249's Q2 on #1552: commit_async and commit_if_async raise InvalidArgument when
+    awaited, through the future's error path."""
+    import asyncio
+
+    condition = ph.Condition.absent("s", b"x")
+
+    async def go(commit):
+        m = leases.mutate(b"r").put("s", b"x", b"1").return_previous("s", b"x")
+        with pytest.raises(ph.InvalidArgument):
+            await commit(m)
+
+    asyncio.run(go(lambda m: m.commit_async()))
+    asyncio.run(go(lambda m: m.commit_if_async(condition)))
+    assert leases.get(b"r", "s", b"x") is None, "nothing was written"
+
+
+def test_return_previous_works_on_the_async_form(leases):
+    import asyncio
+
+    leases.mutate(b"lease:9").put("s", b"holder", b"a").commit()
+
+    async def go():
+        return await (
+            leases.mutate(b"lease:9")
+            .put("s", b"holder", b"b")
+            .return_previous("s", b"holder")
+            .commit_returning_async()
+        )
+
+    r = asyncio.run(go())
+    assert r.previous("s", b"holder").value == b"a"
