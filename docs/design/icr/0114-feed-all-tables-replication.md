@@ -33,7 +33,7 @@ Catalog changes (`create_table` with its family options, `add_family`, `drop_tab
 
 **2b, sidecar failure:** once the session's appends stop, the next catalog change's hold stays up for the rest of the session. A feed of every table in the writer's process expires. One in a reader process waits at that change's place: it can't see the stop (#1516). Only a feed of every table's frontier reads the hold (`ShmRegion::written_seqno(durable, catalog)`, an internal change), so feeds of some tables never wait for a catalog change.
 
-**2b, starts:** an `Oldest` or `After` start passes over the changes with a ceiling at or below its bound in every sidecar load, not only in the entries at open. The hold doesn't bound visible seqnos, so a start past a change's ceiling can come before the change's entry is appended.
+**2b, starts:** an `Oldest` or `After` start passes over the changes with a ceiling at or below its bound in every sidecar load, not only in the entries at open. The hold doesn't bound visible seqnos, so a start past a change's ceiling can come before the change's entry is appended. A token of a feed of every table carries that bound after its last delivered change's sequence (the unreleased token version 2 grows by 8 bytes), so a resume passes over what its start did (simp724's F1b). It doesn't use the token's delivered seqno instead: a `Now` start can be past the ceiling of a change its view doesn't reflect yet, and it delivers that change.
 
 ## PR 3: replication apply (to come)
 `apply_replicated` and `apply_catalog`: the primary's commits, applied with their original timestamps and ids.

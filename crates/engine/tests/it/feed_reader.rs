@@ -926,3 +926,74 @@ fn an_after_start_passes_over_a_change_whose_entry_lands_after_it() {
     drop(r);
     db.close().unwrap();
 }
+
+/// simp724's F1b on #1515 (D315 2b): a token resumes with its start's bound, so a resume
+/// passes over exactly what the start did. The race is F1's: a commit at or above a change's
+/// ceiling is visible while the change's entry isn't appended yet, and the token is taken
+/// then, before any poll.
+/// - **`After(s)` past the ceiling:** the start passes the change over, and so does the
+///   resume (with the bound reset, it delivered the change).
+/// - **`Now`:** the view doesn't reflect the change yet, so the feed delivers it, and so
+///   must a resume from a token taken before that. A bound taken from the token's
+///   delivered seqno would pass it over.
+#[test]
+fn a_resume_passes_over_what_its_start_did() {
+    use pigeonhole_format::feed::FeedEntry;
+    for after in [true, false] {
+        let vfs = SimVfs::new(3172);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        db.delay_root_observer(Duration::from_millis(800));
+        let create = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                    .unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let s = single(&db, &a, b"past", Durability::GroupSync);
+        let start = if after {
+            FeedStart::After(s)
+        } else {
+            FeedStart::Now
+        };
+        let token = db.feed(spec(&[], start)).unwrap().token();
+        create.join().unwrap();
+        db.delay_root_observer(Duration::ZERO);
+        let ceiling = sidecar_entries(&vfs)
+            .iter()
+            .find_map(|e| match e {
+                FeedEntry::Catalog {
+                    seqno_ceiling,
+                    edits,
+                    ..
+                } if edits.iter().any(|e| {
+                    matches!(e, pigeonhole_format::manifest::Edit::CreateTable { name, .. } if name == "c")
+                }) =>
+                {
+                    Some(*seqno_ceiling)
+                }
+                _ => None,
+            })
+            .expect("the create's entry");
+        assert!(
+            ceiling <= s,
+            "{after}: the start must be past the change: {ceiling} > {s}"
+        );
+        let later = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+        if !after {
+            match r.wait(WAIT).unwrap() {
+                Next::Catalog(ev) => assert_eq!(ev.seqno_ceiling, ceiling),
+                other => panic!("now: the change its view didn't reflect first: {other:?}"),
+            }
+        }
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(c) => assert_eq!(c.seqno, later, "{after}"),
+            other => panic!("{after}: the commit after: {other:?}"),
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}

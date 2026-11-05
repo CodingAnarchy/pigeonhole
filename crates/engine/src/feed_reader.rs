@@ -312,11 +312,13 @@ pub struct FeedReader {
     /// are passed over (a commit routed before a drop can be logged after it).
     catalog: VecDeque<CatalogEvent>,
     catalog_seq: u64,
-    /// A `Bound` start's bound (`Oldest`, `After`; 0 for the others): every catalog change
-    /// with a ceiling at or below it is before the start, in every load, not only in the
-    /// entries already in the file at open. The hold doesn't bound visible seqnos, so a
-    /// start past a change's ceiling can come before its entry is appended (simp724's F1 on
-    /// #1515).
+    /// A `Bound` start's bound (`Oldest`, `After`; 0 for `Now` and `Snapshot`, and a token's
+    /// own): every catalog change with a ceiling at or below it is before the start, in every
+    /// load, not only in the entries already in the file at open. The hold doesn't bound
+    /// visible seqnos, so a start past a change's ceiling can come before its entry is
+    /// appended (simp724's F1 on #1515). A token carries it, so a resume passes over what its
+    /// start did (F1b). Not the token's delivered seqno: a `Now` start can be past a change's
+    /// ceiling that its view doesn't reflect, and must still deliver that change.
     catalog_bound: Seqno,
     sidecar_pos: u64,
     dropped_tables: HashSet<TableId>,
@@ -771,7 +773,7 @@ impl FeedReader {
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
     /// commit [`FeedReader::try_next`] returned, never inside one (§2.5).
     pub fn token(&self) -> Vec<u8> {
-        let mut t = Vec::with_capacity(1 + 16 + 4 + 8 + 8 + 16 * self.streams.len());
+        let mut t = Vec::with_capacity(1 + 16 + 4 + 8 + 8 + 16 * self.streams.len() + 16);
         t.push(if self.tables.is_empty() {
             TOKEN_VERSION_ALL
         } else {
@@ -785,9 +787,11 @@ impl FeedReader {
             t.extend_from_slice(&self.hint(s).0.to_le_bytes());
             t.extend_from_slice(&st.delivered_end.0.to_le_bytes());
         }
-        // A feed of every table: the last catalog change delivered (D315).
+        // A feed of every table: the last catalog change delivered, and its start's bound
+        // (D315; simp724's F1b on #1515: a resume passes over what the start did).
         if self.tables.is_empty() {
             t.extend_from_slice(&self.catalog_seq.to_le_bytes());
+            t.extend_from_slice(&self.catalog_bound.to_le_bytes());
         }
         t
     }
@@ -849,11 +853,13 @@ impl FeedReader {
         let session = u64_at(rest, 28);
         let mut per = &rest[36..];
         if version == TOKEN_VERSION_ALL {
-            // The last catalog change delivered, after the streams' positions (D315).
-            let Some(split) = per.len().checked_sub(8) else {
+            // The last catalog change delivered and the start's bound, after the streams'
+            // positions (D315).
+            let Some(split) = per.len().checked_sub(16) else {
                 return Err(bad());
             };
             self.catalog_seq = u64_at(per, split);
+            self.catalog_bound = u64_at(per, split + 8);
             per = &per[..split];
         }
         if per.len() != streams * 16 {
