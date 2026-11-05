@@ -754,8 +754,9 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
 /// simp724's B1 on #1493 (D315): a catalog change whose family needs a new incompat
 /// feature bit (the file's first aggregate family) makes the pager commit the bit's roots
 /// first; its `Catalog` entry still belongs to the root commit that holds its edits, the
-/// last before `create_table` returns, not to one of the bit's. Mutation-checked: staging
-/// before `flag_features` puts it on the bit's root.
+/// last before `create_table` returns, not to one of the bit's, so the bit's Root entries
+/// come before it. Mutation-checked: staging before `flag_features` puts it on the bit's
+/// root.
 #[test]
 fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
     use pigeonhole_format::feed::FeedEntry;
@@ -765,8 +766,21 @@ fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
     let agg = FamilyOptions::default()
         .merge_operator("pigeonhole.i64_min")
         .kind(FamilyKind::Min);
+    let before = sidecar_entries(&vfs).len();
     let t = db.create_table("agg", &[("m".into(), agg)]).unwrap();
     let entries = sidecar_entries(&vfs);
+    // simp724's nit: the bit's Root entries come first, then the create's Catalog entry.
+    let new = &entries[before..];
+    let at = new
+        .iter()
+        .position(|e| matches!(e, FeedEntry::Catalog { .. }))
+        .expect("the create's Catalog entry");
+    assert!(
+        new[..at]
+            .iter()
+            .any(|e| matches!(e, FeedEntry::Root { .. })),
+        "the feature bit's Root entries before the create's: {new:?}"
+    );
     let catalog = entries
         .iter()
         .filter_map(|e| match e {
