@@ -515,8 +515,8 @@ pub(crate) fn top_k(
     let mut skip = 0;
     // The threshold the non-essential prefix and the fuzzy cuts were last taken at.
     let mut cut_at = f64::NEG_INFINITY;
-    let mut contrib = vec![0.0f64; n];
-    let mut has = vec![false; n];
+    // Each clause's contribution to the candidate, `None` for one that doesn't match it.
+    let mut contrib: Vec<Option<f64>> = vec![None; n];
     // The last document decided: a walk that starts being walked again steps past it. It's
     // the candidate's own buffer, reused.
     let mut last: Vec<u8> = Vec::new();
@@ -525,7 +525,7 @@ pub(crate) fn top_k(
     // pay for the gains below (single fuzzy clauses never do, since #1333's cut already drops
     // what they'd leave unwalked).
     let mut unwalked = false;
-    loop {
+    'docs: loop {
         let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
         // Only when the threshold has risen since the last pass: nothing else moves the
         // non-essential prefix or the fuzzy cuts (perf287 and simp724 on #1353).
@@ -566,74 +566,58 @@ pub(crate) fn top_k(
         last.extend_from_slice(next);
         decided = true;
         let doc: &[u8] = &last;
-        has.iter_mut().for_each(|h| *h = false);
+        contrib.fill(None);
         let mut partial = 0.0;
         for &c in essential {
             if clauses[c].doc() == Some(doc) {
-                contrib[c] = clauses[c].here();
-                has[c] = true;
-                partial += contrib[c];
+                let v = clauses[c].here();
+                contrib[c] = Some(v);
+                partial += v;
                 clauses[c].step(bm)?;
             }
         }
         // The essential fuzzy clauses' unwalked expansions (#1363): each can raise its
         // clause's contribution to at most their largest bound.
-        let mut pruned = false;
         let mut gains: f64 = if unwalked {
             essential
                 .iter()
-                .map(|&c| (clauses[c].unwalked() - if has[c] { contrib[c] } else { 0.0 }).max(0.0))
+                .map(|&c| (clauses[c].unwalked() - contrib[c].unwrap_or(0.0)).max(0.0))
                 .sum()
         } else {
             0.0
         };
         for &c in essential.iter().filter(|_| unwalked) {
             let up = clauses[c].unwalked();
-            let here = if has[c] { contrib[c] } else { 0.0 };
+            let here = contrib[c].unwrap_or(0.0);
             if up <= here {
                 continue;
             }
             let th = threshold.expect("expansions are unwalked only with k held");
             if partial + gains + prefix[skip] < th * (1.0 - SLACK) {
-                pruned = true;
-                break;
+                continue 'docs;
             }
             gains -= up - here;
             let v = clauses[c].lookup_unwalked(t, s, bm, doc)?;
             if v > here {
-                contrib[c] = v;
-                has[c] = true;
+                contrib[c] = Some(v);
                 partial += v - here;
             }
-        }
-        if pruned {
-            continue;
         }
         // The non-essential clauses, largest bound first, while the document can still make it.
         for i in (0..skip).rev() {
             let th = threshold.expect("clauses are non-essential only with k held");
             if partial + prefix[i + 1] < th * (1.0 - SLACK) {
-                pruned = true;
-                break;
+                continue 'docs;
             }
             let c = by_bound[i];
             let v = clauses[c].lookup(t, s, bm, doc)?;
             if v != 0.0 {
-                contrib[c] = v;
-                has[c] = true;
+                contrib[c] = Some(v);
                 partial += v;
             }
         }
-        if pruned {
-            continue;
-        }
         // The exact score: contributions in the clauses' fixed order.
-        let mut score = 0.0;
-        for c in 0..n {
-            if has[c] {
-                score += contrib[c];
-            }
-        }
+        let score = contrib.iter().flatten().fold(0.0, |sum, v| sum + v);
         if held.len() < k {
             held.push(Held(score, doc.to_vec()));
         } else {
