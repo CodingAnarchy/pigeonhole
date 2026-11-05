@@ -2641,14 +2641,16 @@ impl ConsolidateLoop {
     }
 
     /// When the next pass is due, µs since the epoch on the loop's clock; `None` before the
-    /// first step or when nothing is pending. It never waits: while another thread's
-    /// `run_once` has the loop, it's the value as of the last step.
+    /// first step, when nothing is pending, or once closed. It never waits: while another
+    /// thread's `run_once` has the loop, it's the value as of the last step.
     #[getter]
     fn next_due(&self, py: Python<'_>) -> Option<u64> {
         py.detach(|| {
             let g = self.state.lock().expect("not poisoned");
             match &g.l {
                 Some(l) => l.next_due(),
+                // A closed loop has nothing due (cli692 on #1563).
+                None if g.closed => None,
                 None => g.due,
             }
         })

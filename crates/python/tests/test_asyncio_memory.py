@@ -241,6 +241,7 @@ def test_a_sync_run_once_and_an_async_wait_take_turns(fdb):
         assert loop.run_once(5).interrupted
     with pytest.raises(ph.Closed):
         loop.run_once(0)
+    assert loop.next_due is None  # nothing is due on a closed loop
 
 
 def test_the_event_loop_keeps_running_while_a_sync_step_has_the_loop(fdb):
