@@ -88,6 +88,7 @@ mod reader_reclaim_stall;
 mod reader_row_cache;
 mod reclaim;
 mod reduce;
+mod reduce_async;
 mod returning_order;
 mod review;
 mod room_freeze;

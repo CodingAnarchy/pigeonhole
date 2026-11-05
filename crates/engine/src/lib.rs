@@ -85,6 +85,7 @@ pub use read::reduce::{
     NoRowLimit, Overflow, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec, ReduceStats, Reduced,
     Reducer, RowLimit, RowRange, RowsLimit, TopK, Visit,
 };
+pub use read::reduce_async::{PendingReduce, REDUCE_POLL_BYTES, REDUCE_POLL_CELLS};
 pub use read::traverse::{
     DEFAULT_MAX_NODES, Hop, MAX_HOPS, PendingTraversal, TRAVERSE_PARALLEL_FLOOR,
     TRAVERSE_POLL_CELLS, Traversal, TraverseSpec, TraverseStats,

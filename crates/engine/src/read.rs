@@ -26,6 +26,7 @@ use crate::{Error, Result};
 pub(crate) mod keys;
 pub(crate) mod knn;
 pub(crate) mod reduce;
+pub(crate) mod reduce_async;
 pub(crate) mod traverse;
 
 /// How a [`CellData`] keeps its value alive.
@@ -1092,6 +1093,32 @@ impl ScanCursor {
             }
         }
         Ok(())
+    }
+
+    /// D308: positions the current row's reads to resume after a column, as
+    /// [`KeyCursor::resume_in_row`](keys::KeyCursor) does for a key (an async bounded read,
+    /// #1286): whether the row has a cell left to read.
+    fn resume_in_row(&mut self, resume: &reduce::Resume) -> Result<bool> {
+        if !self.in_row {
+            return Ok(false);
+        }
+        if let Some(i) = self.last_lane.take() {
+            let fetched = self.lanes[i].fetch();
+            self.snapshot.checked(fetched)?;
+        }
+        let mut any = false;
+        for lane in &mut self.lanes {
+            let rank = self
+                .families
+                .iter()
+                .position(|f| *f == lane.family)
+                .unwrap_or(usize::MAX) as u32;
+            let applied = resume.apply(lane, rank, &self.row_esc);
+            self.snapshot.checked(applied)?;
+            any |= reduce::in_row(lane, &self.row_esc);
+        }
+        self.lane_idx = 0;
+        Ok(any)
     }
 
     /// Advances to the next row with at least one visible cell. Returns `false` at the end.
