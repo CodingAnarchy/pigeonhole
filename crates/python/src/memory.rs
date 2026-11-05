@@ -2482,6 +2482,10 @@ struct LoopState {
     closed: bool,
     /// An async wait that found the loop out: woken when it's put back.
     parked: Option<std::task::Waker>,
+    /// `next_due` as of the last step: what the getter answers while a step has the loop
+    /// out, so it never waits a turn (cli692's L1 on #1563: `run_once_async` reads it on the
+    /// event loop's thread).
+    due: Option<u64>,
 }
 
 /// A feed-driven consolidation loop (D311 T9): `Store.consolidate_loop(...)`.
@@ -2508,6 +2512,7 @@ impl ConsolidateLoop {
                 out: false,
                 closed: false,
                 parked: None,
+                due: None,
             })),
             turn: Arc::new(std::sync::Condvar::new()),
             interrupter,
@@ -2540,6 +2545,7 @@ impl Drop for LoopOut<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.out = false;
         if !g.closed {
+            g.due = self.l.as_ref().and_then(mem::ConsolidateLoop::next_due);
             g.l = self.l.take();
         }
         let parked = g.parked.take();
@@ -2610,7 +2616,9 @@ impl ConsolidateLoop {
     }
 
     /// `run_once(timeout)` as a coroutine (#1479): it awaits new memories without holding a
-    /// thread, then runs the due passes (the consolidator) on a worker thread.
+    /// thread, then runs the due passes (the consolidator) on a worker thread. Unlike the
+    /// sync `run_once`, which reads until its timeout, it returns after the first commit
+    /// with memory events (or the timeout, or a pass falling due): call it in a loop.
     #[pyo3(signature = (timeout=1.0))]
     fn run_once_async<'py>(slf: &Bound<'py, Self>, timeout: f64) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
@@ -2633,14 +2641,16 @@ impl ConsolidateLoop {
     }
 
     /// When the next pass is due, µs since the epoch on the loop's clock; `None` before the
-    /// first step or when nothing is pending.
+    /// first step or when nothing is pending. It never waits: while another thread's
+    /// `run_once` has the loop, it's the value as of the last step.
     #[getter]
     fn next_due(&self, py: Python<'_>) -> Option<u64> {
         py.detach(|| {
-            self.lock_in()
-                .l
-                .as_ref()
-                .and_then(mem::ConsolidateLoop::next_due)
+            let g = self.state.lock().expect("not poisoned");
+            match &g.l {
+                Some(l) => l.next_due(),
+                None => g.due,
+            }
         })
     }
 

@@ -683,7 +683,8 @@ class Watch:
     def next(self, timeout: Seconds | None = None) -> MemoryCommit | None: ...
     def try_next(self) -> MemoryCommit | None: ...
     def next_async(self) -> asyncio.Future[MemoryCommit]:
-        """The next commit, awaited (#1479); one wait at a time; the writer process only."""
+        """The next commit, awaited (#1479); one wait at a time. The writer process only: a
+        reader process's watch raises `Unsupported`."""
     def token(self) -> bytes: ...
     @property
     def oldest_retained(self) -> int | None: ...
@@ -724,7 +725,9 @@ class ConsolidateLoop:
     """A feed-driven consolidation loop (`Store.consolidate_loop`)."""
 
     def run_once(self, timeout: Seconds | None = None) -> LoopStep: ...
-    def run_once_async(self, timeout: float = 1.0) -> Coroutine[Any, Any, LoopStep]: ...
+    def run_once_async(self, timeout: float = 1.0) -> Coroutine[Any, Any, LoopStep]:
+        """Returns after the first commit with memory events (or the timeout, or a pass
+        falling due), where the sync `run_once` reads until its timeout."""
     @property
     def next_due(self) -> int | None:
         """When the next pass is due, µs since the epoch on the loop's clock."""

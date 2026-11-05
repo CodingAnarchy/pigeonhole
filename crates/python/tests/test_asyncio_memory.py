@@ -241,3 +241,53 @@ def test_a_sync_run_once_and_an_async_wait_take_turns(fdb):
         assert loop.run_once(5).interrupted
     with pytest.raises(ph.Closed):
         loop.run_once(0)
+
+
+def test_the_event_loop_keeps_running_while_a_sync_step_has_the_loop(fdb):
+    """cli692's L1 on #1563: run_once_async reads next_due on the event loop's thread; while
+    a sync run_once on another thread has the loop out (for its whole timeout), that read
+    must not wait, so a ticker on the loop keeps its interval."""
+    c = Concat()
+    with mem.Store.create(fdb, "agents") as s, s.consolidate_loop("main", c) as loop:
+        loop.run_once(0)
+
+        async def main():
+            gaps, stop = [], False
+
+            async def ticker():
+                last = asyncio.get_running_loop().time()
+                while not stop:
+                    await asyncio.sleep(0.01)
+                    now = asyncio.get_running_loop().time()
+                    gaps.append(now - last)
+                    last = now
+
+            tick = asyncio.ensure_future(ticker())
+            sync = asyncio.ensure_future(asyncio.to_thread(loop.run_once, 1.0))
+            await asyncio.sleep(0.05)  # the sync step has the loop out now
+            for _ in range(5):
+                await loop.run_once_async(0.05)
+            await sync
+            stop = True
+            await tick
+            return max(gaps)
+
+        assert run(main()) < 0.5
+
+
+def test_a_reader_process_watch_cant_await(fdb, path):
+    """cli692's R1: next_async is the writer process's only; a reader's watch raises
+    Unsupported (its sync next works)."""
+    with mem.Store.create(fdb, "agents") as s:
+        s.remember("n", "hello")
+        reader = ph.open_reader(path)
+        try:
+            with mem.Store.open_reader(reader, "agents", model=None) as rs, rs.watch() as w:
+
+                async def main():
+                    with pytest.raises(ph.Unsupported):
+                        await w.next_async()
+
+                run(main())
+        finally:
+            reader.close()
