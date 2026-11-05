@@ -64,7 +64,10 @@ jobs:
           echo "VENV_PY=$PWD/$bin/python" >> "$GITHUB_ENV"
           # pyarrow, Polars and DuckDB: the Arrow consumers test_arrow.py hands streams to.
           "$bin/python" -m pip install --quiet maturin pytest hypothesis mypy numpy pyarrow polars duckdb
-          VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop --release -m crates/python/Cargo.toml
+          # uvloop for test_asyncio.py (#1479); it has no Windows build.
+          if [ "$RUNNER_OS" != "Windows" ]; then "$bin/python" -m pip install --quiet uvloop; fi
+          # test-hooks: the asyncio bridge's hold seam (`_native._Gate`); the wheels never have it.
+          VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop --release --features test-hooks -m crates/python/Cargo.toml
       # One entry builds phdb, for test_arrow.py's comparison with `phdb dump --format arrow`.
       - name: Build phdb
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'

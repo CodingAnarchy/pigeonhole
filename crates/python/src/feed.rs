@@ -1,13 +1,18 @@
 //! The change feed (D310, #1322): `Table.feed(...)`, `Feed`, `Commit` and `Change`.
 
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::ChangeKind;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::error::{OrPy, with_code};
+use crate::error::with_code;
 
 /// The longest stretch `next` waits with the GIL released before it checks for a signal
 /// (Ctrl-C), so a blocked consumer can still be interrupted.
@@ -16,30 +21,122 @@ const SLICE: Duration = Duration::from_millis(100);
 /// A subscription to some tables' committed changes: whole commits, once each, in commit
 /// order. Get one from `Table.feed(...)`.
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Feed(Mutex<Option<pigeonhole::Feed>>);
+pub(crate) struct Feed(Arc<Mutex<FeedState>>);
+
+/// The feed, and its one `next_async` wait (#1479).
+struct FeedState {
+    /// `None` once closed.
+    feed: Option<pigeonhole::Feed>,
+    /// A commit a `next_async` took from the feed, not yet handed to its future, with the
+    /// feed's token from before it (B5). It's the next commit every caller gets, and
+    /// `token()` gives that token, so a resume from it replays the commit.
+    slot: Option<(pigeonhole::Commit, Vec<u8>)>,
+    /// The wait in progress, if any.
+    wait: Option<Wait>,
+    /// Counts `next_async` waits: a wait whose generation isn't the latest was superseded
+    /// (its future was cancelled), and never touches the feed or the slot again.
+    generation: u64,
+}
+
+struct Wait {
+    /// Set by the wait's asyncio future's done callback: a cancelled wait doesn't block a
+    /// new one, even before its Rust future is dropped.
+    over: Arc<AtomicBool>,
+    /// That future, asked `done()` (with the GIL) before a call is refused: a future
+    /// cancelled and awaited at once is done before its callback has run.
+    owner: Arc<Py<PyAny>>,
+}
+
+impl FeedState {
+    /// Whether a `next_async` wait is still in progress.
+    fn waiting(&mut self) -> bool {
+        match &self.wait {
+            Some(w) if !w.over.load(Ordering::SeqCst) => true,
+            _ => {
+                self.wait = None;
+                false
+            }
+        }
+    }
+}
+
+/// What a sync read of the feed can't do.
+enum Refused {
+    Db(pigeonhole::Error),
+    /// A wait looks in progress: its flag and future, to ask whether it's done.
+    Waiting(Arc<AtomicBool>, Arc<Py<PyAny>>),
+    Closed,
+}
+
+fn refused(r: Refused) -> PyErr {
+    match r {
+        Refused::Db(e) => crate::error::OrPy::or_py(Err::<(), _>(e)).unwrap_err(),
+        Refused::Waiting(..) => waiting(),
+        Refused::Closed => closed(),
+    }
+}
+
+/// Whether the wait's future is done (completed or cancelled); if so, marks it over.
+fn owner_done(py: Python<'_>, over: &AtomicBool, owner: &Py<PyAny>) -> PyResult<bool> {
+    let done = owner.bind(py).call_method0("done")?.is_truthy()?;
+    if done {
+        over.store(true, Ordering::SeqCst);
+    }
+    Ok(done)
+}
+
+fn waiting() -> PyErr {
+    PyValueError::new_err("a next_async wait is in progress on this feed")
+}
+
+fn closed() -> PyErr {
+    with_code(pigeonhole::ErrorCode::Closed, "the feed is closed")
+}
 
 impl Feed {
     pub(crate) fn new(feed: pigeonhole::Feed) -> Self {
-        Self(Mutex::new(Some(feed)))
+        Self(Arc::new(Mutex::new(FeedState {
+            feed: Some(feed),
+            slot: None,
+            wait: None,
+            generation: 0,
+        })))
     }
 
-    /// One wait of at most `slice`, with the GIL released.
+    /// One wait of at most `slice`, with the GIL released: the slot's commit first.
     fn poll(&self, py: Python<'_>, slice: Option<Duration>) -> PyResult<Option<Commit>> {
-        // `None` for a closed feed.
-        let polled = py.detach(|| {
-            let mut guard = self.0.lock().expect("not poisoned");
-            let Some(feed) = guard.as_mut() else {
-                return Ok(None);
-            };
+        match self.poll_once(py, slice) {
+            // The wait may be over already (cancelled and awaited): ask, then try again.
+            Err(Refused::Waiting(over, owner)) if owner_done(py, &over, &owner)? => self
+                .poll_once(py, slice)
+                .map(|c| c.map(Commit))
+                .map_err(refused),
+            r => r.map(|c| c.map(Commit)).map_err(refused),
+        }
+    }
+
+    fn poll_once(
+        &self,
+        py: Python<'_>,
+        slice: Option<Duration>,
+    ) -> Result<Option<pigeonhole::Commit>, Refused> {
+        py.detach(|| {
+            let mut g = self.0.lock().expect("not poisoned");
+            if g.waiting() {
+                let w = g.wait.as_ref().expect("waiting");
+                return Err(Refused::Waiting(Arc::clone(&w.over), Arc::clone(&w.owner)));
+            }
+            if let Some((c, _)) = g.slot.take() {
+                return Ok(Some(c));
+            }
+            let feed = g.feed.as_mut().ok_or(Refused::Closed)?;
             let next = match slice {
-                Some(d) => feed.next(d)?,
-                None => feed.try_next()?,
-            };
-            Ok::<_, pigeonhole::Error>(Some(next.cloned().map(Commit)))
-        });
-        polled
-            .or_py()?
-            .ok_or_else(|| with_code(pigeonhole::ErrorCode::Closed, "the feed is closed"))
+                Some(d) => feed.next(d),
+                None => feed.try_next(),
+            }
+            .map_err(Refused::Db)?;
+            Ok(next.cloned())
+        })
     }
 
     /// `next` with an optional timeout: in slices, checking for signals between them.
@@ -61,6 +158,117 @@ impl Feed {
     }
 }
 
+/// A `next_async` wait's Rust future, polled on the bridge without the GIL. A commit it
+/// takes goes to the slot first; the loop thread then claims it for the wait's future, or
+/// leaves it for the next caller if that future was cancelled meanwhile.
+struct FeedWait {
+    state: Arc<Mutex<FeedState>>,
+    generation: u64,
+    token: Option<Vec<u8>>,
+    finished: bool,
+}
+
+impl FeedWait {
+    fn claim(&self) -> crate::aio::Output {
+        let claim = Claim {
+            state: Arc::clone(&self.state),
+            generation: self.generation,
+        };
+        Box::new(move |py| match Py::new(py, claim) {
+            Ok(c) => crate::aio::Entry::Claim(c.into_any()),
+            Err(e) => crate::aio::Entry::Error(e),
+        })
+    }
+}
+
+impl Future for FeedWait {
+    type Output = crate::aio::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let state = Arc::clone(&this.state);
+        let mut g = state.lock().expect("not poisoned");
+        if g.generation != this.generation {
+            // Superseded: the future was cancelled and a newer wait owns the feed.
+            this.finished = true;
+            return Poll::Ready(Box::new(|py| crate::aio::Entry::Value(py.None())));
+        }
+        if g.slot.is_some() {
+            // Left by a superseded wait that took it after its cancel.
+            this.finished = true;
+            return Poll::Ready(this.claim());
+        }
+        let Some(feed) = g.feed.as_mut() else {
+            g.wait = None;
+            this.finished = true;
+            return Poll::Ready(Box::new(|_| crate::aio::Entry::Error(closed())));
+        };
+        match feed.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(c)) => {
+                let c = c.clone();
+                let token = this.token.take().unwrap_or_default();
+                g.slot = Some((c, token));
+                this.finished = true;
+                Poll::Ready(this.claim())
+            }
+            Poll::Ready(Err(e)) => {
+                g.wait = None;
+                this.finished = true;
+                Poll::Ready(crate::aio::output(Err::<(), _>(e), |py, ()| Ok(py.None())))
+            }
+        }
+    }
+}
+
+impl Drop for FeedWait {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Dropped unfinished (its future was cancelled): nothing was taken from the feed.
+        let mut g = self.state.lock().expect("not poisoned");
+        if g.generation == self.generation {
+            g.wait = None;
+        }
+    }
+}
+
+/// On the loop: hands the slot's commit to the wait's future (`claim(True)`), or ends the
+/// wait and leaves the commit for the next caller (`claim(False)`, the future was cancelled).
+#[pyclass(module = "pigeonhole", frozen)]
+struct Claim {
+    state: Arc<Mutex<FeedState>>,
+    generation: u64,
+}
+
+#[pymethods]
+impl Claim {
+    fn __call__(&self, take: bool) -> Option<Commit> {
+        let mut g = self.state.lock().expect("not poisoned");
+        if g.generation != self.generation {
+            return None;
+        }
+        g.wait = None;
+        if take {
+            g.slot.take().map(|(c, _)| Commit(c))
+        } else {
+            None
+        }
+    }
+}
+
+/// A wait's asyncio done callback: the wait is over, whether it completed or was cancelled.
+#[pyclass(module = "pigeonhole", frozen)]
+struct Over(Arc<AtomicBool>);
+
+#[pymethods]
+impl Over {
+    fn __call__(&self, _fut: &Bound<'_, PyAny>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[pymethods]
 impl Feed {
     /// The next commit, waiting up to `timeout` (seconds or a `timedelta`; `None` waits
@@ -77,6 +285,53 @@ impl Feed {
         self.poll(py, None)
     }
 
+    /// The next commit, as an `asyncio.Future` of the running loop (#1479): no thread
+    /// waits for it. For a timeout, `asyncio.wait_for(feed.next_async(), t)`. One wait at a
+    /// time: a second `next_async`, or a sync `next`, during one raises `ValueError`.
+    /// Cancelling it loses nothing: the commit it would have returned is the next one any
+    /// call returns.
+    fn next_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let mut g = self.0.try_lock().map_err(|_| waiting())?;
+        if g.waiting() {
+            let w = g.wait.as_ref().expect("waiting");
+            if !owner_done(py, &w.over, &w.owner)? {
+                return Err(waiting());
+            }
+            g.wait = None;
+        }
+        if let Some((c, _)) = g.slot.take() {
+            drop(g);
+            let c = Py::new(py, Commit(c))?.into_any();
+            crate::aio::complete_now(py, &fut, crate::aio::Entry::Value(c))?;
+            return Ok(fut);
+        }
+        let token = g
+            .feed
+            .as_ref()
+            .ok_or_else(closed)?
+            .token()
+            .as_bytes()
+            .to_vec();
+        g.generation += 1;
+        let generation = g.generation;
+        let over = Arc::new(AtomicBool::new(false));
+        g.wait = Some(Wait {
+            over: Arc::clone(&over),
+            owner: Arc::new(fut.clone().unbind()),
+        });
+        drop(g);
+        fut.call_method1("add_done_callback", (Over(over),))?;
+        let state = Arc::clone(&self.0);
+        crate::aio::start(py, &event_loop, &fut, move || FeedWait {
+            state,
+            generation,
+            token: Some(token),
+            finished: false,
+        })?;
+        Ok(fut)
+    }
+
     /// Where the feed is, as bytes: `Table.feed(resume=...)` continues after the last
     /// commit delivered, in this open of the database or a later one. Store it with what
     /// the commits fed.
@@ -84,20 +339,24 @@ impl Feed {
         // The lock may be held by a thread waiting in `next`, for up to a slice: wait for
         // it without the GIL.
         let token = py.detach(|| {
-            let guard = self.0.lock().expect("not poisoned");
-            guard.as_ref().map(|f| f.token())
+            let g = self.0.lock().expect("not poisoned");
+            // A commit in the slot isn't delivered yet: the token from before it (B5).
+            match (&g.slot, &g.feed) {
+                (Some((_, t)), _) => Some(t.clone()),
+                (None, Some(f)) => Some(f.token().as_bytes().to_vec()),
+                (None, None) => None,
+            }
         });
-        let token =
-            token.ok_or_else(|| with_code(pigeonhole::ErrorCode::Closed, "the feed is closed"))?;
-        Ok(PyBytes::new(py, token.as_bytes()))
+        let token = token.ok_or_else(closed)?;
+        Ok(PyBytes::new(py, &token))
     }
 
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     #[getter]
     fn oldest_retained(&self, py: Python<'_>) -> Option<u64> {
         py.detach(|| {
-            let guard = self.0.lock().expect("not poisoned");
-            guard.as_ref().and_then(pigeonhole::Feed::oldest_retained)
+            let g = self.0.lock().expect("not poisoned");
+            g.feed.as_ref().and_then(pigeonhole::Feed::oldest_retained)
         })
     }
 
@@ -121,7 +380,11 @@ impl Feed {
     /// Ends the subscription now rather than when the feed is collected. Calls afterwards
     /// raise `Closed`; closing twice does nothing.
     fn close(&self, py: Python<'_>) {
-        py.detach(|| self.0.lock().expect("not poisoned").take());
+        py.detach(|| {
+            let mut g = self.0.lock().expect("not poisoned");
+            g.feed = None;
+            g.slot = None;
+        });
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {

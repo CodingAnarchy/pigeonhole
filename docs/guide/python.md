@@ -300,6 +300,60 @@ with ph.open(path, create=True) as db, mem.Store.create(
     assert passed.committed == 1
 ```
 
+## asyncio
+The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutine awaiting a commit or a feed holds no thread. This replaces `asyncio.to_thread(...)` around the sync calls.
+- **The `_async` forms:**
+  - `Mutation.commit_async()`, `commit_if_async(condition)` and `commit_returning_async()`;
+  - `Table.incr_returning_async(...)`;
+  - `WriteBatch.commit_async()` and `Transaction.commit_async()`, both with `durability=`;
+  - `Transaction.get_async(...)`;
+  - `Feed.next_async()`;
+  - `Database.transact_async(f)`.
+- **What they return:** the same results and errors as the sync forms (`Conflict`, `ReturnedValueError` and the rest).
+  - Each but `transact_async` returns an `asyncio.Future` of the loop it was called on. Call and await it on that loop.
+  - It works with `await`, `asyncio.gather`, `wait_for`, `shield` and `asyncio.timeout`. It isn't a coroutine, so wrap it in `asyncio.ensure_future` rather than `create_task`.
+  - Called with no running loop, it raises `RuntimeError` and spends nothing.
+- **`transact_async(f)` takes an `async def f(txn)`,** retried on `Conflict` and `Busy` exactly as `transact` retries a sync body (the same attempts, backoff and deadline), sleeping with `asyncio.sleep`.
+  - Read with `await txn.get_async(...)`, and await reads before committing.
+  - A sync body is refused with `TypeError`, as is an `async def` passed to `transact`.
+  - `txn.get_row` has no async form yet, so it can block the loop on a cache miss.
+- **`Feed.next_async()`** waits for the next commit. For a timeout, use `asyncio.wait_for(feed.next_async(), t)`.
+  - A timeout or a cancel loses nothing: the commit it would have returned is the next one any call returns, and `feed.token()` still points before it.
+  - One wait at a time: a second `next_async`, or a sync `next`, during one raises `ValueError`.
+- **Cancelling a commit:**
+  - Cancelled while it waits for room (an async commit waits when its shard has too many in flight), nothing is written.
+  - Once it's submitted, it may still land, and the task can't tell which happened. To keep the outcome, await `asyncio.shield(m.commit_async())`.
+- **How it runs:** one `pigeonhole-asyncio` thread per process hands results to the event loops. The engine's threads never take the GIL to do it. Any asyncio loop works, uvloop included.
+- **Not yet async:** the memory store's calls (a follow-up), and reads outside a transaction.
+
+```python
+import asyncio
+
+import pigeonhole as ph
+
+
+async def main(db, t):
+    seqno = await t.mutate(b"u1").put("f", b"name", b"Ada").commit_async()
+    n = await t.incr_returning_async(b"u1", "n", b"logins", 1)
+
+    async def rename(txn):
+        cell = await txn.get_async(t, b"u1", "f", b"name")
+        txn.put(t, b"u1", "f", b"name", cell.value + b" L.")
+
+    await db.transact_async(rename)
+    many = await asyncio.gather(
+        *[t.mutate(f"k{i}").put("f", b"q", b"v").commit_async() for i in range(100)]
+    )
+    return seqno, n, len(many)
+
+
+with ph.open(path, create=True) as db:
+    t = db.table("users").family("f").family("n", ph.Family.counter()).create()
+    seqno, n, many = asyncio.run(main(db, t))
+    assert n == 1 and many == 100
+    assert t.get(b"u1", "f", b"name").value == b"Ada L."
+```
+
 ## Readers, threads and processes
 - **Processes:** one process opens a database as the writer (`ph.open`). Any number of others open it as readers (`ph.open_reader(path)`), which see every commit and can't write ([reader processes](readers.md)).
 - **Threads:** every engine call releases the GIL, so threads in one process run reads and commits in parallel. Handles (`Database`, `Table`, `Snapshot`) are safe to share between threads.
