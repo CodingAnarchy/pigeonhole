@@ -102,6 +102,7 @@ with ph.open(path, create=True) as db:
   - `typed_values=True` adds `value_i64` and `value_f64`; `vector_dim=n` adds `value_vector`.
   - `utf8_keys`, `row_dictionary`, and `ts="uint64"` change the key and timestamp types.
 - **One consumer per scan:** `to_arrow()` takes the scan, so the iterator ends, and it works only on a scan not yet iterated. A stream is read once: a second consumer raises `ValueError`. Close a stream you never hand over (`with t.scan().to_arrow() as s:`, or `s.close()`), as with a scan, to release its snapshot.
+- **Don't write while a stream is open on the same thread:** an open stream holds its scan's snapshot, like a live scan, so a commit from that thread can wait on room only that snapshot holds, and fail with `Busy` after the write-stall timeout. Read the stream to the end (or close it) first. See [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit).
 - **The GIL:** the stream reads without the GIL, but a consumer that keeps the GIL while it reads blocks other Python threads for that long.
 
 ```python
