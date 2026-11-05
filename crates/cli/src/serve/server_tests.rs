@@ -1942,16 +1942,17 @@ fn a_background_index_rebalances_on_a_server_thread_that_close_ends() {
         "the thread saw its index close within one idle wait: {:?}",
         started.elapsed()
     );
-    // The next call opens the index again, with a thread of its own.
-    let (_, r) = s.rpc(
+    // After close, nothing opens again (ai1249's M2 on #1573): a call still queued on the
+    // blocking pool at shutdown, or a request, is Closed, and starts no rebalancer.
+    let late = indexes.get("ix");
+    assert_eq!(late.err().map(|e| e.code), Some("Closed".to_owned()));
+    let (_, e) = s.rpc(
         "Vectors/Search",
         &json!({"index": "ix", "query": f32_query(&[0.0, 1.0]), "k": 1}),
         None,
     );
-    assert_eq!(hit_ids(&r), [b64(b"v000")]);
-    assert_eq!(indexes.rebalancing(), 1);
-    indexes.close();
-    assert_eq!(indexes.rebalancing(), 0);
+    assert_eq!(e["code"].as_str(), Some("Closed"), "{e}");
+    assert_eq!(indexes.rebalancing(), 0, "no thread after close");
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //!   closes the database. An index that rebalances inline needs no thread.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -32,6 +32,10 @@ pub(crate) struct Indexes {
     rebalancers: Mutex<Vec<JoinHandle<()>>>,
     /// Rebalancer threads running, for tests to read.
     running: Arc<AtomicUsize>,
+    /// Set by [`close`](Indexes::close), under `open`'s lock: no index opens after it, so a
+    /// call still queued on the blocking pool at shutdown can't start a rebalancer nothing
+    /// joins (ai1249's M2 on #1573).
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for Indexes {
@@ -49,6 +53,7 @@ impl Indexes {
             open: Mutex::new(HashMap::new()),
             rebalancers: Mutex::new(Vec::new()),
             running: Arc::default(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -62,16 +67,21 @@ impl Indexes {
     }
 
     /// The index `name`, opened if this server hasn't yet. Sync: call it on the blocking pool.
+    /// The open runs outside the cache's lock, so a cached lookup never waits behind another
+    /// request's I/O (ai1249's M1 on #1573); two first calls racing for one name both open
+    /// it, and the first to finish is kept.
     pub(crate) fn get(&self, name: &str) -> Result<Arc<Index>, ApiError> {
-        let mut open = self.handles();
-        if let Some(i) = open.get(name) {
-            return Ok(Arc::clone(i));
+        if let Some(i) = self.cached(name) {
+            return Ok(i);
         }
+        self.refuse_if_closed()?;
         let (index, rebalancer) = Index::open_with_rebalancer(&self.db, name)?;
-        Ok(self.keep(&mut open, name, index, rebalancer))
+        self.keep(name, index, rebalancer)
     }
 
-    /// Creates the index `name`, or with `if_missing` opens an existing one. Sync, as `get`.
+    /// Creates the index `name`, or with `if_missing` opens an existing one, whatever its
+    /// spec and options: `if_missing` compares neither. Sync, as `get`, and outside the
+    /// cache's lock too.
     pub(crate) fn create(
         &self,
         name: &str,
@@ -79,10 +89,10 @@ impl Indexes {
         options: IndexOptions,
         if_missing: bool,
     ) -> Result<(), ApiError> {
-        let mut open = self.handles();
-        if if_missing && open.contains_key(name) {
+        if if_missing && self.cached(name).is_some() {
             return Ok(());
         }
+        self.refuse_if_closed()?;
         let created = Index::create_with_rebalancer(&self.db, name, spec, options);
         let (index, rebalancer) = match created {
             Ok(r) => r,
@@ -91,19 +101,34 @@ impl Indexes {
             }
             Err(e) => return Err(e.into()),
         };
-        self.keep(&mut open, name, index, rebalancer);
+        self.keep(name, index, rebalancer)?;
         Ok(())
     }
 
-    /// Keeps `index` under `name`, and runs its rebalancer on a thread of its own when it
-    /// rebalances in the background.
+    fn refuse_if_closed(&self) -> Result<(), ApiError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        Ok(())
+    }
+
+    /// Keeps `index` under `name`, unless another call kept one first (then its handle is
+    /// returned, and this one is dropped with its rebalancer), and runs the rebalancer of a
+    /// background index it keeps on a thread of its own. Under the cache's lock, which
+    /// `close` takes to set `closed`: after `close`, nothing is kept or started.
     fn keep(
         &self,
-        open: &mut HashMap<String, Arc<Index>>,
         name: &str,
         index: Index,
         rebalancer: Rebalancer,
-    ) -> Arc<Index> {
+    ) -> Result<Arc<Index>, ApiError> {
+        let mut open = self.handles();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        if let Some(kept) = open.get(name) {
+            return Ok(Arc::clone(kept));
+        }
         if matches!(index.options().rebalance_mode(), Rebalance::Background) {
             let running = Arc::clone(&self.running);
             running.fetch_add(1, Ordering::Relaxed);
@@ -129,7 +154,7 @@ impl Indexes {
         }
         let index = Arc::new(index);
         open.insert(name.to_owned(), Arc::clone(&index));
-        index
+        Ok(index)
     }
 
     /// Drops every handle and waits for the rebalancing threads to end: each sees its index
@@ -137,7 +162,11 @@ impl Indexes {
     /// this before it closes the database. A handle a call still holds keeps its index open
     /// until the call ends.
     pub(crate) fn close(&self) {
-        self.handles().clear();
+        {
+            let mut open = self.handles();
+            self.closed.store(true, Ordering::Release);
+            open.clear();
+        }
         let threads = std::mem::take(
             &mut *self
                 .rebalancers
@@ -154,6 +183,13 @@ impl Indexes {
     pub(crate) fn rebalancing(&self) -> usize {
         self.running.load(Ordering::Relaxed)
     }
+}
+
+fn closed() -> ApiError {
+    ApiError::from_code(
+        pigeonhole::ErrorCode::Closed,
+        "the server is closing: its vector indexes are closed",
+    )
 }
 
 /// A background index's rebalancer, run until its index closes: the loop the crate's
