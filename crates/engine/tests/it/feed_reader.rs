@@ -1403,3 +1403,202 @@ fn a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history() {
         db.close().unwrap();
     }
 }
+
+/// Rewrites the sidecar as `f` maps its entries (after the header), for forged cases.
+fn rewrite_sidecar(
+    vfs: &Arc<SimVfs>,
+    f: impl FnOnce(Vec<pigeonhole_format::feed::FeedEntry>) -> Vec<pigeonhole_format::feed::FeedEntry>,
+) {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
+    use pigeonhole_io::Vfs;
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let file = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut head = [0u8; FeedHeader::LEN];
+    file.read_at(&mut head, 0).unwrap();
+    let mut bytes = head.to_vec();
+    for e in f(sidecar_entries(vfs)) {
+        e.encode(&mut bytes);
+    }
+    file.set_len(0).unwrap();
+    file.write_at(&bytes, 0).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A catalog edit for a forged `Catalog` entry.
+fn forged_create(id: u32) -> pigeonhole_format::manifest::Edit {
+    pigeonhole_format::manifest::Edit::CreateTable {
+        table: pigeonhole_format::TableId(id),
+        name: format!("forged{id}"),
+    }
+}
+
+/// simp724's F1 on #1526: a lone `Catalog` entry at the sidecar's end, for the root one past
+/// the superblock's (a power loss kept it and lost its intent, or the intent's append
+/// failed and the commit too), is cut off by the next open, as its intent would be. The
+/// root never landed. A feed of every table then goes on to the changes after it.
+/// Mutation-checked: without the cut, the entry is followed by the new session's, and the
+/// reader expires (the next test's rule) instead of delivering the later create.
+#[test]
+fn a_lone_trailing_catalog_entry_past_the_superblock_is_cut() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3211);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    rewrite_sidecar(&vfs, |mut entries| {
+        let (session, last) = match entries.last() {
+            Some(FeedEntry::Root { session, sequence }) => (*session, *sequence),
+            other => panic!("{other:?}"),
+        };
+        entries.push(FeedEntry::Catalog {
+            session,
+            sequence: last + 1,
+            seqno_ceiling: s1 + 1,
+            timestamp: 0,
+            edits: vec![forged_create(900)],
+            names: Vec::new(),
+        });
+        entries
+    });
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let s2 = single(&db, &c, b"c", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    let mut got = Vec::new();
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Catalog(ev) => got.push(format!("{:?}", ev.edits[0])),
+            Next::Commit(cm) if cm.seqno == s2 => break,
+            Next::Commit(_) => {}
+            other => panic!("the lone entry cut, the feed goes on: {other:?} after {got:?}"),
+        }
+    }
+    assert_eq!(got.len(), 1, "the real create only: {got:?}");
+    assert!(got[0].contains("\"c\""), "{got:?}");
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's F1 on #1526: a `Catalog` entry followed by neither its Root nor its own intent
+/// can never get its Root. The chain doesn't break on it (it is the session's own), so a
+/// reader that waited there would deliver every later commit and no later catalog change: a
+/// silent gap. It expires instead. Mutation-checked: waiting there, as for a pending one,
+/// passes the later create silently.
+#[test]
+fn a_catalog_entry_that_can_never_get_its_root_expires_a_feed_of_every_table() {
+    use pigeonhole_format::feed::FeedEntry;
+    let vfs = SimVfs::new(3212);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+    // Before the session's last Root entry: an orphan Catalog of a root that never landed.
+    rewrite_sidecar(&vfs, |mut entries| {
+        let at = entries.len() - 1;
+        let (session, last) = match &entries[at] {
+            FeedEntry::Root { session, sequence } => (*session, *sequence),
+            other => panic!("{other:?}"),
+        };
+        entries.insert(
+            at,
+            FeedEntry::Catalog {
+                session,
+                sequence: last + 7,
+                seqno_ceiling: s1 + 1,
+                timestamp: 0,
+                edits: vec![forged_create(901)],
+                names: Vec::new(),
+            },
+        );
+        entries
+    });
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    let c = db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    single(&db, &c, b"c", Durability::GroupSync);
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Expired(_) => break,
+            Next::Commit(_) => {}
+            other => panic!("an unrootable catalog entry must expire the feed: {other:?}"),
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's R1 and F2 on #1526 (FORMAT §10.4's torn rule): a Root entry mid-file that
+/// fails its CRC (a power loss tore its overwrite in place) is the end of the history, and
+/// the open cuts there, later roots and all: the superblock is past the cut, so the chain
+/// breaks and a token from before expires. Never a cut that continues silently.
+#[test]
+fn a_damaged_root_entry_mid_file_expires_rather_than_cuts_silently() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, decode_entries_at};
+    use pigeonhole_io::Vfs;
+    let vfs = SimVfs::new(3213);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let s1 = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    let token = r.token();
+    drop(r);
+    // Several roots after the token, each recorded with an intent overwritten in place.
+    for i in 0..3u8 {
+        single(&db, &a, &[b'f', i], Durability::GroupSync);
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let f = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut bytes = vec![0u8; f.len().unwrap() as usize];
+    f.read_at(&mut bytes, 0).unwrap();
+    let (entries, _) = decode_entries_at(&bytes[FeedHeader::LEN..]);
+    let roots: Vec<usize> = entries
+        .iter()
+        .filter(|(_, e)| matches!(e, FeedEntry::Root { .. }))
+        .map(|(at, _)| *at)
+        .collect();
+    assert!(roots.len() >= 4, "{entries:?}");
+    // A Root entry with roots after it: flip a payload byte, its CRC now fails.
+    let at = FeedHeader::LEN + roots[roots.len() - 3] + 8 + 3;
+    f.write_at(&[bytes[at] ^ 0xff], at as u64).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    let a = db.table("a").unwrap();
+    single(&db, &a, b"after", Durability::GroupSync);
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Expired(_) => break,
+            Next::Commit(_) => {}
+            other => panic!("a damaged Root entry mid-file must expire: {other:?}"),
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+}

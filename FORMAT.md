@@ -567,7 +567,7 @@ The change feed's sidecar (D310), `data.phdb-feed` beside `data.phdb`. It isn't 
 - an **Unfed** entry, from an open with the feed off, only if the file exists.
 
 A feeding session records each root commit it makes (§8.2), including its close's, in two steps (the D315 amendment, #1504):
-1. **Before the commit writes anything,** it appends a **RootIntent** entry naming the new superblock, after the commit's Catalog entry if it has one. These appends aren't synced.
+1. **Before the commit writes anything,** it appends a **RootIntent** entry naming the new superblock, after the commit's Catalog entry if it has one, in one write. That append isn't synced.
 2. **Once the commit is durable,** it **overwrites that intent in place with the Root entry**: the same framed length, one write. This is the sidecar's only write in place. If the session appended no intent for the commit, it appends the Root entry instead.
 
 Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry written while the previous sync was in flight (D310 call 4). A failed write or sync ends the session's appends.
@@ -576,6 +576,8 @@ Root entries are synced, at the pager's durability, after the root commit is dur
 - if the superblock it read has the intent's `sequence` and `checksum`, the root landed, and the open overwrites the intent with that session's Root entry;
 - if the superblock's `sequence` is one less, the root didn't land, and the open cuts the file at the intent, or at the Catalog entry of the same `sequence` just before it;
 - otherwise it leaves it.
+
+A **Catalog entry left last** for the root one past the superblock's (its intent lost, or never appended) is cut off in the same way. **A reader** that finds a Catalog entry followed by neither its root's Root entry nor its own RootIntent expires: that root never landed, and nothing after it could be delivered in order.
 
 So a process crash anywhere in a root commit leaves no gap. A lost or torn entry (a power loss before the sync, or a failed sync) only makes the next comparison see one.
 
@@ -605,7 +607,7 @@ Header (40 bytes):
 
 **Torn and unknown entries:**
 - A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
-- A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
+- A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one. Cutting there is fail-closed even when the damage is mid-file (a Root entry torn by a power loss during its overwrite in place, with later entries after it, simp724's R1 on #1504): the entries cut include that root's Root entry, while the superblock is at that root or later, so the next open's `opened_at` is above the last recorded `sequence`, and the chain breaks there.
 - An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it. So does a Catalog entry holding an edit the reader can't decode: it isn't torn, and a writer doesn't cut it off.
 
 **What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal. A RootIntent entry breaks the chain: a resolved one is gone, so one still in the file is the live session's commit in progress, after the entries the chain reads, or an intent no open could decide.

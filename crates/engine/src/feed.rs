@@ -80,7 +80,12 @@ impl Sidecar {
     fn append(&mut self, entry: &FeedEntry) -> Result<()> {
         let mut bytes = Vec::with_capacity(64);
         entry.encode(&mut bytes);
-        self.file.write_at(&bytes, self.end)?;
+        self.append_bytes(&bytes)
+    }
+
+    /// Appends encoded entries in one write.
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.write_at(bytes, self.end)?;
         self.end += bytes.len() as u64;
         Ok(())
     }
@@ -198,6 +203,18 @@ fn resolve_intent(
     end: usize,
     opened: OpenedRoot,
 ) -> Result<usize> {
+    // A lone Catalog entry at the end, for a root one past the superblock's: its intent was
+    // lost (a power loss kept the first part of their one write) or never appended (a failed
+    // append, then a failed commit). Its root never landed: cut it off, as its intent would
+    // be (simp724's F1 on #1526). One for the superblock's own root lost its intent after the
+    // root landed: the chain then misses that Root and fails closed.
+    if let Some((at, FeedEntry::Catalog { sequence, .. })) = entries.last()
+        && *sequence == opened.sequence + 1
+    {
+        let cut = (FeedHeader::LEN + at) as u64;
+        file.set_len(cut)?;
+        return Ok(cut as usize);
+    }
     let Some((at, FeedEntry::RootIntent { sequence, checksum })) = entries.last() else {
         return Ok(end);
     };
@@ -774,12 +791,17 @@ impl Feed {
             edits: c.edits,
             names: c.names,
         });
-        let appended = catalog.iter().try_for_each(|c| s.append(c)).and_then(|()| {
-            let at = s.end;
-            s.append(&FeedEntry::RootIntent { sequence, checksum })?;
-            s.intent = Some((sequence, at));
-            Ok(())
-        });
+        // One write for both (simp724's F1 on #1526): a crash between two would leave the
+        // Catalog entry without its intent, which no open could place.
+        let mut bytes = Vec::with_capacity(128);
+        if let Some(c) = &catalog {
+            c.encode(&mut bytes);
+        }
+        let at = s.end + bytes.len() as u64;
+        FeedEntry::RootIntent { sequence, checksum }.encode(&mut bytes);
+        let appended = s
+            .append_bytes(&bytes)
+            .map(|()| s.intent = Some((sequence, at)));
         if let Err(e) = appended {
             crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
             *sidecar = None;

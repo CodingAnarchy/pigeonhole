@@ -395,6 +395,16 @@ pub(crate) struct Origin {
     pub(crate) writer: Option<Arc<crate::feed::Feed>>,
 }
 
+/// Whether a `Catalog` sidecar entry's root landed, as the entries after it say (D315
+/// amendment): its Root entry follows (`Yes`), its intent follows or nothing does yet
+/// (`Pending`: read it again next time), or something else follows (`Never`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rooted {
+    Yes,
+    Pending,
+    Never,
+}
+
 /// Which catalog changes are before a feed of every table's start, at open (D315), beside
 /// the reader's `catalog_bound` for `Oldest` and `After`.
 #[derive(Clone, Copy)]
@@ -1646,7 +1656,10 @@ impl FeedReader {
         // amendment): its entry is appended with the commit's intent, before the commit
         // writes, and a commit that then fails is cut off at the next open, so until the
         // Root is there, it may never have happened. Read from it again next time.
-        let rooted: Vec<bool> = (0..entries.len())
+        // A Catalog entry with neither its Root nor its own intent after it can never get its
+        // Root: its commit didn't land, and no open resolved it (simp724's F1 on #1526).
+        // Waiting there would deliver later commits without the changes after it: expire.
+        let rooted: Vec<Rooted> = (0..entries.len())
             .map(
                 |i| match (&entries[i].1, entries.get(i + 1).map(|e| &e.1)) {
                     (
@@ -1657,8 +1670,14 @@ impl FeedReader {
                             session: s,
                             sequence: q,
                         }),
-                    ) => s == session && q == sequence,
-                    _ => false,
+                    ) if s == session && q == sequence => Rooted::Yes,
+                    (
+                        FeedEntry::Catalog { sequence, .. },
+                        Some(FeedEntry::RootIntent { sequence: q, .. }),
+                    ) if q == sequence => Rooted::Pending,
+                    // The end of what's whole so far: its intent may still be on its way.
+                    (FeedEntry::Catalog { .. }, None) => Rooted::Pending,
+                    _ => Rooted::Never,
                 },
             )
             .collect();
@@ -1680,9 +1699,19 @@ impl FeedReader {
             if !self.history.holds(session) {
                 continue;
             }
-            if !rooted[i] {
-                self.sidecar_pos = from + at as u64;
-                break;
+            match rooted[i] {
+                Rooted::Yes => {}
+                Rooted::Pending => {
+                    self.sidecar_pos = from + at as u64;
+                    break;
+                }
+                Rooted::Never => {
+                    self.expired = Some(expiry(format!(
+                        "the catalog change of root {sequence} never got its Root entry, and \
+                         a later entry follows it: later catalog changes can't be delivered"
+                    )));
+                    break;
+                }
             }
             let before_start = seqno_ceiling <= self.catalog_bound
                 || match start {
