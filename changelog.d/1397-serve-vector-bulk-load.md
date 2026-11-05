@@ -1,0 +1,2 @@
+### Added
+- **`phdb serve`: `Vectors.BulkLoad`** (D313 ticket 7, ICR 0100 and 0112, #1397): a client stream of vectors loaded into an empty IVF index, over gRPC and as NDJSON over HTTP. Each message holds its share of `--inflight-bytes` until the load takes it, so a slow load holds back its client. One load runs at a time, on a thread of its own off the shards' cores, and `/metrics` shows its progress. The background rebalancer threads now run off the shards' cores too.

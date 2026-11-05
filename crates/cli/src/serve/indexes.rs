@@ -36,6 +36,8 @@ pub(crate) struct Indexes {
     /// call still queued on the blocking pool at shutdown can't start a rebalancer nothing
     /// joins (ai1249's M2 on #1573).
     closed: AtomicBool,
+    /// Where the rebalancer threads run: off the shards' CPUs (perf287's B2 on 7b2).
+    placement: Option<Arc<super::placement::Placement>>,
 }
 
 impl std::fmt::Debug for Indexes {
@@ -47,8 +49,9 @@ impl std::fmt::Debug for Indexes {
 }
 
 impl Indexes {
-    pub(crate) fn new(db: Pigeonhole) -> Self {
+    pub(crate) fn new(db: Pigeonhole, placement: Option<Arc<super::placement::Placement>>) -> Self {
         Self {
+            placement,
             db,
             open: Mutex::new(HashMap::new()),
             rebalancers: Mutex::new(Vec::new()),
@@ -133,9 +136,13 @@ impl Indexes {
             let running = Arc::clone(&self.running);
             running.fetch_add(1, Ordering::Relaxed);
             let index_name = name.to_owned();
+            let placement = self.placement.clone();
             let spawned = std::thread::Builder::new()
                 .name("phdb-serve-rebalance".into())
                 .spawn(move || {
+                    if let Some(p) = placement {
+                        p.enter();
+                    }
                     rebalance(rebalancer, &index_name);
                     running.fetch_sub(1, Ordering::Relaxed);
                 });
