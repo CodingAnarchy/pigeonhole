@@ -696,6 +696,10 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
         .create_table("c", &[("g".into(), FamilyOptions::default())])
         .unwrap();
     let s = single(&db, &c, b"c1", Durability::GroupSync);
+    match all.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => assert!(ev.seqno_ceiling <= s, "{ev:?}"),
+        _ => panic!("the create first"),
+    }
     assert_eq!(next(&mut all).seqno, s, "the hold was released");
 
     let entries = sidecar_entries(&vfs);
@@ -736,6 +740,12 @@ fn a_catalog_change_appends_its_entry_before_its_root_and_releases_its_hold() {
     assert!(matches!(entries[drop_at + 1], FeedEntry::Root { .. }));
     // The frontier still moves past the drop.
     let later = single(&db, &c, b"c2", Durability::GroupSync);
+    match all.wait(WAIT).unwrap() {
+        Next::Catalog(ev) => {
+            assert!(matches!(ev.edits[..], [Edit::DropTable { table }] if table == a.id))
+        }
+        _ => panic!("the drop first"),
+    }
     assert_eq!(next(&mut all).seqno, later);
     drop(all);
     db.close().unwrap();
@@ -785,4 +795,66 @@ fn a_catalog_entry_is_on_its_own_root_when_a_feature_bit_commits_first() {
         "the create's root, not a feature bit's: {entries:?}"
     );
     db.close().unwrap();
+}
+
+/// simp724 on #1493 (D315 2b): once the session's sidecar appends stop, no catalog change
+/// can get its `Catalog` entry, so the catalog hold freezes at the first change's ceiling
+/// for the rest of the session: no feed's frontier passes a change it can't deliver. A
+/// feed of every table expires; a table's feed delivers what is below the frozen ceiling
+/// and nothing at or above it, and writes go on. Two ways in: the change's own `Catalog`
+/// append fails, or an earlier plain Root append did.
+#[test]
+fn a_stopped_sidecar_freezes_the_catalog_hold() {
+    for catalog_append_fails in [true, false] {
+        let vfs = SimVfs::new(3161);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut all = db.feed(spec(&[], FeedStart::Now)).unwrap();
+        let mut one = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let below = single(&db, &a, b"below", Durability::GroupSync);
+        assert_eq!(next(&mut one).seqno, below);
+        assert_eq!(next(&mut all).seqno, below);
+        let mut plan = FaultPlan::none();
+        plan.fail_on = Some("phdb-feed");
+        vfs.set_faults(plan);
+        if !catalog_append_fails {
+            // A flush's plain Root entry fails first.
+            single(&db, &a, b"flushed", Durability::GroupSync);
+            db.flush().unwrap();
+            assert_eq!(next(&mut one).seqno, below + 1);
+        }
+        db.create_table("c", &[("g".into(), FamilyOptions::default())])
+            .unwrap();
+        assert_eq!(
+            vfs.scheduled_fired(),
+            1,
+            "{catalog_append_fails}: one failed write"
+        );
+        vfs.set_faults(FaultPlan::none());
+        let above = single(&db, &a, b"above", Durability::GroupSync);
+        assert!(
+            matches!(one.wait(Duration::from_millis(200)).unwrap(), Next::Pending),
+            "{catalog_append_fails}: nothing at or above the frozen ceiling"
+        );
+        loop {
+            match all.wait(WAIT).unwrap() {
+                Next::Commit(c) => assert!(c.seqno < above, "{catalog_append_fails}: {c:?}"),
+                Next::Expired(_) => break,
+                other => panic!("{catalog_append_fails}: {other:?}"),
+            }
+        }
+        // Writes go on, and a later catalog change takes no hold of its own: one at a
+        // larger ceiling would let the frontier pass the frozen one.
+        let t = db
+            .create_table("d", &[("g".into(), FamilyOptions::default())])
+            .unwrap();
+        single(&db, &t, b"d", Durability::GroupSync);
+        single(&db, &a, b"later", Durability::GroupSync);
+        assert!(
+            matches!(one.wait(Duration::from_millis(200)).unwrap(), Next::Pending),
+            "{catalog_append_fails}: still nothing at or above the frozen ceiling"
+        );
+        drop((all, one));
+        db.close().unwrap();
+    }
 }

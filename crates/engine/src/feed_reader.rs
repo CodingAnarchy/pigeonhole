@@ -895,6 +895,16 @@ impl FeedReader {
         if self.expired.is_some() {
             return Ok(Polled::Expired);
         }
+        // A feed of every table in the writer's process, once the session's sidecar appends
+        // stopped: no later catalog change can reach it, and the frozen catalog hold keeps
+        // the frontier from moving, so this is checked before the frontier is (simp724 on
+        // #1493).
+        if self.tables.is_empty() && self.writer.as_ref().is_some_and(|f| f.appends_stopped()) {
+            self.expired = Some(expiry(
+                "the change feed's sidecar can no longer be written: catalog changes after this point can't be delivered",
+            ));
+            return Ok(Polled::Expired);
+        }
         // simp724's order: the checkpoints, then the frontier, each Acquire from the
         // shared-memory marks the writer mirrors (layout version 8), then every stream read
         // to its readable end. By M1 every record at or below F is then read: F never passes
@@ -955,12 +965,6 @@ impl FeedReader {
         // loaded. In the writer's process, once the session's sidecar appends stopped no
         // later change can reach the feed: it expires (simp724 on #1493).
         if self.tables.is_empty() {
-            if self.writer.as_ref().is_some_and(|f| f.appends_stopped()) {
-                self.expired = Some(expiry(
-                    "the change feed's sidecar can no longer be written: catalog changes after this point can't be delivered",
-                ));
-                return Ok(Polled::Expired);
-            }
             self.load_catalog(None)?;
         }
         if let Some(p) = self.emit()?.polled() {

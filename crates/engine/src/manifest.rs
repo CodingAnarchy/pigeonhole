@@ -984,15 +984,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .cloned()
         .collect();
     // Once the session's sidecar appends stopped (D315; simp724 on #1493), no catalog change
-    // can get an entry: the hold is frozen, taken once under the allocator's lock and never
-    // released, so no feed passes a change it can't deliver, and later changes take none of
-    // their own (a larger ceiling would let the frontier pass the frozen one).
-    if let Some(feed) = &shared.feed
-        && feed.appends_stopped()
-        && feed.freeze_catalog_hold()
-    {
-        shared.clock.hold_catalog(&shared.shm);
-    }
+    // can get an entry: the first change after takes its hold as usual, and
+    // `release_catalog` freezes it there for the rest of the session, so no feed passes a
+    // change it can't deliver. Later changes take none of their own: a larger ceiling would
+    // let the frontier pass the frozen one.
     let catalog_held = shared
         .feed
         .as_ref()
