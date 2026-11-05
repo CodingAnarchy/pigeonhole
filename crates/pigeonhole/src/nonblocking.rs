@@ -188,11 +188,11 @@ enum ReturningState {
         largest: usize,
         max: usize,
     },
-    Ready(Option<Result<crate::Incremented>>),
+    Ready(Option<Result<crate::Returned>>),
 }
 
 impl Future for ReturningFuture {
-    type Output = Result<crate::Incremented>;
+    type Output = Result<crate::Returned>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
@@ -201,11 +201,17 @@ impl Future for ReturningFuture {
                 table,
                 largest,
                 max,
-            } => match Pin::new(pending).poll(cx) {
+            } => match Pin::new(&mut *pending).poll(cx) {
                 Poll::Ready(r) => {
+                    let previous = pending.take_previous();
                     let out = r
                         .map(|(info, cells)| {
-                            crate::Incremented::new(CommitInfo::from_engine(info), table, cells)
+                            crate::Returned::new(
+                                CommitInfo::from_engine(info),
+                                table,
+                                cells,
+                                previous,
+                            )
                         })
                         .map_err(|e| crate::write::commit_error(e, *largest, *max));
                     self.state = ReturningState::Ready(None);

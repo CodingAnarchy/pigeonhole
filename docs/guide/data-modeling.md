@@ -198,6 +198,37 @@ let order_id = r.value("n", b"next")?.expect("a counter without a TTL has a valu
 - **Min and max.** See [Min and max](#min-and-max).
 - **Custom operators.** Implement `pigeonhole::MergeOperator` (an associative fold: `merge(acc, older)` then `finish(base, acc)`), register it with `Options::merge_operator(Arc::new(op))`, and name it on the family with `Family::merge_operator("name")`, then write operands with `RowMutation::merge`. The operator's name is stored in the file; opening without it registered fails with `ErrorCode::UnknownMergeOperator` unless you set `Options::read_only_fallback(true)`: the handle is then read-only (writes, table changes, `flush`, `compact` and `shrink` fail with `ReadOnly`, and nothing is written to the file), and reads of their merged cells fail with `UnknownMergeOperator`. A family naming an operator that is not registered is refused at creation. Reader processes register operators with `ReaderOptions::merge_operator`. Operators must be associative; non-associative operators are not supported. The operator sees stored values: a tag byte (`0x00` for bytes), then the payload.
 
+## Swaps and leases (get-and-set)
+A mutation can put or delete a cell and get back, atomically, the value it replaced: ask with `return_previous(family, qualifier)` and commit with `commit_returning` (D314 amendment 1). `previous(family, qualifier)` on the result is the column's newest version just before the commit, as an owned `Cell` (value and timestamp), or `None` if it had none. A separate `get` followed by a `put` races: two callers can both see the old value. A transaction is correct, but on a hot row it costs validation and `Conflict` retries.
+
+Handing a lease to a new holder, and learning who held it:
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let leases = db.table("leases")?.family("s", Family::default()).create_if_missing()?;
+leases.mutate(b"job:9").put("s", b"holder", b"worker-3").commit()?;
+
+let r = leases
+    .mutate(b"job:9")
+    .put("s", b"holder", b"worker-7")
+    .return_previous("s", b"holder")
+    .commit_returning()?;
+match r.previous("s", b"holder")? {
+    // A retry after `OutcomeUnknown` may find its own first attempt here.
+    Some(old) if old.value() == b"worker-7" => { /* already ours */ }
+    Some(old) => { /* take over from old.value(), held since old.timestamp() */ }
+    None => { /* nobody held it */ }
+}
+# Ok::<(), pigeonhole::Error>(())
+```
+- **Chains.** Concurrent swaps of one cell each get the value the one before wrote, so every value is handed back exactly once. This holds with default timestamps, or explicit ones that increase per cell. A put at an explicit timestamp below the newest version leaves that version newest, so the next swap returns it again.
+- **What counts as previous.** It's the column's newest *visible* version, with the family's TTL judged at the commit's timestamp. Deletes before the commit hide it. Several writes to the cell in the same mutation all count as this commit, so you get the value from before all of them. In a counter family it's the counter's total, so `put_i64(c, 0)` with `return_previous` drains a counter. For a bucket (`incr_at`) it's the column's newest bucket, which may not be the one written.
+- **Any column of the row** can be asked for, not only the ones the mutation writes. Asking twice is asking once. A mutation that only asks, and writes nothing, is refused, and so is `commit` or `commit_if` on a mutation that asks.
+- **Errors and durability are as for counters above.** An `Err` from `previous` means the read failed after the commit applied, so **the commit succeeded**. Values are visible ones (D227): after a crash, a previous value written by another commit that wasn't durable can be gone.
+- **Cost.** Each requested column is a point read on the row's shard thread, about a `get`, plus a blob read for a value stored out of line. Commits without requests pay nothing.
+
 ## Min and max
 A counter is the `Sum` case of an **aggregate family**: every cell combines the `i64` inputs written to it, with an aggregation fixed when the family is created (after Bigtable's aggregate families; D294). `Family::aggregate(Aggregation::Min)` keeps the smallest input of each cell and `Aggregation::Max` the largest; `Family::counter()` is `Family::aggregate(Aggregation::Sum)`.
 

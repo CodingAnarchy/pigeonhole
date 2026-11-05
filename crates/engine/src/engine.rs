@@ -1968,9 +1968,25 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<(CommitInfo, Vec<Returned>)> {
+        self.commit_returning_previous(batch, durability, Vec::new())
+            .map(|(info, cells, _)| (info, cells))
+    }
+
+    /// [`commit_returning`](Self::commit_returning), also returning each column of
+    /// `previous_of` (of `batch`'s one row) as it was just before this commit (D314
+    /// amendment 1): its newest visible version at the seqno below the commit's, with a TTL
+    /// judged at the commit's timestamp, in `previous_of`'s order. Concurrent commits that
+    /// write one cell and ask for its previous value each get the one before (a swap
+    /// chain). Each column costs a point read on the row's shard. `batch` must write its
+    /// row when `previous_of` is not empty, and each family must be in the row's table.
+    pub fn commit_returning_previous(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<(CommitInfo, Vec<Returned>, Vec<Previous>)> {
         self.inner.shared.refuse_blocking_on_driver("commit")?;
-        one_row(&batch)?;
-        let out = crate::shard::ReturnSlot::default();
+        let out = self.return_slot(&batch, previous_of)?;
         let inner = &self.inner;
         let info = match inner.route_and_send_with(
             batch,
@@ -1985,7 +2001,42 @@ impl Engine {
             } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
             Routed::Held(p) => inner.send(p)?.wait(),
         }?;
-        Ok((info, returned(&out)))
+        let (cells, previous) = returned(&out);
+        Ok((info, cells, previous))
+    }
+
+    /// The slot a returning commit's shard fills, holding its `previous_of` request, once
+    /// `batch` is checked to touch one row whose table holds each requested family.
+    fn return_slot(
+        &self,
+        batch: &WriteBatch,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<crate::shard::ReturnSlot> {
+        let table = one_row(batch)?;
+        if !previous_of.is_empty() {
+            let Some(table) = table else {
+                return Err(Error::InvalidArgument(
+                    "a commit returning previous values writes its row".to_owned(),
+                ));
+            };
+            let view = self.inner.shared.view.load();
+            for (family, _) in &previous_of {
+                if view
+                    .catalog
+                    .family(*family)
+                    .is_none_or(|f| f.table != table)
+                {
+                    return Err(Error::FamilyNotFound(format!(
+                        "family {} is not in table {}",
+                        family.0, table.0
+                    )));
+                }
+            }
+        }
+        Ok(Arc::new(Mutex::new(crate::shard::ReturnState {
+            previous_of,
+            ..Default::default()
+        })))
     }
 
     /// [`commit_returning`](Self::commit_returning) without waiting, as
@@ -1996,8 +2047,19 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingReturning> {
-        one_row(&batch)?;
-        let out = crate::shard::ReturnSlot::default();
+        self.submit_returning_previous(batch, durability, Vec::new())
+    }
+
+    /// [`commit_returning_previous`](Self::commit_returning_previous) without waiting, as
+    /// [`submit_returning`](Self::submit_returning) submits: once the [`PendingReturning`]
+    /// resolves, [`PendingReturning::take_previous`] hands over the previous values.
+    pub fn submit_returning_previous(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingReturning> {
+        let out = self.return_slot(&batch, previous_of)?;
         let pending = self.submit_async_with(batch, durability, Some(Arc::clone(&out)))?;
         Ok(PendingReturning { pending, out })
     }
@@ -6082,9 +6144,25 @@ pub struct Returned {
     pub value: Result<Option<i64>>,
 }
 
+/// One column a returning commit asked for, as it was just before the commit (D314
+/// amendment 1).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Previous {
+    /// Its family.
+    pub family: FamilyId,
+    /// Its qualifier.
+    pub qualifier: Vec<u8>,
+    /// Its newest visible version just before the commit (`None`: none, as after a delete
+    /// or past the family's TTL at the commit's timestamp), or the error that kept the shard
+    /// from reading it once the commit had applied.
+    pub value: Result<Option<crate::read::CellData>>,
+}
+
 /// A returning commit's batch touches one row (D314; simp724's B1 on #1453): the shard
 /// returns its cells by family, qualifier and timestamp, which say nothing of the row.
-fn one_row(batch: &WriteBatch) -> Result<()> {
+/// Returns the row's table (`None` for an empty batch).
+fn one_row(batch: &WriteBatch) -> Result<Option<TableId>> {
     let mut first: Option<(TableId, &[u8])> = None;
     let rows = batch
         .builder
@@ -6109,15 +6187,27 @@ fn one_row(batch: &WriteBatch) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(first.map(|(t, _)| t))
 }
 
-/// The cells the shard left in `out` (set before the commit's reply, which orders it).
-fn returned(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
+/// The counter cells the shard left in `out`, leaving its previous values for
+/// [`PendingReturning::take_previous`].
+fn returned_cells(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
     out.lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .cells
         .take()
         .unwrap_or_default()
+}
+
+/// The cells and previous values the shard left in `out` (set before the commit's reply,
+/// which orders it).
+fn returned(out: &crate::shard::ReturnSlot) -> (Vec<Returned>, Vec<Previous>) {
+    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+    (
+        out.cells.take().unwrap_or_default(),
+        std::mem::take(&mut out.previous),
+    )
 }
 
 /// A submitted [`Engine::submit_returning`]: resolves to the commit and its values.
@@ -6131,7 +6221,19 @@ impl PendingReturning {
     /// Waits for the commit, as [`PendingCommit::wait`] does.
     pub fn wait(self) -> Result<(CommitInfo, Vec<Returned>)> {
         let info = self.pending.wait()?;
-        Ok((info, returned(&self.out)))
+        Ok((info, returned_cells(&self.out)))
+    }
+
+    /// The previous values a [`Engine::submit_returning_previous`] asked for, once it has
+    /// resolved (empty before, and after the first call).
+    pub fn take_previous(&mut self) -> Vec<Previous> {
+        std::mem::take(
+            &mut self
+                .out
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .previous,
+        )
     }
 }
 
@@ -6146,7 +6248,7 @@ impl std::future::Future for PendingReturning {
         match std::pin::Pin::new(&mut this.pending).poll(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(r) => {
-                std::task::Poll::Ready(r.map(|info| (info, returned(&this.out))))
+                std::task::Poll::Ready(r.map(|info| (info, returned_cells(&this.out))))
             }
         }
     }

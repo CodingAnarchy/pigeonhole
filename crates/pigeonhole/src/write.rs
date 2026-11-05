@@ -268,14 +268,19 @@ impl Builder {
         engine: &pigeonhole_engine::Engine,
         max_value: usize,
         durability: Option<Durability>,
-    ) -> Result<(CommitInfo, Vec<pigeonhole_engine::Returned>)> {
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<(
+        CommitInfo,
+        Vec<pigeonhole_engine::Returned>,
+        Vec<pigeonhole_engine::Previous>,
+    )> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let largest = self.largest_value;
         engine
-            .commit_returning(self.batch, durability.map(Durability::engine))
-            .map(|(info, cells)| (CommitInfo::from_engine(info), cells))
+            .commit_returning_previous(self.batch, durability.map(Durability::engine), previous_of)
+            .map(|(info, cells, previous)| (CommitInfo::from_engine(info), cells, previous))
             .map_err(|e| commit_error(e, largest, max_value))
     }
 
@@ -286,13 +291,14 @@ impl Builder {
         engine: &pigeonhole_engine::Engine,
         max_value: usize,
         durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
     ) -> Result<(pigeonhole_engine::PendingReturning, usize)> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let largest = self.largest_value;
         engine
-            .submit_returning(self.batch, durability.map(Durability::engine))
+            .submit_returning_previous(self.batch, durability.map(Durability::engine), previous_of)
             .map(|p| (p, largest))
             .map_err(|e| commit_error(e, largest, max_value))
     }
@@ -504,6 +510,9 @@ pub struct RowMutation<'t> {
     row: Vec<u8>,
     builder: Builder,
     durability: Option<Durability>,
+    /// The columns whose values before the commit [`commit_returning`](Self::commit_returning)
+    /// returns (D314 amendment 1).
+    previous_of: Vec<(FamilyId, Vec<u8>)>,
 }
 
 impl<'t> RowMutation<'t> {
@@ -513,6 +522,18 @@ impl<'t> RowMutation<'t> {
             row: row.to_vec(),
             builder: Builder::default(),
             durability: None,
+            previous_of: Vec::new(),
+        }
+    }
+
+    /// Refuses previous-value requests on a commit that doesn't return them, so none is
+    /// dropped silently (D314 amendment 1).
+    fn no_previous(&mut self) {
+        if !self.previous_of.is_empty() {
+            self.builder.fail(Error::new(
+                crate::ErrorCode::InvalidArgument,
+                "return_previous needs commit_returning",
+            ));
         }
     }
 
@@ -893,8 +914,64 @@ impl RowMutation<'_> {
         self
     }
 
+    /// Asks [`commit_returning`](Self::commit_returning) for this row's `family:qualifier`
+    /// as it was just before the commit: its newest visible version then, what a `get` at
+    /// that point returns (get-and-set; D314 amendment 1). Read it with
+    /// [`Returned::previous`]. Usually a cell this mutation writes; any column of the row
+    /// works, and asking twice for one column is asking once. Concurrent commits that each
+    /// write a cell and ask for its previous value get a chain: each sees the one before it.
+    ///
+    /// It is the column's newest version, whatever timestamp this mutation writes: for a
+    /// bucketed counter (`incr_at`) that may be another bucket than the one written, whose
+    /// new value is [`Returned::value_at`]'s. A mutation that writes nothing has nothing to
+    /// replace: `commit_returning` refuses it (`InvalidArgument`), as
+    /// [`commit`](Self::commit) and [`commit_if`](Self::commit_if) refuse any mutation with
+    /// such a request.
+    ///
+    /// Durability is as [`commit_returning`](Self::commit_returning)'s. After
+    /// `OutcomeUnknown` there is no previous value, and a retry after the first attempt
+    /// landed sees that attempt's own write as its previous value: compare it with what you
+    /// wrote. Chains hold with default timestamps, or explicit ones that increase per cell:
+    /// a put at a timestamp below the newest version leaves that version newest, and the
+    /// next swap returns it again.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db.table("leases")?.family("s", Family::default()).create_if_missing()?;
+    /// t.mutate(b"lease:42").put("s", b"holder", b"worker-3").commit()?;
+    /// let r = t
+    ///     .mutate(b"lease:42")
+    ///     .put("s", b"holder", b"worker-7")
+    ///     .return_previous("s", b"holder")
+    ///     .commit_returning()?;
+    /// let old = r.previous("s", b"holder")?.expect("held before");
+    /// assert_eq!(old.value(), b"worker-3");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn return_previous(mut self, family: &str, qualifier: &[u8]) -> Self {
+        match self.table.family_id(family) {
+            Ok(id) => {
+                if !self
+                    .previous_of
+                    .iter()
+                    .any(|(f, q)| *f == id && q == qualifier)
+                {
+                    self.previous_of.push((id, qualifier.to_vec()));
+                }
+            }
+            Err(e) => self.builder.fail(e),
+        }
+        self
+    }
+
     /// Commits.
-    pub fn commit(self) -> Result<CommitInfo> {
+    pub fn commit(mut self) -> Result<CommitInfo> {
+        self.no_previous();
         let RowMutation {
             table,
             builder,
@@ -917,7 +994,11 @@ impl RowMutation<'_> {
     /// A value is as durable as the commit, which returns only once it meets its durability
     /// level; with [`Durability::Buffered`] or [`Durability::None`] a crash can lose the commit
     /// and hand its value out again. After [`ErrorCode::OutcomeUnknown`](crate::ErrorCode)
-    /// there is no value, and retrying the increment counts it twice if it landed.
+    /// there is no value, and retrying the increment counts it twice if it landed. Values
+    /// fold the newest *visible* versions: after a crash, what came from another commit that
+    /// wasn't durable (a cross-shard `Buffered` one, say) can be gone even if this one
+    /// survives. [`return_previous`](Self::return_previous) adds the values columns held
+    /// just before the commit.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};
@@ -931,18 +1012,19 @@ impl RowMutation<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn commit_returning(self) -> Result<Incremented> {
+    pub fn commit_returning(self) -> Result<Returned> {
         let RowMutation {
             table,
             builder,
             durability,
+            previous_of,
             ..
         } = self;
         let generation = table.db.before_commit()?;
-        let (info, cells) = builder
-            .commit_returning(&table.engine(), table.db.max_value, durability)
+        let (info, cells, previous) = builder
+            .commit_returning(&table.engine(), table.db.max_value, durability, previous_of)
             .map_err(|e| table.db.after_commit_closed(generation, e))?;
-        Ok(Incremented::new(info, &table.info, cells))
+        Ok(Returned::new(info, &table.info, cells, previous))
     }
 
     /// Submits as an async returning commit (D314, D210).
@@ -959,14 +1041,20 @@ impl RowMutation<'_> {
         let max_value = self.table.db.max_value;
         let info = Arc::clone(&self.table.info);
         self.builder
-            .submit_returning(&self.table.engine(), max_value, self.durability)
+            .submit_returning(
+                &self.table.engine(),
+                max_value,
+                self.durability,
+                self.previous_of,
+            )
             .map(|(p, largest)| (p, info, largest, max_value))
             .map_err(|e| watch.refused(e))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
-    pub(crate) fn submit_async(self) -> Result<Submitted> {
+    pub(crate) fn submit_async(mut self) -> Result<Submitted> {
+        self.no_previous();
         let watch = self.table.db.watch();
         self.builder
             .submit_async(
@@ -984,6 +1072,7 @@ impl RowMutation<'_> {
     /// pending check submits once admitted when it has to wait for room.
     #[cfg(feature = "async")]
     pub(crate) fn submit_if_async(mut self, condition: &Condition) -> Result<SubmittedCheck> {
+        self.no_previous();
         if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
@@ -1013,6 +1102,7 @@ impl RowMutation<'_> {
     /// Commits only if `condition` holds on this row, atomically (BigTable's
     /// `check_and_mutate`; Phase 2). Returns `None` if the condition failed.
     pub fn commit_if(mut self, condition: &Condition) -> Result<Option<CommitInfo>> {
+        self.no_previous();
         if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
@@ -2771,25 +2861,37 @@ impl Transaction {
     }
 }
 
-/// The counter cells a [`RowMutation::commit_returning`] incremented or set, after its
-/// commit (D314).
+/// The 1.1.0 name of [`Returned`], from when it held counters only (D314 amendment 1).
+pub type Incremented = Returned;
+
+/// What a [`RowMutation::commit_returning`] returns (D314): the counter cells it
+/// incremented or set, after its commit, and the columns
+/// [`return_previous`](RowMutation::return_previous) asked for, as they were before it.
+/// Named `Incremented` in 1.1.0, which stays as an alias.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct Incremented {
+pub struct Returned {
     /// The commit.
     pub info: CommitInfo,
     table: Arc<pigeonhole_engine::TableInfo>,
-    cells: Vec<IncrementedCell>,
+    cells: Vec<ReturnedCell>,
+    previous: Vec<PreviousCell>,
 }
 
-/// One cell of an [`Incremented`]: family, qualifier, timestamp, value.
-type IncrementedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
+/// One cell of an [`Returned`]: family, qualifier, timestamp, value.
+type ReturnedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
 
-impl Incremented {
+/// One previous value of a [`Returned`]: family, qualifier, and the version before the
+/// commit as its timestamp and stored bytes. Kept as bytes, not a `Cell` (which may pin a
+/// cache block), so `Returned` stays `UnwindSafe` as 1.1.0's `Incremented` was.
+type PreviousCell = (FamilyId, Vec<u8>, Result<Option<(u64, Vec<u8>)>>);
+
+impl Returned {
     pub(crate) fn new(
         info: CommitInfo,
         table: &Arc<pigeonhole_engine::TableInfo>,
         cells: Vec<pigeonhole_engine::Returned>,
+        previous: Vec<pigeonhole_engine::Previous>,
     ) -> Self {
         Self {
             info,
@@ -2798,7 +2900,46 @@ impl Incremented {
                 .into_iter()
                 .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
                 .collect(),
+            previous: previous
+                .into_iter()
+                .map(|p| {
+                    let value = p
+                        .value
+                        .map(|v| v.map(|c| (c.timestamp(), c.stored().to_vec())))
+                        .map_err(Error::from);
+                    (p.family, p.qualifier, value)
+                })
+                .collect(),
         }
+    }
+
+    /// The column `family:qualifier` that [`RowMutation::return_previous`] asked for, as it
+    /// was just before the commit: its newest visible version then (value and timestamp),
+    /// with the family's TTL judged at the commit's timestamp (D314 amendment 1).
+    ///
+    /// `Ok(None)` if it had no visible version. An `Err` is the error that kept the value
+    /// from being read once the commit had applied: **the commit succeeded**, so don't retry
+    /// it. `InvalidArgument` if the mutation didn't ask for that column.
+    pub fn previous(&self, family: &str, qualifier: &[u8]) -> Result<Option<crate::Cell>> {
+        let id = self.table.family(family).map(|f| f.id);
+        self.previous
+            .iter()
+            .find(|(f, q, _)| Some(*f) == id && q == qualifier)
+            .map(|c| match &c.2 {
+                Ok(v) => Ok(v.as_ref().map(|(ts, stored)| {
+                    crate::Cell::from_data(pigeonhole_engine::CellData::from_stored(
+                        *ts,
+                        stored.clone(),
+                    ))
+                })),
+                Err(e) => Err(e.clone()),
+            })
+            .unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    format!("the commit did not ask for the previous {family}:{qualifier:?}"),
+                ))
+            })
     }
 
     /// The counter `incr` (or `put_i64`) wrote in `family` at `qualifier`, after the commit.

@@ -190,6 +190,45 @@ fn a_share_writing_a_waiting_returning_row_comes_after_it() {
     assert_eq!(db.value(), 21_006);
 }
 
+/// D314 amendment 1 (#1445): a commit that only asks for a previous value (it writes the
+/// row, but no counter cell: a column delete of another qualifier) waits as a counting one
+/// does, through `Reply::Returning`. Base 5, a cross-shard `+1000` with its decision held;
+/// the previous value of the counter must be 1005, not 5.
+#[test]
+fn a_previous_only_commit_waits_for_a_share_undecided_on_its_row() {
+    let mut db = open(1445);
+    let mut base = db.returning(5);
+    db.answer(&mut base).unwrap();
+    db.engine.inject(Fault::HoldDecides, true);
+    let mut cross = db.cross(1000);
+    db.drive(20);
+    let (t, c) = db.tables[1];
+    let mut b = WriteBatch::new();
+    b.delete_column(t, c, b"r", b"other", None).unwrap();
+    let mut r = db
+        .engine
+        .submit_returning_previous(b, Some(Durability::Buffered), vec![(c, b"n".to_vec())])
+        .expect("submit");
+    db.drive(20);
+    assert!(
+        ready(&mut r).is_none(),
+        "the previous-only commit was answered while a share on its row was undecided there"
+    );
+    db.engine.inject(Fault::HoldDecides, false);
+    assert_eq!(db.engine.release_held_decides(usize::MAX), 1);
+    let (info, cells) = db.answer(&mut r).unwrap();
+    let x = db.answer(&mut cross).unwrap();
+    assert!(x.seqno < info.seqno);
+    assert!(cells.is_empty());
+    let previous = r.take_previous();
+    assert_eq!(previous.len(), 1);
+    let cell = previous[0].value.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        i64::from_le_bytes(cell.stored()[1..9].try_into().unwrap()),
+        1005
+    );
+}
+
 /// A returning batch is one row (simp724's B1 on #1453): its cells come back by family,
 /// qualifier and timestamp, which don't say which row. Two rows on one shard are refused
 /// before anything is sent, by the blocking and the async form alike.
