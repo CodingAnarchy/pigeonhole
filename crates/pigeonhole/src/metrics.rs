@@ -171,9 +171,11 @@ pub struct EngineMetrics {
     /// Nanoseconds the group syncs were in flight, summed over shards (ICR 0116): each
     /// sync adds its own duration, so its rise over an interval, divided by
     /// [`group_syncs`](Self::group_syncs)', is the mean group sync time, even with several
-    /// syncs in flight at once. It covers durable groups' syncs only (`GroupSync` and
-    /// `Sync` commits): flushes' and checkpoints' barrier syncs aren't in it, and `Buffered`
-    /// and `None` commits never add to it. A sync still in flight shows up when it finishes.
+    /// syncs in flight at once. It covers group syncs only, the ones `group_syncs` counts
+    /// (those of groups with a `GroupSync` commit): a `Sync` commit's own sync, flushes' and
+    /// checkpoints' barrier syncs, and `Buffered` and `None` commits aren't in it. It's
+    /// current as of the last time a group sync started or finished on its shard, so a
+    /// sync still in flight counts from then (perf287 and cli692 on #1521).
     pub group_sync_nanos: u64,
     /// Syncs the change feed submitted on its own (D310): fed `Buffered` or `None` commits
     /// waited longer than the feed's sync interval for one and no commit's sync covered

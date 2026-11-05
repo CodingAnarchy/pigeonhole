@@ -359,7 +359,7 @@ static SPECS: &[Spec] = &[
         true,
         "s",
         [],
-        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Durable groups only: no flush or checkpoint barrier syncs, nothing from buffered commits.",
+        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits): not a sync commit's own sync, flush or checkpoint barrier syncs, or buffered commits.",
         |s, out| out.push((seconds(s.e.group_sync_nanos), Vec::new()))
     ),
     spec!(
