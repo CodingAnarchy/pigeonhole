@@ -965,6 +965,44 @@ fn an_async_page_yields_within_a_wide_row() {
     db.close().unwrap();
 }
 
+/// simp724's B1 on #1556: cells a value filter drops count their value bytes toward the
+/// poll's bound too, since the cursor read each separated value from its blob file. One row
+/// of 64 separated values of 64 KiB (4 MiB), none passing the filter, yields by bytes.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_page_yields_over_filtered_separated_values() {
+    use pigeonhole::ValueFilter;
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-async-misses", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Pigeonhole::open(dir.join("m.phdb"), Options::default().shards(1)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("b", Family::default().blob_threshold(64))
+        .create_if_missing()
+        .unwrap();
+    let mut m = t.mutate(b"row");
+    for i in 0..64u32 {
+        m = m.put("b", format!("q{i:02}").as_bytes(), &vec![b'x'; 64 << 10]);
+    }
+    m.commit().unwrap();
+    db.flush().unwrap();
+    let scan = || {
+        t.scan_prefix(b"row")
+            .value_filter(ValueFilter::Prefix(b"never".to_vec()))
+    };
+    let sync = scan_summary(&scan().read_within(1 << 30).unwrap());
+    assert!(sync.0.is_empty());
+    let (got, pending) = poll_counting(scan().read_within_async(1 << 30));
+    assert_eq!(scan_summary(&got.unwrap()), sync);
+    assert!(
+        pending >= 2,
+        "{pending} yields over 4 MiB of filtered values"
+    );
+    db.close().unwrap();
+}
+
 /// #1286: from a cold block cache (a reopen), the async read fetches what it can predict
 /// and counts what it reads synchronously; its page is the sync one.
 #[cfg(feature = "async")]

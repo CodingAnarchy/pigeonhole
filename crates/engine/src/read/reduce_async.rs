@@ -26,9 +26,11 @@ use crate::Result;
 /// ([`NEAREST_POLL_CELLS`](crate::NEAREST_POLL_CELLS)).
 pub const REDUCE_POLL_CELLS: u32 = 4_096;
 
-/// Value bytes an async bounded read hands its visitor (or reads from blob files) in one
-/// poll before it yields: a visitor that copies each value (a byte-budgeted read's) would
-/// otherwise hold the executor for [`REDUCE_POLL_CELLS`] large values.
+/// Value bytes an async bounded read takes in one poll before it yields, every cell's
+/// counted whether or not it reaches the visitor (a separated one is read from its blob file
+/// as the cursor takes it): a visitor that copies each value (a byte-budgeted read's), or a
+/// run of predicate misses over large separated values, would otherwise hold the executor
+/// for [`REDUCE_POLL_CELLS`] large values.
 pub const REDUCE_POLL_BYTES: u64 = 1 << 20;
 
 /// What an async bounded read reads.
@@ -268,6 +270,9 @@ where
                 return Ok(Step::RowDone);
             };
             *self.cells -= 1;
+            // Every taken cell's value counts, skipped or not: the lane already read it, a
+            // separated one from its blob file (simp724's B1 on #1556).
+            *self.bytes = self.bytes.saturating_sub(c.stored.len() as u64);
             let rank = match self.row.family {
                 Some((f, r)) if f == c.family => r,
                 _ => {
@@ -313,7 +318,6 @@ where
                     continue;
                 }
             }
-            *self.bytes = self.bytes.saturating_sub(value.len() as u64);
             let visit = self
                 .visitor
                 .visit(&self.row.key, c.family, c.qualifier, c.ts, value);
