@@ -324,7 +324,10 @@ end
 - **One-commit writes:** `table.put`, `table.incr` and `table.delete` each commit at once and return the commit's sequence number.
 - **`table.mutate(row)`** collects one row's writes for a single commit: `put`, `put_u64`, `incr`, `aggregate` and `delete`, then `commit`, or `commit_if(Pigeonhole::Condition.absent(family, qualifier))`, which returns `nil` when the condition fails.
 - **Increments that return the value (D314):** `table.mutate(row)....commit_returning` commits like `commit` and returns a frozen `Pigeonhole::Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts: nil)`, or all with `to_h` (`{[family, qualifier, ts] => value}`). `table.incr_returning(...)` is the one-cell form and returns the new value, with the GVL released. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `nil` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts: 0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `Pigeonhole::ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its `cause`): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `:group_sync` (the default) or `:sync` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
-- **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Pigeonhole::Cell`, or `nil` if it had none. One call, for example, takes a lease and says who held it. Only `commit_returning` takes such a mutation: `commit` and `commit_if` raise `Pigeonhole::InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Pigeonhole::Returned` is the same class as `Pigeonhole::Incremented`, under the name the Rust struct has had since 1.2.
+- **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Pigeonhole::Cell`, or `nil` if it had none.
+  - **A lease handoff, for example:** one commit takes the lease and says whom it displaced. That's an **unconditional takeover**: it doesn't check that the lease was free or expired. Taking it only then needs a condition, which is #1446.
+  - The displaced holder finds out at its next guarded write. **Guard every holder write** with `commit_if(Pigeonhole::Condition.equals(family, holder_column, own_id))`, which returns `nil` once another holder has taken over.
+  - Optionally, an `incr` of an epoch counter in the same commit gives the new holder a fencing token (`r.value(...)`), so systems downstream can refuse an older holder's work. Only `commit_returning` takes such a mutation: `commit` and `commit_if` raise `Pigeonhole::InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Pigeonhole::Returned` is the same class as `Pigeonhole::Incremented`, under the name the Rust struct has had since 1.2.
 - **`db.write_batch { |batch| ... }`** commits every write in the block at once (the same write methods, with a table and row first). It commits when the block returns normally (`next` included), and discards on an exception, a `break`, a `throw` or an early `return`.
 - **`db.transaction { |txn| ... }`** is an optimistic transaction: `txn.get` and `txn.get_row` read at its snapshot, and the commit checks them. Like `write_batch`, it commits on a normal return and rolls back otherwise. A transaction belongs to one thread of control. It's safe to share between threads (calls serialise), but its reads and writes must make sense in whatever order they land.
 - **`db.transact(max_attempts:, deadline:, durability:) { |txn| ... }`** runs the block in a transaction and commits it, retrying on `Conflict` and `Busy` with backoff, as the Rust `RetryPolicy` does. It returns the block's value. The block may run more than once, so it should have no other effects.
@@ -370,11 +373,20 @@ Pigeonhole.open(path, create: true) do |db|
   raise "value" unless r.value("n", "next") == 2
   raise "to_h" unless r.to_h == { ["n", "next", 0] => 2, ["n", "shipped", 0] => 1 }
 
-  # A lease handoff: take the lease, and learn who held it, in one commit.
-  leases = db.table("leases").family("s").create
-  leases.mutate("lease:42").put("s", "holder", "worker-3").commit
-  r = leases.mutate("lease:42").put("s", "holder", "worker-7").return_previous("s", "holder").commit_returning
+  # A lease handoff: an unconditional takeover that says whom it displaced, with a fencing
+  # epoch for the new holder.
+  leases = db.table("leases").family("s").family("epoch", Pigeonhole::Family.counter).create
+  leases.mutate("lease:42").put("s", "holder", "worker-3").incr("epoch", "n", 1).commit
+  r = leases.mutate("lease:42")
+            .put("s", "holder", "worker-7")
+            .incr("epoch", "n", 1)
+            .return_previous("s", "holder")
+            .commit_returning
   raise "previous" unless r.previous("s", "holder").value == "worker-3"
+  raise "fence" unless r.value("epoch", "n") == 2 # worker-7's fencing token
+  # worker-3 finds out at its next write, which (like every holder write) is guarded.
+  mine = Pigeonhole::Condition.equals("s", "holder", "worker-3")
+  raise "stale" unless leases.mutate("lease:42").put("s", "beat", "3").commit_if(mine).nil?
 end
 ```
 

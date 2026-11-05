@@ -1431,7 +1431,10 @@ impl Mutation {
         qualifier: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, Self>> {
         let q = convert::bytes(qualifier)?;
-        if slf.get().ops.lock().expect("not poisoned").is_none() {
+        // Under the writes' lock, as a commit takes both (ai1249's Q1 on #1552): a commit on
+        // another thread either sees this request or makes it fail as already committed.
+        let ops = slf.get().ops.lock().expect("not poisoned");
+        if ops.is_none() {
             return Err(PyValueError::new_err("the mutation was already committed"));
         }
         slf.get()
@@ -1439,6 +1442,7 @@ impl Mutation {
             .lock()
             .expect("not poisoned")
             .push((family, q));
+        drop(ops);
         Ok(slf.clone())
     }
 
@@ -1519,8 +1523,15 @@ impl Mutation {
 
     /// What a commit takes: the table, the row, the buffered writes and the durability.
     fn parts(&self) -> PyResult<CommitParts> {
-        let ops = self.take()?;
-        let previous = std::mem::take(&mut *self.previous.lock().expect("not poisoned"));
+        let (ops, previous) = {
+            let mut ops = self.ops.lock().expect("not poisoned");
+            let taken = ops
+                .take()
+                .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))?;
+            // Under the writes' lock, as `return_previous` pushes (Q1).
+            let previous = std::mem::take(&mut *self.previous.lock().expect("not poisoned"));
+            (taken, previous)
+        };
         let durability = *self.durability.lock().expect("not poisoned");
         Ok((
             self.table.clone(),
@@ -1529,15 +1540,6 @@ impl Mutation {
             previous,
             durability,
         ))
-    }
-
-    /// The buffered writes, taken for a commit.
-    fn take(&self) -> PyResult<Vec<Op>> {
-        self.ops
-            .lock()
-            .expect("not poisoned")
-            .take()
-            .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))
     }
 }
 

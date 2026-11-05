@@ -498,8 +498,8 @@ class Incremented:
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[tuple[str, bytes, int]]: ...
 
+# `Incremented`'s name since 1.2, when it gained `previous` (ICR 0113): the same class.
 Returned = Incremented
-"""`Incremented`'s name since 1.2, when it gained `previous` (ICR 0113): the same class."""
 
 @final
 class Table:

@@ -135,17 +135,26 @@ class TestReturning < Minitest::Test
     @leases ||= db.table("leases").family("s").family("n", Pigeonhole::Family.counter).create
   end
 
-  # The guide's example: one call takes the lease and says who held it.
+  # The guide's example: an unconditional takeover says whom it displaced, with a fencing
+  # epoch, and the displaced holder's next guarded write finds it lost the lease (simp724's
+  # L1 and L2 on #1552).
   def test_a_lease_handoff_returns_the_holder_it_replaced
-    leases.mutate("lease:42").put("s", "holder", "worker-3").commit
+    mine = Pigeonhole::Condition.equals("s", "holder", "worker-3")
+    leases.mutate("lease:42").put("s", "holder", "worker-3").incr("n", "epoch", 1).commit
+    refute_nil leases.mutate("lease:42").put("s", "beat", "1").commit_if(mine)
     r = leases.mutate("lease:42")
               .put("s", "holder", "worker-7")
+              .incr("n", "epoch", 1)
               .return_previous("s", "holder")
               .commit_returning
     old = r.previous("s", "holder")
     assert_instance_of Pigeonhole::Cell, old
     assert_equal "worker-3", old.value
+    assert_equal 2, r.value("n", "epoch"), "the new holder's fencing token"
     assert_equal "worker-7", leases.get("lease:42", "s", "holder").value
+    # The displaced holder's guarded write: refused, nothing written.
+    assert_nil leases.mutate("lease:42").put("s", "beat", "2").commit_if(mine)
+    assert_equal "1", leases.get("lease:42", "s", "beat").value
     # A column with nothing before the commit.
     r = leases.mutate("lease:43").put(:s, "holder", "worker-1").return_previous(:s, "holder").commit_returning
     assert_nil r.previous("s", "holder")

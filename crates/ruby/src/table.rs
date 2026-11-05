@@ -989,10 +989,13 @@ impl Mutation {
         qualifier: Bytes,
     ) -> Result<(), Error> {
         let m = rb_self.0.get(ruby)?;
-        if lock(&m.ops).is_none() {
+        // Under the writes' lock, as a commit takes both (ai1249's Q1 on #1552).
+        let ops = lock(&m.ops);
+        if ops.is_none() {
             return Err(spent(ruby, "the mutation was already committed"));
         }
         lock(&m.previous).push((family.0, qualifier.0));
+        drop(ops);
         Ok(())
     }
 
@@ -1017,8 +1020,11 @@ impl Mutation {
         let durability = *lock(&m.durability);
         // As in `finish`: the writes are taken inside the call.
         let r = without_gvl(ruby, move || {
-            let ops = lock(&m.ops).take()?;
-            let previous = std::mem::take(&mut *lock(&m.previous));
+            let (ops, previous) = {
+                let mut ops = lock(&m.ops);
+                // Under the writes' lock, as `return_previous` pushes (Q1).
+                (ops.take()?, std::mem::take(&mut *lock(&m.previous)))
+            };
             let r = commit_row_returning(&m.table, &m.row, &ops, &previous, durability);
             Some(r.map(|r| Incremented(r, previous)))
         })?;
@@ -1038,8 +1044,11 @@ impl Mutation {
         // The writes are taken inside the call: if an interrupt was pending and the call
         // didn't run, the mutation keeps them.
         let r = without_gvl(ruby, move || {
-            let ops = lock(&m.ops).take()?;
-            let previous = std::mem::take(&mut *lock(&m.previous));
+            let (ops, previous) = {
+                let mut ops = lock(&m.ops);
+                // Under the writes' lock, as `return_previous` pushes (Q1).
+                (ops.take()?, std::mem::take(&mut *lock(&m.previous)))
+            };
             Some(commit_row(
                 &m.table,
                 &m.row,
