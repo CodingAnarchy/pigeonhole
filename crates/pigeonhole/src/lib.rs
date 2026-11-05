@@ -172,7 +172,8 @@ pub use db::RootCommitHold;
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use feed::{
-    CatalogChange, CatalogEdit, Change, ChangeKind, Commit, Feed, FeedBuilder, FeedEvent, FeedToken,
+    CatalogChange, CatalogEdit, Change, ChangeKind, Commit, Feed, FeedBuilder, FeedEvent,
+    FeedPosition, FeedToken,
 };
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
