@@ -496,6 +496,24 @@ static SPECS: &[Spec] = &[
         "Time the engine-owned shard threads spent working, summed over shards; its rate is how many shards' worth of work the database did.",
         |s, out| out.push((seconds(s.e.shard_busy_nanos), Vec::new()))
     ),
+    spec!(
+        "pigeonhole.memtable.size",
+        Gauge,
+        false,
+        "By",
+        [],
+        "Memtable arena bytes in use, summed over shards: live memtables in whole chunks, and flushed ones a snapshot or read still holds. Near the limit, commits wait for room.",
+        |s, out| one(out, s.m.memtable_bytes)
+    ),
+    spec!(
+        "pigeonhole.memtable.limit",
+        Gauge,
+        false,
+        "By",
+        [],
+        "The memtable arenas' size, summed over shards: Options::memtable_budget (per shard, rounded up to 2 MiB) times the shard count.",
+        |s, out| one(out, s.m.memtable_limit_bytes)
+    ),
     // Caches.
     spec!(
         "pigeonhole.block_cache.requests",

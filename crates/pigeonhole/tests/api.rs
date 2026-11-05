@@ -145,6 +145,47 @@ fn same_database_is_one_open() {
     again.close().unwrap();
 }
 
+/// ICR 0116 (D316 A2): the memtable gauges. The limit is set from the start and holds every
+/// byte used; writes raise the bytes used, and a flush gives them back. The arena updates
+/// the gauge as chunks are taken and returned, and a flushed memtable's chunks come back
+/// once nothing holds it, so the reads poll briefly.
+#[test]
+fn memtable_bytes_rise_with_writes_and_fall_after_a_flush() {
+    let db = db();
+    let t = table(&db);
+    let wait_for = |what: &str, pred: &dyn Fn(&pigeonhole::EngineMetrics) -> bool| {
+        let start = std::time::Instant::now();
+        loop {
+            let m = db.engine_metrics();
+            if pred(&m) {
+                return m;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}: {m:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let start = wait_for("a limit", &|m| m.memtable_limit_bytes > 0);
+    assert!(start.memtable_bytes <= start.memtable_limit_bytes);
+    let value = vec![7u8; 4096];
+    for i in 0..256u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", &value)
+            .commit()
+            .unwrap();
+    }
+    let written = wait_for("bytes used after 1 MiB of writes", &|m| {
+        m.memtable_bytes > start.memtable_bytes
+    });
+    assert!(written.memtable_bytes <= written.memtable_limit_bytes);
+    assert_eq!(written.memtable_limit_bytes, start.memtable_limit_bytes);
+    db.flush().unwrap();
+    wait_for("bytes given back after the flush", &|m| {
+        m.memtable_bytes < written.memtable_bytes
+    });
+    drop(t);
+    db.close().unwrap();
+}
+
 /// ICR 0116 (D316 A3): group syncs' in-flight time. `GroupSync` commits each wait for a
 /// group sync, so the time grows with them; `Buffered` commits never add to it. A real
 /// directory, so the syncs take real time.

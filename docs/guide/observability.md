@@ -109,6 +109,8 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.compactions` | `pigeonhole_compactions_total` | counter | `{compaction}` | `pigeonhole.outcome` | Compactions completed (success), failed or unable to start (failure), and taken back from an application's worker (reclaimed). |
 | `pigeonhole.background.take_backs` | `pigeonhole_background_take_backs_total` | counter | `{task}` | `pigeonhole.take_back.reason` | Background tasks the shards took back from application-owned workers: not driven for 10 ms (reason undriven), or held while a commit waited for room (reason room). Nonzero means the workers aren't driven. |
 | `pigeonhole.shard.busy.time` | `pigeonhole_shard_busy_time_seconds_total` | counter | `s` |  | Time the engine-owned shard threads spent working, summed over shards; its rate is how many shards' worth of work the database did. |
+| `pigeonhole.memtable.size` | `pigeonhole_memtable_size_bytes` | gauge | `By` |  | Memtable arena bytes in use, summed over shards: live memtables in whole chunks, and flushed ones a snapshot or read still holds. Near the limit, commits wait for room. |
+| `pigeonhole.memtable.limit` | `pigeonhole_memtable_limit_bytes` | gauge | `By` |  | The memtable arenas' size, summed over shards: Options::memtable_budget (per shard, rounded up to 2 MiB) times the shard count. |
 | `pigeonhole.block_cache.requests` | `pigeonhole_block_cache_requests_total` | counter | `{request}` | `pigeonhole.cache.result` | Block cache lookups that found the block (hit) or read it from the file (miss). |
 | `pigeonhole.block_cache.capacity` | `pigeonhole_block_cache_capacity_bytes` | gauge | `By` |  | The block cache's capacity. |
 | `pigeonhole.block_cache.pinned` | `pigeonhole_block_cache_pinned_bytes` | gauge | `By` |  | SST indexes and filters pinned in the block cache; past half the capacity, reads start costing two reads. |
@@ -145,9 +147,7 @@ Counters are cumulative from registration. They stay monotonic across an automat
 - **Coverage:** the quantiles cover the commits of the last `latency_window`, whatever the collection interval, and are reported only for durability levels with commits in that window.
 - **Aggregation:** quantiles can't be aggregated across databases or instances (an average of p99s isn't a p99).
 
-**Coming in 1.2.0 (D316's A2–A4),** each in its own release note:
-- `pigeonhole.memtable.size` and `pigeonhole.memtable.limit`;
-- `pigeonhole.feed.lag`.
+**Coming in 1.2.0 (D316's A4):** `pigeonhole.feed.lag`, a watched feed's lag.
 
 ## What to alert on
 In Prometheus terms:
@@ -157,6 +157,7 @@ In Prometheus terms:
 | The database failed | `pigeonhole_failed_ratio == 1` | A failed instance refuses writes until it's reopened or recovered. Set this one first. |
 | Recovery gave up | `pigeonhole_recovery_gave_up_ratio == 1` | Automatic recovery stopped retrying. |
 | Writes are stalling | `sum by (pigeonhole_db_name) (rate(pigeonhole_write_stall_time_seconds_total[5m])) > 0.05` | Commits held more than 5% of the time. `pigeonhole_stall_reason="pacing"` means compaction is behind; `"room"` means the memtable arena is too small, or snapshots hold flushed memtables. |
+| The memtable is nearly full | `pigeonhole_memtable_size_bytes > 0.9 * pigeonhole_memtable_limit_bytes` | An early, approximate warning: commits can also wait for room below it (reserved room, a cross-shard share awaiting its decision, a value larger than the longest free run). The ground truth is the stall rate with `pigeonhole_stall_reason="room"`. Raise `Options::memtable_budget` (per shard), or look for snapshots holding flushed memtables. |
 | Compaction is behind | `pigeonhole_sst_count{pigeonhole_level="0"} > 8` | L0's depth is what paces commits. |
 | The block cache is too small | `pigeonhole_block_cache_pinned_bytes > 0.5 * pigeonhole_block_cache_capacity_bytes` | Past half the capacity, a cold read costs two reads rather than one. |
 | The feed is near its retention | `pigeonhole_feed_retained_size_bytes > 0.9 * pigeonhole_feed_retained_limit_bytes` | Slow subscribers start expiring with `FeedExpired`. |

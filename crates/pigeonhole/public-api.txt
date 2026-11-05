@@ -345,7 +345,10 @@ pub pigeonhole::EngineMetrics::file_growth_nanos: u64
 pub pigeonhole::EngineMetrics::file_growths: u64
 pub pigeonhole::EngineMetrics::flush_failures: u64
 pub pigeonhole::EngineMetrics::flushes: u64
+pub pigeonhole::EngineMetrics::group_sync_nanos: u64
 pub pigeonhole::EngineMetrics::group_syncs: u64
+pub pigeonhole::EngineMetrics::memtable_bytes: u64
+pub pigeonhole::EngineMetrics::memtable_limit_bytes: u64
 pub pigeonhole::EngineMetrics::pacing_stall_nanos: u64
 pub pigeonhole::EngineMetrics::pacing_stalls: u64
 pub pigeonhole::EngineMetrics::reader_pin_seqno_lag: u64
@@ -966,6 +969,7 @@ pub fn pigeonhole::Transaction::set_add(&mut self, &pigeonhole::Table, &[u8], &s
 pub fn pigeonhole::Transaction::set_add_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
 pub fn pigeonhole::Transaction::set_remove(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u32) -> &mut Self
 pub fn pigeonhole::Transaction::set_remove_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
+pub fn pigeonhole::Transaction::snapshot_seqno(&self) -> u64
 impl pigeonhole::Transaction
 pub fn pigeonhole::Transaction::commit_async(self) -> pigeonhole::nonblocking::TransactionCommitFuture
 pub fn pigeonhole::Transaction::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::TransactionCommitFuture

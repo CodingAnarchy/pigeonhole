@@ -223,6 +223,12 @@ pub(crate) struct ShardMetrics {
     /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
     /// time, in nanoseconds, as of the last change in their number.
     pub sync_busy_nanos: AtomicU64,
+    /// The shard's memtable arena's free bytes, which the arena stores itself whenever a
+    /// memtable takes chunks or a retired one gives them back (`ShardArena::set_free_sink`,
+    /// D316 A2, ICR 0116): never per commit. `Engine::metrics` reads it.
+    pub memtable_free: Arc<AtomicU64>,
+    /// The arena's size, stored once when the shard starts (D316 A2).
+    pub memtable_limit: AtomicU64,
     /// Client commits' in-flight time (D257, D262): the sum over the commits this shard
     /// completed (singles and the cross-shard commits it coordinated, committed or failed)
     /// of the nanoseconds from the client's submit to the reply, plus, over the cross-shard
@@ -271,6 +277,8 @@ impl Default for ShardMetrics {
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
             sync_busy_nanos: AtomicU64::new(0),
+            memtable_free: Arc::new(AtomicU64::new(0)),
+            memtable_limit: AtomicU64::new(0),
             commit_inflight_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
             cross: CrossShardCounters::default(),
@@ -3570,6 +3578,14 @@ impl ShardState {
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
         let shards = shared.shards;
         let cross = shards > 1;
+        // The arena keeps the shard's metrics' free bytes current itself, only as chunks
+        // are taken and given back (D316 A2): nothing per commit or per batch.
+        let mut arena = ShardArena::new(region, chunk_size);
+        let metrics = &shared.metrics[usize::from(id.0)];
+        metrics
+            .memtable_limit
+            .store(arena.region().len() as u64, Ordering::Relaxed);
+        arena.set_free_sink(Arc::clone(&metrics.memtable_free));
         let shard = Self {
             cross,
             id,
@@ -3581,7 +3597,7 @@ impl ShardState {
             cross_durable_at_close: false,
             stream_end: Lsn::default(),
             stream_durable_at_close: false,
-            arena: ShardArena::new(region, chunk_size),
+            arena,
             chunk_size,
             memtables: BTreeMap::new(),
             retired: Vec::new(),
