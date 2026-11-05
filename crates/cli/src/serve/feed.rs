@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
 use pigeonhole::{Commit, FeedToken, Snapshot, Table};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::convert;
 use super::errors::ApiError;
@@ -418,6 +418,7 @@ impl Feeds {
         let budget = Arc::new(Semaphore::new(
             self.limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS),
         ));
+        let taken = Arc::new(Notify::new());
         let (end_tx, end_rx) = oneshot::channel();
         let client = Client {
             feeds: Arc::clone(self),
@@ -428,6 +429,7 @@ impl Feeds {
             visible: spec.visible,
             tx,
             budget,
+            taken: Arc::clone(&taken),
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
@@ -456,6 +458,7 @@ impl Feeds {
         });
         Ok(FeedEvents {
             events: rx,
+            taken,
             end: Some(end_rx),
         })
     }
@@ -525,6 +528,9 @@ struct Client {
     tx: mpsc::Sender<(proto::FeedEvent, OwnedSemaphorePermit)>,
     /// The client's buffer's free bytes: each event in its channel holds its encoded size.
     budget: Arc<Semaphore>,
+    /// Poked each time the client takes an event: a send waiting for room starts its
+    /// `--stream-idle-ms` again (simp724's I1 on #1536).
+    taken: Arc<Notify>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -795,19 +801,34 @@ impl Client {
                 .map_err(|_| ())?;
             self.tx.send((event, room)).await.map_err(|_| ())
         };
-        match tokio::time::timeout(self.feeds.limits.stream_idle, queued).await {
-            Ok(Ok(())) => {
-                pos.sent = token;
-                pos.last_event = Instant::now();
-                Ok(())
+        tokio::pin!(queued);
+        // The idle limit counts from the client's last take, not from the start of the wait:
+        // a large event may wait for most of the buffer to drain, and a client taking events
+        // all along is slow, not idle (simp724's I1 on #1536).
+        loop {
+            let taken = self.taken.notified();
+            tokio::select! {
+                sent = &mut queued => {
+                    return match sent {
+                        Ok(()) => {
+                            pos.sent = token;
+                            pos.last_event = Instant::now();
+                            Ok(())
+                        }
+                        // The client went away: end quietly.
+                        Err(()) => Err(ApiError::internal("the client went away")),
+                    };
+                }
+                () = taken => {}
+                () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
+                () = tokio::time::sleep(self.feeds.limits.stream_idle) => {
+                    return Err(ApiError::deadline(format!(
+                        "the client took no feed event for --stream-idle-ms ({} ms); resume \
+                         from the last event's token",
+                        self.feeds.limits.stream_idle.as_millis()
+                    )));
+                }
             }
-            // The client went away: end quietly.
-            Ok(Err(_)) => Err(ApiError::internal("the client went away")),
-            Err(_) => Err(ApiError::deadline(format!(
-                "the client took no feed event for --stream-idle-ms ({} ms); resume from the \
-                 last event's token",
-                self.feeds.limits.stream_idle.as_millis()
-            ))),
         }
     }
 }
@@ -852,6 +873,8 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 #[derive(Debug)]
 pub(crate) struct FeedEvents {
     events: mpsc::Receiver<(proto::FeedEvent, OwnedSemaphorePermit)>,
+    /// Poked on each take, for a send waiting for room.
+    taken: Arc<Notify>,
     end: Option<oneshot::Receiver<ApiError>>,
 }
 
@@ -861,7 +884,11 @@ impl Stream for FeedEvents {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.events.poll_recv(cx) {
             // Taken: its bytes go back to the client's buffer.
-            Poll::Ready(Some((e, _room))) => return Poll::Ready(Some(Ok(e))),
+            Poll::Ready(Some((e, room))) => {
+                drop(room);
+                self.taken.notify_one();
+                return Poll::Ready(Some(Ok(e)));
+            }
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => {}
         }
