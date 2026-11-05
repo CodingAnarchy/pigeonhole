@@ -48,7 +48,7 @@ pub(crate) enum Elements {
     Bf16(Vec<u16>),
 }
 
-fn elements(v: &proto::Vector) -> Result<Elements> {
+pub(crate) fn elements(v: &proto::Vector) -> Result<Elements> {
     let dim = v.dim as usize;
     let data = &v.data;
     let want = |each: usize| {
@@ -850,6 +850,12 @@ fn metric_out(m: pigeonhole::Metric) -> i32 {
         Metric::Hamming => proto::Metric::Hamming,
         _ => proto::Metric::Unspecified,
     }) as i32
+}
+
+/// A `VectorSpec` as the library's (a vector family's or an IVF index's).
+pub(crate) fn vector_spec_in(v: &proto::VectorSpec) -> Result<pigeonhole::VectorSpec> {
+    pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
+        .map_err(|e| ApiError::invalid(e.message()))
 }
 
 /// A `FamilySpec` as the `Family` to create: unset options take the library's defaults.

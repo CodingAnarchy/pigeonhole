@@ -294,6 +294,8 @@ async fn call(
         Ok(ServiceReply::Metrics(r)) => json(&r),
         Ok(ServiceReply::Traverse(r)) => json(&r),
         Ok(ServiceReply::Nearest(r)) => json(&r),
+        Ok(ServiceReply::VectorSearch(r)) => json(&r),
+        Ok(ServiceReply::VectorVerify(r)) => json(&r),
         Ok(ServiceReply::Download(d)) => download(d),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
@@ -550,11 +552,16 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Admin", "Metrics") => ServiceOp::Metrics(parse(body)?),
         ("Graph", "Traverse") => ServiceOp::Traverse(parse(body)?),
         ("Vectors", "Nearest") => ServiceOp::Nearest(parse(body)?),
-        // In the contract, not yet served (D313 ticket 7b): as over gRPC.
-        ("Vectors", "CreateIndex" | "Insert" | "Delete" | "Search" | "BulkLoad" | "Verify") => {
-            return Err(ApiError::unsupported(format!(
-                "Vectors.{method} isn't served by this build yet"
-            )));
+        ("Vectors", "CreateIndex") => ServiceOp::CreateIndex(parse(body)?),
+        ("Vectors", "Insert") => ServiceOp::VectorInsert(parse(body)?),
+        ("Vectors", "Delete") => ServiceOp::VectorDelete(parse(body)?),
+        ("Vectors", "Search") => ServiceOp::VectorSearch(parse(body)?),
+        ("Vectors", "Verify") => ServiceOp::VectorVerify(parse(body)?),
+        // In the contract, not yet served (D313 ticket 7b2): as over gRPC.
+        ("Vectors", "BulkLoad") => {
+            return Err(ApiError::unsupported(
+                "Vectors.BulkLoad isn't served by this build yet",
+            ));
         }
         _ => {
             return Err(ApiError::not_found(format!(

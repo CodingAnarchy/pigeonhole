@@ -1770,8 +1770,8 @@ fn nearest_refuses_a_query_it_cannot_run() {
         let (status, e) = s.rpc("Vectors/Nearest", &req, None);
         assert_eq!(e["code"].as_str(), Some(code), "{req}: {status} {e}");
     }
-    // The IVF index's RPCs aren't served yet: Unsupported, over HTTP and gRPC alike.
-    let (_, e) = s.rpc("Vectors/Search", &json!({}), None);
+    // `BulkLoad` isn't served yet: Unsupported, over HTTP and gRPC alike.
+    let (_, e) = s.rpc("Vectors/BulkLoad", &json!({}), None);
     assert_eq!(e["code"].as_str(), Some("Unsupported"), "{e}");
     let err = s.block_on(async {
         let channel = tonic::transport::Channel::from_shared(s.url.clone())
@@ -1780,11 +1780,179 @@ fn nearest_refuses_a_query_it_cannot_run() {
             .await
             .unwrap();
         proto::vectors_client::VectorsClient::new(channel)
-            .search(proto::VectorSearchRequest::default())
+            .bulk_load(tonic::codegen::tokio_stream::iter(Vec::<
+                proto::VectorBulkLoadRequest,
+            >::new()))
             .await
             .unwrap_err()
     });
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
+}
+
+// ---- Vectors' IVF index (D313 ticket 7b1, ICR 0100) ----
+
+fn index_spec(rebalance: &str) -> Json {
+    json!({"name": "ix", "spec": {"dim": 2, "element": "ELEMENT_F32", "metric": "METRIC_L2"},
+           "rebalance": rebalance})
+}
+
+fn hit_ids(r: &Json) -> Vec<String> {
+    r["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn an_ivf_index_is_created_written_searched_and_verified() {
+    let s = Server::start("", limits());
+    let (status, e) = s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None);
+    assert_eq!(status, 200, "{e}");
+    // A second create is TableExists, unless `if_missing`.
+    let (_, e) = s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None);
+    assert_eq!(e["code"].as_str(), Some("TableExists"), "{e}");
+    let mut again = index_spec("REBALANCE_INLINE");
+    again["if_missing"] = json!(true);
+    assert_eq!(s.rpc("Vectors/CreateIndex", &again, None).0, 200);
+    for (id, y) in [("a", 1.0f32), ("b", 2.0), ("c", 3.0), ("x:d", 4.0)] {
+        let (status, e) = s.rpc(
+            "Vectors/Insert",
+            &json!({"index": "ix", "id": b64(id.as_bytes()), "vector": f32_query(&[0.0, y])}),
+            None,
+        );
+        assert_eq!(status, 200, "{id}: {e}");
+    }
+    let q = f32_query(&[0.0, 0.0]);
+    let (status, r) = s.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix", "query": q, "k": 2, "stats": true}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(hit_ids(&r), [b64(b"a"), b64(b"b")]);
+    assert!(r["stats"]["lists"].as_u64().unwrap() >= 1, "{r}");
+    // Only ids under a prefix.
+    let (_, r) = s.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix", "query": q, "k": 3, "id_prefix": b64(b"x:")}),
+        None,
+    );
+    assert_eq!(hit_ids(&r), [b64(b"x:d")]);
+    assert!(
+        r.get("stats").is_none_or(Json::is_null),
+        "stats only when asked: {r}"
+    );
+    // A delete, then the index's own check.
+    assert_eq!(
+        s.rpc(
+            "Vectors/Delete",
+            &json!({"index": "ix", "id": b64(b"b")}),
+            None
+        )
+        .0,
+        200
+    );
+    let (_, r) = s.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix", "query": q, "k": 2}),
+        None,
+    );
+    assert_eq!(hit_ids(&r), [b64(b"a"), b64(b"c")]);
+    let (status, v) = s.rpc("Vectors/Verify", &json!({"index": "ix"}), None);
+    assert_eq!((status, &v["vectors"]), (200, &json!("3")), "{v}");
+    // Refused: another element type, k out of range, an index that doesn't exist.
+    let i8v = json!({"element": "ELEMENT_I8", "dim": 2, "data": b64(&[0; 2])});
+    for (path, req, code) in [
+        (
+            "Vectors/Insert",
+            json!({"index": "ix", "id": b64(b"e"), "vector": i8v}),
+            "InvalidArgument",
+        ),
+        (
+            "Vectors/Search",
+            json!({"index": "ix", "query": q, "k": 0}),
+            "InvalidArgument",
+        ),
+        (
+            "Vectors/Search",
+            json!({"index": "ix", "query": q, "k": 10_001}),
+            "InvalidArgument",
+        ),
+        (
+            "Vectors/Search",
+            json!({"index": "nope", "query": q, "k": 1}),
+            "TableNotFound",
+        ),
+    ] {
+        let (status, e) = s.rpc(path, &req, None);
+        assert_eq!(e["code"].as_str(), Some(code), "{path} {req}: {status} {e}");
+    }
+    // Over gRPC.
+    let verified = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::vectors_client::VectorsClient::new(channel)
+            .verify(proto::VectorVerifyRequest { index: "ix".into() })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    assert_eq!(verified.vectors, 3);
+}
+
+#[test]
+fn a_background_index_rebalances_on_a_server_thread_that_close_ends() {
+    // The coordinator on 7b1: the server runs a background index's rebalancer itself, so
+    // its shutdown can wait for the thread before it closes the database.
+    let s = Server::start("", limits());
+    let indexes = &s.shared.router.service.indexes;
+    assert_eq!(
+        s.rpc(
+            "Vectors/CreateIndex",
+            &index_spec("REBALANCE_BACKGROUND"),
+            None
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        indexes.rebalancing(),
+        1,
+        "one thread for the background index"
+    );
+    for i in 0..50u32 {
+        let (status, e) = s.rpc(
+            "Vectors/Insert",
+            &json!({"index": "ix", "id": b64(format!("v{i:03}").as_bytes()),
+                    "vector": f32_query(&[i as f32, 1.0])}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+    }
+    let started = std::time::Instant::now();
+    indexes.close();
+    assert_eq!(indexes.rebalancing(), 0, "close waited for the thread");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the thread saw its index close within one idle wait: {:?}",
+        started.elapsed()
+    );
+    // After close, nothing opens again (ai1249's M2 on #1573): a call still queued on the
+    // blocking pool at shutdown, or a request, is Closed, and starts no rebalancer.
+    let late = indexes.get("ix");
+    assert_eq!(late.err().map(|e| e.code), Some("Closed".to_owned()));
+    let (_, e) = s.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix", "query": f32_query(&[0.0, 1.0]), "k": 1}),
+        None,
+    );
+    assert_eq!(e["code"].as_str(), Some("Closed"), "{e}");
+    assert_eq!(indexes.rebalancing(), 0, "no thread after close");
 }
 
 #[test]

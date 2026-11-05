@@ -57,8 +57,14 @@ impl ApiError {
     /// is fixed there (simp724's E1): everything else on a write is outcome-unknown, so not
     /// retry-safe.
     pub(crate) fn from_engine(e: &pigeonhole::Error) -> Self {
+        Self::from_code(e.code(), e.message())
+    }
+
+    /// An error with `code` and `message`, mapped as [`from_engine`](Self::from_engine) maps
+    /// an engine error: for the companion crates' errors, which carry a code of the same
+    /// table (`pigeonhole_vector::Error::code`).
+    pub(crate) fn from_code(code: ErrorCode, message: &str) -> Self {
         use tonic::Code as G;
-        let code = e.code();
         let (grpc, http, retry) = match code {
             ErrorCode::Conflict => (G::Aborted, StatusCode::CONFLICT, RetryFrom::Begin),
             ErrorCode::Busy => (
@@ -135,7 +141,7 @@ impl ApiError {
             ),
         };
         let mut err =
-            Self::new(&format!("{code:?}"), code as u32, e.message(), grpc, http).retry(retry);
+            Self::new(&format!("{code:?}"), code as u32, message, grpc, http).retry(retry);
         if code == ErrorCode::Busy {
             err = err.after(RETRY_AFTER_MS);
         }
@@ -361,6 +367,17 @@ impl ApiError {
 impl From<pigeonhole::Error> for ApiError {
     fn from(e: pigeonhole::Error) -> Self {
         Self::from_engine(&e)
+    }
+}
+
+/// The vector index's errors keep their code: an engine error as the engine's, the crate's
+/// own (`InvalidArgument`, `Conflict`, `Corruption`) under the same table.
+impl From<pigeonhole_vector::Error> for ApiError {
+    fn from(e: pigeonhole_vector::Error) -> Self {
+        match e {
+            pigeonhole_vector::Error::Db(e) => Self::from_engine(&e),
+            e => Self::from_code(e.code(), &e.to_string()),
+        }
     }
 }
 

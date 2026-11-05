@@ -26,6 +26,7 @@ mod errors;
 mod feed;
 mod grpc;
 mod http;
+mod indexes;
 mod listener;
 mod placement;
 mod router;
@@ -233,6 +234,8 @@ pub(crate) fn run(
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
+    // The vector indexes' rebalancing threads end before the database closes.
+    shared.router.service.indexes.close();
     let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
     let closed = db.close().map_err(|e| Failure::db("close", &e));
     served?;
