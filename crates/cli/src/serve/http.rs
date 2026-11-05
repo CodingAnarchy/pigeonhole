@@ -47,6 +47,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         proto::schema_server::SchemaServer::new(super::grpc::SchemaGrpc(Arc::clone(&shared)))
             .max_decoding_message_size(limits.max_request_bytes)
             .max_encoding_message_size(usize::MAX);
+    let graph = proto::graph_server::GraphServer::new(super::grpc::GraphGrpc(Arc::clone(&shared)))
+        .max_decoding_message_size(limits.max_request_bytes)
+        .max_encoding_message_size(usize::MAX);
+    let vectors =
+        proto::vectors_server::VectorsServer::new(super::grpc::VectorsGrpc(Arc::clone(&shared)))
+            .max_decoding_message_size(limits.max_request_bytes)
+            .max_encoding_message_size(usize::MAX);
     let feeds = super::grpc::FeedGrpc {
         shared: Arc::clone(&shared),
         max_request_bytes: limits.max_request_bytes,
@@ -76,6 +83,16 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .route_service(
             "/pigeonhole.v1.Schema/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(schema),
+        )
+        .route_service(
+            "/pigeonhole.v1.Graph/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(graph),
+        )
+        .route_service(
+            "/pigeonhole.v1.Vectors/{*method}",
+            tower::ServiceBuilder::new()
+                .layer(prepay())
+                .service(vectors),
         )
         .route_service(
             "/pigeonhole.v1.Feed/{*method}",
@@ -275,6 +292,8 @@ async fn call(
         Ok(ServiceReply::Info(r)) => json(&r),
         Ok(ServiceReply::Backup(r)) => json(&r),
         Ok(ServiceReply::Metrics(r)) => json(&r),
+        Ok(ServiceReply::Traverse(r)) => json(&r),
+        Ok(ServiceReply::Nearest(r)) => json(&r),
         Ok(ServiceReply::Download(d)) => download(d),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
@@ -529,6 +548,14 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Admin", "Backup") => ServiceOp::Backup(parse(body)?),
         ("Admin", "BackupDownload") => ServiceOp::BackupDownload(parse(body)?),
         ("Admin", "Metrics") => ServiceOp::Metrics(parse(body)?),
+        ("Graph", "Traverse") => ServiceOp::Traverse(parse(body)?),
+        ("Vectors", "Nearest") => ServiceOp::Nearest(parse(body)?),
+        // In the contract, not yet served (D313 ticket 7b): as over gRPC.
+        ("Vectors", "CreateIndex" | "Insert" | "Delete" | "Search" | "BulkLoad" | "Verify") => {
+            return Err(ApiError::unsupported(format!(
+                "Vectors.{method} isn't served by this build yet"
+            )));
+        }
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

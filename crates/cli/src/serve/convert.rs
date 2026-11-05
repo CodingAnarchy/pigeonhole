@@ -508,6 +508,73 @@ macro_rules! select {
     }};
 }
 
+/// `Graph.Traverse`'s edge selection (qualifiers, time range, value filter) on `t`.
+pub(crate) fn edges<'t>(
+    mut t: pigeonhole::Traverse<'t>,
+    r: &proto::TraverseRequest,
+) -> Result<pigeonhole::Traverse<'t>> {
+    if !r.qualifier_prefix.is_empty() {
+        t = t.qualifier_prefix(&r.qualifier_prefix);
+    }
+    if r.qualifier_start.is_some() || r.qualifier_end.is_some() {
+        t = t.qualifier_bounds(
+            bound(r.qualifier_start.as_ref()),
+            bound(r.qualifier_end.as_ref()),
+        );
+    }
+    if let Some(range) = &r.time_range {
+        t = t.time_range(range.start..range.end);
+    }
+    if r.value_filter.is_some() {
+        t = t.value_filter(value_filter(r.value_filter.as_ref())?);
+    }
+    Ok(t)
+}
+
+/// A `Vectors.Nearest` query, decoded: an `f32` query serves `f32`, `f16` and `bf16`
+/// families (as `nearest_f32` does), and `i8` and bit queries their own.
+pub(crate) enum NearestQuery {
+    F32(Vec<f32>),
+    I8(Vec<i8>),
+    Bits(Vec<u8>),
+}
+
+pub(crate) fn nearest_query(v: &proto::Vector) -> Result<NearestQuery> {
+    Ok(match elements(v)? {
+        Elements::F32(x) => NearestQuery::F32(x),
+        Elements::I8(x) => NearestQuery::I8(x),
+        Elements::Bits(x) => NearestQuery::Bits(x),
+        Elements::F16(_) | Elements::Bf16(_) => {
+            return Err(ApiError::invalid(
+                "a nearest query is f32, i8 or bit: query an f16 or bf16 family with f32 \
+                 components",
+            ));
+        }
+    })
+}
+
+impl NearestQuery {
+    pub(crate) fn on_scan<'t>(&self, s: pigeonhole::Scan<'t>, k: usize) -> pigeonhole::Nearest<'t> {
+        match self {
+            Self::F32(q) => s.nearest_f32(q, k),
+            Self::I8(q) => s.nearest_i8(q, k),
+            Self::Bits(q) => s.nearest_bits(q, k),
+        }
+    }
+
+    pub(crate) fn on_keys<'t>(
+        &self,
+        r: pigeonhole::KeysRead<'t>,
+        k: usize,
+    ) -> pigeonhole::Nearest<'t> {
+        match self {
+            Self::F32(q) => r.nearest_f32(q, k),
+            Self::I8(q) => r.nearest_i8(q, k),
+            Self::Bits(q) => r.nearest_bits(q, k),
+        }
+    }
+}
+
 /// A selection's parts, checked once and applied to row reads and multi-gets alike, at the
 /// pinned snapshot its `snapshot_id` names (resolved by the service, `at`), or now.
 pub(crate) struct Select<'s> {

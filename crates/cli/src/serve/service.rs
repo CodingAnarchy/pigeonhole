@@ -61,6 +61,8 @@ pub(crate) enum ServiceOp {
     Backup(proto::BackupRequest),
     BackupDownload(proto::BackupDownloadRequest),
     Metrics(proto::Empty),
+    Traverse(proto::TraverseRequest),
+    Nearest(proto::NearestRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -87,6 +89,8 @@ pub(crate) enum ServiceReply {
     Backup(proto::BackupResponse),
     Download(super::backup::Download),
     Metrics(proto::MetricsResponse),
+    Traverse(proto::TraverseResponse),
+    Nearest(proto::NearestResponse),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -167,6 +171,8 @@ impl ServiceOp {
             Self::Backup(_) => 24,
             Self::BackupDownload(_) => DOWNLOAD,
             Self::Metrics(_) => 26,
+            Self::Traverse(_) => 27,
+            Self::Nearest(_) => 28,
         }
     }
 
@@ -194,7 +200,9 @@ impl ServiceOp {
             | Self::ListTables(_)
             | Self::DescribeTable(_)
             | Self::Info(_)
-            | Self::Metrics(_) => Scope::Read,
+            | Self::Metrics(_)
+            | Self::Traverse(_)
+            | Self::Nearest(_) => Scope::Read,
             // Maintenance and backups: admin (ICR 0112's Admin).
             Self::Flush(_) | Self::Compact(_) | Self::Backup(_) | Self::BackupDownload(_) => {
                 Scope::Admin
@@ -236,6 +244,8 @@ impl ServiceOp {
             Self::Info(_) | Self::Flush(_) | Self::Compact(_) | Self::Metrics(_) => 0,
             Self::Backup(r) => r.encoded_len(),
             Self::BackupDownload(r) => r.encoded_len(),
+            Self::Traverse(r) => r.encoded_len(),
+            Self::Nearest(r) => r.encoded_len(),
         }
     }
 }
@@ -250,7 +260,7 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
-pub(crate) const RPCS: [&str; 27] = [
+pub(crate) const RPCS: [&str; 29] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -278,6 +288,8 @@ pub(crate) const RPCS: [&str; 27] = [
     "Admin.Backup",
     "Admin.BackupDownload",
     "Admin.Metrics",
+    "Graph.Traverse",
+    "Vectors.Nearest",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -796,6 +808,20 @@ impl Service {
                 let table = self.table(&r.name).await?;
                 Ok(ServiceReply::Table(describe(&table)))
             }
+            ServiceOp::Traverse(r) => {
+                drop(budget);
+                self.traverse(r, caller)
+                    .await
+                    .map(ServiceReply::Traverse)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::Nearest(r) => {
+                drop(budget);
+                self.nearest(r, caller)
+                    .await
+                    .map(ServiceReply::Nearest)
+                    .map_err(ApiError::for_read)
+            }
             ServiceOp::Subscribe(r) => self
                 .subscribe(r, caller, budget)
                 .await
@@ -1103,6 +1129,114 @@ impl Service {
             })
         })
         .await
+    }
+
+    /// `Graph.Traverse` (D304): the hops from the seeds over one edge family, at the pinned
+    /// snapshot `snapshot_id` names, or now. Run on the request's task (`run_async` never
+    /// blocks on a block it can fetch), so it holds no blocking thread.
+    async fn traverse(
+        &self,
+        r: proto::TraverseRequest,
+        caller: &Caller,
+    ) -> Result<proto::TraverseResponse, ApiError> {
+        if r.seeds.is_empty() {
+            return Err(ApiError::invalid(
+                "a traversal starts from at least one seed",
+            ));
+        }
+        if r.hops > 64 {
+            return Err(ApiError::invalid("hops is 1 to 64"));
+        }
+        let pinned = self.pinned(&r.snapshot_id, caller)?;
+        let table = self.table(&r.table).await?;
+        let seeds = KeySet::from_unsorted(r.seeds.iter().map(|k| &k[..]));
+        let mut t = convert::edges(table.traverse(&seeds).family(&r.family), &r)?
+            .hops(r.hops.max(1))
+            .parents(r.parents);
+        if let Some(p) = &pinned {
+            t = t.snapshot(p.snapshot());
+        }
+        if r.per_node_limit > 0 {
+            t = t.per_node_limit(r.per_node_limit);
+        }
+        if r.hop_limit > 0 {
+            t = t.hop_limit(r.hop_limit);
+        }
+        if r.max_nodes > 0 {
+            t = t.max_nodes(r.max_nodes);
+        }
+        let found = t.run_async().await?;
+        let stats = found.stats();
+        Ok(proto::TraverseResponse {
+            hops: found
+                .hops()
+                .iter()
+                .map(|h| proto::Hop {
+                    nodes: h.nodes().iter().map(|k| k.to_vec().into()).collect(),
+                    parents: h.parents().map(<[u32]>::to_vec).unwrap_or_default(),
+                })
+                .collect(),
+            stats: Some(proto::TraverseStats {
+                rows: stats.rows,
+                edges: stats.edges,
+                hops_cut: stats.hops_cut,
+                cut_by_max_nodes: stats.cut_by_max_nodes,
+            }),
+        })
+    }
+
+    /// `Vectors.Nearest` (D296, D303): the exact top `k` of one vector family over a key
+    /// range or a key list, at the pinned snapshot `snapshot_id` names, or now, cut to
+    /// `page_bytes` by D308's measure when it's set. Run on the request's task, as `Traverse`.
+    async fn nearest(
+        &self,
+        r: proto::NearestRequest,
+        caller: &Caller,
+    ) -> Result<proto::NearestResponse, ApiError> {
+        use proto::nearest_request::Source;
+        if r.k == 0 {
+            return Err(ApiError::invalid("k is at least 1"));
+        }
+        let query = r
+            .query
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("a nearest search needs a query vector"))?;
+        let query = convert::nearest_query(query)?;
+        let pinned = self.pinned(&r.snapshot_id, caller)?;
+        let table = self.table(&r.table).await?;
+        let at = pinned.as_ref().map(|p| p.snapshot().clone());
+        let select = convert::Select::new(None)?.at(at);
+        let k = r.k as usize;
+        let search = match &r.source {
+            Some(Source::Keys(keys)) => {
+                let keys = KeySet::from_unsorted(keys.keys.iter().map(|k| &k[..]));
+                let read = select.keys(table.keys(&keys))?.family(&r.family);
+                query.on_keys(read, k)
+            }
+            Some(Source::Range(range)) => {
+                query.on_scan(select.scan(&table, Some(range))?.family(&r.family), k)
+            }
+            None => query.on_scan(select.scan(&table, None)?.family(&r.family), k),
+        };
+        let (found, cut_by_budget) = if r.page_bytes == 0 {
+            (search.run_async().await?, false)
+        } else {
+            let page = search.run_within_async(r.page_bytes).await?;
+            let cut = page.cut_by_budget();
+            (page.into_neighbours(), cut)
+        };
+        Ok(proto::NearestResponse {
+            neighbours: found
+                .into_iter()
+                .map(|n| proto::Neighbour {
+                    row: n.row.into(),
+                    qualifier: n.qualifier.into(),
+                    distance: n.distance,
+                    timestamp: n.ts,
+                })
+                .collect(),
+            cut_by_budget,
+        })
     }
 
     /// A row's selected cells, a page at a time: whole columns, at most `page_bytes` by

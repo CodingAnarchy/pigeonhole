@@ -419,6 +419,81 @@ impl proto::admin_server::Admin for AdminGrpc {
     }
 }
 
+/// `Graph` over gRPC (D313 ticket 7).
+#[derive(Debug, Clone)]
+pub(crate) struct GraphGrpc(pub(crate) Arc<Shared>);
+
+#[tonic::async_trait]
+impl proto::graph_server::Graph for GraphGrpc {
+    async fn traverse(
+        &self,
+        req: Request<proto::TraverseRequest>,
+    ) -> Result<Response<proto::TraverseResponse>, Status> {
+        unary!(&self.0, req, Traverse, Traverse)
+    }
+}
+
+/// `Vectors` over gRPC (D313 ticket 7): `Nearest` here; the IVF index's RPCs follow (7b).
+#[derive(Debug, Clone)]
+pub(crate) struct VectorsGrpc(pub(crate) Arc<Shared>);
+
+/// An RPC of the contract this build doesn't serve yet.
+fn not_yet(rpc: &str) -> Status {
+    ApiError::unsupported(format!("{rpc} isn't served by this build yet")).to_status()
+}
+
+#[tonic::async_trait]
+impl proto::vectors_server::Vectors for VectorsGrpc {
+    async fn nearest(
+        &self,
+        req: Request<proto::NearestRequest>,
+    ) -> Result<Response<proto::NearestResponse>, Status> {
+        unary!(&self.0, req, Nearest, Nearest)
+    }
+
+    async fn create_index(
+        &self,
+        _req: Request<proto::CreateVectorIndexRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        Err(not_yet("Vectors.CreateIndex"))
+    }
+
+    async fn insert(
+        &self,
+        _req: Request<proto::VectorInsertRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        Err(not_yet("Vectors.Insert"))
+    }
+
+    async fn delete(
+        &self,
+        _req: Request<proto::VectorDeleteRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        Err(not_yet("Vectors.Delete"))
+    }
+
+    async fn search(
+        &self,
+        _req: Request<proto::VectorSearchRequest>,
+    ) -> Result<Response<proto::VectorSearchResponse>, Status> {
+        Err(not_yet("Vectors.Search"))
+    }
+
+    async fn bulk_load(
+        &self,
+        _req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        Err(not_yet("Vectors.BulkLoad"))
+    }
+
+    async fn verify(
+        &self,
+        _req: Request<proto::VectorVerifyRequest>,
+    ) -> Result<Response<proto::VectorVerifyResponse>, Status> {
+        Err(not_yet("Vectors.Verify"))
+    }
+}
+
 /// `Schema` over gRPC (D313 ticket 6).
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaGrpc(pub(crate) Arc<Shared>);
