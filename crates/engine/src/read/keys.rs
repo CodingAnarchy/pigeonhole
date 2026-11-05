@@ -340,18 +340,7 @@ impl KeyCursor {
         keys: KeySet,
         shared: Arc<crate::shard::Shared>,
     ) -> Result<Self> {
-        let groups = key_groups(&snapshot, table, &keys)?;
-        let end = keys.len();
-        Ok(Self::with_groups(
-            snapshot,
-            families,
-            spec,
-            now,
-            Arc::new(keys),
-            groups,
-            (0, end),
-            shared,
-        ))
+        Self::over(snapshot, table, families, spec, now, Arc::new(keys), shared)
     }
 
     /// [`KeyCursor::new`] over a shared key set (D304's async traversal reads each hop's
@@ -366,17 +355,10 @@ impl KeyCursor {
         shared: Arc<crate::shard::Shared>,
     ) -> Result<Self> {
         let groups = key_groups(&snapshot, table, &keys)?;
-        let end = keys.len();
-        Ok(Self::with_groups(
-            snapshot,
-            families,
-            spec,
-            now,
-            keys,
-            groups,
-            (0, end),
-            shared,
-        ))
+        let mut cursor = Self::base(snapshot, families, spec, now, keys, shared);
+        cursor.end = cursor.keys.len();
+        cursor.groups = groups;
+        Ok(cursor)
     }
 
     /// A cursor over one key group of `keys` (D296's `Keys` input: each tablet group of a
@@ -390,28 +372,19 @@ impl KeyCursor {
         group: KeyGroup,
         shared: Arc<crate::shard::Shared>,
     ) -> Self {
-        let range = (group.keys.start, group.keys.end);
-        Self::with_groups(
-            snapshot,
-            families,
-            spec,
-            now,
-            keys,
-            vec![group],
-            range,
-            shared,
-        )
+        let mut cursor = Self::base(snapshot, families, spec, now, keys, shared);
+        (cursor.next, cursor.end) = (group.keys.start, group.keys.end);
+        cursor.groups = vec![group];
+        cursor
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn with_groups(
+    /// A cursor over no keys yet: the constructors set its groups and its range of keys.
+    fn base(
         snapshot: Snapshot,
         families: Vec<FamilyId>,
         spec: ReadSpec,
         now: Timestamp,
         keys: Arc<KeySet>,
-        groups: Vec<KeyGroup>,
-        (next, end): (usize, usize),
         shared: Arc<crate::shard::Shared>,
     ) -> Self {
         Self {
@@ -420,10 +393,10 @@ impl KeyCursor {
             spec,
             now,
             keys,
-            end,
-            groups,
+            end: 0,
+            groups: Vec::new(),
             group: 0,
-            next,
+            next: 0,
             current: None,
             reads: Vec::new(),
             prefix: Vec::new(),
