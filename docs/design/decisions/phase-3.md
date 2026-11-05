@@ -4400,6 +4400,7 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - if the superblock is one sequence behind, the open cuts the intent off, with its root's Catalog entry;
   - otherwise it leaves it, and `chain` fails closed on it, as on any intent it reads.
 - **A Catalog entry** counts only once its root's Root entry follows it. Until then the root may never have landed, and a reader reads from it again next time.
+- **A 1.1 build (the owner's call, 2026-11-05: accepted, documented in FORMAT §13 and the 1.2.0 changelog)** expires a feed whose history runs across a 1.2 session that changed the schema with the feed on. 1.1 doesn't know the Catalog entries (type 4) that session recorded, and an unknown entry ends the history. That's fail closed, with no data effect. Sessions without schema changes, and the intents, which clean closes overwrite, stay readable by 1.1 (the `feed_root_intent` corpus entry, resumed by `compat-reader-1.1`).
 - **Only a power loss** in that window can still expire a durable feed. The intent isn't synced, so a power loss can lose or tear it, which reads as a torn tail. #1509 is that half (Post-1.0).
 
 **Testing (the amendment).** In `it::feed_reader`:
