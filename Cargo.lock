@@ -1735,6 +1735,7 @@ dependencies = [
  "pigeonhole-arrow",
  "pigeonhole-format",
  "pigeonhole-memory",
+ "pigeonhole-vector",
  "prost",
  "rustls",
  "rustls-native-certs",

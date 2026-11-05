@@ -433,7 +433,8 @@ impl proto::graph_server::Graph for GraphGrpc {
     }
 }
 
-/// `Vectors` over gRPC (D313 ticket 7): `Nearest` here; the IVF index's RPCs follow (7b).
+/// `Vectors` over gRPC (D313 ticket 7): `Nearest` and the IVF index; `BulkLoad` follows
+/// (7b2).
 #[derive(Debug, Clone)]
 pub(crate) struct VectorsGrpc(pub(crate) Arc<Shared>);
 
@@ -453,30 +454,30 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
 
     async fn create_index(
         &self,
-        _req: Request<proto::CreateVectorIndexRequest>,
+        req: Request<proto::CreateVectorIndexRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        Err(not_yet("Vectors.CreateIndex"))
+        unary!(&self.0, req, CreateIndex, Empty)
     }
 
     async fn insert(
         &self,
-        _req: Request<proto::VectorInsertRequest>,
+        req: Request<proto::VectorInsertRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        Err(not_yet("Vectors.Insert"))
+        unary!(&self.0, req, VectorInsert, Empty)
     }
 
     async fn delete(
         &self,
-        _req: Request<proto::VectorDeleteRequest>,
+        req: Request<proto::VectorDeleteRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        Err(not_yet("Vectors.Delete"))
+        unary!(&self.0, req, VectorDelete, Empty)
     }
 
     async fn search(
         &self,
-        _req: Request<proto::VectorSearchRequest>,
+        req: Request<proto::VectorSearchRequest>,
     ) -> Result<Response<proto::VectorSearchResponse>, Status> {
-        Err(not_yet("Vectors.Search"))
+        unary!(&self.0, req, VectorSearch, VectorSearch)
     }
 
     async fn bulk_load(
@@ -488,9 +489,9 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
 
     async fn verify(
         &self,
-        _req: Request<proto::VectorVerifyRequest>,
+        req: Request<proto::VectorVerifyRequest>,
     ) -> Result<Response<proto::VectorVerifyResponse>, Status> {
-        Err(not_yet("Vectors.Verify"))
+        unary!(&self.0, req, VectorVerify, VectorVerify)
     }
 }
 

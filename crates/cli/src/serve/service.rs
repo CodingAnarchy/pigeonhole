@@ -67,6 +67,11 @@ pub(crate) enum ServiceOp {
     Metrics(proto::Empty),
     Traverse(proto::TraverseRequest),
     Nearest(proto::NearestRequest),
+    CreateIndex(proto::CreateVectorIndexRequest),
+    VectorInsert(proto::VectorInsertRequest),
+    VectorDelete(proto::VectorDeleteRequest),
+    VectorSearch(proto::VectorSearchRequest),
+    VectorVerify(proto::VectorVerifyRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -95,6 +100,8 @@ pub(crate) enum ServiceReply {
     Metrics(proto::MetricsResponse),
     Traverse(proto::TraverseResponse),
     Nearest(proto::NearestResponse),
+    VectorSearch(proto::VectorSearchResponse),
+    VectorVerify(proto::VectorVerifyResponse),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -177,6 +184,11 @@ impl ServiceOp {
             Self::Metrics(_) => 26,
             Self::Traverse(_) => 27,
             Self::Nearest(_) => 28,
+            Self::CreateIndex(_) => 29,
+            Self::VectorInsert(_) => 30,
+            Self::VectorDelete(_) => 31,
+            Self::VectorSearch(_) => 32,
+            Self::VectorVerify(_) => 33,
         }
     }
 
@@ -206,7 +218,11 @@ impl ServiceOp {
             | Self::Info(_)
             | Self::Metrics(_)
             | Self::Traverse(_)
-            | Self::Nearest(_) => Scope::Read,
+            | Self::Nearest(_)
+            | Self::VectorSearch(_)
+            | Self::VectorVerify(_) => Scope::Read,
+            // An index is a table: creating one is a write, as `Schema.CreateTable` is.
+            Self::CreateIndex(_) | Self::VectorInsert(_) | Self::VectorDelete(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
             Self::Flush(_) | Self::Compact(_) | Self::Backup(_) | Self::BackupDownload(_) => {
                 Scope::Admin
@@ -250,6 +266,11 @@ impl ServiceOp {
             Self::BackupDownload(r) => r.encoded_len(),
             Self::Traverse(r) => r.encoded_len(),
             Self::Nearest(r) => r.encoded_len(),
+            Self::CreateIndex(r) => r.encoded_len(),
+            Self::VectorInsert(r) => r.encoded_len(),
+            Self::VectorDelete(r) => r.encoded_len(),
+            Self::VectorSearch(r) => r.encoded_len(),
+            Self::VectorVerify(r) => r.encoded_len(),
         }
     }
 }
@@ -264,7 +285,7 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
-pub(crate) const RPCS: [&str; 29] = [
+pub(crate) const RPCS: [&str; 34] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -294,6 +315,11 @@ pub(crate) const RPCS: [&str; 29] = [
     "Admin.Metrics",
     "Graph.Traverse",
     "Vectors.Nearest",
+    "Vectors.CreateIndex",
+    "Vectors.Insert",
+    "Vectors.Delete",
+    "Vectors.Search",
+    "Vectors.Verify",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -557,6 +583,8 @@ pub(crate) struct Service {
     pub(crate) feeds: Arc<super::feed::Feeds>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
     backups: Arc<super::backup::Backups>,
+    /// The vector indexes open, and their rebalancing threads.
+    pub(crate) indexes: Arc<super::indexes::Indexes>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     schema: tokio::sync::Mutex<()>,
@@ -593,6 +621,7 @@ impl Service {
             sessions: super::sessions::Sessions::new(limits.leases),
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
+            indexes: Arc::new(super::indexes::Indexes::new(db.clone())),
             schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
@@ -824,6 +853,30 @@ impl Service {
                 self.nearest(r, caller)
                     .await
                     .map(ServiceReply::Nearest)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::CreateIndex(r) => {
+                drop(budget);
+                self.create_index(r).await.map(ServiceReply::Empty)
+            }
+            ServiceOp::VectorInsert(r) => {
+                self.vector_insert(r, budget).await.map(ServiceReply::Empty)
+            }
+            ServiceOp::VectorDelete(r) => {
+                self.vector_delete(r, budget).await.map(ServiceReply::Empty)
+            }
+            ServiceOp::VectorSearch(r) => {
+                drop(budget);
+                self.vector_search(r)
+                    .await
+                    .map(ServiceReply::VectorSearch)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::VectorVerify(r) => {
+                drop(budget);
+                self.vector_verify(r)
+                    .await
+                    .map(ServiceReply::VectorVerify)
                     .map_err(ApiError::for_read)
             }
             ServiceOp::Subscribe(r) => self
@@ -1243,6 +1296,170 @@ impl Service {
                 .collect(),
             cut_by_budget,
         })
+    }
+
+    /// The IVF index `name`, from the cache, or opened on the blocking pool on a miss.
+    async fn index(&self, name: &str) -> Result<Arc<pigeonhole_vector::Index>, ApiError> {
+        if let Some(i) = self.indexes.cached(name) {
+            return Ok(i);
+        }
+        let indexes = Arc::clone(&self.indexes);
+        let name = name.to_owned();
+        self.blocking(move || indexes.get(&name)).await
+    }
+
+    /// `Vectors.CreateIndex` (ICR 0100): a new index, or with `if_missing` an existing one.
+    async fn create_index(
+        &self,
+        r: proto::CreateVectorIndexRequest,
+    ) -> Result<proto::Empty, ApiError> {
+        let spec = r
+            .spec
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("an index needs a vector spec"))?;
+        let spec = convert::vector_spec_in(spec)?;
+        let mut options = pigeonhole_vector::IndexOptions::new();
+        if let Some(n) = r.target_list_len {
+            options = options.target_list_len(n);
+        }
+        if let Some(n) = r.nprobe {
+            options = options.nprobe(n);
+        }
+        if let Some(n) = r.reassign_neighbours {
+            options = options.reassign_neighbours(n);
+        }
+        match proto::Rebalance::try_from(r.rebalance).unwrap_or(proto::Rebalance::Unspecified) {
+            proto::Rebalance::Unspecified => {}
+            proto::Rebalance::Inline => {
+                options = options.rebalance(pigeonhole_vector::Rebalance::Inline);
+            }
+            proto::Rebalance::Background => {
+                options = options.rebalance(pigeonhole_vector::Rebalance::Background);
+            }
+        }
+        let indexes = Arc::clone(&self.indexes);
+        self.blocking(move || indexes.create(&r.name, spec, options, r.if_missing))
+            .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Vectors.Insert`: one vector under `id`, in the index's element type. A write: it runs
+    /// detached, on the blocking pool (an insert is a transaction, and may rebalance inline).
+    async fn vector_insert(
+        &self,
+        r: proto::VectorInsertRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::Empty, ApiError> {
+        let v = r
+            .vector
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("an insert needs a vector"))?;
+        let v = convert::elements(v)?;
+        let index = self.index(&r.index).await?;
+        let pool = Arc::clone(&self.blocking);
+        self.detached("Vectors.Insert", budget, async move {
+            blocking(&pool, move || {
+                use convert::Elements as V;
+                let id = &r.id[..];
+                match &v {
+                    V::F32(x) => index.insert_f32(id, x),
+                    V::I8(x) => index.insert_i8(id, x),
+                    V::Bits(x) => index.insert_bits(id, x),
+                    V::F16(x) => index.insert_f16(id, x),
+                    V::Bf16(x) => index.insert_bf16(id, x),
+                }?;
+                Ok(())
+            })
+            .await
+        })
+        .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Vectors.Delete`: the vector under `id`, if any. Detached, on the blocking pool.
+    async fn vector_delete(
+        &self,
+        r: proto::VectorDeleteRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::Empty, ApiError> {
+        let index = self.index(&r.index).await?;
+        let pool = Arc::clone(&self.blocking);
+        self.detached("Vectors.Delete", budget, async move {
+            blocking(&pool, move || {
+                index.delete(&r.id)?;
+                Ok(())
+            })
+            .await
+        })
+        .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Vectors.Search`: the `k` (at most [`MAX_NEAREST_K`]) nearest ids, on the request's
+    /// task (`run_async_with_stats`), holding no blocking thread once the index is open.
+    async fn vector_search(
+        &self,
+        r: proto::VectorSearchRequest,
+    ) -> Result<proto::VectorSearchResponse, ApiError> {
+        if r.k == 0 || r.k > MAX_NEAREST_K {
+            return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
+        }
+        let q = r
+            .query
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("a search needs a query vector"))?;
+        let q = convert::elements(q)?;
+        let index = self.index(&r.index).await?;
+        let k = r.k as usize;
+        let mut s = {
+            use convert::Elements as V;
+            match &q {
+                V::F32(x) => index.search_f32(x, k),
+                V::I8(x) => index.search_i8(x, k),
+                V::Bits(x) => index.search_bits(x, k),
+                V::F16(x) => index.search_f16(x, k),
+                V::Bf16(x) => index.search_bf16(x, k),
+            }
+        };
+        if r.nprobe > 0 {
+            s = s.nprobe(r.nprobe);
+        }
+        if !r.id_prefix.is_empty() {
+            s = s.id_prefix(&r.id_prefix);
+        }
+        if r.max_probe > 0 {
+            s = s.max_probe(r.max_probe);
+        }
+        let (hits, stats) = s.run_async_with_stats().await?;
+        Ok(proto::VectorSearchResponse {
+            hits: hits
+                .into_iter()
+                .map(|h| proto::VectorHit {
+                    id: h.id.into(),
+                    distance: h.distance,
+                })
+                .collect(),
+            stats: r.stats.then_some(proto::VectorSearchStats {
+                lists_probed: stats.lists_probed,
+                lists: stats.lists,
+            }),
+        })
+    }
+
+    /// `Vectors.Verify`: checks the index's lists against its vectors, on the blocking pool.
+    async fn vector_verify(
+        &self,
+        r: proto::VectorVerifyRequest,
+    ) -> Result<proto::VectorVerifyResponse, ApiError> {
+        let index = self.index(&r.index).await?;
+        self.blocking(move || {
+            let stats = index.verify()?;
+            Ok(proto::VectorVerifyResponse {
+                vectors: stats.vectors,
+                lists: stats.list_lens.len() as u64,
+            })
+        })
+        .await
     }
 
     /// A row's selected cells, a page at a time: whole columns, at most `page_bytes` by
