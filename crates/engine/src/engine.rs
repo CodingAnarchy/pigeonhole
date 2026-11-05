@@ -943,14 +943,22 @@ impl Engine {
         //    comes first (#147): it only reads (`fstatfs`), and on a network filesystem
         //    without lock support taking the lock fails with a bare I/O error instead.
         //    A handover (D265) brings the handle with both locks held: nothing to take.
+        //    A true read-only open (#1348, ICR 0109 amendment) opens the handle read-only
+        //    and takes the writer byte shared: it works on read-only media, read-only opens
+        //    run beside one another, and a writer can't start under one, nor one under a
+        //    running writer.
         let (file, writer_lock) = match held.as_ref() {
             Some(locks) => (locks.file.clone(), None),
             None => {
                 let mut open_opts = OpenOptions::read();
-                open_opts.write = true;
+                open_opts.write = !options.read_only;
                 let file = vfs.open(path, open_opts)?;
                 check_local(&file, options.allow_fuse)?;
-                let writer_lock = WriterLock::acquire(&file)?;
+                let writer_lock = if options.read_only {
+                    WriterLock::acquire_shared(&file)?
+                } else {
+                    WriterLock::acquire(&file)?
+                };
                 (file, Some(writer_lock))
             }
         };
@@ -1102,12 +1110,24 @@ impl Engine {
         // so: readers cache only then (D281; a raise on every commit cost the cache-off
         // commit shapes 1.5%).
         shm_config.row_epochs_maintained = options.row_cache_bytes > 0;
-        let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
+        // A true read-only open (#1348) serves only its own process: its arenas and words go
+        // in a private region with the same layout, and no region is created for readers.
+        let shm = if options.read_only {
+            ShmRegion::in_memory(db_id, &shm_config)
+        } else {
+            ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?
+        };
         // A new generation, so new zero slots: reader processes re-attach, which clears their
         // caches (D281; every writer open, a recovery's and a handover's too, builds one).
         let row_epochs = Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs()));
         if held.is_none() {
-            let presence = Presence::acquire(&file)?;
+            // No presence for a true read-only open: there's no region to clean up, and it
+            // mustn't count as another process with the database open.
+            let presence = if options.read_only {
+                None
+            } else {
+                Some(Presence::acquire(&file)?)
+            };
             *held = Some(Locks {
                 _writer: writer_lock.expect("taken at step 1 when there is no handover"),
                 presence,

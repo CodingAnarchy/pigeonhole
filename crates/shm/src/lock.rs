@@ -24,6 +24,21 @@ impl WriterLock {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Takes the writer byte shared (a true read-only open, #1348, ICR 0109 amendment): it
+    /// needs only a readable handle, several read-only opens hold it at once, and a writer's
+    /// exclusive [`acquire`](Self::acquire) fails while any does. Fails at once with
+    /// [`Error::WriterLocked`] while a writer holds it.
+    pub fn acquire_shared(file: &FileRef) -> Result<WriterLock> {
+        match file.lock(WRITER_BYTE, LockMode::Shared) {
+            Ok(()) => Ok(WriterLock {
+                file: file.clone(),
+                held_in: pigeonhole_io::sys::process_id(),
+            }),
+            Err(e) if e.kind == ErrorKind::Locked => Err(Error::WriterLocked),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl Drop for WriterLock {

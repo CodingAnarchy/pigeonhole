@@ -138,7 +138,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "shared memory: {e}"),
-            Error::WriterLocked => f.write_str("another process holds the writer lock"),
+            Error::WriterLocked => f.write_str("the writer lock is held: by a running writer, or by a read-only open (in this process or another)"),
             Error::VersionMismatch { found, expected } => write!(
                 f,
                 "shared-memory layout version {found} differs from this build's {expected}"
