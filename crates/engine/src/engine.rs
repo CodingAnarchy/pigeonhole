@@ -1914,6 +1914,19 @@ impl Engine {
         self.inner.drop_table(table)
     }
 
+    /// Applies one catalog change a primary's feed delivered (D315 PR 3), **with the
+    /// primary's ids**, so a replica's tables and families keep them: a table created with
+    /// its families, a family added, or a table dropped, as the change's `edits` hold them. A
+    /// created table gets a tablet of this database's own. The counters are raised past
+    /// every id applied, so this database never allocates one of them itself.
+    ///
+    /// Refused (`InvalidArgument`) when an id or name is already in use, a family's table is
+    /// missing, an id is reserved, or the edits mix a drop with anything else (a primary's
+    /// catalog change is one create, one family added, or one drop).
+    pub fn apply_catalog(&self, edits: &[pigeonhole_format::manifest::Edit]) -> Result<()> {
+        self.inner.apply_catalog(edits)
+    }
+
     /// The highest seqno a new snapshot may include now: every commit at or below it is
     /// applied on every shard (D316 A4, ICR 0116). One Acquire load per shard plus two.
     pub fn visible_seqno(&self) -> Seqno {
@@ -4547,6 +4560,97 @@ impl Inner {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    fn apply_catalog(&self, edits: &[Edit]) -> Result<()> {
+        let bad =
+            |what: String| Error::InvalidArgument(format!("a replicated catalog change: {what}"));
+        // A drop: as `drop_table` does it (its blob files, the shards' tablets).
+        if let [Edit::DropTable { table }] = edits {
+            return self.drop_table(*table);
+        }
+        if edits.is_empty()
+            || edits
+                .iter()
+                .any(|e| !matches!(e, Edit::CreateTable { .. } | Edit::PutFamily { .. }))
+        {
+            return Err(bad(format!(
+                "only one create (with its families), one family added, or one drop: {edits:?}"
+            )));
+        }
+        for e in edits {
+            if let Edit::PutFamily { options, .. } = e {
+                check_merge_operator(options, &self.options.merge_operators)?;
+            }
+        }
+        let edits = edits.to_vec();
+        self.catalog_change(move |catalog| {
+            let mut out = Vec::with_capacity(edits.len() + 1);
+            let mut created: Vec<TableId> = Vec::new();
+            let mut families: HashSet<FamilyId> = HashSet::new();
+            for e in &edits {
+                match e {
+                    Edit::CreateTable { table, name } => {
+                        if is_reserved_table(*table) {
+                            return Err(bad(format!("table id {} is reserved", table.0)));
+                        }
+                        if catalog.table(*table).is_some() || created.contains(table) {
+                            return Err(bad(format!("table id {} is in use", table.0)));
+                        }
+                        if catalog.table_by_name(name).is_some() {
+                            return Err(Error::TableExists(name.clone()));
+                        }
+                        created.push(*table);
+                        catalog.counters.next_table = catalog.counters.next_table.max(table.0 + 1);
+                        out.push(e.clone());
+                    }
+                    Edit::PutFamily {
+                        table,
+                        family,
+                        name,
+                        ..
+                    } => {
+                        if is_reserved_family(*family) {
+                            return Err(bad(format!("family id {} is reserved", family.0)));
+                        }
+                        if catalog.table(*table).is_none() && !created.contains(table) {
+                            return Err(Error::TableNotFound(format!("table {}", table.0)));
+                        }
+                        if catalog.family(*family).is_some() || !families.insert(*family) {
+                            return Err(bad(format!("family id {} is in use", family.0)));
+                        }
+                        if catalog
+                            .table(*table)
+                            .is_some_and(|t| t.family(name).is_some())
+                        {
+                            return Err(Error::FamilyExists(name.clone()));
+                        }
+                        catalog.counters.next_family =
+                            catalog.counters.next_family.max(family.0 + 1);
+                        out.push(e.clone());
+                    }
+                    _ => unreachable!("checked above"),
+                }
+            }
+            // Each created table's own tablet, as `create_table` makes one: tablets are this
+            // database's, never replicated.
+            for table in created {
+                let tablet = catalog.alloc_tablet();
+                out.push(Edit::PutTablet {
+                    tablet,
+                    table,
+                    start: Vec::new(),
+                    end: None,
+                });
+            }
+            debug_assert!(
+                !is_reserved_table(TableId(catalog.counters.next_table))
+                    && !is_reserved_family(FamilyId(catalog.counters.next_family)),
+                "a counter reached a reserved id"
+            );
+            Ok(out)
+        })?;
+        Ok(())
+    }
+
     fn add_family(
         &self,
         table: TableId,
@@ -5934,6 +6038,17 @@ fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> R
     }
     v.check_components(params.metric)
         .or_else(|e| refuse(e.to_string()))
+}
+
+/// The ids reserved for a replica's own state (D315 PR 3; simp724's R1): never allocated (the
+/// counters count up from 1 and never reach them), never applied from a primary.
+fn is_reserved_table(table: TableId) -> bool {
+    table.0 == u32::MAX
+}
+
+/// See [`is_reserved_table`].
+fn is_reserved_family(family: FamilyId) -> bool {
+    family.0 == u32::MAX
 }
 
 fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {
