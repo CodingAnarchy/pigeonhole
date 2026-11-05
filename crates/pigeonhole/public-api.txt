@@ -919,7 +919,6 @@ pub fn pigeonhole::ScanPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
 #[non_exhaustive] pub struct pigeonhole::Seen
 impl pigeonhole::Seen
 pub fn pigeonhole::Seen::current(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::Cell>>
-pub fn pigeonhole::Seen::seqno(&self) -> u64
 pub struct pigeonhole::SetIntersection<'a, 'b>(_)
 impl core::iter::traits::iterator::Iterator for pigeonhole::SetIntersection<'_, '_>
 pub type pigeonhole::SetIntersection<'_, '_>::Item = u32

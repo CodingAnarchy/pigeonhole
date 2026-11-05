@@ -1239,6 +1239,15 @@ impl RowMutation<'_> {
     ///   the applied state the condition saw: read once, so the value it compared is the
     ///   value returned, and a column it found missing is `None`.
     ///
+    /// [`return_previous`](Self::return_previous)'s columns are reported only when it
+    /// applies. When it doesn't, nothing changed, so a column's value then is its current
+    /// one: ask for it with [`return_current`](Self::return_current) and read it from
+    /// [`Seen::current`].
+    ///
+    /// A mutation that writes nothing is a check-and-read, as with
+    /// [`commit_if`](Self::commit_if): when the condition holds it commits an empty
+    /// mutation and returns `Applied` with the columns as they are; when it fails, `NotApplied`.
+    ///
     /// Nothing is written when the condition fails. When it holds, durability and
     /// `OutcomeUnknown` are as [`commit_returning`](Self::commit_returning)'s: after
     /// `OutcomeUnknown` nothing is returned, and a retry that finds its own earlier write
@@ -1293,7 +1302,7 @@ impl RowMutation<'_> {
             .map_err(|e| {
                 db.after_commit_closed(generation, commit_error(e, largest, db.max_value))
             })?;
-        Ok(Checked::from_engine(r, &self.table.info))
+        Checked::from_engine(r, &self.table.info)
     }
 
     /// The engine's form of `condition`, on this row's table.
@@ -1373,7 +1382,7 @@ impl SubmittedCheckReturning {
             self.watch
                 .refused(commit_error(e, self.largest_value, self.max_value))
         })?;
-        Ok(Checked::from_engine(r, &self.info))
+        Checked::from_engine(r, &self.info)
     }
 }
 
@@ -3168,8 +3177,8 @@ impl Checked {
     fn from_engine(
         r: pigeonhole_engine::CheckReturned,
         table: &Arc<pigeonhole_engine::TableInfo>,
-    ) -> Self {
-        match (r.applied, r.info) {
+    ) -> Result<Self> {
+        Ok(match (r.applied, r.info) {
             (true, Some(info)) => {
                 let mut ret = Returned::new_with_previous(
                     CommitInfo::from_engine(info),
@@ -3180,12 +3189,20 @@ impl Checked {
                 ret.current = previous_cells(r.current);
                 Checked::Applied(ret)
             }
-            _ => Checked::NotApplied(Seen {
+            (true, None) => {
+                // The shard notifies every applied check with its commit's info.
+                debug_assert!(false, "a check applied without its commit info");
+                return Err(Error::new(
+                    ErrorCode::OutcomeUnknown,
+                    "internal error: the conditional commit applied, but its commit info is \
+                     missing",
+                ));
+            }
+            (false, _) => Checked::NotApplied(Seen {
                 table: Arc::clone(table),
                 current: previous_cells(r.current),
-                seqno: r.seen,
             }),
-        }
+        })
     }
 }
 
@@ -3198,7 +3215,6 @@ impl Checked {
 pub struct Seen {
     table: Arc<pigeonhole_engine::TableInfo>,
     current: Vec<PreviousCell>,
-    seqno: u64,
 }
 
 impl Seen {
@@ -3208,13 +3224,6 @@ impl Seen {
     /// it and it isn't the condition's column.
     pub fn current(&self, family: &str, qualifier: &[u8]) -> Result<Option<crate::Cell>> {
         column(&self.table, &self.current, family, qualifier, "current")
-    }
-
-    /// The seqno a [`Snapshot`](crate::Snapshot) reads these columns at as the condition saw
-    /// them: the last sequence number handed out when it read the row (as
-    /// [`Snapshot::seqno`](crate::Snapshot::seqno) and `CommitInfo::seqno` number them).
-    pub fn seqno(&self) -> u64 {
-        self.seqno
     }
 }
 

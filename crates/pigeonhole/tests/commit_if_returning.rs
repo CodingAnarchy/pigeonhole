@@ -2,6 +2,7 @@
 //! commit that returns the row's state whichever way the condition goes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use pigeonhole::{Checked, Condition, ErrorCode, Family, Options, Pigeonhole, Table, ValueFilter};
 use pigeonhole_io::sim::SimVfs;
@@ -101,7 +102,6 @@ fn both_outcomes_report_the_row() {
         value(seen.current("s", b"note")).as_deref(),
         Some(&b"fragile"[..])
     );
-    assert!(seen.seqno() > 0);
     // Nothing written.
     let now = t.get(b"r", "s", b"state").unwrap().unwrap();
     assert_eq!(now.value(), b"shipped");
@@ -210,6 +210,245 @@ fn a_compare_and_swap_loop_hands_out_each_value_once() {
 
 /// `return_current` is refused everywhere but `commit_if_returning`, with the transaction
 /// hint; an unknown family is `FamilyNotFound`.
+/// Runs `condition` as a plain `commit_if` on row `a` and as `commit_if_returning` on row
+/// `b`, after `setup` wrote both rows the same way, and checks they agree (simp724's T1 on
+/// #1566): the same outcome, and on `NotApplied`, `Seen::current` is the column the
+/// condition compared, as a read of the row gives it.
+fn agree(
+    t: &Table,
+    case: &str,
+    setup: &dyn Fn(&[u8]),
+    condition: &Condition,
+    (family, qualifier): (&str, &[u8]),
+    write: &str,
+    want_applied: bool,
+) {
+    let a = format!("{case}/a").into_bytes();
+    let b = format!("{case}/b").into_bytes();
+    setup(&a);
+    setup(&b);
+    let plain = t
+        .mutate(&a)
+        .put(write, b"w", b"1")
+        .commit_if(condition)
+        .unwrap()
+        .is_some();
+    let read = t
+        .get(&b, family, qualifier)
+        .unwrap()
+        .map(|c| (c.value().to_vec(), c.timestamp()));
+    let returning = t
+        .mutate(&b)
+        .put(write, b"w", b"1")
+        .commit_if_returning(condition)
+        .unwrap();
+    assert_eq!(plain, want_applied, "{case}: commit_if");
+    assert_eq!(
+        returning.is_applied(),
+        plain,
+        "{case}: the two forms disagree"
+    );
+    if let Checked::NotApplied(seen) = returning {
+        let saw = seen
+            .current(family, qualifier)
+            .unwrap()
+            .map(|c| (c.value().to_vec(), c.timestamp()));
+        assert_eq!(saw, read, "{case}: Seen::current is the compared column");
+        assert!(
+            t.get(&b, write, b"w").unwrap().is_none(),
+            "{case}: nothing written"
+        );
+    }
+}
+
+/// A separated value and a counter column: `commit_if` and `commit_if_returning` agree,
+/// and a failed condition reports the value it compared (the blob's bytes, the folded sum).
+#[test]
+fn both_forms_agree_on_blobs_and_counters() {
+    let (_db, t) = open(1566);
+    let big = vec![b'x'; 300];
+    let blob = |row: &[u8]| {
+        t.mutate(row).put("b", b"q", &big).commit().unwrap();
+    };
+    agree(
+        &t,
+        "blob-eq",
+        &blob,
+        &equals("b", b"q", &big),
+        ("b", b"q"),
+        "s",
+        true,
+    );
+    agree(
+        &t,
+        "blob-ne",
+        &blob,
+        &equals("b", b"q", b"small"),
+        ("b", b"q"),
+        "s",
+        false,
+    );
+    let mut other = big.clone();
+    other[299] = b'y';
+    agree(
+        &t,
+        "blob-last",
+        &blob,
+        &equals("b", b"q", &other),
+        ("b", b"q"),
+        "s",
+        false,
+    );
+
+    // Two commits, so the column holds operands the read folds.
+    let counter = |row: &[u8]| {
+        t.mutate(row).incr("c", b"n", 5).commit().unwrap();
+        t.mutate(row).incr("c", b"n", 2).commit().unwrap();
+    };
+    counter(b"probe");
+    let folded = t
+        .get(b"probe", "c", b"n")
+        .unwrap()
+        .unwrap()
+        .value()
+        .to_vec();
+    agree(
+        &t,
+        "ctr-eq",
+        &counter,
+        &equals("c", b"n", &folded),
+        ("c", b"n"),
+        "s",
+        true,
+    );
+    let mut five = folded.clone();
+    five[0] = 5;
+    agree(
+        &t,
+        "ctr-ne",
+        &counter,
+        &equals("c", b"n", &five),
+        ("c", b"n"),
+        "s",
+        false,
+    );
+    let exists = Condition::Exists {
+        family: "c".into(),
+        qualifier: b"n".to_vec(),
+    };
+    agree(&t, "ctr-exists", &counter, &exists, ("c", b"n"), "s", true);
+}
+
+/// A column at the family's TTL: a version past it is missing to both forms, and a column
+/// whose old version expired is compared (and reported) at its live one.
+#[test]
+fn both_forms_agree_at_the_ttl() {
+    // A real clock: expiry is against wall-clock microseconds.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("ttl.phdb"), Options::default()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("e", Family::default().ttl(Duration::from_secs(3_600)))
+        .family("s", Family::default())
+        .create()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let hour = 3_600_000_000u64;
+    let rows = |row: &[u8]| {
+        t.mutate(row)
+            .put_at("e", b"dead", now - hour - hour / 10, b"gone")
+            .put_at("e", b"live", now - hour - hour / 10, b"old")
+            .put_at("e", b"live", now - hour + hour / 10, b"new")
+            .commit()
+            .unwrap();
+    };
+    let exists = |q: &[u8]| Condition::Exists {
+        family: "e".into(),
+        qualifier: q.to_vec(),
+    };
+    let absent = Condition::Absent {
+        family: "e".into(),
+        qualifier: b"dead".to_vec(),
+    };
+    agree(
+        &t,
+        "dead-exists",
+        &rows,
+        &exists(b"dead"),
+        ("e", b"dead"),
+        "s",
+        false,
+    );
+    agree(&t, "dead-absent", &rows, &absent, ("e", b"dead"), "s", true);
+    agree(
+        &t,
+        "dead-eq",
+        &rows,
+        &equals("e", b"dead", b"gone"),
+        ("e", b"dead"),
+        "s",
+        false,
+    );
+    agree(
+        &t,
+        "live-new",
+        &rows,
+        &equals("e", b"live", b"new"),
+        ("e", b"live"),
+        "s",
+        true,
+    );
+    agree(
+        &t,
+        "live-old",
+        &rows,
+        &equals("e", b"live", b"old"),
+        ("e", b"live"),
+        "s",
+        false,
+    );
+    agree(
+        &t,
+        "live-exists",
+        &rows,
+        &exists(b"live"),
+        ("e", b"live"),
+        "s",
+        true,
+    );
+}
+
+/// A mutation that writes nothing is a check-and-read in both forms (cli692's Q1 on #1566):
+/// the same outcome as plain `commit_if`, and the columns as they are.
+#[test]
+fn an_empty_mutation_is_a_check_and_read() {
+    let (_db, t) = open(1567);
+    for row in [&b"e/a"[..], b"e/b"] {
+        t.mutate(row).put("s", b"state", b"paid").commit().unwrap();
+    }
+    for (cond, want) in [(&b"paid"[..], true), (b"packed", false)] {
+        let plain = t
+            .mutate(b"e/a")
+            .commit_if(&equals("s", b"state", cond))
+            .unwrap();
+        assert_eq!(plain.is_some(), want, "commit_if on {cond:?}");
+        let r = t
+            .mutate(b"e/b")
+            .commit_if_returning(&equals("s", b"state", cond))
+            .unwrap();
+        assert_eq!(r.is_applied(), want, "commit_if_returning on {cond:?}");
+        let state = match &r {
+            Checked::Applied(ret) => value(ret.current("s", b"state")),
+            Checked::NotApplied(seen) => value(seen.current("s", b"state")),
+        };
+        assert_eq!(state.as_deref(), Some(&b"paid"[..]));
+    }
+}
+
 #[test]
 fn return_current_is_refused_elsewhere() {
     let (_db, t) = open(5);

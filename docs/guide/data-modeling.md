@@ -232,7 +232,7 @@ match r.previous("s", b"holder")? {
 ## Compare and set, then read (commit_if_returning)
 `commit_if_returning(&condition)` is a `commit_if` that returns the row's state whichever way the condition goes (D314 amendment 2). It gives a `Checked`:
 - **`Applied(returned)`:** the mutation committed. `returned.current(family, qualifier)` is a column as of the commit, so the condition's own column has the value this commit wrote. `return_previous` gives the old one, and the counters fold as for `commit_returning`.
-- **`NotApplied(seen)`:** nothing was written. `seen.current(family, qualifier)` is the column in the applied state the condition saw: the value it compared, or `None` where it was missing. `seen.seqno()` is a seqno a snapshot reads those columns at.
+- **`NotApplied(seen)`:** nothing was written. `seen.current(family, qualifier)` is the column in the applied state the condition saw: the value it compared, or `None` where it was missing.
 
 The condition's column is always returned. Ask for more with `return_current(family, qualifier)`. Only `commit_if_returning` takes it: to read other columns as of a plain commit, use a transaction, because a `get` after a commit may already see a later writer's.
 

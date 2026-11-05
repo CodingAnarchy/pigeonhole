@@ -6487,9 +6487,6 @@ pub struct CheckReturned {
     /// Each `current_of` column, the condition's own first: as of the commit when it
     /// applied, as the condition saw it otherwise.
     pub current: Vec<Previous>,
-    /// When it didn't apply: the seqno a snapshot reads the `current` columns at as the
-    /// condition saw them (the last seqno handed out at the check). 0 when it applied.
-    pub seen: pigeonhole_format::Seqno,
 }
 
 /// A submitted [`Engine::submit_check_and_mutate_returning`].
@@ -6548,7 +6545,6 @@ fn check_returned(
         cells,
         previous: p.values,
         current: p.current,
-        seen: if applied { 0 } else { p.seen },
     }
 }
 

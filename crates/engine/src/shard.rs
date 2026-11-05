@@ -1286,9 +1286,6 @@ pub(crate) struct PreviousState {
     pub current_of: Vec<(FamilyId, Vec<u8>)>,
     /// Each column of `current_of`, in its order.
     pub current: Vec<crate::engine::Previous>,
-    /// For a check that failed: the last seqno handed out when it read the row. A
-    /// snapshot at it reads the reported columns as the check saw them.
-    pub seen: Seqno,
 }
 
 /// One counter cell a returning commit incremented, as the shard reads it from the batch.
@@ -5933,7 +5930,6 @@ impl ShardState {
         }
         let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(p) = out.previous.as_deref_mut() {
-            p.seen = self.shared.clock.next_seqno().saturating_sub(1);
             let of = std::mem::take(&mut p.current_of);
             p.current = of
                 .into_iter()
