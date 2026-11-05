@@ -61,6 +61,21 @@ pub(crate) struct Grid {
     pub(crate) headers: Vec<Option<SegmentHeader>>,
 }
 
+/// The file a stream writes, and whose stream it is: what every way of making a
+/// [`WalStream`] starts from.
+pub(crate) struct StreamFile {
+    pub vfs: VfsRef,
+    pub file: FileRef,
+    pub path: PathBuf,
+    pub stream: StreamId,
+    pub db_id: [u8; 16],
+}
+
+/// `m`'s guard, poisoned or not, as every lock in this file took it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The segment header in `probe`, or `None` where there is none (a blank or torn slot). A
 /// header whose checksum passed but whose version is newer was written by a newer build:
 /// refused, never read as a blank or torn slot with its records skipped, nor the stream as
@@ -202,11 +217,7 @@ struct InFlight(Arc<Shared>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        let mut n = self
-            .0
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut n = lock(&self.0.in_flight);
         *n -= 1;
         if *n == 0 {
             self.0.in_flight_done.notify_all();
@@ -235,11 +246,7 @@ impl IoTracker {
     /// when it is next polled. Reaps I/O only the calling thread completes meanwhile (#207).
     pub fn wait_idle(&self) {
         crate::foreground::may_block("a wait for a WAL stream's submitted I/O");
-        let mut n = self
-            .0
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut n = lock(&self.0.in_flight);
         self.0.closing_io.store(true, Ordering::Release);
         loop {
             if *n == 0 {
@@ -247,11 +254,7 @@ impl IoTracker {
             }
             drop(n);
             let reaped = reap_for_wait();
-            n = self
-                .0
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            n = lock(&self.0.in_flight);
             if reaped || *n == 0 {
                 continue;
             }
@@ -283,7 +286,7 @@ impl Shared {
     /// have, durable only if both succeeded. Its waiters run outside the lock.
     fn creation_synced(&self, ok: bool) {
         let waiters = {
-            let mut c = self.creation.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut c = lock(&self.creation);
             let Creation::Pending { left, waiters } = &mut *c else {
                 return;
             };
@@ -572,7 +575,7 @@ struct RolloverState {
 
 impl RolloverSync {
     fn lock(&self) -> MutexGuard<'_, RolloverState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Whether the sync finished, and how: `None` while in flight.
@@ -682,11 +685,11 @@ fn reap_for_wait() -> bool {
 
 impl Shared {
     fn pool(&self) -> MutexGuard<'_, Pool> {
-        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.pool)
     }
 
     fn syncs(&self) -> MutexGuard<'_, Syncs> {
-        self.syncs.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.syncs)
     }
 
     /// Waits for the open-time syncs still in flight, making progress on their I/O as a
@@ -694,8 +697,7 @@ impl Shared {
     /// I/O that only a waiter completes (the simulator's deferred device, #158) never would.
     /// Their outcome reaches the ordering on its own (a failure poisons the stream).
     fn drive_open_io(&self) {
-        let pending =
-            std::mem::take(&mut *self.open_io.lock().unwrap_or_else(PoisonError::into_inner));
+        let pending = std::mem::take(&mut *lock(&self.open_io));
         for c in pending {
             let _ = c.wait();
         }
@@ -753,10 +755,7 @@ impl Shared {
     /// stream (an application-owned engine's single driver thread blocks in that wait,
     /// and nothing polls a paused preparation meanwhile, #824 R2).
     fn track(self: &Arc<Self>) -> Option<InFlight> {
-        let mut n = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut n = lock(&self.in_flight);
         if self.closing_io.load(Ordering::Acquire) {
             return None;
         }
@@ -846,44 +845,43 @@ impl Shared {
         let (done, resolver) = Completion::pair();
         let shared = Arc::clone(self);
         let Some(token) = self.track() else {
-            let mut syncs = self.syncs();
-            self.end_sync(&mut syncs, ticket, true);
-            let ready = syncs.settled();
-            drop(syncs);
-            self.tell(ready);
+            self.end_failed_sync(ticket);
             resolver.resolve(Err(Self::closing_error()));
             return done;
         };
         // The continuation's own completion is not needed: `resolver` reports the outcome.
         let _chained = submit().map(move |r| {
             let _token = token;
-            let ready = {
-                let mut syncs = shared.syncs();
-                shared.end_sync(&mut syncs, ticket, r.is_err());
-                match r {
-                    Err(e) => {
-                        let ready = syncs.settled();
-                        drop(syncs);
-                        shared.tell(ready);
-                        resolver.resolve(Err(e));
-                        return Ok(());
-                    }
-                    Ok(()) => {
-                        let barrier = syncs.next;
-                        syncs.settling.push((
-                            barrier,
-                            Box::new(move |ok| {
-                                resolver.resolve(if ok { Ok(()) } else { Err(poisoned_io()) });
-                            }),
-                        ));
-                        syncs.settled()
-                    }
-                }
-            };
+            if let Err(e) = r {
+                shared.end_failed_sync(ticket);
+                resolver.resolve(Err(e));
+                return Ok(());
+            }
+            let mut syncs = shared.syncs();
+            shared.end_sync(&mut syncs, ticket, false);
+            let barrier = syncs.next;
+            syncs.settling.push((
+                barrier,
+                Box::new(move |ok| {
+                    resolver.resolve(if ok { Ok(()) } else { Err(poisoned_io()) });
+                }),
+            ));
+            let ready = syncs.settled();
+            drop(syncs);
             shared.tell(ready);
             Ok(())
         });
         done
+    }
+
+    /// Ends sync `ticket` as failed and wakes whatever that settles; the caller then reports
+    /// the error.
+    fn end_failed_sync(&self, ticket: u64) {
+        let mut syncs = self.syncs();
+        self.end_sync(&mut syncs, ticket, true);
+        let ready = syncs.settled();
+        drop(syncs);
+        self.tell(ready);
     }
 }
 
@@ -1495,10 +1493,7 @@ impl WalStream {
             let shared = Arc::clone(&w.shared);
             // The stream's creation is durable once both syncs have succeeded (D211): until
             // then no checkpoint may name it.
-            *w.shared
-                .creation
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Creation::Pending {
+            *lock(&w.shared.creation) = Creation::Pending {
                 left: 2,
                 waiters: Vec::new(),
             };
@@ -1516,11 +1511,7 @@ impl WalStream {
                 shared.creation_synced(r.is_ok());
                 r
             }));
-            w.shared
-                .open_io
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend([file_drive, dir_drive]);
+            lock(&w.shared.open_io).extend([file_drive, dir_drive]);
             out.push(w);
         }
         Ok(out)
@@ -1551,32 +1542,30 @@ impl WalStream {
         let path = stream_path(db_path, stream);
         let file = vfs.open(&path, OpenOptions::read_write_create())?;
         file.set_len(0)?;
-        let mut s = Self::blank(
-            Arc::clone(vfs),
+        let f = StreamFile {
+            vfs: Arc::clone(vfs),
             file,
             path,
             stream,
             db_id,
-            opts.segment_size,
-            opts.spare_segments,
-        );
-        s.configure_feed(&opts);
-        Ok(s)
+        };
+        Ok(Self::blank(f, opts.segment_size, &opts))
     }
 
-    /// A stream over `file` with no current segment yet.
-    pub(crate) fn blank(
-        vfs: VfsRef,
-        file: FileRef,
-        path: PathBuf,
-        stream: StreamId,
-        db_id: [u8; 16],
-        segment_size: u64,
-        spare: u32,
-    ) -> Self {
+    /// A stream over `f` with no current segment yet, its slots `segment_size` bytes, with
+    /// `opts`' spare count and change-feed settings.
+    pub(crate) fn blank(f: StreamFile, segment_size: u64, opts: &WalOptions) -> Self {
+        let StreamFile {
+            vfs,
+            file,
+            path,
+            stream,
+            db_id,
+        } = f;
+        let spare = opts.spare_segments;
         let frames = segment_size / FRAME;
         let max_payload = (frames as usize - 1) * (FRAME_SIZE - FRAGMENT_HEADER_LEN);
-        Self {
+        let mut s = Self {
             vfs,
             file,
             path,
@@ -1613,7 +1602,9 @@ impl WalStream {
                 in_flight_done: Condvar::new(),
                 closing_io: AtomicBool::new(false),
             }),
-        }
+        };
+        s.configure_feed(opts);
+        s
     }
 
     /// The stream's feed marks, for the crate's own updates.
@@ -1857,34 +1848,38 @@ impl WalStream {
                 let slot = pool.total;
                 pool.total += 1;
                 drop(pool);
-                let end = (slot as u64 + 1) * self.segment_size;
-                if at_open {
-                    if self.file.len()? >= end {
-                        // Bytes past the slots the stream knows of (a preparation that
-                        // failed after growing the file): treat them as stale.
-                        (slot, SlotSource::Blank)
-                    } else {
-                        // Never written, so it reads as zeros and needs no zero-fill.
-                        // `open_segment` syncs the length with the header.
-                        self.extend_at_open(slot)?;
-                        (slot, SlotSource::Extended)
-                    }
-                } else {
-                    self.shared
-                        .counters
-                        .inline_grows
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.file
-                        .allocate(slot as u64 * self.segment_size, self.segment_size)?;
-                    crate::foreground::exempt(|| self.shared.side_sync(|| self.file.sync_all()))?;
-                    (slot, SlotSource::Blank)
-                }
+                (slot, self.new_slot(slot, at_open)?)
             }
         };
         if slot >= self.slots.len() {
             self.slots.resize(slot + 1, POOLED);
         }
         Ok((slot, source))
+    }
+
+    /// Makes slot `slot`, the first past the stream's slots, ready for a segment. At open it
+    /// is either stale bytes a failed preparation left or a fresh extension; otherwise it is
+    /// allocated and synced inline on this thread (D30's fallback, counted in `inline_grows`).
+    fn new_slot(&self, slot: usize, at_open: bool) -> Result<SlotSource> {
+        if !at_open {
+            self.shared
+                .counters
+                .inline_grows
+                .fetch_add(1, Ordering::Relaxed);
+            self.file
+                .allocate(slot as u64 * self.segment_size, self.segment_size)?;
+            crate::foreground::exempt(|| self.shared.side_sync(|| self.file.sync_all()))?;
+            return Ok(SlotSource::Blank);
+        }
+        if self.file.len()? >= (slot as u64 + 1) * self.segment_size {
+            // Bytes past the slots the stream knows of (a preparation that failed after
+            // growing the file): treat them as stale.
+            return Ok(SlotSource::Blank);
+        }
+        // Never written, so it reads as zeros and needs no zero-fill. `open_segment` syncs the
+        // length with the header.
+        self.extend_at_open(slot)?;
+        Ok(SlotSource::Extended)
     }
 
     /// Adds slot `slot` past the file's end for the open-time segment, without writing it.
@@ -2275,12 +2270,7 @@ impl Wal for WalStream {
     }
 
     fn created_durable(&self) -> Option<bool> {
-        match *self
-            .shared
-            .creation
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
+        match *lock(&self.shared.creation) {
             Creation::Durable => Some(true),
             Creation::Pending { .. } => None,
             Creation::Failed => Some(false),
@@ -2289,11 +2279,7 @@ impl Wal for WalStream {
 
     fn notify_created(&self, wake: Box<dyn FnOnce() + Send>) {
         {
-            let mut c = self
-                .shared
-                .creation
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut c = lock(&self.shared.creation);
             if let Creation::Pending { waiters, .. } = &mut *c {
                 waiters.push(wake);
                 return;
