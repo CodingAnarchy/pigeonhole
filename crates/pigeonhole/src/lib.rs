@@ -197,7 +197,8 @@ pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
 pub use write::{
-    CommitInfo, CommitTicket, Durability, Incremented, RowMutation, Transaction, WriteBatch,
+    CommitInfo, CommitTicket, Durability, Incremented, Returned, RowMutation, Transaction,
+    WriteBatch,
 };
 
 pub use merge::{MergeError, MergeOperator};

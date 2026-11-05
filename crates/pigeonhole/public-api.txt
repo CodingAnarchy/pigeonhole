@@ -39,7 +39,7 @@ pub type pigeonhole::nonblocking::MaintenanceFuture::Output = core::result::Resu
 pub fn pigeonhole::nonblocking::MaintenanceFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
 pub struct pigeonhole::nonblocking::ReturningFuture
 impl core::future::future::Future for pigeonhole::nonblocking::ReturningFuture
-pub type pigeonhole::nonblocking::ReturningFuture::Output = core::result::Result<pigeonhole::Incremented, pigeonhole::Error>
+pub type pigeonhole::nonblocking::ReturningFuture::Output = core::result::Result<pigeonhole::Returned, pigeonhole::Error>
 pub fn pigeonhole::nonblocking::ReturningFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
 pub struct pigeonhole::nonblocking::RowFuture
 impl core::future::future::Future for pigeonhole::nonblocking::RowFuture
@@ -511,12 +511,6 @@ pub fn pigeonhole::HistogramParams::new(impl core::convert::Into<alloc::vec::Vec
 impl pigeonhole::Hop
 pub fn pigeonhole::Hop::nodes(&self) -> &pigeonhole_engine::read::keys::KeySet
 pub fn pigeonhole::Hop::parents(&self) -> core::option::Option<&[u32]>
-#[non_exhaustive] pub struct pigeonhole::Incremented
-pub pigeonhole::Incremented::info: pigeonhole::CommitInfo
-impl pigeonhole::Incremented
-pub fn pigeonhole::Incremented::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &[u8], u64, pigeonhole::Result<core::option::Option<i64>>)>
-pub fn pigeonhole::Incremented::value(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<i64>>
-pub fn pigeonhole::Incremented::value_at(&self, &str, &[u8], u64) -> pigeonhole::Result<core::option::Option<i64>>
 #[non_exhaustive] pub struct pigeonhole::IoRings
 pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
@@ -751,6 +745,13 @@ pub fn pigeonhole::RetryPolicy::retry_busy(self, bool) -> Self
 pub fn pigeonhole::RetryPolicy::unlimited_attempts(self) -> Self
 impl core::default::Default for pigeonhole::RetryPolicy
 pub fn pigeonhole::RetryPolicy::default() -> Self
+#[non_exhaustive] pub struct pigeonhole::Returned
+pub pigeonhole::Returned::info: pigeonhole::CommitInfo
+impl pigeonhole::Returned
+pub fn pigeonhole::Returned::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &[u8], u64, pigeonhole::Result<core::option::Option<i64>>)>
+pub fn pigeonhole::Returned::previous(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::Cell>>
+pub fn pigeonhole::Returned::value(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<i64>>
+pub fn pigeonhole::Returned::value_at(&self, &str, &[u8], u64) -> pigeonhole::Result<core::option::Option<i64>>
 pub struct pigeonhole::Row
 impl pigeonhole::Row
 pub fn pigeonhole::Row::entry(&self, usize) -> core::option::Option<pigeonhole::CellEntry<'_>>
@@ -786,7 +787,7 @@ pub fn pigeonhole::RowMutation<'_>::aggregate_u64(self, &str, &[u8], u64) -> Sel
 pub fn pigeonhole::RowMutation<'_>::aggregate_u64_at(self, &str, &[u8], u64, u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
 pub fn pigeonhole::RowMutation<'_>::commit_if(self, &pigeonhole::Condition) -> pigeonhole::Result<core::option::Option<pigeonhole::CommitInfo>>
-pub fn pigeonhole::RowMutation<'_>::commit_returning(self) -> pigeonhole::Result<pigeonhole::Incremented>
+pub fn pigeonhole::RowMutation<'_>::commit_returning(self) -> pigeonhole::Result<pigeonhole::Returned>
 pub fn pigeonhole::RowMutation<'_>::delete_cell(self, &str, &[u8], u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::delete_column(self, &str, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::delete_family(self, &str) -> Self
@@ -813,6 +814,7 @@ pub fn pigeonhole::RowMutation<'_>::put_vector_f32(self, &str, &[u8], &[f32]) ->
 pub fn pigeonhole::RowMutation<'_>::put_vector_f32_at(self, &str, &[u8], u64, &[f32]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8(self, &str, &[u8], &[i8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8_at(self, &str, &[u8], u64, &[i8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::return_previous(self, &str, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::set_add(self, &str, &[u8], u32) -> Self
 pub fn pigeonhole::RowMutation<'_>::set_add_at(self, &str, &[u8], u64, u32) -> Self
 pub fn pigeonhole::RowMutation<'_>::set_remove(self, &str, &[u8], u32) -> Self
@@ -1130,4 +1132,5 @@ pub fn pigeonhole::MergeOperator::merge(&self, &mut alloc::vec::Vec<u8>, &[u8]) 
 pub fn pigeonhole::MergeOperator::name(&self) -> &str
 pub fn pigeonhole::check(impl core::convert::AsRef<std::path::Path>, pigeonhole::CheckOptions) -> pigeonhole::Result<pigeonhole::CheckReport>
 pub fn pigeonhole::days(u64) -> core::time::Duration
+pub type pigeonhole::Incremented = pigeonhole::Returned
 pub type pigeonhole::Result<T, E> = core::result::Result<T, E>
