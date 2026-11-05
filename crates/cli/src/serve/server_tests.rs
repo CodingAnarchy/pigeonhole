@@ -35,6 +35,8 @@ fn limits() -> Limits {
         max_catch_up: 4,
         feed_ring_bytes: 1 << 20,
         feed_quiet: Duration::from_secs(10),
+        feed_client_events: super::feed::CLIENT_EVENTS,
+        feed_client_bytes: super::feed::CLIENT_BYTES,
         request_timeout: Duration::from_secs(5),
         stream_idle: Duration::from_secs(5),
         leases: super::sessions::Leases {
@@ -1656,6 +1658,8 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     // with nothing missed or repeated.
     let mut l = limits();
     l.feed_ring_bytes = 2048; // a few entries
+    // A one-event buffer: a client that takes nothing stops reading the ring at once.
+    l.feed_client_events = 1;
     let s = Server::start("", l);
     let mut slow = direct_feed(&s, subscribe(&["t"], b"a"));
     let mut want = vec![write_row(&s, b"a0")];
@@ -1690,6 +1694,104 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     );
 }
 
+/// A client that takes nothing: its buffer fills, then the stream ends with
+/// `DeadlineExceeded` after `--stream-idle-ms`. The events it buffered come first, in order.
+fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Vec<u64>, Vec<u64>) {
+    let mut l = limits();
+    l.stream_idle = Duration::from_millis(300);
+    l.feed_client_events = client_events;
+    l.feed_client_bytes = client_bytes;
+    let s = Server::start("", l);
+    let mut stalled = direct_feed(&s, subscribe(&["t"], b""));
+    let written: Vec<u64> = (0..writes)
+        .map(|i| write_row(&s, format!("r{i:04}").as_bytes()))
+        .collect();
+    std::thread::sleep(Duration::from_millis(900));
+    let mut got = Vec::new();
+    loop {
+        match next_event(&s, &mut stalled, Duration::from_secs(5)) {
+            Some(Ok(e)) => got.extend(commit_of(&e).map(|(n, _)| n)),
+            Some(Err(e)) => {
+                assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+                assert!(e.message.contains("--stream-idle-ms"), "{e:?}");
+                break;
+            }
+            None => panic!("the stream ends with an error, after {} events", got.len()),
+        }
+    }
+    assert!(next_event(&s, &mut stalled, Duration::from_secs(1)).is_none());
+    (got, written)
+}
+
+#[test]
+fn a_feed_client_that_takes_nothing_fills_its_buffer_then_times_out() {
+    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, super::feed::CLIENT_BYTES, 100);
+    assert_eq!(
+        got,
+        written[..super::feed::CLIENT_EVENTS],
+        "the full buffer, in order"
+    );
+}
+
+#[test]
+fn a_feed_clients_buffer_is_bounded_by_bytes_too() {
+    // About 100 bytes an event: a 1 KiB buffer holds far fewer than 64 of them.
+    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, 1024, 100);
+    assert!(
+        !got.is_empty() && got.len() < 16,
+        "{} events buffered",
+        got.len()
+    );
+    assert_eq!(got, written[..got.len()], "in order");
+}
+
+#[test]
+fn a_slow_feed_client_that_keeps_taking_outlasts_a_large_events_wait() {
+    // simp724's I1 on #1536: a large event waits for the whole buffer to drain. A client
+    // taking an event every 60 ms (under the 250 ms idle limit) drains it in well over
+    // 250 ms, and must not time out: the limit counts from its last take. The writes run on
+    // their own thread, so the client takes from the first event on.
+    let mut l = limits();
+    l.stream_idle = Duration::from_millis(250);
+    l.feed_client_bytes = 4096;
+    let s = Server::start("", l);
+    let mut slow = direct_feed(&s, subscribe(&["t"], b""));
+    let t = s
+        .shared
+        .router
+        .service
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    let writer = std::thread::spawn(move || {
+        let mut want: Vec<u64> = (0..60)
+            .map(|i| {
+                t.mutate(format!("r{i:04}").as_bytes())
+                    .put("f", b"q", b"v")
+                    .commit()
+                    .unwrap()
+                    .seqno
+            })
+            .collect();
+        // Larger than the whole buffer: it goes alone, once every earlier event is taken.
+        for (row, value) in [(&b"zbig"[..], &[7u8; 8192][..]), (b"zz", b"v")] {
+            want.push(t.mutate(row).put("f", b"q", value).commit().unwrap().seqno);
+        }
+        want
+    });
+    let mut got = Vec::new();
+    while got.len() < 62 {
+        match next_event(&s, &mut slow, Duration::from_secs(5)) {
+            Some(Ok(e)) => got.extend(commit_of(&e).map(|(n, _)| n)),
+            other => panic!("after {} events: {other:?}", got.len()),
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    assert_eq!(got, writer.join().unwrap());
+}
+
 #[test]
 fn feed_streams_match_a_direct_feed_across_fall_offs() {
     // feed1248's (6): each client's stream, ring and own-stream catch-up alike, delivers
@@ -1713,6 +1815,8 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
     };
     let mut l = limits();
     l.feed_ring_bytes = 2048;
+    // One-event buffers, so a stalled round takes clients off the ring.
+    l.feed_client_events = 1;
     l.max_catch_up = 2;
     let s = Server::start_with("", l, 2);
     let prefixes: [&[u8]; 4] = [b"", b"a", b"b", b"ab"];
@@ -1883,6 +1987,10 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     // the rest wait, and are counted, then deliver everything all the same.
     let mut l = limits();
     l.max_catch_up = 1;
+    // A one-event buffer: the first, untaken, keeps its catch-up slot while the second
+    // asks for it. With a deeper one it could buffer all five, rejoin and free the slot
+    // first.
+    l.feed_client_events = 1;
     let s = Server::start("", l);
     let written: Vec<u64> = (0..5)
         .map(|i| write_row(&s, format!("r{i}").as_bytes()))
@@ -1897,9 +2005,19 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
+    // The second gets its slot only once the first has rejoined the ring (up to a
+    // REJOIN_TICK after it caught up). So collect until every commit is in or a long
+    // deadline passes, never stopping at a quiet spell: a slow runner can pause longer than
+    // any short window (#1527's CI on macOS).
     for events in [&mut first, &mut second] {
-        let got = drain(&s, events, Duration::from_millis(300));
-        assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), written);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got = Vec::new();
+        while got.len() < written.len() && std::time::Instant::now() < deadline {
+            if let Some(e) = next_event(&s, events, Duration::from_millis(200)) {
+                got.extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+            }
+        }
+        assert_eq!(got, written);
     }
 }
 
