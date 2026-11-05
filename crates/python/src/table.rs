@@ -6,6 +6,7 @@ use std::ops::Bound as KeyBound;
 use std::sync::Mutex;
 
 use pigeonhole::{Aggregation, Compression};
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -1068,6 +1069,44 @@ impl Table {
             .map_err(|e| returned_value(r.0.info.seqno, e))
     }
 
+    /// `incr_returning(...)` as an `asyncio.Future` of the running loop (#1479): the
+    /// counter's value after the commit, with the same `None` and `ReturnedValueError` cases.
+    #[pyo3(signature = (row, family, qualifier, delta, *, ts=None, durability=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn incr_returning_async<'py>(
+        &self,
+        py: Python<'py>,
+        row: &Bound<'_, PyAny>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+        delta: i64,
+        ts: Option<u64>,
+        durability: Option<Durability>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let q = convert::bytes(qualifier)?;
+        let row = convert::bytes(row)?;
+        let table = self.writer()?.clone();
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let op = Op::Incr(family.clone(), q.clone(), ts, delta);
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &[op], durability).commit_returning_async();
+            async move {
+                let r = f.await;
+                Box::new(move |py: Python<'_>| {
+                    let value = r.or_py().and_then(|r| {
+                        r.value_at(&family, &q, ts.unwrap_or(0))
+                            .map_err(|e| returned_value(r.info.seqno, e))
+                    });
+                    match value.and_then(|v| v.into_py_any(py)) {
+                        Ok(v) => crate::aio::Entry::Value(v),
+                        Err(e) => crate::aio::Entry::Error(e),
+                    }
+                }) as crate::aio::Output
+            }
+        })?;
+        Ok(fut)
+    }
+
     /// Deletes and commits: the row; with `family`, that family; with `qualifier` too, the
     /// column; with `ts` too, that one version.
     #[pyo3(signature = (row, family=None, qualifier=None, *, ts=None, durability=None))]
@@ -1371,6 +1410,49 @@ impl Mutation {
         let durability = *self.durability.lock().expect("not poisoned");
         commit_row_returning(py, &self.table, self.row.clone(), ops, durability)
     }
+
+    /// `commit()` as an `asyncio.Future` of the running loop (#1479): the commit's sequence
+    /// number. No thread waits for it. Cancelled while the commit waits for room, nothing is
+    /// written; once it's submitted it may still land (`asyncio.shield` keeps the outcome).
+    fn commit_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, durability) = self.parts()?;
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &ops, durability).commit_async();
+            async move { crate::aio::output(f.await, |py, i| i.seqno.into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
+    /// `commit_if(condition)` as an `asyncio.Future`: the sequence number, or `None` when
+    /// the condition failed.
+    fn commit_if_async<'py>(
+        &self,
+        py: Python<'py>,
+        condition: &Condition,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, durability) = self.parts()?;
+        let c = condition.0.clone();
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &ops, durability).commit_if_async(&c);
+            async move { crate::aio::output(f.await, |py, i| i.map(|i| i.seqno).into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
+    /// `commit_returning()` as an `asyncio.Future`: the `Incremented` cells.
+    fn commit_returning_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, durability) = self.parts()?;
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &ops, durability).commit_returning_async();
+            async move {
+                crate::aio::output(f.await, |py, r| Ok(Py::new(py, Incremented(r))?.into_any()))
+            }
+        })?;
+        Ok(fut)
+    }
 }
 
 impl Mutation {
@@ -1391,6 +1473,13 @@ impl Mutation {
         )
     }
 
+    /// What a commit takes: the table, the row, the buffered writes and the durability.
+    fn parts(&self) -> PyResult<CommitParts> {
+        let ops = self.take()?;
+        let durability = *self.durability.lock().expect("not poisoned");
+        Ok((self.table.clone(), self.row.clone(), ops, durability))
+    }
+
     /// The buffered writes, taken for a commit.
     fn take(&self) -> PyResult<Vec<Op>> {
         self.ops
@@ -1400,6 +1489,9 @@ impl Mutation {
             .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))
     }
 }
+
+/// What a mutation's commit takes: its table, row, writes and durability.
+type CommitParts = (pigeonhole::Table, Vec<u8>, Vec<Op>, Option<Durability>);
 
 /// The counter cells a `Mutation.commit_returning()` incremented or set, after its commit
 /// (D314): `value(family, qualifier, ts=None)`, or index it with `(family, qualifier)` or

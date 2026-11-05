@@ -1232,6 +1232,20 @@ impl Pigeonhole {
         self.engine().pinned_shard_cpus()
     }
 
+    /// Counts one retried transaction attempt in
+    /// [`EngineMetrics::transaction_retries`](crate::EngineMetrics::transaction_retries), as
+    /// [`transact`](Self::transact) counts its own: for a binding that runs its own retry
+    /// loop over [`RetryPolicy::next_pause`](crate::RetryPolicy::next_pause) (the Python
+    /// bindings' `transact` and `transact_async`, ICR 0121's amendment). Hidden: a binding
+    /// hook, not a stable API.
+    #[doc(hidden)]
+    pub fn note_transaction_retry(&self) {
+        self.db
+            .txn_counts
+            .retries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The writer's counters since this instance opened: commits and their latency,
     /// flushes, compactions, write stalls, the block cache, file growth, the shard threads,
     /// reader slots, transactions, and cross-shard commits' rounds and fast failures

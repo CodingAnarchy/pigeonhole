@@ -15,6 +15,11 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+[features]
+# Hold seams for the asyncio bridge's tests (`_native._Gate`, #1479): CI's pytest build
+# only, never the wheels.
+test-hooks = []
+
 [dependencies]
 pigeonhole = { workspace = true }
 # `pigeonhole.memory` (D311 T6).
