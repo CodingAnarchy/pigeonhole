@@ -86,7 +86,8 @@ fn row_cache_hash_collision_is_a_miss() {
         read: AtomicU8::new(0),
     });
     let shard = rows.shards.shard(h).expect("shard");
-    lock(shard).insert(h, entry, 10, Priority::Normal);
+    let mut taken = Taken::new();
+    lock(shard).insert(h, entry, 10, Priority::Normal, &mut taken);
     assert!(rows.get(1, b"a", 0).is_none());
     // Invalidating "a" must not drop "b".
     rows.invalidate(1, b"a");
