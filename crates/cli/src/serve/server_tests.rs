@@ -1902,3 +1902,62 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
         assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), written);
     }
 }
+
+#[test]
+fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
+    // simp724's F1 on #1518: with one catch-up slot, clients resuming from a token on a table
+    // nobody writes must still get back on the ring, as other tables' writes move the
+    // feed's position, and hand the slot on, so none starves.
+    let mut l = limits();
+    l.max_catch_up = 1;
+    let s = Server::start("", l);
+    let db = &s.shared.router.service.db;
+    db.table("u")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let u = db.table("u").unwrap().open().unwrap();
+    // A token on `t` from an earlier stream.
+    let mut first = direct_feed(&s, subscribe(&["t"], b""));
+    let r1 = write_row(&s, b"r1");
+    let token = next_event(&s, &mut first, Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .token;
+    drop(first);
+    let resume = || proto::SubscribeRequest {
+        start: Some(proto::subscribe_request::Start::Resume(token.clone())),
+        ..subscribe(&["t"], b"")
+    };
+    let mut a = direct_feed(&s, resume());
+    let mut b = direct_feed(&s, resume());
+    let mut c = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::FromOldest(true)),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    // Only `u` is written: `t` stays quiet.
+    for i in 0..20u32 {
+        u.mutate(&i.to_be_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let feeds = &s.shared.router.service.feeds;
+    // The Oldest client delivers r1 first; then all three are on the ring.
+    let got_c = drain(&s, &mut c, Duration::from_millis(300));
+    assert_eq!(got_c.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r1]);
+    wait_for("all three rejoin the ring, the slot handed on", || {
+        feeds.stats.rejoined.load(Ordering::Relaxed) >= 3 && feeds.gauges().catching_up == 0
+    });
+    // A write to `t` reaches each once.
+    let r2 = write_row(&s, b"r2");
+    for events in [&mut a, &mut b, &mut c] {
+        let got = drain(&s, events, Duration::from_millis(300));
+        assert_eq!(got.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r2]);
+    }
+    drop(u);
+}

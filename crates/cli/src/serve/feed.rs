@@ -42,8 +42,9 @@ use super::proto;
 /// The feed fan-out's limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FeedLimits {
-    /// Bytes of commits each hub's ring holds (`--feed-ring-bytes`), tokens included: memory
-    /// outside R3's in-flight budget.
+    /// Bytes of commits the rings hold in all (`--feed-ring-bytes`), tokens included (about
+    /// 45 + 16 × shards bytes each): memory outside R3's in-flight budget. Each hub's ring is
+    /// capped at this over the live hubs (perf287's K2 on #1518).
     pub ring_bytes: usize,
     /// Hubs at once (`--max-feed-hubs`): distinct table sets subscribed.
     pub max_hubs: usize,
@@ -75,7 +76,9 @@ pub(crate) struct Spec {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct HubKey {
-    tables: Vec<String>,
+    /// The tables' feed ids, so a table dropped and created again under its name is another
+    /// key (feed1248's R2, simp724's F4 on #1518).
+    tables: Vec<u64>,
     visible: bool,
 }
 
@@ -84,8 +87,8 @@ struct Entry {
     commit: Commit,
     /// The hub feed's token right after this commit.
     token: Vec<u8>,
-    /// Where the hub's feed was just before it: the seqno of the commit before it, or for
-    /// the hub's first entry the snapshot the feed started after.
+    /// The hub feed's position just before it (`Feed::position`): every commit of the spec
+    /// at or below it came before this one.
     prev: u64,
     bytes: usize,
 }
@@ -96,11 +99,14 @@ struct Ring {
     /// The index of `entries[0]` in the hub's whole sequence.
     base: u64,
     bytes: usize,
-    /// The token the hub's feed started at, before any entry.
-    start_token: Vec<u8>,
-    /// The seqno of the snapshot the hub's feed started after: it holds every commit of its
-    /// spec above it.
+    /// The hub feed's position when it opened: with no entry yet, the ring holds every
+    /// commit of the spec above it.
     start_seqno: u64,
+    /// The hub feed's latest position, after its last commit or its last poll that found
+    /// none (so it follows other tables' writes too), and the token taken with it: one pair,
+    /// from one poll (simp724's F1 on #1518).
+    passed: u64,
+    passed_token: Vec<u8>,
     /// The shared feed ended (an error): clients move to their own streams.
     failed: bool,
 }
@@ -110,18 +116,14 @@ impl Ring {
         self.base + self.entries.len() as u64
     }
 
-    /// Where a client at `seqno` rejoins: the index of the first entry after it. The client
-    /// has every commit of the spec up to `seqno`, and the ring every one after the position
-    /// before its first entry. So it rejoins only if that position is at most `seqno` (nothing
+    /// Where a client at position `seqno` rejoins: the index of the first entry after it.
+    /// The client has covered every commit of the spec up to `seqno` (its own stream's
+    /// `position`), and the ring holds every one after the position before its first entry. So it rejoins only if that position is at most `seqno` (nothing
     /// between them was evicted) and the hub's feed has passed `seqno` (nothing it will add
     /// is one the client has): feed1248's (2) on ticket 5.
     fn rejoin_at(&self, seqno: u64) -> Option<u64> {
         let covered_from = self.entries.front().map_or(self.start_seqno, |e| e.prev);
-        let passed = self
-            .entries
-            .back()
-            .map_or(self.start_seqno, |e| e.commit.seqno());
-        if covered_from > seqno || passed < seqno {
+        if covered_from > seqno || self.passed < seqno {
             return None;
         }
         let i = self
@@ -139,6 +141,8 @@ struct Hub {
     head: watch::Sender<u64>,
     task: tokio::task::AbortHandle,
     stats: Arc<FeedStats>,
+    /// Live hubs, shared: each ring's cap is the total over it.
+    live: Arc<AtomicU64>,
 }
 
 impl Hub {
@@ -146,10 +150,13 @@ impl Hub {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, commit: Commit, token: Vec<u8>, limit: usize) {
+    fn push(&self, commit: Commit, token: Vec<u8>, position: u64, total: usize) {
+        let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
         let bytes = entry_bytes(&commit, &token);
         let mut r = self.ring();
-        let prev = r.entries.back().map_or(r.start_seqno, |e| e.commit.seqno());
+        let prev = r.passed;
+        r.passed = position.max(commit.seqno());
+        r.passed_token = token.clone();
         r.entries.push_back(Arc::new(Entry {
             commit,
             token,
@@ -169,6 +176,15 @@ impl Hub {
         self.head.send_replace(head);
     }
 
+    /// The hub's feed found nothing at `position`: the ring holds everything up to it.
+    fn note_passed(&self, position: u64, token: impl FnOnce() -> Vec<u8>) {
+        let mut r = self.ring();
+        if position > r.passed {
+            r.passed = position;
+            r.passed_token = token();
+        }
+    }
+
     fn fail(&self) {
         self.ring().failed = true;
         self.stats.hub_failures.fetch_add(1, Ordering::Relaxed);
@@ -181,6 +197,7 @@ impl Drop for Hub {
     fn drop(&mut self) {
         // The last client left: the engine subscription (and its shard wakers) goes.
         self.task.abort();
+        self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -228,6 +245,7 @@ pub(crate) struct Feeds {
     catch_up: Arc<Semaphore>,
     limits: FeedLimits,
     pub(crate) stats: Arc<FeedStats>,
+    live: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Feeds {
@@ -254,6 +272,7 @@ impl Feeds {
             catch_up: Arc::new(Semaphore::new(limits.max_catch_up.max(1))),
             limits,
             stats: Arc::default(),
+            live: Arc::default(),
         })
     }
 
@@ -268,17 +287,21 @@ impl Feeds {
         }
     }
 
-    /// The hub for `spec`'s tables, opened if none is live.
-    fn hub(&self, spec: &Spec) -> Result<Arc<Hub>, ApiError> {
+    /// The hub for `tables`, opened if none is live. A failed hub is replaced (feed1248's
+    /// R1, simp724's F2 on #1518): its clients are on their own streams, and rejoin the new
+    /// one; a new subscriber must not start from the failed one's last position.
+    fn hub(&self, tables: &[Table], visible: bool) -> Result<Arc<Hub>, ApiError> {
         let key = HubKey {
-            tables: spec.tables.iter().map(|t| t.name().to_owned()).collect(),
-            visible: spec.visible,
+            tables: tables.iter().map(Table::feed_id).collect(),
+            visible,
         };
         let mut hubs = self.hubs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hub) = hubs.get(&key).and_then(Weak::upgrade) {
+        if let Some(hub) = hubs.get(&key).and_then(Weak::upgrade)
+            && !hub.ring().failed
+        {
             return Ok(hub);
         }
-        hubs.retain(|_, w| w.strong_count() > 0);
+        hubs.retain(|k, w| w.strong_count() > 0 && *k != key);
         if hubs.len() >= self.limits.max_hubs.max(1) {
             return Err(ApiError::overloaded(
                 "the server is at its feed hub limit (--max-feed-hubs): too many distinct table \
@@ -288,30 +311,42 @@ impl Feeds {
         // From a snapshot taken now, at the visibility it delivers at, so the ring knows the
         // position it starts from exactly: a client catching up can then rejoin it before
         // the hub has a commit of its own.
-        let snapshot = if spec.visible {
+        let snapshot = if visible {
             self.db.snapshot()?
         } else {
             self.db.durable_snapshot()?
         };
-        let start_seqno = snapshot.seqno();
-        let mut stream = FeedStream::new(open(
-            &spec.tables,
-            spec.visible,
-            &Start::Snapshot(snapshot),
-        )?);
+        let mut stream = FeedStream::new(open(tables, visible, &Start::Snapshot(snapshot))?);
+        let start_seqno = stream.position().seqno();
         let start_token = stream.token().as_bytes().to_vec();
         let (head, _) = watch::channel(0);
         let limit = self.limits.ring_bytes;
         let stats = Arc::clone(&self.stats);
+        let live = Arc::clone(&self.live);
+        live.fetch_add(1, Ordering::Relaxed);
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let weak = weak.clone();
             let task = tokio::spawn(async move {
                 loop {
-                    let item = next(&mut stream).await;
+                    // A poll that finds nothing records how far the feed got, so the ring's
+                    // `passed` follows other tables' writes (the engine wakes the hub on each
+                    // frontier move).
+                    let item = std::future::poll_fn(|cx| {
+                        let polled = Pin::new(&mut stream).poll_next(cx);
+                        if polled.is_pending()
+                            && let Some(hub) = weak.upgrade()
+                        {
+                            let at = stream.position().seqno();
+                            hub.note_passed(at, || stream.token().as_bytes().to_vec());
+                        }
+                        polled
+                    })
+                    .await;
                     let Some(hub) = weak.upgrade() else { return };
                     match item {
                         Some(Ok(commit)) => {
-                            hub.push(commit, stream.token().as_bytes().to_vec(), limit);
+                            let at = stream.position().seqno();
+                            hub.push(commit, stream.token().as_bytes().to_vec(), at, limit);
                         }
                         // An expiry, `Closed`, damage: each client goes on from its own
                         // token on its own stream, and the engine decides each (feed1248's
@@ -326,13 +361,15 @@ impl Feeds {
             .abort_handle();
             Hub {
                 ring: Mutex::new(Ring {
-                    start_token,
                     start_seqno,
+                    passed: start_seqno,
+                    passed_token: start_token,
                     ..Ring::default()
                 }),
                 head,
                 task,
                 stats,
+                live,
             }
         });
         hubs.insert(key, Arc::downgrade(&hub));
@@ -347,22 +384,35 @@ impl Feeds {
         slot: OwnedSemaphorePermit,
         on_end: impl FnOnce(Option<&ApiError>) + Send + 'static,
     ) -> Result<FeedEvents, ApiError> {
-        let hub = self.hub(&spec)?;
+        let hub = self.hub(&spec.tables, spec.visible)?;
+        let after = match spec.start {
+            Start::Now if spec.visible => self.db.snapshot()?.seqno(),
+            Start::Now => self.db.durable_snapshot()?.seqno(),
+            _ => 0,
+        };
         let (tx, rx) = mpsc::channel(1);
         let (end_tx, end_rx) = oneshot::channel();
         let client = Client {
             feeds: Arc::clone(self),
-            hub,
+            hub: Mutex::new(hub),
+            after,
             tables: spec.tables,
             prefix: spec.prefix,
             visible: spec.visible,
             tx,
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
-        // than the stream.
+        // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
+        // client waiting for a catch-up slot holds bytes, not a view that pins memtables
+        // (perf287's K1 on #1518).
         let first = match spec.start {
             Start::Now => None,
-            start => Some((open(&client.tables, client.visible, &start)?, start)),
+            start => {
+                let feed = open(&client.tables, client.visible, &start)?;
+                drop(start);
+                let token = feed.token();
+                Some((feed, token))
+            }
         };
         tokio::spawn(async move {
             let outcome = match client.run(first).await {
@@ -409,6 +459,12 @@ async fn next(stream: &mut FeedStream) -> Option<pigeonhole::Result<Commit>> {
     std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
 }
 
+/// How often a client on its own stream looks at its hub's ring for a place to rejoin.
+const REJOIN_TICK: Duration = Duration::from_millis(250);
+
+/// How often a client whose hub failed tries the key's current hub.
+const HUB_RETRY: Duration = Duration::from_secs(1);
+
 /// Where a client reads.
 enum Source {
     /// The hub's ring, from this index.
@@ -420,7 +476,12 @@ enum Source {
 
 struct Client {
     feeds: Arc<Feeds>,
-    hub: Arc<Hub>,
+    /// Its hub: replaced by the key's current one when it fails (F2).
+    hub: Mutex<Arc<Hub>>,
+    /// For a `Now` start, the database's seqno when it subscribed: commits at or below it
+    /// are passed over, as an in-process feed opened then would never deliver them, even
+    /// when the hub hadn't read them yet.
+    after: u64,
     tables: Vec<Table>,
     prefix: Vec<u8>,
     visible: bool,
@@ -437,31 +498,34 @@ struct Position {
 }
 
 impl Client {
-    async fn run(&self, first: Option<(pigeonhole::Feed, Start)>) -> Result<(), ApiError> {
+    fn hub(&self) -> Arc<Hub> {
+        Arc::clone(&self.hub.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    async fn run(&self, first: Option<(pigeonhole::Feed, FeedToken)>) -> Result<(), ApiError> {
         let mut pos;
         let mut source = match first {
             Some((feed, start)) => {
-                // A snapshot start is a known position; a token's or the oldest isn't, until
-                // the stream delivers a commit.
-                let known = match &start {
-                    Start::Snapshot(s) => Some(s.seqno()),
-                    _ => None,
-                };
                 // Opened at subscribe so a bad start fails the call. Waiting for a catch-up
                 // slot, it would hold an engine reader (and its shard wakers): drop it, and
-                // open it again once there's a slot.
+                // open it again from its start token once there's a slot.
                 let (feed, slot) = match Arc::clone(&self.feeds.catch_up).try_acquire_owned() {
                     Ok(slot) => (feed, slot),
                     Err(_) => {
                         drop(feed);
                         let slot = self.catch_up_slot().await?;
-                        (open(&self.tables, self.visible, &start)?, slot)
+                        (
+                            open(&self.tables, self.visible, &Start::Token(start))?,
+                            slot,
+                        )
                     }
                 };
                 let stream = FeedStream::new(feed);
                 let token = stream.token().as_bytes().to_vec();
+                // A position from the start: a token or the oldest start can rejoin as soon
+                // as the ring covers it, without waiting for a commit (simp724's F1).
                 pos = Position {
-                    seqno: known,
+                    seqno: Some(stream.position().seqno()),
                     sent: token.clone(),
                     token,
                     last_event: Instant::now(),
@@ -469,11 +533,11 @@ impl Client {
                 Source::Own(Box::new(stream), slot)
             }
             None => {
-                let r = self.hub.ring();
-                let last = r.entries.back();
+                let hub = self.hub();
+                let r = hub.ring();
                 pos = Position {
-                    seqno: Some(last.map_or(r.start_seqno, |e| e.commit.seqno())),
-                    token: last.map_or_else(|| r.start_token.clone(), |e| e.token.clone()),
+                    seqno: Some(r.passed),
+                    token: r.passed_token.clone(),
                     sent: Vec::new(),
                     last_event: Instant::now(),
                 };
@@ -481,10 +545,9 @@ impl Client {
                 Source::Ring(r.head())
             }
         };
-        let mut head = self.hub.head.subscribe();
         loop {
             source = match source {
-                Source::Ring(at) => self.read_ring(at, &mut pos, &mut head).await?,
+                Source::Ring(at) => self.read_ring(at, &mut pos).await?,
                 Source::Own(stream, slot) => self.read_own(stream, slot, &mut pos).await?,
             };
         }
@@ -506,15 +569,13 @@ impl Client {
 
     /// Reads the ring from `at` until the client must leave it: fallen off the tail, or the
     /// hub failed. Then its own stream, from its own last token.
-    async fn read_ring(
-        &self,
-        mut at: u64,
-        pos: &mut Position,
-        head: &mut watch::Receiver<u64>,
-    ) -> Result<Source, ApiError> {
+    async fn read_ring(&self, mut at: u64, pos: &mut Position) -> Result<Source, ApiError> {
+        let hub = self.hub();
+        // Subscribed before the first look at the ring, so no commit after it is missed.
+        let mut head = hub.head.subscribe();
         loop {
             let (batch, behind, failed) = {
-                let r = self.hub.ring();
+                let r = hub.ring();
                 if at < r.base {
                     (Vec::new(), true, r.failed)
                 } else {
@@ -528,15 +589,15 @@ impl Client {
                 if behind {
                     self.feeds.stats.fell_behind.fetch_add(1, Ordering::Relaxed);
                 }
+                // The slot first, then the feed: a waiting client holds no engine reader
+                // (simp724's F3, feed1248's S2 on #1518). The token is its whole position.
+                let slot = self.catch_up_slot().await?;
                 let feed = open(
                     &self.tables,
                     self.visible,
                     &Start::Token(FeedToken::from_bytes(pos.token.clone())),
                 )?;
-                return Ok(Source::Own(
-                    Box::new(FeedStream::new(feed)),
-                    self.catch_up_slot().await?,
-                ));
+                return Ok(Source::Own(Box::new(FeedStream::new(feed)), slot));
             }
             if batch.is_empty() {
                 let quiet =
@@ -547,7 +608,18 @@ impl Client {
                             return Err(ApiError::internal("the feed's hub ended"));
                         }
                     }
-                    () = quiet => self.progress(pos).await?,
+                    () = quiet => {
+                        // At the head: the hub's feed may have got further than its last
+                        // commit (other tables' writes), and its token with it.
+                        {
+                            let r = hub.ring();
+                            if at == r.head() && pos.seqno.is_none_or(|s| r.passed > s) {
+                                pos.seqno = Some(r.passed);
+                                pos.token = r.passed_token.clone();
+                            }
+                        }
+                        self.progress(pos).await?;
+                    }
                 }
                 continue;
             }
@@ -565,9 +637,20 @@ impl Client {
         slot: OwnedSemaphorePermit,
         pos: &mut Position,
     ) -> Result<Source, ApiError> {
+        let mut hub_retry: Option<Instant> = None;
         loop {
+            // A failed hub: take the key's current one, opening a new one if none (F2), at
+            // most once a second so a hub that keeps failing isn't reopened in a loop.
+            let mut hub = self.hub();
+            if hub.ring().failed && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
+                hub_retry = Some(Instant::now());
+                if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
+                    *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&new);
+                    hub = new;
+                }
+            }
             if let Some(seqno) = pos.seqno {
-                let r = self.hub.ring();
+                let r = hub.ring();
                 if !r.failed
                     && let Some(at) = r.rejoin_at(seqno)
                 {
@@ -577,21 +660,30 @@ impl Client {
                     return Ok(Source::Ring(at));
                 }
             }
-            let quiet = tokio::time::sleep_until((pos.last_event + self.feeds.limits.quiet).into());
+            // Woken by a commit, or every `REJOIN_TICK` to look at the ring again: a caught-up
+            // client gives its catch-up slot back as soon as it can rejoin.
+            let tick = tokio::time::sleep(REJOIN_TICK.min(self.feeds.limits.quiet));
             tokio::select! {
                 item = next(&mut stream) => match item {
                     Some(Ok(commit)) => {
                         let token = stream.token().as_bytes().to_vec();
                         self.cover(&commit, &token, pos).await?;
+                        pos.seqno = Some(stream.position().seqno());
                     }
                     Some(Err(e)) => return Err(e.into()),
                     None => return Err(ApiError::internal("the feed ended without an error")),
                 },
-                () = quiet => {
+                () = tick => {
                     // The stream may have read past commits of other tables: its position
-                    // moved without a commit.
-                    pos.token = stream.token().as_bytes().to_vec();
-                    self.progress(pos).await?;
+                    // moved without a commit, and its token with it.
+                    let at = stream.position().seqno();
+                    if pos.seqno.is_none_or(|s| at > s) {
+                        pos.seqno = Some(at);
+                        pos.token = stream.token().as_bytes().to_vec();
+                    }
+                    if pos.last_event.elapsed() >= self.feeds.limits.quiet {
+                        self.progress(pos).await?;
+                    }
                 }
             }
         }
@@ -607,6 +699,9 @@ impl Client {
     ) -> Result<(), ApiError> {
         pos.seqno = Some(commit.seqno());
         pos.token = token.to_vec();
+        if commit.seqno() <= self.after {
+            return Ok(());
+        }
         if let Some(c) = filtered(commit, &self.prefix) {
             self.send(
                 proto::FeedEvent {
@@ -727,8 +822,8 @@ mod tests {
     use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
 
     /// Real commits of seqnos the test can't choose, read off a feed.
-    fn commits(n: usize) -> (Vec<Commit>, Pigeonhole, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("phdb-feed-ring-{}", std::process::id()));
+    fn commits(name: &str, n: usize) -> (Vec<Commit>, Pigeonhole, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("phdb-feed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Pigeonhole::open(
@@ -761,6 +856,7 @@ mod tests {
     fn ring(start: u64, commits: &[Commit], evicted: usize) -> Ring {
         let mut r = Ring {
             start_seqno: start,
+            passed: commits.last().map_or(start, Commit::seqno),
             ..Ring::default()
         };
         let mut prev = start;
@@ -780,9 +876,92 @@ mod tests {
         r
     }
 
+    /// Commit seqnos from `events` until none comes for `quiet` (durable feeds: a commit
+    /// arrives once synced, which a slow disk or VM can take a while).
+    async fn seqnos(events: &mut FeedEvents, quiet: Duration) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(Some(e)) = tokio::time::timeout(
+            quiet,
+            std::future::poll_fn(|cx| Pin::new(&mut *events).poll_next(cx)),
+        )
+        .await
+        {
+            if let Some(proto::feed_event::Event::Commit(c)) = e.unwrap().event {
+                out.push(c.seqno);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_failed_hub_is_replaced_and_its_clients_rejoin_the_new_one() {
+        // feed1248's R1 and simp724's F2 on #1518.
+        let (_, db, dir) = commits("fail", 0);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(10),
+                stream_idle: Duration::from_secs(5),
+            },
+        );
+        let slots = Arc::new(Semaphore::new(8));
+        let spec = || Spec {
+            tables: vec![t.clone()],
+            prefix: Vec::new(),
+            visible: false,
+            start: Start::Now,
+        };
+        rt.block_on(async {
+            let slot = || Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut a = feeds.subscribe(spec(), slot(), |_| {}).unwrap();
+            let first = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            let w = |row: &str| {
+                t.mutate(row.as_bytes())
+                    .put("f", b"q", b"v")
+                    .commit()
+                    .unwrap()
+                    .seqno
+            };
+            let mut want = vec![w("a1")];
+            assert_eq!(seqnos(&mut a, Duration::from_secs(1)).await, want);
+            // The shared feed fails (an expiry, say): its engine task ends.
+            first.task.abort();
+            first.fail();
+            want.push(w("a2"));
+            // A new subscriber gets a fresh hub, and starts now, not from the failed one.
+            let mut b = feeds.subscribe(spec(), slot(), |_| {}).unwrap();
+            let second = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            assert!(!Arc::ptr_eq(&first, &second));
+            let after = vec![w("b1"), w("b2")];
+            want.extend(&after);
+            assert_eq!(seqnos(&mut b, Duration::from_secs(1)).await, after);
+            // The old client went on from its own token, once each, and rejoined the new hub,
+            // giving its catch-up slot back (one slot: a second laggard would wait for it).
+            let got = seqnos(&mut a, Duration::from_secs(2)).await;
+            assert_eq!(got, want[1..]);
+            assert_eq!(feeds.stats.hub_failures.load(Ordering::Relaxed), 1);
+            assert!(feeds.stats.rejoined.load(Ordering::Relaxed) >= 1);
+            assert_eq!(feeds.gauges().catching_up, 0);
+            drop((a, b, first, second));
+        });
+        drop(t);
+        drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_client_rejoins_only_where_the_ring_covers_it_and_has_passed_it() {
-        let (c, db, dir) = commits(3);
+        let (c, db, dir) = commits("ring", 3);
         let (a, b, z) = (c[0].seqno(), c[1].seqno(), c[2].seqno());
         let start = a - 1;
         let r = ring(start, &c[..2], 0);

@@ -3,4 +3,4 @@
   - Streams on the same table set share one engine subscription: the shard threads wake one reader for it, and the WAL is read once, whatever the number of subscribers.
   - A stream that starts from a token, a snapshot or the oldest commit, or falls behind, reads on its own until it catches up. Its events and tokens are the same either way.
   - Quiet streams send progress events and keepalives.
-  - New flags: `--max-streams` (256), `--max-feed-hubs` (32), `--max-catch-up` (16) and `--feed-ring-bytes` (64 MiB).
+  - New flags: `--max-streams` (256), `--max-feed-hubs` (32), `--max-catch-up` (16) and `--feed-ring-bytes` (256 MiB, in all).

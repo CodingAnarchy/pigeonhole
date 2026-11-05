@@ -368,7 +368,7 @@ u1   profile  name       1761030000000000  Ada
   - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page before ending the stream.
   - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
   - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
-  - `--feed-ring-bytes` (64 MiB): each table set's recent commits kept for its streams. This is outside `--inflight-bytes`: up to `--max-feed-hubs` times this in all.
+  - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. Each commit also carries its resume token (about 45 + 16 × shards bytes). This is outside `--inflight-bytes`; `/metrics` reports what's in use.
   - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
   - `--request-timeout-ms`: the longest wait for those limits. A gRPC client's shorter `grpc-timeout` wins, and running out of it is `DeadlineExceeded`.
   - A write the server has submitted always answers its real outcome.
