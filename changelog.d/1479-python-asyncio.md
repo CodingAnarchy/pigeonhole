@@ -10,3 +10,4 @@
 
 ### Changed
 - Python: `Database.transact` refuses an `async def` body with `TypeError` (use `transact_async`).
+- Python: `Database.transact`'s retries now count in the engine's `transaction_retries`, as the library's `transact` counts its own; `transact_async`'s count too.
