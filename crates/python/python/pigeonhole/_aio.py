@@ -15,7 +15,7 @@ from pigeonhole import _native  # type: ignore[attr-defined]  # the compiled mod
 async def transact(db, f, max_attempts, deadline, durability):
     if not callable(f):
         raise TypeError("transact_async takes an async def body")
-    retry = _native._Retry(max_attempts, deadline)
+    retry = _native._Retry(db, max_attempts, deadline)
     while True:
         txn = db.transaction()
         try:

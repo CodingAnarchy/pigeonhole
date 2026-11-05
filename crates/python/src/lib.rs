@@ -45,7 +45,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<arrow::ArrowStream>()?;
     m.add_class::<aio::Retry>()?;
     #[cfg(feature = "test-hooks")]
-    m.add_class::<aio::hooks::Gate>()?;
+    {
+        m.add_class::<aio::hooks::Gate>()?;
+        m.add_function(wrap_pyfunction!(aio::hooks::transaction_retries, m)?)?;
+    }
     m.add_class::<vector::VectorSpec>()?;
     m.add_class::<walk::Hop>()?;
     m.add_class::<walk::Traversal>()?;

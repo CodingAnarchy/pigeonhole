@@ -23,7 +23,11 @@
 //!   shard's queue after its cancel, and one not yet submitted is never submitted.
 //! - **Exit and fork:** the bridge attaches with `Python::try_attach`, so it never hangs on a
 //!   finalizing interpreter (it drops what's left). A forked child starts a fresh bridge on
-//!   its first await; futures carried over fail through the engine's own fork check.
+//!   its first parked await; an await started before `fork()` never completes in the child
+//!   (its task belongs to the parent's bridge), so start new ones there.
+//! - **A panic** in a poll, a result's conversion or a delivery fails that task with an
+//!   internal `RuntimeError` and never stops the bridge, which every await in the process
+//!   relies on (perf2's F1).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -78,8 +82,27 @@ struct Bridge {
 
 static BRIDGE: Mutex<Option<Arc<Bridge>>> = Mutex::new(None);
 
-/// The process's bridge, started on first use (and again in a forked child).
+thread_local! {
+    /// This thread's handle on the bridge, so a loop's parked awaits don't take `BRIDGE`'s
+    /// lock (perf2's F3). Checked against the pid: a forked child starts its own.
+    static LOCAL: std::cell::RefCell<Option<Arc<Bridge>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The process's bridge, started on the first parked await (and again in a forked child).
 fn bridge() -> Arc<Bridge> {
+    let pid = std::process::id();
+    LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        if let Some(b) = l.as_ref().filter(|b| b.pid == pid) {
+            return Arc::clone(b);
+        }
+        let b = shared_bridge();
+        *l = Some(Arc::clone(&b));
+        b
+    })
+}
+
+fn shared_bridge() -> Arc<Bridge> {
     let mut b = BRIDGE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -103,18 +126,21 @@ fn bridge() -> Arc<Bridge> {
 
 impl Bridge {
     fn run(&self) {
+        // F2: the queue and this spare swap under the lock, so neither the shard threads'
+        // pushes nor this drain allocate once both have grown.
+        let mut batch: VecDeque<Arc<Task>> = VecDeque::new();
         loop {
-            let batch: Vec<Arc<Task>> = {
+            {
                 let mut q = self.queue.lock().expect("not poisoned");
                 while q.is_empty() {
                     self.idle.store(true, Ordering::SeqCst);
                     q = self.ready.wait(q).expect("not poisoned");
                     self.idle.store(false, Ordering::SeqCst);
                 }
-                q.drain(..).collect()
-            };
+                std::mem::swap(&mut *q, &mut batch);
+            }
             let done: Vec<(Arc<Task>, Result<Output, String>)> = batch
-                .into_iter()
+                .drain(..)
                 .filter_map(|t| {
                     // R1: cleared before the poll, so a wake during it queues the task again.
                     t.queued.store(false, Ordering::SeqCst);
@@ -122,7 +148,11 @@ impl Bridge {
                 })
                 .collect();
             if !done.is_empty() {
-                deliver(done);
+                // F1: a drain that panics past its per-task guards is reported, and the
+                // bridge goes on.
+                if let Err(p) = catch_unwind(AssertUnwindSafe(|| deliver(done))) {
+                    eprintln!("pigeonhole-asyncio: {}", panic_message(&p));
+                }
             }
         }
     }
@@ -133,9 +163,13 @@ struct Task {
     fut: Mutex<Option<BoxFuture>>,
     queued: AtomicBool,
     cancelled: AtomicBool,
-    py_fut: Py<PyAny>,
-    event_loop: Py<PyAny>,
-    bridge: Arc<Bridge>,
+    /// The asyncio future and its loop: taken out under the GIL on delivery or cancel, so
+    /// the last `Arc<Task>`, often a stale waker the engine drops on a shard thread, holds
+    /// no Python object (cli692's P2).
+    py: Mutex<Option<(Py<PyAny>, Py<PyAny>)>>,
+    /// Set once the first poll is `Pending` (F3). A wake before that only sets `queued`, and
+    /// `start` queues the task itself.
+    bridge: std::sync::OnceLock<Arc<Bridge>>,
 }
 
 impl Wake for Task {
@@ -147,7 +181,9 @@ impl Wake for Task {
         if self.queued.swap(true, Ordering::SeqCst) {
             return;
         }
-        let b = &self.bridge;
+        let Some(b) = self.bridge.get() else {
+            return;
+        };
         b.queue
             .lock()
             .expect("not poisoned")
@@ -232,16 +268,22 @@ fn deliver(done: Vec<(Arc<Task>, Result<Output, String>)>) {
         };
         let mut loops: Vec<(Py<PyAny>, Vec<Bound<'_, PyTuple>>)> = Vec::new();
         for (task, r) in done {
-            let item = match batch_item(py, &task.py_fut, entry(py, r)) {
+            let converted = catch_unwind(AssertUnwindSafe(|| entry(py, r)))
+                .unwrap_or_else(|p| Entry::Error(PyRuntimeError::new_err(panic_message(&p))));
+            // Taken by a cancel already: nothing to complete.
+            let Some((fut, event_loop)) = task.py.lock().expect("not poisoned").take() else {
+                continue;
+            };
+            let item = match batch_item(py, &fut, converted) {
                 Ok(i) => i,
                 Err(e) => {
                     e.print(py);
                     continue;
                 }
             };
-            match loops.iter_mut().find(|(l, _)| l.is(&task.event_loop)) {
+            match loops.iter_mut().find(|(l, _)| l.is(&event_loop)) {
                 Some((_, items)) => items.push(item),
-                None => loops.push((task.event_loop.clone_ref(py), vec![item])),
+                None => loops.push((event_loop, vec![item])),
             }
         }
         for (l, items) in loops {
@@ -286,7 +328,13 @@ fn complete_one(item: &Bound<'_, PyAny>) -> PyResult<()> {
         }
         2 => {
             let r = value.call1((true,))?;
-            if !r.is_none() {
+            if r.is_none() {
+                // F4: can't happen for a live future; fail loudly rather than hang.
+                let e = PyRuntimeError::new_err(
+                    "internal error: a feed wait's commit was lost before it was delivered",
+                );
+                fut.call_method1("set_exception", (e,))?;
+            } else {
                 fut.call_method1("set_result", (r,))?;
             }
         }
@@ -314,6 +362,9 @@ impl CancelHook {
         }
         let task = &self.0;
         task.cancelled.store(true, Ordering::SeqCst);
+        // P2: the Python objects go here, under the GIL.
+        let objects = task.py.lock().expect("not poisoned").take();
+        drop(objects);
         let dropped = match task.fut.try_lock() {
             Ok(mut slot) => {
                 let fut = slot.take();
@@ -357,9 +408,8 @@ where
         fut: Mutex::new(None),
         queued: AtomicBool::new(false),
         cancelled: AtomicBool::new(false),
-        py_fut: fut.clone().unbind(),
-        event_loop: event_loop.clone().unbind(),
-        bridge: bridge(),
+        py: Mutex::new(Some((fut.clone().unbind(), event_loop.clone().unbind()))),
+        bridge: std::sync::OnceLock::new(),
     });
     let first = py.detach(|| {
         // R5: the slot stays locked from the first poll to the store, so a wake that comes
@@ -377,8 +427,18 @@ where
         r
     });
     match first {
-        Some(r) => complete_now(py, fut, entry(py, r)),
+        Some(r) => {
+            // Done at once: the task's Python objects go now, under the GIL (P2).
+            drop(task.py.lock().expect("not poisoned").take());
+            complete_now(py, fut, entry(py, r))
+        }
         None => {
+            let _ = task.bridge.set(bridge());
+            // A wake during the first poll found no bridge and only set `queued`: queue the
+            // task now (a duplicate push is harmless, R1).
+            if task.queued.swap(false, Ordering::SeqCst) {
+                task.wake_by_ref();
+            }
             fut.call_method1("add_done_callback", (CancelHook(task),))?;
             Ok(())
         }
@@ -396,6 +456,7 @@ pub(crate) fn complete_now(py: Python<'_>, fut: &Bound<'_, PyAny>, e: Entry) -> 
 /// attempts, backoff, deadline and retried codes.
 #[pyclass(module = "pigeonhole._native", name = "_Retry")]
 pub(crate) struct Retry {
+    db: pigeonhole::Pigeonhole,
     policy: pigeonhole::RetryPolicy,
     started: std::time::Instant,
     attempt: u32,
@@ -404,8 +465,12 @@ pub(crate) struct Retry {
 #[pymethods]
 impl Retry {
     #[new]
-    #[pyo3(signature = (max_attempts=None, deadline=None))]
-    fn new(max_attempts: Option<u32>, deadline: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (db, max_attempts=None, deadline=None))]
+    fn new(
+        db: &crate::db::Database,
+        max_attempts: Option<u32>,
+        deadline: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         use crate::Maybe;
         let mut policy = pigeonhole::RetryPolicy::default();
         policy = policy.maybe(max_attempts, |p, n| p.max_attempts(n));
@@ -413,6 +478,7 @@ impl Retry {
             policy = policy.deadline(crate::convert::duration(d)?);
         }
         Ok(Self {
+            db: db.db()?,
             policy,
             started: std::time::Instant::now(),
             attempt: 1,
@@ -436,6 +502,8 @@ impl Retry {
             .policy
             .next_pause(code, self.attempt, self.started.elapsed())?;
         self.attempt += 1;
+        // Counted as the library's `transact` counts its retries (cli692's N1).
+        self.db.note_transaction_retry();
         Some(pause.as_secs_f64())
     }
 }
@@ -480,6 +548,19 @@ pub(crate) mod hooks {
         }
     }
 
+    struct Panics(Held);
+
+    impl Future for Panics {
+        type Output = super::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match Pin::new(&mut self.0).poll(cx) {
+                Poll::Ready(_) => Poll::Ready(Box::new(|_| panic!("a test conversion panic"))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
     impl Drop for Held {
         fn drop(&mut self) {
             self.0.drops.fetch_add(1, Ordering::SeqCst);
@@ -501,6 +582,15 @@ pub(crate) mod hooks {
             Ok(fut)
         }
 
+        /// A future that panics converting its result once the gate opens (perf2's F1): it
+        /// fails with `RuntimeError`, and the bridge goes on serving others.
+        fn panicking_future<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let (event_loop, fut) = super::new_future(py)?;
+            let s = Arc::clone(&self.0);
+            super::start(py, &event_loop, &fut, move || Panics(Held(s)))?;
+            Ok(fut)
+        }
+
         /// Opens the gate and wakes its future (from any thread, like an engine wake).
         fn open(&self) {
             self.0.open.store(true, Ordering::SeqCst);
@@ -518,5 +608,13 @@ pub(crate) mod hooks {
         fn drops(&self) -> u64 {
             self.0.drops.load(Ordering::SeqCst)
         }
+    }
+
+    /// The database's `EngineMetrics::transaction_retries` (an inspection helper, for the
+    /// test that the Python transacts count their retries: cli692's N1).
+    #[pyfunction]
+    #[pyo3(name = "_transaction_retries")]
+    pub(crate) fn transaction_retries(db: &crate::db::Database) -> PyResult<u64> {
+        Ok(db.db()?.engine_metrics().transaction_retries)
     }
 }

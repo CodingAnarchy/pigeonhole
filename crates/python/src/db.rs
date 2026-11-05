@@ -393,7 +393,11 @@ impl Database {
                 return Err(err);
             }
             match policy.next_pause(code, attempt, started.elapsed()) {
-                Some(pause) => py.detach(|| std::thread::sleep(pause)),
+                Some(pause) => {
+                    // Counted as the library's `transact` counts its retries (cli692's N1).
+                    db.note_transaction_retry();
+                    py.detach(|| std::thread::sleep(pause));
+                }
                 None => return Err(err),
             }
             attempt += 1;

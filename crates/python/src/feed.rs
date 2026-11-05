@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -21,12 +21,17 @@ const SLICE: Duration = Duration::from_millis(100);
 /// A subscription to some tables' committed changes: whole commits, once each, in commit
 /// order. Get one from `Table.feed(...)`.
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Feed(Arc<Mutex<FeedState>>);
+pub(crate) struct Feed(Arc<Mutex<FeedState>>, Arc<Condvar>);
 
 /// The feed, and its one `next_async` wait (#1479).
 struct FeedState {
-    /// `None` once closed.
+    /// `None` once closed, or while a sync read has it out.
     feed: Option<pigeonhole::Feed>,
+    /// A sync `next`/`try_next` has the feed out and waits on it with this lock released
+    /// (cli692's P1: no engine wait ever holds this lock, which the bridge and the loop
+    /// take). Other sync calls wait for it on the condvar; `next_async` refuses.
+    out: bool,
+    closed: bool,
     /// A commit a `next_async` took from the feed, not yet handed to its future, with the
     /// feed's token from before it (B5). It's the next commit every caller gets, and
     /// `token()` gives that token, so a resume from it replays the commit.
@@ -95,12 +100,17 @@ fn closed() -> PyErr {
 
 impl Feed {
     pub(crate) fn new(feed: pigeonhole::Feed) -> Self {
-        Self(Arc::new(Mutex::new(FeedState {
-            feed: Some(feed),
-            slot: None,
-            wait: None,
-            generation: 0,
-        })))
+        Self(
+            Arc::new(Mutex::new(FeedState {
+                feed: Some(feed),
+                out: false,
+                closed: false,
+                slot: None,
+                wait: None,
+                generation: 0,
+            })),
+            Arc::new(Condvar::new()),
+        )
     }
 
     /// One wait of at most `slice`, with the GIL released: the slot's commit first.
@@ -121,7 +131,7 @@ impl Feed {
         slice: Option<Duration>,
     ) -> Result<Option<pigeonhole::Commit>, Refused> {
         py.detach(|| {
-            let mut g = self.0.lock().expect("not poisoned");
+            let mut g = self.lock_unread();
             if g.waiting() {
                 let w = g.wait.as_ref().expect("waiting");
                 return Err(Refused::Waiting(Arc::clone(&w.over), Arc::clone(&w.owner)));
@@ -129,14 +139,35 @@ impl Feed {
             if let Some((c, _)) = g.slot.take() {
                 return Ok(Some(c));
             }
-            let feed = g.feed.as_mut().ok_or(Refused::Closed)?;
+            let mut feed = g.feed.take().ok_or(Refused::Closed)?;
+            g.out = true;
+            // A cancelled wait still being dropped is superseded: it never polls the feed.
+            g.generation += 1;
+            drop(g);
             let next = match slice {
                 Some(d) => feed.next(d),
                 None => feed.try_next(),
             }
-            .map_err(Refused::Db)?;
-            Ok(next.cloned())
+            .map(|c| c.cloned());
+            let mut g = self.0.lock().expect("not poisoned");
+            g.out = false;
+            if !g.closed {
+                g.feed = Some(feed);
+            }
+            drop(g);
+            self.1.notify_all();
+            next.map_err(Refused::Db)
         })
+    }
+
+    /// The state, once no sync read has the feed out (without the GIL: a read waits up to
+    /// a slice).
+    fn lock_unread(&self) -> std::sync::MutexGuard<'_, FeedState> {
+        let mut g = self.0.lock().expect("not poisoned");
+        while g.out {
+            g = self.1.wait(g).expect("not poisoned");
+        }
+        g
     }
 
     /// `next` with an optional timeout: in slices, checking for signals between them.
@@ -197,6 +228,11 @@ impl Future for FeedWait {
             // Left by a superseded wait that took it after its cancel.
             this.finished = true;
             return Poll::Ready(this.claim());
+        }
+        if g.out {
+            // A sync read has the feed: only a superseded wait gets here, and the generation
+            // check above has already ended it.
+            return Poll::Pending;
         }
         let Some(feed) = g.feed.as_mut() else {
             g.wait = None;
@@ -292,7 +328,13 @@ impl Feed {
     /// call returns.
     fn next_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (event_loop, fut) = crate::aio::new_future(py)?;
-        let mut g = self.0.try_lock().map_err(|_| waiting())?;
+        // Brief: no engine wait holds this lock (P1).
+        let mut g = self.0.lock().expect("not poisoned");
+        if g.out {
+            return Err(PyValueError::new_err(
+                "a sync next is in progress on this feed",
+            ));
+        }
         if g.waiting() {
             let w = g.wait.as_ref().expect("waiting");
             if !owner_done(py, &w.over, &w.owner)? {
@@ -339,7 +381,7 @@ impl Feed {
         // The lock may be held by a thread waiting in `next`, for up to a slice: wait for
         // it without the GIL.
         let token = py.detach(|| {
-            let g = self.0.lock().expect("not poisoned");
+            let g = self.lock_unread();
             // A commit in the slot isn't delivered yet: the token from before it (B5).
             match (&g.slot, &g.feed) {
                 (Some((_, t)), _) => Some(t.clone()),
@@ -355,7 +397,7 @@ impl Feed {
     #[getter]
     fn oldest_retained(&self, py: Python<'_>) -> Option<u64> {
         py.detach(|| {
-            let g = self.0.lock().expect("not poisoned");
+            let g = self.lock_unread();
             g.feed.as_ref().and_then(pigeonhole::Feed::oldest_retained)
         })
     }
@@ -382,6 +424,8 @@ impl Feed {
     fn close(&self, py: Python<'_>) {
         py.detach(|| {
             let mut g = self.0.lock().expect("not poisoned");
+            // A sync read that has the feed out drops it when it comes back.
+            g.closed = true;
             g.feed = None;
             g.slot = None;
         });

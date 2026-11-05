@@ -319,7 +319,7 @@ The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutin
   - `txn.get_row` has no async form yet, so it can block the loop on a cache miss.
 - **`Feed.next_async()`** waits for the next commit. For a timeout, use `asyncio.wait_for(feed.next_async(), t)`.
   - A timeout or a cancel loses nothing: the commit it would have returned is the next one any call returns, and `feed.token()` still points before it.
-  - One wait at a time: a second `next_async`, or a sync `next`, during one raises `ValueError`.
+  - One wait at a time: a second `next_async`, or a sync `next`, during one raises `ValueError`, and so does a `next_async` while another thread's sync `next` waits.
 - **Cancelling a commit:**
   - Cancelled while it waits for room (an async commit waits when its shard has too many in flight), nothing is written.
   - Once it's submitted, it may still land, and the task can't tell which happened. To keep the outcome, await `asyncio.shield(m.commit_async())`.

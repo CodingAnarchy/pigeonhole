@@ -302,6 +302,23 @@ def test_a_wake_from_another_thread_completes_on_the_loop():
     run(main())
 
 
+def test_a_panicking_conversion_fails_its_future_and_the_bridge_goes_on():
+    """perf2's F1: a panic converting one result fails that future with RuntimeError; the
+    bridge thread survives, so later awaits still complete."""
+
+    async def main():
+        bad, good = gate(), gate()
+        f = bad.panicking_future()
+        bad.open()
+        with pytest.raises(RuntimeError, match="internal error"):
+            await asyncio.wait_for(f, 5)
+        g = good.future()
+        good.open()
+        assert await asyncio.wait_for(g, 5) is None
+
+    run(main())
+
+
 def test_many_loops_in_threads_and_a_closed_one(t):
     """B2: each future completes on its own loop; a loop closed with a commit pending drops
     that completion and breaks nothing."""
@@ -387,3 +404,109 @@ def test_uvloop():
 
     with tempfile.TemporaryDirectory() as d:
         uvloop.run(main(Path(d) / "u.phdb"))
+
+
+def test_a_sync_next_never_stalls_the_bridge(fdb, ft):
+    """cli692's P1 (a): after a cancelled next_async, a sync next(timeout=2) on another
+    thread waits with the feed's lock released, so the bridge (and an unrelated commit on
+    the loop) isn't held up behind it."""
+
+    async def main():
+        feed = ft.feed()
+        w = feed.next_async()
+        await asyncio.sleep(0.01)
+        w.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await w
+        th = threading.Thread(target=lambda: feed.next(timeout=2))
+        th.start()
+        await asyncio.sleep(0.05)
+        s = time.perf_counter()
+        await asyncio.wait_for(ft.mutate(b"other").put("f", b"q", b"v").commit_async(), 5)
+        took = time.perf_counter() - s
+        await asyncio.to_thread(th.join)
+        feed.close()
+        return took
+
+    assert run(main()) < 1.0
+
+
+def test_next_async_during_a_sync_next_is_refused_at_once(fdb, ft):
+    """cli692's P1 (b): the loop never blocks on a sync read's wait."""
+
+    async def main():
+        feed = ft.feed()
+        th = threading.Thread(target=lambda: feed.next(timeout=1))
+        th.start()
+        await asyncio.sleep(0.05)
+        s = time.perf_counter()
+        with pytest.raises(ValueError, match="sync next"):
+            feed.next_async()
+        took = time.perf_counter() - s
+        await asyncio.to_thread(th.join)
+        feed.close()
+        return took
+
+    assert run(main()) < 0.1
+
+
+def test_two_sync_nexts_on_one_feed_still_take_turns(fdb, ft):
+    """Unchanged sync behaviour: a second thread's next waits for the first, it isn't
+    refused."""
+    feed = ft.feed()
+    got = []
+    ths = [threading.Thread(target=lambda: got.append(feed.next(timeout=2))) for _ in range(2)]
+    for th in ths:
+        th.start()
+    time.sleep(0.05)
+    ft.mutate(b"a").put("f", b"q", b"1").commit()
+    ft.mutate(b"b").put("f", b"q", b"2").commit()
+    for th in ths:
+        th.join()
+    assert sorted(c.changes[0].row for c in got) == [b"a", b"b"]
+    feed.close()
+
+
+def test_both_transacts_count_their_retries(db, t):
+    """cli692's N1: a retried attempt counts in EngineMetrics.transaction_retries, from the
+    sync and the async transact alike."""
+    retries = getattr(ph._native, "_transaction_retries", None)
+    if retries is None:
+        pytest.skip("needs the test-hooks build")
+    t.put(b"a", "f", b"v", 0)
+    attempts = []
+
+    def body(txn):
+        attempts.append(1)
+        n = txn.get(t, b"a", "f", b"v").as_int()
+        if len(attempts) == 1:
+            t.put(b"a", "f", b"v", 100)
+        txn.put(t, b"a", "f", b"v", n + 1)
+
+    before = retries(db)
+    db.transact(body)
+    assert retries(db) == before + 1
+
+    attempts.clear()
+
+    async def abody(txn):
+        attempts.append(1)
+        n = (await txn.get_async(t, b"a", "f", b"v")).as_int()
+        if len(attempts) == 1:
+            t.put(b"a", "f", b"v", 200)
+        txn.put(t, b"a", "f", b"v", n + 1)
+
+    run(db.transact_async(abody))
+    assert retries(db) == before + 2
+
+
+def test_a_batch_called_with_no_loop_keeps_its_writes(db, t):
+    """cli692's N2: a commit_async that fails before submitting (no running loop) leaves
+    the batch's writes, so it can still be committed."""
+    wb = db.write_batch()
+    wb.put(t, b"x", "f", b"q", b"v")
+    with pytest.raises(RuntimeError):
+        wb.commit_async()
+    assert len(wb) == 1
+    wb.commit()
+    assert t.get(b"x", "f", b"q").value == b"v"
