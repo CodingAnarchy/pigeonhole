@@ -719,49 +719,20 @@ impl FeedReader {
                 return Ok(Next::Pending);
             }
             let mut park = deadline - now;
-            let target = self.frontier.saturating_add(1);
-            let waker = || std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
             match &self.writer {
                 // A reader process watches shared memory: a bounded backoff, never a spin.
                 None => {
                     park = park.min(self.backoff);
                     self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
                 }
-                // The feed's own holds (or a catalog change's) keep the frontier below the
-                // watermark: park on the hold list, which their release wakes, rather than
-                // poll every millisecond (#1417).
-                Some(feed) if held => {
-                    feed.wait_for_hold(self.key, &waker());
-                    on_hold_list = true;
-                    // A releaser's store before its wake, re-checked after the
-                    // registration's fence, so a wake that found the list empty is seen here.
-                    if self.catalog_wake_missed(feed) {
-                        continue;
-                    }
-                }
                 Some(feed) => {
-                    let waiters = if self.durable {
-                        &self.shared.durable_waiters
-                    } else {
-                        &self.shared.waiters
-                    };
-                    waiters.register(self.key, target, Wake::Task(waker()));
-                    // A feed of every table waits for catalog changes too, which move no
-                    // seqno: their release wakes the catalog list.
-                    if self.tables.is_empty() {
-                        feed.wait_for_catalog(self.key, &waker());
-                        on_hold_list = true;
-                        if self.catalog_wake_missed(feed) {
-                            continue;
-                        }
+                    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+                    if self.register_wake(feed, held, &waker, &mut on_hold_list) {
+                        continue;
                     }
                 }
             }
             if let Some(feed) = &self.writer {
-                // A publish or a release that missed the registration is seen here.
-                if self.shm.written_seqno(self.durable, self.tables.is_empty()) >= target {
-                    continue;
-                }
                 // A backstop, either way: a hold may pass the watermark later than the
                 // publish that wakes this, and a wake may be lost to a racing drain. Bound
                 // the sleep by the hold's interval.
@@ -828,50 +799,57 @@ impl FeedReader {
             let polled = match self.poll() {
                 Ok(p) => p,
                 Err(e) => {
-                    if on_hold_list {
-                        feed.forget_hold_waiter(self.key);
-                    }
+                    self.leave_hold_list(on_hold_list);
                     return Poll::Ready(Err(e));
                 }
             };
             let Polled::Pending { held } = polled else {
-                if on_hold_list {
-                    feed.forget_hold_waiter(self.key);
-                }
+                self.leave_hold_list(on_hold_list);
                 return Poll::Ready(Ok(self.lend(polled)));
             };
-            let target = self.frontier.saturating_add(1);
-            if held {
-                // The feed's own holds keep the frontier below the watermark: the shard wakes
-                // this when it lets one go.
-                feed.wait_for_hold(self.key, cx.waker());
-                on_hold_list = true;
-                // As in `wait`: a releaser's store before its wake, re-checked after the
-                // registration's fence (simp724's W2 on #1533).
-                if self.catalog_wake_missed(&feed) {
-                    continue;
-                }
-            } else {
-                let waiters = if self.durable {
-                    &self.shared.durable_waiters
-                } else {
-                    &self.shared.waiters
-                };
-                waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
-                // As in `wait`: a feed of every table waits for catalog changes too.
-                if self.tables.is_empty() {
-                    feed.wait_for_catalog(self.key, cx.waker());
-                    on_hold_list = true;
-                    if self.catalog_wake_missed(&feed) {
-                        continue;
-                    }
-                }
-            }
-            // A publish or a release that missed the registration is seen here.
-            if self.shm.written_seqno(self.durable, self.tables.is_empty()) < target {
+            if !self.register_wake(&feed, held, cx.waker(), &mut on_hold_list) {
                 return Poll::Pending;
             }
         }
+    }
+
+    /// Leaves `waker` where the frontier's next move wakes it, for [`wait`](Self::wait) and
+    /// [`poll_next`](Self::poll_next) in the writer process; `true` to poll again instead, as
+    /// something that wakes it may have come before the registration. `on_hold_list` notes
+    /// a waker left on the feed's hold list.
+    fn register_wake(
+        &self,
+        feed: &crate::feed::Feed,
+        held: bool,
+        waker: &std::task::Waker,
+        on_hold_list: &mut bool,
+    ) -> bool {
+        let target = self.frontier.saturating_add(1);
+        if held {
+            // The feed's own holds (or a catalog change's) keep the frontier below the
+            // watermark: park on the hold list, which their release wakes, rather than poll
+            // every millisecond (#1417).
+            feed.wait_for_hold(self.key, waker);
+            *on_hold_list = true;
+        } else {
+            let waiters = if self.durable {
+                &self.shared.durable_waiters
+            } else {
+                &self.shared.waiters
+            };
+            waiters.register(self.key, target, Wake::Task(waker.clone()));
+            // A feed of every table waits for catalog changes too, which move no seqno:
+            // their release wakes the catalog list.
+            if self.tables.is_empty() {
+                feed.wait_for_catalog(self.key, waker);
+                *on_hold_list = true;
+            }
+        }
+        // A releaser's store before its wake, re-checked after the registration's fence, so
+        // a wake that found the list empty is seen here (simp724's W2 on #1533); then a
+        // publish that missed the registration.
+        self.catalog_wake_missed(feed)
+            || self.shm.written_seqno(self.durable, self.tables.is_empty()) >= target
     }
 
     fn lend(&self, polled: Polled) -> Next<'_> {
