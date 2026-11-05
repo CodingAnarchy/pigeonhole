@@ -716,7 +716,8 @@ impl Feed {
             let next = match self.reader.poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(next)) => next,
-                // `Unsupported` in a reader process: not the feed's failure, so not kept.
+                // `Unsupported` in a reader process: not the feed's failure, so not kept. Tested
+                // before a recovery's swap (`read_error`), which a reader process never makes.
                 Poll::Ready(Err(e @ pigeonhole_engine::Error::Unsupported(_))) => {
                     return Poll::Ready(Err(e.into()));
                 }
