@@ -206,12 +206,8 @@ impl Future for ReturningFuture {
                     let previous = pending.take_previous();
                     let out = r
                         .map(|(info, cells)| {
-                            crate::Returned::new(
-                                CommitInfo::from_engine(info),
-                                table,
-                                cells,
-                                previous,
-                            )
+                            crate::Returned::new(CommitInfo::from_engine(info), table, cells)
+                                .with_previous(previous)
                         })
                         .map_err(|e| crate::write::commit_error(e, *largest, *max));
                     self.state = ReturningState::Ready(None);

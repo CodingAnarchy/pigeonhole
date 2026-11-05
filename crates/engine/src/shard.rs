@@ -1243,14 +1243,22 @@ pub(crate) type ReturnSlot = Arc<Mutex<ReturnState>>;
 /// A returning commit's request and results (D314).
 #[derive(Debug, Default)]
 pub(crate) struct ReturnState {
-    /// The columns of the commit's row whose values just before the commit to read
-    /// (D314 amendment 1): the committer's, taken by the shard.
-    pub previous_of: Vec<(FamilyId, Vec<u8>)>,
     /// Each counter cell the commit incremented, in the order the batch first wrote it;
     /// `None` until the shard folds them.
     pub cells: Option<Vec<crate::engine::Returned>>,
-    /// Each column of `previous_of`, in its order, as it was just before the commit.
-    pub previous: Vec<crate::engine::Previous>,
+    /// The commit's request for previous values (D314 amendment 1), boxed so a commit that
+    /// makes none carries one null pointer (#1517).
+    pub previous: Option<Box<PreviousState>>,
+}
+
+/// A returning commit's request for previous values, and the shard's answer.
+#[derive(Debug)]
+pub(crate) struct PreviousState {
+    /// The columns of the commit's row whose values just before the commit to read: the
+    /// committer's, taken by the shard.
+    pub of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `of`, in its order, as it was just before the commit.
+    pub values: Vec<crate::engine::Previous>,
 }
 
 /// One counter cell a returning commit incremented, as the shard reads it from the batch.
@@ -7759,11 +7767,10 @@ impl ShardState {
                         // slot only at its reply, so holding it across the reads contends
                         // with nothing.
                         let mut out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
-                        let previous_of = std::mem::take(&mut out.previous_of);
                         out.cells = Some(self.fold_returning(&m.bytes, m.seqno, m.commit_ts));
-                        if !previous_of.is_empty() {
-                            out.previous =
-                                self.previous_values(&m.bytes, previous_of, m.seqno, m.commit_ts);
+                        if let Some(p) = out.previous.as_deref_mut() {
+                            let of = std::mem::take(&mut p.of);
+                            p.values = self.previous_values(&m.bytes, of, m.seqno, m.commit_ts);
                         }
                     }
                     if let Err(e) = applied {

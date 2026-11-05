@@ -268,7 +268,25 @@ impl Builder {
         engine: &pigeonhole_engine::Engine,
         max_value: usize,
         durability: Option<Durability>,
-        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<(CommitInfo, Vec<pigeonhole_engine::Returned>)> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let largest = self.largest_value;
+        engine
+            .commit_returning(self.batch, durability.map(Durability::engine))
+            .map(|(info, cells)| (CommitInfo::from_engine(info), cells))
+            .map_err(|e| commit_error(e, largest, max_value))
+    }
+
+    /// [`commit_returning`](Self::commit_returning), also returning the columns of
+    /// `previous_of` as they were just before the commit (D314 amendment 1).
+    fn commit_returning_previous(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+        previous_of: PreviousOf,
     ) -> Result<(
         CommitInfo,
         Vec<pigeonhole_engine::Returned>,
@@ -291,16 +309,19 @@ impl Builder {
         engine: &pigeonhole_engine::Engine,
         max_value: usize,
         durability: Option<Durability>,
-        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        previous_of: Option<Box<PreviousOf>>,
     ) -> Result<(pigeonhole_engine::PendingReturning, usize)> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let largest = self.largest_value;
-        engine
-            .submit_returning_previous(self.batch, durability.map(Durability::engine), previous_of)
-            .map(|p| (p, largest))
-            .map_err(|e| commit_error(e, largest, max_value))
+        let durability = durability.map(Durability::engine);
+        match previous_of {
+            None => engine.submit_returning(self.batch, durability),
+            Some(of) => engine.submit_returning_previous(self.batch, durability, *of),
+        }
+        .map(|p| (p, largest))
+        .map_err(|e| commit_error(e, largest, max_value))
     }
 
     /// Commits through `db`, reporting the first builder error instead if there was one.
@@ -512,8 +533,12 @@ pub struct RowMutation<'t> {
     durability: Option<Durability>,
     /// The columns whose values before the commit [`commit_returning`](Self::commit_returning)
     /// returns (D314 amendment 1).
-    previous_of: Vec<(FamilyId, Vec<u8>)>,
+    previous_of: Option<Box<PreviousOf>>,
 }
+
+/// The columns a mutation asked [`RowMutation::return_previous`] for. Boxed in the
+/// mutation, so one that asks for none carries a null pointer (#1517).
+type PreviousOf = Vec<(FamilyId, Vec<u8>)>;
 
 impl<'t> RowMutation<'t> {
     pub(crate) fn new(table: &'t Table, row: &[u8]) -> Self {
@@ -522,18 +547,16 @@ impl<'t> RowMutation<'t> {
             row: row.to_vec(),
             builder: Builder::default(),
             durability: None,
-            previous_of: Vec::new(),
+            previous_of: None,
         }
     }
 
     /// Refuses previous-value requests on a commit that doesn't return them, so none is
     /// dropped silently (D314 amendment 1).
+    #[inline(always)]
     fn no_previous(&mut self) {
-        if !self.previous_of.is_empty() {
-            self.builder.fail(Error::new(
-                crate::ErrorCode::InvalidArgument,
-                "return_previous needs commit_returning",
-            ));
+        if self.previous_of.is_some() {
+            refuse_previous(&mut self.builder);
         }
     }
 
@@ -958,12 +981,9 @@ impl RowMutation<'_> {
     pub fn return_previous(mut self, family: &str, qualifier: &[u8]) -> Self {
         match self.table.family_id(family) {
             Ok(id) => {
-                if !self
-                    .previous_of
-                    .iter()
-                    .any(|(f, q)| *f == id && q == qualifier)
-                {
-                    self.previous_of.push((id, qualifier.to_vec()));
+                let of = self.previous_of.get_or_insert_default();
+                if !of.iter().any(|(f, q)| *f == id && q == qualifier) {
+                    of.push((id, qualifier.to_vec()));
                 }
             }
             Err(e) => self.builder.fail(e),
@@ -1022,11 +1042,14 @@ impl RowMutation<'_> {
             previous_of,
             ..
         } = self;
+        if let Some(of) = previous_of {
+            return commit_returning_previous(table, builder, durability, *of);
+        }
         let generation = table.db.before_commit()?;
-        let (info, cells, previous) = builder
-            .commit_returning(&table.engine(), table.db.max_value, durability, previous_of)
+        let (info, cells) = builder
+            .commit_returning(&table.engine(), table.db.max_value, durability)
             .map_err(|e| table.db.after_commit_closed(generation, e))?;
-        Ok(Returned::new(info, &table.info, cells, previous))
+        Ok(Returned::new(info, &table.info, cells))
     }
 
     /// Submits as an async returning commit (D314, D210).
@@ -2863,6 +2886,56 @@ impl Transaction {
     }
 }
 
+/// Refuses a `return_previous` request on a commit that returns nothing. Out of line, so
+/// `commit` and the async submits pay one test for it (#1517: inlined, `commit-async` cost
+/// 8 instructions more).
+#[cold]
+#[inline(never)]
+fn refuse_previous(builder: &mut Builder) {
+    builder.fail(Error::new(
+        crate::ErrorCode::InvalidArgument,
+        "return_previous needs commit_returning",
+    ));
+}
+
+/// [`RowMutation::commit_returning`] for a mutation that asked for previous values. Out of
+/// line, so the plain path keeps its shape and inlining (#1517).
+#[inline(never)]
+fn commit_returning_previous(
+    table: &TableCore,
+    builder: Builder,
+    durability: Option<Durability>,
+    previous_of: PreviousOf,
+) -> Result<Returned> {
+    let generation = table.db.before_commit()?;
+    let (info, cells, previous) = builder
+        .commit_returning_previous(&table.engine(), table.db.max_value, durability, previous_of)
+        .map_err(|e| table.db.after_commit_closed(generation, e))?;
+    Ok(Returned::new_with_previous(
+        info,
+        &table.info,
+        cells,
+        previous,
+    ))
+}
+
+/// A returning commit's previous values, kept as timestamp and stored bytes (so
+/// [`Returned`] holds no cache block and stays `UnwindSafe`). Out of line: most returning
+/// commits ask for none.
+#[cold]
+fn previous_cells(previous: Vec<pigeonhole_engine::Previous>) -> Vec<PreviousCell> {
+    previous
+        .into_iter()
+        .map(|p| {
+            let value = p
+                .value
+                .map(|v| v.map(|c| (c.timestamp(), c.stored().to_vec())))
+                .map_err(Error::from);
+            (p.family, p.qualifier, value)
+        })
+        .collect()
+}
+
 /// The 1.1.0 name of [`Returned`], from when it held counters only (D314 amendment 1).
 pub type Incremented = Returned;
 
@@ -2893,6 +2966,26 @@ impl Returned {
         info: CommitInfo,
         table: &Arc<pigeonhole_engine::TableInfo>,
         cells: Vec<pigeonhole_engine::Returned>,
+    ) -> Self {
+        Self {
+            info,
+            table: Arc::clone(table),
+            cells: cells
+                .into_iter()
+                .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
+                .collect(),
+            previous: Vec::new(),
+        }
+    }
+
+    /// [`new`](Self::new) with the previous values a [`RowMutation::return_previous`]
+    /// commit asked for. Apart from `new`, which plain returning commits inline (a third
+    /// caller of `new` put its collect out of line, about 30 instructions a commit, #1517).
+    #[cold]
+    pub(crate) fn new_with_previous(
+        info: CommitInfo,
+        table: &Arc<pigeonhole_engine::TableInfo>,
+        cells: Vec<pigeonhole_engine::Returned>,
         previous: Vec<pigeonhole_engine::Previous>,
     ) -> Self {
         Self {
@@ -2902,17 +2995,16 @@ impl Returned {
                 .into_iter()
                 .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
                 .collect(),
-            previous: previous
-                .into_iter()
-                .map(|p| {
-                    let value = p
-                        .value
-                        .map(|v| v.map(|c| (c.timestamp(), c.stored().to_vec())))
-                        .map_err(Error::from);
-                    (p.family, p.qualifier, value)
-                })
-                .collect(),
+            previous: previous_cells(previous),
         }
+    }
+
+    /// With the previous values a [`RowMutation::return_previous`] commit asked for.
+    pub(crate) fn with_previous(mut self, previous: Vec<pigeonhole_engine::Previous>) -> Self {
+        if !previous.is_empty() {
+            self.previous = previous_cells(previous);
+        }
+        self
     }
 
     /// The column `family:qualifier` that [`RowMutation::return_previous`] asked for, as it
