@@ -5907,7 +5907,7 @@ impl ShardState {
         columns
             .into_iter()
             .map(|(family, qualifier)| crate::engine::Previous {
-                value: self.read_before(table, family, row, &qualifier, seqno, now),
+                value: self.read_before::<true>(table, family, row, &qualifier, seqno, now),
                 family,
                 qualifier,
             })
@@ -5930,7 +5930,7 @@ impl ShardState {
     ) -> Result<bool> {
         let (family, qualifier) = predicate_column(predicate);
         let now = self.shared.vfs.now_micros();
-        let cell = self.read_before(table, family, row, qualifier, u64::MAX, now)?;
+        let cell = self.read_before::<true>(table, family, row, qualifier, u64::MAX, now)?;
         let holds = match predicate {
             Predicate::Exists { .. } => cell.is_some(),
             Predicate::Absent { .. } => cell.is_none(),
@@ -5949,7 +5949,7 @@ impl ShardState {
                 let value = if f == family && q == qualifier {
                     Ok(cell.clone())
                 } else {
-                    self.read_before(table, f, row, &q, u64::MAX, now)
+                    self.read_before::<true>(table, f, row, &q, u64::MAX, now)
                 };
                 crate::engine::Previous {
                     family: f,
@@ -6610,7 +6610,7 @@ impl ShardState {
             .into_iter()
             .map(|(family, qualifier)| {
                 let value = match &row {
-                    Some((table, row)) => self.read_before(
+                    Some((table, row)) => self.read_before::<false>(
                         *table,
                         family,
                         row,
@@ -6632,12 +6632,12 @@ impl ShardState {
     /// The newest visible version of one column at `seqno`, with the family's TTL judged at
     /// `now`, as a get at that snapshot returns it (a separated value read out).
     ///
-    /// Always inlined: a returning commit's previous values read through it, and with the
-    /// returning check's two cold callers LTO outlined it, and its by-value `Result<Option<Cell>>`
-    /// return cost two more copies per read (+120 instructions per commit on x86's
-    /// `commit-put-previous`, #1566).
-    #[inline(always)]
-    fn read_before(
+    /// `COLD` changes nothing in the read: it makes the returning check's callers
+    /// (`::<true>`) their own instance, closures included, so `previous_values` (`::<false>`)
+    /// stays its only caller, as before #1566. Shared by three callers, LTO outlined it and
+    /// the generic `FlushedRoots::read` it calls, which cost `commit-put-previous` on x86
+    /// (the zero-cost-by-type pattern of #1284).
+    fn read_before<const COLD: bool>(
         &self,
         table: TableId,
         family: FamilyId,
