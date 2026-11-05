@@ -1138,3 +1138,132 @@ fn an_intent_naming_another_root_of_its_sequence_is_never_adopted() {
     drop(r);
     db.close().unwrap();
 }
+
+/// simp724's R4 on #1504 (D315 amendment): around a root commit, a power loss either
+/// expires a durable feed or keeps its whole history: never a silent gap. The intent is not
+/// synced, so a power loss can lose it (the sim's power crash keeps only synced data) or,
+/// on a real device, tear it; both read as a torn tail, cut off. A root whose superblock
+/// landed then has no entry, so the chain breaks and the token expires; one that didn't has
+/// nothing to lose. An intent mid-file (a build that doesn't resolve intents opened and
+/// appended after the crash) breaks the chain too. Whatever happens, a feed that resumes
+/// delivers every durable commit after its token.
+#[test]
+fn a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry};
+    use pigeonhole_io::Vfs;
+    use pigeonhole_io::sim::CrashKind;
+    #[derive(Debug, Clone, Copy)]
+    enum Damage {
+        /// The sim's power crash, held between the intent and the superblock.
+        PowerBeforeSuperblock,
+        /// The sim's power crash, held between the superblock and the Root entry.
+        PowerAfterSuperblock,
+        /// The trailing intent cut in half (a torn write), then a process crash.
+        TornIntent,
+        /// A Session entry appended after the trailing intent, as an older build's open does.
+        IntentMidFile,
+    }
+    for (i, damage) in [
+        Damage::PowerBeforeSuperblock,
+        Damage::PowerAfterSuperblock,
+        Damage::TornIntent,
+        Damage::IntentMidFile,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let vfs = SimVfs::new(3200 + i as u64);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let s1 = single(&db, &a, b"before", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, s1);
+        let token = r.token();
+        drop(r);
+        let mid = single(&db, &a, b"mid", Durability::Sync);
+        let hold = Duration::from_millis(1500);
+        match damage {
+            Damage::PowerBeforeSuperblock => db.delay_root_intent(hold),
+            _ => db.delay_root_observer(hold),
+        }
+        let flush = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let _ = db.flush();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        match damage {
+            Damage::PowerBeforeSuperblock | Damage::PowerAfterSuperblock => {
+                vfs.crash(CrashKind::Power)
+            }
+            Damage::TornIntent | Damage::IntentMidFile => {
+                // The intent is the sidecar's last entry now, its superblock written.
+                let path = format!("{DB}{FEED_SUFFIX}");
+                let f = vfs
+                    .open(
+                        Path::new(&path),
+                        pigeonhole_io::OpenOptions::read_write_create(),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(
+                        sidecar_entries(&vfs).last(),
+                        Some(FeedEntry::RootIntent { .. })
+                    ),
+                    "{damage:?}: held with the intent last"
+                );
+                let len = f.len().unwrap();
+                if matches!(damage, Damage::TornIntent) {
+                    f.set_len(len - 12).unwrap();
+                } else {
+                    let mut bytes = Vec::new();
+                    FeedEntry::Session {
+                        session: 0x5e55,
+                        opened_at: 0,
+                        retention_bytes: 1 << 20,
+                        retention_age_secs: 0,
+                        streams: 2,
+                        tables: pigeonhole_format::feed::FeedTables::All,
+                    }
+                    .encode(&mut bytes);
+                    f.write_at(&bytes, len).unwrap();
+                }
+                drop(f);
+                vfs.crash(CrashKind::Process);
+            }
+        }
+        flush.join().unwrap();
+        drop(db);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let a = db.table("a").unwrap();
+        let s2 = single(&db, &a, b"after", Durability::GroupSync);
+        let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+        let mut got = Vec::new();
+        let expired = loop {
+            match r.wait(WAIT).unwrap() {
+                Next::Commit(c) => {
+                    got.push(c.seqno);
+                    if c.seqno == s2 {
+                        break false;
+                    }
+                }
+                Next::Expired(_) => break true,
+                other => panic!("{damage:?}: {other:?} after {got:?}"),
+            }
+        };
+        if !expired {
+            assert!(
+                got.contains(&mid) && got.ends_with(&[s2]),
+                "{damage:?}: resumed, so with the whole history: {got:?} (mid {mid}, after {s2})"
+            );
+        }
+        // Where the root landed and its entry was lost, torn or buried, the token must
+        // expire: resuming would skip that session's later roots unseen.
+        if !matches!(damage, Damage::PowerBeforeSuperblock) {
+            assert!(expired, "{damage:?}: a root whose entry is gone is a break");
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}
