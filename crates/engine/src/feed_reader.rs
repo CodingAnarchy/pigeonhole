@@ -47,11 +47,6 @@ const TOKEN_VERSION: u8 = 1;
 /// refuses the token as not one (`InvalidArgument`), never misreading it.
 const TOKEN_VERSION_ALL: u8 = 2;
 
-/// How long a waiting reader sleeps when the frontier is held by the change feed's own
-/// holds (a lazy flush or background sync to come) or a stream's next segment header is not
-/// on disk yet: the wait is bounded, never a spin.
-const HELD_BACKOFF: Duration = Duration::from_millis(1);
-
 /// Where a feed starts.
 #[derive(Debug, Clone)]
 pub enum FeedStart {
@@ -330,6 +325,8 @@ pub struct FeedReader {
     read_through: Option<Seqno>,
     /// Polls that read the streams (an inspection count for tests).
     stream_reads: u64,
+    /// Polls of any kind (an inspection count for tests, #1417).
+    polls: u64,
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
@@ -515,6 +512,7 @@ impl FeedReader {
             frontier: 0,
             read_through: None,
             stream_reads: 0,
+            polls: 0,
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
@@ -679,51 +677,86 @@ impl FeedReader {
 
     /// The next whole commit, waiting up to `timeout` for one. Waits on the watermark the
     /// feed follows (never spins): a commit wakes it once its seqno passes; where the feed's
-    /// own holds keep the frontier back, it looks again every millisecond.
+    /// own holds, or a catalog change's, keep the frontier back, it waits on the feed's hold
+    /// list, which their release wakes (#1417), bounded by the hold's interval. A reader
+    /// process, with no hold list, backs off from 50 µs to 5 ms.
     pub fn wait(&mut self, timeout: Duration) -> Result<Next<'_>> {
         let deadline = Instant::now() + timeout;
+        // Whether this call left a waker on the feed's hold list: taken back on the way out,
+        // so releases don't keep waking a waiter that isn't waiting (as `poll_next` does).
+        let mut on_hold_list = false;
         loop {
-            let polled = self.poll()?;
+            let polled = match self.poll() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.leave_hold_list(on_hold_list);
+                    return Err(e);
+                }
+            };
             let Polled::Pending { held } = polled else {
+                self.leave_hold_list(on_hold_list);
                 self.backoff = READER_BACKOFF_MIN;
                 return Ok(self.lend(polled));
             };
             let now = Instant::now();
             if now >= deadline {
+                self.leave_hold_list(on_hold_list);
                 return Ok(Next::Pending);
             }
             let mut park = deadline - now;
-            if self.writer.is_none() {
+            let target = self.frontier.saturating_add(1);
+            let waker = || std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+            match &self.writer {
                 // A reader process watches shared memory: a bounded backoff, never a spin.
-                park = park.min(self.backoff);
-                self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
-            } else if held {
-                park = park.min(HELD_BACKOFF);
-            } else {
-                let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
-                let target = self.frontier.saturating_add(1);
-                let waiters = if self.durable {
-                    &self.shared.durable_waiters
-                } else {
-                    &self.shared.waiters
-                };
-                waiters.register(self.key, target, Wake::Task(waker));
-                // A publish that missed the registration is seen here.
+                None => {
+                    park = park.min(self.backoff);
+                    self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
+                }
+                // The feed's own holds (or a catalog change's) keep the frontier below the
+                // watermark: park on the hold list, which their release wakes, rather than
+                // poll every millisecond (#1417).
+                Some(feed) if held => {
+                    feed.wait_for_hold(self.key, &waker());
+                    on_hold_list = true;
+                    // A frozen catalog hold's releaser stores `appends_stopped`, then wakes
+                    // the list: re-checked after the registration's fence, so a wake that
+                    // found the list empty is seen here (simp724's W2 on #1533).
+                    if self.tables.is_empty() && feed.appends_stopped() {
+                        continue;
+                    }
+                }
+                Some(_) => {
+                    let waiters = if self.durable {
+                        &self.shared.durable_waiters
+                    } else {
+                        &self.shared.waiters
+                    };
+                    waiters.register(self.key, target, Wake::Task(waker()));
+                }
+            }
+            if let Some(feed) = &self.writer {
+                // A publish or a release that missed the registration is seen here.
                 if self.shm.written_seqno(self.durable, self.tables.is_empty()) >= target {
                     continue;
                 }
-                // The feed's holds may pass the watermark later than the publish that
-                // wakes this: bound the sleep by the hold's interval.
-                if let Some(feed) = &self.writer {
-                    let hold = if self.durable {
-                        feed.sync_interval_nanos
-                    } else {
-                        feed.flush_interval_nanos
-                    };
-                    park = park.min(Duration::from_nanos(hold));
-                }
+                // A backstop, either way: a hold may pass the watermark later than the
+                // publish that wakes this, and a wake may be lost to a racing drain. Bound
+                // the sleep by the hold's interval.
+                let hold = if self.durable {
+                    feed.sync_interval_nanos
+                } else {
+                    feed.flush_interval_nanos
+                };
+                park = park.min(Duration::from_nanos(hold));
             }
             std::thread::park_timeout(park);
+        }
+    }
+
+    /// Takes this reader's waker off the feed's hold list, if `on` (it left one there).
+    fn leave_hold_list(&self, on: bool) {
+        if on && let Some(feed) = &self.writer {
+            feed.forget_hold_waiter(self.key);
         }
     }
 
@@ -773,6 +806,11 @@ impl FeedReader {
                 // this when it lets one go.
                 feed.wait_for_hold(self.key, cx.waker());
                 on_hold_list = true;
+                // As in `wait`: a frozen catalog hold's `appends_stopped`, stored before its
+                // wake, is re-checked after the registration's fence (simp724's W2 on #1533).
+                if self.tables.is_empty() && feed.appends_stopped() {
+                    continue;
+                }
             } else {
                 let waiters = if self.durable {
                     &self.shared.durable_waiters
@@ -987,6 +1025,7 @@ impl FeedReader {
     /// position keeps up with the frontier it passes. One `fetch_max` a poll, on the feed's
     /// own thread; nothing on the commit path.
     fn poll(&mut self) -> Result<Polled> {
+        self.polls += 1;
         let polled = self.poll_inner();
         if let Some(p) = &self.progress {
             p.fetch_max(self.position().seqno, Ordering::Relaxed);
@@ -1114,6 +1153,12 @@ impl FeedReader {
     #[cfg(feature = "test-hooks")]
     pub fn stream_reads(&self) -> u64 {
         self.stream_reads
+    }
+
+    /// Polls of any kind since the reader opened (#1417).
+    #[cfg(feature = "test-hooks")]
+    pub fn polls(&self) -> u64 {
+        self.polls
     }
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.

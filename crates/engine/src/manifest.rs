@@ -1122,16 +1122,23 @@ fn catalog_names(old: &Catalog, edits: &[Edit]) -> Vec<(TableId, String)> {
 /// Drops a catalog change's staged edits, if its root-commit observer didn't append them (a
 /// failed or refused commit), and releases its hold on the change feed (D315).
 fn release_catalog(shared: &Shared) {
-    if let Some(feed) = &shared.feed {
-        feed.unstage_catalog();
-        // This commit's own append failed (or an earlier one did): the hold, at this change's
-        // ceiling, stays up for the rest of the session, so no feed passes it (simp724).
-        if feed.appends_stopped() {
-            feed.freeze_catalog_hold();
-            return;
-        }
+    let Some(feed) = &shared.feed else {
+        shared.shm.publish_catalog_hold(u64::MAX);
+        return;
+    };
+    feed.unstage_catalog();
+    // This commit's own append failed (or an earlier one did): the hold, at this change's
+    // ceiling, stays up for the rest of the session, so no feed passes it (simp724).
+    if feed.appends_stopped() {
+        feed.freeze_catalog_hold();
+    } else {
+        shared.shm.publish_catalog_hold(u64::MAX);
     }
-    shared.shm.publish_catalog_hold(u64::MAX);
+    // A feed of every table the hold kept back waits on the feed's hold list, as for the
+    // shard's WRITTEN/SYNCED holds: woken after the release is stored (its fence pairs with
+    // `wait_for_hold`'s), so the release is never missed (#1417). And when the hold froze:
+    // that feed re-polls and expires, as the stopped appends say (simp724's W1 on #1533).
+    feed.wake_hold_waiters();
 }
 
 /// Finishes a commit whose root commit returned `result`: publishes the view, retires what

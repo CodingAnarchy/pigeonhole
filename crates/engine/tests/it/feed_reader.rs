@@ -1684,3 +1684,123 @@ fn a_damaged_root_entry_mid_file_expires_rather_than_cuts_silently() {
     drop(r);
     db.close().unwrap();
 }
+
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// #1417 (D315's catalog hold): an async feed of every table that a catalog change's hold
+/// keeps back (`held`: the frontier is below the watermark) waits on the feed's hold list,
+/// and the change's release wakes it. Without that wake it slept until some other hold let
+/// go, which a workload of only `GroupSync` commits may never do.
+#[test]
+fn a_catalog_change_s_release_wakes_a_feed_it_held_back() {
+    let vfs = SimVfs::new(3221);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // The create's root commit waits in its observer, its hold up meanwhile.
+    db.delay_root_observer(Duration::from_millis(600));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.create_table("c", &[("g".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    // A commit at or above the hold's ceiling: visible, but held from the feed's frontier.
+    let s = single(&db, &a, b"held", Durability::GroupSync);
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        r.poll_next(&mut cx).is_pending(),
+        "held back by the create's hold"
+    );
+    create.join().unwrap();
+    db.delay_root_observer(Duration::ZERO);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the hold's release never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // And it then delivers: the create, then the commit.
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        match r.wait(WAIT).unwrap() {
+            Next::Catalog(_) => got.push("catalog".to_string()),
+            Next::Commit(c) => got.push(format!("c{}", c.seqno)),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(got, ["catalog".to_string(), format!("c{s}")]);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// simp724's W1 on #1533: when a catalog change's hold freezes (its Root write fails, so the
+/// session's sidecar appends stop), the change's release still wakes the hold list, so an
+/// async feed of every table it kept back re-polls and expires, on a quiet database with no
+/// other write to wake it. Mutation-checked: without the wake on the frozen path the feed
+/// is never woken.
+#[test]
+fn a_frozen_catalog_hold_wakes_the_feed_it_keeps_back_to_expire() {
+    let vfs = SimVfs::new(3223);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // The create's intent is written; its root commit then waits in the observer, the hold up.
+    db.delay_root_observer(Duration::from_millis(600));
+    let create = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _ = db.create_table("c", &[("g".into(), FamilyOptions::default())]);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(150));
+    single(&db, &a, b"held", Durability::GroupSync);
+    let wakes = Arc::new(Wakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    {
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            r.poll_next(&mut cx).is_pending(),
+            "held back by the create's hold"
+        );
+    }
+    // The observer's Root write fails: the session's appends stop, the hold freezes.
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    create.join().unwrap();
+    vfs.set_faults(FaultPlan::none());
+    db.delay_root_observer(Duration::ZERO);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while wakes.0.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the frozen hold's release never woke the feed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cx = std::task::Context::from_waker(&waker);
+    match r.poll_next(&mut cx) {
+        std::task::Poll::Ready(Ok(Next::Expired(_))) => {}
+        other => panic!(
+            "woken, it expires: {:?}",
+            other.map(|n| n.map(|n| format!("{n:?}")))
+        ),
+    }
+    drop(r);
+    db.close().unwrap();
+}
