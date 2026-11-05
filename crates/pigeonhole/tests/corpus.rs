@@ -147,7 +147,7 @@ fn write_entry(e: &Entry, seed: u64, path: &str, observer_delay: Duration) -> Ar
     (e.write)(&db);
     if let Some(then) = e.then {
         db.close().unwrap();
-        db = Pigeonhole::open(path, sim_options(&vfs, e.shards)).unwrap();
+        db = Pigeonhole::open(path, (e.then_options)(sim_options(&vfs, e.shards))).unwrap();
         db.delay_root_observer(observer_delay);
         then(&db);
     }
@@ -219,7 +219,19 @@ struct Entry {
     /// reopens it with the simulator's options alone (so it inherits what the first open
     /// set), and runs this before the entry's crash or close.
     then: Option<fn(&Pigeonhole)>,
+    /// What the later session's open adds to the simulator's options ([`same`]: nothing, so
+    /// it inherits what the first open set).
+    then_options: fn(Options) -> Options,
+    /// Whether 1.1.0, the first release with the feed, must resume the entry's stored table
+    /// feed token and deliver what this build listed: `compat-reader-1.1` does it for an entry
+    /// with the marker file [`FEED_RESUMES`] (the D315 amendment: a 1.2 sidecar after clean
+    /// closes holds only entries 1.1.0 reads, when no session changed the catalog).
+    feed_resumes_by_1_1: bool,
 }
+
+/// The marker file of an entry whose stored feed token 1.1.0 must resume
+/// ([`Entry::feed_resumes_by_1_1`]).
+const FEED_RESUMES: &str = "feed-resumes-by-1.1.0.txt";
 
 /// An entry's open adds nothing.
 fn same(o: Options) -> Options {
@@ -237,6 +249,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "values",
@@ -247,6 +261,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "counters",
@@ -257,6 +273,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "blobs",
@@ -267,6 +285,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "merge",
@@ -277,6 +297,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "wal_crash",
@@ -287,6 +309,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "families",
@@ -297,6 +321,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "wal_ops",
@@ -307,6 +333,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "checkpoints",
@@ -317,6 +345,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "aggregates",
@@ -327,6 +357,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "vectors",
@@ -337,6 +369,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(vectors_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "text",
@@ -348,6 +382,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(text_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "memory",
@@ -358,6 +394,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(memory_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "feed",
@@ -368,6 +406,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "feed_crash",
@@ -378,6 +418,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "feed_sessions",
@@ -388,6 +430,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_oldest_extra),
             then: Some(write_feed_session),
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "returning",
@@ -398,6 +442,8 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
         },
         Entry {
             name: "feed_catalog",
@@ -408,6 +454,20 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_catalog_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+        },
+        Entry {
+            name: "feed_root_intent",
+            shards: 2,
+            options: same,
+            write: create_feed_tables,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_extra),
+            then: Some(write_feed_commits),
+            then_options: feed_options,
+            feed_resumes_by_1_1: true,
         },
     ]
 }
@@ -1111,6 +1171,68 @@ fn write_feed(db: &Pigeonhole) {
         .unwrap();
 }
 
+/// `feed_root_intent`'s first session, with the feed off: the tables, and no catalog
+/// change in any feeding session's sidecar, which 1.1.0 couldn't read past.
+fn create_feed_tables(db: &Pigeonhole) {
+    for (name, families) in [
+        ("events", &["e"][..]),
+        ("other", &["e"][..]),
+        (FEED_TOKEN.0, &["t"][..]),
+    ] {
+        let mut b = db.table(name).unwrap();
+        for f in families {
+            b = b.family(f, Family::default());
+        }
+        b.create().unwrap();
+    }
+}
+
+/// `feed_root_intent`'s second session, with the feed on (D315 amendment, #1504): a table
+/// feed's token, stored, then commits to two tables with flushes between, so the session's
+/// root commits record their intents and overwrite them with their Root entries, and a clean
+/// close. Its sidecar then holds Session and Root entries only, as 1.1.0's do.
+fn write_feed_commits(db: &Pigeonhole) {
+    let events = db.table("events").unwrap().open().unwrap();
+    let other = db.table("other").unwrap().open().unwrap();
+    let tokens = db.table(FEED_TOKEN.0).unwrap().open().unwrap();
+    let token = events.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    let mut last = 0;
+    for i in 0..60u64 {
+        let row = format!("r{:02}", i % 7);
+        last = events
+            .mutate(row.as_bytes())
+            .put_at(
+                "e",
+                b"what",
+                T0 + i,
+                format!("event {i:03} ").repeat(40).as_bytes(),
+            )
+            .commit()
+            .unwrap()
+            .seqno;
+        if i % 4 == 0 {
+            other
+                .mutate(row.as_bytes())
+                .put("e", b"x", b"not followed")
+                .commit()
+                .unwrap();
+        }
+        if i % 20 == 19 {
+            db.flush().unwrap();
+        }
+    }
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
 /// Every commit after the stored token, as a resumed feed delivers them, up to the stored
 /// last seqno: one line per change, with a value's bytes as their length and xxh3-64 (the
 /// puts are long).
@@ -1610,6 +1732,13 @@ fn generate_corpus() {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
         std::fs::write(dir.join("expected.txt"), &expected).unwrap();
+        if e.feed_resumes_by_1_1 {
+            std::fs::write(
+                dir.join(FEED_RESUMES),
+                "compat-reader-1.1 resumes this entry's stored table feed token (D315 amendment)\n",
+            )
+            .unwrap();
+        }
         if let Some(extra) = &extra {
             std::fs::write(dir.join(EXTRA), extra).unwrap();
             frozen.push(frozen_line(

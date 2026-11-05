@@ -566,7 +566,18 @@ The change feed's sidecar (D310), `data.phdb-feed` beside `data.phdb`. It isn't 
 - a **Session** entry, from an open with the feed on (creating the file if it's missing, or replacing one whose header is another database's or damaged);
 - an **Unfed** entry, from an open with the feed off, only if the file exists.
 
-A feeding session then appends a **Root** entry after each root commit it makes (§8.2), including its close's. Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry appended while the previous sync was in flight (D310 call 4). A failed sync ends the session's appends. A lost entry (a crash between a root commit and its entry's sync, or a failed sync) only makes the next comparison see a gap.
+A feeding session records each root commit it makes (§8.2), including its close's, in two steps (the D315 amendment, #1504):
+1. **Before the commit writes anything,** it appends a **RootIntent** entry naming the new superblock, after the commit's Catalog entry if it has one. These appends aren't synced.
+2. **Once the commit is durable,** it **overwrites that intent in place with the Root entry**: the same framed length, one write. This is the sidecar's only write in place. If the session appended no intent for the commit, it appends the Root entry instead.
+
+Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry written while the previous sync was in flight (D310 call 4). A failed write or sync ends the session's appends.
+
+**An open resolves a RootIntent the last session left as the file's last entry,** before it appends its own:
+- if the superblock it read has the intent's `sequence` and `checksum`, the root landed, and the open overwrites the intent with that session's Root entry;
+- if the superblock's `sequence` is one less, the root didn't land, and the open cuts the file at the intent, or at the Catalog entry of the same `sequence` just before it;
+- otherwise it leaves it.
+
+So a process crash anywhere in a root commit leaves no gap. A lost or torn entry (a power loss before the sync, or a failed sync) only makes the next comparison see one.
 
 Header (40 bytes):
 
@@ -589,14 +600,15 @@ Header (40 bytes):
 | Session | `1` | `session` u64 (random, nonzero), `opened_at` u64 (the superblock `sequence` the open read, before any root commit of its own), `retention_bytes` u64, `retention_age_secs` u64 (0 = none), `streams` u32 (WAL streams, the shard count), `all_tables` u8 (1 = every table), `count` u32, then `count` × `table` u32 (zero when `all_tables` is 1) |
 | Root | `2` | `session` u64, `sequence` u64 (the new superblock's) |
 | Unfed | `3` | `sequence` u64 (the superblock `sequence` the open read) |
-| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Then, only if there are any, the names: `names` u32, then `names` × (`table` u32, `name` as varint length + bytes), one for each table a `PutFamily` or `DropTable` names that no `CreateTable` of the same entry creates, once each, as the catalog named it before the edits applied (D315 2b), so a reader names a dropped table without the catalog. An entry that ends after its edits has none. A `names` count of 0, or one above the bytes left over 5, doesn't decode, so each entry has one encoding. Appended just before that root commit's Root entry, in the same append |
+| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Then, only if there are any, the names: `names` u32, then `names` × (`table` u32, `name` as varint length + bytes), one for each table a `PutFamily` or `DropTable` names that no `CreateTable` of the same entry creates, once each, as the catalog named it before the edits applied (D315 2b), so a reader names a dropped table without the catalog. An entry that ends after its edits has none. A `names` count of 0, or one above the bytes left over 5, doesn't decode, so each entry has one encoding. Appended just before that root commit's RootIntent, in the same append, before the commit writes. It counts only once that root's Root entry follows it: until then, the root may not have landed |
+| RootIntent | `5` | `sequence` u64 (the new superblock's), `checksum` u64 (its checksum, §8.2: the xxh3-64 of bytes 0..120). A root commit about to happen, overwritten by its Root entry once durable (the same framed length: 25 bytes). One left by a crash is resolved by the next open, as above; any other one a reader reads breaks the chain (D315 amendment) |
 
 **Torn and unknown entries:**
 - A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
 - A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
 - An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it. So does a Catalog entry holding an edit the reader can't decode: it isn't torn, and a writer doesn't cut it off.
 
-**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal.
+**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal. A RootIntent entry breaks the chain: a resolved one is gone, so one still in the file is the live session's commit in progress, after the entries the chain reads, or an intent no open could decide.
 
 The history ends at any of these:
 - a segment marked 0, or marked by another session;
