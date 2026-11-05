@@ -2103,7 +2103,7 @@ impl Engine {
             cells: None,
             previous: Some(Box::new(crate::shard::PreviousState {
                 of: previous_of,
-                ..Default::default()
+                values: Vec::new(),
             })),
         })))
     }
@@ -2182,8 +2182,8 @@ impl Engine {
     /// way (D314 amendment 2, #1446): when the condition holds, the batch's incremented
     /// counters (as [`commit_returning`](Self::commit_returning)), each of `previous_of` as
     /// it was just before the commit, and each of `current_of` as of the commit; when it
-    /// fails, each of `current_of` as the condition saw it (the applied state), with the
-    /// seqno a snapshot reads them at. The condition's own column is always reported, first.
+    /// fails, each of `current_of` as the condition saw it (the applied state). The
+    /// condition's own column is always reported, first.
     /// Every family must be in `table`.
     #[allow(clippy::too_many_arguments)]
     pub fn check_and_mutate_returning(
@@ -2280,7 +2280,7 @@ impl Engine {
         predicate: &Predicate,
         previous_of: Vec<(FamilyId, Vec<u8>)>,
         mut current_of: Vec<(FamilyId, Vec<u8>)>,
-    ) -> Result<crate::shard::ReturnSlot> {
+    ) -> Result<crate::shard::CheckSlot> {
         let (family, qualifier) = match predicate {
             Predicate::Exists { family, qualifier }
             | Predicate::Absent { family, qualifier }
@@ -2299,13 +2299,10 @@ impl Engine {
                 )));
             }
         }
-        Ok(Arc::new(Mutex::new(crate::shard::ReturnState {
-            cells: None,
-            previous: Some(Box::new(crate::shard::PreviousState {
-                of: previous_of,
-                current_of,
-                ..Default::default()
-            })),
+        Ok(Arc::new(Mutex::new(crate::shard::CheckState {
+            previous_of,
+            current_of,
+            ..Default::default()
         })))
     }
 
@@ -6493,7 +6490,7 @@ pub struct CheckReturned {
 #[derive(Debug)]
 pub struct PendingCheckReturning {
     pending: PendingCheck,
-    out: crate::shard::ReturnSlot,
+    out: crate::shard::CheckSlot,
 }
 
 impl PendingCheckReturning {
@@ -6525,26 +6522,24 @@ impl std::future::Future for PendingCheckReturning {
 type CheckNotifier = pigeonhole_runtime::Notifier<Result<(bool, Option<CommitInfo>)>>;
 
 /// The reply a returning check's shard fills `out` for (D314 amendment 2).
-fn check_reply(out: &crate::shard::ReturnSlot) -> impl FnOnce(CheckNotifier) -> Reply + use<> {
+fn check_reply(out: &crate::shard::CheckSlot) -> impl FnOnce(CheckNotifier) -> Reply + use<> {
     let out = Arc::clone(out);
     move |notifier| Reply::CheckReturning(Box::new(crate::shard::CheckReturning { notifier, out }))
 }
 
 /// What the shard left in a returning check's slot (set before its reply).
 fn check_returned(
-    out: &crate::shard::ReturnSlot,
+    out: &crate::shard::CheckSlot,
     applied: bool,
     info: Option<CommitInfo>,
 ) -> CheckReturned {
     let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
-    let cells = out.cells.take().unwrap_or_default();
-    let p = out.previous.take().map(|p| *p).unwrap_or_default();
     CheckReturned {
         applied,
         info,
-        cells,
-        previous: p.values,
-        current: p.current,
+        cells: out.cells.take().unwrap_or_default(),
+        previous: std::mem::take(&mut out.previous),
+        current: std::mem::take(&mut out.current),
     }
 }
 

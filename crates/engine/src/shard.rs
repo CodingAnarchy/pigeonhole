@@ -1245,7 +1245,28 @@ pub(crate) enum Reply {
 #[derive(Debug)]
 pub(crate) struct CheckReturning {
     pub notifier: Notifier<Result<(bool, Option<CommitInfo>)>>,
-    pub out: ReturnSlot,
+    pub out: CheckSlot,
+}
+
+/// Where a returning check's values go (D314 amendment 2). Its own type, so a returning
+/// commit's [`ReturnState`] and [`PreviousState`] stay as small as before it (#1566: their
+/// extra fields cost `commit-put-previous` on x86).
+pub(crate) type CheckSlot = Arc<Mutex<CheckState>>;
+
+/// A returning check's request and results (D314 amendment 2).
+#[derive(Debug, Default)]
+pub(crate) struct CheckState {
+    /// Each counter cell an applied check incremented, as [`ReturnState::cells`].
+    pub cells: Option<Vec<crate::engine::Returned>>,
+    /// The columns whose values just before an applied check to read.
+    pub previous_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `previous_of`, in its order, when the check applied.
+    pub previous: Vec<crate::engine::Previous>,
+    /// The columns to report as they are: the condition's own column first. As of the
+    /// commit when the check applies, or as the condition saw them when it fails.
+    pub current_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `current_of`, in its order.
+    pub current: Vec<crate::engine::Previous>,
 }
 
 /// A returning commit's reply (D314): `Commit`'s notifier, and the slot the shard fills with
@@ -1272,20 +1293,14 @@ pub(crate) struct ReturnState {
     pub previous: Option<Box<PreviousState>>,
 }
 
-/// A returning commit's request for column values, and the shard's answer.
-#[derive(Debug, Default)]
+/// A returning commit's request for previous values, and the shard's answer.
+#[derive(Debug)]
 pub(crate) struct PreviousState {
     /// The columns of the commit's row whose values just before the commit to read: the
     /// committer's, taken by the shard.
     pub of: Vec<(FamilyId, Vec<u8>)>,
     /// Each column of `of`, in its order, as it was just before the commit.
     pub values: Vec<crate::engine::Previous>,
-    /// A returning check's columns to report as they are (D314 amendment 2): the
-    /// condition's own column first. As of the commit when it applies, or as the condition
-    /// saw them when it fails.
-    pub current_of: Vec<(FamilyId, Vec<u8>)>,
-    /// Each column of `current_of`, in its order.
-    pub current: Vec<crate::engine::Previous>,
 }
 
 /// One counter cell a returning commit incremented, as the shard reads it from the batch.
@@ -5864,7 +5879,7 @@ impl ShardState {
     #[inline(never)]
     fn fill_applied_check(
         &mut self,
-        slot: &ReturnSlot,
+        slot: &CheckSlot,
         bytes: &Bytes,
         table: TableId,
         row: &[u8],
@@ -5873,12 +5888,10 @@ impl ShardState {
     ) {
         let mut out = slot.lock().unwrap_or_else(PoisonError::into_inner);
         out.cells = Some(self.fold_returning(bytes, seqno, commit_ts));
-        if let Some(p) = out.previous.as_deref_mut() {
-            let of = std::mem::take(&mut p.of);
-            p.values = self.column_values(table, row, of, seqno.saturating_sub(1), commit_ts);
-            let of = std::mem::take(&mut p.current_of);
-            p.current = self.column_values(table, row, of, seqno, commit_ts);
-        }
+        let of = std::mem::take(&mut out.previous_of);
+        out.previous = self.column_values(table, row, of, seqno.saturating_sub(1), commit_ts);
+        let of = std::mem::take(&mut out.current_of);
+        out.current = self.column_values(table, row, of, seqno, commit_ts);
     }
 
     /// Each of `columns` of `row`, its newest visible version at `seqno` with TTL judged at
@@ -5913,7 +5926,7 @@ impl ShardState {
         table: TableId,
         row: &[u8],
         predicate: &Predicate,
-        out: &ReturnSlot,
+        out: &CheckSlot,
     ) -> Result<bool> {
         let (family, qualifier) = predicate_column(predicate);
         let now = self.shared.vfs.now_micros();
@@ -5929,24 +5942,22 @@ impl ShardState {
             return Ok(true);
         }
         let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(p) = out.previous.as_deref_mut() {
-            let of = std::mem::take(&mut p.current_of);
-            p.current = of
-                .into_iter()
-                .map(|(f, q)| {
-                    let value = if f == family && q == qualifier {
-                        Ok(cell.clone())
-                    } else {
-                        self.read_before(table, f, row, &q, u64::MAX, now)
-                    };
-                    crate::engine::Previous {
-                        family: f,
-                        qualifier: q,
-                        value,
-                    }
-                })
-                .collect();
-        }
+        let of = std::mem::take(&mut out.current_of);
+        out.current = of
+            .into_iter()
+            .map(|(f, q)| {
+                let value = if f == family && q == qualifier {
+                    Ok(cell.clone())
+                } else {
+                    self.read_before(table, f, row, &q, u64::MAX, now)
+                };
+                crate::engine::Previous {
+                    family: f,
+                    qualifier: q,
+                    value,
+                }
+            })
+            .collect();
         Ok(false)
     }
 
@@ -8835,12 +8846,10 @@ impl ShardState {
                 // group, or it would report a state the row never had (simp724's S1 on #1446).
                 if !same && let Reply::CheckReturning(r) = &m.reply {
                     let out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
-                    if let Some(p) = out.previous.as_deref() {
-                        same = p
-                            .current_of
-                            .iter()
-                            .any(|(f, q)| writes_cell(admitted.iter(), *table, row, *f, q));
-                    }
+                    same = out
+                        .current_of
+                        .iter()
+                        .any(|(f, q)| writes_cell(admitted.iter(), *table, row, *f, q));
                 }
             }
         }
