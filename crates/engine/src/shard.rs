@@ -6620,6 +6620,12 @@ impl ShardState {
 
     /// The newest visible version of one column at `seqno`, with the family's TTL judged at
     /// `now`, as a get at that snapshot returns it (a separated value read out).
+    ///
+    /// Always inlined: a returning commit's previous values read through it, and with the
+    /// returning check's two cold callers LTO outlined it, and its by-value `Result<Option<Cell>>`
+    /// return cost two more copies per read (+120 instructions per commit on x86's
+    /// `commit-put-previous`, #1566).
+    #[inline(always)]
     fn read_before(
         &self,
         table: TableId,

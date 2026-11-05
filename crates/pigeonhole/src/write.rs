@@ -3128,6 +3128,8 @@ fn previous_cells(previous: Vec<pigeonhole_engine::Previous>) -> Vec<PreviousCel
 
 /// The asked-for column `family:qualifier` among `cells`, as an owned `Cell`;
 /// `InvalidArgument` if it wasn't asked for (`what`: "previous" or "current").
+/// Always inlined, as [`Returned::previous`]'s body was before it was shared (#1566).
+#[inline(always)]
 fn column(
     table: &pigeonhole_engine::TableInfo,
     cells: &[PreviousCell],
