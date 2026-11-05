@@ -139,23 +139,24 @@ impl Feed {
             if let Some((c, _)) = g.slot.take() {
                 return Ok(Some(c));
             }
-            let mut feed = g.feed.take().ok_or(Refused::Closed)?;
+            let feed = g.feed.take().ok_or(Refused::Closed)?;
             g.out = true;
             // A cancelled wait still being dropped is superseded: it never polls the feed.
             g.generation += 1;
             drop(g);
+            // Puts the feed back and wakes the sync callers taking turns, even if the wait
+            // panics (cli692's N3).
+            let mut out = Out {
+                feed: Some(feed),
+                home: self,
+            };
+            let feed = out.feed.as_mut().expect("just taken");
             let next = match slice {
                 Some(d) => feed.next(d),
                 None => feed.try_next(),
             }
             .map(|c| c.cloned());
-            let mut g = self.0.lock().expect("not poisoned");
-            g.out = false;
-            if !g.closed {
-                g.feed = Some(feed);
-            }
-            drop(g);
-            self.1.notify_all();
+            drop(out);
             next.map_err(Refused::Db)
         })
     }
@@ -186,6 +187,29 @@ impl Feed {
                 return Ok(None);
             }
         }
+    }
+}
+
+/// A sync read's hold on the feed, out of the state: dropped (even by a panic), it puts the
+/// feed back, unless the feed was closed meanwhile, and wakes the callers waiting a turn.
+struct Out<'a> {
+    feed: Option<pigeonhole::Feed>,
+    home: &'a Feed,
+}
+
+impl Drop for Out<'_> {
+    fn drop(&mut self) {
+        let mut g = self
+            .home
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.out = false;
+        if !g.closed {
+            g.feed = self.feed.take();
+        }
+        drop(g);
+        self.home.1.notify_all();
     }
 }
 

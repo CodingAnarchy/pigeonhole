@@ -435,7 +435,10 @@ where
         None => {
             let _ = task.bridge.set(bridge());
             // A wake during the first poll found no bridge and only set `queued`: queue the
-            // task now (a duplicate push is harmless, R1).
+            // task now (a duplicate push is harmless, R1). Both sides must stay `SeqCst`
+            // swaps on `queued` (the waker swaps, then reads `bridge`; this sets `bridge`,
+            // then swaps): a plain store/load pair would be a store-buffering race in which
+            // neither side sees the other, and the wake is lost (perf2 on #1547).
             if task.queued.swap(false, Ordering::SeqCst) {
                 task.wake_by_ref();
             }
