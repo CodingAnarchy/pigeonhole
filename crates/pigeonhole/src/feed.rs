@@ -434,10 +434,10 @@ impl FeedBuilder {
                 names,
                 commit: Commit::empty(),
                 event: None,
+                oldest_retained: None,
+                failed: None,
             },
             covered: pigeonhole_engine::FeedPosition::default(),
-            oldest_retained: None,
-            failed: None,
             progress: FeedProgress::attach(reader_progress),
         })
     }
@@ -509,17 +509,12 @@ pub struct Feed {
     reader: FeedReader,
     /// The engine generation `reader` reads (D265).
     generation: u64,
-    /// What the last call delivered, and the names that fill it.
+    /// What the last call delivered, the names that fill it, and how the feed ended.
     out: Delivery,
     /// The position covered by the readers before the current one (a recovery's or a writer
     /// restart's resubscribe starts the new one at the token's delivered seqno, which can
     /// be below it).
     covered: pigeonhole_engine::FeedPosition,
-    oldest_retained: Option<u64>,
-    /// The error that ended the feed, returned by every later call (simp724 on #1321): the
-    /// reader had already moved past the commit it was delivering, so going on would skip
-    /// it.
-    failed: Option<Error>,
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
 }
@@ -662,26 +657,17 @@ impl Feed {
             });
             let next = match self.reader.wait(left) {
                 Ok(next) => next,
-                // A reader process's writer restarted: follow it from the token.
-                Err(pigeonhole_engine::Error::SnapshotExpired) => {
-                    self.resubscribe()?;
+                Err(e) => {
+                    self.read_error(e)?;
                     continue;
                 }
-                // The old engine failing under a recovery's swap: follow the recovery.
-                Err(_) if swapped(&self.db, self.generation) => continue,
-                Err(e) => return Err(fail(&mut self.failed, e.into())),
             };
-            match step(&mut self.out, &self.db, self.generation, next, events) {
-                Ok(Step::Ready) => return Ok(true),
+            match step(&mut self.out, &self.db, self.generation, next, events)? {
+                Step::Ready => return Ok(true),
                 // A catalog change a commits-only call passes over, or a superseded
                 // reader's expiry: look again (the engine returns at once if more is ready).
-                Ok(Step::Again) => continue,
-                Ok(Step::Pending) => {}
-                Ok(Step::Expired(oldest, e)) => {
-                    self.oldest_retained = oldest;
-                    return Err(e);
-                }
-                Err(e) => return Err(fail(&mut self.failed, e)),
+                Step::Again => continue,
+                Step::Pending => {}
             }
             // Out of time, unless a recovery's swap ended the old engine's wait early (look
             // again on the new one) or the wait was one slice of a longer one.
@@ -700,25 +686,15 @@ impl Feed {
             self.follow_recovery()?;
             let next = match self.reader.try_next() {
                 Ok(next) => next,
-                // A reader process's writer restarted: follow it from the token.
-                Err(pigeonhole_engine::Error::SnapshotExpired) => {
-                    self.resubscribe()?;
+                Err(e) => {
+                    self.read_error(e)?;
                     continue;
                 }
-                // The old engine failing under a recovery's swap: follow it and look again
-                // (a swap is rare, so this goes round once or twice).
-                Err(_) if swapped(&self.db, self.generation) => continue,
-                Err(e) => return Err(fail(&mut self.failed, e.into())),
             };
-            return match step(&mut self.out, &self.db, self.generation, next, events) {
-                Ok(Step::Ready) => Ok(true),
-                Ok(Step::Again) => continue,
-                Ok(Step::Pending) => Ok(false),
-                Ok(Step::Expired(oldest, e)) => {
-                    self.oldest_retained = oldest;
-                    Err(e)
-                }
-                Err(e) => Err(fail(&mut self.failed, e)),
+            return match step(&mut self.out, &self.db, self.generation, next, events)? {
+                Step::Ready => Ok(true),
+                Step::Again => continue,
+                Step::Pending => Ok(false),
             };
         }
     }
@@ -746,25 +722,36 @@ impl Feed {
                 Poll::Ready(Err(e @ pigeonhole_engine::Error::Unsupported(_))) => {
                     return Poll::Ready(Err(e.into()));
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(fail(&mut self.failed, e.into()))),
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(fail(&mut self.out.failed, e.into())));
+                }
             };
             return match step(&mut self.out, &self.db, self.generation, next, events) {
                 Ok(Step::Ready) => Poll::Ready(Ok(())),
                 Ok(Step::Again) => continue,
                 // The engine's `poll_next` returns `Poll::Pending` instead.
                 Ok(Step::Pending) => Poll::Pending,
-                Ok(Step::Expired(oldest, e)) => {
-                    self.oldest_retained = oldest;
-                    Poll::Ready(Err(e))
-                }
-                Err(e) => Poll::Ready(Err(fail(&mut self.failed, e))),
+                Err(e) => Poll::Ready(Err(e)),
             };
         }
     }
 
+    /// An error from the engine's reader in a blocking call: `Ok` to look again, after a
+    /// reader process's writer restarted (followed from the token) or under a recovery's swap
+    /// (the old engine failing: follow the recovery); else the feed's failure, kept.
+    fn read_error(&mut self, e: pigeonhole_engine::Error) -> Result<()> {
+        if matches!(e, pigeonhole_engine::Error::SnapshotExpired) {
+            return self.resubscribe();
+        }
+        if swapped(&self.db, self.generation) {
+            return Ok(());
+        }
+        Err(fail(&mut self.out.failed, e.into()))
+    }
+
     /// The error that ended the feed, again.
     fn check_failed(&self) -> Result<()> {
-        match &self.failed {
+        match &self.out.failed {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
@@ -801,7 +788,7 @@ impl Feed {
 
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     pub fn oldest_retained(&self) -> Option<u64> {
-        self.oldest_retained
+        self.out.oldest_retained
     }
 
     /// `Closed` once the database closed. After an automatic recovery onto a new engine
@@ -845,6 +832,12 @@ struct Delivery {
     /// The last event [`Feed::next_event`] delivered. A commit's buffer comes back to
     /// `commit` for the next one.
     event: Option<FeedEvent>,
+    /// The oldest seqno still held, from the last expiry ([`Feed::oldest_retained`]).
+    oldest_retained: Option<u64>,
+    /// The error that ended the feed, returned by every later call (simp724 on #1321): the
+    /// reader had already moved past the commit it was delivering, so going on would skip
+    /// it.
+    failed: Option<Error>,
 }
 
 /// What one of the engine's answers comes to.
@@ -855,12 +848,10 @@ enum Step {
     Again,
     /// Nothing ready.
     Pending,
-    /// The feed expired, with the oldest seqno still held.
-    Expired(Option<u64>, Error),
 }
 
 /// `next` into `out`: catalog changes only if `events`, though their names are always
-/// noted. An error is the feed's failure.
+/// noted. An expiry is noted in `out` and returned; any other error is the feed's failure.
 fn step(
     out: &mut Delivery,
     db: &Db,
@@ -874,7 +865,9 @@ fn step(
     }
     match next {
         Next::Commit(c) => {
-            fill(&mut out.commit, &mut out.names, db, c)?;
+            if let Err(e) = fill(&mut out.commit, &mut out.names, db, c) {
+                return Err(fail(&mut out.failed, e));
+            }
             if events {
                 let commit = std::mem::replace(&mut out.commit, Commit::empty());
                 out.event = Some(FeedEvent::Commit(commit));
@@ -893,7 +886,10 @@ fn step(
         // reads the new session's records as outside its history: the new engine's reader
         // decides from the token instead (cli692's S2 on #1321).
         Next::Expired(_) if swapped(db, generation) => Ok(Step::Again),
-        Next::Expired(e) => Ok(Step::Expired(e.oldest_retained, expired(e))),
+        Next::Expired(e) => {
+            out.oldest_retained = e.oldest_retained;
+            Err(expired(e))
+        }
         Next::Pending => Ok(Step::Pending),
     }
 }
@@ -1085,7 +1081,7 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Corruption, "{e}");
         assert!(feed.out.commit.changes.is_empty());
         // What `next` does with it: kept, and returned by every later call.
-        let e = fail(&mut feed.failed, e);
+        let e = fail(&mut feed.out.failed, e);
         t.mutate(b"after").put("f", b"q", b"v").commit().unwrap();
         for _ in 0..2 {
             assert_eq!(feed.next(Duration::from_secs(5)).unwrap_err(), e);
