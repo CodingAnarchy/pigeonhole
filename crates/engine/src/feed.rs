@@ -487,6 +487,13 @@ pub(crate) struct Feed {
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,
+    /// Feeds of every table waiting for a catalog change, which moves no seqno, by reader
+    /// key (the idle-catalog fix after #1515): woken by `manifest::release_catalog` and on
+    /// close, never by the shards' settles, so an idle feed of every table costs the shards
+    /// nothing (simp724's P1 on #1539).
+    catalog_waiters: Mutex<FastMap<u64, std::task::Waker>>,
+    /// Whether `catalog_waiters` may be non-empty.
+    has_catalog_waiters: std::sync::atomic::AtomicBool,
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
     /// observer waits before it records the root, widening the window between a durable
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
@@ -561,6 +568,8 @@ impl Feed {
             catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
+            catalog_waiters: Mutex::default(),
+            has_catalog_waiters: std::sync::atomic::AtomicBool::new(false),
             catalog_roots: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
@@ -722,15 +731,53 @@ impl Feed {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Forgets reader `key`'s waker (the reader is dropped).
-    pub(crate) fn forget_hold_waiter(&self, key: u64) {
+    /// Registers `waker` (reader `key`, a feed of every table) to be woken when a catalog
+    /// change's hold is released, as [`wait_for_hold`](Self::wait_for_hold) for the shards'
+    /// holds: the caller re-checks [`catalog_roots`](Self::catalog_roots) afterwards.
+    pub(crate) fn wait_for_catalog(&self, key: u64, waker: &std::task::Waker) {
         let mut w = self
-            .hold_waiters
+            .catalog_waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        w.remove(&key);
-        if w.is_empty() {
-            self.has_hold_waiters.store(false, Ordering::SeqCst);
+        w.insert(key, waker.clone());
+        self.has_catalog_waiters.store(true, Ordering::SeqCst);
+        drop(w);
+        // Pairs with the fence in `wake_catalog_waiters`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Forgets reader `key`'s wakers, on both lists (the reader is dropped, or delivered).
+    pub(crate) fn forget_hold_waiter(&self, key: u64) {
+        for (list, flag) in [
+            (&self.hold_waiters, &self.has_hold_waiters),
+            (&self.catalog_waiters, &self.has_catalog_waiters),
+        ] {
+            let mut w = list.lock().unwrap_or_else(PoisonError::into_inner);
+            if w.remove(&key).is_some() && w.is_empty() {
+                flag.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// After a catalog change's hold is released (`release_catalog`, its Root entry and
+    /// `catalog_roots` stored first): wakes every feed of every table waiting for one, as
+    /// [`wake_hold_waiters`](Self::wake_hold_waiters) does for the shards' holds.
+    #[inline(never)]
+    pub(crate) fn wake_catalog_waiters(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.has_catalog_waiters.load(Ordering::SeqCst) {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut w = self
+                .catalog_waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.has_catalog_waiters.store(false, Ordering::SeqCst);
+            w.drain().map(|(_, waker)| waker).collect()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 

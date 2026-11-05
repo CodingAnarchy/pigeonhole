@@ -355,6 +355,8 @@ pub struct FeedReader {
     /// The writer's `Feed::catalog_roots` as of the last sidecar load: a change means a
     /// catalog change's entry is rooted that this feed hasn't loaded, though no seqno moved.
     catalog_roots_seen: u64,
+    /// The sidecar, once opened ([`FeedReader::load_catalog`]).
+    sidecar_file: Option<pigeonhole_io::FileRef>,
     dropped_tables: HashSet<TableId>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
@@ -536,6 +538,7 @@ impl FeedReader {
             catalog_bound: 0,
             sidecar_pos: 0,
             catalog_roots_seen: 0,
+            sidecar_file: None,
             dropped_tables: HashSet::new(),
             out_catalog: CatalogEvent::default(),
         };
@@ -736,9 +739,9 @@ impl FeedReader {
                     };
                     waiters.register(self.key, target, Wake::Task(waker()));
                     // A feed of every table waits for catalog changes too, which move no
-                    // seqno: their release wakes the hold list.
+                    // seqno: their release wakes the catalog list.
                     if self.tables.is_empty() {
-                        feed.wait_for_hold(self.key, &waker());
+                        feed.wait_for_catalog(self.key, &waker());
                         on_hold_list = true;
                         if self.catalog_wake_missed(feed) {
                             continue;
@@ -849,7 +852,7 @@ impl FeedReader {
                 waiters.register(self.key, target, Wake::Task(cx.waker().clone()));
                 // As in `wait`: a feed of every table waits for catalog changes too.
                 if self.tables.is_empty() {
-                    feed.wait_for_hold(self.key, cx.waker());
+                    feed.wait_for_catalog(self.key, cx.waker());
                     on_hold_list = true;
                     if self.catalog_wake_missed(&feed) {
                         continue;
@@ -1751,11 +1754,22 @@ impl FeedReader {
         if let Some(feed) = &self.writer {
             self.catalog_roots_seen = feed.catalog_roots();
         }
-        let path = crate::feed::sidecar_path(&self.shared.path);
-        let file = match self.shared.vfs.open(&path, OpenOptions::read()) {
-            Ok(f) => f,
-            Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+        // Opened once and kept: an idle reader process's poll then costs one length check
+        // (simp724's N1 on #1539). The sidecar is only ever appended to, cut or overwritten in
+        // place, never replaced by another file.
+        let file = match &self.sidecar_file {
+            Some(f) => Arc::clone(f),
+            None => {
+                let path = crate::feed::sidecar_path(&self.shared.path);
+                match self.shared.vfs.open(&path, OpenOptions::read()) {
+                    Ok(f) => {
+                        self.sidecar_file = Some(Arc::clone(&f));
+                        f
+                    }
+                    Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                }
+            }
         };
         let len = file.len()?;
         let from = self.sidecar_pos.max(FeedHeader::LEN as u64);
