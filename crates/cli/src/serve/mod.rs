@@ -232,8 +232,8 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
-        // At the signal, a running bulk load stops at its next message, so it ends within the
-        // grace period (the coordinator on #1580).
+        // At the signal, a running bulk load stops at its next message: it takes no more of
+        // its stream, then writes and rebalances what it took (the coordinator on #1580).
         let stopping = Arc::clone(&shared);
         let signal = async move {
             shutdown_signal().await;

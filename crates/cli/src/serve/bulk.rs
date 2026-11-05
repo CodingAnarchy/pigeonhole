@@ -360,8 +360,9 @@ impl BulkLoads {
     }
 
     /// Stops a running load at its next message and refuses new ones: called when the
-    /// server starts shutting down, so a load ends within the grace period and its client
-    /// hears `Closed` ("interrupted"). The load writes and rebalances what it took first.
+    /// server starts shutting down, so a load stops taking vectors at once, and its client
+    /// hears `Closed` ("interrupted"). The load still writes and rebalances what it took,
+    /// which for a large load can outlast the grace period (perf287 on #1580).
     pub(crate) fn stop(&self) {
         self.stopping.flag.store(true, Ordering::Release);
         let waker = self
