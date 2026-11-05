@@ -336,6 +336,9 @@ commit-incr-returning-spread 34610 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
 # From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
 commit-put-previous 21668 0.3
+# D314 amendment 2 (#1446): compare-and-set-then-read, commit-overwrite through
+# commit_if_returning. Provisional until this PR's run measures it.
+commit-if-returning 99999 0.3
 scan-narrow-q1 5053 0.3
 scan-wide-q10 1744 0.3
 scan-wide-q1 13395 0.3

@@ -4382,6 +4382,20 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
   - `it/returning_order.rs`: a previous-only commit waits for an undecided share, and fails with the wait removed.
   - `tests/returning.rs`: half the returning commits ask for each column they write, plus one more, checked against the model's newest version at *Y*−1.
 
+**Amendment 2 (perf2, design; reviewed by simp724 and cli692 on #1446; owner sign-off 2026-11-05; ICR 0113 amendment 2): compare-and-set-then-read.** `RowMutation::commit_if_returning(&Condition) -> Result<Checked>` (and `_async`) is a `commit_if` that returns the row's state whichever way the condition goes. `Checked` is `#[must_use]`: `Applied(Returned)` or `NotApplied(Seen)`, with `is_applied()`.
+- **The columns:** `return_current(family, qualifier)` names columns to report, and the condition's own column is always reported.
+  - **Applied:** `Returned::current` is the column as of the commit, at seqno *Y* with TTL at the commit's timestamp, so the condition's column is the new value. `return_previous` gives the old one, at *Y*−1, as in amendment 1.
+  - **NotApplied:** `Seen::current` is the column in the applied state the condition saw, and `Seen::seqno()` is the last seqno handed out at the check (a snapshot there reads the columns the same).
+- **One read decides and reports (simp724's S2):** on the returning path, the condition's column is read once as a cell (`read_before`), and the predicate is matched against that cell. Plain `commit_if` keeps `read_latest`.
+- **Reported columns count as reads (S1):** `conflicts_with_group` treats them as cells the member reads, so a write to one by an earlier member of the group waits the check for the next group. Otherwise a failed check could report a state the row never had in seqno order.
+- **Ordering:** a check waits for shares undecided on its row (`overlaps_undecided`, through its predicate row), as a returning commit does.
+- **Refusals:** `return_current` is refused (`InvalidArgument`) on `commit`, `commit_returning` and plain `commit_if`: "use a transaction" to read other columns as of a plain commit (cli692).
+- **The plumbing:** a separate boxed reply, `Reply::CheckReturning`, fills the return slot at the check (a failed condition) or after the apply. Plain `commit_if` keeps `Reply::Check` and its own code.
+- **Tests:**
+  - `pigeonhole/tests/commit_if_returning.rs`: both outcomes, a missing cell, a separated value, a compare-and-swap loop under 6 threads (each value taken once), refusals and the async form.
+  - `it/returning_order.rs`: a check behind an undecided share (it reports 1005, not 5), and S1's group case. Each is mutation-checked.
+  - The model check: half the checks are returning checks, checked both ways.
+
 <a id="d315"></a>
 ## D315: the change feed's read-replica prerequisites: a feed of every table, catalog events, replication apply (#1436, ICR 0114)
 

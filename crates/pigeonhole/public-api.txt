@@ -5,6 +5,10 @@ pub struct pigeonhole::nonblocking::CheckFuture
 impl core::future::future::Future for pigeonhole::nonblocking::CheckFuture
 pub type pigeonhole::nonblocking::CheckFuture::Output = core::result::Result<core::option::Option<pigeonhole::CommitInfo>, pigeonhole::Error>
 pub fn pigeonhole::nonblocking::CheckFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::CheckReturningFuture
+impl core::future::future::Future for pigeonhole::nonblocking::CheckReturningFuture
+pub type pigeonhole::nonblocking::CheckReturningFuture::Output = core::result::Result<pigeonhole::Checked, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::CheckReturningFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
 pub struct pigeonhole::nonblocking::CommitFuture
 impl core::future::future::Future for pigeonhole::nonblocking::CommitFuture
 pub type pigeonhole::nonblocking::CommitFuture::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
@@ -88,6 +92,11 @@ pub pigeonhole::ChangeKind::Merge
 pub pigeonhole::ChangeKind::Put
 impl pigeonhole::ChangeKind
 pub fn pigeonhole::ChangeKind::is_delete(self) -> bool
+pub enum pigeonhole::Checked
+pub pigeonhole::Checked::Applied(pigeonhole::Returned)
+pub pigeonhole::Checked::NotApplied(pigeonhole::Seen)
+impl pigeonhole::Checked
+pub fn pigeonhole::Checked::is_applied(&self) -> bool
 #[non_exhaustive] pub enum pigeonhole::Compaction
 pub pigeonhole::Compaction::FifoByTime
 pub pigeonhole::Compaction::Leveled
@@ -749,6 +758,7 @@ pub fn pigeonhole::RetryPolicy::default() -> Self
 #[non_exhaustive] pub struct pigeonhole::Returned
 pub pigeonhole::Returned::info: pigeonhole::CommitInfo
 impl pigeonhole::Returned
+pub fn pigeonhole::Returned::current(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::Cell>>
 pub fn pigeonhole::Returned::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&str, &[u8], u64, pigeonhole::Result<core::option::Option<i64>>)>
 pub fn pigeonhole::Returned::previous(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::Cell>>
 pub fn pigeonhole::Returned::value(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<i64>>
@@ -788,6 +798,7 @@ pub fn pigeonhole::RowMutation<'_>::aggregate_u64(self, &str, &[u8], u64) -> Sel
 pub fn pigeonhole::RowMutation<'_>::aggregate_u64_at(self, &str, &[u8], u64, u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
 pub fn pigeonhole::RowMutation<'_>::commit_if(self, &pigeonhole::Condition) -> pigeonhole::Result<core::option::Option<pigeonhole::CommitInfo>>
+pub fn pigeonhole::RowMutation<'_>::commit_if_returning(self, &pigeonhole::Condition) -> pigeonhole::Result<pigeonhole::Checked>
 pub fn pigeonhole::RowMutation<'_>::commit_returning(self) -> pigeonhole::Result<pigeonhole::Returned>
 pub fn pigeonhole::RowMutation<'_>::delete_cell(self, &str, &[u8], u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::delete_column(self, &str, &[u8]) -> Self
@@ -815,6 +826,7 @@ pub fn pigeonhole::RowMutation<'_>::put_vector_f32(self, &str, &[u8], &[f32]) ->
 pub fn pigeonhole::RowMutation<'_>::put_vector_f32_at(self, &str, &[u8], u64, &[f32]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8(self, &str, &[u8], &[i8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8_at(self, &str, &[u8], u64, &[i8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::return_current(self, &str, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::return_previous(self, &str, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::set_add(self, &str, &[u8], u32) -> Self
 pub fn pigeonhole::RowMutation<'_>::set_add_at(self, &str, &[u8], u64, u32) -> Self
@@ -824,6 +836,7 @@ impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_if_async(self, &pigeonhole::Condition) -> pigeonhole::nonblocking::CheckFuture
+pub fn pigeonhole::RowMutation<'_>::commit_if_returning_async(self, &pigeonhole::Condition) -> pigeonhole::nonblocking::CheckReturningFuture
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_returning_async(self) -> pigeonhole::nonblocking::ReturningFuture
 pub struct pigeonhole::RowPages<'t>
@@ -903,6 +916,10 @@ impl pigeonhole::ScanPosition
 pub fn pigeonhole::ScanPosition::from_bytes(&[u8]) -> pigeonhole::Result<Self>
 pub fn pigeonhole::ScanPosition::row(&self) -> &[u8]
 pub fn pigeonhole::ScanPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
+#[non_exhaustive] pub struct pigeonhole::Seen
+impl pigeonhole::Seen
+pub fn pigeonhole::Seen::current(&self, &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::Cell>>
+pub fn pigeonhole::Seen::seqno(&self) -> u64
 pub struct pigeonhole::SetIntersection<'a, 'b>(_)
 impl core::iter::traits::iterator::Iterator for pigeonhole::SetIntersection<'_, '_>
 pub type pigeonhole::SetIntersection<'_, '_>::Item = u32

@@ -1,0 +1,2 @@
+### Added
+- **`RowMutation::commit_if_returning`** (and `commit_if_returning_async`; D314 amendment 2, #1446): a `commit_if` that returns the row's state whichever way the condition goes. It returns `Checked::Applied(Returned)` with the columns as of the commit (`Returned::current`), or `Checked::NotApplied(Seen)` with the columns as the condition saw them (`Seen::current`, `Seen::seqno`). The condition's column is always returned; `return_current` asks for more. A compare-and-swap retry loop becomes one call per attempt.

@@ -66,9 +66,10 @@ pub use check::{
 pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
-    AppOwned, BackgroundWorker, CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard,
-    FamilyInfo, FamilyStorage, FeedStorage, LatencyBuckets, LevelStorage, Metrics,
-    PendingReturning, Previous, Returned, Role, ShardStats, TableInfo, TableStorage,
+    AppOwned, BackgroundWorker, CheckReturned, CommitInfo, CrossShardMetrics, DbInfo, Engine,
+    EngineShard, FamilyInfo, FamilyStorage, FeedStorage, LatencyBuckets, LevelStorage, Metrics,
+    PendingCheckReturning, PendingReturning, Previous, Returned, Role, ShardStats, TableInfo,
+    TableStorage,
 };
 pub use error::{Error, Result};
 pub use feed_reader::{

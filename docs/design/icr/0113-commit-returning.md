@@ -40,3 +40,22 @@ None: additive. The Python and Ruby bindings expose it (#1440, cli692):
   - Python: `Mutation.return_previous(family, qualifier) -> Mutation`, and `Incremented.previous(family, qualifier) -> Cell | None` (`InvalidArgument` for a column not asked for). `commit_returning_async()` takes the requests too.
   - Ruby: `Mutation#return_previous(family, qualifier) -> self`, and `Incremented#previous(family, qualifier) -> Cell?`, with the same errors.
   - Both refuse `commit` and `commit_if` on a mutation with requests, as the Rust API does.
+
+## Amendment 2: compare-and-set-then-read (#1446, D314 amendment 2)
+
+**Status:** Approved (the owner signed off the design on 2026-11-05).
+
+- **pigeonhole** (semver, additive):
+  - `RowMutation::commit_if_returning(self, &Condition) -> Result<Checked>`, and `commit_if_returning_async` (the `async` feature, `nonblocking::CheckReturningFuture`);
+  - `RowMutation::return_current(self, family, qualifier) -> Self`;
+  - `#[must_use] enum Checked { Applied(Returned), NotApplied(Seen) }` with `is_applied()`;
+  - `#[non_exhaustive] struct Seen` with `current(family, qualifier) -> Result<Option<Cell>>` and `seqno() -> u64`;
+  - `Returned::current(family, qualifier) -> Result<Option<Cell>>`.
+  
+  `return_current` is refused (`InvalidArgument`) by every commit except `commit_if_returning`.
+- **pigeonhole-engine** (additive):
+  - `Engine::check_and_mutate_returning`, `submit_check_and_mutate_returning` and `submit_check_and_mutate_returning_async`;
+  - `PendingCheckReturning`;
+  - `CheckReturned { applied, info, cells, previous, current, seen }`.
+
+**Callers changed:** none; additive. The Python and Ruby bindings follow in cli692's PR 2.

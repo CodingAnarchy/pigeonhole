@@ -240,6 +240,19 @@ impl RowMutation<'_> {
             },
         }
     }
+
+    /// [`commit_if_returning`](RowMutation::commit_if_returning), as a future, submitted as
+    /// [`commit_if_async`](RowMutation::commit_if_async) is (D210): the same
+    /// [`Checked`](crate::Checked) either way. **Dropped while it still waits for room, it
+    /// writes nothing.**
+    pub fn commit_if_returning_async(self, condition: &Condition) -> CheckReturningFuture {
+        CheckReturningFuture {
+            state: match self.submit_if_returning_async(condition) {
+                Ok(s) => CheckReturningState::Pending(s),
+                Err(e) => CheckReturningState::Ready(Some(Err(e))),
+            },
+        }
+    }
 }
 
 impl WriteBatch {
@@ -346,6 +359,45 @@ impl Future for CheckFuture {
                 Poll::Pending => Poll::Pending,
             },
             CheckState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "commit future polled after it resolved",
+                ))
+            })),
+        }
+    }
+}
+
+/// A [`RowMutation::commit_if_returning`] as a future
+/// ([`RowMutation::commit_if_returning_async`], D314 amendment 2).
+#[derive(Debug)]
+#[must_use = "a future does nothing unless polled; dropped once submitted, it does not roll back"]
+pub struct CheckReturningFuture {
+    state: CheckReturningState,
+}
+
+#[derive(Debug)]
+enum CheckReturningState {
+    /// Submitted (or waiting for room, D210), not resolved.
+    Pending(crate::write::SubmittedCheckReturning),
+    /// Refused before submission; `None` once taken.
+    Ready(Option<Result<crate::Checked>>),
+}
+
+impl Future for CheckReturningFuture {
+    type Output = Result<crate::Checked>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            CheckReturningState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
+                Poll::Ready(r) => {
+                    let out = s.outcome(r);
+                    self.state = CheckReturningState::Ready(None);
+                    Poll::Ready(out)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            CheckReturningState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
                 Err(Error::new(
                     crate::ErrorCode::InvalidArgument,
                     "commit future polled after it resolved",
