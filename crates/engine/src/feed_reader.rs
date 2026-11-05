@@ -443,6 +443,16 @@ const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
 /// takes them as removed (the bound a reader snapshot waits for its view too).
 const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 
+/// What [`FeedReader::take_round`] found of a decided round.
+enum Round {
+    /// Every share, its changes in stream order.
+    Whole(Vec<Raw>),
+    /// Dropped whole by an earlier session's recovery: never happened.
+    Dropped,
+    /// A share is missing or outside the history: the feed expires.
+    Gap,
+}
+
 /// What `emit` delivered.
 enum Emitted {
     Nothing,
@@ -1415,6 +1425,38 @@ impl FeedReader {
         )
     }
 
+    /// A decided round's shares, taken from those held: whole, or dropped whole by an
+    /// earlier session's recovery (a power loss took a share of its `Buffered` commit, and
+    /// recovery replays all or nothing), or a gap that expires the feed. Each share's stream
+    /// is past it.
+    fn take_round(&mut self, id: Seqno, participants: &[StreamId], session: u64) -> Round {
+        let shares = self.held.remove(&id).unwrap_or_default();
+        // A round rule C dropped a share of: never passed over silently.
+        let dropped = self.dropped.remove(&id).is_some();
+        // Every participant's PREPARE was in its file before the Decision was written, so it
+        // has been read; one missing was lost under the reader.
+        let complete = participants
+            .iter()
+            .all(|p| shares.iter().any(|h| h.stream == p.0 as usize));
+        if !complete && session != self.current && !dropped {
+            for h in &shares {
+                let st = &mut self.streams[h.stream];
+                st.delivered_end = st.delivered_end.max(h.end);
+            }
+            return Round::Dropped;
+        }
+        if !complete || shares.iter().any(|h| h.outside) {
+            return Round::Gap;
+        }
+        let mut raws = Vec::new();
+        for h in shares {
+            let st = &mut self.streams[h.stream];
+            st.delivered_end = st.delivered_end.max(h.end);
+            raws.extend(h.changes);
+        }
+        Round::Whole(raws)
+    }
+
     /// Delivers the smallest pending commit at or below the frontier into `out`. Returns
     /// whether it did; a commit with nothing the feed follows is passed over.
     fn emit(&mut self) -> Result<Emitted> {
@@ -1487,36 +1529,17 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
-                    let shares = self.held.remove(&id).unwrap_or_default();
-                    // A round rule C dropped a share of: never passed over silently.
-                    let dropped = self.dropped.remove(&id).is_some();
-                    // Every participant's PREPARE was in its file before the Decision was
-                    // written, so it has been read; one missing was lost under the reader.
-                    let complete = participants
-                        .iter()
-                        .all(|p| shares.iter().any(|h| h.stream == p.0 as usize));
-                    if !complete && session != self.current && !dropped {
-                        // A power loss took a share of a `Buffered` commit an earlier session
-                        // wrote, and that session's recovery dropped it whole, as replay
-                        // does (all or nothing): it never happened, so it isn't delivered.
-                        for h in &shares {
-                            let st = &mut self.streams[h.stream];
-                            st.delivered_end = st.delivered_end.max(h.end);
+                    match self.take_round(id, &participants, session) {
+                        Round::Whole(raws) => (ts, raws),
+                        Round::Dropped => {
+                            self.delivered = key;
+                            continue;
                         }
-                        self.delivered = key;
-                        continue;
+                        Round::Gap => {
+                            self.expired = Some(gap(key));
+                            return Ok(Emitted::Nothing);
+                        }
                     }
-                    if !complete || shares.iter().any(|h| h.outside) {
-                        self.expired = Some(gap(key));
-                        return Ok(Emitted::Nothing);
-                    }
-                    let mut raws = Vec::new();
-                    for h in shares {
-                        let st = &mut self.streams[h.stream];
-                        st.delivered_end = st.delivered_end.max(h.end);
-                        raws.extend(h.changes);
-                    }
-                    (ts, raws)
                 }
             };
             self.delivered = key;
