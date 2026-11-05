@@ -1,5 +1,6 @@
 //! The 1.1 reads: multi-get, traversal, and walking a wide row in pages from a position.
 
+use crate::Maybe;
 use pigeonhole::KeySet;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -44,18 +45,12 @@ pub(crate) fn multi_get(
             std::collections::HashMap::new();
         either!(&h, |t| {
             let mut r = t.keys(&set).versions(versions);
-            if let Some(f) = &families {
-                r = r.families(f.iter().map(String::as_str));
-            }
-            if let Some(q) = &qp {
-                r = r.qualifier_prefix(q);
-            }
-            if let Some(n) = column_limit {
-                r = r.column_limit(n);
-            }
-            if let Some(s) = &snap {
-                r = r.snapshot(s);
-            }
+            r = r.maybe(families.as_ref(), |r, f| {
+                r.families(f.iter().map(String::as_str))
+            });
+            r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+            r = r.maybe(column_limit, |r, n| r.column_limit(n));
+            r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
             let mut rows = r.read()?;
             while let Some((_, row)) = rows.next()? {
                 found.insert(row.key().to_vec(), row.to_owned());
@@ -205,24 +200,12 @@ pub(crate) fn traverse(
                     .hops(hops)
                     .byte_budget(byte_budget)
                     .parents(parents);
-                if let Some(n) = per_node_limit {
-                    r = r.per_node_limit(n);
-                }
-                if let Some(n) = hop_limit {
-                    r = r.hop_limit(n);
-                }
-                if let Some(n) = max_nodes {
-                    r = r.max_nodes(n);
-                }
-                if let Some(q) = &qp {
-                    r = r.qualifier_prefix(q);
-                }
-                if let Some(s) = &snap {
-                    r = r.snapshot(s);
-                }
-                if let Some(n) = parallel {
-                    r = r.parallel(n);
-                }
+                r = r.maybe(per_node_limit, |r, n| r.per_node_limit(n));
+                r = r.maybe(hop_limit, |r, n| r.hop_limit(n));
+                r = r.maybe(max_nodes, |r, n| r.max_nodes(n));
+                r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
+                r = r.maybe(parallel, |r, n| r.parallel(n));
                 r.run()
             })?;
             Ok::<_, pigeonhole::Error>((seeds.iter().map(<[u8]>::to_vec).collect::<Vec<_>>(), t))
@@ -363,18 +346,12 @@ impl Pages {
             .detach(move || {
                 either!(&h, |t| {
                     let mut r = t.row(&row).versions(versions);
-                    if let Some(f) = &families {
-                        r = r.families(f.iter().map(String::as_str));
-                    }
-                    if let Some(q) = &qp {
-                        r = r.qualifier_prefix(q);
-                    }
-                    if let Some(s) = &snap {
-                        r = r.snapshot(s);
-                    }
-                    if let Some(p) = &pos {
-                        r = r.resume_after(p);
-                    }
+                    r = r.maybe(families.as_ref(), |r, f| {
+                        r.families(f.iter().map(String::as_str))
+                    });
+                    r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                    r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
+                    r = r.maybe(pos.as_ref(), |r, p| r.resume_after(p));
                     let mut pages = r.pages(size)?;
                     let page = pages.next()?.map(|p| p.to_owned());
                     Ok::<_, pigeonhole::Error>(page.map(|p| (p, pages.position())))
@@ -510,9 +487,7 @@ pub(crate) fn nearest(
                 Vector::I8(q) => r.nearest_i8(q, k),
                 Vector::Bits(q) => r.nearest_bits(q, k),
             };
-            if let Some(p) = parallel {
-                n = n.parallel(p);
-            }
+            n = n.maybe(parallel, |n, p| n.parallel(p));
             match within {
                 Some(b) => n.run_within(b).map(|p| {
                     let (bytes, next) = (p.bytes(), p.next_bytes());
@@ -527,12 +502,8 @@ pub(crate) fn nearest(
             either!(&h, |t| {
                 if let Some(keys) = &keys {
                     let mut r = t.keys(keys).family(&family);
-                    if let Some(q) = &qp {
-                        r = r.qualifier_prefix(q);
-                    }
-                    if let Some(s) = &snap {
-                        r = r.snapshot(s);
-                    }
+                    r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                    r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
                     search!(r)
                 } else {
                     let mut r = match &prefix {
@@ -546,12 +517,8 @@ pub(crate) fn nearest(
                         ),
                     }
                     .family(&family);
-                    if let Some(q) = &qp {
-                        r = r.qualifier_prefix(q);
-                    }
-                    if let Some(s) = &snap {
-                        r = r.snapshot(s);
-                    }
+                    r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                    r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
                     search!(r)
                 }
             })

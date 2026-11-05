@@ -1,6 +1,7 @@
 //! Tables: families, the table builder, reads, and writes recorded as operations that one
 //! engine call applies (a row mutation, a batch or a transaction).
 
+use crate::Maybe;
 use std::ops::Bound as KeyBound;
 use std::sync::Mutex;
 
@@ -171,12 +172,8 @@ impl Family {
             }
             "quantiles" => {
                 let mut q = pigeonhole::QuantileParams::default();
-                if let Some(p) = mantissa_bits {
-                    q = q.mantissa_bits(p);
-                }
-                if let Some(n) = max_buckets {
-                    q = q.max_buckets(n);
-                }
+                q = q.maybe(mantissa_bits, |q, p| q.mantissa_bits(p));
+                q = q.maybe(max_buckets, |q, n| q.max_buckets(n));
                 Aggregation::Quantiles(q)
             }
             "bloom" => {
@@ -217,21 +214,13 @@ fn options(
     compression: Option<&str>,
     zstd_level: Option<i8>,
 ) -> PyResult<Family> {
-    if let Some(n) = max_versions {
-        f = f.max_versions(n);
-    }
+    f = f.maybe(max_versions, |f, n| f.max_versions(n));
     if let Some(t) = ttl {
         f = f.ttl(convert::duration(t)?);
     }
-    if let Some(n) = bloom_bits {
-        f = f.bloom_bits(n);
-    }
-    if let Some(n) = block_size {
-        f = f.block_size(n);
-    }
-    if let Some(n) = blob_threshold {
-        f = f.blob_threshold(n);
-    }
+    f = f.maybe(bloom_bits, |f, n| f.bloom_bits(n));
+    f = f.maybe(block_size, |f, n| f.block_size(n));
+    f = f.maybe(blob_threshold, |f, n| f.blob_threshold(n));
     f = match (compression, zstd_level) {
         (None, None) => f,
         (Some("lz4"), None) => f.compression(Compression::Lz4),
@@ -607,18 +596,12 @@ impl Table {
         py.detach(move || {
             either!(&h, |t| {
                 let mut r = t.row(&row).versions(versions);
-                if let Some(f) = &families {
-                    r = r.families(f.iter().map(String::as_str));
-                }
-                if let Some(q) = &qp {
-                    r = r.qualifier_prefix(q);
-                }
-                if let Some(n) = column_limit {
-                    r = r.column_limit(n);
-                }
-                if let Some(s) = &snap {
-                    r = r.snapshot(s);
-                }
+                r = r.maybe(families.as_ref(), |r, f| {
+                    r.families(f.iter().map(String::as_str))
+                });
+                r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                r = r.maybe(column_limit, |r, n| r.column_limit(n));
+                r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
                 r.read().map(|r| r.map(|r| r.to_owned()))
             })
         })
@@ -665,21 +648,13 @@ impl Table {
                 ),
             }
             .versions(versions);
-            if let Some(f) = &families {
-                s = s.families(f.iter().map(String::as_str));
-            }
-            if let Some(q) = &qp {
-                s = s.qualifier_prefix(q);
-            }
-            if let Some(n) = limit {
-                s = s.limit(n);
-            }
-            if let Some(n) = column_limit {
-                s = s.column_limit(n);
-            }
-            if let Some(sn) = &snap {
-                s = s.snapshot(sn);
-            }
+            s = s.maybe(families.as_ref(), |s, f| {
+                s.families(f.iter().map(String::as_str))
+            });
+            s = s.maybe(qp.as_ref(), |s, q| s.qualifier_prefix(q));
+            s = s.maybe(limit, |s, n| s.limit(n));
+            s = s.maybe(column_limit, |s, n| s.column_limit(n));
+            s = s.maybe(snap.as_ref(), |s, sn| s.snapshot(sn));
             s.into_owned()
         });
         ScanIter::new(scan, chunk)
@@ -1204,9 +1179,7 @@ fn row_mutation<'t>(
     durability: Option<Durability>,
 ) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
-    if let Some(d) = durability {
-        m = m.durability(d.into());
-    }
+    m = m.maybe(durability, |m, d| m.durability(d.into()));
     for op in ops {
         m = match op {
             Op::Put(f, q, None, Val::Bytes(b)) => m.put(f, q, b),
