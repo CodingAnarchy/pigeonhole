@@ -4360,8 +4360,27 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 - **When the caller has the value:** only once the commit meets its durability level.
 - **How long a value stays unique:** as long as its commit survives. That means across power loss with `GroupSync` or `Sync`, across a process crash with `Buffered`, and only within the open with `None`. Other readers may see the new total first (D227).
 - **After `OutcomeUnknown`:** there is no value, and a blind retry counts the increment twice if it landed.
+- **Visible, not durable (simp724's C2 on #1445):** a value folds the newest *visible* versions (D227). After a crash, the part of it that came from a commit that wasn't durable can be gone. For example, a cross-shard `Buffered` increment that recovery drops whole (D83) can be gone even when the returning commit survives. Callers whose writers are all at least as durable as the returning commit are unaffected.
 
 **Testing.** `tests/returning.rs` is a model-check target of its own. Its families are a plain `sum`, `sum_v2` (2 versions), `sum_ttl` and `f`. Returning commits there include members of concurrent batches beside blind cross-shard writers, with and without deletes. Each value is compared with the model's fold at *Y*, and the run asserts the fast path is taken. Its sweep is conditional: it runs on #1440's PRs and on any PR touching counter or returning apply code (REQUIRE_SWEEPS=6).
+
+**Amendment 1 (perf2, design; coordinator 2026-11-04; reviewed by simp724 and cli692 on #1445; ICR 0113 amendment): get-and-set, a column's value just before the commit.** `RowMutation::return_previous(family, qualifier)` asks `commit_returning` for that column of the row as it was just before the commit, and `Returned::previous(family, qualifier) -> Result<Option<Cell>>` hands it back. The result struct is renamed `Returned`, and `Incremented` stays as an alias (cli692's N1).
+- **The value:** the column's newest visible version at *Y*−1, with the TTL judged at the commit's timestamp. That's what a get just before the commit returned, except that a get judges TTL at its own time. It's the column's newest version whatever timestamp the commit writes, so for a bucketed counter it may be another bucket than the one written (cli692's N3; an `_at` form can come later).
+  - Column, family and row deletes below *Y* hide it (`None`).
+  - In an aggregate family it's the folded value, so `put_i64(0)` with `return_previous` drains a counter.
+  - Several writes to one cell in the commit all sit at *Y*, so none of them is seen.
+- **Chains (simp724's C1):** with default timestamps, or explicit ones that increase per cell, *N* concurrent swaps of one cell each return the one before, so every previous value is returned once. This follows from the ordering rule above, unchanged: a returning member waits through `Reply::Returning` whatever it asks for.
+  - A put at an explicit timestamp below the newest version leaves that version newest, so the next swap returns it again.
+- **The read:** a point read through the view (`read_before`, beside `fold_returning` in the apply loop), with the read path's pooled resolver. There's no fast path, because with explicit timestamps an older source can hold a newer version than the active memtable.
+  - It never consults the D290 row cache, which the commit's write-through has already moved to *Y* (simp724's C3).
+  - A separated value costs a blob read on the shard thread.
+  - The request rides in the boxed return slot, so blind commits and plain `commit_returning` are unchanged.
+- **Refusals:** a mutation that asks but writes nothing has nothing to replace, so it's refused with `InvalidArgument` (cli692's N2). So are `commit`, `commit_if` and their async forms on a mutation with requests. Asking twice for one column is asking once (N5).
+- **Durability:** as above, including "visible, not durable". After `OutcomeUnknown` there is no previous value, and a retry that runs after the first attempt landed sees that attempt's write as its previous value: the lease example checks for "the previous holder is me".
+- **Tests:**
+  - `pigeonhole/tests/return_previous.rs`: the chain under flushes, several writes, deletes, C1's exception, a counter drain, the row cache, a blob value, refusals and repeats, and the async form.
+  - `it/returning_order.rs`: a previous-only commit waits for an undecided share, and fails with the wait removed.
+  - `tests/returning.rs`: half the returning commits ask for each column they write, plus one more, checked against the model's newest version at *Y*−1.
 
 <a id="d315"></a>
 ## D315: the change feed's read-replica prerequisites: a feed of every table, catalog events, replication apply (#1436, ICR 0114)

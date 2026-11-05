@@ -440,6 +440,13 @@ let n: i64 = stats.get(b"user:42", "stats", b"logins")?
 // The value this increment produced, atomically (D314): unique per caller.
 let r = stats.mutate(b"user:42").incr("stats", b"logins", 1).commit_returning()?;
 assert_eq!(r.value("stats", b"logins")?, Some(2));
+// Get-and-set (D314 amendment 1): the value a put replaced, atomically.
+let r = stats
+    .mutate(b"user:42")
+    .put_i64("stats", b"logins", 0)
+    .return_previous("stats", b"logins")
+    .commit_returning()?;
+assert_eq!(r.previous("stats", b"logins")?.and_then(|c| c.as_i64()), Some(2));
 # Ok::<(), pigeonhole::Error>(())
 ```
 

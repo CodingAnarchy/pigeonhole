@@ -23,3 +23,17 @@ None: additive. The Python and Ruby bindings expose it (#1440, cli692):
 - **Python:** `Mutation.commit_returning() -> Incremented` (`seqno`; `value(family, qualifier, *, ts=None) -> int | None`; indexing with `(family, qualifier)` or `(family, qualifier, ts)`, `KeyError` for a cell the commit didn't write; iteration over the keys `(family, qualifier, ts)`; `cells()`), and `Table.incr_returning(row, family, qualifier, delta, *, ts=None, durability=None) -> int | None`.
 - **Ruby:** `Mutation#commit_returning -> Incremented`, frozen (`seqno`; `value(family, qualifier, ts: nil) -> Integer?`; `to_h -> {[family, qualifier, ts] => value}`; `size`), and `Table#incr_returning(row, family, qualifier, delta, ts: nil, durability: nil) -> Integer?`, with the GVL released.
 - **Both:** a read that failed after the commit applied raises `ReturnedValueError` (`pigeonhole.ReturnedValueError`, `Pigeonhole::ReturnedValueError`, subclasses of the base error), from `incr_returning` and when that value is read (`value`, indexing, `cells()`, `to_h`). It carries the commit's `seqno`, and the read's error as its `code`, `code_num` and cause: the commit succeeded, so a caller doesn't retry it. A failed commit keeps its usual exception (perf2's S1 on #1473). Neither binding has an async form, as neither has async commits.
+
+## Amendment 1: get-and-set (#1445, D314 amendment 1)
+**Status:** Approved (the coordinator, 2026-11-04: an amendment, no new number; reviewed by simp724 and cli692 on #1445).
+
+- **pigeonhole** (semver, additive):
+  - `RowMutation::return_previous(self, family, qualifier) -> Self` asks `commit_returning` for that column as it was just before the commit. A mutation that writes nothing is refused with `InvalidArgument`, as are `commit`, `commit_if` and their async forms on a mutation with requests. Repeats are one request.
+  - `Returned::previous(&self, family, qualifier) -> Result<Option<Cell>>` returns the column's newest visible version before the commit, as an owned `Cell`. `Err` is a read that failed after the commit applied, and `InvalidArgument` names a column that wasn't asked for.
+  - The result struct is renamed `Returned`, and `pub type Incremented = Returned;` keeps 1.1.0 code compiling, not deprecated. `commit_returning` and `ReturningFuture::Output` name `Returned`.
+  - **Later, if asked for:** `return_previous_at` / `previous_at` for one timestamp (a bucket). Today `previous` is the column's newest version (cli692's N3).
+- **pigeonhole-engine** (internal, additive):
+  - `Engine::commit_returning_previous(batch, durability, previous_of: Vec<(FamilyId, Vec<u8>)>) -> Result<(CommitInfo, Vec<Returned>, Vec<Previous>)>`.
+  - `Engine::submit_returning_previous(..) -> Result<PendingReturning>`, plus `PendingReturning::take_previous(&mut self) -> Vec<Previous>` once it resolves.
+  - `Previous` (`#[non_exhaustive]`: `family`, `qualifier`, `value: Result<Option<CellData>>`).
+- **Bindings** (cli692's PR 2): Python `Returned = Incremented` and Ruby `Pigeonhole::Returned = Pigeonhole::Incremented`, keeping the classes' identity. A failed previous-value read raises `ReturnedValueError`, as a counter's does.

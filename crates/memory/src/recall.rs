@@ -251,6 +251,16 @@ pub struct Recall<'a> {
     expand: Option<Expand>,
 }
 
+/// What a recall's steps share, once its arguments are checked.
+struct Plan<'p> {
+    s: &'p Snapshot,
+    /// The text to search for, if any.
+    text: Option<&'p str>,
+    /// The query embedding's spec, if there's one.
+    spec: Option<VectorSpec>,
+    now: u64,
+}
+
 impl std::fmt::Debug for Recall<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recall")
@@ -426,6 +436,48 @@ impl<'a> Recall<'a> {
 
     /// [`run`](Self::run), with what the recall met.
     pub fn run_with_stats(self) -> Result<(Vec<RecallHit>, RecallStats)> {
+        let (text, spec) = self.check()?;
+        let owned;
+        let s = match self.snapshot {
+            Some(s) => s,
+            None => {
+                owned = match self.db {
+                    Snap::W(db) => db.snapshot()?,
+                    Snap::R(r) => r.snapshot()?,
+                };
+                &owned
+            }
+        };
+        let plan = Plan {
+            s,
+            text,
+            spec,
+            now: self.at_us.unwrap_or_else(now_us),
+        };
+        let mut stats = RecallStats::default();
+        if self.k == 0 {
+            return Ok((Vec::new(), stats));
+        }
+        // 1. Candidates.
+        let ivf_counts = self.ivf_counts(s)?;
+        let (mut cands, fell_back) = self.gather(&plan, &ivf_counts)?;
+        // 2. The graph expansion.
+        if let Some(x) = self.expand {
+            self.expand_from_fused(&plan, &mut cands, x, &mut stats)?;
+        }
+        stats.candidates = cands.len();
+        stats.ivf_fallbacks = fell_back.len();
+        stats.ivf_namespaces = ivf_counts.len() - fell_back.len();
+        // 3. Fusion.
+        fuse(&mut cands, &self.signal_weights(), self.fusion);
+        // 4. The hits.
+        let out = self.take_hits(cands, &mut stats);
+        Ok((out, stats))
+    }
+
+    /// The arguments' checks: the text to search for, if any, and the query embedding's
+    /// spec, if there's one.
+    fn check(&self) -> Result<(Option<&str>, Option<VectorSpec>)> {
         if self.namespaces.is_empty() {
             return Err(Error::InvalidArgument(
                 "recall takes at least one namespace".into(),
@@ -465,31 +517,13 @@ impl<'a> Recall<'a> {
                 x.hops
             )));
         }
-        let owned;
-        let s = match self.snapshot {
-            Some(s) => s,
-            None => {
-                owned = match self.db {
-                    Snap::W(db) => db.snapshot()?,
-                    Snap::R(r) => r.snapshot()?,
-                };
-                &owned
-            }
-        };
-        let now = self.at_us.unwrap_or_else(now_us);
-        let mut stats = RecallStats::default();
-        if self.k == 0 {
-            return Ok((Vec::new(), stats));
-        }
-        // 1. Candidates: per namespace and signal, its best `n`, read in one multi-get; the
-        // filters (superseded, session) apply to each. Until every list holds `per_signal`
-        // that pass, or came back short (its namespace is exhausted), `n` doubles, so a
-        // filtered recall still gets each signal's best `per_signal` eligible memories
-        // (simp724's N1 on #1374).
-        let mut n = self.per_signal.max(1);
-        // Each namespace's path for the vector signal: the IVF index once its counter (read
-        // at the recall's snapshot, as the search and the memories are) reaches the store's
-        // `min_namespace_len`. `None`: exact.
+        Ok((text, spec))
+    }
+
+    /// Each namespace's path for the vector signal: the IVF index once its counter (read
+    /// at the recall's snapshot, as the search and the memories are) reaches the store's
+    /// `min_namespace_len`. Not in the map: exact.
+    fn ivf_counts(&self, s: &Snapshot) -> Result<BTreeMap<&str, u64>> {
         let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
         if let (Some(ivf), Some(_), false) = (self.ivf, &self.embedding, self.exact) {
             let min = ivf.options().get_min_namespace_len();
@@ -500,6 +534,21 @@ impl<'a> Recall<'a> {
                 }
             }
         }
+        Ok(ivf_counts)
+    }
+
+    /// Step 1, the candidates: per namespace and signal, its best `n`, read in one
+    /// multi-get; the filters (superseded, session) apply to each. Until every list holds
+    /// `per_signal` that pass, or came back short (its namespace is exhausted), `n` doubles,
+    /// so a filtered recall still gets each signal's best `per_signal` eligible memories
+    /// (simp724's N1 on #1374). Also the namespaces whose IVF search fell back to exact.
+    fn gather(
+        &self,
+        plan: &Plan<'_>,
+        ivf_counts: &BTreeMap<&str, u64>,
+    ) -> Result<(Vec<Cand>, BTreeSet<&str>)> {
+        let (s, text, spec, now) = (plan.s, plan.text, plan.spec.as_ref(), plan.now);
+        let mut n = self.per_signal.max(1);
         let mut fell_back: BTreeSet<&str> = BTreeSet::new();
         let (lists, eligible) = loop {
             let mut lists: Vec<(usize, Vec<Vec<u8>>, bool)> = Vec::new();
@@ -542,7 +591,7 @@ impl<'a> Recall<'a> {
             let set = KeySet::from_unsorted(keys.into_iter().collect::<Vec<_>>());
             let mut eligible: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
             self.rows.read_each(s, &set, |key, row| {
-                if let Some(c) = self.candidate(key, row, spec.as_ref(), now)? {
+                if let Some(c) = self.candidate(key, row, spec, now)? {
                     eligible.insert(key.to_vec(), c);
                 }
                 Ok(())
@@ -585,34 +634,41 @@ impl<'a> Recall<'a> {
             }
         }
         let kept: BTreeSet<Vec<u8>> = kept.into_iter().cloned().collect();
-        let mut cands: Vec<Cand> = eligible
+        let cands: Vec<Cand> = eligible
             .into_iter()
             .filter(|(k, _)| kept.contains(k))
             .map(|(_, c)| c)
             .collect();
-        // 2. The graph expansion: seeded by the fused order without it.
-        if let Some(x) = self.expand {
-            let mut w = self.signal_weights();
-            w[5] = 0.0;
-            fuse(&mut cands, &w, self.fusion);
-            let seeds = cands
-                .iter()
-                .take(GRAPH_SEEDS)
-                .enumerate()
-                .map(|(i, c)| (c.key.clone(), 1.0 / (i + 1) as f64))
-                .collect();
-            self.expand_graph(s, &mut cands, seeds, x, spec.as_ref(), now, &mut stats)?;
-            for c in &mut cands {
-                c.score = 0.0;
-                c.ranks = [None; 6];
-            }
+        Ok((cands, fell_back))
+    }
+
+    /// Step 2, the graph expansion: seeded by the fused order without it.
+    fn expand_from_fused(
+        &self,
+        plan: &Plan<'_>,
+        cands: &mut Vec<Cand>,
+        x: Expand,
+        stats: &mut RecallStats,
+    ) -> Result<()> {
+        let mut w = self.signal_weights();
+        w[5] = 0.0;
+        fuse(cands, &w, self.fusion);
+        let seeds = cands
+            .iter()
+            .take(GRAPH_SEEDS)
+            .enumerate()
+            .map(|(i, c)| (c.key.clone(), 1.0 / (i + 1) as f64))
+            .collect();
+        self.expand_graph(plan, cands, seeds, x, stats)?;
+        for c in cands.iter_mut() {
+            c.score = 0.0;
+            c.ranks = [None; 6];
         }
-        stats.candidates = cands.len();
-        stats.ivf_fallbacks = fell_back.len();
-        stats.ivf_namespaces = ivf_counts.len() - fell_back.len();
-        // 3. Fusion.
-        fuse(&mut cands, &self.signal_weights(), self.fusion);
-        // 4. In fused order, within k and the byte budget.
+        Ok(())
+    }
+
+    /// Step 4: the candidates in fused order, within `k` and the byte budget.
+    fn take_hits(&self, cands: Vec<Cand>, stats: &mut RecallStats) -> Vec<RecallHit> {
         let mut out = Vec::new();
         let mut used = 0u64;
         for c in cands {
@@ -650,7 +706,7 @@ impl<'a> Recall<'a> {
             used += size;
             out.push(hit);
         }
-        Ok((out, stats))
+        out
     }
 
     /// The signals' weights, in [`Cand::vals`]' order.
@@ -668,17 +724,15 @@ impl<'a> Recall<'a> {
 
     /// Walks the links from `seeds` (each with its value, best first) as [`Expand`] says,
     /// adding the memories it reaches to `cands` and setting their graph values.
-    #[allow(clippy::too_many_arguments)]
     fn expand_graph(
         &self,
-        s: &Snapshot,
+        plan: &Plan<'_>,
         cands: &mut Vec<Cand>,
         seeds: Vec<(Vec<u8>, f64)>,
         x: Expand,
-        spec: Option<&VectorSpec>,
-        now: u64,
         stats: &mut RecallStats,
     ) -> Result<()> {
+        let (s, spec, now) = (plan.s, plan.spec.as_ref(), plan.now);
         let mut at: BTreeMap<Vec<u8>, usize> = cands
             .iter()
             .enumerate()
