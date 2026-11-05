@@ -1,0 +1,2 @@
+### Fixed
+- `pigeonhole-text`'s `Index::repair` and `Index::rebuild` no longer hold a snapshot, or a scan's iterator, across their own commits. Under a write load that filled the memtable arena, one of their commits could wait the whole write-stall timeout for room only that snapshot held, and fail with `Busy`. `repair` now reads each prefix's keys and drops the snapshot before it deletes them; `rebuild` reads 256 documents at a time and drops each page's snapshot before re-indexing them (#1514, as #1513 did for the IVF index).
