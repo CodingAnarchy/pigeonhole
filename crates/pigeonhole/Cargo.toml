@@ -29,6 +29,10 @@ __unstable-hooks = []
 # methods for this crate's tests (#1504): hold and fault seams only. Only this crate's
 # dev-dependency on itself turns it on; the bench's `__unstable-hooks` builds don't get it.
 __engine-hooks = ["__unstable-hooks", "pigeonhole-engine/test-hooks"]
+# Replication apply (D315 PR 3, ICR 0114): the hidden, id-carrying `ReplicatedEvent` a
+# primary's feed gives, and the calls a replica applies them with. Not part of the API and
+# outside the semver promise, until the replica's surface is designed for it.
+__unstable-replication = []
 
 [dependencies]
 pigeonhole-engine = { workspace = true }

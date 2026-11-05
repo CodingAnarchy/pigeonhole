@@ -2829,10 +2829,11 @@ impl ShardState {
     ) -> Option<TabletOpKind> {
         let cfg = self.shared.balance;
         let view = self.shared.view.load_full();
+        // A replica's state tablet (D315 PR 3; simp724's R2) is never split or merged.
         let owned: Vec<TabletEntry> = view
             .tablets
             .iter()
-            .filter(|t| t.shard == self.id)
+            .filter(|t| t.shard == self.id && t.table != pigeonhole_format::manifest::REPLICA_TABLE)
             .cloned()
             .collect();
         if owned.is_empty() {

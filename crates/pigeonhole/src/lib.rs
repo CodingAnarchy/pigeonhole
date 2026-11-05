@@ -98,6 +98,9 @@ mod metrics;
 mod options;
 mod read;
 mod recovery;
+#[cfg(feature = "__unstable-replication")]
+#[doc(hidden)]
+pub mod replication;
 mod retry;
 mod set;
 mod table;

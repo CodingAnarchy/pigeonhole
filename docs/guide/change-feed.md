@@ -111,6 +111,7 @@ match feed.next_event(wait)?.expect("the commit") {
 - **Names:** a change to a table dropped before the feed reached it comes with empty names, unless the feed delivered the table's creation.
 - **A sidecar failure** (the feed's `-feed` file can't be written) stops this session from recording catalog changes. A feed of every table in the writer's process expires at once. In a reader process, it waits at the next catalog change's place in commit order until the database reopens. Feeds of some tables carry on. Every token taken since expires at the next open, as for any sidecar failure. Writes go on.
 - **Async:** `nonblocking::FeedEventStream` is `FeedStream` for events, and `Feed::poll_next_event` is the same one level down.
+- **Replicas** (unstable, behind the `__unstable-replication` feature; D315): a database that applies another's feed of every table takes only its primary's changes. Its own writes and schema changes fail with `ReadOnly`, and so do pigeonhole's own background writers on it, such as an agent memory store's consolidation or an index build. Table names starting with `__pigeonhole.` are reserved everywhere.
 
 ## Tokens
 Take `feed.token()` after handling a commit, and store it with what the commit fed, ideally in the same write. `FeedToken::as_bytes` and `FeedToken::from_bytes` round-trip it. Resuming continues exactly after the last commit delivered, so a crash between handling a commit and storing its token delivers that commit again, never skips it. Make your handling idempotent, or store the token atomically with its effect.

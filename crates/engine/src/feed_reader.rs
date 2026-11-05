@@ -497,6 +497,12 @@ impl FeedReader {
         let mut tables = spec.tables;
         tables.sort_unstable();
         tables.dedup();
+        // A replica's state table (D315 PR 3; simp724's S2) is no feed's, at every layer.
+        if tables.contains(&pigeonhole_format::manifest::REPLICA_TABLE) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be fed".into(),
+            ));
+        }
         // Every table (D315): the session must feed every table, not a list of them.
         if tables.is_empty() && !matches!(fed, FeedTables::All) {
             return Err(Error::InvalidArgument(
@@ -1312,8 +1318,13 @@ impl FeedReader {
                 let m = m?;
                 // The table first, then the row: a mutation outside is skipped by its
                 // lengths, never copied (§2.7).
-                // An empty list is every table (D315).
-                let followed = tables.is_empty() || tables.binary_search(&m.table).is_ok();
+                // An empty list is every table (D315), but a replica's state table: a
+                // commit only to it is passed over (D315 PR 3).
+                let followed = if tables.is_empty() {
+                    m.table != pigeonhole_format::manifest::REPLICA_TABLE
+                } else {
+                    tables.binary_search(&m.table).is_ok()
+                };
                 if !followed || !m.row.starts_with(prefix) {
                     continue;
                 }
