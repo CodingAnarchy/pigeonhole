@@ -646,6 +646,7 @@ pub fn pigeonhole::Options::default() -> Self
 pub struct pigeonhole::Pigeonhole
 impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::backup(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::backup_at(&self, &pigeonhole::Snapshot, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::backup_durable(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::close(self) -> pigeonhole::Result<()>
 pub fn pigeonhole::Pigeonhole::compact(&self) -> pigeonhole::Result<()>

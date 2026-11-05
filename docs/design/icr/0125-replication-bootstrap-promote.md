@@ -1,10 +1,12 @@
 # 0125: a replica's bootstrap and promotion (`backup_at`, `begin_replication`, `promote`)
 
-**Status:** Approved (the number is from the coordinator, 2026-11-06; the design is agreed on #1436 with simp724's P1 and P2 and cli692's serve review). Everything here is hidden (`#[doc(hidden)]`) behind `__unstable-replication`. Whether `backup_at` becomes public is the owner's call; it's built so either way works.
+**Status:** Approved (the number is from the coordinator, 2026-11-06; the design is agreed on #1436 with simp724's P1 and P2 and cli692's serve review). `backup_at` is public and stable from 1.2.0 (the owner's call, 2026-11-05; the ledger records it). Everything else here is hidden (`#[doc(hidden)]`) behind `__unstable-replication`.
 
 ## The change
-**pigeonhole** (hidden, behind the feature):
-- **`Pigeonhole::backup_at(&Snapshot, dest)`:** `backup` of a given snapshot. The copy holds exactly what the snapshot sees, so a feed opened `from_snapshot` on that snapshot starts where the copy ends.
+**pigeonhole, public (stable API, in the API snapshot):**
+- **`Pigeonhole::backup_at(&Snapshot, dest)`:** `backup` of a given snapshot. The copy holds exactly what the snapshot sees, so a feed opened `from_snapshot` on that snapshot starts where the copy ends. Useful alone: seeding a downstream copy that a feed then keeps current, or backing up a durable snapshot an application also reads. Errors: `InvalidArgument` for another database's snapshot, `SnapshotExpired` for one from before an automatic recovery, and `backup`'s own (`dest` exists, I/O).
+
+**pigeonhole, hidden behind `__unstable-replication`:**
 - **`Pigeonhole::begin_replication(&FeedToken)`:** makes a bootstrap copy a replica that follows its primary from `token`.
   - **The token** is that of a feed of every table opened `from_snapshot` on the snapshot the copy was taken at.
   - **What it does:** creates the reserved state table (`ro_compat` bit 0, R6's write refusal) and stores the token's position and the primary's database id, so the first `apply_replicated` chains on it.
@@ -26,4 +28,4 @@
 **Not here:** the serve side (`phdb serve --replica-of`, the `Replication` service, re-bootstrap's file swap, `Admin.Promote`), which is in ICR 0112's amendment. Read-your-writes on a replica (#1577).
 
 ## Callers changed
-None: hidden and additive. The `it::milestone_b` test moves from the removed hook to `Engine::backup_at`.
+None: additive. `backup_at` is a new public method; the rest is hidden. The `it::milestone_b` test moves from the removed hook to `Engine::backup_at`.

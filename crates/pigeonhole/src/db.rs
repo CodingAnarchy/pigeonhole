@@ -1504,11 +1504,53 @@ impl Pigeonhole {
     }
 
     /// As [`backup`](Self::backup), of `snapshot` (#1436, ICR 0125): the copy holds exactly
-    /// what the snapshot sees, so a feed opened [`from_snapshot`](crate::FeedBuilder::from_snapshot)
-    /// on it starts where the copy ends (a replica's bootstrap). `SnapshotExpired` for a
-    /// snapshot of another engine (before a recovery). Not part of the stable API.
-    #[cfg(feature = "__unstable-replication")]
-    #[doc(hidden)]
+    /// the commits `snapshot` sees, no more and no fewer, whenever this is called. Take one
+    /// snapshot, back it up, and open a change feed
+    /// [`from_snapshot`](crate::FeedBuilder::from_snapshot) of the same snapshot: the feed
+    /// starts at the first commit the copy doesn't hold, so the copy plus the feed misses
+    /// nothing and repeats nothing (a downstream copy seeded from the backup, then kept
+    /// current from the feed). With a [`durable_snapshot`](Self::durable_snapshot), the copy
+    /// holds only durable commits, as [`backup_durable`](Self::backup_durable)'s does.
+    ///
+    /// The snapshot is held for the copy's length, which holds back version and blob GC as
+    /// any held snapshot does. `dest` must not exist. `InvalidArgument` for another
+    /// database's snapshot, and `SnapshotExpired` for one taken before an automatic recovery
+    /// (D265) replaced the engine: take a new one.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let options = Options::default().shards(1).change_feed(FeedRetention::bytes(64 << 20));
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), options)?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"a").put("f", b"q", b"1").commit()?;
+    ///
+    /// // One snapshot for both: the copy holds `a`, the feed starts after it.
+    /// let snapshot = db.durable_snapshot()?;
+    /// let copy_path = dir.join("seed.phdb");
+    /// db.backup_at(&snapshot, &copy_path)?;
+    /// let mut feed = db.feed().from_snapshot(&snapshot).open()?;
+    /// drop(snapshot);
+    ///
+    /// t.mutate(b"b").put("f", b"q", b"2").commit()?;
+    /// let commit = feed.next(Duration::from_secs(5))?.expect("b's commit");
+    /// assert_eq!(commit.changes()[0].row(), b"b");
+    ///
+    /// let copy = Pigeonhole::open(&copy_path, Options::default().shards(1))?;
+    /// let ct = copy.table("t")?.open()?;
+    /// assert!(ct.get(b"a", "f", b"q")?.is_some());
+    /// assert!(ct.get(b"b", "f", b"q")?.is_none()); // the feed brings it
+    /// # drop(ct);
+    /// # copy.close()?;
+    /// # drop(feed);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn backup_at(&self, snapshot: &Snapshot, dest: impl AsRef<Path>) -> Result<()> {
         self.db.check_snapshot(snapshot)?;
         self.engine()
