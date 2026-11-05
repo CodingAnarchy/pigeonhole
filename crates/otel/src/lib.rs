@@ -1258,47 +1258,26 @@ fn build(
         Value::U(u) => u,
         Value::F(f) => f as u64,
     };
+    // The four instruments differ only in their constructor, value type and conversion.
+    macro_rules! instrument {
+        ($new:ident, $t:ty, $of:expr) => {
+            Box::new(
+                meter
+                    .$new(i.name)
+                    .with_unit(i.unit)
+                    .with_description(i.description)
+                    .with_callback(move |o: &dyn AsyncInstrument<$t>| {
+                        observe(&mut |v, a| o.observe($of(v), a))
+                    })
+                    .build(),
+            )
+        };
+    }
     match (i.kind, spec.float) {
-        (InstrumentKind::Counter, false) => Box::new(
-            meter
-                .u64_observable_counter(i.name)
-                .with_unit(i.unit)
-                .with_description(i.description)
-                .with_callback(move |o: &dyn AsyncInstrument<u64>| {
-                    observe(&mut |v, a| o.observe(u64_of(v), a))
-                })
-                .build(),
-        ),
-        (InstrumentKind::Counter, true) => Box::new(
-            meter
-                .f64_observable_counter(i.name)
-                .with_unit(i.unit)
-                .with_description(i.description)
-                .with_callback(move |o: &dyn AsyncInstrument<f64>| {
-                    observe(&mut |v, a| o.observe(f64_of(v), a))
-                })
-                .build(),
-        ),
-        (InstrumentKind::Gauge, false) => Box::new(
-            meter
-                .u64_observable_gauge(i.name)
-                .with_unit(i.unit)
-                .with_description(i.description)
-                .with_callback(move |o: &dyn AsyncInstrument<u64>| {
-                    observe(&mut |v, a| o.observe(u64_of(v), a))
-                })
-                .build(),
-        ),
-        (InstrumentKind::Gauge, true) => Box::new(
-            meter
-                .f64_observable_gauge(i.name)
-                .with_unit(i.unit)
-                .with_description(i.description)
-                .with_callback(move |o: &dyn AsyncInstrument<f64>| {
-                    observe(&mut |v, a| o.observe(f64_of(v), a))
-                })
-                .build(),
-        ),
+        (InstrumentKind::Counter, false) => instrument!(u64_observable_counter, u64, u64_of),
+        (InstrumentKind::Counter, true) => instrument!(f64_observable_counter, f64, f64_of),
+        (InstrumentKind::Gauge, false) => instrument!(u64_observable_gauge, u64, u64_of),
+        (InstrumentKind::Gauge, true) => instrument!(f64_observable_gauge, f64, f64_of),
     }
 }
 
