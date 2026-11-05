@@ -856,22 +856,50 @@ impl Store {
     /// With [near dedup](NearDedup), the nearest live memory is looked up first, outside the
     /// transaction, and a close enough one is skipped, merged into or linked to.
     pub fn remember(&self, ns: &str, memory: Memory) -> Result<Remembered> {
+        let p = self.prepare_remember(ns, memory)?;
+        #[cfg(feature = "__unstable-hooks")]
+        if p.near.is_some() {
+            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
+        }
+        let r = self.db.transact(&RetryPolicy::default(), |txn| {
+            self.remember_prepared_in(txn, &p)
+        });
+        self.settle();
+        Ok(r?.0)
+    }
+
+    /// The part of [`remember`](Self::remember) before its transaction (ICR 0123): checks
+    /// the memory, runs the near-dedup lookup if the store has near dedup (a read outside
+    /// any transaction), and fixes the new memory's id and time. Then commit
+    /// [`remember_prepared_in`](Self::remember_prepared_in) in a transaction of your own,
+    /// retrying it as you like (each attempt writes the same memory), and
+    /// [`settle`](Self::settle) after it commits. That's `remember`, step by step, for a
+    /// caller with its own retry loop (#1479's asyncio forms).
+    pub fn prepare_remember(&self, ns: &str, memory: Memory) -> Result<PreparedMemory> {
         self.check_memory(ns, &memory)?;
         let near = match self.near_dedup()? {
             Some(setting) => self.near(ns, &memory, setting)?,
             None => None,
         };
-        #[cfg(feature = "__unstable-hooks")]
-        if near.is_some() {
-            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
-        }
         let now = now_us();
         let rid = new_rid(now)?;
-        let r = self.db.transact(&RetryPolicy::default(), |txn| {
-            self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
-        });
-        self.settle();
-        Ok(r?.0)
+        Ok(PreparedMemory {
+            ns: ns.to_owned(),
+            memory,
+            rid,
+            now,
+            near,
+        })
+    }
+
+    /// One attempt of [`remember`](Self::remember)'s transaction, in the caller's
+    /// transaction: exact dedup, and the near-dedup outcome `prepare` found (ICR 0123).
+    pub fn remember_prepared_in(
+        &self,
+        txn: &mut Transaction,
+        p: &PreparedMemory,
+    ) -> Result<Remembered> {
+        self.remember_with(txn, &p.ns, &p.memory, p.rid, p.now, p.near.as_ref())
     }
 
     /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
@@ -1927,4 +1955,15 @@ fn check_weight(w: f32) -> Result<()> {
             "a link's weight is from 0 to 1, not {w}"
         )))
     }
+}
+
+/// A memory [`Store::prepare_remember`] checked and placed: its near-dedup lookup done and
+/// its id and time fixed, for [`Store::remember_prepared_in`] (ICR 0123).
+#[derive(Debug)]
+pub struct PreparedMemory {
+    ns: String,
+    memory: Memory,
+    rid: [u8; 16],
+    now: u64,
+    near: Option<Near>,
 }

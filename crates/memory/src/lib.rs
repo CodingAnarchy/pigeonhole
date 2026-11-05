@@ -47,8 +47,8 @@ pub use layout::{MemoryId, normalize};
 pub use pigeonhole_text::Normalization;
 pub use recall::{Expand, Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
 pub use store::{
-    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
-    Source, Store, StoreOptions, StoreStats, StoredMemory,
+    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, PreparedMemory, ReadStore,
+    Remembered, Source, Store, StoreOptions, StoreStats, StoredMemory,
 };
 pub use watch::{MemoryCommit, MemoryEvent, PASS_OVER_PER_POLL, Watch, WatchBuilder, WatchToken};
 

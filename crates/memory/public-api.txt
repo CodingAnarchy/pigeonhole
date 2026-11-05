@@ -233,6 +233,7 @@ pub fn pigeonhole_memory::OpenOptions::model(self, impl core::convert::Into<allo
 pub fn pigeonhole_memory::OpenOptions::new() -> Self
 pub fn pigeonhole_memory::OpenOptions::own_forgetter(self) -> Self
 pub fn pigeonhole_memory::OpenOptions::without_embeddings(self) -> Self
+pub struct pigeonhole_memory::PreparedMemory
 pub struct pigeonhole_memory::ReadStore
 impl pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
@@ -318,9 +319,11 @@ pub fn pigeonhole_memory::Store::normalization(&self) -> pigeonhole_text::layout
 pub fn pigeonhole_memory::Store::open(&pigeonhole::db::Pigeonhole, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_without_embeddings(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::prepare_remember(&self, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::PreparedMemory>
 pub fn pigeonhole_memory::Store::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Store::remember(&self, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
 pub fn pigeonhole_memory::Store::remember_in(&self, &mut pigeonhole::write::Transaction, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
+pub fn pigeonhole_memory::Store::remember_prepared_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::PreparedMemory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
 pub fn pigeonhole_memory::Store::set_forget_policy(&self, core::option::Option<pigeonhole_memory::ForgetPolicy>) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::settle(&self)
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>

@@ -366,7 +366,15 @@ The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutin
   - Cancelled while it waits for room (an async commit waits when its shard has too many in flight), nothing is written.
   - Once it's submitted, it may still land, and the task can't tell which happened. To keep the outcome, await `asyncio.shield(m.commit_async())`.
 - **How it runs:** one `pigeonhole-asyncio` thread per process hands results to the event loops. The engine's threads never take the GIL to do it. Any asyncio loop works, uvloop included.
-- **Not yet async:** the memory store's calls (#1479's second PR), and reads outside a transaction. Until then, call them through `asyncio.to_thread`.
+- **The memory store (#1479's second PR):**
+  - `Store.remember_async`, `delete_async`, `link_async`, `supersede_async` and `mark_used_async` take the sync forms' arguments and return their results. Each commit is awaited, and retried as `transact` retries.
+  - Their reads inside the transaction can block the loop on a cache miss.
+  - `remember_async`'s near-dedup lookup (on a store with near dedup) and an IVF store's settle run on a worker thread.
+  - `Store.watch(...)` gives a `Watch` of the store's memory events, with `next`, `try_next` and `next_async`, under the same rules as `Feed.next_async`.
+  - `Store.consolidate_loop(...)` gives a `ConsolidateLoop`. Its `run_once_async` awaits new memories without holding a thread, and a timeout loses no events. It runs the due passes, and so your consolidator, on a worker thread.
+  - Recall isn't async yet (#1560).
+- **An awaited write is a commit:** finish or drop snapshots, scans and Arrow streams before you await a write. A `remember_async`'s settle may commit splits too. Holding a snapshot across them is [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) with the event loop as the thread: the write waits for room only your snapshot holds, and ends in `Busy`.
+- **Not yet async:** reads outside a transaction, and memory recall (#1560). Call them through `asyncio.to_thread` meanwhile.
 
 ```python
 import asyncio

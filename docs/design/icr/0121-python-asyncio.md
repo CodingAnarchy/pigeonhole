@@ -28,3 +28,20 @@ The Python bindings (ICR 0102's stubs) gain the awaitable forms of the calls tha
 
 ## Callers changed
 None outside the bindings. The memory store's async forms are #1479's second PR, which needs single-attempt additions to pigeonhole-memory and the owner's scope call.
+
+## Amendment 2 (2026-11-05): the memory store (#1479 PR 2)
+The owner put the memory store's waits in #1479's second PR (tier 1); the async recall is #1560. Over ICR 0123's pigeonhole-memory additions, `pigeonhole.memory` gains:
+- **The async writes:** `Store.remember_async`, `delete_async`, `link_async`, `supersede_async` and `mark_used_async`.
+  - They return coroutines with the sync forms' results, retried as `transact` retries (`_Retry`).
+  - The near-dedup lookup and an IVF store's settle run on a worker thread.
+- **The single-attempt forms:** `Store.link_in`, `supersede_in` and `mark_used_in`, beside the existing `remember_in`, `delete_in` and `forget_in`, plus `Store.settle()`.
+- **The watch:** `Store.watch(namespaces=None, *, from_snapshot=None, resume=None, visible=False)` and `ReadStore.watch(...)` give a `Watch`:
+  - `next(timeout)`, `try_next()`, `next_async()`, `token()`, `oldest_retained`, `closed`, iteration, `close()` and `with`;
+  - it yields `MemoryCommit(seqno, timestamp_us, events)` with `MemoryEvent(kind, id, by)`, where `kind` is a `str` with Ruby's names.
+  - `next_async` follows `Feed.next_async`'s rules, and shares its code (`crate::waits`).
+- **The loop:** `Store.consolidate_loop(name, consolidator, *, policy=None, namespaces=None, clock_offset=None)` gives a `ConsolidateLoop`:
+  - `run_once(timeout=None)`, giving a `LoopStep`, and `run_once_async(timeout=1.0)`;
+  - `next_due` (µs since the epoch, on the loop's clock), `interrupt()`, `close()` and `with`.
+  - Ruby's loop has no `interrupt`: its `run_once` releases the GVL, and Ruby's own interrupts reach it.
+- **Private names, outside the stubs:** `_prepare_remember`, `_remember_prepared_in`, `_near_dedup_on`, `_has_ivf`, `_db`, `ConsolidateLoop._wait_async`, `_run_once_after` and `_now_us`.
+- **`namespaces`** takes a `str` or a sequence, as Ruby's does.

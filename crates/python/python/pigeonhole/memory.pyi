@@ -4,11 +4,12 @@ The Python API's snapshot for `pigeonhole.memory` (ICR 0102, ICR 0107): `mypy.st
 checks these stubs against the built module in CI.
 """
 
+import asyncio
 import enum
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from datetime import timedelta
 from types import TracebackType
-from typing import ClassVar, Literal, final
+from typing import Any, ClassVar, Literal, final
 
 from pigeonhole import Database, Element, InvalidArgument, MergeFailed, Reader, Seconds, Snapshot, Transaction
 
@@ -468,6 +469,48 @@ class Store:
     def link(self, from_: Id, to: Id, link_type: int, weight: float = 1.0) -> None: ...
     def supersede(self, old: Id, new: Id) -> None: ...
     def mark_used(self, ids: Sequence[Id]) -> Marked: ...
+    def link_in(self, txn: Transaction, from_: Id, to: Id, link_type: int, weight: float = 1.0) -> None: ...
+    def supersede_in(self, txn: Transaction, old: Id, new: Id) -> None: ...
+    def mark_used_in(self, txn: Transaction, ids: Sequence[Id]) -> Marked: ...
+    def settle(self) -> None:
+        """Hands an IVF store's parked writes on, after a transaction that ran `remember_in`
+        or `delete_in`."""
+    def remember_async(
+        self,
+        ns: str,
+        text: str,
+        *,
+        embedding: Sequence[float] | None = None,
+        kind: Kind | Literal["episodic", "semantic", "procedural"] | None = None,
+        importance: float | None = None,
+        source: str | None = None,
+        session: str | None = None,
+        links: Sequence[LinkSpec] | None = None,
+        pinned: bool = False,
+    ) -> Coroutine[Any, Any, Remembered]: ...
+    def delete_async(self, id: Id) -> Coroutine[Any, Any, bool]: ...
+    def link_async(
+        self, from_: Id, to: Id, link_type: int, weight: float = 1.0
+    ) -> Coroutine[Any, Any, None]: ...
+    def supersede_async(self, old: Id, new: Id) -> Coroutine[Any, Any, None]: ...
+    def mark_used_async(self, ids: Sequence[Id]) -> Coroutine[Any, Any, Marked]: ...
+    def watch(
+        self,
+        namespaces: str | Sequence[str] | None = None,
+        *,
+        from_snapshot: Snapshot | None = None,
+        resume: bytes | None = None,
+        visible: bool = False,
+    ) -> Watch: ...
+    def consolidate_loop(
+        self,
+        name: str,
+        consolidator: Consolidator,
+        *,
+        policy: ConsolidatePolicy | None = None,
+        namespaces: str | Sequence[str] | None = None,
+        clock_offset: float | None = None,
+    ) -> ConsolidateLoop: ...
     def get(self, id: Id) -> StoredMemory | None: ...
     def verify(self) -> StoreStats: ...
     def recall(
@@ -555,6 +598,14 @@ class ReadStore:
     def normalization(self) -> Literal["nfc", "nfkc", "none", "unknown"]: ...
     def get(self, id: Id) -> StoredMemory | None: ...
     def verify(self) -> StoreStats: ...
+    def watch(
+        self,
+        namespaces: str | Sequence[str] | None = None,
+        *,
+        from_snapshot: Snapshot | None = None,
+        resume: bytes | None = None,
+        visible: bool = False,
+    ) -> Watch: ...
     def recall(
         self,
         namespaces: Namespaces,
@@ -595,3 +646,94 @@ class ReadStore:
         with_embeddings: bool = False,
         expand: Expand | None = None,
     ) -> tuple[list[RecallHit], RecallStats]: ...
+
+@final
+class MemoryEvent:
+    """One memory event of a commit: `kind` is `"remembered"`, `"summarized"`,
+    `"superseded"` (`by` is the newer memory), `"deleted"`, `"updated"` or `"unknown"`."""
+
+    @property
+    def kind(self) -> Literal["remembered", "summarized", "superseded", "deleted", "updated", "unknown"]: ...
+    @property
+    def id(self) -> MemoryId: ...
+    @property
+    def by(self) -> MemoryId | None: ...
+
+@final
+class MemoryCommit:
+    """One commit's memory events, in commit order."""
+
+    @property
+    def seqno(self) -> int: ...
+    @property
+    def timestamp_us(self) -> int: ...
+    @property
+    def events(self) -> list[MemoryEvent]: ...
+    def __len__(self) -> int: ...
+
+@final
+class WatchIter:
+    def __iter__(self) -> WatchIter: ...
+    def __next__(self) -> MemoryCommit: ...
+
+@final
+class Watch:
+    """A store's memory events, through the change feed (`Store.watch`)."""
+
+    def next(self, timeout: Seconds | None = None) -> MemoryCommit | None: ...
+    def try_next(self) -> MemoryCommit | None: ...
+    def next_async(self) -> asyncio.Future[MemoryCommit]:
+        """The next commit, awaited (#1479); one wait at a time; the writer process only."""
+    def token(self) -> bytes: ...
+    @property
+    def oldest_retained(self) -> int | None: ...
+    @property
+    def closed(self) -> bool: ...
+    def iter(self, timeout: Seconds | None = None) -> WatchIter: ...
+    def __iter__(self) -> WatchIter: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Watch: ...
+    def __exit__(
+        self,
+        ty: type[BaseException] | None,
+        value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
+
+@final
+class LoopStep:
+    """One step of a `ConsolidateLoop`."""
+
+    @property
+    def events(self) -> int: ...
+    @property
+    def passes(self) -> list[tuple[str, ConsolidatePass]]: ...
+    @property
+    def failed(self) -> list[tuple[str, BaseException]]: ...
+    @property
+    def stopped(self) -> list[tuple[str, ConsolidatePass]]: ...
+    @property
+    def interrupted(self) -> bool: ...
+    @property
+    def next_due(self) -> int | None: ...
+    @property
+    def token(self) -> bytes: ...
+
+@final
+class ConsolidateLoop:
+    """A feed-driven consolidation loop (`Store.consolidate_loop`)."""
+
+    def run_once(self, timeout: Seconds | None = None) -> LoopStep: ...
+    def run_once_async(self, timeout: float = 1.0) -> Coroutine[Any, Any, LoopStep]: ...
+    @property
+    def next_due(self) -> int | None:
+        """When the next pass is due, µs since the epoch on the loop's clock."""
+    def interrupt(self) -> None: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> ConsolidateLoop: ...
+    def __exit__(
+        self,
+        ty: type[BaseException] | None,
+        value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
