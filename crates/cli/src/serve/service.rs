@@ -30,6 +30,10 @@ use super::sessions::{SnapshotGuard, Taken};
 const DEFAULT_PAGE_BYTES: u64 = 1 << 20;
 const MAX_PAGE_BYTES: u64 = 8 << 20;
 
+/// `Vectors.Nearest`'s largest `k`: the engine keeps `k` candidates while it ranks, before
+/// the reply's byte budget cuts it (simp724's L1 on #1565).
+const MAX_NEAREST_K: u32 = 10_000;
+
 /// One call, decoded. It holds its request by value: routing moves it, never copies it
 /// (perf287 on D317's seam).
 #[derive(Debug)]
@@ -1132,8 +1136,10 @@ impl Service {
     }
 
     /// `Graph.Traverse` (D304): the hops from the seeds over one edge family, at the pinned
-    /// snapshot `snapshot_id` names, or now. Run on the request's task (`run_async` never
-    /// blocks on a block it can fetch), so it holds no blocking thread.
+    /// snapshot `snapshot_id` names, or now, cut to `page_bytes` of nodes (D308; 0 is the
+    /// server's default, and the server caps it), so a reply is bounded as a `MultiGet`'s is
+    /// (simp724's L1 on #1565). Run on the request's task (`run_async` never blocks on a block
+    /// it can fetch), so it holds no blocking thread.
     async fn traverse(
         &self,
         r: proto::TraverseRequest,
@@ -1145,14 +1151,15 @@ impl Service {
             ));
         }
         if r.hops > 64 {
-            return Err(ApiError::invalid("hops is 1 to 64"));
+            return Err(ApiError::invalid("hops is at most 64 (0 is 1)"));
         }
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let seeds = KeySet::from_unsorted(r.seeds.iter().map(|k| &k[..]));
         let mut t = convert::edges(table.traverse(&seeds).family(&r.family), &r)?
             .hops(r.hops.max(1))
-            .parents(r.parents);
+            .parents(r.parents)
+            .byte_budget(page_bytes(r.page_bytes));
         if let Some(p) = &pinned {
             t = t.snapshot(p.snapshot());
         }
@@ -1181,21 +1188,24 @@ impl Service {
                 edges: stats.edges,
                 hops_cut: stats.hops_cut,
                 cut_by_max_nodes: stats.cut_by_max_nodes,
+                cut_by_budget: stats.cut_by_budget,
             }),
         })
     }
 
-    /// `Vectors.Nearest` (D296, D303): the exact top `k` of one vector family over a key
-    /// range or a key list, at the pinned snapshot `snapshot_id` names, or now, cut to
-    /// `page_bytes` by D308's measure when it's set. Run on the request's task, as `Traverse`.
+    /// `Vectors.Nearest` (D296, D303): the exact top `k` (at most [`MAX_NEAREST_K`]) of one
+    /// vector family over a key range or a key list, at the pinned snapshot `snapshot_id`
+    /// names, or now, cut to `page_bytes` by D308's measure (0 is the server's default, and
+    /// the server caps it), so a reply is bounded as a `MultiGet`'s is. Run on the request's
+    /// task, as `Traverse`.
     async fn nearest(
         &self,
         r: proto::NearestRequest,
         caller: &Caller,
     ) -> Result<proto::NearestResponse, ApiError> {
         use proto::nearest_request::Source;
-        if r.k == 0 {
-            return Err(ApiError::invalid("k is at least 1"));
+        if r.k == 0 || r.k > MAX_NEAREST_K {
+            return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
         }
         let query = r
             .query
@@ -1218,13 +1228,9 @@ impl Service {
             }
             None => query.on_scan(select.scan(&table, None)?.family(&r.family), k),
         };
-        let (found, cut_by_budget) = if r.page_bytes == 0 {
-            (search.run_async().await?, false)
-        } else {
-            let page = search.run_within_async(r.page_bytes).await?;
-            let cut = page.cut_by_budget();
-            (page.into_neighbours(), cut)
-        };
+        let page = search.run_within_async(page_bytes(r.page_bytes)).await?;
+        let cut_by_budget = page.cut_by_budget();
+        let found = page.into_neighbours();
         Ok(proto::NearestResponse {
             neighbours: found
                 .into_iter()

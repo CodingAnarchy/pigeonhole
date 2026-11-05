@@ -2826,6 +2826,11 @@ pub struct TraverseRequest {
     pub value_filter: ::core::option::Option<ValueFilter>,
     #[prost(string, tag = "14")]
     pub snapshot_id: ::prost::alloc::string::String,
+    /// Cut the traversal to this many bytes of nodes by D308's measure (a node counts its key
+    /// and 16 bytes, plus 4 with `parents`): 0 is the server's default, 1 MiB, and the server
+    /// caps it at 8 MiB. The hop it cuts keeps its in-budget prefix, and the traversal ends.
+    #[prost(uint64, tag = "15")]
+    pub page_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraverseResponse {
@@ -2855,6 +2860,9 @@ pub struct TraverseStats {
     pub hops_cut: u32,
     #[prost(bool, tag = "4")]
     pub cut_by_max_nodes: bool,
+    /// `page_bytes` cut the last hop short: the traversal ended with it.
+    #[prost(bool, tag = "5")]
+    pub cut_by_budget: bool,
 }
 /// Generated client implementations.
 pub mod graph_client {
@@ -6928,11 +6936,14 @@ pub struct NearestRequest {
     pub family: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "5")]
     pub query: ::core::option::Option<Vector>,
+    /// 1 to 10,000.
     #[prost(uint32, tag = "6")]
     pub k: u32,
     #[prost(string, tag = "7")]
     pub snapshot_id: ::prost::alloc::string::String,
-    /// Cut the result to this many bytes by D308's measure (0: no budget).
+    /// Cut the result to this many bytes by D308's measure (each neighbour counts its row, its
+    /// qualifier and 16 bytes): 0 is the server's default, 1 MiB, and the server caps it at
+    /// 8 MiB.
     #[prost(uint64, tag = "8")]
     pub page_bytes: u64,
     /// Which rows' vectors to search.

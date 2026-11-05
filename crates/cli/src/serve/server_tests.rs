@@ -1593,6 +1593,17 @@ fn traverse_walks_an_edge_family_hop_by_hop() {
     };
     assert_eq!(walk(Some(&id)), [vec![b64(b"d")]]);
     assert_eq!(walk(None), [vec![b64(b"d")], vec![b64(b"later")]]);
+    // A reply is byte-budgeted (simp724's L1 on #1565): a node counts its key and 16 bytes,
+    // so 20 bytes keep one of hop 1's two nodes, and the traversal ends there.
+    let (_, r) = s.rpc(
+        "Graph/Traverse",
+        &json!({"table": "g", "family": "e", "seeds": [b64(b"a")], "hops": 2,
+                "page_bytes": 20}),
+        None,
+    );
+    assert_eq!(hops_of(&r).len(), 1, "{r}");
+    assert_eq!(hops_of(&r)[0].len(), 1, "{r}");
+    assert_eq!(r["stats"]["cut_by_budget"], json!(true), "{r}");
     // Over gRPC.
     let got = s.block_on(async {
         let channel = tonic::transport::Channel::from_shared(s.url.clone())
@@ -1728,6 +1739,11 @@ fn nearest_refuses_a_query_it_cannot_run() {
     for (req, code) in [
         (
             json!({"table": "v", "family": "emb", "query": q, "k": 0}),
+            "InvalidArgument",
+        ),
+        // A ranking keeps `k` candidates before the reply's budget cuts it: k is capped.
+        (
+            json!({"table": "v", "family": "emb", "query": q, "k": 10_001}),
             "InvalidArgument",
         ),
         (
