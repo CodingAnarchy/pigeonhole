@@ -56,6 +56,8 @@ Each reader's package version is the release it pins. The release opens each ent
 
 The `Compatibility` workflow (`.github/workflows/compat.yml`) runs one arm per release on main and PRs. Each arm enables itself once its release is on crates.io.
 
+**Neither reader commits a lockfile.** Each run resolves the pinned release's own dependencies afresh, within their semver ranges, as an application that adds that release today would. So a run's third-party versions can differ from the last one's. That's intended: the promise is about what the release reads, not the build that a lockfile would freeze.
+
 ## Upgrade corpus
 
 `v0.2.5/<entry>/` and `v0.3.3/<entry>/` hold databases written by the released 0.2.5 and 0.3.3 builds from crates.io: files from before format 4, which every 1.x build must open, upgrade and read exactly ([FORMAT.md §13](../../../../FORMAT.md#13-compatibility-promise): "every 1.x build opens every file written by 0.1.0 or later"). Each entry has the same layout as a `format4` entry. Its `expected.txt` is every cell the old build read back from a copy of its own files.

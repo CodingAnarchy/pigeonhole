@@ -256,6 +256,41 @@ fn chunks_spill_fill_and_reclaim() {
     assert_eq!(scan(&mt2.reader()).len(), 1);
 }
 
+/// D316 A2: the free-bytes sink follows `free_bytes` as chunks are taken and given back:
+/// set to the current value at once, unchanged by inserts that fit their chunk, lowered
+/// when a memtable takes a chunk, and raised when a retired memtable is reclaimed.
+#[test]
+fn the_free_sink_follows_free_bytes_as_chunks_are_taken_and_returned() {
+    let mut arena = small();
+    let sink = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let read = |s: &Arc<std::sync::atomic::AtomicU64>| s.load(std::sync::atomic::Ordering::Relaxed);
+    arena.set_free_sink(Arc::clone(&sink));
+    assert_eq!(read(&sink), 64 * 1024, "set to the current value");
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    assert_eq!(read(&sink), arena.free_bytes() as u64);
+    assert_eq!(read(&sink), 63 * 1024);
+    let value = vec![0u8; 300];
+    // Two entries fit chunk 0's room: the sink doesn't move.
+    mt.insert(&mut arena, &key(b"a", 1), &value).unwrap();
+    mt.insert(&mut arena, &key(b"b", 2), &value).unwrap();
+    assert_eq!(
+        read(&sink),
+        63 * 1024,
+        "inserts that fit their chunk store nothing new"
+    );
+    // A third takes a chunk.
+    mt.insert(&mut arena, &key(b"c", 3), &value).unwrap();
+    assert_eq!(read(&sink), 62 * 1024);
+    assert_eq!(read(&sink), arena.free_bytes() as u64);
+    arena.reclaim(mt.retire());
+    assert_eq!(
+        read(&sink),
+        64 * 1024,
+        "a reclaimed memtable's chunks come back"
+    );
+    assert_eq!(read(&sink), arena.free_bytes() as u64);
+}
+
 #[test]
 fn large_entries_take_contiguous_runs() {
     let mut arena = small();
