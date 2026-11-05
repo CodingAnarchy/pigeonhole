@@ -240,6 +240,11 @@ pub struct PendingNearest {
     /// so the cells it drops count toward a poll's budget (#1237's rule), with the SSTs to
     /// read a separated value from.
     filter: Option<Filter>,
+    /// The read's column limit when `filter` left the read (0: none), and the columns that
+    /// passed it in the current row: the resolver counts only passing columns, so the search
+    /// does too (simp724's A1 on #1286).
+    column_limit: u32,
+    columns: u32,
     /// The row being read (its key in a buffer reused from row to row), if one is.
     row: Vec<u8>,
     in_row: bool,
@@ -263,8 +268,9 @@ impl PendingNearest {
         query: Prepared,
         k: usize,
         filter: Option<Filter>,
+        column_limit: u32,
     ) -> Self {
-        Self::with(Source::Scan(cursor), query, k, filter)
+        Self::with(Source::Scan(cursor), query, k, filter, column_limit)
     }
 
     pub(crate) fn keys(
@@ -273,16 +279,31 @@ impl PendingNearest {
         query: Prepared,
         k: usize,
         filter: Option<Filter>,
+        column_limit: u32,
     ) -> Self {
-        Self::with(Source::Keys { cursor, keys }, query, k, filter)
+        Self::with(
+            Source::Keys { cursor, keys },
+            query,
+            k,
+            filter,
+            column_limit,
+        )
     }
 
-    fn with(source: Source, query: Prepared, k: usize, filter: Option<Filter>) -> Self {
+    fn with(
+        source: Source,
+        query: Prepared,
+        k: usize,
+        filter: Option<Filter>,
+        column_limit: u32,
+    ) -> Self {
         Self {
             source,
             visitor: KnnVisitor::typed(query, Arc::new(KnnSkips::default())),
             top: TopK::new(k),
             filter,
+            column_limit,
+            columns: 0,
             row: Vec::new(),
             in_row: false,
             done: false,
@@ -315,18 +336,29 @@ impl PendingNearest {
                     return Poll::Ready(Ok(()));
                 }
                 self.in_row = true;
+                self.columns = 0;
             }
             let row = self.row.as_slice();
-            let (visitor, top, filter) = (&mut self.visitor, &mut self.top, self.filter.as_ref());
-            let ended = match &mut self.source {
-                Source::Scan(c) => {
-                    c.counted(|c| read_row(c, row, &mut budget, visitor, top, filter))
-                }
-                Source::Keys { cursor, .. } => {
-                    cursor.counted(|c| read_row(c, row, &mut budget, visitor, top, filter))
-                }
+            let mut r = RowRead {
+                row,
+                budget: &mut budget,
+                visitor: &mut self.visitor,
+                top: &mut self.top,
+                filter: self.filter.as_ref(),
+                column_limit: self.column_limit,
+                columns: &mut self.columns,
+            };
+            let end = match &mut self.source {
+                Source::Scan(c) => c.counted(|c| r.read(c)),
+                Source::Keys { cursor, .. } => cursor.counted(|c| r.read(c)),
             }?;
-            if ended {
+            if end == RowEnd::Limit
+                && let Source::Keys { cursor, .. } = &mut self.source
+            {
+                // The rest of the key goes unread; a scan's next row drops it itself.
+                cursor.skip_rest_of_key();
+            }
+            if end != RowEnd::Budget {
                 self.in_row = false;
             } else {
                 // The budget ran out mid-row: yield, keeping the row's place.
@@ -354,43 +386,71 @@ impl RowCells for super::keys::KeyCursor {
     }
 }
 
-/// Scores the current row's cells into `top` within `budget` cells: whether the row ended.
-/// Cells `filter` drops count toward the budget too, and never reach the visitor.
-fn read_row(
-    cells: &mut impl RowCells,
-    row: &[u8],
-    budget: &mut u32,
-    visitor: &mut KnnVisitor,
-    top: &mut TopK<Score>,
-    filter: Option<&Filter>,
-) -> crate::Result<bool> {
-    use super::reduce::{CellRef, Reducer};
-    loop {
-        if *budget == 0 {
-            return Ok(false);
-        }
-        let Some(c) = cells.next_cell()? else {
-            return Ok(true);
-        };
-        *budget -= 1;
-        if let Some((p, ssts)) = filter {
-            let kept = match pigeonhole_compaction::blob_pointer(c.stored) {
-                Some(ptr) => p.matches(&ssts.read_pointer(&ptr)?),
-                None => p.matches(c.stored),
-            };
-            if !kept {
-                continue;
+/// Where a row's read stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowEnd {
+    /// The poll's cell budget ran out: the row goes on next poll.
+    Budget,
+    /// The row's cells ran out.
+    Ended,
+    /// The column limit is reached: the rest of the row is skipped.
+    Limit,
+}
+
+/// One row's read into `top`, within the poll's `budget` cells.
+struct RowRead<'a> {
+    row: &'a [u8],
+    budget: &'a mut u32,
+    visitor: &'a mut KnnVisitor,
+    top: &'a mut TopK<Score>,
+    filter: Option<&'a Filter>,
+    column_limit: u32,
+    columns: &'a mut u32,
+}
+
+impl RowRead<'_> {
+    /// Scores the current row's cells. Cells `filter` drops count toward the budget too,
+    /// and never reach the visitor; with a column limit, only the cells it keeps count
+    /// toward the limit (one version per column).
+    fn read(&mut self, cells: &mut impl RowCells) -> crate::Result<RowEnd> {
+        use super::reduce::{CellRef, Reducer};
+        let row = self.row;
+        loop {
+            if *self.budget == 0 {
+                return Ok(RowEnd::Budget);
             }
-        }
-        if let Visit::Emit(score) = visitor.visit(row, c.family, c.qualifier, c.ts, c.stored) {
-            let cell = CellRef {
-                row,
-                family_rank: 0,
-                family: c.family,
-                qualifier: c.qualifier,
-                ts: c.ts,
+            let Some(c) = cells.next_cell()? else {
+                return Ok(RowEnd::Ended);
             };
-            let _ = top.push(cell, score);
+            *self.budget -= 1;
+            if let Some((p, ssts)) = self.filter {
+                let kept = match pigeonhole_compaction::blob_pointer(c.stored) {
+                    Some(ptr) => p.matches(&ssts.read_pointer(&ptr)?),
+                    None => p.matches(c.stored),
+                };
+                if !kept {
+                    continue;
+                }
+                if self.column_limit != 0 {
+                    if *self.columns == self.column_limit {
+                        return Ok(RowEnd::Limit);
+                    }
+                    *self.columns += 1;
+                }
+            }
+            let visited = self
+                .visitor
+                .visit(row, c.family, c.qualifier, c.ts, c.stored);
+            if let Visit::Emit(score) = visited {
+                let cell = CellRef {
+                    row,
+                    family_rank: 0,
+                    family: c.family,
+                    qualifier: c.qualifier,
+                    ts: c.ts,
+                };
+                let _ = self.top.push(cell, score);
+            }
         }
     }
 }

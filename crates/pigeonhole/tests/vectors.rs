@@ -840,6 +840,64 @@ fn a_dropped_async_search_releases_what_it_holds() {
     db.close().expect("close after the drop");
 }
 
+/// simp724's A1 on #1286: a column limit counts only the columns that pass the value filter
+/// (the resolver counts a column when its newest version passes), in the async search as in
+/// the sync one, which takes the filter out of the read to count its misses. One row of 10
+/// vectors, the last 5 passing, read 2 columns per row: both find `id05` and `id06`.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_search_with_a_value_filter_counts_only_passing_columns_toward_a_column_limit() {
+    let (_dir, db, t) = open();
+    let kept = [1.0f32; 8];
+    let mut m = t.mutate(b"list");
+    for i in 0..10u32 {
+        let v = if i >= 5 { kept.to_vec() } else { f32s(i) };
+        m = m.put_vector_f32("f", format!("id{i:02}").as_bytes(), &v);
+    }
+    m.commit().expect("put");
+    let value = t.get(b"list", "f", b"id05").expect("get").expect("written");
+    let only_kept = || ValueFilter::Equals(value.value().to_vec());
+    let list = KeySet::from_unsorted([b"list"]);
+    for flushed in [false, true] {
+        let keys = || {
+            t.keys(&list)
+                .family("f")
+                .column_limit(2)
+                .value_filter(only_kept())
+                .nearest_f32(&[0.5; 8], 5)
+        };
+        let scan = || {
+            t.scan_prefix(b"")
+                .family("f")
+                .column_limit(2)
+                .value_filter(only_kept())
+                .nearest_f32(&[0.5; 8], 5)
+        };
+        let qualifiers = |n: Vec<Neighbour>| {
+            let mut q: Vec<Vec<u8>> = n.into_iter().map(|n| n.qualifier).collect();
+            q.sort();
+            q
+        };
+        let want = vec![b"id05".to_vec(), b"id06".to_vec()];
+        assert_eq!(qualifiers(keys().run().unwrap()), want, "sync keys");
+        assert_eq!(qualifiers(scan().run().unwrap()), want, "sync scan");
+        let (got, _) = poll_counting(keys().run_async());
+        assert_eq!(
+            qualifiers(got.unwrap()),
+            want,
+            "async keys (flushed: {flushed})"
+        );
+        let (got, _) = poll_counting(scan().run_async());
+        assert_eq!(
+            qualifiers(got.unwrap()),
+            want,
+            "async scan (flushed: {flushed})"
+        );
+        db.flush().expect("flush");
+    }
+    db.close().expect("close");
+}
+
 /// perf287's S1 on #1269 (#1237's rule): a value filter's misses count toward the poll
 /// budget. One row of 10,000 vectors, of which 1% pass the filter (a value-equality on the
 /// vector's bytes), still takes several polls, and gives `run`'s result.
