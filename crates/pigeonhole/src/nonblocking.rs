@@ -664,3 +664,52 @@ impl futures_core::Stream for FeedStream {
         }
     }
 }
+
+/// A change feed as a `Stream` of owned events (D315): [`FeedStream`] for
+/// [`Feed::poll_next_event`](crate::Feed::poll_next_event), so a feed of every table
+/// ([`Pigeonhole::feed`](crate::Pigeonhole::feed)) yields its catalog changes in their place
+/// among the commits. It ends as `FeedStream` does, and in a reader process too the first
+/// item is `Unsupported`.
+#[must_use = "a stream does nothing unless polled"]
+#[derive(Debug)]
+pub struct FeedEventStream {
+    feed: crate::Feed,
+    done: bool,
+}
+
+impl FeedEventStream {
+    /// The stream of `feed`'s events.
+    pub fn new(feed: crate::Feed) -> Self {
+        Self { feed, done: false }
+    }
+
+    /// Where the stream is: [`FeedBuilder::resume`](crate::FeedBuilder::resume) continues
+    /// after the last event it yielded.
+    pub fn token(&self) -> crate::FeedToken {
+        self.feed.token()
+    }
+
+    /// The feed back, for its blocking calls.
+    pub fn into_inner(self) -> crate::Feed {
+        self.feed
+    }
+}
+
+impl futures_core::Stream for FeedEventStream {
+    type Item = Result<crate::FeedEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match this.feed.poll_next_event(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(e)) => Poll::Ready(Some(Ok(e.clone()))),
+            Poll::Ready(Err(e)) => {
+                this.done = true;
+                Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}

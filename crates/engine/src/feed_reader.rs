@@ -59,8 +59,14 @@ pub enum FeedStart {
     /// that history may be recycled before the reader reaches it, which expires the feed at
     /// once; [`FeedStart::After`] from a snapshot is the way to bootstrap.
     Oldest,
-    /// With the commits after `seqno` (a snapshot's seqno).
+    /// With the commits after `seqno` (a snapshot's seqno). A feed of every table delivers
+    /// the catalog changes with a ceiling above it ([`FeedStart::Snapshot`] knows which the
+    /// snapshot saw).
     After(Seqno),
+    /// With the commits after `snapshot`'s seqno, and in a feed of every table the catalog
+    /// changes its catalog doesn't reflect yet (D315): read the snapshot, then follow the
+    /// feed, and no commit or catalog change is missed or seen twice.
+    Snapshot(crate::Snapshot),
     /// Where a token left off ([`FeedReader::token`]).
     Token(Vec<u8>),
 }
@@ -351,6 +357,32 @@ pub(crate) struct Origin {
     pub(crate) writer: Option<Arc<crate::feed::Feed>>,
 }
 
+/// Which catalog changes are before a feed of every table's start (D315).
+#[derive(Clone, Copy)]
+enum CatalogStart<'a> {
+    /// Those with a ceiling at or below a seqno: `Oldest`, `After`.
+    Bound(Seqno),
+    /// Those the start's catalog reflects: `Now` (the view's), `Snapshot` (its view's).
+    Reflected(&'a crate::catalog::Catalog),
+}
+
+/// Whether `catalog` reflects every one of a catalog change's `edits`. Ids only grow and are
+/// never reused, and an id is counted only once its change is published: a created table or
+/// family is reflected once the counter passed its id, a drop once the table is gone. That
+/// holds for a prefix of the changes, checked in order.
+fn reflects(
+    catalog: &crate::catalog::Catalog,
+    edits: &[pigeonhole_format::manifest::Edit],
+) -> bool {
+    use pigeonhole_format::manifest::Edit;
+    edits.iter().all(|e| match e {
+        Edit::CreateTable { table, .. } => table.0 < catalog.counters.next_table,
+        Edit::PutFamily { family, .. } => family.0 < catalog.counters.next_family,
+        Edit::DropTable { table } => catalog.table(*table).is_none(),
+        _ => true,
+    })
+}
+
 /// A reader process's first and longest waits between polls: it watches the writer's
 /// watermarks in shared memory, so the writer does no per-commit work for it.
 const READER_BACKOFF_MIN: Duration = Duration::from_micros(50);
@@ -452,6 +484,16 @@ impl FeedReader {
             out_catalog: CatalogEvent::default(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
+        // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
+        // (D315). `Now`'s is the view loaded before the sidecar is read, so every change it
+        // reflects already has its entry there (the entry is appended before the change is
+        // published).
+        let start_catalog = match &spec.start {
+            _ if !this.tables.is_empty() => None,
+            FeedStart::Now => Some(Arc::clone(&(this.view)()?.catalog)),
+            FeedStart::Snapshot(snap) => Some(Arc::clone(&snap.view.catalog)),
+            _ => None,
+        };
         // `Oldest` from an earlier session still kept whole (#1465), when there is one.
         let earlier = match spec.start {
             FeedStart::Oldest => this.earlier_start(db_id),
@@ -493,6 +535,7 @@ impl FeedReader {
                             .max(this.writer.as_ref().map_or(0, |f| f.checkpoint_key()))
                     }
                     FeedStart::After(seqno) => seqno,
+                    FeedStart::Snapshot(ref snap) => snap.seqno,
                     FeedStart::Oldest => {
                         // The largest bound every stream's retained history serves: from the
                         // writer's checkpoint history, or in a reader process from the
@@ -561,8 +604,11 @@ impl FeedReader {
         // A feed of every table: the catalog changes before its start are passed over, their
         // drops kept (D315). A token says the last one delivered; another start, its bound.
         if this.tables.is_empty() && this.expired.is_none() {
-            let bound = (!token_start).then_some(this.delivered);
-            this.load_catalog(bound)?;
+            let start = match &start_catalog {
+                Some(catalog) => Some(CatalogStart::Reflected(catalog)),
+                None => (!token_start).then_some(CatalogStart::Bound(this.delivered)),
+            };
+            this.load_catalog(start)?;
         }
         Ok(this)
     }
@@ -1481,10 +1527,10 @@ impl FeedReader {
     /// changes of the feed's history not yet delivered. Called after the frontier F is
     /// loaded: the catalog hold keeps F below a change's ceiling until its entry is appended,
     /// so every change with a ceiling at most F + 1 is in the file by then. At open, `start`
-    /// is a non-token start's bound: the changes with a ceiling at or below it are before the
-    /// feed's start (a token says the last one delivered instead). A passed-over or
-    /// delivered change's drops are kept, so a dropped table's later changes are passed over.
-    fn load_catalog(&mut self, start: Option<Seqno>) -> Result<()> {
+    /// says which changes are before a non-token start (a token says the last one delivered
+    /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
+    /// later changes are passed over.
+    fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
         let path = crate::feed::sidecar_path(&self.shared.path);
         let file = match self.shared.vfs.open(&path, OpenOptions::read()) {
             Ok(f) => f,
@@ -1509,6 +1555,9 @@ impl FeedReader {
         // Up to the first torn entry: the rest is read again once it's whole.
         let (entries, used) = decode_entries(&bytes);
         self.sidecar_pos = from + used as u64;
+        // The start's catalog reflects a prefix of the changes, in order: once one isn't
+        // reflected, no later one is.
+        let mut reflecting = true;
         for e in entries {
             let FeedEntry::Catalog {
                 session,
@@ -1525,7 +1574,11 @@ impl FeedReader {
                 continue;
             }
             let before_start = match start {
-                Some(bound) => seqno_ceiling <= bound,
+                Some(CatalogStart::Bound(bound)) => seqno_ceiling <= bound,
+                Some(CatalogStart::Reflected(catalog)) => {
+                    reflecting = reflecting && reflects(catalog, &edits);
+                    reflecting
+                }
                 None => sequence <= self.catalog_seq,
             };
             if before_start {

@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pigeonhole_engine::{FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
+use pigeonhole_engine::{CatalogEvent, FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
 use pigeonhole_format::key::Kind;
+use pigeonhole_format::manifest::Edit;
 use pigeonhole_format::value::decode_value;
 
 use crate::db::{Db, Snapshot};
 use crate::table::TableCore;
-use crate::{Error, ErrorCode, ReadTable, Result, Table, Value};
+use crate::{Error, ErrorCode, FamilyInfo, ReadTable, Result, Table, Value};
 
 /// Table and family names by id, as the feed's changes carry them.
 type Names = HashMap<(TableId, FamilyId), (Arc<str>, Arc<str>)>;
@@ -143,6 +144,86 @@ impl Commit {
     }
 }
 
+impl Commit {
+    /// A commit with nothing in it yet: the buffer the next one is read into.
+    fn empty() -> Self {
+        Commit {
+            seqno: 0,
+            ts: 0,
+            changes: Vec::new(),
+        }
+    }
+}
+
+/// What a feed delivers ([`Feed::next_event`]): a commit, or in a feed of every table
+/// ([`Pigeonhole::feed`](crate::Pigeonhole::feed)) a change to its tables too (D315), each
+/// in its place in commit order.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum FeedEvent {
+    /// One whole commit, as [`Feed::next`] delivers it.
+    Commit(Commit),
+    /// Tables created or dropped, or families added: every commit before it saw the old
+    /// tables, every commit after it the new ones.
+    Catalog(CatalogChange),
+}
+
+/// One change to the database's tables, as a feed of every table delivers it
+/// ([`FeedEvent::Catalog`]): one or more edits that applied together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogChange {
+    seqno: u64,
+    ts: u64,
+    edits: Vec<CatalogEdit>,
+}
+
+impl CatalogChange {
+    /// Where it falls in commit order: every commit with a lower [`Commit::seqno`] came
+    /// before it, every commit at or above it comes after.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+
+    /// The timestamp floor when it applied: every commit before it that took the default
+    /// timestamp has one at most this.
+    pub fn timestamp(&self) -> u64 {
+        self.ts
+    }
+
+    /// Its edits, in the order they applied.
+    pub fn edits(&self) -> &[CatalogEdit] {
+        &self.edits
+    }
+}
+
+/// One edit of a [`CatalogChange`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CatalogEdit {
+    /// A table was created, with these families.
+    #[non_exhaustive]
+    TableCreated {
+        /// Its name.
+        table: String,
+        /// Its families, with their options.
+        families: Vec<FamilyInfo>,
+    },
+    /// A family was added to an existing table.
+    #[non_exhaustive]
+    FamilyAdded {
+        /// The table's name.
+        table: String,
+        /// The family, with its options.
+        family: FamilyInfo,
+    },
+    /// A table was dropped, with all its data.
+    #[non_exhaustive]
+    TableDropped {
+        /// Its name.
+        table: String,
+    },
+}
+
 /// Where a [`Feed`] left off: [`FeedBuilder::resume`] continues after its last delivered
 /// commit, in this or a later open of the database. Opaque bytes, to store with the work
 /// the commits fed (`as_bytes`, `from_bytes`).
@@ -260,7 +341,8 @@ impl FeedBuilder {
             self.error.get_or_insert(e);
             return self;
         }
-        self.start = FeedStart::After(snapshot.seqno());
+        // The snapshot itself, so a feed of every table knows which catalog changes it saw.
+        self.start = FeedStart::Snapshot(snapshot.inner.clone());
         self
     }
 
@@ -310,14 +392,18 @@ impl FeedBuilder {
         let (reader, generation) = subscribe(&self.db, spec.clone())?;
         Ok(Feed {
             db: self.db,
-            spec,
+            // Only ever resubscribed from its own token: the start isn't kept, so a snapshot
+            // start doesn't stay pinned for the feed's life.
+            spec: FeedSpec {
+                start: FeedStart::Now,
+                ..spec
+            },
             reader,
             generation,
-            names,
-            commit: Commit {
-                seqno: 0,
-                ts: 0,
-                changes: Vec::new(),
+            out: Delivery {
+                names,
+                commit: Commit::empty(),
+                event: None,
             },
             oldest_retained: None,
             failed: None,
@@ -391,8 +477,8 @@ pub struct Feed {
     reader: FeedReader,
     /// The engine generation `reader` reads (D265).
     generation: u64,
-    names: Names,
-    commit: Commit,
+    /// What the last call delivered, and the names that fill it.
+    out: Delivery,
     oldest_retained: Option<u64>,
     /// The error that ended the feed, returned by every later call (simp724 on #1321): the
     /// reader had already moved past the commit it was delivering, so going on would skip
@@ -404,13 +490,86 @@ pub struct Feed {
 const WAIT_SLICE: Duration = Duration::from_secs(3600);
 
 impl Feed {
-    /// The next commit, waiting up to `timeout` for one; `None` if none arrived in time.
+    /// The next commit, waiting up to `timeout` for one; `None` if none arrived in time. A
+    /// feed of every table passes its catalog changes over ([`next_event`](Self::next_event)
+    /// delivers them too).
     ///
     /// An error reading the feed ends it: every later call returns the same error, as an
     /// expired feed does, so no commit is ever skipped. A value that doesn't decode is
     /// `Corruption`; the feed's [`token`](Self::token) then points past that commit, so
     /// resuming from it skips the damaged one.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<&Commit>> {
+        Ok(self.wait(timeout, false)?.then_some(&self.out.commit))
+    }
+
+    /// The next commit if one is ready; `None` otherwise. Never waits. Errors end the feed
+    /// as [`next`](Self::next)'s do.
+    pub fn try_next(&mut self) -> Result<Option<&Commit>> {
+        Ok(self.try_step(false)?.then_some(&self.out.commit))
+    }
+
+    /// The next commit, for an async caller (D310 PR 5a): `Poll::Ready` with it, or with an
+    /// error as [`next`](Self::next) would end with (they end the feed the same way), and
+    /// `Poll::Pending` until there is one, with `cx`'s waker registered so the task is woken,
+    /// never spinning, when the frontier can move. A feed doesn't end on its own, so there is
+    /// no `None`. It follows an automatic recovery as `next` does.
+    ///
+    /// The writer process only: in a reader process it is
+    /// [`ErrorCode::Unsupported`]; call the blocking [`next`](Self::next) on a thread of its
+    /// own (#1407). [`nonblocking::FeedStream`](crate::nonblocking::FeedStream) wraps this
+    /// as a `Stream` of owned commits.
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<&Commit>> {
+        self.poll_step(cx, false).map_ok(|()| &self.out.commit)
+    }
+
+    /// The next event, waiting up to `timeout` for one; `None` if none arrived in time: a
+    /// commit, or in a feed of every table ([`Pigeonhole::feed`](crate::Pigeonhole::feed))
+    /// a catalog change too (D315), each in its place in commit order. Errors end the feed as
+    /// [`next`](Self::next)'s do, and the [`token`](Self::token) after an event resumes just
+    /// past it.
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<&FeedEvent>> {
+        Ok(if self.wait(timeout, true)? {
+            self.out.event.as_ref()
+        } else {
+            None
+        })
+    }
+
+    /// The next event if one is ready; `None` otherwise. Never waits. As
+    /// [`next_event`](Self::next_event) otherwise.
+    pub fn try_next_event(&mut self) -> Result<Option<&FeedEvent>> {
+        Ok(if self.try_step(true)? {
+            self.out.event.as_ref()
+        } else {
+            None
+        })
+    }
+
+    /// The next event, for an async caller: [`poll_next`](Self::poll_next) for
+    /// [`next_event`](Self::next_event). The writer process only, as `poll_next`.
+    /// [`nonblocking::FeedEventStream`](crate::nonblocking::FeedEventStream) wraps it as a
+    /// `Stream` of owned events.
+    pub fn poll_next_event(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<&FeedEvent>> {
+        use std::task::Poll;
+        match self.poll_step(cx, true) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => match &self.out.event {
+                Some(event) => Poll::Ready(Ok(event)),
+                None => unreachable!("a delivered step leaves its event"),
+            },
+        }
+    }
+
+    /// Waits up to `timeout` for the next delivery into `self.out` (catalog changes too, if
+    /// `events`): whether one arrived.
+    fn wait(&mut self, timeout: Duration, events: bool) -> Result<bool> {
         self.check_failed()?;
         let deadline = Instant::now().checked_add(timeout);
         loop {
@@ -429,35 +588,30 @@ impl Feed {
                 Err(_) if swapped(&self.db, self.generation) => continue,
                 Err(e) => return Err(fail(&mut self.failed, e.into())),
             };
-            match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Err(fail(&mut self.failed, e));
-                    }
-                    return Ok(Some(&self.commit));
+            match step(&mut self.out, &self.db, self.generation, next, events) {
+                Ok(Step::Ready) => return Ok(true),
+                // A catalog change a commits-only call passes over, or a superseded
+                // reader's expiry: look again (the engine returns at once if more is ready).
+                Ok(Step::Again) => continue,
+                Ok(Step::Pending) => {}
+                Ok(Step::Expired(oldest, e)) => {
+                    self.oldest_retained = oldest;
+                    return Err(e);
                 }
-                // The old engine's reader, still waiting as a recovery swapped in a new
-                // engine, reads the new session's records as outside its history: the new
-                // engine's reader decides from the token instead (cli692's S2 on #1321).
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    return Err(expired(e));
-                }
-                Next::Pending => {}
+                Err(e) => return Err(fail(&mut self.failed, e)),
             }
             // Out of time, unless a recovery's swap ended the old engine's wait early (look
             // again on the new one) or the wait was one slice of a longer one.
             let more = deadline.is_none_or(|d| Instant::now() < d);
             if !more {
-                return Ok(None);
+                return Ok(false);
             }
         }
     }
 
-    /// The next commit if one is ready; `None` otherwise. Never waits. Errors end the feed
-    /// as [`next`](Self::next)'s do.
-    pub fn try_next(&mut self) -> Result<Option<&Commit>> {
+    /// The next delivery into `self.out` if one is ready, as [`wait`](Self::wait) without
+    /// waiting.
+    fn try_step(&mut self, events: bool) -> Result<bool> {
         self.check_failed()?;
         loop {
             self.follow_recovery()?;
@@ -473,38 +627,25 @@ impl Feed {
                 Err(_) if swapped(&self.db, self.generation) => continue,
                 Err(e) => return Err(fail(&mut self.failed, e.into())),
             };
-            return match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Err(fail(&mut self.failed, e));
-                    }
-                    Ok(Some(&self.commit))
+            return match step(&mut self.out, &self.db, self.generation, next, events) {
+                Ok(Step::Ready) => Ok(true),
+                Ok(Step::Again) => continue,
+                Ok(Step::Pending) => Ok(false),
+                Ok(Step::Expired(oldest, e)) => {
+                    self.oldest_retained = oldest;
+                    Err(e)
                 }
-                // As in `next`: a superseded reader's expiry is not the feed's.
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    Err(expired(e))
-                }
-                Next::Pending => Ok(None),
+                Err(e) => Err(fail(&mut self.failed, e)),
             };
         }
     }
 
-    /// The next commit, for an async caller (D310 PR 5a): `Poll::Ready` with it, or with an
-    /// error as [`next`](Self::next) would end with (they end the feed the same way), and
-    /// `Poll::Pending` until there is one, with `cx`'s waker registered so the task is woken,
-    /// never spinning, when the frontier can move. A feed doesn't end on its own, so there is
-    /// no `None`. It follows an automatic recovery as `next` does.
-    ///
-    /// The writer process only: in a reader process it is
-    /// [`ErrorCode::Unsupported`]; call the blocking [`next`](Self::next) on a thread of its
-    /// own (#1407). [`nonblocking::FeedStream`](crate::nonblocking::FeedStream) wraps this
-    /// as a `Stream` of owned commits.
-    pub fn poll_next(
+    /// The next delivery into `self.out`, for an async caller, as [`wait`](Self::wait).
+    fn poll_step(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<&Commit>> {
+        events: bool,
+    ) -> std::task::Poll<Result<()>> {
         use std::task::Poll;
         if let Err(e) = self.check_failed() {
             return Poll::Ready(Err(e));
@@ -524,20 +665,16 @@ impl Feed {
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(fail(&mut self.failed, e.into()))),
             };
-            return match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Poll::Ready(Err(fail(&mut self.failed, e)));
-                    }
-                    Poll::Ready(Ok(&self.commit))
-                }
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    Poll::Ready(Err(expired(e)))
-                }
+            return match step(&mut self.out, &self.db, self.generation, next, events) {
+                Ok(Step::Ready) => Poll::Ready(Ok(())),
+                Ok(Step::Again) => continue,
                 // The engine's `poll_next` returns `Poll::Pending` instead.
-                Next::Pending => Poll::Pending,
+                Ok(Step::Pending) => Poll::Pending,
+                Ok(Step::Expired(oldest, e)) => {
+                    self.oldest_retained = oldest;
+                    Poll::Ready(Err(e))
+                }
+                Err(e) => Poll::Ready(Err(fail(&mut self.failed, e))),
             };
         }
     }
@@ -585,6 +722,131 @@ impl Feed {
         self.reader = reader;
         self.generation = generation;
         Ok(())
+    }
+}
+
+/// What the last call delivered, and the names that fill it.
+#[derive(Debug)]
+struct Delivery {
+    names: Names,
+    /// The last commit [`Feed::next`] delivered, or the buffer the next is read into.
+    commit: Commit,
+    /// The last event [`Feed::next_event`] delivered. A commit's buffer comes back to
+    /// `commit` for the next one.
+    event: Option<FeedEvent>,
+}
+
+/// What one of the engine's answers comes to.
+enum Step {
+    /// Delivered into the [`Delivery`].
+    Ready,
+    /// Nothing for this call; ask the engine again at once.
+    Again,
+    /// Nothing ready.
+    Pending,
+    /// The feed expired, with the oldest seqno still held.
+    Expired(Option<u64>, Error),
+}
+
+/// `next` into `out`: catalog changes only if `events`, though their names are always
+/// noted. An error is the feed's failure.
+fn step(
+    out: &mut Delivery,
+    db: &Db,
+    generation: u64,
+    next: Next<'_>,
+    events: bool,
+) -> Result<Step> {
+    // The last event's commit buffer, for this one.
+    if let Some(FeedEvent::Commit(c)) = out.event.take() {
+        out.commit = c;
+    }
+    match next {
+        Next::Commit(c) => {
+            fill(&mut out.commit, &mut out.names, db, c)?;
+            if events {
+                let commit = std::mem::replace(&mut out.commit, Commit::empty());
+                out.event = Some(FeedEvent::Commit(commit));
+            }
+            Ok(Step::Ready)
+        }
+        Next::Catalog(ev) => {
+            let change = catalog_change(&mut out.names, ev);
+            if !events {
+                return Ok(Step::Again);
+            }
+            out.event = Some(FeedEvent::Catalog(change));
+            Ok(Step::Ready)
+        }
+        // The old engine's reader, still waiting as a recovery swapped in a new engine,
+        // reads the new session's records as outside its history: the new engine's reader
+        // decides from the token instead (cli692's S2 on #1321).
+        Next::Expired(_) if swapped(db, generation) => Ok(Step::Again),
+        Next::Expired(e) => Ok(Step::Expired(e.oldest_retained, expired(e))),
+        Next::Pending => Ok(Step::Pending),
+    }
+}
+
+/// `ev` as the public [`CatalogChange`], noting the names of the families it adds and
+/// forgetting those of the tables it drops. A `CreateTable` and the `PutFamily` edits of
+/// its table are one [`CatalogEdit::TableCreated`].
+fn catalog_change(names: &mut Names, ev: &CatalogEvent) -> CatalogChange {
+    // Every table the edits name: created among them, or named by the event (the
+    // writer's rule, D315 2b).
+    let mut tables: HashMap<TableId, Arc<str>> = ev
+        .names
+        .iter()
+        .map(|(t, n)| (*t, Arc::from(n.as_str())))
+        .collect();
+    // Where each table created here sits in `edits`.
+    let mut created: HashMap<TableId, usize> = HashMap::new();
+    let mut edits = Vec::with_capacity(ev.edits.len());
+    for e in &ev.edits {
+        match e {
+            Edit::CreateTable { table, name } => {
+                tables.insert(*table, Arc::from(name.as_str()));
+                created.insert(*table, edits.len());
+                edits.push(CatalogEdit::TableCreated {
+                    table: name.clone(),
+                    families: Vec::new(),
+                });
+            }
+            Edit::PutFamily {
+                table,
+                family,
+                name,
+                options,
+            } => {
+                let table_name = tables.get(table).cloned().unwrap_or_else(|| Arc::from(""));
+                names.insert(
+                    (*table, *family),
+                    (Arc::clone(&table_name), Arc::from(name.as_str())),
+                );
+                let info = FamilyInfo::from_parts(name, options);
+                match created.get(table).and_then(|&i| edits.get_mut(i)) {
+                    Some(CatalogEdit::TableCreated { families, .. }) => families.push(info),
+                    _ => edits.push(CatalogEdit::FamilyAdded {
+                        table: table_name.to_string(),
+                        family: info,
+                    }),
+                }
+            }
+            Edit::DropTable { table } => {
+                names.retain(|(t, _), _| t != table);
+                created.remove(table);
+                let name = tables
+                    .get(table)
+                    .map_or_else(String::new, |n| n.to_string());
+                edits.push(CatalogEdit::TableDropped { table: name });
+            }
+            // The writer stages only the three above (D315).
+            _ => {}
+        }
+    }
+    CatalogChange {
+        seqno: ev.seqno_ceiling,
+        ts: ev.timestamp,
+        edits,
     }
 }
 
@@ -708,9 +970,9 @@ mod tests {
                 value: vec![0xEE, 1, 2],
             }],
         };
-        let e = fill(&mut feed.commit, &mut feed.names, &feed.db, &bad).unwrap_err();
+        let e = fill(&mut feed.out.commit, &mut feed.out.names, &feed.db, &bad).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Corruption, "{e}");
-        assert!(feed.commit.changes.is_empty());
+        assert!(feed.out.commit.changes.is_empty());
         // What `next` does with it: kept, and returned by every later call.
         let e = fail(&mut feed.failed, e);
         t.mutate(b"after").put("f", b"q", b"v").commit().unwrap();

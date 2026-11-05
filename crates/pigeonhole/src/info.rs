@@ -237,9 +237,14 @@ pub struct LevelInfo {
 
 impl FamilyInfo {
     pub(crate) fn from_engine(f: &pigeonhole_engine::FamilyInfo) -> Self {
-        let o = &f.options;
+        Self::from_parts(&f.name, &f.options)
+    }
+
+    /// A family named `name` with stored options `o`: the catalog's, or a feed's catalog
+    /// change's (D315).
+    pub(crate) fn from_parts(name: &str, o: &pigeonhole_format::manifest::FamilyOptions) -> Self {
         Self {
-            name: f.name.clone(),
+            name: name.to_owned(),
             family: Family::from_engine(o.clone()),
             counter: o.kind == FamilyKind::Counter,
             aggregation: crate::Aggregation::of_options(o),
