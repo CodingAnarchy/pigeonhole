@@ -386,6 +386,13 @@ impl FeedEntry {
 /// and the length of the valid prefix of `bytes` (where a writer truncates before
 /// appending).
 pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
+    let (entries, end) = decode_entries_at(bytes);
+    (entries.into_iter().map(|(_, e)| e).collect(), end)
+}
+
+/// [`decode_entries`], each entry with the offset of its frame in `bytes`: where a writer
+/// cuts the file, or overwrites an entry in place (D315 amendment).
+pub fn decode_entries_at(bytes: &[u8]) -> (Vec<(usize, FeedEntry)>, usize) {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(head) = bytes.get(pos..pos + 8) {
@@ -399,7 +406,7 @@ pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
         let Ok(entry) = FeedEntry::decode_payload(payload) else {
             break;
         };
-        out.push(entry);
+        out.push((pos, entry));
         pos += 8 + len;
     }
     (out, pos)

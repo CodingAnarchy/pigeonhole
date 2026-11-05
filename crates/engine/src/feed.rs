@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_format::BlobFileId;
-use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries};
+use pigeonhole_format::feed::{
+    FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries, decode_entries_at,
+};
 use pigeonhole_format::manifest::Edit;
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
 use pigeonhole_runtime::ShardId;
@@ -68,6 +70,10 @@ pub(crate) struct Sidecar {
     file: FileRef,
     /// Where the next entry goes.
     end: u64,
+    /// The `RootIntent` this session appended for the root commit in progress, and where:
+    /// its Root entry overwrites exactly that one (simp724's R2 on #1504). Root commits
+    /// never overlap, so one.
+    intent: Option<(u64, u64)>,
 }
 
 impl Sidecar {
@@ -76,6 +82,15 @@ impl Sidecar {
         entry.encode(&mut bytes);
         self.file.write_at(&bytes, self.end)?;
         self.end += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Overwrites the entry at `at` with `entry`, of the same framed length (a `RootIntent`
+    /// by its `Root`): the sidecar's only write in place.
+    fn overwrite(&mut self, at: u64, entry: &FeedEntry) -> Result<()> {
+        let mut bytes = Vec::with_capacity(32);
+        entry.encode(&mut bytes);
+        self.file.write_at(&bytes, at)?;
         Ok(())
     }
 }
@@ -90,6 +105,7 @@ pub(crate) fn open_sidecar(
     db_id: [u8; 16],
     entry: &FeedEntry,
     create: bool,
+    opened: OpenedRoot,
 ) -> Result<Option<Sidecar>> {
     let path = sidecar_path(db);
     let exists = vfs.exists(&path)?;
@@ -104,8 +120,13 @@ pub(crate) fn open_sidecar(
     }
     let valid = match FeedHeader::decode(&bytes) {
         Ok(h) if h.db_id == db_id => {
-            let (_, end) = decode_entries(&bytes[FeedHeader::LEN..]);
-            Some(FeedHeader::LEN + end)
+            let (entries, end) = decode_entries_at(&bytes[FeedHeader::LEN..]);
+            Some(resolve_intent(
+                &file,
+                &entries,
+                FeedHeader::LEN + end,
+                opened,
+            )?)
         }
         // Another database's, or a torn or damaged header: its history is not ours. A reader
         // finds no session for the segments' marks and expires.
@@ -120,6 +141,7 @@ pub(crate) fn open_sidecar(
             Sidecar {
                 file,
                 end: end as u64,
+                intent: None,
             }
         }
         None => {
@@ -131,6 +153,7 @@ pub(crate) fn open_sidecar(
             Sidecar {
                 file,
                 end: FeedHeader::LEN as u64,
+                intent: None,
             }
         }
     };
@@ -146,6 +169,67 @@ pub(crate) fn open_sidecar(
         vfs.sync_dir(dir)?;
     }
     Ok(Some(sidecar))
+}
+
+/// The superblock an open read, before any root commit of its own: its `sequence` and
+/// checksum (FORMAT §8.2), which decide a trailing `RootIntent` (D315 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenedRoot {
+    pub(crate) sequence: u64,
+    pub(crate) checksum: u64,
+}
+
+/// Resolves a `RootIntent` the previous session left as the sidecar's last entry (D315
+/// amendment, #1504), before this open appends anything: a process crash came between that
+/// root commit's intent and its Root entry. Returns where the valid entries now end.
+///
+/// - The root landed (the superblock this open read has the intent's sequence and
+///   checksum): the intent becomes that session's `Root`, written over it in place, so the
+///   history reads as if no crash happened, for any build.
+/// - It didn't (its sequence is one past the superblock's): the intent goes, with the
+///   `Catalog` entry of the same root before it, if any, cut off as a torn tail is.
+/// - Anything else (a build that knows no intents opened and committed since): left alone,
+///   and readers fail closed on it (`chain`).
+///
+/// Offsets in `entries` are past the header.
+fn resolve_intent(
+    file: &FileRef,
+    entries: &[(usize, FeedEntry)],
+    end: usize,
+    opened: OpenedRoot,
+) -> Result<usize> {
+    let Some((at, FeedEntry::RootIntent { sequence, checksum })) = entries.last() else {
+        return Ok(end);
+    };
+    let at = (FeedHeader::LEN + at) as u64;
+    if *sequence == opened.sequence && *checksum == opened.checksum {
+        // The session that wrote it: the last Session entry before it.
+        let session = entries.iter().rev().find_map(|(_, e)| match e {
+            FeedEntry::Session { session, .. } => Some(*session),
+            _ => None,
+        });
+        if let Some(session) = session {
+            let mut root = Vec::with_capacity(32);
+            FeedEntry::Root {
+                session,
+                sequence: *sequence,
+            }
+            .encode(&mut root);
+            file.write_at(&root, at)?;
+        }
+        return Ok(end);
+    }
+    if *sequence == opened.sequence + 1 {
+        let cut = match entries.iter().rev().nth(1) {
+            Some((before, FeedEntry::Catalog { sequence: s, .. })) if s == sequence => {
+                (FeedHeader::LEN + before) as u64
+            }
+            _ => at,
+        };
+        file.set_len(cut)?;
+        return Ok(cut as usize);
+    }
+    Ok(end)
 }
 
 /// What an open inherits from the sidecar's last session (the D310 amendment, the owner
@@ -219,8 +303,9 @@ pub(crate) fn open_session(
     catalog: &Catalog,
     options: &EngineOptions,
     shards: usize,
-    opened_at: u64,
+    opened: OpenedRoot,
 ) -> Result<Option<Arc<Feed>>> {
+    let opened_at = opened.sequence;
     let Some(cfg) = &options.feed else {
         open_sidecar(
             vfs,
@@ -230,6 +315,7 @@ pub(crate) fn open_session(
                 sequence: opened_at,
             },
             false,
+            opened,
         )?;
         return Ok(None);
     };
@@ -265,7 +351,7 @@ pub(crate) fn open_session(
         streams: streams as u32,
         tables: tables.clone(),
     };
-    let sidecar = open_sidecar(vfs, path, db_id, &entry, true)?
+    let sidecar = open_sidecar(vfs, path, db_id, &entry, true, opened)?
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
     feed.retain_bytes_per_stream = cfg.retention_bytes / streams;
@@ -657,11 +743,47 @@ impl Feed {
         *self.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = Some(sidecar);
     }
 
-    /// After a root commit of this session (the pager's observer): appends its sequence and
-    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure ends the
-    /// session's appends, as a failed sync does (fail closed): a partly written entry is
-    /// never followed by more, and the next feeding open sees the sequence ahead of the last
-    /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
+    /// Records the root commit about to happen (D315 amendment, #1504): the pager's intent
+    /// hook calls it before the commit writes anything. Appends the commit's staged
+    /// `Catalog` entry, if any, then a `RootIntent` naming the new superblock, unsynced: a
+    /// process crash keeps the page cache, and the superblock write comes after. A failed
+    /// append ends the session's appends, as any sidecar failure does, but never the commit
+    /// (simp724's R3).
+    pub(crate) fn note_intent(&self, sequence: u64, checksum: u64) {
+        let staged = self
+            .staged_catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(s) = sidecar.as_mut() else {
+            return;
+        };
+        let catalog = staged.map(|c| FeedEntry::Catalog {
+            session: self.session,
+            sequence,
+            seqno_ceiling: c.ceiling,
+            timestamp: c.timestamp,
+            edits: c.edits,
+            names: c.names,
+        });
+        let appended = catalog.iter().try_for_each(|c| s.append(c)).and_then(|()| {
+            let at = s.end;
+            s.append(&FeedEntry::RootIntent { sequence, checksum })?;
+            s.intent = Some((sequence, at));
+            Ok(())
+        });
+        if let Err(e) = appended {
+            crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
+            *sidecar = None;
+            self.appends_stopped.store(true, Ordering::Release);
+        }
+    }
+
+    /// Records a root commit (the pager's root-commit observer, after the commit is
+    /// durable): its `Root` entry, written over the `RootIntent` this session appended for
+    /// it, or appended if there is none (simp724's R2 on #1504: never over another), then
+    /// the coalesced sync.
     pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
         #[cfg(feature = "test-hooks")]
         {
@@ -670,9 +792,8 @@ impl Feed {
                 std::thread::sleep(std::time::Duration::from_nanos(delay));
             }
         }
-        // A catalog change this root commit made (D315): its entry goes first, in the same
-        // append and the same sync as the Root entry, so a torn tail keeps it only without
-        // the Root (the chain breaks), never the Root without it.
+        // A catalog change whose intent didn't append it (no intent hook ran): its entry
+        // goes first, in the same append as the Root entry.
         let staged = self
             .staged_catalog
             .lock()
@@ -683,26 +804,27 @@ impl Feed {
             let Some(s) = sidecar.as_mut() else {
                 return;
             };
-            if let Some(c) = staged
-                && let Err(e) = s.append(&FeedEntry::Catalog {
-                    session: self.session,
-                    sequence,
-                    seqno_ceiling: c.ceiling,
-                    timestamp: c.timestamp,
-                    edits: c.edits,
-                    names: c.names,
-                })
-            {
-                crate::shard::trace!("feed: sidecar append of catalog {sequence} failed: {e}");
-                *sidecar = None;
-                self.appends_stopped.store(true, Ordering::Release);
-                return;
-            }
-            if let Err(e) = s.append(&FeedEntry::Root {
+            let root = FeedEntry::Root {
                 session: self.session,
                 sequence,
-            }) {
-                crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+            };
+            let written = match s.intent.take() {
+                Some((seq, at)) if seq == sequence && staged.is_none() => s.overwrite(at, &root),
+                _ => staged
+                    .map(|c| FeedEntry::Catalog {
+                        session: self.session,
+                        sequence,
+                        seqno_ceiling: c.ceiling,
+                        timestamp: c.timestamp,
+                        edits: c.edits,
+                        names: c.names,
+                    })
+                    .iter()
+                    .try_for_each(|c| s.append(c))
+                    .and_then(|()| s.append(&root)),
+            };
+            if let Err(e) = written {
+                crate::shard::trace!("feed: sidecar write of root {sequence} failed: {e}");
                 *sidecar = None;
                 self.appends_stopped.store(true, Ordering::Release);
                 return;

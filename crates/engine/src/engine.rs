@@ -997,6 +997,12 @@ impl Engine {
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
+        // And its checksum: a trailing RootIntent of the last session is decided by both
+        // (D315 amendment, #1504).
+        let opened_root = crate::feed::OpenedRoot {
+            sequence: opened_at,
+            checksum: opened.checksum(),
+        };
         // The clean flag is informational only: WAL replay is never skipped (decision D57).
         let _clean = opened.clean_shutdown();
         let (mut catalog, manifest_extents) =
@@ -1053,13 +1059,21 @@ impl Engine {
         let feed = if no_writes {
             None
         } else {
-            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_at)?
+            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_root)?
         };
         if let Some(f) = &feed {
             let weak = Arc::downgrade(f);
             pager.on_root_commit(Box::new(move |sequence| {
                 if let Some(f) = weak.upgrade() {
                     f.note_root(sequence);
+                }
+            }));
+            // Before each root commit writes: its intent, so a process crash between the
+            // superblock and its Root entry is told from a gap (D315 amendment, #1504).
+            let weak = Arc::downgrade(f);
+            pager.on_root_intent(Box::new(move |sequence, checksum| {
+                if let Some(f) = weak.upgrade() {
+                    f.note_intent(sequence, checksum);
                 }
             }));
             // Root commits of this open before the observer: only `finish`'s upgrade of an
