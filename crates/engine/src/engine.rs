@@ -4641,6 +4641,14 @@ impl Inner {
         let name_owned = name.to_owned();
         let families = families.to_vec();
         let view = self.catalog_change(move |catalog| {
+            // Again under the manifest's exclusion (simp724's note (a) on #1562): a create
+            // racing a replica's first apply.
+            if catalog
+                .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                .is_some()
+            {
+                return Err(replica_refusal());
+            }
             if catalog.table_by_name(&name_owned).is_some() {
                 return Err(Error::TableExists(name_owned.clone()));
             }
@@ -4690,6 +4698,13 @@ impl Inner {
         self.catalog_change(move |catalog| {
             if catalog.table(REPLICA_TABLE).is_some() {
                 return Ok(Vec::new());
+            }
+            // A table of the database's own made since the first apply's check (a local
+            // create racing it): no replica here (simp724's note (a) on #1562).
+            if catalog.tables().any(|t| !is_reserved_table(t.id)) {
+                return Err(Error::InvalidArgument(
+                    "a replica's first apply needs a database with no tables of its own".to_owned(),
+                ));
             }
             Ok(vec![
                 Edit::CreateTable {
@@ -4854,6 +4869,13 @@ impl Inner {
         check_merge_operator(&options, &self.options.merge_operators)?;
         let name_owned = name.to_owned();
         let view = self.catalog_change(move |catalog| {
+            // As `create_table`: again under the manifest's exclusion.
+            if catalog
+                .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                .is_some()
+            {
+                return Err(replica_refusal());
+            }
             let info = catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))?;
