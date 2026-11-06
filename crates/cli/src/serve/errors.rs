@@ -381,6 +381,18 @@ impl From<pigeonhole_vector::Error> for ApiError {
     }
 }
 
+/// The text index's errors keep their code too: an engine error as the engine's, the crate's
+/// own (`InvalidArgument` for a bad query, `Busy` during a repair, `Corruption`) under the
+/// same table.
+impl From<pigeonhole_text::Error> for ApiError {
+    fn from(e: pigeonhole_text::Error) -> Self {
+        match e {
+            pigeonhole_text::Error::Db(e) => Self::from_engine(&e),
+            e => Self::from_code(e.code(), &e.to_string()),
+        }
+    }
+}
+
 impl From<ApiError> for tonic::Status {
     fn from(e: ApiError) -> Self {
         e.to_status()

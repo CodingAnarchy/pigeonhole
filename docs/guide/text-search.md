@@ -44,8 +44,9 @@ index.delete(b"note:2")?;
 | Syntax | Builder | Matches |
 |---|---|---|
 | `postgres meeting` | `Query::new().text("postgres meeting")` | either word, tokenised as documents are |
-| `"march meeting"` | `.phrase(["march", "meeting"])` | the words at consecutive positions |
-| `"march meeting"~2` | `.phrase_with_slop(["march", "meeting"], 2)` | within 2 position moves |
+| `"March meeting"` | `.quoted_phrase("March meeting", 0)` | the words at consecutive positions, tokenised as documents are (stop words keep their places) |
+| `"March meeting"~2` | `.quoted_phrase("March meeting", 2)` | within 2 position moves |
+| | `.phrase(["march", "meeting"])`, `.phrase_with_slop(words, 2)` | the words exactly as given, never tokenised |
 | `postgress~`, `postgress~1` | `.fuzzy("postgress", Fuzziness::Auto)`, `Fuzziness::One` | terms within a few edits |
 
 ```rust

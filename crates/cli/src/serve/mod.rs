@@ -33,6 +33,7 @@ mod placement;
 mod router;
 mod service;
 mod sessions;
+mod texts;
 mod tls;
 
 pub(crate) use config::ServeArgs;
@@ -247,6 +248,8 @@ pub(crate) fn run(
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.
     shared.router.service.bulk.close();
+    // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
+    shared.router.service.texts.close();
     shared.router.service.indexes.close();
     let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
     let closed = db.close().map_err(|e| Failure::db("close", &e));

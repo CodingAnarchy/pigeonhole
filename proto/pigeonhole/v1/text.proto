@@ -109,7 +109,8 @@ message TextHit {
 }
 
 message TextMatch {
-  // The query clause it matched, by index.
+  // The query clause it matched, by index: the request's `clauses` (a repeated clause is
+  // refused), or with `syntax`, the parsed query's clauses, a repeat counted once.
   uint32 clause = 1;
   uint32 occurrence = 2;
   // The match's byte range in `text`.
