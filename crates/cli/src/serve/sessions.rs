@@ -318,6 +318,23 @@ impl Sessions {
         }
     }
 
+    /// Drops every session not in a call: the database under them was replaced (#1436's
+    /// re-bootstrap), so their transactions and snapshots are of a closed engine. A session
+    /// in a call fails it (`Closed`) and goes when it lapses. Later calls on a dropped one
+    /// find no session, and begin again.
+    pub(crate) fn drop_idle(&self) {
+        let mut t = self.lock();
+        let idle: Vec<Id> = t
+            .map
+            .iter()
+            .filter(|(_, e)| e.busy == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &idle {
+            t.remove(id);
+        }
+    }
+
     /// Expires every lapsed session as of `now`; sessions with a call in flight are skipped.
     /// Returns how many expired.
     pub(crate) fn sweep(&self, now: Instant) -> usize {

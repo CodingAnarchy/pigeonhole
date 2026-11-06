@@ -1209,6 +1209,17 @@ impl Drop for MaintenanceGuard<'_> {
 }
 
 /// Removes every WAL stream file of `path` (after a clean close checkpointed them all).
+/// Removes the files beside the database at `path` that belong to its current contents: the
+/// WAL streams and the change feed's sidecar (#1436: a replica's re-bootstrap removes the old
+/// copy's before its new file is renamed in, under the locks). The directory is synced.
+pub fn remove_side_files(vfs: &VfsRef, path: &std::path::Path) -> Result<()> {
+    let sidecar = crate::feed::sidecar_path(path);
+    if vfs.exists(&sidecar)? {
+        vfs.remove(&sidecar)?;
+    }
+    remove_wal_files(vfs, path)
+}
+
 pub(crate) fn remove_wal_files(vfs: &VfsRef, path: &std::path::Path) -> Result<()> {
     for stream in pigeonhole_wal::discover_streams(vfs, path)? {
         vfs.remove(&pigeonhole_wal::stream_path(path, stream))?;

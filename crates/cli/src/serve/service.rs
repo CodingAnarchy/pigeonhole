@@ -74,6 +74,8 @@ pub(crate) enum ServiceOp {
     VectorVerify(proto::VectorVerifyRequest),
     /// A client stream: its first message's index and count, and its messages after.
     VectorBulkLoad(super::bulk::BulkLoadOp),
+    Promote(proto::Empty),
+    Follow(proto::FollowRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -104,6 +106,8 @@ pub(crate) enum ServiceReply {
     Nearest(proto::NearestResponse),
     VectorSearch(proto::VectorSearchResponse),
     VectorVerify(proto::VectorVerifyResponse),
+    Promote(proto::PromoteResponse),
+    Follow(super::replica::FollowBatches),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -192,6 +196,8 @@ impl ServiceOp {
             Self::VectorSearch(_) => 32,
             Self::VectorVerify(_) => 33,
             Self::VectorBulkLoad(_) => 34,
+            Self::Promote(_) => 35,
+            Self::Follow(_) => FOLLOW,
         }
     }
 
@@ -230,9 +236,13 @@ impl ServiceOp {
             | Self::VectorDelete(_)
             | Self::VectorBulkLoad(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
-            Self::Flush(_) | Self::Compact(_) | Self::Backup(_) | Self::BackupDownload(_) => {
-                Scope::Admin
-            }
+            // A replica's bootstrap and follow read everything, ids and all (#1436).
+            Self::Flush(_)
+            | Self::Compact(_)
+            | Self::Backup(_)
+            | Self::BackupDownload(_)
+            | Self::Promote(_)
+            | Self::Follow(_) => Scope::Admin,
             // Dropping a table drops its data: admin, as ICR 0112's Schema says.
             Self::DropTable(_) => Scope::Admin,
             Self::CreateTable(_) => Scope::Write,
@@ -267,7 +277,11 @@ impl ServiceOp {
             Self::CreateTable(r) => r.encoded_len(),
             Self::DropTable(r) => r.encoded_len(),
             Self::DescribeTable(r) => r.encoded_len(),
-            Self::Info(_) | Self::Flush(_) | Self::Compact(_) | Self::Metrics(_) => 0,
+            Self::Info(_)
+            | Self::Flush(_)
+            | Self::Compact(_)
+            | Self::Metrics(_)
+            | Self::Promote(_) => 0,
             Self::Backup(r) => r.encoded_len(),
             Self::BackupDownload(r) => r.encoded_len(),
             Self::Traverse(r) => r.encoded_len(),
@@ -279,7 +293,25 @@ impl ServiceOp {
             Self::VectorVerify(r) => r.encoded_len(),
             // The messages hold their own budget, each until the loader takes it.
             Self::VectorBulkLoad(op) => op.index.len() + 16,
+            Self::Follow(r) => r.encoded_len(),
         }
+    }
+
+    /// Whether the call writes or changes the schema: a replica refuses it (#1436).
+    fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::Mutate(_)
+                | Self::CheckAndMutate(_)
+                | Self::Batch(_)
+                | Self::MutateReturning(_)
+                | Self::TxnWrite(_)
+                | Self::CreateTable(_)
+                | Self::DropTable(_)
+                | Self::CreateIndex(_)
+                | Self::VectorInsert(_)
+                | Self::VectorDelete(_)
+        )
     }
 }
 
@@ -293,7 +325,10 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
-pub(crate) const RPCS: [&str; 35] = [
+/// `Replication.Follow`'s index in `RPCS`: counted when its stream ends.
+pub(crate) const FOLLOW: usize = 36;
+
+pub(crate) const RPCS: [&str; 37] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -329,11 +364,13 @@ pub(crate) const RPCS: [&str; 35] = [
     "Vectors.Search",
     "Vectors.Verify",
     "Vectors.BulkLoad",
+    "Admin.Promote",
+    "Replication.Follow",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 43] = [
+pub(crate) const OUTCOMES: [&str; 44] = [
     "ok",
     "Io",
     "Corruption",
@@ -375,6 +412,7 @@ pub(crate) const OUTCOMES: [&str; 43] = [
     "SessionBusy",
     "TransactionExpired",
     "TransactionFinished",
+    "FailedPrecondition",
     "Internal",
     "other",
 ];
@@ -618,6 +656,8 @@ pub(crate) struct Service {
     scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
+    /// Set on a replica server (`--replica-of`, #1436).
+    pub(crate) replica: Option<Arc<super::replica::Replica>>,
 }
 
 impl std::fmt::Debug for Service {
@@ -664,7 +704,36 @@ impl Service {
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
+            replica: None,
         }
+    }
+
+    /// Makes this server a replica of `replica`'s primary: writes are refused until it is
+    /// promoted. The loop is started by the caller once the server runs.
+    pub(crate) fn replica(mut self, replica: Arc<super::replica::Replica>) -> Self {
+        self.replica = Some(replica);
+        self
+    }
+
+    /// `Admin.Info`'s replica section.
+    fn replica_info(&self) -> Option<proto::ReplicaInfo> {
+        self.replica.as_ref().and_then(|r| r.info())
+    }
+
+    /// The catalog changed under the service (a replica applied a primary's change): the
+    /// cached table and vector index handles go, and the next call on each name opens it
+    /// again.
+    pub(crate) fn tables_changed(&self) {
+        self.tables.store(Arc::new(HashMap::new()));
+        self.indexes.forget();
+    }
+
+    /// The served database was replaced under the handle (#1436's bootstrap): the table
+    /// cache, the feed hubs and the sessions are of the old engine, and go.
+    pub(crate) fn engine_replaced(&self) {
+        self.tables_changed();
+        self.feeds.fail_all();
+        self.sessions.drop_idle();
     }
 
     /// Takes backups in `dir` (`--backup-dir`), at most `max_backups` at once. Without a
@@ -712,8 +781,28 @@ impl Service {
     }
 
     /// Answers `op` for `caller`: the scope check, the in-flight bytes budget (unless the
-    /// front-end already reserved it, `prepaid`), then the call.
+    /// front-end already reserved it, `prepaid`), then the call. A replica refuses writes
+    /// with the primary's URL in the error.
     pub(crate) async fn call(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes()) else {
+            return self.answer(op, caller, prepaid).await;
+        };
+        if op.writes() && caller.scope >= op.scope() {
+            return Err(ApiError::replica_read_only(replica.primary()));
+        }
+        match self.answer(op, caller, prepaid).await {
+            // A transaction's Commit with writes: the engine's gate (R6) refused it.
+            Err(e) if e.code == "ReadOnly" => Err(ApiError::replica_read_only(replica.primary())),
+            reply => reply,
+        }
+    }
+
+    async fn answer(
         &self,
         op: ServiceOp,
         caller: &Caller,
@@ -832,6 +921,7 @@ impl Service {
                     free_bytes: info.free_bytes.unwrap_or(0),
                     tables,
                     version: env!("CARGO_PKG_VERSION").to_owned(),
+                    replica: self.replica_info(),
                 }))
             }
             ServiceOp::Flush(_) => {
@@ -866,6 +956,22 @@ impl Service {
             ServiceOp::BackupDownload(r) => {
                 drop(budget);
                 self.backup_download(r).await.map(ServiceReply::Download)
+            }
+            ServiceOp::Promote(_) => {
+                drop(budget);
+                let Some(replica) = &self.replica else {
+                    return Err(ApiError::failed_precondition(
+                        "this server isn't a replica (--replica-of)",
+                    ));
+                };
+                let primary_token = replica.promote(&self.db).await?;
+                Ok(ServiceReply::Promote(proto::PromoteResponse {
+                    primary_token: primary_token.into(),
+                }))
+            }
+            ServiceOp::Follow(r) => {
+                drop(budget);
+                self.follow(r).map(ServiceReply::Follow)
             }
             ServiceOp::Metrics(_) => {
                 drop(budget);
@@ -1028,7 +1134,32 @@ impl Service {
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);
+        if let Some(replica) = &self.replica {
+            replica.render(&mut text);
+        }
         text
+    }
+
+    /// `Replication.Follow` (#1436): under a `--max-streams` slot, on a thread of its own.
+    fn follow(&self, r: proto::FollowRequest) -> Result<super::replica::FollowBatches, ApiError> {
+        if self.replica_info().is_some() {
+            // No cascading replicas in 1.2.0 (simp724's P2 on #1436).
+            return Err(ApiError::failed_precondition(
+                "a replica can't be followed: follow its primary",
+            ));
+        }
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        super::replica::follow(
+            &self.db,
+            r.token.to_vec(),
+            slot,
+            self.limits.stream_idle,
+            Arc::clone(&self.metrics),
+        )
     }
 
     /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
@@ -1044,18 +1175,33 @@ impl Service {
                 "the server is at its concurrent stream limit (--max-streams)",
             ));
         };
+        if r.replica && self.replica_info().is_some() {
+            // No cascading replicas in 1.2.0 (simp724's P2 on #1436): this copy would carry
+            // this server's own replication state.
+            return Err(ApiError::failed_precondition(
+                "a replica can't be a bootstrap source: bootstrap from its primary",
+            ));
+        }
         let (id, kept) = if r.backup_id.is_empty() {
-            let (db, durable) = (self.db.clone(), r.durable);
+            let (db, durable, replica) = (self.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
             self.backups
                 .fresh_download(move |p| {
+                    if replica {
+                        // A replica's bootstrap (#1436): a durable snapshot's copy, and the
+                        // token of a feed of every table from that same snapshot.
+                        let snap = db.durable_snapshot()?;
+                        let token = db.feed().from_snapshot(&snap).open()?.token();
+                        db.backup_at(&snap, p)?;
+                        return Ok(token.as_bytes().to_vec());
+                    }
                     if durable {
                         db.backup_durable(p)?;
                     } else {
                         db.backup(p)?;
                     }
-                    Ok(())
+                    Ok(Vec::new())
                 })
                 .await?
         } else {
@@ -1095,6 +1241,7 @@ impl Service {
                         } else {
                             Default::default()
                         },
+                        feed_token: task_kept.feed_token.clone().into(),
                     };
                     match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
                         Ok(Ok(())) => {}

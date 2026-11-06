@@ -93,6 +93,179 @@ impl ReplicatedEvent {
     pub fn token(&self) -> &FeedToken {
         &self.token
     }
+
+    /// The primary's commit seqno the feed stood at after this event: what a replica that
+    /// applied it has applied through (#1436's lag).
+    pub fn primary_seqno(&self) -> u64 {
+        self.after.seqno
+    }
+
+    /// The event's bytes, for a replica in another process (#1436: `phdb serve`'s
+    /// `Replication.Follow`): versioned, opaque to the transport. [`decode`](Self::decode)
+    /// reads them back.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(EVENT_VERSION);
+        for v in [
+            self.before.seqno,
+            self.before.catalog,
+            self.after.seqno,
+            self.after.catalog,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        put_bytes(&mut out, self.token.as_bytes());
+        match &self.body {
+            Body::Commit { seqno, ts, changes } => {
+                out.push(0);
+                out.extend_from_slice(&seqno.to_le_bytes());
+                out.extend_from_slice(&ts.to_le_bytes());
+                out.extend_from_slice(&(changes.len() as u32).to_le_bytes());
+                for c in changes {
+                    out.extend_from_slice(&c.table.0.to_le_bytes());
+                    out.extend_from_slice(&c.family.0.to_le_bytes());
+                    out.push(logged_kind(c.kind) as u8);
+                    out.extend_from_slice(&c.ts.to_le_bytes());
+                    put_bytes(&mut out, &c.row);
+                    put_bytes(&mut out, &c.qualifier);
+                    put_bytes(&mut out, &c.stored);
+                }
+            }
+            Body::Catalog(ev) => {
+                out.push(1);
+                for v in [ev.seqno_ceiling, ev.timestamp, ev.sequence] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut edits = Vec::new();
+                for e in &ev.edits {
+                    e.encode(&mut edits);
+                }
+                out.extend_from_slice(&(ev.edits.len() as u32).to_le_bytes());
+                put_bytes(&mut out, &edits);
+                out.extend_from_slice(&(ev.names.len() as u32).to_le_bytes());
+                for (table, name) in &ev.names {
+                    out.extend_from_slice(&table.0.to_le_bytes());
+                    put_bytes(&mut out, name.as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// An event [`encode`](Self::encode) wrote. `InvalidArgument` for anything else, or for a
+    /// newer encoding.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader(bytes);
+        if r.u8()? != EVENT_VERSION {
+            return Err(invalid("not a replicated event of this version".to_owned()));
+        }
+        let before = StreamPosition {
+            seqno: r.u64()?,
+            catalog: r.u64()?,
+        };
+        let after = StreamPosition {
+            seqno: r.u64()?,
+            catalog: r.u64()?,
+        };
+        let token = FeedToken::from_bytes(r.bytes()?);
+        let body = match r.u8()? {
+            0 => {
+                let (seqno, ts) = (r.u64()?, r.u64()?);
+                let n = r.u32()?;
+                let mut changes = Vec::with_capacity(n.min(1 << 16) as usize);
+                for _ in 0..n {
+                    let table = TableId(r.u32()?);
+                    let family = FamilyId(r.u32()?);
+                    let kind = Kind::from_u8(r.u8()?)
+                        .map_err(|_| invalid("a replicated change's kind".to_owned()))?;
+                    let ts = r.u64()?;
+                    changes.push(ReplicatedChange {
+                        table,
+                        family,
+                        kind: ChangeKind::of(kind),
+                        row: r.bytes()?.to_vec(),
+                        qualifier: r.bytes()?.to_vec(),
+                        ts,
+                        stored: r.bytes()?.to_vec(),
+                    });
+                }
+                Body::Commit { seqno, ts, changes }
+            }
+            1 => {
+                let mut ev = CatalogEvent::default();
+                ev.seqno_ceiling = r.u64()?;
+                ev.timestamp = r.u64()?;
+                ev.sequence = r.u64()?;
+                let n = r.u32()?;
+                let mut edits = r.bytes()?;
+                for _ in 0..n {
+                    let (e, used) = pigeonhole_format::manifest::Edit::decode(edits)
+                        .map_err(|_| invalid("a replicated catalog edit".to_owned()))?;
+                    ev.edits.push(e);
+                    edits = &edits[used..];
+                }
+                for _ in 0..r.u32()? {
+                    let table = TableId(r.u32()?);
+                    let name = std::str::from_utf8(r.bytes()?)
+                        .map_err(|_| invalid("a replicated table name".to_owned()))?;
+                    ev.names.push((table, name.to_owned()));
+                }
+                Body::Catalog(ev)
+            }
+            _ => return Err(invalid("a replicated event's body".to_owned())),
+        };
+        if !r.0.is_empty() {
+            return Err(invalid(
+                "trailing bytes after a replicated event".to_owned(),
+            ));
+        }
+        Ok(Self {
+            before,
+            after,
+            token,
+            body,
+        })
+    }
+}
+
+/// [`ReplicatedEvent::encode`]'s version.
+const EVENT_VERSION: u8 = 1;
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+/// Reads [`ReplicatedEvent::encode`]'s fields.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let (head, rest) = self
+            .0
+            .split_first_chunk::<N>()
+            .ok_or_else(|| invalid("a truncated replicated event".to_owned()))?;
+        self.0 = rest;
+        Ok(*head)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take::<1>()?[0])
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take()?))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take()?))
+    }
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let n = self.u32()? as usize;
+        if self.0.len() < n {
+            return Err(invalid("a truncated replicated event".to_owned()));
+        }
+        let (b, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(b)
+    }
 }
 
 /// What a replica stores with each apply (D315 PR 3), in its state cell: the primary feed's
@@ -203,6 +376,53 @@ impl Pigeonhole {
         Ok(())
     }
 
+    /// Replaces this database's file with the one at `side` (#1436: a replica's
+    /// re-bootstrap swaps a fresh copy of its primary in), as a recovery swaps engines
+    /// (D265): every handle and clone then reads the new file, and operations in flight on
+    /// the old engine fail with `Closed` or retry on the new one. The path is never left
+    /// unlocked (simp724's sequence):
+    /// 1. `side` is opened and locked (writer byte and presence) first;
+    /// 2. the current engine closes, keeping its locks;
+    /// 3. the old copy's WAL and sidecar files are removed;
+    /// 4. `side` is renamed over the path;
+    /// 5. the old locks are released;
+    /// 6. the new engine opens on `side`'s locks and is swapped in.
+    ///
+    /// Refused while an automatic recovery runs. If a step after 2 fails, the handle is
+    /// left closed (`Closed`): reopen the path. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn replace_with(&self, side: impl AsRef<std::path::Path>) -> Result<()> {
+        let db = &self.db;
+        db.check_open()?;
+        if db.supervision().is_some_and(|s| s.recovering()) {
+            return Err(Error::new(
+                ErrorCode::Busy,
+                "a recovery is running: replace the file after it",
+            ));
+        }
+        let options = db.reopen_options()?;
+        let path = db.path().to_path_buf();
+        let vfs = std::sync::Arc::clone(&options.vfs);
+        let side = side.as_ref();
+        let adopted = pigeonhole_engine::Handover::adopt(&vfs, side, &path, options.allow_fuse)?;
+        let old = db.engine_arc();
+        let (_closed, held) = old.close_for_reopen();
+        pigeonhole_engine::remove_side_files(&vfs, &path)?;
+        let io = |e| Error::from(pigeonhole_engine::Error::Io(e));
+        vfs.rename(side, &path).map_err(io)?;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        vfs.sync_dir(dir).map_err(io)?;
+        drop(held);
+        let engine =
+            pigeonhole_engine::Engine::open_with(&path, options, adopted).map_err(|(e, _)| e)?;
+        drop(db.swap_engine(engine));
+        drop(old);
+        Ok(())
+    }
+
     /// Turns this replica into a primary at the last event it applied (#1436, ICR 0125):
     /// returns the primary's token stored with that event (`None` if it applied none). It then
     /// takes writes, and its own feed goes on; an apply after it is refused. Stop following
@@ -223,6 +443,13 @@ impl Pigeonhole {
     #[doc(hidden)]
     pub fn replicated_token(&self) -> Result<Option<FeedToken>> {
         Ok(self.replication_state()?.and_then(|s| s.token))
+    }
+
+    /// The primary's commit seqno a replica applied through (#1436's lag): `None` on a
+    /// database that isn't a replica. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn replicated_seqno(&self) -> Result<Option<u64>> {
+        Ok(self.replication_state()?.map(|s| s.after.seqno))
     }
 
     fn replication_state(&self) -> Result<Option<State>> {

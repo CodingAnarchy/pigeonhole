@@ -191,6 +191,30 @@ impl ApiError {
         )
     }
 
+    /// A call this server's state refuses (a replica's write, `Promote` on a primary): as
+    /// the engine's `ReadOnly`, it changed nothing and fails the same way again.
+    pub(crate) fn failed_precondition(message: impl Into<String>) -> Self {
+        Self::new(
+            "FailedPrecondition",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// A write to a replica server (#1436): the engine's `ReadOnly`, naming the primary
+    /// that takes the writes.
+    pub(crate) fn replica_read_only(primary: &str) -> Self {
+        Self::new(
+            "ReadOnly",
+            ErrorCode::ReadOnly as u32,
+            format!("this server is a replica of {primary}: send writes to the primary"),
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     pub(crate) fn overloaded(message: impl Into<String>) -> Self {
         Self::new(
             "Overloaded",

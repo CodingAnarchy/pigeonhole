@@ -571,6 +571,40 @@ impl RetryFrom {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PromoteResponse {
+    /// The primary's feed token stored with the last event the replica applied (empty if it
+    /// applied none). Opaque.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub primary_token: ::prost::bytes::Bytes,
+}
+/// A replica server's state (#1436): unset on a primary.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplicaInfo {
+    /// The primary's URL (`--replica-of`).
+    #[prost(string, tag = "1")]
+    pub primary: ::prost::alloc::string::String,
+    /// "starting", "bootstrapping", "following", "re-bootstrapping" or "retrying"
+    /// (after an error, which `last_error` gives).
+    #[prost(string, tag = "2")]
+    pub state: ::prost::alloc::string::String,
+    /// The primary's seqno the replica applied through.
+    #[prost(uint64, tag = "3")]
+    pub applied_primary_seqno: u64,
+    /// The primary's latest commit seqno, as its last message said.
+    #[prost(uint64, tag = "4")]
+    pub primary_seqno: u64,
+    /// primary_seqno - applied_primary_seqno: the seqnos the replica hasn't applied, commits
+    /// waiting for the primary's next sync included.
+    #[prost(uint64, tag = "5")]
+    pub lag_commits: u64,
+    /// Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
+    #[prost(uint64, tag = "6")]
+    pub lag_ms: u64,
+    /// The last error the replica loop met, if it's in `error` or retrying.
+    #[prost(string, tag = "7")]
+    pub last_error: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthResponse {
     /// "ok" while the database is open and not failed.
     #[prost(string, tag = "1")]
@@ -590,6 +624,9 @@ pub struct InfoResponse {
     /// The server's version (`pigeonhole`'s).
     #[prost(string, tag = "5")]
     pub version: ::prost::alloc::string::String,
+    /// Set on a replica server (#1436).
+    #[prost(message, optional, tag = "6")]
+    pub replica: ::core::option::Option<ReplicaInfo>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupRequest {
@@ -615,6 +652,11 @@ pub struct BackupDownloadRequest {
     pub backup_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
     pub offset: u64,
+    /// A replica's bootstrap (#1436): the backup is of a durable snapshot, and the stream
+    /// carries the token of a feed of every table opened from that same snapshot, which the
+    /// replica follows from. Refused on a server that is itself a replica.
+    #[prost(bool, tag = "4")]
+    pub replica: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupChunk {
@@ -633,6 +675,9 @@ pub struct BackupChunk {
     /// In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
     #[prost(bytes = "bytes", tag = "5")]
     pub sha256: ::prost::bytes::Bytes,
+    /// With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub feed_token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MetricsResponse {
@@ -876,6 +921,33 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Metrics"));
             self.inner.unary(req, path, codec).await
         }
+        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
+        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+        pub async fn promote(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<
+            tonic::Response<super::PromoteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Promote",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Promote"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -936,6 +1008,13 @@ pub mod admin_server {
             &self,
             request: tonic::Request<super::Empty>,
         ) -> std::result::Result<tonic::Response<super::MetricsResponse>, tonic::Status>;
+        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
+        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+        async fn promote(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct AdminServer<T> {
@@ -1302,6 +1381,49 @@ pub mod admin_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = MetricsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Promote" => {
+                    #[allow(non_camel_case_types)]
+                    struct PromoteSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
+                    for PromoteSvc<T> {
+                        type Response = super::PromoteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::promote(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PromoteSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -4163,6 +4285,330 @@ pub mod memory_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "pigeonhole.v1.Memory";
     impl<T> tonic::server::NamedService for MemoryServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FollowRequest {
+    /// A token the replica stored (or the bootstrap's). Opaque.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub token: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplicationBatch {
+    /// Events in order, each opaque (`pigeonhole`'s replicated-event encoding).
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    pub events: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    /// The primary's latest visible commit seqno when this message was sent. A commit not yet
+    /// durable on the primary counts as lag until a sync covers it.
+    #[prost(uint64, tag = "2")]
+    pub primary_seqno: u64,
+    /// The primary's feed had nothing more to send when the batch was cut: a replica that
+    /// applies it is caught up.
+    #[prost(bool, tag = "3")]
+    pub caught_up: bool,
+}
+/// Generated client implementations.
+pub mod replication_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct ReplicationClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> ReplicationClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> ReplicationClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            ReplicationClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// The primary's durable feed of every table from `token`, as encoded events in batches,
+        /// each with the primary's latest commit seqno (a batch with no events is sent while the
+        /// feed is quiet, so a replica measures its lag). Each event carries the primary's
+        /// database id in its token; an event of an encoding version the replica doesn't know
+        /// fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary
+        /// keeps: the replica bootstraps again. Refused on a server that is itself a replica.
+        pub async fn follow(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FollowRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReplicationBatch>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Replication/Follow",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Replication", "Follow"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod replication_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with ReplicationServer.
+    #[async_trait]
+    pub trait Replication: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the Follow method.
+        type FollowStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ReplicationBatch, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// The primary's durable feed of every table from `token`, as encoded events in batches,
+        /// each with the primary's latest commit seqno (a batch with no events is sent while the
+        /// feed is quiet, so a replica measures its lag). Each event carries the primary's
+        /// database id in its token; an event of an encoding version the replica doesn't know
+        /// fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary
+        /// keeps: the replica bootstraps again. Refused on a server that is itself a replica.
+        async fn follow(
+            &self,
+            request: tonic::Request<super::FollowRequest>,
+        ) -> std::result::Result<tonic::Response<Self::FollowStream>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct ReplicationServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> ReplicationServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ReplicationServer<T>
+    where
+        T: Replication,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Replication/Follow" => {
+                    #[allow(non_camel_case_types)]
+                    struct FollowSvc<T: Replication>(pub Arc<T>);
+                    impl<
+                        T: Replication,
+                    > tonic::server::ServerStreamingService<super::FollowRequest>
+                    for FollowSvc<T> {
+                        type Response = super::ReplicationBatch;
+                        type ResponseStream = T::FollowStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FollowRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Replication>::follow(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FollowSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for ReplicationServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Replication";
+    impl<T> tonic::server::NamedService for ReplicationServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

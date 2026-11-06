@@ -18,7 +18,8 @@
 | `Vectors` | `Nearest` (exact, D303), and the IVF index: `CreateIndex`, `Insert`, `Delete`, `Search`, `BulkLoad` (client stream), `Verify` |
 | `Text` | the BM25 index (D309): `CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild`, `Verify` |
 | `Memory` | the server's memory store (D311): `Remember`, `Recall`, `MarkUsed`, `Supersede`, `Link`, `Forget`, `Watch` (server stream) |
-| `Admin` | `Health`, `Info`, `Flush`, `Compact`, `Backup`, `BackupDownload` (server stream), `Metrics` |
+| `Admin` | `Health`, `Info`, `Flush`, `Compact`, `Backup`, `BackupDownload` (server stream), `Metrics`, `Promote` (#1436) |
+| `Replication` | `Follow` (a server stream a replica server reads, gRPC only; #1436, the amendment below) |
 
 Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and isn't part of this proto. Its tools call the same service layer.
 
@@ -118,6 +119,7 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
 | `DeadlineExceeded` (only before a write was submitted, B3; or a server stream (`Data.Scan`, `Feed.Subscribe`) whose client took no message for `--stream-idle-ms`, resumable from its last page's `next` or its last event's `token`) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
+| `FailedPrecondition` (the server's role refuses the call, #1436: `Admin.Promote` on a server that isn't a replica, a replica asked for a bootstrap copy or to be followed) | `FAILED_PRECONDITION` | 409 | not applied | no |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
 A code an older client doesn't know follows its `retry_safe` and `retry_from`.
@@ -160,3 +162,16 @@ A code an older client doesn't know follows its `retry_safe` and `retry_from`.
 
 ## Callers changed
 None: the contract is new. `phdb serve` (D313's tickets 3 and later) implements it, and D317's `cluster.proto` (ICR 0117) builds on it, reusing `FamilySpec` and `RoutingKey`.
+
+## Amendment: replication (#1436)
+**Status:** proposed with #1436's serve PR; the coordinator approves. The design is [#1436's note](https://github.com/CodingAnarchy/pigeonhole/issues/1436), with cli692's serve review and simp724's engine review folded in. The engine side is ICR 0125. Everything here is additive in v1.
+
+- **A new service, `Replication`** ([`replication.proto`](../../../proto/pigeonhole/v1/replication.proto)), gRPC only, admin scope: `Follow(FollowRequest { token }) -> stream ReplicationBatch`. It streams the primary's durable feed of every table from a replica's token, in batches of opaque events (`pigeonhole`'s hidden `ReplicatedEvent` encoding, versioned by its first byte, so the server never interprets them): at most 256 events, or about 1 MiB, per message. Each message carries `primary_seqno` (the primary's latest visible commit, for lag) and `caught_up` (the feed had nothing more to send). A quiet stream sends a message with no events every second. Errors: `FeedExpired` (`OUT_OF_RANGE`) for a token older than the primary keeps, `InvalidArgument` for another database's token, `FailedPrecondition` on a replica (no cascades in 1.2.0, simp724's P2). Each follower reads on a thread of its own and holds a `--max-streams` slot; one that takes nothing for `--stream-idle-ms` ends with `DeadlineExceeded` and resumes from its token.
+- **`Admin.BackupDownloadRequest.replica`** (field 4) asks for a replica's bootstrap copy: a backup of one durable snapshot (`durable` is implied), with `BackupChunk.feed_token` (field 6) in every chunk, the token of a feed of every table opened from that same snapshot. Refused (`FailedPrecondition`) on a replica.
+- **`Admin.Promote(Empty) -> PromoteResponse { primary_token }`**, admin scope, also `POST /v1/Admin/Promote`: stops a replica server's loop (an apply in flight finishes first) and makes the database a primary at the last commit it applied (ICR 0125's `promote`). It answers the primary's token stored with that commit. `FailedPrecondition` on a server that isn't a replica, one already promoted, or one whose first bootstrap hasn't finished.
+- **`InfoResponse.replica`** (field 6), a `ReplicaInfo`, is set on a replica server until it's promoted: the primary's URL, the state (`starting`, `bootstrapping`, `following`, `re-bootstrapping`, `retrying`), `applied_primary_seqno`, `primary_seqno`, `lag_commits`, `lag_ms` and `last_error`.
+- **A replica's write** (any `Data` write, `Transactions.Write`, a `Commit` with writes, `CreateTable`, `DropTable`, `Vectors.CreateIndex`, `Insert`, `Delete`) fails with the engine's `ReadOnly` row of the table (`FAILED_PRECONDITION`, 409, not applied), its message naming the primary: "this server is a replica of <URL>: send writes to the primary".
+- **A new server code, `FailedPrecondition`,** in the table above (the coordinator approved it, with `--change-feed`).
+- **Vector indexes on a replica** are opened as on a primary and searched and verified there; their writes are refused as above. A catalog change applied from the primary, or a new copy swapped in, drops the server's open table and index handles, so the next call opens them on what the replica now holds.
+- **`phdb serve` flags:** `--replica-of URL`, `--replica-token-file FILE` (or `PHDB_REPLICA_TOKEN`), `--replica-run N` (256), and `--change-feed BYTES` (the primary's feed; a database whose feed is on keeps it without the flag). `phdb promote <file>` promotes a stopped replica's file. `--replica-of` refuses to start on a database that has tables and isn't a replica's, since the bootstrap would replace it.
+- **The client side's dependencies:** tonic's `channel`, `tls-ring` and `tls-native-roots` features (rustls with the system's roots), approved by the coordinator; `cargo deny check` passes.
