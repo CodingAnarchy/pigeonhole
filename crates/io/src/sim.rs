@@ -854,6 +854,12 @@ impl SimVfs {
         self.io_submitted.notify_all();
     }
 
+    /// Shared-memory regions that exist (created and not removed), in every directory: a
+    /// test's check that a close or a file swap removed the regions it should.
+    pub fn shared_regions(&self) -> usize {
+        self.state().shm.len()
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()

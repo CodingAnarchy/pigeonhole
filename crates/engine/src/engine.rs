@@ -3911,6 +3911,31 @@ impl Engine {
     /// next open replays and rebuilds. Engine-owned writers only: an application-owned
     /// engine's close cannot wait, and a reader holds no writer lock. For `pigeonhole`'s
     /// automatic recovery (#620); not a stable API.
+    /// Releases `held`, a handover this engine's [`close_for_reopen`](Self::close_for_reopen)
+    /// gave, once nothing will reopen its file (#1436: a replica's re-bootstrap renamed a new
+    /// copy over the path, simp724's A3 on #1583). It runs the last-one-out cleanup the
+    /// handover skipped: if no reader process is still attached, the old file's shm region
+    /// goes. A reader that is attached removes it at its own close. The old file's WAL files
+    /// are the caller's (`remove_side_files` before the rename).
+    #[doc(hidden)]
+    pub fn retire(&self, mut held: Handover) -> Result<()> {
+        let Some(locks) = held.locks.take() else {
+            return Ok(());
+        };
+        let last = match &locks.presence {
+            Some(presence) if pigeonhole_io::sys::process_id() == self.inner.opened_in => {
+                presence.try_become_last()?
+            }
+            _ => false,
+        };
+        if last {
+            let shared = &self.inner.shared;
+            ShmRegion::remove(&shared.vfs, shared.identity, shared.shm_dir.as_deref())?;
+        }
+        drop(locks);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
         if let Err(e) = self.inner.check_process() {
@@ -4011,6 +4036,12 @@ impl Handover {
     /// `side` and takes its writer byte and presence on that handle, so the inode that becomes
     /// `target` is locked from before the rename until the new engine holds it; a second
     /// writer is refused throughout. Fails with `WriterLocked` if another holds `side`.
+    ///
+    /// `side` must have been closed cleanly (simp724's A1 on #1583): its WAL streams are named
+    /// after `side`, so once it's renamed nothing would replay them, and a commit only they
+    /// held (a replica's state, written just before) would be lost without a word. A side
+    /// file whose last writer didn't close cleanly is refused (`InvalidArgument`); reopen
+    /// and close it first. A side file that was only ever created clean (a backup) passes.
     pub fn adopt(vfs: &VfsRef, side: &Path, target: &Path, allow_fuse: bool) -> Result<Handover> {
         let mut open_opts = OpenOptions::read();
         open_opts.write = true;
@@ -4018,6 +4049,14 @@ impl Handover {
         check_local(&file, allow_fuse)?;
         let writer = WriterLock::acquire(&file)?;
         let presence = Presence::acquire(&file)?;
+        // Under the writer byte: no writer can open `side` and clear the flag after this.
+        if !Pager::open(vfs, side, false)?.clean_shutdown() {
+            return Err(Error::InvalidArgument(format!(
+                "{} wasn't closed cleanly: its WAL would be left behind by the replace; \
+                 open and close it first",
+                side.display()
+            )));
+        }
         Ok(Handover {
             locks: Some(Box::new(Locks {
                 _writer: writer,
