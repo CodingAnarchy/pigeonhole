@@ -1,0 +1,33 @@
+// Pigeonhole's network API, v1: replication (#1436, ICR 0112's amendment). A replica server
+// (`phdb serve --replica-of`) bootstraps from `Admin.BackupDownload` with `replica` set, then
+// follows the primary here. Admin scope.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+service Replication {
+  // The primary's durable feed of every table from `token`, as encoded events in batches,
+  // each with the primary's durable frontier (a batch with no events is sent while the
+  // feed is quiet, so a replica measures its lag). Each event carries the primary's
+  // database id in its token; an event of an encoding version the replica doesn't know
+  // fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary
+  // keeps: the replica bootstraps again. Refused on a server that is itself a replica.
+  rpc Follow(FollowRequest) returns (stream ReplicationBatch);
+}
+
+message FollowRequest {
+  // A token the replica stored (or the bootstrap's). Opaque.
+  bytes token = 1;
+}
+
+message ReplicationBatch {
+  // Events in order, each opaque (`pigeonhole`'s replicated-event encoding).
+  repeated bytes events = 1;
+  // The primary's durable frontier when this message was sent: every commit at or below it
+  // is durable there, so this stream can deliver it. Commits the primary hasn't synced yet
+  // aren't counted: a replica can't have them.
+  uint64 primary_seqno = 2;
+  // The primary's feed had nothing more to send when the batch was cut: a replica that
+  // applies it is caught up.
+  bool caught_up = 3;
+}

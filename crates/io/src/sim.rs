@@ -192,6 +192,8 @@ pub enum SimOp {
     },
     /// [`Vfs::remove`].
     Remove(PathBuf),
+    /// [`Vfs::rename`]: from, to.
+    Rename(PathBuf, PathBuf),
     /// [`Vfs::sync_dir`].
     SyncDir(PathBuf),
 }
@@ -852,6 +854,12 @@ impl SimVfs {
         self.io_submitted.notify_all();
     }
 
+    /// Shared-memory regions that exist (created and not removed), in every directory: a
+    /// test's check that a close or a file swap removed the regions it should.
+    pub fn shared_regions(&self) -> usize {
+        self.state().shm.len()
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()
@@ -1475,6 +1483,21 @@ impl Vfs for SimVfs {
         }
         st.gc();
         st.mutated(|| SimOp::Remove(path.to_path_buf()));
+        Ok(())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut st = self.state();
+        if st.read_only_media {
+            return Err(Error::new(ErrorKind::Other, "rename: read-only media"));
+        }
+        let Some(id) = st.names.remove(from) else {
+            return Err(Error::new(ErrorKind::NotFound, "rename"));
+        };
+        // The name `to` had (if any) is replaced: its node lives on while handles hold it.
+        st.names.insert(to.to_path_buf(), id);
+        st.gc();
+        st.mutated(|| SimOp::Rename(from.to_path_buf(), to.to_path_buf()));
         Ok(())
     }
 

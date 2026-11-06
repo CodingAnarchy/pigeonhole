@@ -3911,6 +3911,31 @@ impl Engine {
     /// next open replays and rebuilds. Engine-owned writers only: an application-owned
     /// engine's close cannot wait, and a reader holds no writer lock. For `pigeonhole`'s
     /// automatic recovery (#620); not a stable API.
+    /// Releases `held`, a handover this engine's [`close_for_reopen`](Self::close_for_reopen)
+    /// gave, once nothing will reopen its file (#1436: a replica's re-bootstrap renamed a new
+    /// copy over the path, simp724's A3 on #1583). It runs the last-one-out cleanup the
+    /// handover skipped: if no reader process is still attached, the old file's shm region
+    /// goes. A reader that is attached removes it at its own close. The old file's WAL files
+    /// are the caller's (`remove_side_files` before the rename).
+    #[doc(hidden)]
+    pub fn retire(&self, mut held: Handover) -> Result<()> {
+        let Some(locks) = held.locks.take() else {
+            return Ok(());
+        };
+        let last = match &locks.presence {
+            Some(presence) if pigeonhole_io::sys::process_id() == self.inner.opened_in => {
+                presence.try_become_last()?
+            }
+            _ => false,
+        };
+        if last {
+            let shared = &self.inner.shared;
+            ShmRegion::remove(&shared.vfs, shared.identity, shared.shm_dir.as_deref())?;
+        }
+        drop(locks);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
         if let Err(e) = self.inner.check_process() {
@@ -4003,6 +4028,45 @@ pub struct Handover {
     /// `open_with`'s error, which clippy keeps small.
     locks: Option<Box<Locks>>,
     path: PathBuf,
+}
+
+impl Handover {
+    /// The locks of the file at `side`, for an [`Engine::open_with`] of `target` once `side`
+    /// has been renamed over it (#1436: a replica's re-bootstrap, simp724's sequence). Opens
+    /// `side` and takes its writer byte and presence on that handle, so the inode that becomes
+    /// `target` is locked from before the rename until the new engine holds it; a second
+    /// writer is refused throughout. Fails with `WriterLocked` if another holds `side`.
+    ///
+    /// `side` must have been closed cleanly (simp724's A1 on #1583): its WAL streams are named
+    /// after `side`, so once it's renamed nothing would replay them, and a commit only they
+    /// held (a replica's state, written just before) would be lost without a word. A side
+    /// file whose last writer didn't close cleanly is refused (`InvalidArgument`); reopen
+    /// and close it first. A side file that was only ever created clean (a backup) passes.
+    pub fn adopt(vfs: &VfsRef, side: &Path, target: &Path, allow_fuse: bool) -> Result<Handover> {
+        let mut open_opts = OpenOptions::read();
+        open_opts.write = true;
+        let file = vfs.open(side, open_opts)?;
+        check_local(&file, allow_fuse)?;
+        let writer = WriterLock::acquire(&file)?;
+        let presence = Presence::acquire(&file)?;
+        // Under the writer byte: no writer can open `side` and clear the flag after this.
+        if !Pager::open(vfs, side, false)?.clean_shutdown() {
+            return Err(Error::InvalidArgument(format!(
+                "{} wasn't closed cleanly: its WAL would be left behind by the replace; \
+                 open and close it first",
+                side.display()
+            )));
+        }
+        Ok(Handover {
+            locks: Some(Box::new(Locks {
+                _writer: writer,
+                presence: Some(presence),
+                shared: false,
+                file,
+            })),
+            path: target.to_path_buf(),
+        })
+    }
 }
 
 /// Closes as [`Engine::close`] does (an application-owned engine's drop cannot wait). It
@@ -5721,11 +5785,31 @@ impl Inner {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
             // which a writer keeps from before it is present until it is.
             if let Ok(lock) = WriterLock::acquire(&r.file) {
+                // The WAL files are found by path, and the path may name another file now: a
+                // replace (#1436's re-bootstrap, `Pigeonhole::replace_with`) renamed a new copy
+                // over it while this reader held the old one, whose writer byte nobody holds
+                // any more. Those are the running engine's live streams, never this reader's
+                // to remove (simp724's B1 on #1583). Only the region, named by this file's
+                // identity, is ours then.
+                //
+                // No replace can land between this check and the removal below: this runs
+                // only while this reader holds the writer byte on its (old) inode, and a
+                // replace holds that byte, through the running engine and then its handover,
+                // until after the rename. So either the rename came first, and the check sees
+                // the new file, or no engine runs on the old file and no replace is in flight.
+                // A new writer of the path meanwhile gets `WriterLocked` (simp724 on #1583).
+                let still_ours = self
+                    .shared
+                    .vfs
+                    .open(&self.path, OpenOptions::read())
+                    .and_then(|f| f.identity())
+                    .is_ok_and(|id| id == self.shared.identity);
                 // The writer closed cleanly (its streams are checkpointed to their ends): the
                 // WAL files are not needed. After a writer crash they are, so they stay.
-                if Pager::open(&self.shared.vfs, &self.path, false)
-                    .map(|o| o.clean_shutdown())
-                    .unwrap_or(false)
+                if still_ours
+                    && Pager::open(&self.shared.vfs, &self.path, false)
+                        .map(|o| o.clean_shutdown())
+                        .unwrap_or(false)
                 {
                     crate::shard::remove_wal_files(&self.shared.vfs, &self.path)?;
                 }

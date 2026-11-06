@@ -47,6 +47,9 @@ pub(crate) struct Kept {
     pub path: PathBuf,
     pub total: u64,
     pub sha256: [u8; 32],
+    /// A replica bootstrap's feed token (#1436): what the replica follows the primary from,
+    /// returned with every chunk, a resume's too. Empty for an ordinary backup.
+    pub feed_token: Vec<u8>,
 }
 
 struct Entry {
@@ -211,7 +214,7 @@ impl Backups {
     /// taken before anything is evicted for the copy (E2).
     pub(crate) async fn fresh_download(
         self: &Arc<Self>,
-        take: impl FnOnce(&Path) -> Result<(), ApiError> + Send + 'static,
+        take: impl FnOnce(&Path) -> Result<Vec<u8>, ApiError> + Send + 'static,
     ) -> Result<(String, Kept), ApiError> {
         let permit = self.permit()?;
         let (id, path) = self.reserve()?;
@@ -229,9 +232,9 @@ impl Backups {
                 }
             }
             let mut pending = Pending(me, tid, false);
-            take(&tpath)?;
+            let feed_token = take(&tpath)?;
             let (total, sha256) = digest(&tpath)?;
-            let kept = pending.0.finish(&pending.1, total, sha256);
+            let kept = pending.0.finish(&pending.1, total, sha256, feed_token);
             pending.2 = true;
             let kept = kept.ok_or_else(|| ApiError::internal("the backup's copy vanished"))?;
             Ok(Handoff {
@@ -277,6 +280,7 @@ impl Backups {
                     path: path.clone(),
                     total: 0,
                     sha256: [0; 32],
+                    feed_token: Vec::new(),
                 },
                 ready: false,
                 readers: 0,
@@ -289,11 +293,12 @@ impl Backups {
     /// The backup thread wrote and hashed copy `id`: it's ready, and its requester is its
     /// reader from this moment, so no other download can evict it before the requester has
     /// it (simp724's H1, perf287's nit on #1527). `None` if it's gone.
-    fn finish(&self, id: &str, total: u64, sha256: [u8; 32]) -> Option<Kept> {
+    fn finish(&self, id: &str, total: u64, sha256: [u8; 32], feed_token: Vec<u8>) -> Option<Kept> {
         let mut kept = self.lock();
         let e = kept.get_mut(id)?;
         e.kept.total = total;
         e.kept.sha256 = sha256;
+        e.kept.feed_token = feed_token;
         e.ready = true;
         e.readers = 1;
         e.last_used = Instant::now();
@@ -597,7 +602,9 @@ mod tests {
         bytes: &'static [u8],
     ) -> Result<(String, Kept), ApiError> {
         rt.block_on(b.fresh_download(move |p| {
-            std::fs::write(p, bytes).map_err(|e| ApiError::internal(e.to_string()))
+            std::fs::write(p, bytes)
+                .map(|()| Vec::new())
+                .map_err(|e| ApiError::internal(e.to_string()))
         }))
     }
 
@@ -666,7 +673,7 @@ mod tests {
         for _ in 0..KEPT_MAX {
             let (id, path) = b.reserve().unwrap();
             std::fs::write(&path, b"backup").unwrap();
-            let kept = b.finish(&id, 6, [0; 32]).unwrap();
+            let kept = b.finish(&id, 6, [0; 32], Vec::new()).unwrap();
             // Finished, not yet taken by its requester.
             handoffs.push(Handoff {
                 backups: Arc::clone(&b),
@@ -706,7 +713,7 @@ mod tests {
                 let _ = wait.recv();
                 std::fs::write(p, b"backup").map_err(|e| ApiError::internal(e.to_string()))?;
                 let _ = written.send(p.to_owned());
-                Ok(())
+                Ok(Vec::new())
             });
             tokio::pin!(request);
             assert!(

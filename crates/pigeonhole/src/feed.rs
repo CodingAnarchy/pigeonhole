@@ -41,7 +41,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    fn of(kind: Kind) -> Self {
+    pub(crate) fn of(kind: Kind) -> Self {
         match kind {
             Kind::Put => ChangeKind::Put,
             Kind::Merge => ChangeKind::Merge,
