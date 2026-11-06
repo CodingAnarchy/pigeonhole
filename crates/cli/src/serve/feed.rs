@@ -845,12 +845,31 @@ impl Client {
                 .client_bytes
                 .clamp(1, Semaphore::MAX_PERMITS),
         );
+        let n = u32::try_from(bytes).unwrap_or(u32::MAX);
+        let gone = || ApiError::internal("the client went away");
+        // The fast path: room in the buffer and a place in the channel at once, with no
+        // timer or waiter registered. Arming them on every send was 64% of the samples in
+        // futex calls at 256 subscribers (perf287's profile on #1397).
+        let (event, held) = match Arc::clone(&self.budget).try_acquire_many_owned(n) {
+            Ok(room) => match self.tx.try_send((event, room)) {
+                Ok(()) => {
+                    pos.sent = token;
+                    pos.last_event = Instant::now();
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Full((event, room))) => (event, Some(room)),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
+            },
+            Err(tokio::sync::TryAcquireError::NoPermits) => (event, None),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(gone()),
+        };
+        // The slow path: wait for whichever was missing.
         let budget = Arc::clone(&self.budget);
         let queued = async {
-            let room = budget
-                .acquire_many_owned(u32::try_from(bytes).unwrap_or(u32::MAX))
-                .await
-                .map_err(|_| ())?;
+            let room = match held {
+                Some(room) => room,
+                None => budget.acquire_many_owned(n).await.map_err(|_| ())?,
+            };
             self.tx.send((event, room)).await.map_err(|_| ())
         };
         tokio::pin!(queued);
@@ -860,6 +879,8 @@ impl Client {
         loop {
             let taken = self.taken.notified();
             tokio::select! {
+                // The send first: room that is there wins over a timer that fired meanwhile.
+                biased;
                 sent = &mut queued => {
                     return match sent {
                         Ok(()) => {
@@ -868,11 +889,11 @@ impl Client {
                             Ok(())
                         }
                         // The client went away: end quietly.
-                        Err(()) => Err(ApiError::internal("the client went away")),
+                        Err(()) => Err(gone()),
                     };
                 }
                 () = taken => {}
-                () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
+                () = self.tx.closed() => return Err(gone()),
                 () = tokio::time::sleep(self.feeds.limits.stream_idle) => {
                     return Err(ApiError::deadline(format!(
                         "the client took no feed event for --stream-idle-ms ({} ms); resume \
