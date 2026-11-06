@@ -5785,11 +5785,24 @@ impl Inner {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
             // which a writer keeps from before it is present until it is.
             if let Ok(lock) = WriterLock::acquire(&r.file) {
+                // The WAL files are found by path, and the path may name another file now: a
+                // replace (#1436's re-bootstrap, `Pigeonhole::replace_with`) renamed a new copy
+                // over it while this reader held the old one, whose writer byte nobody holds
+                // any more. Those are the running engine's live streams, never this reader's
+                // to remove (simp724's B1 on #1583). Only the region, named by this file's
+                // identity, is ours then.
+                let still_ours = self
+                    .shared
+                    .vfs
+                    .open(&self.path, OpenOptions::read())
+                    .and_then(|f| f.identity())
+                    .is_ok_and(|id| id == self.shared.identity);
                 // The writer closed cleanly (its streams are checkpointed to their ends): the
                 // WAL files are not needed. After a writer crash they are, so they stay.
-                if Pager::open(&self.shared.vfs, &self.path, false)
-                    .map(|o| o.clean_shutdown())
-                    .unwrap_or(false)
+                if still_ours
+                    && Pager::open(&self.shared.vfs, &self.path, false)
+                        .map(|o| o.clean_shutdown())
+                        .unwrap_or(false)
                 {
                     crate::shard::remove_wal_files(&self.shared.vfs, &self.path)?;
                 }

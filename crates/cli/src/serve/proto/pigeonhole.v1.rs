@@ -590,11 +590,11 @@ pub struct ReplicaInfo {
     /// The primary's seqno the replica applied through.
     #[prost(uint64, tag = "3")]
     pub applied_primary_seqno: u64,
-    /// The primary's latest commit seqno, as its last message said.
+    /// The primary's durable frontier, as its last message said.
     #[prost(uint64, tag = "4")]
     pub primary_seqno: u64,
-    /// primary_seqno - applied_primary_seqno: the seqnos the replica hasn't applied, commits
-    /// waiting for the primary's next sync included.
+    /// primary_seqno - applied_primary_seqno: the durable commits the replica hasn't applied
+    /// yet (0 when caught up). Commits the primary hasn't synced aren't counted.
     #[prost(uint64, tag = "5")]
     pub lag_commits: u64,
     /// Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
@@ -4299,8 +4299,9 @@ pub struct ReplicationBatch {
     /// Events in order, each opaque (`pigeonhole`'s replicated-event encoding).
     #[prost(bytes = "bytes", repeated, tag = "1")]
     pub events: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
-    /// The primary's latest visible commit seqno when this message was sent. A commit not yet
-    /// durable on the primary counts as lag until a sync covers it.
+    /// The primary's durable frontier when this message was sent: every commit at or below it
+    /// is durable there, so this stream can deliver it. Commits the primary hasn't synced yet
+    /// aren't counted: a replica can't have them.
     #[prost(uint64, tag = "2")]
     pub primary_seqno: u64,
     /// The primary's feed had nothing more to send when the batch was cut: a replica that
@@ -4389,7 +4390,7 @@ pub mod replication_client {
             self
         }
         /// The primary's durable feed of every table from `token`, as encoded events in batches,
-        /// each with the primary's latest commit seqno (a batch with no events is sent while the
+        /// each with the primary's durable frontier (a batch with no events is sent while the
         /// feed is quiet, so a replica measures its lag). Each event carries the primary's
         /// database id in its token; an event of an encoding version the replica doesn't know
         /// fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary
@@ -4440,7 +4441,7 @@ pub mod replication_server {
             + std::marker::Send
             + 'static;
         /// The primary's durable feed of every table from `token`, as encoded events in batches,
-        /// each with the primary's latest commit seqno (a batch with no events is sent while the
+        /// each with the primary's durable frontier (a batch with no events is sent while the
         /// feed is quiet, so a replica measures its lag). Each event carries the primary's
         /// database id in its token; an event of an encoding version the replica doesn't know
         /// fails its apply. FeedExpired (OUT_OF_RANGE) once the token is older than the primary

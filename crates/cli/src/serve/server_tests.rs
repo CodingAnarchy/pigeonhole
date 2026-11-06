@@ -3637,6 +3637,32 @@ fn a_replica_bootstraps_follows_and_refuses_writes() {
     assert!(text.contains("pigeonhole_replica_following 1"), "{text}");
     assert!(text.contains("pigeonhole_replica_lag_commits"), "{text}");
 
+    // Every write RPC, whatever its body: the gate is the call's scope (cli692's F2).
+    for rpc in [
+        "Data/Mutate",
+        "Data/CheckAndMutate",
+        "Data/Batch",
+        "Data/MutateReturning",
+        "Transactions/Write",
+        "Schema/CreateTable",
+        "Schema/DropTable",
+        "Vectors/CreateIndex",
+        "Vectors/Insert",
+        "Vectors/Delete",
+    ] {
+        let (status, body) = r.rpc(rpc, &json!({}), None);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (409, Some("ReadOnly")),
+            "{rpc}: {body}"
+        );
+    }
+
+    // Caught up means no lag: the primary reports its durable frontier, which a replica can
+    // reach, not its visible seqno (cli692's F5).
+    let info = wait_replica(&r, "caught up again", caught_up(&p, tok));
+    assert!(info.get("lag_commits").is_none(), "{info}");
+
     // A replica is no bootstrap source and can't be followed (no cascades).
     let (status, body) = r.rpc("Admin/BackupDownload", &json!({"replica": true}), None);
     assert_eq!(
@@ -3802,4 +3828,141 @@ fn a_replica_serves_ivf_index_reads_and_refuses_its_writes() {
         None,
     );
     assert_eq!(hit_ids(&hits), [b64(b"n")]);
+}
+
+/// Two `Admin.Promote` calls at once: one promotes, the other is refused (cli692's F4). A
+/// background index rebalances on a replica only once it's promoted, and the catalog
+/// changes that drop the server's index handles don't pile up rebalancer threads (F3).
+#[test]
+fn concurrent_promotes_promote_once_and_rebalancers_start_after() {
+    let p = Server::start("", limits());
+    let mut spec = index_spec("REBALANCE_BACKGROUND");
+    spec["name"] = json!("bg");
+    assert_eq!(p.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let (status, e) = p.rpc(
+        "Vectors/Insert",
+        &json!({"index": "bg", "id": b64(b"a"), "vector": f32_query(&[0.0, 1.0])}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let search = |s: &Server| {
+        let q = f32_query(&[0.0, 0.0]);
+        let (status, hits) = s.rpc(
+            "Vectors/Search",
+            &json!({"index": "bg", "query": q, "k": 1}),
+            None,
+        );
+        assert_eq!(status, 200, "{hits}");
+        assert_eq!(hit_ids(&hits), [b64(b"a")]);
+    };
+    let indexes = &r.shared.router.service.indexes;
+    search(&r);
+    assert_eq!(indexes.rebalancing(), 0, "no rebalancer on a replica");
+
+    let statuses: Vec<(u16, Json)> = std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..2)
+            .map(|_| scope.spawn(|| r.rpc("Admin/Promote", &json!({}), None)))
+            .collect();
+        calls.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    let ok = statuses.iter().filter(|(s, _)| *s == 200).count();
+    assert_eq!(ok, 1, "exactly one promote: {statuses:?}");
+    let refused = statuses.iter().find(|(s, _)| *s != 200).unwrap();
+    assert_eq!(
+        (refused.0, refused.1["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{refused:?}"
+    );
+
+    // A primary now: the index's rebalancer runs. Catalog changes forget the handles, and
+    // each next search reopens it; the forgotten rebalancers end, so one is left.
+    search(&r);
+    assert_eq!(indexes.rebalancing(), 1);
+    for _ in 0..3 {
+        r.shared.router.service.tables_changed();
+        search(&r);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while indexes.rebalancing() > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} rebalancers after three forgets",
+            indexes.rebalancing()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A replica's own feed subscribers when a bootstrap swaps a new copy in: their tokens are
+/// the old copy's database's, and they end with an error rather than silently starting
+/// over on the new one (cli692's N3). Driven as the replica's loop does it, on one server.
+#[test]
+fn a_swap_ends_the_old_copy_s_feed_streams_with_an_error() {
+    let s = Server::start("", limits());
+    let other = Server::start("", limits());
+    write_row(&other, b"theirs");
+    let db = &s.shared.router.service.db;
+    let side = s.dir.join("side.phdb");
+    {
+        let theirs = &other.shared.router.service.db;
+        let snap = theirs.durable_snapshot().unwrap();
+        theirs.backup_at(&snap, &side).unwrap();
+    }
+    let mut events = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"ours");
+    let got = drain(&s, &mut events, Duration::from_millis(300));
+    assert_eq!(got.len(), 1, "{got:?}");
+    let token = got[0].2.clone();
+
+    db.replace_with(&side).unwrap();
+    s.shared.router.service.engine_replaced();
+
+    // The open stream: an error, never an event of the new copy.
+    let mut ended = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ended.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stream never ended"
+        );
+        match next_event(&s, &mut events, Duration::from_millis(200)) {
+            Some(Ok(e)) => assert!(commit_of(&e).is_none(), "an event after the swap: {e:?}"),
+            Some(Err(e)) => ended = Some(e),
+            None => {}
+        }
+    }
+    let ended = ended.unwrap();
+    // A resubscribe from the old token is refused the same way.
+    let resumed = s.block_on(s.shared.router.service.call(
+        ServiceOp::Subscribe(proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(token.into())),
+            ..subscribe(&["t"], b"")
+        }),
+        &Caller::anonymous(),
+        None,
+    ));
+    let refused = match resumed {
+        Err(e) => e,
+        Ok(super::service::ServiceReply::Feed(mut events)) => {
+            match next_event(&s, &mut events, Duration::from_secs(5)) {
+                Some(Err(e)) => e,
+                other => panic!("a resume from the old copy's token: {other:?}"),
+            }
+        }
+        Ok(_) => unreachable!(),
+    };
+    eprintln!(
+        "ended: {} {}; resume: {} {}",
+        ended.code, ended.message, refused.code, refused.message
+    );
+    for e in [&ended, &refused] {
+        assert!(
+            ["FeedExpired", "InvalidArgument"].contains(&e.code.as_str()),
+            "{}: {}",
+            e.code,
+            e.message
+        );
+    }
 }

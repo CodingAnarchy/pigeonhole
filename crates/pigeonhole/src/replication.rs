@@ -457,6 +457,15 @@ impl Pigeonhole {
         Ok(self.replication_state()?.and_then(|s| s.token))
     }
 
+    /// The durable feed's frontier: every commit at or below it is durable at its level and in
+    /// its stream file, so a feed that isn't `visible` can deliver it (#1436: what a primary
+    /// tells its replicas they can have, cli692's F5 on #1583). An atomic read. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn replication_frontier(&self) -> u64 {
+        self.engine().feed_frontier(true)
+    }
+
     /// The primary's commit seqno a replica applied through (#1436's lag): `None` on a
     /// database that isn't a replica. Not part of the stable API.
     #[doc(hidden)]

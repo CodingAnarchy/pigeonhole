@@ -43,10 +43,10 @@ message ReplicaInfo {
   string state = 2;
   // The primary's seqno the replica applied through.
   uint64 applied_primary_seqno = 3;
-  // The primary's latest commit seqno, as its last message said.
+  // The primary's durable frontier, as its last message said.
   uint64 primary_seqno = 4;
-  // primary_seqno - applied_primary_seqno: the seqnos the replica hasn't applied, commits
-  // waiting for the primary's next sync included.
+  // primary_seqno - applied_primary_seqno: the durable commits the replica hasn't applied
+  // yet (0 when caught up). Commits the primary hasn't synced aren't counted.
   uint64 lag_commits = 5;
   // Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
   uint64 lag_ms = 6;

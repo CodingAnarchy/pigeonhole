@@ -297,21 +297,13 @@ impl ServiceOp {
         }
     }
 
-    /// Whether the call writes or changes the schema: a replica refuses it (#1436).
+    /// Whether the call writes or changes the schema: a replica refuses it (#1436). Derived
+    /// from the scope, so a new write RPC is covered without being listed here (cli692's F2
+    /// on #1583): every write-scope RPC writes, and `DropTable` is the one admin-scope
+    /// write. A transaction's `Commit` is read scope; one with writes is refused by the
+    /// engine's gate (R6).
     fn writes(&self) -> bool {
-        matches!(
-            self,
-            Self::Mutate(_)
-                | Self::CheckAndMutate(_)
-                | Self::Batch(_)
-                | Self::MutateReturning(_)
-                | Self::TxnWrite(_)
-                | Self::CreateTable(_)
-                | Self::DropTable(_)
-                | Self::CreateIndex(_)
-                | Self::VectorInsert(_)
-                | Self::VectorDelete(_)
-        )
+        self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }
 }
 
@@ -658,6 +650,8 @@ pub(crate) struct Service {
     pub(crate) metrics: Arc<Metrics>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
+    /// Where the server's own threads run (none in tests).
+    placement: Option<Arc<super::placement::Placement>>,
 }
 
 impl std::fmt::Debug for Service {
@@ -705,6 +699,7 @@ impl Service {
             limits,
             metrics,
             replica: None,
+            placement: None,
         }
     }
 
@@ -712,6 +707,9 @@ impl Service {
     /// promoted. The loop is started by the caller once the server runs.
     pub(crate) fn replica(mut self, replica: Arc<super::replica::Replica>) -> Self {
         self.replica = Some(replica);
+        // A replica's rebalancer could only fail (its writes are refused, R6): none runs
+        // until a promote (cli692's F3 on #1583).
+        self.indexes.pause_rebalancing(true);
         self
     }
 
@@ -748,14 +746,17 @@ impl Service {
         Ok(self)
     }
 
-    /// Runs the threads the server starts for vector indexes (rebalancers, bulk loads) on
-    /// `placement`'s CPUs, off the shards' (perf287's B2 on 7b2): they run k-means.
+    /// Runs the threads the server starts on `placement`'s CPUs, off the shards': those of
+    /// vector indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2) and
+    /// `Replication.Follow`'s (a replica catching up reads and encodes at full speed,
+    /// cli692's F1 on #1583).
     pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
-        self.indexes = Arc::new(super::indexes::Indexes::new(
-            self.db.clone(),
-            Some(Arc::clone(placement)),
-        ));
+        let indexes = super::indexes::Indexes::new(self.db.clone(), Some(Arc::clone(placement)));
+        // A replica's pause survives the rebuild, whichever is set first.
+        indexes.pause_rebalancing(self.replica.is_some());
+        self.indexes = Arc::new(indexes);
         self.bulk.placement = Some(Arc::clone(placement));
+        self.placement = Some(Arc::clone(placement));
         self
     }
 
@@ -965,6 +966,10 @@ impl Service {
                     ));
                 };
                 let primary_token = replica.promote(&self.db).await?;
+                // A primary now: background indexes rebalance again, from handles opened
+                // afresh (cli692's F3 on #1583).
+                self.indexes.forget();
+                self.indexes.pause_rebalancing(false);
                 Ok(ServiceReply::Promote(proto::PromoteResponse {
                     primary_token: primary_token.into(),
                 }))
@@ -1159,6 +1164,7 @@ impl Service {
             slot,
             self.limits.stream_idle,
             Arc::clone(&self.metrics),
+            self.placement.clone(),
         )
     }
 
