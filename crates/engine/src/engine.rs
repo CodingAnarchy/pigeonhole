@@ -5791,6 +5791,13 @@ impl Inner {
                 // any more. Those are the running engine's live streams, never this reader's
                 // to remove (simp724's B1 on #1583). Only the region, named by this file's
                 // identity, is ours then.
+                //
+                // No replace can land between this check and the removal below: this runs
+                // only while this reader holds the writer byte on its (old) inode, and a
+                // replace holds that byte, through the running engine and then its handover,
+                // until after the rename. So either the rename came first, and the check sees
+                // the new file, or no engine runs on the old file and no replace is in flight.
+                // A new writer of the path meanwhile gets `WriterLocked` (simp724 on #1583).
                 let still_ours = self
                     .shared
                     .vfs
