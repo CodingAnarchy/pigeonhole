@@ -64,7 +64,7 @@ for change in commit.changes() {
 
 ## Where it starts
 - **After now** (the default): the commits after `open()`.
-- **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed.
+- **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed. To seed a copy elsewhere, back the same snapshot up with `db.backup_at(&snapshot, path)`: the copy holds exactly what the snapshot sees, and the feed starts at the first commit it doesn't hold. Use a `durable_snapshot()` for a copy that holds only durable commits.
 - **`from_oldest()`:** the oldest history kept, across reopens too: it starts at the oldest earlier open whose history every shard still keeps whole. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
 - **`resume(&token)`:** after the last commit a feed delivered before it gave that token.
 

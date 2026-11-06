@@ -183,3 +183,148 @@ fn a_feed_naming_the_replica_state_table_is_refused() {
     assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
     db.close().unwrap();
 }
+
+/// Sets `ro_compat` in both superblock pages of the closed database at `path`, as a crash
+/// after a promoted replica's drop and before its bit's clearing leaves it.
+fn set_ro_compat(vfs: &SimVfs, path: &str, bits: u64) {
+    use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
+    use pigeonhole_io::{OpenOptions, Vfs};
+    const PAGE: u64 = 4096;
+    let mut opts = OpenOptions::read();
+    opts.write = true;
+    let f = vfs.open(Path::new(path), opts).unwrap();
+    for p in [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B] {
+        let mut buf = [0u8; PAGE as usize];
+        f.read_at(&mut buf, p * PAGE).unwrap();
+        let mut sb = Superblock::decode(&buf).unwrap();
+        sb.features.ro_compat = bits;
+        sb.encode(&mut buf);
+        f.write_at(&buf, p * PAGE).unwrap();
+    }
+    f.sync_all().unwrap();
+}
+
+/// A promoted replica's bit left behind by a crash between its state table's drop and the
+/// bit's clearing (#1436, ICR 0125; simp724's note): a writable open clears it; a read-only
+/// one leaves it as it is.
+#[test]
+fn an_open_clears_a_replica_bit_left_without_its_state_table() {
+    let vfs = SimVfs::new(5104);
+    let db = open(&vfs, PRIMARY);
+    db.close().unwrap();
+    drop(db);
+    set_ro_compat(
+        &vfs,
+        PRIMARY,
+        pigeonhole_format::manifest::RO_COMPAT_REPLICA,
+    );
+    let mut o = common::options(Arc::clone(&vfs), 2, 16 << 20);
+    o.read_only = true;
+    let ro = Engine::open(Path::new(PRIMARY), o).unwrap();
+    assert_eq!(
+        ro.info().unwrap().features.ro_compat,
+        1,
+        "a read-only open writes nothing"
+    );
+    ro.close().unwrap();
+    drop(ro);
+    // Feed off: an open that commits nothing else, so the repair alone clears it.
+    let db = Engine::open(
+        Path::new(PRIMARY),
+        common::options(Arc::clone(&vfs), 2, 16 << 20),
+    )
+    .unwrap();
+    assert_eq!(db.info().unwrap().features.ro_compat, 0, "repaired");
+    db.close().unwrap();
+}
+
+/// simp724's P1 on #1436: a replica's state write that raced `promote` (its batch built
+/// before the promote's drop, committed after) fails, and nothing brings the state table,
+/// the bit or the write refusal back.
+#[test]
+fn a_state_write_racing_promote_fails_and_brings_nothing_back() {
+    use pigeonhole_format::manifest::{REPLICA_FAMILY, REPLICA_TABLE};
+    let vfs = SimVfs::new(5105);
+    let db = open(&vfs, REPLICA);
+    db.begin_replication(b"state", false).unwrap();
+    assert_eq!(db.info().unwrap().features.ro_compat, 1);
+    // What an apply had built when the promote ran: its state cell's put.
+    let mut raced = WriteBatch::new();
+    raced
+        .push_logged(
+            REPLICA_TABLE,
+            REPLICA_FAMILY,
+            pigeonhole_format::Kind::Put,
+            b"replication",
+            b"state",
+            1,
+            &[0, b'x'],
+        )
+        .unwrap();
+    db.promote().unwrap();
+    assert!(
+        db.commit(raced, None).is_err(),
+        "the raced state write fails"
+    );
+    assert!(matches!(
+        db.store_replication_state(b"later"),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        db.begin_replication(b"again", true),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert_eq!(db.info().unwrap().features.ro_compat, 0);
+    assert_eq!(db.replication_state().unwrap(), None);
+    // Local writes are taken.
+    let t = db
+        .create_table("local", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        b"r",
+        b"q",
+        None,
+        pigeonhole_engine::ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    db.commit(wb, None).unwrap();
+    db.close().unwrap();
+}
+
+/// `all_tables_token_position` reads a token through the reader's own decoder (simp724's N2
+/// on #1578): a feed of every table's token round-trips to its database, its delivered seqno
+/// and its catalog position, after commits and a catalog change.
+#[test]
+fn a_token_s_position_is_where_its_feed_stood() {
+    let vfs = SimVfs::new(5106);
+    let db = open(&vfs, PRIMARY);
+    let mut r = every_table(&db);
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..3u8 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            t.families[0].id,
+            &[i],
+            b"q",
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    }
+    for _ in 0..4 {
+        r.wait(WAIT).unwrap();
+    }
+    let token = r.token();
+    let (id, delivered, catalog) = pigeonhole_engine::all_tables_token_position(&token).unwrap();
+    assert_eq!(id, db.info().unwrap().db_id);
+    assert_eq!((delivered, catalog), (r.delivered(), r.position().catalog));
+    assert!(catalog >= 1, "the create was delivered");
+    db.close().unwrap();
+}

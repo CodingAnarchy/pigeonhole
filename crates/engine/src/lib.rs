@@ -72,6 +72,7 @@ pub use engine::{
     TableStorage,
 };
 pub use error::{Error, Result};
+pub use feed_reader::all_tables_token_position;
 pub use feed_reader::{
     CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
 };

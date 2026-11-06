@@ -377,9 +377,17 @@ impl ManifestWriter {
     /// thread (a creation that found the exclusion held may be drained there), whose turn
     /// then waits on four syncs, against D30's rule for that loop: accepted for a one-time step
     /// (perf287's S2 on #1194; `a_creation_queued_behind_a_background_commit_flags_the_file`).
-    pub(crate) fn flag_features(&mut self, edits: &[Edit]) -> Result<()> {
+    pub(crate) fn flag_features(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<()> {
         if self.poisoned {
             return Err(Self::poisoned_error());
+        }
+        // A promoted replica's bit, once its state table's drop is durable (an earlier commit,
+        // never this batch's): cleared before this commit (#1436, ICR 0125).
+        let dropping = edits.iter().any(|e| {
+            matches!(e, Edit::DropTable { table } if *table == pigeonhole_format::manifest::REPLICA_TABLE)
+        });
+        if !dropping {
+            self.clear_stale_replica_bit(catalog, false)?;
         }
         let needed = edits.iter().fold(0, |bits, e| match e {
             Edit::PutFamily { options, .. } => bits | options.kind.required_incompat(),
@@ -409,9 +417,36 @@ impl ManifestWriter {
         })
     }
 
+    /// Clears `ro_compat` bit 0 when the file carries it but has no replica state table (#1436,
+    /// ICR 0125): a promoted replica's last step, and the open-time repair when a crash came
+    /// between its state table's drop and this. Under the writer's exclusion, as
+    /// [`flag_features`](Self::flag_features); a no-op when the bit isn't set or the table is
+    /// there. `repair` (the open-time repair, simp724's note on #1436): a failure is returned
+    /// without poisoning the writer, so it never fails the open; the next writable open tries
+    /// again.
+    pub(crate) fn clear_stale_replica_bit(
+        &mut self,
+        catalog: &Catalog,
+        repair: bool,
+    ) -> Result<()> {
+        use pigeonhole_format::manifest::{REPLICA_TABLE, RO_COMPAT_REPLICA};
+        let features = self.pager.features();
+        if features.ro_compat & RO_COMPAT_REPLICA == 0 || catalog.table(REPLICA_TABLE).is_some() {
+            return Ok(());
+        }
+        let cleared = Features {
+            ro_compat: features.ro_compat & !RO_COMPAT_REPLICA,
+            ..features
+        };
+        self.pager.set_features(cleared).map_err(|e| {
+            self.poisoned |= !repair;
+            e.into()
+        })
+    }
+
     /// Commits synchronously (open-time flushes, before the shards run).
     pub(crate) fn commit(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<ManifestVersion> {
-        self.flag_features(edits)?;
+        self.flag_features(catalog, edits)?;
         let p = self.prepare(catalog, edits, Rewrite::AsNeeded)?;
         let r = self.pager.commit_root(p.root).map_err(pager_io);
         self.complete(p, r)
@@ -1044,7 +1079,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         Err(Error::NoSpace)
     } else {
         writer
-            .flag_features(&edits)
+            .flag_features(&catalog, &edits)
             .and_then(|()| writer.prepare(&catalog, &edits, rewrite))
     };
     match prepared {

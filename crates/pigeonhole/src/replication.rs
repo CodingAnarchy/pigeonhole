@@ -101,18 +101,22 @@ impl ReplicatedEvent {
 /// so a crash in its middle resumes there).
 #[derive(Debug, Clone, PartialEq)]
 struct State {
+    /// The primary's database id (simp724 on #1436): a replica follows only this database.
+    /// Zero in a version 1 cell, written before it was recorded.
+    primary: [u8; 16],
     after: StreamPosition,
     token: Option<FeedToken>,
 }
 
 /// The state cell's encoding version.
-const STATE_VERSION: u8 = 1;
+const STATE_VERSION: u8 = 2;
 
 impl State {
     fn encode(&self) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(18 + self.token.as_ref().map_or(0, |t| t.as_bytes().len()));
         out.push(STATE_VERSION);
+        out.extend_from_slice(&self.primary);
         out.extend_from_slice(&self.after.seqno.to_le_bytes());
         out.extend_from_slice(&self.after.catalog.to_le_bytes());
         match &self.token {
@@ -128,13 +132,20 @@ impl State {
     fn decode(bytes: &[u8]) -> Result<Self> {
         let bad = || Error::new(ErrorCode::Corruption, "a replica's state cell is malformed");
         let (&[version], rest) = bytes.split_first_chunk::<1>().ok_or_else(bad)?;
-        if version != STATE_VERSION {
-            return Err(bad());
-        }
+        // Version 1 had no primary id (D315 PR 3, before #1436's bootstrap).
+        let (primary, rest) = match version {
+            1 => ([0; 16], rest),
+            2 => {
+                let (id, rest) = rest.split_first_chunk::<16>().ok_or_else(bad)?;
+                (*id, rest)
+            }
+            _ => return Err(bad()),
+        };
         let (seqno, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
         let (catalog, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
         let (&[has_token], token) = rest.split_first_chunk::<1>().ok_or_else(bad)?;
         Ok(Self {
+            primary,
             after: StreamPosition {
                 seqno: u64::from_le_bytes(*seqno),
                 catalog: u64::from_le_bytes(*catalog),
@@ -163,11 +174,48 @@ fn logged_kind(kind: ChangeKind) -> Kind {
     }
 }
 
+/// The primary database a token belongs to (zeros for a token that isn't a feed of every
+/// table's, which a replicated event never carries).
+fn primary_of(token: &FeedToken) -> [u8; 16] {
+    pigeonhole_engine::all_tables_token_position(token.as_bytes()).map_or([0; 16], |(id, _, _)| id)
+}
+
 fn invalid(message: String) -> Error {
     Error::new(ErrorCode::InvalidArgument, message)
 }
 
 impl Pigeonhole {
+    /// Makes this database, a bootstrap copy of a primary (its [`backup_at`](Self::backup_at)
+    /// of a snapshot), a replica that follows the primary from `token`: the token of a feed of
+    /// every table opened `from_snapshot` on that same snapshot (#1436, ICR 0125). The first
+    /// [`apply_replicated`](Self::apply_replicated) chains on it. Refused on a replica, and on
+    /// a promoted one. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn begin_replication(&self, token: &FeedToken) -> Result<()> {
+        let (primary, seqno, catalog) =
+            pigeonhole_engine::all_tables_token_position(token.as_bytes())?;
+        let state = State {
+            primary,
+            after: StreamPosition { seqno, catalog },
+            token: Some(token.clone()),
+        };
+        self.engine().begin_replication(&state.encode(), true)?;
+        Ok(())
+    }
+
+    /// Turns this replica into a primary at the last event it applied (#1436, ICR 0125):
+    /// returns the primary's token stored with that event (`None` if it applied none). It then
+    /// takes writes, and its own feed goes on; an apply after it is refused. Stop following
+    /// the old primary first, and stop the old primary's writers: nothing fences it. If it fails after
+    /// dropping the state (its bit's commit failed), the database is already no replica: reopen
+    /// it to finish. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn promote(&self) -> Result<Option<FeedToken>> {
+        let token = self.replicated_token()?;
+        self.engine().promote()?;
+        Ok(token)
+    }
+
     /// The primary feed's token a replica stored with the last event it applied (D315 PR 3):
     /// resume the primary's feed from it ([`FeedBuilder::resume`](crate::FeedBuilder::resume))
     /// to go on from there. `None` before the first event is applied. Not part of the stable
@@ -188,8 +236,12 @@ impl Pigeonhole {
     /// (`run[0].before == stored.after`: anything else is a gap or an overlap). The first
     /// apply, with none stored, needs a database with no tables of its own, and records
     /// `before` as where it starts.
-    fn chain(&self, before: StreamPosition) -> Result<()> {
+    fn chain(&self, before: StreamPosition, primary: [u8; 16]) -> Result<()> {
         match self.replication_state()? {
+            // Another database's history (#1436): a replica follows only its primary.
+            Some(s) if s.primary != [0; 16] && s.primary != primary => Err(invalid(
+                "the events are another database's than the replica's primary".to_owned(),
+            )),
             Some(s) if s.after == before => Ok(()),
             Some(s) => Err(invalid(format!(
                 "a replicated run must start where the last apply ended: it starts at \
@@ -204,10 +256,11 @@ impl Pigeonhole {
                     ));
                 }
                 let start = State {
+                    primary,
                     after: before,
                     token: None,
                 };
-                self.engine().store_replication_state(&start.encode())?;
+                self.engine().begin_replication(&start.encode(), false)?;
                 Ok(())
             }
         }
@@ -247,7 +300,7 @@ impl Pigeonhole {
                 "the token to store must be the run's last event's".to_owned(),
             ));
         }
-        self.chain(first.before)?;
+        self.chain(first.before, primary_of(&first.token))?;
         let mut batch = WriteBatch::new();
         let mut cells: HashSet<Cell<'_>> = HashSet::new();
         let mut max_ts = 0;
@@ -297,6 +350,7 @@ impl Pigeonhole {
             // Commits with nothing this database stores (every change was another's): only
             // the state moves.
             let state = State {
+                primary: primary_of(&end.token),
                 after: end.after,
                 token: Some(end.token.clone()),
             };
@@ -308,6 +362,7 @@ impl Pigeonhole {
 
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
         let state = State {
+            primary: primary_of(&end.token),
             after: end.after,
             token: Some(end.token.clone()),
         };
@@ -332,9 +387,10 @@ impl Pigeonhole {
         if event.token != *token {
             return Err(invalid("the token to store must be the event's".to_owned()));
         }
-        self.chain(event.before)?;
+        self.chain(event.before, primary_of(&event.token))?;
         self.engine().apply_catalog(&change.edits)?;
         let state = State {
+            primary: primary_of(&event.token),
             after: event.after,
             token: Some(event.token.clone()),
         };

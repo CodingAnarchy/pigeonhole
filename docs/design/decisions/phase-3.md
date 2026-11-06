@@ -4463,6 +4463,12 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - resumes after process crashes and power losses, including one inside an apply (mutation-checked: a state committed apart fails it).
   - The corpus entry `replica` opens read-only, and only read-only, with 1.0.0 and 1.1.0.
 
+**Amendment, 2026-11-06: bootstrap and promotion (#1436, ICR 0125; the design on #1436 with simp724's P1/P2 and cli692's serve review).**
+- **Bootstrap:** a backup of one durable snapshot (`backup_at`) and a feed of every table opened `from_snapshot` on it meet exactly. `begin_replication(token)` on the copy creates the state table and stores the token's position and the primary's database id.
+- **Only `begin_replication` creates the state table** (the from-nothing first apply goes through it). A replica of a replica isn't supported in 1.2.0: a replica refuses to be a bootstrap source.
+- **Promote:** drop the state table with a one-way promoted state, so no apply after it runs. Clear `ro_compat` bit 0 once the drop is durable (a writable open repairs a crash between the two), then lift R6's refusal.
+- **The rest is serve's,** in ICR 0112's amendment: the `Replication` service, the replica loop, re-bootstrap on `FeedExpired` through a lock-preserving file swap, and `Admin.Promote`. Read-your-writes on a replica is #1577.
+
 <a id="d316"></a>
 ## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
 
