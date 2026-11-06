@@ -375,3 +375,15 @@ scan-budget-twin 1370 0.3
 knn-exact-f16 1368 0.3
 knn-exact-bf16 1084 0.3
 knn-budget 1069 0.3
+# #1560 PR 0 (perf287's T3): the sync text search's floor before its read path goes async,
+# from textshapes.rs over a 100,000-document index (hub terms of 95,649 and 67,972
+# postings), one pass of each shape's queries. From run 42133495367 on 814f72c1, head counts
+# times 1.003 (base and head agreed to 0.0% on every shape).
+text-term-rare 270408 0.3
+text-term-hub 70603557 0.3
+text-two-terms 27657383 0.3
+text-five-terms 22144727 0.3
+text-two-terms-k100 52001738 0.3
+text-fuzzy 59091020 0.3
+text-phrase 126670191 0.3
+text-phrase-slop2 131159719 0.3

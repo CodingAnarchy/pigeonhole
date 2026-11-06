@@ -50,7 +50,7 @@ env:
   PIGEONHOLE_IO: pread
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
-  EXAMPLES: hotrow readshapes writepath ycsb scanrate
+  EXAMPLES: hotrow readshapes writepath ycsb scanrate textshapes
   # The write shapes run with `Options::commit_spin(ZERO)` (crates/bench/examples/support/
   # shards.rs): how often a waiting client polls depends on thread timing (D198), so counting
   # it would make the shapes nondeterministic. The default spin is checked on wall time
@@ -63,6 +63,7 @@ env:
     writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
     ycsb:ycsb-c,ycsb-a
     scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+    textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read
@@ -163,6 +164,16 @@ jobs:
               fi
               groups+=("/tmp/bin-$side/$g")
             done
+            # The text shapes' index, built natively once per side (about 25 s) and opened
+            # read-only by every text shape: valgrind runs only the searches (#1560 PR 0). The
+            # build pins its clock and ids, so each side indexes the same bytes of text into
+            # the same layout. It also checks the corpus (the hub term's postings).
+            if [ -x "/tmp/bin-$side/textshapes" ]; then
+              "/tmp/bin-$side/textshapes" build "/tmp/textidx-$side"
+              export TEXTSHAPES_INDEX="/tmp/textidx-$side"
+            else
+              unset TEXTSHAPES_INDEX
+            fi
             scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
           done
           if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
