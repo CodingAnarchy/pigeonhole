@@ -772,15 +772,49 @@ impl Drop for HeldSyncs<'_> {
     }
 }
 
+/// One simulated step for the held-sync test: a shard turn, then one deferred operation
+/// completed on this thread (the seed picks which). With `tick`, a step that finds nothing
+/// in flight moves the simulated clock a millisecond, so a timed sync comes due; without
+/// it the clock stands still. No device thread and no wall clock, so a run replays exactly.
+fn sim_step(vfs: &SimVfs, shard: &mut EngineShard, tick: bool) {
+    shard.run_once(u64::MAX);
+    if !vfs.complete_io() && tick {
+        vfs.advance(1_000_000);
+    }
+}
+
+/// [`drive`] on the simulator, with the clock standing still: a shard turn, then `pending`
+/// polled, then one deferred operation completed. Polling between the turn and the
+/// completion sees the commit resolve at the turn that handled its sync, before anything
+/// that turn submitted (a follow-up sync) can complete. Within `limit` steps.
+fn sim_drive(
+    vfs: &SimVfs,
+    shard: &mut EngineShard,
+    mut pending: PendingCommit,
+    limit: u32,
+) -> CommitInfo {
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..limit {
+        shard.run_once(u64::MAX);
+        if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
+            return r.unwrap();
+        }
+        vfs.complete_io();
+    }
+    panic!("the commit never resolved in {limit} simulated steps");
+}
+
 /// [`a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered`] on the simulator,
 /// with the sync held in flight ([`SimVfs::hold_file_syncs`]), so `b` is always logged while
 /// the sync covering `a` is still out: the race that test can only hope to hit on real files.
+/// Deterministic: the test thread completes every deferred operation itself and moves the
+/// simulated clock, which the background sync's interval runs on, so no step depends on
+/// when another thread runs (#1581's macOS miss, with a device thread completing the I/O).
 #[test]
 fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
     for group in [true, false] {
         let vfs = SimVfs::new(1340 + u64::from(group));
         vfs.set_deferred_io(true);
-        let _device = vfs.complete_io_in_background();
         // The group case keeps the background sync out of it.
         let t_sync = if group {
             Duration::from_secs(600)
@@ -792,16 +826,20 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
         let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
         let mut shard = shards.remove(0);
         let t = table(&db, "t");
-        settle(&mut shard);
+        for _ in 0..1000 {
+            sim_step(&vfs, &mut shard, false);
+        }
+        vfs.complete_all_io();
         // Syncs held from before `a`, so the one covering it stays in flight; released on
         // the way out whatever happens, so a failed check can't leave the close waiting.
         let syncs = db.feed_background_syncs();
         let hold = HeldSyncs::new(&vfs);
-        let a = drive(
-            &db,
+        let a = sim_drive(
+            &vfs,
             &mut shard,
             db.submit(batch(&t, b"a"), Some(Durability::Buffered))
                 .unwrap(),
+            10_000,
         )
         .seqno;
         // A sync covering `a`, held in flight.
@@ -813,12 +851,13 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
                 Durability::GroupSync,
             ))
         } else {
+            // The interval passes on the simulated clock, and the next turn submits it.
             for _ in 0..1000 {
                 if db.feed_background_syncs() > syncs {
                     break;
                 }
                 vfs.advance(t_sync.as_nanos() as u64);
-                shard.run_once(u64::MAX);
+                sim_step(&vfs, &mut shard, false);
             }
             assert!(db.feed_background_syncs() > syncs, "no background sync");
             None
@@ -828,10 +867,12 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
             db.feed_frontier(true) < a,
             "the held sync can't have covered `a` (group {group})"
         );
-        let b = drive(&db, &mut shard, b).seqno;
+        let b = sim_drive(&vfs, &mut shard, b, 10_000).seqno;
         drop(hold);
         if let Some(g) = g {
-            let g = drive(&db, &mut shard, g).seqno;
+            // Its resolution means its sync's completion was handled. Nothing else is
+            // completed before the check: a later sync may cover `b`, legitimately.
+            let g = sim_drive(&vfs, &mut shard, g, 10_000).seqno;
             settle(&mut shard);
             let f = db.feed_frontier(true);
             assert!(
@@ -841,6 +882,8 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
         } else {
             // The held sync's completion moves the frontier past `a` but not `b`; the next
             // background sync covers `b`. With the hold one pair, it would jump.
+            // Each step completes one operation (the held sync among them) or moves the clock
+            // a millisecond, so the next background sync comes due within its interval.
             let mut between = false;
             for _ in 0..10_000 {
                 let f = db.feed_frontier(true);
@@ -848,10 +891,7 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
                 if f >= b {
                     break;
                 }
-                shard.run_once(u64::MAX);
-                if db.feed_frontier(true) == f {
-                    vfs.advance(1_000_000);
-                }
+                sim_step(&vfs, &mut shard, true);
             }
             assert!(db.feed_frontier(true) >= b, "never synced `b`");
             assert!(
@@ -859,6 +899,8 @@ fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
                 "the frontier passed `a` only with `b`: a {a}, b {b}"
             );
         }
+        // Every check is done: a device thread completes what the close waits on.
+        let _device = vfs.complete_io_in_background();
         close_real(&db, &mut shard);
     }
 }
