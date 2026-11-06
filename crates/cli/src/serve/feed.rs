@@ -292,6 +292,8 @@ pub(crate) struct FeedStats {
 
 /// The hubs, by table set.
 pub(crate) struct Feeds {
+    /// Where hubs and clients run: the server's feed runtime, once `run_on` set it.
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     db: pigeonhole::Pigeonhole,
     hubs: Mutex<HashMap<HubKey, Weak<Hub>>>,
     catch_up: Arc<Semaphore>,
@@ -319,6 +321,7 @@ pub(crate) struct FeedGauges {
 impl Feeds {
     pub(crate) fn new(db: pigeonhole::Pigeonhole, limits: FeedLimits) -> Arc<Self> {
         Arc::new(Self {
+            runtime: std::sync::OnceLock::new(),
             db,
             hubs: Mutex::new(HashMap::new()),
             catch_up: Arc::new(Semaphore::new(limits.max_catch_up.max(1))),
@@ -326,6 +329,25 @@ impl Feeds {
             stats: Arc::default(),
             live: Arc::default(),
         })
+    }
+
+    /// Runs the hubs and the clients' delivery on `runtime` from now on, instead of the
+    /// caller's: the server's feed runtime (ticket 5's (A), with perf287's D1: the hubs too),
+    /// so delivery never holds a worker that serves requests. Set once, before serving.
+    pub(crate) fn run_on(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.runtime.set(runtime);
+    }
+
+    /// Spawns `f` on the feed runtime, or on the caller's without one (tests).
+    fn spawn<F>(&self, f: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self.runtime.get() {
+            Some(rt) => rt.spawn(f),
+            None => tokio::spawn(f),
+        }
     }
 
     pub(crate) fn gauges(&self) -> FeedGauges {
@@ -378,39 +400,40 @@ impl Feeds {
         live.fetch_add(1, Ordering::Relaxed);
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let weak = weak.clone();
-            let task = tokio::spawn(async move {
-                loop {
-                    // A poll that finds nothing records how far the feed got, so the ring's
-                    // `passed` follows other tables' writes (the engine wakes the hub on each
-                    // frontier move).
-                    let item = std::future::poll_fn(|cx| {
-                        let polled = Pin::new(&mut stream).poll_next(cx);
-                        if polled.is_pending()
-                            && let Some(hub) = weak.upgrade()
-                        {
-                            let at = stream.position().seqno();
-                            hub.note_passed(at, || token_of(&stream));
-                        }
-                        polled
-                    })
-                    .await;
-                    let Some(hub) = weak.upgrade() else { return };
-                    match item {
-                        Some(Ok(commit)) => {
-                            let at = stream.position().seqno();
-                            hub.push(commit, token_of(&stream), at, limit);
-                        }
-                        // An expiry, `Closed`, damage: each client goes on from its own
-                        // token on its own stream, and the engine decides each (feed1248's
-                        // (5)).
-                        _ => {
-                            hub.fail();
-                            return;
+            let task = self
+                .spawn(async move {
+                    loop {
+                        // A poll that finds nothing records how far the feed got, so the ring's
+                        // `passed` follows other tables' writes (the engine wakes the hub on each
+                        // frontier move).
+                        let item = std::future::poll_fn(|cx| {
+                            let polled = Pin::new(&mut stream).poll_next(cx);
+                            if polled.is_pending()
+                                && let Some(hub) = weak.upgrade()
+                            {
+                                let at = stream.position().seqno();
+                                hub.note_passed(at, || token_of(&stream));
+                            }
+                            polled
+                        })
+                        .await;
+                        let Some(hub) = weak.upgrade() else { return };
+                        match item {
+                            Some(Ok(commit)) => {
+                                let at = stream.position().seqno();
+                                hub.push(commit, token_of(&stream), at, limit);
+                            }
+                            // An expiry, `Closed`, damage: each client goes on from its own
+                            // token on its own stream, and the engine decides each (feed1248's
+                            // (5)).
+                            _ => {
+                                hub.fail();
+                                return;
+                            }
                         }
                     }
-                }
-            })
-            .abort_handle();
+                })
+                .abort_handle();
             Hub {
                 ring: Mutex::new(Ring {
                     start_seqno,
@@ -481,7 +504,7 @@ impl Feeds {
                 Begin::Own(Box::new(feed), token)
             }
         };
-        tokio::spawn(async move {
+        self.spawn(async move {
             let outcome = match client.run(begin).await {
                 // The client went away: not a failure.
                 Err(_) if client.tx.is_closed() => Ok(()),
@@ -1180,6 +1203,70 @@ mod tests {
         });
         drop(t);
         drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hubs_and_clients_run_on_the_feed_runtime() {
+        // Ticket 5's (A): with a feed runtime, a subscription's hub and client tasks run
+        // there, not on the request's runtime, and its events still reach the stream the
+        // request side reads.
+        let (_, db, dir) = commits("feedrt", 0);
+        let requests = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let delivery = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("phdb-serve-feed")
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(10),
+                stream_idle: Duration::from_secs(5),
+                client_events: CLIENT_EVENTS,
+                client_bytes: CLIENT_BYTES,
+            },
+        );
+        feeds.run_on(delivery.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        let before = delivery.metrics().num_alive_tasks();
+        requests.block_on(async {
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let spec = Spec {
+                tables: vec![t.clone()],
+                prefix: Vec::new(),
+                visible: false,
+                start: Start::Now,
+            };
+            let mut events = feeds.subscribe(spec, slot, |_| {}).unwrap();
+            assert_eq!(
+                delivery.metrics().num_alive_tasks(),
+                before + 2,
+                "the hub and the client"
+            );
+            assert_eq!(
+                tokio::runtime::Handle::current()
+                    .metrics()
+                    .num_alive_tasks(),
+                0,
+                "nothing of the feed on the request side"
+            );
+            let seqno = t.mutate(b"r").put("f", b"q", b"v").commit().unwrap().seqno;
+            assert_eq!(seqnos(&mut events, Duration::from_secs(1)).await, [seqno]);
+        });
+        drop(t);
+        drop(requests);
+        drop(delivery);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
