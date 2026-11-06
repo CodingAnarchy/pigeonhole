@@ -46,8 +46,10 @@ impl Prepaid {
 /// The header's length is the message as sent, compressed or not. tonic isn't configured to
 /// accept compressed requests (`accept_compressed`), so it refuses them and the reservation
 /// is exact; enabling compression would need the decoded bound,
-/// `max_decoding_message_size`, reserved instead. TODO(`Vectors.BulkLoad`'s ticket): a
-/// client-streaming RPC needs a reservation per message; this reserves only the first.
+/// `max_decoding_message_size`, reserved instead.
+///
+/// A client stream (`Vectors.BulkLoad`) reserves each later message the same way, from its
+/// header, as tonic reads on ([`Metered`]); its handler takes the reservations in order.
 pub(crate) async fn prepay(
     State(shared): State<Arc<Shared>>,
     req: HttpRequest,
@@ -81,16 +83,134 @@ pub(crate) async fn prepay(
         }
         Err(e) => return status(e),
     };
-    let mut req = HttpRequest::from_parts(
-        parts,
-        Body::from_stream(Rest {
-            head: Some(Bytes::from(head)),
-            rest: data,
-        }),
-    );
+    let rest = Rest {
+        head: Some(Bytes::from(head)),
+        rest: data,
+    };
+    let meter = Meter::default();
+    let body = if parts.uri.path() == BULK_LOAD {
+        Body::from_stream(Metered {
+            inner: rest,
+            meter: meter.clone(),
+            shared: Arc::clone(&shared),
+            wait,
+            left: 5 + length,
+            head: Vec::new(),
+            held: Bytes::new(),
+            reserving: None,
+        })
+    } else {
+        Body::from_stream(rest)
+    };
+    let mut req = HttpRequest::from_parts(parts, body);
     req.extensions_mut()
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
+    req.extensions_mut().insert(meter);
     next.run(req).await
+}
+
+/// The client stream whose messages are each reserved as they arrive.
+const BULK_LOAD: &str = "/pigeonhole.v1.Vectors/BulkLoad";
+
+/// The reservations [`Metered`] made for a stream's later messages, in order, for its
+/// handler to take one per message; or the reservation that failed.
+#[derive(Clone, Default)]
+struct Meter(
+    Arc<
+        Mutex<(
+            std::collections::VecDeque<OwnedSemaphorePermit>,
+            Option<ApiError>,
+        )>,
+    >,
+);
+
+impl Meter {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        (
+            std::collections::VecDeque<OwnedSemaphorePermit>,
+            Option<ApiError>,
+        ),
+    > {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+type Reserving =
+    Pin<Box<dyn std::future::Future<Output = Result<OwnedSemaphorePermit, ApiError>> + Send>>;
+
+/// A client stream's body after `prepay`: each message after the first has its length
+/// reserved from its 5-byte header before its bytes pass on to tonic (perf287's (A) on 7b2).
+/// The bytes read meanwhile wait here: at most a chunk, as the HTTP/2 window allows.
+struct Metered {
+    inner: Rest,
+    meter: Meter,
+    shared: Arc<Shared>,
+    wait: Duration,
+    /// The current message's bytes, header included, still to pass.
+    left: usize,
+    /// The next message's header, gathered across chunks.
+    head: Vec<u8>,
+    /// Bytes read, not yet passed.
+    held: Bytes,
+    reserving: Option<Reserving>,
+}
+
+impl Stream for Metered {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        loop {
+            if let Some(r) = &mut this.reserving {
+                match r.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(r) => {
+                        this.reserving = None;
+                        match r {
+                            Ok(p) => this.meter.lock().0.push_back(p),
+                            Err(e) => {
+                                this.meter.lock().1 = Some(e);
+                                return Poll::Ready(Some(Err(axum::Error::new(
+                                    "the in-flight budget stayed full",
+                                ))));
+                            }
+                        }
+                    }
+                }
+            }
+            if this.held.is_empty() {
+                match Pin::new(&mut this.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(b))) => this.held = b,
+                    other => return other,
+                }
+                continue;
+            }
+            if this.left > 0 {
+                let out = this.held.split_to(this.left.min(this.held.len()));
+                this.left -= out.len();
+                return Poll::Ready(Some(Ok(out)));
+            }
+            // A message boundary: the next header, then its reservation, then its bytes.
+            let take = (5 - this.head.len()).min(this.held.len());
+            this.head.extend_from_slice(&this.held.split_to(take));
+            if this.head.len() == 5 {
+                let head = std::mem::take(&mut this.head);
+                let length = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+                this.left = length;
+                let bytes = length.min(this.shared.limits.max_request_bytes);
+                let (shared, wait) = (Arc::clone(&this.shared), this.wait);
+                this.reserving = Some(Box::pin(async move {
+                    shared.router.service.reserve_within(bytes, wait).await
+                }));
+                return Poll::Ready(Some(Ok(Bytes::from(head))));
+            }
+        }
+    }
 }
 
 fn status(e: ApiError) -> HttpResponse {
@@ -433,15 +553,10 @@ impl proto::graph_server::Graph for GraphGrpc {
     }
 }
 
-/// `Vectors` over gRPC (D313 ticket 7): `Nearest` and the IVF index; `BulkLoad` follows
-/// (7b2).
+/// `Vectors` over gRPC (D313 ticket 7): `Nearest`, and the IVF index with its client-stream
+/// `BulkLoad`.
 #[derive(Debug, Clone)]
 pub(crate) struct VectorsGrpc(pub(crate) Arc<Shared>);
-
-/// An RPC of the contract this build doesn't serve yet.
-fn not_yet(rpc: &str) -> Status {
-    ApiError::unsupported(format!("{rpc} isn't served by this build yet")).to_status()
-}
 
 #[tonic::async_trait]
 impl proto::vectors_server::Vectors for VectorsGrpc {
@@ -482,9 +597,48 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
 
     async fn bulk_load(
         &self,
-        _req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
+        req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
-        Err(not_yet("Vectors.BulkLoad"))
+        let shared = &self.0;
+        let header = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let caller = shared.caller(header)?;
+        let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+        let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
+        let limits = shared.limits;
+        let deadline = grpc_timeout(req.metadata().as_ref());
+        let wait = deadline.map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+        let started = Instant::now();
+        let mut stream = req.into_inner();
+        let Some(first) = stream.message().await? else {
+            return Err(
+                ApiError::invalid("a BulkLoad's first message names the index").to_status(),
+            );
+        };
+        let (tx, input) = tokio::sync::mpsc::channel(1);
+        let op = ServiceOp::VectorBulkLoad(super::bulk::BulkLoadOp {
+            index: first.index.clone(),
+            expected: first.expected,
+            input,
+            wait,
+        });
+        let rpc = op.index();
+        let pump = super::bulk::pump(tx, (first, first_budget), GrpcSource { stream, meter });
+        let dispatch = shared.router.dispatch(op, &caller, None);
+        tokio::pin!(pump, dispatch);
+        // The loader ends the call; a pump that ends first (the stream did) leaves it to
+        // finish.
+        let reply = tokio::select! {
+            r = &mut dispatch => r,
+            () = &mut pump => dispatch.await,
+        };
+        shared.count(rpc, started, &reply);
+        match reply? {
+            ServiceReply::Empty(r) => Ok(Response::new(r)),
+            _ => Err(unexpected()),
+        }
     }
 
     async fn verify(
@@ -492,6 +646,27 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         req: Request<proto::VectorVerifyRequest>,
     ) -> Result<Response<proto::VectorVerifyResponse>, Status> {
         unary!(&self.0, req, VectorVerify, VectorVerify)
+    }
+}
+
+/// A BulkLoad's later messages, each with the reservation `Metered` made for it.
+struct GrpcSource {
+    stream: tonic::Streaming<proto::VectorBulkLoadRequest>,
+    meter: Meter,
+}
+
+impl super::bulk::Source for GrpcSource {
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(proto::VectorBulkLoadRequest, Option<OwnedSemaphorePermit>)>, ApiError>
+    {
+        match self.stream.message().await {
+            Ok(Some(m)) => Ok(Some((m, self.meter.lock().0.pop_front()))),
+            Ok(None) => Ok(None),
+            Err(status) => Err(self.meter.lock().1.take().unwrap_or_else(|| {
+                ApiError::invalid(format!("the load's stream failed: {}", status.message()))
+            })),
+        }
     }
 }
 

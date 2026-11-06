@@ -72,6 +72,8 @@ pub(crate) enum ServiceOp {
     VectorDelete(proto::VectorDeleteRequest),
     VectorSearch(proto::VectorSearchRequest),
     VectorVerify(proto::VectorVerifyRequest),
+    /// A client stream: its first message's index and count, and its messages after.
+    VectorBulkLoad(super::bulk::BulkLoadOp),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -189,6 +191,7 @@ impl ServiceOp {
             Self::VectorDelete(_) => 31,
             Self::VectorSearch(_) => 32,
             Self::VectorVerify(_) => 33,
+            Self::VectorBulkLoad(_) => 34,
         }
     }
 
@@ -222,7 +225,10 @@ impl ServiceOp {
             | Self::VectorSearch(_)
             | Self::VectorVerify(_) => Scope::Read,
             // An index is a table: creating one is a write, as `Schema.CreateTable` is.
-            Self::CreateIndex(_) | Self::VectorInsert(_) | Self::VectorDelete(_) => Scope::Write,
+            Self::CreateIndex(_)
+            | Self::VectorInsert(_)
+            | Self::VectorDelete(_)
+            | Self::VectorBulkLoad(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
             Self::Flush(_) | Self::Compact(_) | Self::Backup(_) | Self::BackupDownload(_) => {
                 Scope::Admin
@@ -271,6 +277,8 @@ impl ServiceOp {
             Self::VectorDelete(r) => r.encoded_len(),
             Self::VectorSearch(r) => r.encoded_len(),
             Self::VectorVerify(r) => r.encoded_len(),
+            // The messages hold their own budget, each until the loader takes it.
+            Self::VectorBulkLoad(op) => op.index.len() + 16,
         }
     }
 }
@@ -285,7 +293,7 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
-pub(crate) const RPCS: [&str; 34] = [
+pub(crate) const RPCS: [&str; 35] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -320,6 +328,7 @@ pub(crate) const RPCS: [&str; 34] = [
     "Vectors.Delete",
     "Vectors.Search",
     "Vectors.Verify",
+    "Vectors.BulkLoad",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -519,6 +528,20 @@ pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sess
     );
 }
 
+/// `Vectors.BulkLoad`'s gauges (perf287's B3 on 7b2): the running load's phase, and the
+/// vectors and message bytes handed to it, an upper bound on what it holds.
+fn render_bulk(out: &mut String, g: &super::bulk::Gauges) {
+    use std::fmt::Write as _;
+    for (name, v) in [
+        ("pigeonhole_serve_bulk_load_phase", &g.phase),
+        ("pigeonhole_serve_bulk_load_vectors", &g.vectors),
+        ("pigeonhole_serve_bulk_load_bytes", &g.bytes),
+    ] {
+        let _ = writeln!(out, "# TYPE {name} gauge");
+        let _ = writeln!(out, "{name} {}", v.load(Ordering::Relaxed));
+    }
+}
+
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
 pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
     use std::fmt::Write as _;
@@ -585,6 +608,8 @@ pub(crate) struct Service {
     backups: Arc<super::backup::Backups>,
     /// The vector indexes open, and their rebalancing threads.
     pub(crate) indexes: Arc<super::indexes::Indexes>,
+    /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
+    pub(crate) bulk: super::bulk::BulkLoads,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     schema: tokio::sync::Mutex<()>,
@@ -621,7 +646,8 @@ impl Service {
             sessions: super::sessions::Sessions::new(limits.leases),
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
-            indexes: Arc::new(super::indexes::Indexes::new(db.clone())),
+            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None)),
+            bulk: super::bulk::BulkLoads::default(),
             schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
@@ -651,6 +677,17 @@ impl Service {
     ) -> Result<Self, String> {
         self.backups = super::backup::Backups::new(dir, max_backups)?;
         Ok(self)
+    }
+
+    /// Runs the threads the server starts for vector indexes (rebalancers, bulk loads) on
+    /// `placement`'s CPUs, off the shards' (perf287's B2 on 7b2): they run k-means.
+    pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
+        self.indexes = Arc::new(super::indexes::Indexes::new(
+            self.db.clone(),
+            Some(Arc::clone(placement)),
+        ));
+        self.bulk.placement = Some(Arc::clone(placement));
+        self
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -879,6 +916,14 @@ impl Service {
                     .map(ServiceReply::VectorVerify)
                     .map_err(ApiError::for_read)
             }
+            ServiceOp::VectorBulkLoad(op) => {
+                drop(budget);
+                let index = self.index(&op.index).await?;
+                self.bulk
+                    .run(index, op)
+                    .await
+                    .map(|()| ServiceReply::Empty(proto::Empty {}))
+            }
             ServiceOp::Subscribe(r) => self
                 .subscribe(r, caller, budget)
                 .await
@@ -982,6 +1027,7 @@ impl Service {
         let mut text = self.metrics.render(&self.db);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
+        render_bulk(&mut text, &self.bulk.gauges);
         text
     }
 
