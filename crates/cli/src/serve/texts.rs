@@ -8,7 +8,9 @@
 //!   (`Query::text`, and a phrase's text as `Query::quoted_phrase`, the syntax's `"..."~N`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 use pigeonhole::Pigeonhole;
 use pigeonhole_text::{Fuzziness, Index, IndexOptions, Normalization, Query, Source};
@@ -20,6 +22,10 @@ use super::proto;
 pub(crate) struct Texts {
     db: Pigeonhole,
     open: Mutex<HashMap<String, Arc<Index>>>,
+    /// The running (or last) `Text.Rebuild`'s thread, for `close` to wait for.
+    rebuild: Mutex<Option<JoinHandle<()>>>,
+    /// Set by `close` under `rebuild`'s lock: no rebuild starts after it.
+    closed: AtomicBool,
 }
 
 impl Texts {
@@ -27,6 +33,47 @@ impl Texts {
         Self {
             db,
             open: Mutex::new(HashMap::new()),
+            rebuild: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Runs `rebuild` on a thread of its own (`phdb-serve-text-rebuild`), which `close`
+    /// waits for: a shutdown never closes the database under a rebuild (ai1249's S1 on
+    /// #1587). `Closed` once the server is closing.
+    pub(crate) fn spawn_rebuild(
+        &self,
+        rebuild: impl FnOnce() + Send + 'static,
+    ) -> Result<(), ApiError> {
+        let mut thread = self.rebuild.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ApiError::from_code(
+                pigeonhole::ErrorCode::Closed,
+                "the server is shutting down",
+            ));
+        }
+        // The last rebuild's thread is done: the caller holds the one rebuild slot, which
+        // that thread released last.
+        *thread = Some(
+            std::thread::Builder::new()
+                .name("phdb-serve-text-rebuild".into())
+                .spawn(rebuild)
+                .map_err(|e| ApiError::internal(format!("a rebuild thread: {e}")))?,
+        );
+        Ok(())
+    }
+
+    /// Refuses new rebuilds and waits for a running one to finish: called at shutdown,
+    /// before the database closes. A rebuild can't be interrupted, so a large one can hold
+    /// the shutdown past its grace period.
+    pub(crate) fn close(&self) {
+        let thread = {
+            let mut thread = self.rebuild.lock().unwrap_or_else(PoisonError::into_inner);
+            self.closed.store(true, Ordering::Release);
+            thread.take()
+        };
+        if let Some(t) = thread {
+            let _ = t.join();
         }
     }
 

@@ -5072,7 +5072,8 @@ pub struct TextHit {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextMatch {
-    /// The query clause it matched, by index.
+    /// The query clause it matched, by index: the request's `clauses` (a repeated clause is
+    /// refused), or with `syntax`, the parsed query's clauses, a repeat counted once.
     #[prost(uint32, tag = "1")]
     pub clause: u32,
     #[prost(uint32, tag = "2")]

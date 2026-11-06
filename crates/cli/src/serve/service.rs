@@ -643,8 +643,8 @@ pub(crate) struct Service {
     pub(crate) indexes: Arc<super::indexes::Indexes>,
     /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
     pub(crate) bulk: super::bulk::BulkLoads,
-    /// The text indexes open.
-    texts: Arc<super::texts::Texts>,
+    /// The text indexes open, and the running rebuild.
+    pub(crate) texts: Arc<super::texts::Texts>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
     text_rebuilds: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
@@ -1658,18 +1658,15 @@ impl Service {
         };
         let placement = self.bulk.placement.clone();
         let (tx, rx) = oneshot::channel();
-        std::thread::Builder::new()
-            .name("phdb-serve-text-rebuild".into())
-            .spawn(move || {
-                if let Some(p) = placement {
-                    p.enter();
-                }
-                let r = index.rebuild();
-                drop(index);
-                drop(slot);
-                let _ = tx.send(r);
-            })
-            .map_err(|e| ApiError::internal(format!("a rebuild thread: {e}")))?;
+        self.texts.spawn_rebuild(move || {
+            if let Some(p) = placement {
+                p.enter();
+            }
+            let r = index.rebuild();
+            drop(index);
+            drop(slot);
+            let _ = tx.send(r);
+        })?;
         let stats = rx
             .await
             .map_err(|_| ApiError::internal("the rebuild's thread ended early"))??;

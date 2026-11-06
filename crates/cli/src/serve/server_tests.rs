@@ -177,6 +177,7 @@ impl Drop for Server {
             rt.shutdown_timeout(Duration::from_secs(5));
         }
         self.shared.router.service.bulk.close();
+        self.shared.router.service.texts.close();
         let _ = self.shared.router.service.db.clone().close();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -2480,6 +2481,11 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     assert_eq!(status, 200, "{r}");
     assert_eq!(r["documents"], json!("2"), "{r}");
     assert!(r.get("changed").is_none_or(|c| c == "0"), "{r}");
+    // Shutdown's close waits for a rebuild, and refuses one after it (ai1249's S1).
+    let texts = &s.shared.router.service.texts;
+    texts.close();
+    let (_, e) = s.rpc("Text/Rebuild", &json!({"index": "tx"}), None);
+    assert_eq!(e["code"].as_str(), Some("Closed"), "{e}");
     // Over gRPC.
     let hits = s.block_on(async {
         let channel = tonic::transport::Channel::from_shared(s.url.clone())
