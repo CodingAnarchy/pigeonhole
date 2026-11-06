@@ -164,6 +164,14 @@ impl Indexes {
         Ok(index)
     }
 
+    /// Drops every handle, so the next call opens its index again: the catalog changed under
+    /// the server (a replica applied a primary's change, or swapped in a new copy, #1436).
+    /// A rebalancer sees its index close at its next look and ends; a handle a call still
+    /// holds keeps its index open until the call ends.
+    pub(crate) fn forget(&self) {
+        self.handles().clear();
+    }
+
     /// Drops every handle and waits for the rebalancing threads to end: each sees its index
     /// close at its next look (at most one split or merge later). The server's shutdown calls
     /// this before it closes the database. A handle a call still holds keeps its index open

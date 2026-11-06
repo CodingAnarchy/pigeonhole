@@ -59,7 +59,11 @@ fn ready(feed: &mut Feed) -> Vec<ReplicatedEvent> {
         .unwrap()
         .is_some()
     {
-        out.push(feed.replicated().expect("an event was delivered"));
+        // Through the wire encoding a replica in another process reads (#1436).
+        let event = feed.replicated().expect("an event was delivered");
+        let decoded = ReplicatedEvent::decode(&event.encode()).unwrap();
+        assert_eq!(decoded, event);
+        out.push(decoded);
     }
     out
 }
@@ -531,6 +535,57 @@ fn a_promoted_replica_takes_writes_and_refuses_applies() {
         .put("a", b"q", b"v")
         .commit()
         .unwrap();
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// `replace_with` (#1436: a replica's re-bootstrap): a handle's file is swapped for a fresh
+/// copy under its locks. Every clone then reads the copy, the old copy's WAL is gone, and a
+/// second process's writer is refused before and after.
+#[test]
+fn replace_with_swaps_a_handle_s_file_for_a_copy_under_its_locks() {
+    let vfs = SimVfs::new(43);
+    let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+    for step in 0..6 {
+        workload(&primary, step);
+    }
+    let replica = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+    replica
+        .table("old")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let clone = replica.clone();
+    let other = || {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(pigeonhole_io::ProcessId {
+                pid: 99,
+                start_time: 1,
+            });
+            Pigeonhole::open("/r/data.phdb", options(&vfs))
+                .err()
+                .map(|e| e.code())
+        })
+        .join()
+        .unwrap()
+    };
+    assert_eq!(other(), Some(ErrorCode::WriterLocked));
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/r/side.phdb").unwrap();
+    drop(snap);
+    replica.replace_with("/r/side.phdb").unwrap();
+    assert_eq!(
+        contents(&clone),
+        contents(&primary),
+        "every clone reads the copy"
+    );
+    assert!(
+        replica.table("old").unwrap().open().is_err(),
+        "the old file is gone"
+    );
+    assert_eq!(other(), Some(ErrorCode::WriterLocked));
     replica.close().unwrap();
     primary.close().unwrap();
 }

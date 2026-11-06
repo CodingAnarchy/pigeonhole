@@ -4005,6 +4005,31 @@ pub struct Handover {
     path: PathBuf,
 }
 
+impl Handover {
+    /// The locks of the file at `side`, for an [`Engine::open_with`] of `target` once `side`
+    /// has been renamed over it (#1436: a replica's re-bootstrap, simp724's sequence). Opens
+    /// `side` and takes its writer byte and presence on that handle, so the inode that becomes
+    /// `target` is locked from before the rename until the new engine holds it; a second
+    /// writer is refused throughout. Fails with `WriterLocked` if another holds `side`.
+    pub fn adopt(vfs: &VfsRef, side: &Path, target: &Path, allow_fuse: bool) -> Result<Handover> {
+        let mut open_opts = OpenOptions::read();
+        open_opts.write = true;
+        let file = vfs.open(side, open_opts)?;
+        check_local(&file, allow_fuse)?;
+        let writer = WriterLock::acquire(&file)?;
+        let presence = Presence::acquire(&file)?;
+        Ok(Handover {
+            locks: Some(Box::new(Locks {
+                _writer: writer,
+                presence: Some(presence),
+                shared: false,
+                file,
+            })),
+            path: target.to_path_buf(),
+        })
+    }
+}
+
 /// Closes as [`Engine::close`] does (an application-owned engine's drop cannot wait). It
 /// can block on a device that never answers, as `close` does (#824).
 impl Drop for Engine {

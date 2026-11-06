@@ -339,6 +339,20 @@ impl Feeds {
         }
     }
 
+    /// Fails every hub: the database under them was replaced (#1436's re-bootstrap). Their
+    /// clients go on from their own tokens on their own streams, and the engine decides
+    /// each (a token of the replaced copy is another database's); new subscribers open new
+    /// hubs.
+    pub(crate) fn fail_all(&self) {
+        let mut hubs = self.hubs.lock().unwrap_or_else(PoisonError::into_inner);
+        let live: Vec<Arc<Hub>> = hubs.drain().filter_map(|(_, w)| w.upgrade()).collect();
+        drop(hubs);
+        for hub in live {
+            hub.task.abort();
+            hub.fail();
+        }
+    }
+
     /// The hub for `tables`, opened if none is live. A failed hub is replaced (feed1248's
     /// R1, simp724's F2 on #1518): its clients are on their own streams, and rejoin the new
     /// one; a new subscriber must not start from the failed one's last position.

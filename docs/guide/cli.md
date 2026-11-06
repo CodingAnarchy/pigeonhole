@@ -19,6 +19,7 @@
 | `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
 | `phdb mcp <file> [--read-only] [--create] [--memory NAME]` | A Model Context Protocol server on standard input and output, for AI agents, with optional [agent memory tools](ai-agents.md#the-memory-tools): see [Using Pigeonhole from AI agents](ai-agents.md). New in 1.1.0. |
 | `phdb serve <file> [--listen ADDR:PORT] [--tls-cert PEM --tls-key PEM] [--token-file FILE]` | Serve the database over gRPC and HTTP/JSON on one port (ICR 0112): see [`phdb serve`](#phdb-serve). Only in a build with the `serve` feature (`cargo install pigeonhole-cli --features serve`). New in 1.2.0, in progress. |
+| `phdb promote <file>` | Turn a stopped replica's database (`phdb serve --replica-of`) into a primary that takes writes: see [Replicas](#replicas). Only with the `serve` feature. New in 1.2.0. |
 
 **Global flags,** before or after the command:
 
@@ -363,7 +364,7 @@ u1   profile  name       1761030000000000  Ada
 - **Admin:**
   - `Admin.Health` needs no token;
   - `Info` (path, sizes, tables, version) and `Metrics` (the `/metrics` text) need read scope;
-  - `Flush`, `Compact`, `Backup` and `BackupDownload` need admin scope.
+  - `Flush`, `Compact`, `Backup`, `BackupDownload` and `Promote` need admin scope, as does `Replication.Follow` (gRPC only), which replicas use.
 - **Backups** need `--backup-dir`; without it they're off.
   - `Admin.Backup` writes a consistent backup inside it, at a path relative to it that doesn't exist yet and doesn't lead out of it through a link.
   - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
@@ -406,7 +407,36 @@ u1   profile  name       1761030000000000  Ada
   - A write the server has submitted always answers its real outcome.
 - **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts.
 - **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (a scan's runs to the end of its stream), open sessions by kind, the oldest open session's age, the feed's shared subscriptions, their memory, and the streams that fell behind or are catching up, and a running bulk load's phase, vectors and bytes.
-- **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown. A read may be retried; one that failed on `Io` says so (`retry_from: REQUEST`). `MergeFailed` doesn't: a merge operator that fails on stored data fails the same way again.
+- **Errors** carry ICR 0112's stable code: a gRPC status detail, or the HTTP JSON body (`{"code": "TableNotFound", ...}`). Retry a write only when the error says `retry_safe`. A bare transport error means its outcome is unknown. A read may be retried; one that failed on `Io` says so (`retry_from: REQUEST`). `MergeFailed` doesn't: a merge operator that fails on stored data fails the same way again. `FailedPrecondition` (409, not applied, don't retry) means the server's role refuses the call: `Admin.Promote` on a server that isn't a replica, or a replica asked for a bootstrap copy or to be followed (see [Replicas](#replicas)).
+
+#### Replicas
+A replica server serves reads of a copy that follows a primary server's commits (#1436). Use one to move reads off the primary, to keep a warm copy on another machine, or to take backups there.
+
+```sh
+# The primary: the change feed on (retention is how far a replica may fall behind), and
+# a backup directory (a replica's first copy is a backup download).
+phdb serve primary.phdb --listen 0.0.0.0:7448 --tls-cert cert.pem --tls-key key.pem \
+  --token-file tokens --backup-dir /var/lib/phdb/backups --change-feed 4294967296
+
+# The replica, on another machine: an admin token of the primary's in a file of its own.
+phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls-key key.pem \
+  --token-file tokens --replica-of https://primary.example:7448 --replica-token-file primary-token
+```
+
+- **Setup.** `--replica-of` takes the primary's URL (`http://` or `https://`, checked against the system's roots). The replica sends the token from `--replica-token-file` (or `PHDB_REPLICA_TOKEN`), which needs admin scope on the primary. The primary needs `--backup-dir`, and its change feed on (`--change-feed`, or a database whose feed is already on).
+- **Bootstrap.** A new replica downloads a copy of the primary at one durable snapshot (`Admin.BackupDownload` with `replica`), checks its SHA-256, and swaps it in for its own file. It then follows the primary from exactly that snapshot (`Replication.Follow`). The download resumes if the connection breaks. A restarted replica doesn't download again: it goes on from the last commit it applied.
+- **What it serves.** Every read, snapshot and feed of its own works as on the primary, and so do IVF index searches and `Vectors.Verify` on the indexes the primary made. Writes, schema changes and index writes (`Vectors.CreateIndex`, `Insert`, `Delete`) fail with `ReadOnly` (HTTP 409, gRPC `FAILED_PRECONDITION`), and the message names the primary to send them to. `Flush` and `Compact` are local maintenance and work.
+- **The consistency model:**
+  - **A consistent prefix.** A replica holds the primary's commits up to some point, in the primary's order, and never part of one: a read, a pinned snapshot or a feed on the replica sees the primary as it was after some commit.
+  - **Durable commits only.** A replica receives a commit once it is durable on the primary, so it never holds a commit the primary could lose to a crash. With `Buffered` writes on the primary, commits arrive after the primary's next sync.
+  - **Monotonic reads** on one replica: they go forward in time. Across replicas, or between the primary and a replica, they don't, and a client that wrote to the primary may not see its write on a replica yet.
+  - **The primary's timestamps and ids,** so cells read the same on both. Local seqnos (`CommitInfo.seqno`, feed tokens) are the replica's own.
+  - **Schema changes arrive in commit order:** a table created after a commit appears on the replica after it.
+- **Lag.** `Admin.Info`'s `replica` section reports the replica's `state` (`bootstrapping`, `following`, `re-bootstrapping`, or `retrying` with `last_error`), the primary's seqno it applied through, the primary's latest, `lag_commits` (the difference, counting commits waiting for the primary's next sync) and `lag_ms` (how long since it was last caught up, 0 when it is). `/metrics` has the same as `pigeonhole_replica_following`, `pigeonhole_replica_applied_primary_seqno`, `pigeonhole_replica_lag_commits` and `pigeonhole_replica_lag_seconds`.
+- **Throughput.** A replica applies the primary's commits in runs, one commit of its own per run: at most `--replica-run` (256) primary commits, or 8 MiB. A caught-up replica applies each arrival at once. One that is behind fills runs, so it catches up faster than the primary wrote.
+- **Retention, and falling behind.** The primary doesn't track its replicas: its feed retention (`--change-feed`) decides how long a replica may be down or behind. Size it to the write rate times the longest replica outage you want to ride out; the primary's `/metrics` reports the feed's retained bytes. A replica that falls off the end, or whose primary's URL now serves another database, bootstraps again: it downloads a new copy while serving its old one (stale, with `lag_ms` growing), then swaps it in. Requests during the swap get `Unavailable` (retry them), and transactions, pinned snapshots and feed streams open on the old copy end.
+- **Promotion.** `Admin.Promote` (admin scope) on a running replica, or `phdb promote <file>` on a stopped one's file, makes it a primary at the last commit it applied: it stops following and takes writes, and its own feed tokens stay valid. It returns the primary's token it stopped at. **Nothing fences the old primary:** stop it (or its writers) before promoting, or the two diverge. A promoted database can't follow again, and `phdb serve --replica-of` refuses to start on it (or on any database with tables that isn't a replica's) rather than replace it; start a new replica from it instead.
+- **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Exit status
 

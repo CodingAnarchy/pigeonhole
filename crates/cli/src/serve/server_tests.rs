@@ -22,6 +22,24 @@ struct Server {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     runtime: Option<tokio::runtime::Runtime>,
     dir: PathBuf,
+    /// Leave the directory behind when dropped (a replica restarted on it).
+    keep_dir: bool,
+}
+
+/// A fresh directory for a server's files, with its `backups`.
+fn test_dir() -> PathBuf {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "phdb-serve-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(dir.join("backups")).unwrap();
+    dir
 }
 
 fn limits() -> Limits {
@@ -67,17 +85,7 @@ impl Server {
         shards: usize,
         f: impl FnOnce(Service) -> Service,
     ) -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "phdb-serve-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        let dir = test_dir();
         let db = Pigeonhole::open(
             dir.join("t.phdb"),
             Options::default()
@@ -92,11 +100,43 @@ impl Server {
             .family("n", Family::counter())
             .create()
             .unwrap();
+        Self::serve(dir, db, tokens, limits, None, f)
+    }
+
+    /// A replica server (#1436) of the server at `primary`, on `dir`'s `t.phdb` (an empty
+    /// database if there is none), sending `token` to the primary.
+    fn start_replica(dir: PathBuf, primary: &str, token: Option<&str>) -> Self {
+        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        let db = Pigeonhole::open(
+            dir.join("t.phdb"),
+            Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let replica = super::replica::Replica::new(super::replica::ReplicaConfig {
+            primary: primary.to_owned(),
+            token: token.map(str::to_owned),
+            run_events: 4,
+        });
+        Self::serve(dir, db, "", limits(), Some(replica), |s| s)
+    }
+
+    fn serve(
+        dir: PathBuf,
+        db: Pigeonhole,
+        tokens: &str,
+        limits: Limits,
+        replica: Option<Arc<super::replica::Replica>>,
+        f: impl FnOnce(Service) -> Service,
+    ) -> Self {
         let metrics = Arc::new(Metrics::default());
+        let mut service = f(Service::new(db, limits, 2, Arc::clone(&metrics))
+            .backups(Some(&dir.join("backups")), 1)
+            .unwrap());
+        if let Some(r) = &replica {
+            service = service.replica(Arc::clone(r));
+        }
         let shared = Arc::new(Shared {
-            router: Router::single(f(Service::new(db, limits, 2, Arc::clone(&metrics))
-                .backups(Some(&dir.join("backups")), 1)
-                .unwrap())),
+            router: Router::single(service),
             tokens: Tokens::parse(tokens, "test").unwrap(),
             limits,
             metrics,
@@ -121,12 +161,17 @@ impl Server {
             },
             Duration::from_secs(2),
         ));
+        if let Some(r) = &replica {
+            let _guard = runtime.enter();
+            r.spawn(Arc::clone(&shared));
+        }
         Self {
             url,
             shared,
             stop: Some(stop),
             runtime: Some(runtime),
             dir,
+            keep_dir: false,
         }
     }
 
@@ -174,11 +219,16 @@ impl Drop for Server {
             let _ = s.send(());
         }
         if let Some(rt) = self.runtime.take() {
+            if let Some(r) = &self.shared.router.service.replica {
+                rt.block_on(r.stop());
+            }
             rt.shutdown_timeout(Duration::from_secs(5));
         }
         self.shared.router.service.bulk.close();
         let _ = self.shared.router.service.db.clone().close();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -3444,4 +3494,312 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
             );
         }
     }
+}
+
+// ---- Replication (#1436) ----
+
+/// Waits until the replica's `Admin.Info` replica section passes `ok`, and returns it.
+fn wait_replica(r: &Server, what: &str, ok: impl Fn(&Json) -> bool) -> Json {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, info) = r.rpc("Admin/Info", &json!({}), None);
+        assert_eq!(status, 200, "{info}");
+        if ok(&info["replica"]) {
+            return info["replica"].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never got {what}: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The replica has applied everything the primary has.
+fn caught_up(primary: &Server, token: Option<&str>) -> impl Fn(&Json) -> bool {
+    let (_, info) = primary.rpc("Admin/Info", &json!({}), token);
+    assert!(
+        info.get("replica").is_none(),
+        "a primary has no replica section: {info}"
+    );
+    let seqno = primary.shared.router.service.db.visible_seqno();
+    move |r: &Json| {
+        r["state"] == "following"
+            && r["applied_primary_seqno"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|a| a >= seqno)
+            && r.get("lag_ms").is_none()
+    }
+}
+
+fn get_value(s: &Server, table: &str, row: &str, token: Option<&str>) -> Json {
+    let (status, body) = s.post(
+        "Get",
+        &json!({"table": table, "row": b64(row.as_bytes()), "family": "f", "qualifier": b64(b"q")}),
+        token,
+    );
+    assert_eq!(status, 200, "{body}");
+    body["cell"]["value"].clone()
+}
+
+#[test]
+fn a_replica_bootstraps_follows_and_refuses_writes() {
+    let p = Server::start("admin s3cret", limits());
+    let tok = Some("s3cret");
+    for i in 0..20 {
+        let value = json!({"bytes": b64(format!("v{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), tok)
+                .0,
+            200
+        );
+    }
+    let r = Server::start_replica(test_dir(), &p.url, Some("s3cret"));
+    wait_replica(&r, "caught up after its bootstrap", caught_up(&p, tok));
+    assert_eq!(get_value(&r, "t", "r7", None), b64(b"v7"));
+
+    // Commits after the bootstrap follow, a new table and its writes in commit order.
+    for i in 20..40 {
+        let value = json!({"bytes": b64(format!("v{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), tok)
+                .0,
+            200
+        );
+    }
+    let (status, body) = p.rpc(
+        "Schema/CreateTable",
+        &json!({"name": "u", "families": [{"name": "f"}]}),
+        tok,
+    );
+    assert_eq!(status, 200, "{body}");
+    let mut w = put("x", "f", "q", json!({"bytes": b64(b"in u")}));
+    w["writes"]["row"]["table"] = json!("u");
+    assert_eq!(p.post("Mutate", &w, tok).0, 200);
+    // The primary's durable feed: a sync makes them durable at once.
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), tok).0, 200);
+    let info = wait_replica(&r, "the later commits", caught_up(&p, tok));
+    assert_eq!(info["primary"], p.url);
+    assert_eq!(get_value(&r, "t", "r39", None), b64(b"v39"));
+    assert_eq!(get_value(&r, "u", "x", None), b64(b"in u"));
+    // A table dropped and made again on the primary: the replica's reads (whose handle for
+    // the name was cached) see the new one.
+    assert_eq!(p.rpc("Schema/DropTable", &json!({"name": "u"}), tok).0, 200);
+    let (status, body) = p.rpc(
+        "Schema/CreateTable",
+        &json!({"name": "u", "families": [{"name": "f"}]}),
+        tok,
+    );
+    assert_eq!(status, 200, "{body}");
+    let mut w = put("x2", "f", "q", json!({"bytes": b64(b"in the new u")}));
+    w["writes"]["row"]["table"] = json!("u");
+    assert_eq!(p.post("Mutate", &w, tok).0, 200);
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), tok).0, 200);
+    wait_replica(&r, "the new table", caught_up(&p, tok));
+    assert_eq!(get_value(&r, "u", "x2", None), b64(b"in the new u"));
+    assert_eq!(get_value(&r, "u", "x", None), Json::Null);
+
+    // Writes and schema changes are refused, naming the primary.
+    let (status, body) = r.post(
+        "Mutate",
+        &put("y", "f", "q", json!({"bytes": b64(b"no")})),
+        None,
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("ReadOnly")),
+        "{body}"
+    );
+    assert!(body["message"].as_str().unwrap().contains(&p.url), "{body}");
+    let (status, body) = r.rpc("Schema/DropTable", &json!({"name": "u"}), None);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("ReadOnly")),
+        "{body}"
+    );
+    // A transaction's Commit with writes reaches the engine's gate, and says the same.
+    let id = begin(&r, None);
+    let (status, body) = r.rpc(
+        "Transactions/Commit",
+        &json!({"txn_id": id, "rows": txn_rows("z", b"no")}),
+        None,
+    );
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("replica"),
+        "{body}"
+    );
+
+    // The lag gauges.
+    let (_, m) = r.rpc("Admin/Metrics", &json!({}), None);
+    let text = m["text"].as_str().unwrap();
+    assert!(text.contains("pigeonhole_replica_following 1"), "{text}");
+    assert!(text.contains("pigeonhole_replica_lag_commits"), "{text}");
+
+    // A replica is no bootstrap source and can't be followed (no cascades).
+    let (status, body) = r.rpc("Admin/BackupDownload", &json!({"replica": true}), None);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{body}"
+    );
+}
+
+#[test]
+fn a_restarted_replica_resumes_and_a_new_primary_bootstraps_it_again() {
+    let p = Server::start("", limits());
+    for i in 0..10 {
+        let value = json!({"bytes": b64(format!("a{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), None)
+                .0,
+            200
+        );
+    }
+    let dir = test_dir();
+    let mut r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    r.keep_dir = true;
+    drop(r);
+
+    // Restarted, it resumes from its stored token: no second bootstrap, and what the primary
+    // wrote meanwhile arrives.
+    for i in 10..20 {
+        let value = json!({"bytes": b64(format!("a{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), None)
+                .0,
+            200
+        );
+    }
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    let downloads = || std::fs::read_dir(p.dir.join("backups")).map_or(0, |d| d.count());
+    let before = downloads();
+    let mut r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up after its restart", caught_up(&p, None));
+    assert_eq!(get_value(&r, "t", "r15", None), b64(b"a15"));
+    assert_eq!(downloads(), before, "a restart takes no bootstrap copy");
+    r.keep_dir = true;
+    drop(r);
+
+    // Another database at a URL: the replica's token is another database's, so it
+    // bootstraps again from the new one rather than apply its history.
+    let q = Server::start("", limits());
+    let value = json!({"bytes": b64(b"from q")});
+    assert_eq!(q.post("Mutate", &put("q1", "f", "q", value), None).0, 200);
+    let r = Server::start_replica(dir, &q.url, None);
+    wait_replica(&r, "caught up with the new primary", caught_up(&q, None));
+    assert_eq!(get_value(&r, "t", "q1", None), b64(b"from q"));
+    assert_eq!(
+        get_value(&r, "t", "r15", None),
+        Json::Null,
+        "the old copy is gone"
+    );
+}
+
+#[test]
+fn promote_makes_a_replica_take_writes() {
+    let p = Server::start("", limits());
+    let value = json!({"bytes": b64(b"v")});
+    assert_eq!(p.post("Mutate", &put("r1", "f", "q", value), None).0, 200);
+    // On a primary, Promote is refused.
+    let (status, body) = p.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{body}"
+    );
+
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["primary_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "{body}"
+    );
+    // A primary now: writes are taken, and Info has no replica section.
+    let value = json!({"bytes": b64(b"mine")});
+    assert_eq!(r.post("Mutate", &put("r2", "f", "q", value), None).0, 200);
+    assert_eq!(get_value(&r, "t", "r2", None), b64(b"mine"));
+    let (_, info) = r.rpc("Admin/Info", &json!({}), None);
+    assert!(info.get("replica").is_none(), "{info}");
+    // It follows no more: the old primary's writes don't arrive.
+    let value = json!({"bytes": b64(b"late")});
+    assert_eq!(p.post("Mutate", &put("r3", "f", "q", value), None).0, 200);
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(get_value(&r, "t", "r3", None), Json::Null);
+    let (status, _) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 409, "promoted once");
+}
+
+/// An IVF index made and written on the primary is searched and verified on a replica, and
+/// the replica refuses its writes like any other (#1436 with #1573's index RPCs).
+#[test]
+fn a_replica_serves_ivf_index_reads_and_refuses_its_writes() {
+    let p = Server::start("", limits());
+    for (name, mode) in [("ix", "REBALANCE_INLINE"), ("bg", "REBALANCE_BACKGROUND")] {
+        let mut spec = index_spec(mode);
+        spec["name"] = json!(name);
+        let (status, e) = p.rpc("Vectors/CreateIndex", &spec, None);
+        assert_eq!(status, 200, "{e}");
+        for (id, y) in [("a", 1.0f32), ("b", 2.0), ("c", 3.0)] {
+            let (status, e) = p.rpc(
+                "Vectors/Insert",
+                &json!({"index": name, "id": b64(id.as_bytes()), "vector": f32_query(&[0.0, y])}),
+                None,
+            );
+            assert_eq!(status, 200, "{id}: {e}");
+        }
+    }
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    for name in ["ix", "bg"] {
+        let q = f32_query(&[0.0, 0.0]);
+        let (status, hits) = r.rpc(
+            "Vectors/Search",
+            &json!({"index": name, "query": q, "k": 2}),
+            None,
+        );
+        assert_eq!(status, 200, "{name}: {hits}");
+        assert_eq!(hit_ids(&hits), [b64(b"a"), b64(b"b")], "{name}");
+        let (status, v) = r.rpc("Vectors/Verify", &json!({"index": name}), None);
+        assert_eq!(status, 200, "{name}: {v}");
+        for (rpc, body) in [
+            (
+                "Vectors/Insert",
+                json!({"index": name, "id": b64(b"z"), "vector": f32_query(&[1.0, 1.0])}),
+            ),
+            ("Vectors/Delete", json!({"index": name, "id": b64(b"a")})),
+        ] {
+            let (status, e) = r.rpc(rpc, &body, None);
+            assert_eq!(
+                (status, e["code"].as_str()),
+                (409, Some("ReadOnly")),
+                "{rpc}: {e}"
+            );
+        }
+    }
+    let (status, e) = r.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None);
+    assert_eq!((status, e["code"].as_str()), (409, Some("ReadOnly")), "{e}");
+    // Writes on the primary after the index was opened on the replica still arrive.
+    let (status, e) = p.rpc(
+        "Vectors/Insert",
+        &json!({"index": "ix", "id": b64(b"n"), "vector": f32_query(&[0.0, 0.5])}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    wait_replica(&r, "the later insert", caught_up(&p, None));
+    let q = f32_query(&[0.0, 0.0]);
+    let (_, hits) = r.rpc(
+        "Vectors/Search",
+        &json!({"index": "ix", "query": q, "k": 1}),
+        None,
+    );
+    assert_eq!(hit_ids(&hits), [b64(b"n")]);
 }
