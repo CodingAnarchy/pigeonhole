@@ -215,6 +215,10 @@ async fn call(
         Ok(c) => c,
         Err(_) => return ApiError::unauthenticated().into_response(),
     };
+    // A client stream: NDJSON, its lines reserved as they arrive.
+    if (service.as_str(), method.as_str()) == ("Vectors", "BulkLoad") {
+        return bulk_load(&shared, &caller, req).await;
+    }
     // The in-flight budget is reserved from `Content-Length` before any of the body is
     // read (perf287's F2 on #1501), so waiting requests hold no bodies. A body without a
     // length (chunked) is refused; no header and no `Transfer-Encoding` is an empty body.
@@ -496,6 +500,140 @@ fn download(d: super::backup::Download) -> Response {
     resp
 }
 
+/// `POST /v1/Vectors/BulkLoad`: an NDJSON body, one `VectorBulkLoadRequest` per line (the
+/// gRPC stream's messages as JSON lines), the first naming the index. With or without
+/// `Content-Length`: each chunk of the body reserves its bytes as it arrives, and a line
+/// holds its share until the loader takes its last vector (perf287's (2) on 7b2).
+async fn bulk_load(shared: &Arc<Shared>, caller: &super::auth::Caller, req: Request) -> Response {
+    let started = Instant::now();
+    let mut src = NdjsonLines {
+        shared: Arc::clone(shared),
+        body: req.into_body().into_data_stream(),
+        buf: Vec::new(),
+        held: None,
+        done: false,
+    };
+    let first = match src.next_line().await {
+        Ok(Some(first)) => first,
+        Ok(None) => {
+            return ApiError::invalid("a BulkLoad's first line names the index").into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    let (tx, input) = tokio::sync::mpsc::channel(1);
+    let op = ServiceOp::VectorBulkLoad(super::bulk::BulkLoadOp {
+        index: first.0.index.clone(),
+        expected: first.0.expected,
+        input,
+        wait: shared.limits.request_timeout,
+    });
+    let rpc = op.index();
+    let pump = super::bulk::pump(tx, first, src);
+    let dispatch = shared.router.dispatch(op, caller, None);
+    tokio::pin!(pump, dispatch);
+    let reply = tokio::select! {
+        r = &mut dispatch => r,
+        () = &mut pump => dispatch.await,
+    };
+    shared.count(rpc, started, &reply);
+    match reply {
+        Ok(ServiceReply::Empty(r)) => json(&r),
+        Ok(_) => ApiError::internal("an unexpected reply").into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// An NDJSON body's lines, each with the budget its bytes reserved. A line longer than
+/// `--max-request-bytes` is refused, so a body without newlines can't grow without bound.
+struct NdjsonLines {
+    shared: Arc<Shared>,
+    body: axum::body::BodyDataStream,
+    /// Bytes read and reserved, not yet a whole line.
+    buf: Vec<u8>,
+    /// `buf`'s reservation: one permit per byte.
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    done: bool,
+}
+
+impl NdjsonLines {
+    async fn next_line(
+        &mut self,
+    ) -> Result<
+        Option<(
+            proto::VectorBulkLoadRequest,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        )>,
+        ApiError,
+    > {
+        let limit = self.shared.limits.max_request_bytes;
+        let too_long = || {
+            ApiError::invalid(format!(
+                "a BulkLoad line is longer than --max-request-bytes ({limit})"
+            ))
+        };
+        loop {
+            let end = self.buf.iter().position(|&b| b == b'\n');
+            let line = match end {
+                Some(i) => Some(i + 1),
+                None if self.done && !self.buf.is_empty() => Some(self.buf.len()),
+                None if self.done => return Ok(None),
+                None => None,
+            };
+            if let Some(n) = line {
+                if n > limit.saturating_add(1) {
+                    return Err(too_long());
+                }
+                let bytes: Vec<u8> = self.buf.drain(..n).collect();
+                let budget = match &mut self.held {
+                    Some(h) if h.num_permits() > n => h.split(n),
+                    _ => self.held.take(),
+                };
+                let text = bytes.trim_ascii();
+                if text.is_empty() {
+                    continue;
+                }
+                let m = serde_json::from_slice(text).map_err(|e| {
+                    ApiError::invalid(format!(
+                        "a BulkLoad line isn't valid JSON for VectorBulkLoadRequest: {e}"
+                    ))
+                })?;
+                return Ok(Some((m, budget)));
+            }
+            if self.buf.len() > limit {
+                return Err(too_long());
+            }
+            let chunk = std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_next(cx)).await;
+            match chunk {
+                Some(Ok(chunk)) if chunk.is_empty() => {}
+                Some(Ok(chunk)) => {
+                    let p = self.shared.router.service.reserve(chunk.len()).await?;
+                    match &mut self.held {
+                        Some(h) => h.merge(p),
+                        None => self.held = Some(p),
+                    }
+                    self.buf.extend_from_slice(&chunk);
+                }
+                Some(Err(_)) => return Err(ApiError::invalid("the request body broke off")),
+                None => self.done = true,
+            }
+        }
+    }
+}
+
+impl super::bulk::Source for NdjsonLines {
+    async fn next(
+        &mut self,
+    ) -> Result<
+        Option<(
+            proto::VectorBulkLoadRequest,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        )>,
+        ApiError,
+    > {
+        self.next_line().await
+    }
+}
+
 /// The body's length from `Content-Length`; 0 with neither it nor `Transfer-Encoding`.
 fn content_length(headers: &HeaderMap) -> Result<usize, ApiError> {
     match headers.get(header::CONTENT_LENGTH) {
@@ -557,12 +695,6 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Vectors", "Delete") => ServiceOp::VectorDelete(parse(body)?),
         ("Vectors", "Search") => ServiceOp::VectorSearch(parse(body)?),
         ("Vectors", "Verify") => ServiceOp::VectorVerify(parse(body)?),
-        // In the contract, not yet served (D313 ticket 7b2): as over gRPC.
-        ("Vectors", "BulkLoad") => {
-            return Err(ApiError::unsupported(
-                "Vectors.BulkLoad isn't served by this build yet",
-            ));
-        }
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

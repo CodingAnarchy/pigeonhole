@@ -20,6 +20,7 @@ use crate::exit::Failure;
 
 mod auth;
 mod backup;
+mod bulk;
 mod config;
 mod convert;
 mod errors;
@@ -195,7 +196,8 @@ pub(crate) fn run(
                 Arc::clone(&metrics),
             )
             .backups(args.backup_dir.as_deref(), args.max_backups)
-            .map_err(|e| Failure::usage(&e))?,
+            .map_err(|e| Failure::usage(&e))?
+            .placement(&placement),
         ),
         tokens,
         limits,
@@ -230,11 +232,21 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
-        listener::serve(listener, tls, http::router(Arc::clone(&shared)), shutdown_signal(), Duration::from_millis(args.shutdown_grace_ms)).await;
+        // At the signal, a running bulk load stops at its next message: it takes no more of
+        // its stream, then writes and rebalances what it took (the coordinator on #1580).
+        let stopping = Arc::clone(&shared);
+        let signal = async move {
+            shutdown_signal().await;
+            stopping.router.service.bulk.stop();
+        };
+        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms)).await;
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
-    // The vector indexes' rebalancing threads end before the database closes.
+    // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
+    // database closes. The front-ends are gone, so a load's input has ended: it writes what
+    // came, and rebalances inline if its index does.
+    shared.router.service.bulk.close();
     shared.router.service.indexes.close();
     let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
     let closed = db.close().map_err(|e| Failure::db("close", &e));
