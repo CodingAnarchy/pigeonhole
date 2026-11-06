@@ -572,10 +572,69 @@ fn replace_with_swaps_a_handle_s_file_for_a_copy_under_its_locks() {
         .unwrap()
     };
     assert_eq!(other(), Some(ErrorCode::WriterLocked));
+    // A side copy whose last writer (another process) didn't close it is refused: its WAL,
+    // named after the side path, wouldn't be replayed after the rename (simp724's A1).
     let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/r/crashed.phdb").unwrap();
+    let crashed = pigeonhole_io::ProcessId {
+        pid: 77,
+        start_time: 1,
+    };
+    {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(crashed);
+            let copy = Pigeonhole::open("/r/crashed.phdb", options(&vfs)).unwrap();
+            copy.table("only_in_wal")
+                .unwrap()
+                .family("f", Family::default())
+                .create()
+                .unwrap();
+            std::mem::forget(copy);
+        })
+        .join()
+        .unwrap();
+    }
+    vfs.crash_process(crashed);
+    let refused = replica.replace_with("/r/crashed.phdb").unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    assert!(
+        replica.table("old").unwrap().open().is_ok(),
+        "a refused replace leaves the database as it was"
+    );
+
+    // The bootstrap's way: the copy opened under its own name (its WAL named after it),
+    // changed, closed cleanly, then swapped in. Its WAL goes with the replace.
     primary.backup_at(&snap, "/r/side.phdb").unwrap();
     drop(snap);
+    let side = Pigeonhole::open("/r/side.phdb", options(&vfs)).unwrap();
+    side.table("in_side")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    side.close().unwrap();
+    let side_wal = |vfs: &SimVfs| {
+        pigeonhole_io::Vfs::list_dir(vfs, std::path::Path::new("/r"))
+            .unwrap()
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("side.phdb-"))
+            })
+            .count()
+    };
+    assert!(side_wal(&vfs) > 0, "the side copy's open left its own WAL");
+    let before = vfs.shared_regions();
     replica.replace_with("/r/side.phdb").unwrap();
+    assert_eq!(side_wal(&vfs), 0, "the side copy's WAL and sidecar go");
+    // The new file's region in place of the old one's (simp724's A3).
+    assert_eq!(
+        vfs.shared_regions(),
+        before,
+        "the old file's shm region goes"
+    );
+    assert!(replica.table("in_side").unwrap().open().is_ok());
     assert_eq!(
         contents(&clone),
         contents(&primary),

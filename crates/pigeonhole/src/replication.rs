@@ -381,11 +381,15 @@ impl Pigeonhole {
     /// (D265): every handle and clone then reads the new file, and operations in flight on
     /// the old engine fail with `Closed` or retry on the new one. The path is never left
     /// unlocked (simp724's sequence):
-    /// 1. `side` is opened and locked (writer byte and presence) first;
+    /// 1. `side` is opened and locked (writer byte and presence) first, and must have been
+    ///    closed cleanly (`InvalidArgument` otherwise): its own WAL isn't replayed after the
+    ///    rename, so a commit only it held would be lost;
     /// 2. the current engine closes, keeping its locks;
     /// 3. the old copy's WAL and sidecar files are removed;
-    /// 4. `side` is renamed over the path;
-    /// 5. the old locks are released;
+    /// 4. `side` is renamed over the path, and `side`'s own WAL and sidecar files (from an
+    ///    open of it under its own name, all checkpointed) are removed;
+    /// 5. the old locks are released, and the old file's shm region removed unless a reader
+    ///    process is still attached to it;
     /// 6. the new engine opens on `side`'s locks and is swapped in.
     ///
     /// Refused while an automatic recovery runs. If a step after 2 fails, the handle is
@@ -415,7 +419,15 @@ impl Pigeonhole {
             _ => std::path::Path::new("."),
         };
         vfs.sync_dir(dir).map_err(io)?;
-        drop(held);
+        // The side file's own WAL streams and sidecar, from an open of it under its own name
+        // (the bootstrap's `begin_replication`): checkpointed by its clean close, which
+        // `adopt` checked, so nothing in them is needed (simp724's A1 on #1583).
+        pigeonhole_engine::remove_side_files(&vfs, side)?;
+        // The old file is gone from the path: its shm region goes too, unless a reader
+        // process is still attached to it (simp724's A3 on #1583).
+        if let Some(held) = held {
+            old.retire(held)?;
+        }
         let engine =
             pigeonhole_engine::Engine::open_with(&path, options, adopted).map_err(|(e, _)| e)?;
         drop(db.swap_engine(engine));

@@ -93,13 +93,12 @@ pub(crate) fn follow(
         .open()
         .map_err(|e| ApiError::from_engine(&e).for_read())?;
     let (tx, rx) = mpsc::channel(2);
-    let runtime = tokio::runtime::Handle::current();
     let db = db.clone();
     std::thread::Builder::new()
         .name("phdb-follow".into())
         .spawn(move || {
             let started = Instant::now();
-            let outcome = pump(&db, feed, &tx, &runtime, idle);
+            let outcome = pump(&db, feed, &tx, idle);
             metrics.count(
                 FOLLOW,
                 outcome.as_ref().err().map(|e| e.code.as_str()),
@@ -119,7 +118,6 @@ fn pump(
     db: &Pigeonhole,
     mut feed: pigeonhole::Feed,
     tx: &mpsc::Sender<Result<proto::ReplicationBatch, ApiError>>,
-    runtime: &tokio::runtime::Handle,
     idle: Duration,
 ) -> Result<(), ApiError> {
     let engine = |e: pigeonhole::Error| ApiError::from_engine(&e).for_read();
@@ -151,14 +149,40 @@ fn pump(
             primary_seqno: db.visible_seqno(),
             caught_up,
         };
-        match runtime.block_on(async { tokio::time::timeout(idle, tx.send(Ok(batch))).await }) {
-            Ok(Ok(())) => {}
+        if !send_within(tx, batch, idle)? {
             // The replica went away.
-            Ok(Err(_)) => return Ok(()),
-            Err(_) => {
-                return Err(ApiError::deadline(
-                    "the replica took no message for --stream-idle-ms; it resumes from its token",
-                ));
+            return Ok(());
+        }
+    }
+}
+
+/// How long a follower waits between tries while its replica's buffer is full.
+const SEND_RETRY: Duration = Duration::from_millis(5);
+
+/// Sends `batch`, waiting at most `idle` for room: `false` if the replica went away,
+/// `DeadlineExceeded` if it took nothing for `idle`. On this thread alone, with no runtime
+/// call, so it holds while the runtime shuts down (cli692 on #1583: a tokio timer from
+/// `Handle::block_on` panics then). It polls only while the replica is slower than the feed.
+fn send_within(
+    tx: &mpsc::Sender<Result<proto::ReplicationBatch, ApiError>>,
+    batch: proto::ReplicationBatch,
+    idle: Duration,
+) -> Result<bool, ApiError> {
+    let deadline = Instant::now() + idle;
+    let mut item = Ok(batch);
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return Ok(true),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(false),
+            Err(mpsc::error::TrySendError::Full(back)) => {
+                if Instant::now() >= deadline {
+                    return Err(ApiError::deadline(
+                        "the replica took no message for --stream-idle-ms; it resumes from its \
+                         token",
+                    ));
+                }
+                item = back;
+                std::thread::sleep(SEND_RETRY);
             }
         }
     }
