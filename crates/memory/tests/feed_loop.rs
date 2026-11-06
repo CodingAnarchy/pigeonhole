@@ -415,3 +415,55 @@ fn an_interrupter_ends_a_steps_wait_early() {
     assert!(step.interrupted && started.elapsed() < Duration::from_secs(1));
     db.close().unwrap();
 }
+
+/// ICR 0123 (perf287's W6, cli692's C1 on #1479 PR 2): `wait_async` records a commit in the
+/// same poll that takes it, so a wait dropped at any point (asyncio's timeout) loses nothing.
+/// Twenty namespaces each get a pair, with a wait polled once and dropped after each; every
+/// namespace is still due, and consolidated, afterwards.
+#[test]
+fn a_dropped_wait_async_loses_no_events() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(&db, "notes", StoreOptions::new()).unwrap();
+    let c = Arc::new(Concat::new());
+    let clock = Arc::new(AtomicU64::new(now()));
+    let t = Arc::clone(&clock);
+    let p = policy(Duration::from_secs(10));
+    let mut l = store
+        .consolidate_loop("main", c.clone())
+        .policy(&p)
+        .clock(move || t.load(Ordering::SeqCst));
+    // Before the first step, a wait returns 0 at once: `run_once` starts the loop.
+    assert_eq!(
+        pigeonhole::doc_support::block_on(l.wait_async()).unwrap(),
+        0
+    );
+    l.run_once(Duration::ZERO).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut waited = 0;
+    for i in 0..20 {
+        pair(&store, &format!("n{i:02}"), "s");
+        // Polled once, then dropped, whether it took a commit or not.
+        let mut f = std::pin::pin!(l.wait_async());
+        if let std::task::Poll::Ready(r) = f.as_mut().poll(&mut cx) {
+            waited += r.unwrap();
+        }
+    }
+    // A wait that resolves records like `run_once`'s.
+    let (a, _) = pair(&store, "last", "s");
+    waited += pigeonhole::doc_support::block_on(l.wait_async()).unwrap();
+    assert!(waited >= 1, "some events came through the waits");
+    let step = l.run_once(Duration::from_millis(500)).unwrap();
+    assert!(step.passes.is_empty(), "nothing due yet: {step:?}");
+    assert!(l.next_due().is_some_and(|d| d <= a.created_us() + 10 * SEC));
+    clock.fetch_add(60 * SEC, Ordering::SeqCst);
+    let step = l.run_once(Duration::ZERO).unwrap();
+    assert_eq!(
+        step.passes.len(),
+        21,
+        "every namespace, none lost: {step:?}"
+    );
+    db.close().unwrap();
+}

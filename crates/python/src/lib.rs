@@ -20,6 +20,7 @@ mod memory;
 mod read;
 mod table;
 mod vector;
+mod waits;
 mod walk;
 
 /// The native module.

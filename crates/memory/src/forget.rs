@@ -300,7 +300,7 @@ impl<'a> Forget<'a> {
         let store = self.store;
         let r = self.run_inner();
         // The pass's IVF writes, after its transactions (D311 T8).
-        store.ivf_settle();
+        store.settle();
         r
     }
 
