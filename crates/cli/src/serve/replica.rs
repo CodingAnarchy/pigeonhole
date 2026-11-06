@@ -75,12 +75,17 @@ impl Stream for FollowBatches {
 /// Opens the primary's durable feed of every table from `token` and starts its follower's
 /// thread. The thread holds `slot` until the stream ends: the replica went away, took no
 /// message for `idle`, or the feed failed (its error is the stream's last item).
+///
+/// Nothing joins the thread. At shutdown it may still hold its feed and a database handle
+/// when the server closes the database: that's safe, since the feed then fails (`Closed`)
+/// and the thread ends, its send failing or its error unsent (cli692's F1 on #1583).
 pub(crate) fn follow(
     db: &Pigeonhole,
     token: Vec<u8>,
     slot: OwnedSemaphorePermit,
     idle: Duration,
     metrics: Arc<Metrics>,
+    placement: Option<Arc<super::placement::Placement>>,
 ) -> Result<FollowBatches, ApiError> {
     if token.is_empty() {
         return Err(ApiError::invalid(
@@ -95,8 +100,13 @@ pub(crate) fn follow(
     let (tx, rx) = mpsc::channel(2);
     let db = db.clone();
     std::thread::Builder::new()
-        .name("phdb-follow".into())
+        .name("phdb-serve-follow".into())
         .spawn(move || {
+            // Off the shards' cores, as the runtime's threads: a replica catching up reads
+            // and encodes at full speed (cli692's F1 on #1583).
+            if let Some(p) = &placement {
+                p.enter();
+            }
             let started = Instant::now();
             let outcome = pump(&db, feed, &tx, idle);
             metrics.count(
@@ -146,7 +156,9 @@ fn pump(
         }
         let batch = proto::ReplicationBatch {
             events,
-            primary_seqno: db.visible_seqno(),
+            // The durable frontier, which this feed can deliver up to, not the visible
+            // seqno, which runs ahead of it under `Buffered` (cli692's F5 on #1583).
+            primary_seqno: db.replication_frontier(),
             caught_up,
         };
         if !send_within(tx, batch, idle)? {
@@ -221,6 +233,9 @@ pub(crate) struct Replica {
     /// Set once `Admin.Promote` made the database a primary: writes are taken, and the
     /// replica reports nothing.
     promoted: AtomicBool,
+    /// Set while an `Admin.Promote` runs: a second one is refused rather than racing it to
+    /// `promote` (cli692's F4 on #1583).
+    promoting: AtomicBool,
     stop: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -249,6 +264,7 @@ impl Replica {
                 last_error: String::new(),
             }),
             promoted: AtomicBool::new(false),
+            promoting: AtomicBool::new(false),
             stop: watch::channel(false).0,
             task: Mutex::new(None),
         })
@@ -352,6 +368,21 @@ impl Replica {
                 "this server was already promoted",
             ));
         }
+        if self.promoting.swap(true, Ordering::AcqRel) {
+            return Err(ApiError::failed_precondition(
+                "this server is already being promoted",
+            ));
+        }
+        let promoted = self.promote_once(db).await;
+        if promoted.is_err() {
+            // The loop is stopped either way: a failed promote leaves a replica that no
+            // longer follows (Info says so), and another Promote may try again.
+            self.promoting.store(false, Ordering::Release);
+        }
+        promoted
+    }
+
+    async fn promote_once(&self, db: &Pigeonhole) -> Result<Vec<u8>, ApiError> {
         self.stop().await;
         let db = db.clone();
         let token = tokio::task::spawn_blocking(move || {
@@ -614,6 +645,8 @@ impl Replica {
         let service = &shared.router.service;
         let db = service.db.clone();
         let side = side_path(db.path());
+        // A stop mid-download leaves a partial side file: harmless, since the next
+        // bootstrap truncates it (`File::create`) before writing (cli692's N4 on #1583).
         let token = tokio::select! {
             r = self.download(&side) => r.map_err(Halt::Failed)?,
             _ = stop.changed() => return Err(Halt::Stopped),
@@ -653,6 +686,7 @@ impl Replica {
         let mut hash = sha2::Sha256::new();
         let (mut backup_id, mut offset, mut token) = (String::new(), 0u64, Vec::new());
         let mut tries = 0;
+        let mut at_last_break = 0u64;
         loop {
             let req = self.request(proto::BackupDownloadRequest {
                 durable: true,
@@ -713,6 +747,12 @@ impl Replica {
                 }
                 Err(status) => status.message().to_owned(),
             };
+            // Three breaks in a row without progress give up; progress starts the count again
+            // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
+            if offset > at_last_break {
+                tries = 0;
+                at_last_break = offset;
+            }
             tries += 1;
             if backup_id.is_empty() || tries > 3 {
                 return Err(format!("downloading the bootstrap copy: {broke}"));

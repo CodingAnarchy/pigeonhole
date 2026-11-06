@@ -648,3 +648,77 @@ fn replace_with_swaps_a_handle_s_file_for_a_copy_under_its_locks() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// A reader process attached to the old file when `replace_with` swaps a new copy in, and
+/// closing after it, must not remove the new engine's WAL (simp724's B1 on #1583). Its
+/// last-one-out cleanup takes the writer byte on its own (old, now unlocked) inode, and the
+/// WAL files are found by path, which names the new file; the new file still reads clean
+/// until its first root commit. Commits after the swap, before any flush, then live only in
+/// that WAL: a crash and reopen keep them.
+#[test]
+fn a_reader_of_the_replaced_file_never_removes_the_new_file_s_wal() {
+    let vfs = SimVfs::new(44);
+    let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+    primary
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/r/side.phdb").unwrap();
+    drop(snap);
+    primary.close().unwrap();
+    let db = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+
+    // A reader process on the old file, until told to close.
+    let (attached_tx, attached) = std::sync::mpsc::channel();
+    let (close_tx, close) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(pigeonhole_io::ProcessId {
+                pid: 88,
+                start_time: 1,
+            });
+            let r = Pigeonhole::open_reader(
+                "/r/data.phdb",
+                pigeonhole::ReaderOptions::default().vfs(Arc::clone(&vfs) as _),
+            )
+            .unwrap();
+            attached_tx.send(()).unwrap();
+            close.recv().unwrap();
+            drop(r);
+        })
+    };
+    attached.recv().unwrap();
+
+    db.replace_with("/r/side.phdb").unwrap();
+    // Writes to a table the copy has: no catalog change, so no root commit, so the new
+    // file still reads clean; the rows are only in its WAL.
+    let t = db.table("t").unwrap().open().unwrap();
+    for i in 0..20u32 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put("f", b"q", b"after the swap")
+            .commit()
+            .unwrap();
+    }
+    close_tx.send(()).unwrap();
+    reader.join().unwrap();
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    for i in 0..20u32 {
+        assert!(
+            t.get(format!("r{i:02}").as_bytes(), "f", b"q")
+                .unwrap()
+                .is_some(),
+            "r{i:02}, committed after the swap, survives the crash"
+        );
+    }
+    drop(t);
+    db.close().unwrap();
+}

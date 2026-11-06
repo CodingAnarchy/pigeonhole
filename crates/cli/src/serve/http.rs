@@ -317,9 +317,9 @@ async fn call(
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
         Ok(ServiceReply::Empty(r)) => json(&r),
         Ok(ServiceReply::Promote(r)) => json(&r),
-        // `Replication.Follow` is gRPC only: HTTP has no route to it.
+        // `Replication.Follow` is gRPC only: `decode` has no route to it (cli692's N2).
         Ok(ServiceReply::Follow(_)) => {
-            ApiError::internal("Replication.Follow over HTTP").into_response()
+            ApiError::unsupported("Replication is gRPC only").into_response()
         }
         Err(e) => e.into_response(),
     }

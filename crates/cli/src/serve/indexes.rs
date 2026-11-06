@@ -38,6 +38,9 @@ pub(crate) struct Indexes {
     closed: AtomicBool,
     /// Where the rebalancer threads run: off the shards' CPUs (perf287's B2 on 7b2).
     placement: Option<Arc<super::placement::Placement>>,
+    /// Set on a replica (#1436): a background index's rebalancer isn't started, since its
+    /// writes would be refused; its lists stay marked for after a promote.
+    paused: AtomicBool,
 }
 
 impl std::fmt::Debug for Indexes {
@@ -57,6 +60,7 @@ impl Indexes {
             rebalancers: Mutex::new(Vec::new()),
             running: Arc::default(),
             closed: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -132,7 +136,9 @@ impl Indexes {
         if let Some(kept) = open.get(name) {
             return Ok(Arc::clone(kept));
         }
-        if matches!(index.options().rebalance_mode(), Rebalance::Background) {
+        if matches!(index.options().rebalance_mode(), Rebalance::Background)
+            && !self.paused.load(Ordering::Acquire)
+        {
             let running = Arc::clone(&self.running);
             running.fetch_add(1, Ordering::Relaxed);
             let index_name = name.to_owned();
@@ -168,8 +174,30 @@ impl Indexes {
     /// the server (a replica applied a primary's change, or swapped in a new copy, #1436).
     /// A rebalancer sees its index close at its next look and ends; a handle a call still
     /// holds keeps its index open until the call ends.
+    ///
+    /// It doesn't wait for those rebalancers (a call holding a handle would hold this
+    /// caller, the replica's loop, too): it reaps the threads that have ended, so their
+    /// handles don't pile up over many changes (cli692's F3 on #1583).
     pub(crate) fn forget(&self) {
         self.handles().clear();
+        let mut threads = self
+            .rebalancers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (ended, running): (Vec<_>, Vec<_>) = std::mem::take(&mut *threads)
+            .into_iter()
+            .partition(JoinHandle::is_finished);
+        *threads = running;
+        drop(threads);
+        for t in ended {
+            let _ = t.join();
+        }
+    }
+
+    /// Whether background rebalancers start for the indexes opened from now on: not on a
+    /// replica, again after its promote (#1436).
+    pub(crate) fn pause_rebalancing(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
     }
 
     /// Drops every handle and waits for the rebalancing threads to end: each sees its index
