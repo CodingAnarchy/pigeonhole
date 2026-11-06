@@ -33,6 +33,7 @@ mod placement;
 mod router;
 mod service;
 mod sessions;
+mod texts;
 mod tls;
 
 pub(crate) use config::ServeArgs;
