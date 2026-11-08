@@ -82,6 +82,7 @@ impl Memory {
                 url,
                 args.embed_model.as_deref().unwrap_or_default(),
                 args.embed_key_env.as_deref(),
+                super::embed::TIMEOUT,
             )?),
             None => None,
         };

@@ -2571,6 +2571,307 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     assert_eq!(&hits[0].id[..], b"doc:1");
 }
 
+// ---- Memory (D313 ticket 8a) ----
+
+/// A server with the memory store `m` (no embedding model: recall by keyword and recency).
+fn memory_server(tokens: &str) -> Server {
+    Server::start_custom(tokens, limits(), 1, |svc| {
+        let core = crate::memcore::MemCore::open(
+            &svc.db,
+            "m",
+            None,
+            None,
+            |_| Ok(pigeonhole_memory::StoreOptions::new()),
+            (1 << 20, 8 << 20),
+        )
+        .unwrap();
+        svc.memory_opt(Some(core), 0)
+    })
+}
+
+fn remember(s: &Server, ns: &str, text: &str, token: Option<&str>) -> (u16, Json) {
+    s.rpc(
+        "Memory/Remember",
+        &json!({"namespace": ns, "memory": {"text": text}}),
+        token,
+    )
+}
+
+#[test]
+fn memories_are_remembered_recalled_marked_linked_superseded_and_forgotten() {
+    let s = memory_server("");
+    let (status, r) = remember(&s, "a", "the deploy key rotates on Fridays", None);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["outcome"].as_str(), Some("REMEMBER_OUTCOME_NEW"), "{r}");
+    let first = r["id"].as_str().unwrap().to_owned();
+    // The same text again is merged into it.
+    let (_, r) = remember(&s, "a", "the deploy key rotates on Fridays", None);
+    assert_eq!(
+        r["outcome"].as_str(),
+        Some("REMEMBER_OUTCOME_MERGED"),
+        "{r}"
+    );
+    assert_eq!(r["id"].as_str(), Some(first.as_str()));
+    let (_, r) = remember(&s, "a", "the deploy key now rotates on Mondays", None);
+    assert_eq!(r["outcome"].as_str(), Some("REMEMBER_OUTCOME_NEW"), "{r}");
+    let second = r["id"].as_str().unwrap().to_owned();
+    // Recall by keyword, with signals.
+    let (status, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "deploy key", "k": 5, "with_signals": true}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    let hits = r["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{r}");
+    assert!(hits[0]["signals"].is_object(), "{r}");
+    // Mark used, link, then supersede the old with the new: recall drops the old.
+    let (_, r) = s.rpc("Memory/MarkUsed", &json!({"ids": [first]}), None);
+    assert_eq!(r["marked"].as_str(), Some("1"), "{r}");
+    let (status, e) = s.rpc(
+        "Memory/Link",
+        &json!({"from": second, "to": first, "link_type": {"builtin": "BUILTIN_LINK_SIMILAR_TO"}, "weight": 0.5}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    let (status, e) = s.rpc(
+        "Memory/Supersede",
+        &json!({"old": first, "new": second}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    let (_, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "deploy key", "k": 5}),
+        None,
+    );
+    let ids: Vec<&str> = r["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [second.as_str()], "{r}");
+    // Forgetting the new one brings the old one back, as the store documents (its
+    // `superseded_by` is cleared); forgetting that too leaves nothing.
+    let (_, r) = s.rpc("Memory/Forget", &json!({"ids": [second]}), None);
+    assert_eq!(r["forgotten"].as_str(), Some("1"), "{r}");
+    let recalled = |s: &Server| {
+        let (_, r) = s.rpc(
+            "Memory/Recall",
+            &json!({"namespaces": ["a"], "text": "deploy key", "k": 5}),
+            None,
+        );
+        r["hits"]
+            .as_array()
+            .map(|h| {
+                h.iter()
+                    .map(|h| h["id"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_else(Vec::new)
+    };
+    assert_eq!(recalled(&s), std::slice::from_ref(&first));
+    let (_, r) = s.rpc("Memory/Forget", &json!({"ids": [first]}), None);
+    assert_eq!(r["forgotten"].as_str(), Some("1"), "{r}");
+    assert!(recalled(&s).is_empty());
+    // Refused: an embedding for a store without a model, a bad id, a supersedes link, k
+    // out of range, a budget past the server's cap.
+    let v = f32_query(&[0.1, 0.2]);
+    for (path, req) in [
+        (
+            "Memory/Remember",
+            json!({"namespace": "a", "memory": {"text": "x", "embedding": v}}),
+        ),
+        ("Memory/MarkUsed", json!({"ids": [b64(b"not an id")]})),
+        (
+            "Memory/Link",
+            json!({"from": first, "to": first, "link_type": {"builtin": "BUILTIN_LINK_SUPERSEDES"}}),
+        ),
+        (
+            "Memory/Recall",
+            json!({"namespaces": ["a"], "text": "x", "k": 0}),
+        ),
+        (
+            "Memory/Recall",
+            json!({"namespaces": ["a"], "text": "x", "k": 1, "byte_budget": (64u64 << 20).to_string()}),
+        ),
+        (
+            "Memory/Recall",
+            json!({"namespaces": [], "text": "x", "k": 1}),
+        ),
+    ] {
+        let (_, e) = s.rpc(path, &req, None);
+        assert_eq!(
+            e["code"].as_str(),
+            Some("InvalidArgument"),
+            "{path} {req}: {e}"
+        );
+    }
+    // Over gRPC too.
+    let r = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::memory_client::MemoryClient::new(channel)
+            .remember(proto::RememberRequest {
+                namespace: "a".into(),
+                memory: Some(proto::NewMemory {
+                    text: "over gRPC".into(),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    assert_eq!(r.outcome, proto::RememberOutcome::New as i32);
+}
+
+#[test]
+fn a_namespace_scoped_token_reaches_only_its_namespaces() {
+    // ai1249's M4 on D313 §7: every Memory RPC checks the token's namespaces, against the
+    // names a call gives and the namespace each id carries; a call outside them is refused
+    // whole, never trimmed.
+    let s = memory_server("admin all\nwrite ns=a scoped\nread ns=a reader\n");
+    let (_, r) = remember(&s, "b", "in b", Some("all"));
+    let in_b = r["id"].as_str().unwrap().to_owned();
+    let (_, r) = remember(&s, "a", "in a", Some("all"));
+    let in_a = r["id"].as_str().unwrap().to_owned();
+    let denied = |path: &str, req: Json, token: &str| {
+        let (status, e) = s.rpc(path, &req, Some(token));
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (403, Some("PermissionDenied")),
+            "{path} {req}: {e}"
+        );
+    };
+    denied(
+        "Memory/Remember",
+        json!({"namespace": "b", "memory": {"text": "x"}}),
+        "scoped",
+    );
+    denied(
+        "Memory/Remember",
+        json!({"namespace": "a", "memory": {"text": "x", "links": [{"to": in_b}]}}),
+        "scoped",
+    );
+    denied(
+        "Memory/Recall",
+        json!({"namespaces": ["a", "b"], "text": "in", "k": 5}),
+        "scoped",
+    );
+    denied(
+        "Memory/Recall",
+        json!({"namespaces": ["b"], "text": "in", "k": 5}),
+        "reader",
+    );
+    denied("Memory/MarkUsed", json!({"ids": [in_a, in_b]}), "scoped");
+    denied(
+        "Memory/Supersede",
+        json!({"old": in_b, "new": in_a}),
+        "scoped",
+    );
+    denied("Memory/Link", json!({"from": in_a, "to": in_b}), "scoped");
+    denied("Memory/Forget", json!({"ids": [in_b]}), "scoped");
+    denied("Memory/Watch", json!({"namespaces": ["b"]}), "scoped");
+    // A watch of every namespace is everyone's: a scoped token names its own.
+    denied("Memory/Watch", json!({}), "scoped");
+    // A read token can't write, even in its namespace.
+    denied(
+        "Memory/Remember",
+        json!({"namespace": "a", "memory": {"text": "x"}}),
+        "reader",
+    );
+    // Inside the namespace, all fine; b's memory is untouched.
+    assert_eq!(remember(&s, "a", "x", Some("scoped")).0, 200);
+    let (status, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "in", "k": 5}),
+        Some("reader"),
+    );
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(
+        s.rpc("Memory/Forget", &json!({"ids": [in_a]}), Some("scoped"))
+            .0,
+        200
+    );
+    let (_, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["b"], "text": "in", "k": 5}),
+        Some("all"),
+    );
+    assert_eq!(r["hits"].as_array().map(Vec::len), Some(1), "{r}");
+}
+
+#[test]
+fn a_memory_watch_streams_new_memories_and_resumes() {
+    let s = memory_server("");
+    let mut client = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::memory_client::MemoryClient::new(channel)
+    });
+    let mut stream = s
+        .block_on(client.watch(proto::MemoryWatchRequest {
+            namespaces: vec!["a".into()],
+            resume: Default::default(),
+        }))
+        .unwrap()
+        .into_inner();
+    remember(&s, "b", "elsewhere", None);
+    remember(&s, "a", "the first", None);
+    let next = |stream: &mut tonic::Streaming<proto::MemoryEvent>| {
+        s.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        })
+    };
+    // The memory in a comes as a memory; b's write, if delivered, only as progress.
+    let token = loop {
+        let e = next(&mut stream);
+        match e.event {
+            Some(proto::memory_event::Event::Memory(m)) => {
+                assert_eq!((m.namespace.as_str(), m.text.as_str()), ("a", "the first"));
+                break e.token;
+            }
+            Some(proto::memory_event::Event::Progress(_)) => {}
+            None => panic!("an event without a body"),
+        }
+    };
+    drop(stream);
+    // A watch resumed from that token sees only what came after.
+    remember(&s, "a", "the second", None);
+    let mut resumed = s
+        .block_on(client.watch(proto::MemoryWatchRequest {
+            namespaces: vec!["a".into()],
+            resume: token,
+        }))
+        .unwrap()
+        .into_inner();
+    loop {
+        if let Some(proto::memory_event::Event::Memory(m)) = next(&mut resumed).event {
+            assert_eq!(m.text, "the second");
+            break;
+        }
+    }
+}
+
+#[test]
+fn memory_calls_without_a_store_are_unsupported() {
+    let s = Server::start("", limits());
+    let (_, e) = remember(&s, "a", "x", None);
+    assert_eq!(e["code"].as_str(), Some("Unsupported"), "{e}");
+}
+
 // ---- Feed.Subscribe (D313 ticket 5, R2) ----
 
 /// A feed subscription straight through the service: events are taken only when polled.
@@ -3867,6 +4168,11 @@ fn a_replica_bootstraps_follows_and_refuses_writes() {
         "Text/Put",
         "Text/Delete",
         "Text/Rebuild",
+        "Memory/Remember",
+        "Memory/MarkUsed",
+        "Memory/Supersede",
+        "Memory/Link",
+        "Memory/Forget",
     ] {
         let (status, body) = r.rpc(rpc, &json!({}), None);
         assert_eq!(
