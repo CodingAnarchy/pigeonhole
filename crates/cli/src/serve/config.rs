@@ -107,9 +107,14 @@ pub(crate) struct ServeArgs {
     pub blocking_threads: Option<usize>,
     /// Threads that deliver the change feed to its streams, a runtime of their own so feed
     /// delivery never holds a request's worker (default: a quarter of the CPUs the shards
-    /// don't use, at least 1, taken from `--io-threads`' default).
+    /// don't use, but at least 4 where they leave 8 or more, taken from `--io-threads`'
+    /// default).
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
+    /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
+    /// (default: hyper's 400 KiB). Smaller bounds a feed stream's queued delivery.
+    #[arg(long, value_name = "BYTES")]
+    pub http2_send_buffer: Option<usize>,
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,

@@ -29,7 +29,8 @@
 //! Only one subscriber in `--lag-every` (16) decodes its events for the lag columns; the
 //! others count frames through a codec that decodes nothing, so 256 subscribers cost the
 //! client little (perf287 on #1589). `--h2-conn-window`, `--h2-stream-window` and
-//! `--h2-adaptive` set the client's HTTP/2 receive windows, which pace the server's sends.
+//! `--h2-adaptive` (on by default) set the client's HTTP/2 receive windows, which pace the
+//! server's sends.
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -102,8 +103,10 @@ struct Args {
     /// The client's HTTP/2 per-stream receive window, in bytes (default: hyper's, 2 MiB).
     #[arg(long, value_name = "BYTES")]
     h2_stream_window: Option<u32>,
-    /// Let the client's HTTP/2 windows grow with the measured bandwidth-delay product.
-    #[arg(long)]
+    /// Let the client's HTTP/2 windows follow the measured bandwidth-delay product (on by
+    /// default: fixed windows let about 18 ms of events queue per stream, perf287 on #1397).
+    /// `--h2-adaptive false` uses the fixed windows.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     h2_adaptive: bool,
 }
 

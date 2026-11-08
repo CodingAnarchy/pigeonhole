@@ -120,6 +120,7 @@ impl Server {
                 let _ = stopped.await;
             },
             Duration::from_secs(2),
+            None,
         ));
         Self {
             url,

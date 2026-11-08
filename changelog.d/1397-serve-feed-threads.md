@@ -1,2 +1,3 @@
 ### Added
-- **`phdb serve --feed-threads`:** the change feed's delivery (its shared subscriptions and every stream) runs on a runtime of its own, by default a quarter of the CPUs the shards don't use, carved out of the network threads' default. A put never waits behind feed streams for a worker (D313 ticket 5, #1397).
+- **`phdb serve --feed-threads`:** the change feed's delivery (its shared subscriptions and every stream) runs on a runtime of its own, by default a quarter of the CPUs the shards don't use but at least 4 where 8 or more are free, carved out of the network threads' default. A put never waits behind feed streams for a worker (D313 ticket 5, #1397).
+- **`phdb serve --http2-send-buffer`:** what one HTTP/2 stream may queue for its client (default: hyper's 400 KiB). The guide recommends HTTP/2 adaptive flow control for feed clients: it took 16 subscribers' delivery lag from about 18 ms to 0.5 ms (D313 ticket 5, #1397).
