@@ -258,7 +258,7 @@ pub(crate) fn run(
             shutdown_signal().await;
             stopping.router.service.bulk.stop();
         };
-        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms), args.http2_send_buffer).await;
+        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms), args.http2_send_buffer.map(|n| usize::try_from(n).unwrap_or(usize::MAX))).await;
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));

@@ -112,9 +112,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
-    /// (default: hyper's 400 KiB). Smaller bounds a feed stream's queued delivery.
-    #[arg(long, value_name = "BYTES")]
-    pub http2_send_buffer: Option<usize>,
+    /// (default: hyper's 400 KiB; at least 16 KiB, one frame). Smaller bounds a feed
+    /// stream's queued delivery.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(16_384..))]
+    pub http2_send_buffer: Option<u64>,
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
