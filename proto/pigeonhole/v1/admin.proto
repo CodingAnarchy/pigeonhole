@@ -22,6 +22,36 @@ service Admin {
   rpc BackupDownload(BackupDownloadRequest) returns (stream BackupChunk);
   // The metrics in Prometheus text format, under D316's names (read scope).
   rpc Metrics(Empty) returns (MetricsResponse);
+  // Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
+  // it stops following, takes writes, and returns the primary's token it stopped at (#1436).
+  // Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+  rpc Promote(Empty) returns (PromoteResponse);
+}
+
+message PromoteResponse {
+  // The primary's feed token stored with the last event the replica applied (empty if it
+  // applied none). Opaque.
+  bytes primary_token = 1;
+}
+
+// A replica server's state (#1436): unset on a primary.
+message ReplicaInfo {
+  // The primary's URL (`--replica-of`).
+  string primary = 1;
+  // "starting", "bootstrapping", "following", "re-bootstrapping" or "retrying"
+  // (after an error, which `last_error` gives).
+  string state = 2;
+  // The primary's seqno the replica applied through.
+  uint64 applied_primary_seqno = 3;
+  // The primary's durable frontier, as its last message said.
+  uint64 primary_seqno = 4;
+  // primary_seqno - applied_primary_seqno: the durable commits the replica hasn't applied
+  // yet (0 when caught up). Commits the primary hasn't synced aren't counted.
+  uint64 lag_commits = 5;
+  // Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
+  uint64 lag_ms = 6;
+  // The last error the replica loop met, if it's in `error` or retrying.
+  string last_error = 7;
 }
 
 message HealthResponse {
@@ -37,6 +67,8 @@ message InfoResponse {
   repeated string tables = 4;
   // The server's version (`pigeonhole`'s).
   string version = 5;
+  // Set on a replica server (#1436).
+  ReplicaInfo replica = 6;
 }
 
 message BackupRequest {
@@ -56,6 +88,10 @@ message BackupDownloadRequest {
   // fresh backup. An id the server no longer keeps is `NotFound`; start over.
   string backup_id = 2;
   uint64 offset = 3;
+  // A replica's bootstrap (#1436): the backup is of a durable snapshot, and the stream
+  // carries the token of a feed of every table opened from that same snapshot, which the
+  // replica follows from. Refused on a server that is itself a replica.
+  bool replica = 4;
 }
 
 message BackupChunk {
@@ -69,6 +105,8 @@ message BackupChunk {
   uint64 offset = 4;
   // In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
   bytes sha256 = 5;
+  // With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
+  bytes feed_token = 6;
 }
 
 message MetricsResponse {

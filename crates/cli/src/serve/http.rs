@@ -66,6 +66,11 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     ))
     .max_decoding_message_size(limits.max_request_bytes)
     .max_encoding_message_size(usize::MAX);
+    let replication = proto::replication_server::ReplicationServer::new(
+        super::grpc::ReplicationGrpc(Arc::clone(&shared)),
+    )
+    .max_decoding_message_size(limits.max_request_bytes)
+    .max_encoding_message_size(usize::MAX);
     let prepay = || axum::middleware::from_fn_with_state(Arc::clone(&shared), super::grpc::prepay);
     let shed = Arc::clone(&shared);
     let limited = axum::Router::new()
@@ -110,6 +115,12 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
             tower::ServiceBuilder::new()
                 .layer(prepay())
                 .service(snapshots),
+        )
+        .route_service(
+            "/pigeonhole.v1.Replication/{*method}",
+            tower::ServiceBuilder::new()
+                .layer(prepay())
+                .service(replication),
         )
         .with_state(Arc::clone(&shared))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
@@ -315,6 +326,11 @@ async fn call(
         Ok(ServiceReply::Commit(r)) => json(&r),
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
         Ok(ServiceReply::Empty(r)) => json(&r),
+        Ok(ServiceReply::Promote(r)) => json(&r),
+        // `Replication.Follow` is gRPC only: `decode` has no route to it (cli692's N2).
+        Ok(ServiceReply::Follow(_)) => {
+            ApiError::unsupported("Replication is gRPC only").into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -698,6 +714,7 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Admin", "Backup") => ServiceOp::Backup(parse(body)?),
         ("Admin", "BackupDownload") => ServiceOp::BackupDownload(parse(body)?),
         ("Admin", "Metrics") => ServiceOp::Metrics(parse(body)?),
+        ("Admin", "Promote") => ServiceOp::Promote(parse(body)?),
         ("Graph", "Traverse") => ServiceOp::Traverse(parse(body)?),
         ("Vectors", "Nearest") => ServiceOp::Nearest(parse(body)?),
         ("Vectors", "CreateIndex") => ServiceOp::CreateIndex(parse(body)?),

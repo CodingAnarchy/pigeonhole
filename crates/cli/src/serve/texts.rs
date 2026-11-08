@@ -120,6 +120,14 @@ impl Texts {
         Ok(())
     }
 
+    /// Drops every handle: the catalog changed under the server (a replica applied a
+    /// primary's change, or a re-bootstrap swapped the database), so the next call on each
+    /// name opens it again (#1436). A call holding a handle finishes on it. An index has no
+    /// thread, so nothing else is left.
+    pub(crate) fn forget(&self) {
+        self.handles().clear();
+    }
+
     fn keep(&self, name: &str, index: Index) -> Arc<Index> {
         Arc::clone(
             self.handles()

@@ -537,6 +537,44 @@ impl proto::admin_server::Admin for AdminGrpc {
     ) -> Result<Response<proto::MetricsResponse>, Status> {
         unary!(&self.0, req, Metrics, Metrics)
     }
+
+    async fn promote(
+        &self,
+        req: Request<proto::Empty>,
+    ) -> Result<Response<proto::PromoteResponse>, Status> {
+        unary!(&self.0, req, Promote, Promote)
+    }
+}
+
+/// `Replication` over gRPC (#1436): a replica server follows its primary here.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationGrpc(pub(crate) Arc<Shared>);
+
+struct GrpcBatches(super::replica::FollowBatches);
+
+impl Stream for GrpcBatches {
+    type Item = Result<proto::ReplicationBatch, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::replication_server::Replication for ReplicationGrpc {
+    type FollowStream = Pin<Box<dyn Stream<Item = Result<proto::ReplicationBatch, Status>> + Send>>;
+
+    async fn follow(
+        &self,
+        req: Request<proto::FollowRequest>,
+    ) -> Result<Response<Self::FollowStream>, Status> {
+        match call(&self.0, req, ServiceOp::Follow).await? {
+            ServiceReply::Follow(b) => Ok(Response::new(Box::pin(GrpcBatches(b)))),
+            _ => Err(unexpected()),
+        }
+    }
 }
 
 /// `Graph` over gRPC (D313 ticket 7).

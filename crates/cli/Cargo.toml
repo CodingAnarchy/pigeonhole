@@ -33,6 +33,8 @@ serve = [
     "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",
     "dep:sha2", "dep:arc-swap", "dep:num_cpus", "dep:nix", "dep:futures-core",
     "dep:pigeonhole-vector", "dep:pigeonhole-text",
+    # `--replica-of` (#1436): the replica side of replication, hidden in the library.
+    "pigeonhole/__unstable-replication",
 ]
 
 [dependencies]
@@ -57,14 +59,16 @@ arrow-ipc = { workspace = true }
 # `serve`: the network API's messages (prost), services (tonic, codegen only) and proto3 JSON
 # mapping (pbjson), generated into src/serve/proto/ by tools/protogen.
 prost = { version = "0.14", optional = true }
-tonic = { version = "0.14", default-features = false, features = ["codegen"], optional = true }
+# `channel` and TLS for a replica's client of its primary (`--replica-of`, #1436; ICR 0112's
+# amendment): rustls with the system's roots, as `embed` already uses.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-native-roots"], optional = true }
 tonic-prost = { version = "0.14", optional = true }
 pbjson = { version = "0.9", optional = true }
 serde = { version = "1", optional = true }
 # `serve`'s server: the runtime, one router for gRPC and HTTP/JSON, the limits, one accept
 # loop for plain and TLS connections, token digests, the table cache, and core counts for
 # placing threads off the shards' CPUs (perf287's R1 on D313).
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros", "fs", "io-util"], optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"], optional = true }
 tower = { version = "0.5", features = ["limit", "load-shed", "util"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio", "service"], optional = true }

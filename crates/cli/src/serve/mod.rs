@@ -30,6 +30,7 @@ mod http;
 mod indexes;
 mod listener;
 mod placement;
+mod replica;
 mod router;
 mod service;
 mod sessions;
@@ -85,7 +86,8 @@ impl Shared {
         if let Ok(
             service::ServiceReply::Scan(_)
             | service::ServiceReply::Feed(_)
-            | service::ServiceReply::Download(_),
+            | service::ServiceReply::Download(_)
+            | service::ServiceReply::Follow(_),
         ) = reply
         {
             return;
@@ -112,6 +114,33 @@ fn tokens(args: &ServeArgs) -> Result<auth::Tokens, Failure> {
     auth::Tokens::parse(&text, "the tokens").map_err(|e| Failure::usage(&e))
 }
 
+/// `--replica-of`'s settings, with the token from its file or `PHDB_REPLICA_TOKEN`.
+fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
+    let Some(primary) = &args.replica_of else {
+        return Ok(None);
+    };
+    if !(primary.starts_with("http://") || primary.starts_with("https://")) {
+        return Err(Failure::usage(
+            "--replica-of is the primary's URL: http://HOST:PORT or https://HOST:PORT",
+        ));
+    }
+    let token = match &args.replica_token_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?
+                .trim()
+                .to_owned(),
+        ),
+        None => std::env::var("PHDB_REPLICA_TOKEN").ok(),
+    }
+    .filter(|t| !t.is_empty());
+    Ok(Some(replica::Replica::new(replica::ReplicaConfig {
+        primary: primary.trim_end_matches('/').to_owned(),
+        token,
+        run_events: args.replica_run.max(1),
+    })))
+}
+
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     let mut options = Options::default().create_if_missing(args.create);
     // A database this command creates gets the server's default shard count. An existing
@@ -124,6 +153,9 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     }
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
+    }
+    if let Some(bytes) = args.change_feed {
+        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
     }
     if !args.create && !args.file.exists() {
         return Err(Failure::file_not_found(&args.file));
@@ -180,7 +212,24 @@ pub(crate) fn run(
         );
     }
 
+    let replica = replica(args)?;
     let db = open(cli, args)?;
+    if replica.is_some() {
+        // A bootstrap replaces the file: only a replica's, or an empty one, never a
+        // database of its own (a promoted replica restarted with `--replica-of` still set).
+        let is_replica = db
+            .replicated_seqno()
+            .map_err(|e| Failure::db("read the replica's state", &e))?
+            .is_some();
+        if !is_replica && !db.tables().is_empty() {
+            let _ = db.close();
+            return Err(Failure::usage(&format!(
+                "{} isn't a replica and has tables: --replica-of bootstraps only an empty \
+                 database or a replica's (a promoted one is a primary now)",
+                args.file.display()
+            )));
+        }
+    }
     let placement = Arc::new(placement::Placement::plan(
         &db,
         args.io_threads,
@@ -189,18 +238,21 @@ pub(crate) fn run(
     ));
     let limits = args.limits();
     let metrics = Arc::new(service::Metrics::default());
+    let mut service = service::Service::new(
+        db.clone(),
+        limits,
+        placement.blocking_threads,
+        Arc::clone(&metrics),
+    )
+    .backups(args.backup_dir.as_deref(), args.max_backups)
+    .map_err(|e| Failure::usage(&e))?
+    // Before `replica`: it rebuilds the indexes, whose rebalancing a replica pauses.
+    .placement(&placement);
+    if let Some(r) = &replica {
+        service = service.replica(Arc::clone(r));
+    }
     let shared = Arc::new(Shared {
-        router: router::Router::single(
-            service::Service::new(
-                db.clone(),
-                limits,
-                placement.blocking_threads,
-                Arc::clone(&metrics),
-            )
-            .backups(args.backup_dir.as_deref(), args.max_backups)
-            .map_err(|e| Failure::usage(&e))?
-            .placement(&placement),
-        ),
+        router: router::Router::single(service),
         tokens,
         limits,
         metrics,
@@ -252,6 +304,10 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
+        if let Some(r) = &replica {
+            let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());
+            r.spawn(Arc::clone(&shared));
+        }
         // At the signal, a running bulk load stops at its next message: it takes no more of
         // its stream, then writes and rebalances what it took (the coordinator on #1580).
         let stopping = Arc::clone(&shared);
@@ -260,6 +316,9 @@ pub(crate) fn run(
             stopping.router.service.bulk.stop();
         };
         listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms)).await;
+        if let Some(r) = &replica {
+            r.stop().await;
+        }
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
