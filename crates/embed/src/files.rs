@@ -347,7 +347,12 @@ mod tests {
                 offline: true,
             },
         ] {
-            match load(spec, f, &source) {
+            let e = load(spec, f, &source);
+            assert_eq!(
+                e.as_ref().map_err(Error::code).err(),
+                Some(pigeonhole::ErrorCode::Io)
+            );
+            match e {
                 Err(Error::Missing { path, url, .. }) => {
                     assert_eq!(path, dir.join("config.json"));
                     assert_eq!(
@@ -367,7 +372,10 @@ mod tests {
         let dir = scratch("checksum");
         let path = dir.join("config.json");
         std::fs::write(&path, b"{}").unwrap();
-        match load(spec, &spec.files[crate::model::CONFIG], &Source::Dir(&dir)) {
+        let e = load(spec, &spec.files[crate::model::CONFIG], &Source::Dir(&dir));
+        let code = e.as_ref().map_err(Error::code).err();
+        assert_eq!(code, Some(pigeonhole::ErrorCode::Corruption));
+        match e {
             Err(Error::Checksum {
                 expected, actual, ..
             }) => {

@@ -85,6 +85,13 @@ impl Model {
         self.spec().dim
     }
 
+    /// The longest input the model reads, in tokens (512): text past it is truncated. A
+    /// caller can warn on long text with a tokenizer's count, or with a rough rule (about
+    /// 0.75 English words a token).
+    pub fn max_tokens(self) -> usize {
+        self.spec().max_tokens
+    }
+
     /// The pinned upstream revision (a full commit id).
     pub fn revision(self) -> &'static str {
         self.spec().revision

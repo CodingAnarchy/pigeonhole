@@ -4,7 +4,7 @@ Local text embeddings for [`pigeonhole-memory`](https://crates.io/crates/pigeonh
 
 ```rust,no_run
 use pigeonhole::{Options, Pigeonhole};
-use pigeonhole_embed::{LoadOptions, LocalEmbedder, Model};
+use pigeonhole_embed::{Element, LoadOptions, LocalEmbedder, Model};
 use pigeonhole_memory::{Memory, Store, StoreOptions};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,7 +12,7 @@ use pigeonhole_memory::{Memory, Store, StoreOptions};
 let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
 // The first open downloads the model's files once (133 MB) and checks their SHA-256s.
 let embedder = LocalEmbedder::open(Model::BgeSmallEnV15, &LoadOptions::new())?;
-let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model()))?;
+let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model(Element::F32)?))?;
 
 let text = "The March meeting chose Postgres.";
 store.remember("agent:alice", Memory::new(text).embedding(embedder.embed_passages(&[text])?.remove(0)))?;

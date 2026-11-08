@@ -6,7 +6,7 @@
 //! It needs the model's files: set `PIGEONHOLE_EMBED_MODEL_DIR` to a directory holding them
 //! (CI restores them from its cache). Unset, the test says so and passes.
 
-use pigeonhole_embed::{LocalEmbedder, Model};
+use pigeonhole_embed::{Element, ErrorCode, LoadOptions, LocalEmbedder, Model};
 
 /// The least cosine between a vector and its reference.
 const MIN_COSINE: f64 = 0.9999;
@@ -57,7 +57,7 @@ fn the_local_model_matches_the_reference_vectors() {
     let r = reference();
     let model = Model::BgeSmallEnV15;
     assert_eq!(r["revision"], model.revision());
-    let e = LocalEmbedder::open_dir(model, dir).unwrap();
+    let e = LocalEmbedder::open(model, &LoadOptions::new().dir(dir)).unwrap();
     let texts = r["texts"].as_array().unwrap();
     let all: Vec<&str> = texts.iter().map(|t| t["text"].as_str().unwrap()).collect();
     let passages = e.embed_passages(&all).unwrap();
@@ -77,6 +77,9 @@ fn the_local_model_matches_the_reference_vectors() {
             batched,
         );
     }
-    let m = e.embedding_model();
+    let m = e.embedding_model(Element::F16).unwrap();
     assert_eq!((m.id(), m.dim()), ("BAAI/bge-small-en-v1.5@5c38ec7c", 384));
+    assert_eq!(m.element(), Element::F16);
+    let refused = e.embedding_model(Element::I8).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument);
 }

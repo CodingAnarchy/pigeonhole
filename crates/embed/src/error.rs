@@ -51,6 +51,29 @@ pub enum Error {
     Tokenizer(String),
     /// The embedder's thread pool couldn't be started.
     Threads(String),
+    /// An argument isn't valid: an [`Element`](pigeonhole::Element) a store can't take.
+    InvalidArgument(String),
+}
+
+impl Error {
+    /// The error's [`ErrorCode`](pigeonhole::ErrorCode), as `pigeonhole-vector`, `-text`
+    /// and `-memory` give theirs, so a front end maps errors without parsing messages:
+    /// - `Io`: [`Io`](Error::Io), [`Download`](Error::Download),
+    ///   [`Missing`](Error::Missing) (a file that isn't there) and [`Threads`](Error::Threads);
+    /// - `Corruption`: [`Checksum`](Error::Checksum), and [`Model`](Error::Model) and
+    ///   [`Tokenizer`](Error::Tokenizer) (files that verify but don't load);
+    /// - `InvalidArgument`: [`InvalidArgument`](Error::InvalidArgument).
+    pub fn code(&self) -> pigeonhole::ErrorCode {
+        use pigeonhole::ErrorCode as C;
+        match self {
+            Error::Io { .. }
+            | Error::Download { .. }
+            | Error::Missing { .. }
+            | Error::Threads(_) => C::Io,
+            Error::Checksum { .. } | Error::Model(_) | Error::Tokenizer(_) => C::Corruption,
+            Error::InvalidArgument(_) => C::InvalidArgument,
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -76,6 +99,7 @@ impl std::fmt::Display for Error {
             Error::Model(m) => write!(f, "the model: {m}"),
             Error::Tokenizer(m) => write!(f, "the tokenizer: {m}"),
             Error::Threads(m) => write!(f, "the embedder's thread pool: {m}"),
+            Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
         }
     }
 }

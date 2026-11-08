@@ -4514,7 +4514,10 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **Redirects** are followed only to Hugging Face's hosts.
   - **Offline:** `LoadOptions::offline` or `PIGEONHOLE_EMBED_OFFLINE=1`. Without the `download` feature, the crate has no network code.
 - **Inference:** candle 0.11 and tokenizers 0.23, CPU only, in pure Rust (no `onig`, no `cpp`, no BLAS, no GPU features). The weights are read into a buffer rather than mmapped, so the crate is `#![forbid(unsafe_code)]`.
-  - **Threads:** each embedder runs on its own rayon pool (`LoadOptions::threads`, default `min(cores, 4)`), never the application's global pool. Batches are 32 texts.
+  - **Threads:** each embedder runs its matrix products on its own rayon pool (`LoadOptions::threads`, default `min(cores, 4)`), never the application's global pool. A server places that pool with `LoadOptions::on_thread_start`. Batches are 32 texts, padded to the longest (perf287's E3: length buckets can come later).
+  - **candle's own pool:** candle 0.11 also runs element-wise steps of 64K elements and up on a process-wide "barrier pool". It has one thread per physical core less one (`CANDLE_NUM_THREADS`), spins briefly before parking, and on Linux is pinned by `CANDLE_CPU_MASK`. The embedder's pool and `on_thread_start` don't reach it (perf287's E2).
+    - **candle 0.10.2** has no such pool and runs everything on the embedder's, but it's slower. On the laptop at 4 threads, it took 13.4 against 8.4 ms at 16 tokens, and 141 against 65 ms at 256 tokens.
+    - **So:** 0.11 is kept, the two variables are documented, and `phdb serve` sets them from its placement (D313).
 - **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
 - **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
 - **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.

@@ -1,10 +1,12 @@
 //! [`LocalEmbedder`]: a model loaded once, embedding on a thread pool of its own.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
+use pigeonhole::Element;
 use pigeonhole_memory::EmbeddingModel;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
@@ -16,12 +18,25 @@ use crate::model::{CONFIG, Model, Spec, TOKENIZER, WEIGHTS};
 const BATCH: usize = 32;
 
 /// How [`LocalEmbedder::open`] finds the model's files and runs it.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LoadOptions {
     dir: Option<PathBuf>,
     cache: Option<PathBuf>,
     offline: bool,
     threads: Option<usize>,
+    on_thread_start: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LoadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadOptions")
+            .field("dir", &self.dir)
+            .field("cache", &self.cache)
+            .field("offline", &self.offline)
+            .field("threads", &self.threads)
+            .field("on_thread_start", &self.on_thread_start.is_some())
+            .finish()
+    }
 }
 
 impl LoadOptions {
@@ -53,8 +68,21 @@ impl LoadOptions {
     }
 
     /// The embedder's threads (at least 1). Unset: `min(available parallelism, 4)`.
+    ///
+    /// Every call on one embedder queues for this pool, so `threads` bounds the CPU its
+    /// matrix products take, however many threads call it. (candle also runs large
+    /// element-wise steps on a process-wide pool of its own, sized by `CANDLE_NUM_THREADS`
+    /// and, on Linux, placed by `CANDLE_CPU_MASK`: see the crate docs.)
     pub fn threads(mut self, n: usize) -> Self {
         self.threads = Some(n.max(1));
+        self
+    }
+
+    /// Runs `f` first on each of the embedder's pool threads, as each starts: to place them
+    /// (CPU affinity, a scheduling class) away from latency-sensitive threads, as a server
+    /// keeps its non-shard threads off the shards' cores.
+    pub fn on_thread_start(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_thread_start = Some(Arc::new(f));
         self
     }
 }
@@ -135,11 +163,13 @@ impl LocalEmbedder {
         let threads = options
             .threads
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)));
-        let pool = rayon::ThreadPoolBuilder::new()
+        let mut pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|i| format!("pigeonhole-embed-{i}"))
-            .build()
-            .map_err(|e| Error::Threads(e.to_string()))?;
+            .thread_name(|i| format!("pigeonhole-embed-{i}"));
+        if let Some(f) = options.on_thread_start.clone() {
+            pool = pool.start_handler(move |_| f());
+        }
+        let pool = pool.build().map_err(|e| Error::Threads(e.to_string()))?;
         Ok(Self {
             model,
             spec,
@@ -149,25 +179,26 @@ impl LocalEmbedder {
         })
     }
 
-    /// [`open`](Self::open) from `dir` only: [`LoadOptions::new().dir(dir)`](LoadOptions::dir).
-    pub fn open_dir(model: Model, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open(model, &LoadOptions::new().dir(dir.as_ref()))
-    }
-
     /// The model.
     pub fn model(&self) -> Model {
         self.model
     }
 
     /// The record a store pins at create: the model's [`id`](Model::id) (with its revision),
-    /// its dimension, and `F32`.
-    pub fn embedding_model(&self) -> EmbeddingModel {
-        EmbeddingModel::new(self.spec.id, self.spec.dim, pigeonhole::Element::F32)
-            .expect("an f32 model is a valid EmbeddingModel")
+    /// its dimension, and `element`, the store's vector element: `F32`, or `F16` or `BF16`
+    /// for half the space. The embeddings are always `f32`, and a half store rounds them as it
+    /// writes them, as `pigeonhole-memory` does for any model.
+    ///
+    /// `InvalidArgument` for `I8` or `Bit`, which a store refuses (D303).
+    pub fn embedding_model(&self, element: Element) -> Result<EmbeddingModel> {
+        EmbeddingModel::new(self.spec.id, self.spec.dim, element)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))
     }
 
     /// The embeddings of texts to remember: one unit-length vector each, in order. Text
-    /// longer than the model's limit (512 tokens) is truncated.
+    /// longer than the model's [`max_tokens`](Model::max_tokens) is truncated, silently: the
+    /// stored text stays whole, and keyword recall still sees all of it. Batches are padded to
+    /// their longest text, so texts of similar lengths batch cheapest.
     pub fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(BATCH) {

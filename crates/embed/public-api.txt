@@ -1,5 +1,7 @@
 pub mod pigeonhole_embed
+pub use pigeonhole_embed::Element
 pub use pigeonhole_embed::EmbeddingModel
+pub use pigeonhole_embed::ErrorCode
 #[non_exhaustive] pub enum pigeonhole_embed::Error
 pub pigeonhole_embed::Error::Checksum
 pub pigeonhole_embed::Error::Checksum::actual: alloc::string::String
@@ -8,6 +10,7 @@ pub pigeonhole_embed::Error::Checksum::path: std::path::PathBuf
 pub pigeonhole_embed::Error::Download
 pub pigeonhole_embed::Error::Download::message: alloc::string::String
 pub pigeonhole_embed::Error::Download::url: alloc::string::String
+pub pigeonhole_embed::Error::InvalidArgument(alloc::string::String)
 pub pigeonhole_embed::Error::Io
 pub pigeonhole_embed::Error::Io::path: std::path::PathBuf
 pub pigeonhole_embed::Error::Io::source: core::io::error::Error
@@ -18,6 +21,8 @@ pub pigeonhole_embed::Error::Missing::why: &'static str
 pub pigeonhole_embed::Error::Model(alloc::string::String)
 pub pigeonhole_embed::Error::Threads(alloc::string::String)
 pub pigeonhole_embed::Error::Tokenizer(alloc::string::String)
+impl pigeonhole_embed::Error
+pub fn pigeonhole_embed::Error::code(&self) -> pigeonhole::error::ErrorCode
 impl core::error::Error for pigeonhole_embed::Error
 pub fn pigeonhole_embed::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for pigeonhole_embed::Error
@@ -27,6 +32,7 @@ pub pigeonhole_embed::Model::BgeSmallEnV15
 impl pigeonhole_embed::Model
 pub fn pigeonhole_embed::Model::dim(self) -> u32
 pub fn pigeonhole_embed::Model::id(self) -> &'static str
+pub fn pigeonhole_embed::Model::max_tokens(self) -> usize
 pub fn pigeonhole_embed::Model::revision(self) -> &'static str
 pub struct pigeonhole_embed::LoadOptions
 impl pigeonhole_embed::LoadOptions
@@ -34,15 +40,17 @@ pub fn pigeonhole_embed::LoadOptions::cache_dir(self, impl core::convert::Into<s
 pub fn pigeonhole_embed::LoadOptions::dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn pigeonhole_embed::LoadOptions::new() -> Self
 pub fn pigeonhole_embed::LoadOptions::offline(self) -> Self
+pub fn pigeonhole_embed::LoadOptions::on_thread_start(self, impl core::ops::function::Fn() + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn pigeonhole_embed::LoadOptions::threads(self, usize) -> Self
+impl core::fmt::Debug for pigeonhole_embed::LoadOptions
+pub fn pigeonhole_embed::LoadOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_embed::LocalEmbedder
 impl pigeonhole_embed::LocalEmbedder
 pub fn pigeonhole_embed::LocalEmbedder::embed_passages(&self, &[&str]) -> pigeonhole_embed::Result<alloc::vec::Vec<alloc::vec::Vec<f32>>>
 pub fn pigeonhole_embed::LocalEmbedder::embed_query(&self, &str) -> pigeonhole_embed::Result<alloc::vec::Vec<f32>>
-pub fn pigeonhole_embed::LocalEmbedder::embedding_model(&self) -> pigeonhole_memory::store::EmbeddingModel
+pub fn pigeonhole_embed::LocalEmbedder::embedding_model(&self, pigeonhole::vector::Element) -> pigeonhole_embed::Result<pigeonhole_memory::store::EmbeddingModel>
 pub fn pigeonhole_embed::LocalEmbedder::model(&self) -> pigeonhole_embed::Model
 pub fn pigeonhole_embed::LocalEmbedder::open(pigeonhole_embed::Model, &pigeonhole_embed::LoadOptions) -> pigeonhole_embed::Result<Self>
-pub fn pigeonhole_embed::LocalEmbedder::open_dir(pigeonhole_embed::Model, impl core::convert::AsRef<std::path::Path>) -> pigeonhole_embed::Result<Self>
 impl core::fmt::Debug for pigeonhole_embed::LocalEmbedder
 pub fn pigeonhole_embed::LocalEmbedder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub type pigeonhole_embed::Result<T> = core::result::Result<T, pigeonhole_embed::Error>

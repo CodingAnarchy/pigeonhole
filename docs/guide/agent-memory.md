@@ -44,10 +44,10 @@ pigeonhole-embed = "0.1"
 ```
 
 ```rust,ignore
-use pigeonhole_embed::{LoadOptions, LocalEmbedder, Model};
+use pigeonhole_embed::{Element, LoadOptions, LocalEmbedder, Model};
 
 let embedder = LocalEmbedder::open(Model::BgeSmallEnV15, &LoadOptions::new())?;
-let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model()))?;
+let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model(Element::F32)?))?;
 
 let text = "The March meeting chose Postgres.";
 store.remember("agent:alice", Memory::new(text).embedding(embedder.embed_passages(&[text])?.remove(0)))?;
@@ -63,7 +63,9 @@ let hits = store
 - **The files:** the weights (133 MB) aren't in the crate. The first `open` downloads the model's three files from the pinned revision on huggingface.co into the cache: `$PIGEONHOLE_EMBED_CACHE`, else `~/.cache/pigeonhole/models` on Linux, `~/Library/Caches/pigeonhole/models` on macOS, and `%LOCALAPPDATA%\pigeonhole\models` on Windows. Every file is checked against a SHA-256 pinned in the crate, however it arrived.
 - **Offline and air-gapped:** `LoadOptions::offline()` (or `PIGEONHOLE_EMBED_OFFLINE=1`) never downloads, and a missing file fails with the URL to fetch and where to put it. `LoadOptions::dir(path)` loads from a directory you filled yourself. Build with `default-features = false` to leave out the download code entirely.
 - **Text past 512 tokens is truncated** (about 350 English words), so split long documents before remembering them.
-- **CPU cost:** each embedder has its own thread pool (`LoadOptions::threads`, by default up to 4), so it never takes your application's rayon pool. A `LocalEmbedder` is `Send` and `Sync`: share one. On a 10-core Apple laptop:
+- **One embedder, shared:** each `LocalEmbedder` holds the weights (about 133 MB), and it's `Send` and `Sync`. Calls from many threads queue for its pool.
+- **The store's element:** `embedding_model(Element::F16)` (or `BF16`) pins a half-size store. The embeddings stay `f32`, and the store rounds them as it writes.
+- **CPU cost:** the matrix products run on the embedder's own thread pool (`LoadOptions::threads`, by default up to 4), never your application's rayon pool. `LoadOptions::on_thread_start` can place its threads. candle runs large element-wise steps on a process-wide pool of its own, one thread per physical core less one, sized by `CANDLE_NUM_THREADS` and on Linux pinned by `CANDLE_CPU_MASK` (a CPU list). Set both before the first embedding to keep embedding work off cores your latency-sensitive threads use. On a 10-core Apple laptop:
 
 | Threads | 16 tokens | 64 tokens | 256 tokens | Batches of 32 (16 tokens) |
 |---|---|---|---|---|
