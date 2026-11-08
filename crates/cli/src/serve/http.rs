@@ -298,7 +298,23 @@ async fn call(
         }
     }
     let rpc = op.index();
-    let reply = shared.router.dispatch(op, &caller, Some(budget)).await;
+    // Read-your-writes on a replica (#1577), within the request timeout.
+    let reply = match super::replica::min_primary_seqno(
+        headers
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    ) {
+        Ok(seqno) => match shared
+            .router
+            .service
+            .await_primary(&op, seqno, shared.limits.request_timeout)
+            .await
+        {
+            Ok(()) => shared.router.dispatch(op, &caller, Some(budget)).await,
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
     shared.count(rpc, started, &reply);
     match reply {
         Ok(ServiceReply::Get(r)) => json(&r),

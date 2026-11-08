@@ -239,7 +239,11 @@ impl Stream for Rest {
 
 /// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
 fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
-    let v = headers.get("grpc-timeout")?.to_str().ok()?;
+    parse_grpc_timeout(headers.get("grpc-timeout")?.to_str().ok()?)
+}
+
+/// A `grpc-timeout` value: digits and a unit.
+fn parse_grpc_timeout(v: &str) -> Option<Duration> {
     let (n, unit) = v.split_at(v.len().checked_sub(1)?);
     let n: u64 = n.parse().ok()?;
     Some(match unit {
@@ -293,9 +297,29 @@ async fn call<T>(
     let caller = shared.caller(header)?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
+    let min_primary_seqno = super::replica::min_primary_seqno(
+        req.metadata()
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    // Bounded by the client's deadline when it set a shorter one (#1577).
+    let wait = req
+        .metadata()
+        .get("grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_grpc_timeout)
+        .map_or(shared.limits.request_timeout, |d| {
+            d.min(shared.limits.request_timeout)
+        });
     let op = op(req.into_inner());
     let rpc = op.index();
-    let reply = shared.router.dispatch(op, &caller, prepaid).await;
+    let reply = match min_primary_seqno {
+        Ok(seqno) => match shared.router.service.await_primary(&op, seqno, wait).await {
+            Ok(()) => shared.router.dispatch(op, &caller, prepaid).await,
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
     shared.count(rpc, started, &reply);
     Ok(reply?)
 }

@@ -395,7 +395,7 @@ pub(crate) const RPCS: [&str; 43] = [
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 44] = [
+pub(crate) const OUTCOMES: [&str; 45] = [
     "ok",
     "Io",
     "Corruption",
@@ -438,6 +438,7 @@ pub(crate) const OUTCOMES: [&str; 44] = [
     "TransactionExpired",
     "TransactionFinished",
     "FailedPrecondition",
+    "ReplicaBehind",
     "Internal",
     "other",
 ];
@@ -750,6 +751,27 @@ impl Service {
         // until a promote (cli692's F3 on #1583).
         self.indexes.pause_rebalancing(true);
         self
+    }
+
+    /// Read-your-writes on a replica (#1577): with the client's `min_primary_seqno` (the
+    /// `x-pigeonhole-min-primary-seqno` header), a read waits at most `wait` until the replica
+    /// has applied the primary's commits through it. Reads only: a write is refused on a
+    /// replica anyway, and `Info` and `Metrics` answer at once (a monitor must see a lagging
+    /// replica). A server that isn't a replica, or was promoted, ignores it. The wait holds the
+    /// request's slot and budget, as any read in progress does.
+    pub(crate) async fn await_primary(
+        &self,
+        op: &ServiceOp,
+        min_primary_seqno: Option<u64>,
+        wait: Duration,
+    ) -> Result<(), ApiError> {
+        let (Some(seqno), Some(replica)) = (min_primary_seqno, &self.replica) else {
+            return Ok(());
+        };
+        if op.scope() != Scope::Read || matches!(op, ServiceOp::Info(_) | ServiceOp::Metrics(_)) {
+            return Ok(());
+        }
+        replica.wait_applied(seqno, wait).await
     }
 
     /// `Admin.Info`'s replica section.

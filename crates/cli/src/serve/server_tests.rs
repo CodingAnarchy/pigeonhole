@@ -106,6 +106,16 @@ impl Server {
     /// A replica server (#1436) of the server at `primary`, on `dir`'s `t.phdb` (an empty
     /// database if there is none), sending `token` to the primary.
     fn start_replica(dir: PathBuf, primary: &str, token: Option<&str>) -> Self {
+        Self::start_replica_with(dir, primary, token, limits())
+    }
+
+    /// `start_replica` with its own limits.
+    fn start_replica_with(
+        dir: PathBuf,
+        primary: &str,
+        token: Option<&str>,
+        limits: Limits,
+    ) -> Self {
         std::fs::create_dir_all(dir.join("backups")).unwrap();
         let db = Pigeonhole::open(
             dir.join("t.phdb"),
@@ -117,7 +127,7 @@ impl Server {
             token: token.map(str::to_owned),
             run_events: 4,
         });
-        Self::serve(dir, db, "", limits(), Some(replica), |s| s)
+        Self::serve(dir, db, "", limits, Some(replica), |s| s)
     }
 
     fn serve(
@@ -182,6 +192,17 @@ impl Server {
 
     /// `POST /v1/{path}`, e.g. `Transactions/Begin`.
     fn rpc(&self, path: &str, body: &Json, token: Option<&str>) -> (u16, Json) {
+        self.rpc_with(path, body, token, &[])
+    }
+
+    /// `rpc` with more request headers.
+    fn rpc_with(
+        &self,
+        path: &str,
+        body: &Json,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> (u16, Json) {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build()
@@ -189,6 +210,9 @@ impl Server {
         let mut req = agent.post(format!("{}/v1/{path}", self.url));
         if let Some(t) = token {
             req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        for (name, value) in headers {
+            req = req.header(*name, *value);
         }
         let mut resp = req.send_json(body).unwrap();
         let status = resp.status().as_u16();
@@ -3743,9 +3767,10 @@ fn caught_up(primary: &Server, token: Option<&str>) -> impl Fn(&Json) -> bool {
     let seqno = primary.shared.router.service.db.visible_seqno();
     move |r: &Json| {
         r["state"] == "following"
+            // A 64-bit field is a string, and absent when 0.
             && r["applied_primary_seqno"]
                 .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
+                .map_or(Some(0), |s| s.parse::<u64>().ok())
                 .is_some_and(|a| a >= seqno)
             && r.get("lag_ms").is_none()
     }
@@ -4192,4 +4217,119 @@ fn a_swap_ends_the_old_copy_s_feed_streams_with_an_error() {
             e.message
         );
     }
+}
+
+// ---- Read-your-writes on a replica (#1577) ----
+
+/// A client that committed on the primary reads its write on a replica by sending the
+/// commit's seqno (`x-pigeonhole-min-primary-seqno`): the replica waits until it has applied
+/// it. The primary's background sync is set far off, so a `Buffered` commit reaches the
+/// replica only when a later `GroupSync` commit syncs it: a replica held behind for as long
+/// as the test likes, with no hook.
+#[test]
+fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
+    let dir = test_dir();
+    let db = Pigeonhole::open(
+        dir.join("t.phdb"),
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .change_feed(
+                pigeonhole::FeedRetention::bytes(64 << 20).sync_interval(Duration::from_secs(600)),
+            ),
+    )
+    .unwrap();
+    db.table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let p = Server::serve(dir, db, "", limits(), None, |s| s);
+    let mut short = limits();
+    short.request_timeout = Duration::from_millis(500);
+    let r = Server::start_replica_with(test_dir(), &p.url, None, short);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+
+    let mut w = put("x", "f", "q", json!({"bytes": b64(b"mine")}));
+    w["durability"] = json!("DURABILITY_BUFFERED");
+    let (status, body) = p.post("Mutate", &w, None);
+    assert_eq!(status, 200, "{body}");
+    let seqno = body["commit"]["seqno"].as_str().unwrap().to_owned();
+    let get = json!({"table": "t", "row": b64(b"x"), "family": "f", "qualifier": b64(b"q")});
+    let header = [(super::replica::MIN_PRIMARY_SEQNO, seqno.as_str())];
+
+    // Not durable on the primary, so not on the replica: the read waits out its deadline,
+    // then fails retry-safe, having read nothing.
+    let (status, body) = r.rpc_with("Data/Get", &get, None, &header);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("ReplicaBehind")),
+        "{body}"
+    );
+    assert_eq!(body["retry_from"], "RETRY_FROM_REQUEST", "{body}");
+    // Without the header, a replica answers what it has.
+    let (status, body) = r.post("Get", &get, None);
+    assert_eq!((status, body.get("cell").is_none()), (200, true), "{body}");
+
+    // A read that waits, while the primary syncs: a GroupSync commit covers `x`.
+    let started = std::time::Instant::now();
+    let (status, body) = std::thread::scope(|scope| {
+        // Within the replica's 500 ms request timeout.
+        let read = scope.spawn(|| r.rpc_with("Data/Get", &get, None, &header));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!read.is_finished(), "the read waits for the replica");
+        let sync = put("y", "f", "q", json!({"bytes": b64(b"sync")}));
+        assert_eq!(p.post("Mutate", &sync, None).0, 200);
+        read.join().unwrap()
+    });
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["cell"]["value"],
+        b64(b"mine"),
+        "it reads its own write"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+
+    // Over gRPC, as metadata.
+    let mut client = r.grpc();
+    let mut req = tonic::Request::new(proto::GetRequest {
+        table: "t".into(),
+        row: b"x".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert(super::replica::MIN_PRIMARY_SEQNO, seqno.parse().unwrap());
+    let got = r.block_on(client.get(req)).unwrap().into_inner();
+    assert!(got.cell.is_some());
+
+    // A seqno far ahead: ReplicaBehind over gRPC too (UNAVAILABLE).
+    let mut req = tonic::Request::new(proto::GetRequest {
+        table: "t".into(),
+        row: b"x".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    });
+    req.metadata_mut().insert(
+        super::replica::MIN_PRIMARY_SEQNO,
+        "999999999".parse().unwrap(),
+    );
+    let err = r.block_on(client.get(req)).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+
+    // Not a number: InvalidArgument. A primary ignores the header. Info doesn't wait.
+    let bad = [(super::replica::MIN_PRIMARY_SEQNO, "soon")];
+    let (status, body) = r.rpc_with("Data/Get", &get, None, &bad);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{body}"
+    );
+    let ahead = [(super::replica::MIN_PRIMARY_SEQNO, "999999999")];
+    let (status, body) = p.rpc_with("Data/Get", &get, None, &ahead);
+    assert_eq!(status, 200, "a primary ignores it: {body}");
+    let (status, body) = r.rpc_with("Admin/Info", &json!({}), None, &ahead);
+    assert_eq!(status, 200, "Info answers at once: {body}");
 }

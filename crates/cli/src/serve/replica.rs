@@ -49,6 +49,29 @@ pub(crate) const RUN_BYTES: usize = 8 << 20;
 /// The default `--replica-run`.
 pub(crate) const RUN_EVENTS: usize = 256;
 
+/// The request header a client sends with a read on a replica to see its own writes (#1577):
+/// the seqno of its commit on the primary (`CommitInfo.seqno`, decimal). The replica waits,
+/// up to the request's deadline, until it has applied the primary's commits through it. A
+/// server that isn't a replica ignores it.
+pub(crate) const MIN_PRIMARY_SEQNO: &str = "x-pigeonhole-min-primary-seqno";
+
+/// [`MIN_PRIMARY_SEQNO`]'s value: none without the header, `InvalidArgument` unless it's a
+/// decimal `u64`.
+pub(crate) fn min_primary_seqno(value: Option<&[u8]>) -> Result<Option<u64>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::invalid(format!(
+                "{MIN_PRIMARY_SEQNO} is a primary commit's seqno, a decimal number"
+            ))
+        })
+}
+
 /// The longest pause between a replica's attempts after an error.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -238,6 +261,9 @@ pub(crate) struct Replica {
     promoting: AtomicBool,
     stop: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The primary's seqno applied through, as `Status::applied`, for reads waiting on it
+    /// (#1577). It goes back to 0 only when a bootstrap swaps another copy in.
+    applied: watch::Sender<u64>,
 }
 
 /// Why following stopped.
@@ -267,6 +293,7 @@ impl Replica {
             promoting: AtomicBool::new(false),
             stop: watch::channel(false).0,
             task: Mutex::new(None),
+            applied: watch::channel(0).0,
         })
     }
 
@@ -292,6 +319,39 @@ impl Replica {
         let mut s = self.status();
         s.state = state;
         s.last_error = error;
+    }
+
+    fn set_applied(&self, applied: u64) {
+        self.status().applied = applied;
+        self.applied.send_replace(applied);
+    }
+
+    /// Waits until the replica has applied the primary's commits through `seqno`, at most
+    /// `wait` (#1577: read-your-writes on a replica). `ReplicaBehind` (retry-safe) if it
+    /// hasn't by then, or at once while a bootstrap runs: a copy being swapped in has
+    /// nothing to wait on. Immediate once promoted: the database is a primary then.
+    pub(crate) async fn wait_applied(&self, seqno: u64, wait: Duration) -> Result<(), ApiError> {
+        if !self.refuses_writes() {
+            return Ok(());
+        }
+        let mut rx = self.applied.subscribe();
+        if *rx.borrow() >= seqno {
+            return Ok(());
+        }
+        let state = self.status().state;
+        if matches!(state, "bootstrapping" | "re-bootstrapping") {
+            return Err(ApiError::replica_behind(format!(
+                "this replica is {state}: it can't wait for the primary's seqno {seqno}"
+            )));
+        }
+        match tokio::time::timeout(wait, rx.wait_for(|&a| a >= seqno)).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(ApiError::replica_behind(format!(
+                "this replica hadn't applied the primary's seqno {seqno} within the request's \
+                 deadline (it's at {}): retry, or read from the primary",
+                *self.applied.borrow()
+            ))),
+        }
     }
 
     /// `Admin.Info`'s section: `None` once promoted.
@@ -485,7 +545,7 @@ impl Replica {
             };
             match stored {
                 Ok(Ok((Some(applied), Some(token)))) => {
-                    self.status().applied = applied;
+                    self.set_applied(applied);
                     break token;
                 }
                 // Not a replica yet: the first bootstrap, then follow from its token. (A
@@ -616,7 +676,7 @@ impl Replica {
         .await
         .map_err(|e| format!("applying a run: {e}"))?
         .map_err(|e| format!("applying a run: {e}"))?;
-        self.status().applied = applied;
+        self.set_applied(applied);
         Ok(())
     }
 
@@ -630,8 +690,8 @@ impl Replica {
             .map_err(|e| format!("applying a catalog change: {e}"));
         shared.router.service.tables_changed();
         outcome?.map_err(|e| format!("applying a catalog change: {e}"))?;
-        let mut s = self.status();
-        s.applied = s.applied.max(applied);
+        let applied = applied.max(self.status().applied);
+        self.set_applied(applied);
         Ok(())
     }
 
@@ -666,8 +726,8 @@ impl Replica {
         // nothing cached of the old one may serve again.
         service.engine_replaced();
         swapped.map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        self.set_applied(0);
         let mut s = self.status();
-        s.applied = 0;
         s.caught_up = false;
         s.behind_since = Instant::now();
         s.last_error.clear();
