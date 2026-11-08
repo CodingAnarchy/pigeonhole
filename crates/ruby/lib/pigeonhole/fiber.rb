@@ -92,12 +92,25 @@ module Pigeonhole
         ensure
           @parked.delete(op.id)
           hand_off(scheduler) if @drainer.equal?(entry)
+          absorb(scheduler, op) if entry.resuming
           op.cancel unless entry.done
         end
         op.take
       end
 
       private
+
+      # The longest a raised-into fiber waits to take the resume already sent to it.
+      ABSORB_LIMIT = 1.0
+
+      # Takes the resume the drainer already sent this fiber when something else resumed it
+      # first: a raise (`Async::Task#stop`, a timeout, `Thread#raise`) crossing a queued
+      # unblock, the design note's R2 residual. Left queued, that resume reaches the fiber's
+      # next wait, somewhere unrelated, and ends it early (the minimal scheduler's test hit it
+      # on CI). Bounded, for a scheduler that drops an unblock of a fiber that isn't blocked.
+      def absorb(scheduler, op)
+        Thread.handle_interrupt(Object => :never) { scheduler.block(op, ABSORB_LIMIT) }
+      end
 
       # The drainer's loop: waits on the pipe through the scheduler, polls the woken ops, and
       # resumes the fibers whose ops are done, until its own is.

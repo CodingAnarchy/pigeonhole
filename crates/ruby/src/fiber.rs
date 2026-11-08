@@ -160,7 +160,8 @@ impl FiberBridge {
         let shared = Arc::clone(rb_self.0.get(ruby)?);
         without_gvl(ruby, move || {
             let mut buf = [0u8; 64];
-            // Non-blocking: `WouldBlock` (or anything else) ends it.
+            // Non-blocking: `WouldBlock` (or anything else, `EINTR` included) ends it. A byte
+            // left behind only makes the next wait return at once, for nothing (cli692's N2).
             while matches!((&shared.reader).read(&mut buf), Ok(n) if n > 0) {}
             shared.armed.store(false, Ordering::SeqCst);
             let mut woken = std::mem::take(&mut *lock(&shared.ready));

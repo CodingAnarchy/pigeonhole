@@ -33,6 +33,8 @@ A fiber raised into while it waits drops its op's future, as D210 defines:
 
 So it's the same outcome as Python's asyncio forms (ICR 0121).
 
+**A raise crossing a resume already sent** (the design note's R2 residual, cli692's N1): the drainer has unblocked a fiber whose op is done, and before that resume runs, a raise resumes the fiber instead. The scheduler still holds the unblock. The fiber's `ensure` then takes it with one more `block`, bounded at 1 s and with interrupts masked, before it unwinds. So the stale resume can't end the fiber's next, unrelated wait early. This relies on the scheduler keeping an unblock for a fiber that wasn't blocked when it arrived, as queue-based schedulers do (Async, and Ruby's test scheduler). A scheduler that drops it costs the stopping fiber up to 1 s, never a stray resume. CI's minimal-scheduler run found the case before the absorb was added.
+
 ## Known effects
 - **After a fork,** the child leaves the parent's bridge open (two file descriptors for each thread that had waited) and makes its own (S1).
 - **The change feed's, memory's and recall's waits** follow in #1574's later PRs, and they're named here when they land.
