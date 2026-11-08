@@ -6,6 +6,9 @@
 #
 #   scripts/instructions-per-cell.sh HOTROW_BINARY [SHAPE_BINARY:shape,shape,... ...]
 #
+# A HOTROW_BINARY of `-` skips the hot-row states (and their guard): a run of shape binaries
+# alone, as the instructions workflow's text-search job is (#1575).
+#
 # for example
 #
 #   scripts/instructions-per-cell.sh target/release/examples/hotrow \
@@ -52,6 +55,9 @@ shift || true
 work="$(mktemp -d)"
 
 states=("as-written:" "flushed:HOT_FLUSH=1" "compacted:HOT_COMPACT=1")
+if [[ "$bin" == - ]]; then
+    states=()
+fi
 
 # Fewest instructions a unit of real work can take: the cheapest state or shape measures well
 # over 1,000 (a cell of a compacted row read). Far below this, the measured functions missed
@@ -122,8 +128,10 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
     # One setup-only run per binary (each runs its full setup under valgrind, so one per
     # state or shape would cost about two thirds more time): hotrow's first state, and each
     # shape binary's last shape, which should be the one with the fullest setup.
-    guard "${states[0]%%:*}" '*hotrow_iteration*' "${states[0]#*:}" "$bin" 20 "$work"
-    for s in "${states[@]}"; do
+    if (( ${#states[@]} > 0 )); then
+        guard "${states[0]%%:*}" '*hotrow_iteration*' "${states[0]#*:}" "$bin" 20 "$work"
+    fi
+    for s in ${states[@]+"${states[@]}"}; do
         name="${s%%:*}"; env_set="${s#*:}"
         ir=$(callgrind '*hotrow_iteration*' "$env_set" "$bin" 20 "$work")
         report "$name" "$ir" "$(units_of "$work/err")"
@@ -141,7 +149,7 @@ elif [[ -x /usr/bin/time ]] && [[ "$(uname)" == Darwin ]]; then
         /usr/bin/time -l "$@" </dev/null 2>"$work/err" >/dev/null
         awk '/instructions retired/{print $1}' "$work/err"
     }
-    for s in "${states[@]}"; do
+    for s in ${states[@]+"${states[@]}"}; do
         name="${s%%:*}"; env_set="${s#*:}"
         a=$(count env $env_set "$bin" 1000 "$work"); a_units=$(units_of "$work/err")
         b=$(count env $env_set "$bin" 3000 "$work"); b_units=$(units_of "$work/err")

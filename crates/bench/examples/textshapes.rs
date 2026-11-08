@@ -18,7 +18,8 @@
 //! **One build per side.** With `TEXTSHAPES_INDEX=DIR` set, `build DIR` writes the index
 //! there natively. The instructions workflow runs it once per side before the shapes, which
 //! then only open it. Without the variable, a shape builds the index into its own scratch
-//! directory first. The build reads a stepped wall clock from a fixed start (`FixedClock`),
+//! directory first. The build also writes the phrase shapes' queries beside the index
+//! ([`PHRASES_FILE`]), so no shape regenerates the corpus under valgrind. The build reads a stepped wall clock from a fixed start (`FixedClock`),
 //! with a fixed sequence of random ids, so the index is laid out the same however and wherever
 //! it's built. Wall-clock timestamps would change the SSTs' encoding and block boundaries,
 //! and with them the counts (#1305). (The files still differ in bytes no search reads.)
@@ -83,6 +84,12 @@ const PHRASE_QUERIES: usize = 25;
 const HUB_POSTINGS: usize = 95_649;
 /// The index directory's name inside `DIR` when the shape builds it itself.
 const INDEX_DIR: &str = "phdb-textshapes-index";
+/// The phrase shapes' queries, written by `build` beside the index: one `a b` pair per line.
+/// Drawing them needs the corpus, and regenerating 100,000 documents under valgrind for each
+/// phrase shape was a large part of the job's setup time (#1575).
+const PHRASES_FILE: &str = "phrases.txt";
+/// The seed of every shape's queries (and of the phrase list `build` writes).
+const QUERY_SEED: u64 = 0x5EED_1560;
 /// The wall clock's start (µs since the epoch), and how far it moves per reading.
 const CLOCK_START_US: u64 = 1_600_000_000_000_000;
 /// A reopened index's clock starts this far after the build's, so no timestamp it reads is
@@ -269,7 +276,13 @@ fn build(dir: &Path) {
         IndexOptions::new().positions(true),
     )
     .unwrap();
-    for (i, d) in corpus().iter().enumerate() {
+    let corpus = corpus();
+    let phrase_list = phrases(&corpus, &mut Rng(QUERY_SEED))
+        .into_iter()
+        .map(|(a, b)| format!("{a} {b}\n"))
+        .collect::<String>();
+    std::fs::write(tmp.join(PHRASES_FILE), phrase_list).expect("write the phrase queries");
+    for (i, d) in corpus.iter().enumerate() {
         let text = d.iter().map(|&r| word(r)).collect::<Vec<_>>().join(" ");
         index.put(&doc_id(i), &text).unwrap();
         // A flush every 20,000 documents bounds the build's memory (the driver's memtable
@@ -319,9 +332,9 @@ fn phrases(corpus: &[Vec<usize>], rng: &mut Rng) -> Vec<(String, String)> {
 }
 
 /// The shape's queries and `k`, seeded: the same on every run.
-fn queries(shape: &str) -> (Vec<Query>, usize) {
+fn queries(shape: &str, dir: &Path) -> (Vec<Query>, usize) {
     let z = Zipf::new();
-    let mut rng = Rng(0x5EED_1560);
+    let mut rng = Rng(QUERY_SEED);
     let terms = |n: usize, rng: &mut Rng| -> Vec<Query> {
         (0..QUERIES)
             .map(|_| (0..n).fold(Query::new(), |q, _| q.term(word(z.rank(rng)))))
@@ -356,7 +369,18 @@ fn queries(shape: &str) -> (Vec<Query>, usize) {
         ),
         "text-phrase" | "text-phrase-slop2" => {
             let slop = if shape == "text-phrase" { 0 } else { 2 };
-            let ps = phrases(&corpus(), &mut rng);
+            // The list `build` wrote, the same pairs `phrases` draws with this seed: reading
+            // it skips regenerating the corpus under valgrind.
+            let ps: Vec<(String, String)> = match std::fs::read_to_string(dir.join(PHRASES_FILE)) {
+                Ok(text) => text
+                    .lines()
+                    .map(|l| {
+                        let (a, b) = l.split_once(' ').expect("a phrase line is `a b`");
+                        (a.to_owned(), b.to_owned())
+                    })
+                    .collect(),
+                Err(_) => phrases(&corpus(), &mut rng),
+            };
             (
                 ps.into_iter()
                     .map(|(a, b)| Query::new().phrase_with_slop([a, b], slop))
@@ -406,7 +430,7 @@ fn main() {
         build(&dir);
     }
     // The queries are built before the index is opened, as the measured iterations' inputs.
-    let (queries, k) = queries(&shape);
+    let (queries, k) = queries(&shape, &dir);
     // Read-only (#1348): the open writes nothing, so every shape reads the same bytes in
     // place, and nothing runs in the background.
     let (db, driver) = driver::Driver::open(
