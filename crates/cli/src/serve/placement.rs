@@ -52,9 +52,9 @@ impl Placement {
             "unpinned",
         );
         let default = free.max(2);
-        // A quarter, but at least 4 where that leaves the network half the CPUs: with 3, a
-        // split run fell behind under 16 and 256 subscribers (perf287 on #1397).
-        let feed_threads = feed.unwrap_or((free / 4).max(4.min(free / 2))).max(1);
+        // A quarter. perf287 on #1397: a floor of 4 (8 network + 4 feed on a 12-CPU slice)
+        // left the network side short and every split run fell behind; 9 + 3 kept up.
+        let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
             io_threads: io
                 .unwrap_or(free.saturating_sub(feed_threads).max(2))
@@ -171,8 +171,6 @@ mod tests {
                 plan.free_cpus,
                 "{plan:?}"
             );
-            // At least 4 feed threads where the network keeps half (perf287 on #1397).
-            assert!(plan.feed_threads >= 4.min(plan.free_cpus / 2), "{plan:?}");
         }
         let given = Placement::plan(&db, Some(3), Some(5), Some(2));
         assert_eq!((given.io_threads, given.feed_threads), (3, 2));

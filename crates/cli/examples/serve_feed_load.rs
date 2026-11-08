@@ -103,6 +103,11 @@ struct Args {
     /// The client's HTTP/2 per-stream receive window, in bytes (default: hyper's, 2 MiB).
     #[arg(long, value_name = "BYTES")]
     h2_stream_window: Option<u32>,
+    /// Offer puts at this total rate, puts/s across all writers, each on a fixed schedule;
+    /// unset, the writers run flat out. With a rate, a put's latency counts from when it was
+    /// due, so a server that falls behind can't hide it (perf287's offered-load acceptance).
+    #[arg(long, value_name = "PUTS_PER_SEC")]
+    put_rate: Option<f64>,
     /// Let the client's HTTP/2 windows follow the measured bandwidth-delay product (on by
     /// default: fixed windows let about 18 ms of events queue per stream, perf287 on #1397).
     /// `--h2-adaptive false` uses the fixed windows.
@@ -176,8 +181,11 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
     if !args.serve_args.is_empty() {
         println!("phdb serve {}", args.serve_args.join(" "));
     }
+    if let Some(rate) = args.put_rate {
+        println!("offered: {rate:.0} puts/s across {} writers", args.writers);
+    }
     println!(
-        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11}",
+        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11} {:>7} {:>8} {:>8}",
         "scenario",
         "puts/s",
         "p50 us",
@@ -186,7 +194,10 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
         "cpu us/put",
         "events/sub",
         "lag p50 us",
-        "lag p99 us"
+        "lag p99 us",
+        "behind",
+        "rejoined",
+        "dropped"
     );
     let busy = |n: usize| vec![vec!["busy".to_owned()]; n];
     let mut scenarios: Vec<(String, Vec<Vec<String>>)> = args
@@ -209,7 +220,7 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
                 .map_or_else(|| "-".into(), |v| v.to_string())
         };
         println!(
-            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1} {:>11} {:>11}",
+            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1} {:>11} {:>11} {:>7} {:>8} {:>8}",
             r.puts_per_sec,
             r.p50,
             r.p99,
@@ -218,7 +229,10 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
                 .map_or_else(|| "n/a".into(), |c| format!("{c:.1}")),
             r.events_per_sub,
             lag(0.5),
-            lag(0.99)
+            lag(0.99),
+            r.fell_behind,
+            r.rejoined,
+            r.dropped
         );
     }
     server.stop();
@@ -306,6 +320,25 @@ async fn connect(
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// The server's feed counters, from `Admin.Metrics` (Prometheus text): name to value.
+async fn feed_counters(
+    channel: &tonic::transport::Channel,
+) -> Result<std::collections::HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let text = proto::admin_client::AdminClient::new(channel.clone())
+        .metrics(proto::Empty {})
+        .await?
+        .into_inner()
+        .text;
+    Ok(text
+        .lines()
+        .filter(|l| l.starts_with("pigeonhole_serve_feed_"))
+        .filter_map(|l| {
+            let (name, value) = l.rsplit_once(' ')?;
+            Some((name.to_owned(), value.parse().ok()?))
+        })
+        .collect())
 }
 
 /// `Feed.Subscribe` with a codec that counts each event's frame and decodes nothing.
@@ -429,6 +462,11 @@ impl Lag {
 
 struct Outcome {
     lag: Lag,
+    /// Server-side: subscribers that fell behind the shared ring, and that rejoined it.
+    fell_behind: u64,
+    rejoined: u64,
+    /// Client-side: streams the server ended before the scenario did.
+    dropped: u64,
     puts_per_sec: f64,
     p50: u64,
     p99: u64,
@@ -447,6 +485,7 @@ async fn run(
     // what it gets.
     let subscribers = tables.len();
     let events = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     let mut subs = Vec::with_capacity(subscribers);
     let url = format!("http://127.0.0.1:{}", args.port);
@@ -464,6 +503,7 @@ async fn run(
             ..Default::default()
         };
         let events = Arc::clone(&events);
+        let dropped = Arc::clone(&dropped);
         let mut stop = stop_rx.clone();
         if i % args.lag_every.max(1) != 0 {
             // A counting subscriber: frames, not decoded.
@@ -474,7 +514,10 @@ async fn run(
                         m = stream.message() => m,
                         _ = stop.changed() => break,
                     };
-                    let Ok(Some(_)) = n else { break };
+                    let Ok(Some(_)) = n else {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    };
                     events.fetch_add(1, Ordering::Relaxed);
                 }
                 Lag::new()
@@ -489,7 +532,10 @@ async fn run(
                     m = stream.message() => m,
                     _ = stop.changed() => break,
                 };
-                let Ok(Some(e)) = e else { break };
+                let Ok(Some(e)) = e else {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
                 events.fetch_add(1, Ordering::Relaxed);
                 if let Some(proto::feed_event::Event::Commit(c)) = e.event {
                     let now = now_nanos();
@@ -511,6 +557,7 @@ async fn run(
     // Let the streams settle before measuring.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let cpu_before = cpu_seconds(server);
+    let metrics_before = feed_counters(channel).await?;
     let started = Instant::now();
     let end = started + Duration::from_secs(args.seconds);
     let mut writers = Vec::with_capacity(args.writers);
@@ -518,16 +565,30 @@ async fn run(
         let mut client = DataClient::new(channel.clone());
         let value_bytes = args.value_bytes.max(8);
         let durability = args.durability;
+        // With --put-rate, this writer's share: one put every `every`, staggered across the
+        // writers so the offered load is even.
+        let every = args
+            .put_rate
+            .map(|r| Duration::from_secs_f64(args.writers as f64 / r.max(1e-9)));
+        let first = every.map(|e| started + e.mul_f64(w as f64 / args.writers as f64));
         writers.push(tokio::spawn(async move {
             let mut lat = Vec::new();
             let mut i = 0u64;
             while Instant::now() < end {
+                // Paced: wait for the put's due time, and count its latency from then.
+                let due = first.zip(every).map(|(f, e)| f + e * (i as u32));
+                if let Some(d) = due {
+                    if d >= end {
+                        break;
+                    }
+                    tokio::time::sleep_until(d.into()).await;
+                }
                 let row = format!("w{w:03}-{i:012}").into_bytes();
                 i += 1;
                 // The send time first: the subscribers' lag is measured from it.
                 let mut value = vec![b'v'; value_bytes];
                 value[..8].copy_from_slice(&now_nanos().to_le_bytes());
-                let t = Instant::now();
+                let t = due.unwrap_or_else(Instant::now);
                 let r = client
                     .mutate(proto::MutateRequest {
                         writes: Some(proto::RowWrites {
@@ -569,6 +630,14 @@ async fn run(
     for s in subs {
         lag.merge(&s.await?);
     }
+    let metrics_after = feed_counters(channel).await?;
+    let delta = |name: &str| {
+        metrics_after
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(metrics_before.get(name).copied().unwrap_or(0))
+    };
     lat.sort_unstable();
     let at = |q: f64| {
         lat.get(((lat.len() as f64 * q) as usize).min(lat.len().saturating_sub(1)))
@@ -578,6 +647,9 @@ async fn run(
     let puts = lat.len() as f64;
     Ok(Outcome {
         lag,
+        fell_behind: delta("pigeonhole_serve_feed_fell_behind_total"),
+        rejoined: delta("pigeonhole_serve_feed_rejoined_total"),
+        dropped: dropped.load(Ordering::Relaxed),
         puts_per_sec: puts / elapsed,
         p50: at(0.5),
         p99: at(0.99),
