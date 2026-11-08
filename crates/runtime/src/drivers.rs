@@ -604,6 +604,10 @@ pub(crate) fn driver_main<H: ShardHandler>(
     // Sized from this thread's idle gaps (#1176); made at the first spin, from a shard's
     // settings (a driver may start with none).
     let mut gaps: Option<GapWindow> = None;
+    // The last park ran out the caller-runs backstop: work the next pass finds was left by
+    // a lost wake (counted per shard, `ShardCell::backstop_woke`). Always false with
+    // caller-runs off.
+    let mut backstop = false;
     vfs.attach_thread();
     for cell in &cores {
         if let Some(mut t) = cell.driver_wait() {
@@ -674,6 +678,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 stats.ops.fetch_add(worked, Ordering::Relaxed);
                 if worked > 0 {
                     sibling_wait += start.saturating_sub(pass_start);
+                    if backstop {
+                        cell.backstop_woke();
+                    }
                 }
                 core.inbox().is_closed()
             };
@@ -689,6 +696,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
             }
             i += 1;
         }
+        backstop = false;
         if !cores.is_empty() {
             stats.passes.fetch_add(1, Ordering::Relaxed);
             if sibling_wait > 0 {
@@ -786,7 +794,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
                     "an idle shard driver parks inside an async poll (a lost wake, #1226)"
                 );
                 if drivers.caller_runs {
+                    let parked_at = Instant::now();
                     thread::park_timeout(CALLER_RUNS_PARK_BACKSTOP);
+                    backstop = parked_at.elapsed() >= CALLER_RUNS_PARK_BACKSTOP;
                 } else {
                     thread::park();
                 }

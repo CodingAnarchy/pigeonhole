@@ -717,6 +717,10 @@ pub struct Stalls {
     /// Caller-runs (#1176): turns committing clients ran on their shards.
     #[serde(default)]
     pub caller_turns: u64,
+    /// Caller-runs: driver turns that found work only after the 100 ms park backstop (a
+    /// lost wake, #1502; should be 0).
+    #[serde(default)]
+    pub caller_backstop_wakes: u64,
     /// Caller-runs' evaluation split (the bench's `caller-stats` feature; 0 without it):
     /// caller-run commits resolved in the client's own turn, another client's, the driver's.
     #[serde(default)]
@@ -851,6 +855,7 @@ impl Stalls {
             unpin_flushes: d(before.unpin_flushes, after.unpin_flushes),
             wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
             caller_turns: d(before.caller_turns, after.caller_turns),
+            caller_backstop_wakes: d(before.caller_backstop_wakes, after.caller_backstop_wakes),
             caller_resolved_own: d(before.caller_resolved_own, after.caller_resolved_own),
             caller_resolved_other: d(before.caller_resolved_other, after.caller_resolved_other),
             caller_resolved_driver: d(before.caller_resolved_driver, after.caller_resolved_driver),

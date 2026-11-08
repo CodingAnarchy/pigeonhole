@@ -58,6 +58,12 @@ struct RunWord {
     /// (rev 3.1: charged to that driver's busy time, so the controller sizes it for the
     /// moments it takes over).
     caller_busy: AtomicU64,
+    /// Driver passes on this shard that found work after the driver's park ran out its
+    /// caller-runs backstop (`CALLER_RUNS_PARK_BACKSTOP`): each is a wake the handshake lost
+    /// and the backstop recovered, so it should stay 0 (#1502's re-run reports it per row).
+    /// Written by the hosting driver only; read through the inbox's caller entry, so 0 with
+    /// caller-runs off.
+    backstop_wakes: AtomicU64,
 }
 
 /// A shard a committing client may run (#1176): the runtime's entry, on the shard's inbox.
@@ -70,6 +76,10 @@ pub(crate) trait CallerTurn: Send + Sync {
     /// doesn't want it (a relaxed look, for a waiting client deciding whether to keep
     /// polling: rev 3.1, C1).
     fn is_free(&self) -> bool;
+
+    /// Driver passes that found work on the shard only after the backstop ran out (a lost
+    /// wake; see `RunWord::backstop_wakes`). Relaxed.
+    fn backstop_wakes(&self) -> u64;
 }
 
 /// An engine-owned shard: its loop state behind the run token.
@@ -93,6 +103,7 @@ impl<H: ShardHandler> ShardCell<H> {
                 driver_wants: AtomicBool::new(false),
                 skipped: AtomicBool::new(false),
                 caller_busy: AtomicU64::new(0),
+                backstop_wakes: AtomicU64::new(0),
             },
             id,
             signal,
@@ -159,6 +170,12 @@ impl<H: ShardHandler> ShardCell<H> {
         self.run.driver_wants.store(true, Ordering::Relaxed);
     }
 
+    /// The hosting driver's turn found work on the shard after its park ran out the
+    /// caller-runs backstop: a lost wake the backstop recovered.
+    pub(crate) fn backstop_woke(&self) {
+        self.run.backstop_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Callers' turn time since the last call, for the hosting driver's busy count.
     pub(crate) fn take_caller_busy(&self) -> u64 {
         if self.run.caller_busy.load(Ordering::Relaxed) == 0 {
@@ -190,6 +207,10 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
     fn is_free(&self) -> bool {
         self.run.state.load(Ordering::Relaxed) == FREE
             && !self.run.driver_wants.load(Ordering::Relaxed)
+    }
+
+    fn backstop_wakes(&self) -> u64 {
+        self.run.backstop_wakes.load(Ordering::Relaxed)
     }
 
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool {

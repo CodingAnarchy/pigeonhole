@@ -483,6 +483,14 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.caller.get().is_some_and(|c| c.is_free())
     }
 
+    /// Driver passes that found work on the target shard only after the driver's park ran
+    /// out its caller-runs backstop: wakes the caller-to-driver handshake lost (#1176, #1502;
+    /// should stay 0). 0 with caller-runs off. Relaxed.
+    #[doc(hidden)]
+    pub fn caller_backstop_wakes(&self) -> u64 {
+        self.inbox.caller.get().map_or(0, |c| c.backstop_wakes())
+    }
+
     #[doc(hidden)]
     pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         match self.inbox.caller.get() {

@@ -283,6 +283,7 @@ pub(crate) fn internal(
         ("shard_pool_busy_nanos", m.shard_pool_busy_nanos),
         ("shard_spin_time_nanos", m.shard_spin_time_nanos),
         ("caller_turns", m.caller_turns),
+        ("caller_backstop_wakes", m.caller_backstop_wakes),
         ("caller_resolved_own", m.caller_resolved[0]),
         ("caller_resolved_other", m.caller_resolved[1]),
         ("caller_resolved_driver", m.caller_resolved[2]),

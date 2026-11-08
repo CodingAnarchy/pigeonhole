@@ -200,6 +200,10 @@ pub struct Metrics {
     /// Caller-runs (#1176): turns committing clients ran on the shards that handled a
     /// message, summed over shards; 0 with it off.
     pub caller_turns: u64,
+    /// Caller-runs (#1176): driver turns that found work only after the driver's park ran
+    /// out its 100 ms backstop, summed over shards: wakes the caller-to-driver handshake
+    /// lost (#1502). Should stay 0; 0 with caller-runs off.
+    pub caller_backstop_wakes: u64,
     /// Caller-runs' evaluation split (the `caller-stats` feature; zeros without it):
     /// caller-run commits resolved in the client's own turn, another client's, and the
     /// driver's.
@@ -3297,6 +3301,7 @@ impl Engine {
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
                 m.shard_spin_time_nanos += sub.spin_nanos();
                 m.caller_turns += sub.caller_turns();
+                m.caller_backstop_wakes += sub.caller_backstop_wakes();
                 let (fallbacks, room) = sub.background_take_backs();
                 m.background_take_backs.0 += fallbacks;
                 m.background_take_backs.1 += room;

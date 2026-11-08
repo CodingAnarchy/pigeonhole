@@ -189,6 +189,14 @@ fn run(spin_extend_nanos: u64) {
     let turns = db.caller_turns();
     assert!(turns > 0, "no client ran its shard's turn");
     eprintln!("caller turns: {turns} for {} ops", ops * CLIENTS as u64);
+    // A driver turn that found work only after its park ran out the backstop is a wake the
+    // caller-to-driver handshake lost (#1502 Phase B's hang, which the backstop now turns
+    // into a 100 ms stall rather than a hang): there must be none.
+    assert_eq!(
+        db.metrics().caller_backstop_wakes,
+        0,
+        "a driver found work only after its park's backstop ran out: a lost wake"
+    );
     #[cfg(feature = "caller-stats")]
     {
         let [own, other, driver] = db.caller_resolutions();
