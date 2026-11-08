@@ -4498,3 +4498,30 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **A4:** `pigeonhole.feed.lag`, with `Feed::progress()` and `visible_seqno()`, stored once per delivered batch.
 - **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
 - **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
+
+<a id="d318"></a>
+## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
+
+**Decided:** a companion crate, `pigeonhole-embed`, gives `pigeonhole-memory` local embeddings: `LocalEmbedder` loads a pinned model once and embeds passages and queries on the CPU, with no service. `pigeonhole-memory` stays model-free and doesn't depend on it. The design note is on #1345.
+
+- **The model (owner, Q2):** `BAAI/bge-small-en-v1.5` (MIT) at revision `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. It's a 12-layer BERT, 384 dimensions, 512 tokens, CLS pooling, L2-normalised.
+  - It's the model D311 T5 measured, so the guide's recall numbers describe what this crate produces.
+  - **Its store id is `BAAI/bge-small-en-v1.5@5c38ec7c`,** naming the revision. A store refuses vectors from any other runtime of the same model. A later model or revision is a new id.
+  - **The fallback:** MiniLM-L6 becomes a second `Model` if bge-small is too slow for interactive use. That's the owner's call on the measured numbers, never a silent switch.
+- **Passages and queries are separate calls:** `embed_query` prepends bge's retrieval instruction, as the fixture did.
+- **The files:** the weights aren't bundled. The three files come from a directory (`LoadOptions::dir`), or from the cache, downloaded once from the pinned revision.
+  - **Checksums:** every file is checked against a SHA-256 pinned in the crate, wherever it came from. A download is written to a temporary file and renamed into place only once it verifies.
+  - **Redirects** are followed only to Hugging Face's hosts.
+  - **Offline:** `LoadOptions::offline` or `PIGEONHOLE_EMBED_OFFLINE=1`. Without the `download` feature, the crate has no network code.
+- **Inference:** candle 0.11 and tokenizers 0.23, CPU only, in pure Rust (no `onig`, no `cpp`, no BLAS, no GPU features). The weights are read into a buffer rather than mmapped, so the crate is `#![forbid(unsafe_code)]`.
+  - **Threads:** each embedder runs on its own rayon pool (`LoadOptions::threads`, default `min(cores, 4)`), never the application's global pool. Batches are 32 texts.
+- **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
+- **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
+- **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.
+- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before.
+- **The cost, PR 1's first numbers** (a 10-core Apple laptop):
+  - **1 thread:** 33, 41 and 138 ms (p50) at 16, 64 and 256 tokens;
+  - **4 threads:** 8.4, 18 and 65 ms;
+  - **Batched:** 375 texts/s in batches of 32 at 4 threads.
+
+  The AX102 rows come in the PR. The owner judges Q2's fallback on them.

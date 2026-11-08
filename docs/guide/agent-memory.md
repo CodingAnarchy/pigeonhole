@@ -35,6 +35,43 @@ assert_eq!(again, Remembered::Merged(r.id().clone()));
 - **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
 - **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. Python's `Store.create(..., normalization="nfkc")` and `phdb mcp --memory-normalization nfkc` set it too. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
 
+## Local embeddings
+`pigeonhole-embed` (0.1, on its own version line) computes embeddings in your process, on the CPU, with no service and no network after the first load. It runs [`BAAI/bge-small-en-v1.5`](https://huggingface.co/BAAI/bge-small-en-v1.5) (MIT licence), the model this guide's [recall numbers](#how-well-it-recalls) were measured with, and gives the reference implementation's (sentence-transformers') vectors to within 1e-4 per component.
+
+```toml
+[dependencies]
+pigeonhole-embed = "0.1"
+```
+
+```rust,ignore
+use pigeonhole_embed::{LoadOptions, LocalEmbedder, Model};
+
+let embedder = LocalEmbedder::open(Model::BgeSmallEnV15, &LoadOptions::new())?;
+let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model()))?;
+
+let text = "The March meeting chose Postgres.";
+store.remember("agent:alice", Memory::new(text).embedding(embedder.embed_passages(&[text])?.remove(0)))?;
+let hits = store
+    .recall(&["agent:alice"])
+    .embedding(embedder.embed_query("which database did we pick?")?)
+    .k(5)
+    .run()?;
+```
+
+- **Passages and queries are embedded differently.** `embed_passages` is for what you remember. `embed_query` adds the model's retrieval instruction, which recall's measured quality depends on. Don't embed a query as a passage.
+- **The pinned id** is `BAAI/bge-small-en-v1.5@5c38ec7c`: the model and its revision. A store created with it refuses vectors from anything else, including the same model served by Ollama or another runtime, whose vectors can differ.
+- **The files:** the weights (133 MB) aren't in the crate. The first `open` downloads the model's three files from the pinned revision on huggingface.co into the cache: `$PIGEONHOLE_EMBED_CACHE`, else `~/.cache/pigeonhole/models` on Linux, `~/Library/Caches/pigeonhole/models` on macOS, and `%LOCALAPPDATA%\pigeonhole\models` on Windows. Every file is checked against a SHA-256 pinned in the crate, however it arrived.
+- **Offline and air-gapped:** `LoadOptions::offline()` (or `PIGEONHOLE_EMBED_OFFLINE=1`) never downloads, and a missing file fails with the URL to fetch and where to put it. `LoadOptions::dir(path)` loads from a directory you filled yourself. Build with `default-features = false` to leave out the download code entirely.
+- **Text past 512 tokens is truncated** (about 350 English words), so split long documents before remembering them.
+- **CPU cost:** each embedder has its own thread pool (`LoadOptions::threads`, by default up to 4), so it never takes your application's rayon pool. A `LocalEmbedder` is `Send` and `Sync`: share one. On a 10-core Apple laptop:
+
+| Threads | 16 tokens | 64 tokens | 256 tokens | Batches of 32 (16 tokens) |
+|---|---|---|---|---|
+| 1 | 33 ms | 41 ms | 138 ms | 62 texts/s |
+| 4 | 8.4 ms | 18 ms | 65 ms | 375 texts/s |
+
+  Pass many texts to `embed_passages` when you can: a batch costs far less per text. A query is one text.
+
 ## Recall
 ```rust
 # use pigeonhole::*;
