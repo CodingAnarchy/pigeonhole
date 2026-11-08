@@ -683,3 +683,57 @@ impl Transaction {
         without_gvl(ruby, move || lock(m).is_some())
     }
 }
+
+// ---- Under a fiber scheduler (#1574, ICR 0126) ---------------------------------------------
+
+#[cfg(unix)]
+impl WriteBatch {
+    /// `native_commit_op(bridge, durability)`: `commit`, as a fiber op. The writes are taken
+    /// and submitted at the call, as the blocking form does.
+    pub(crate) fn commit_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        durability: Option<Durability>,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let state = rb_self.0.get(ruby)?;
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some(ops) = lock(&state.ops).take() else {
+                return crate::fiber::ready(Box::new(|ruby: &Ruby| Err(spent(ruby, BATCH_SPENT))));
+            };
+            let mut b = state.db.write_batch();
+            for (t, row, op) in &ops {
+                apply!(&mut b, t, row, op);
+            }
+            let fut = match durability {
+                Some(d) => b.commit_with_async(d.into()),
+                None => b.commit_async(),
+            };
+            crate::fiber::map(fut, |ruby, r| Ok(ruby.into_value(r.or_rb(ruby)?.seqno)))
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Transaction {
+    /// `native_commit_op(bridge, durability)`: `commit`, as a fiber op; `Conflict` as the
+    /// blocking form raises it.
+    pub(crate) fn commit_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        durability: Option<Durability>,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some(txn) = lock(m).take() else {
+                return crate::fiber::ready(Box::new(|ruby: &Ruby| Err(spent(ruby, TXN_SPENT))));
+            };
+            let fut = match durability {
+                Some(d) => txn.commit_with_async(d.into()),
+                None => txn.commit_async(),
+            };
+            crate::fiber::map(fut, |ruby, r| Ok(ruby.into_value(r.or_rb(ruby)?.seqno)))
+        })
+    }
+}

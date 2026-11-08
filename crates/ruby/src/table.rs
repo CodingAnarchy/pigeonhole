@@ -1342,3 +1342,110 @@ impl Seen {
             .or_rb(ruby)
     }
 }
+
+// ---- Under a fiber scheduler (#1574, ICR 0126) ---------------------------------------------
+
+/// The mutation's four commits as fiber ops: each takes the writes and submits at the call,
+/// as its blocking form does, and the result converts as that form's does.
+#[cfg(unix)]
+impl Mutation {
+    /// The writes and the asked columns, taken; `None` if already committed.
+    fn take_for_op(m: &MutationState) -> Option<(Vec<Op>, Asked)> {
+        let mut ops = lock(&m.ops);
+        // Under the writes' lock, as `return_previous` pushes (Q1).
+        Some((ops.take()?, std::mem::take(&mut *lock(&m.asked))))
+    }
+
+    fn spent_op() -> crate::fiber::Fut {
+        crate::fiber::ready(Box::new(|ruby: &Ruby| {
+            Err(spent(ruby, "the mutation was already committed"))
+        }))
+    }
+
+    /// `native_commit_op(bridge)`: `commit`, as a fiber op.
+    pub(crate) fn commit_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_async();
+            crate::fiber::map(fut, |ruby, r| Ok(ruby.into_value(r.or_rb(ruby)?.seqno)))
+        })
+    }
+
+    /// `native_commit_if_op(bridge, condition)`: `commit_if`, as a fiber op.
+    pub(crate) fn commit_if_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        condition: &Condition,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        let c = condition.0.clone();
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_if_async(&c);
+            crate::fiber::map(fut, |ruby, r| {
+                Ok(ruby.into_value(r.or_rb(ruby)?.map(|i| i.seqno)))
+            })
+        })
+    }
+
+    /// `native_commit_returning_op(bridge)`: `commit_returning`, as a fiber op.
+    pub(crate) fn commit_returning_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut =
+                row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_returning_async();
+            crate::fiber::map(fut, move |ruby, r| {
+                Ok(ruby.into_value(Incremented(r.or_rb(ruby)?, asked, None)))
+            })
+        })
+    }
+
+    /// `native_commit_if_returning_op(bridge, condition)`: `commit_if_returning`, as a fiber
+    /// op: an `Incremented` (as `Returned`) or a `Seen`, which `api.rb` wraps in a `Checked`.
+    pub(crate) fn commit_if_returning_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        condition: &Condition,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        let c = condition.0.clone();
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let column = condition_column(&c);
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability)
+                .commit_if_returning_async(&c);
+            crate::fiber::map(fut, move |ruby, r| {
+                Ok(match r.or_rb(ruby)? {
+                    pigeonhole::Checked::Applied(ret) => {
+                        ruby.into_value(Incremented(ret, asked, column))
+                    }
+                    pigeonhole::Checked::NotApplied(seen) => ruby.into_value(Seen(seen)),
+                })
+            })
+        })
+    }
+}

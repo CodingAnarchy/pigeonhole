@@ -29,6 +29,11 @@ magnus = { version = "0.9", features = ["bytes"] }
 # `gvl.rs` only: `rb_thread_call_without_gvl2`, which magnus doesn't wrap (ICR 0111, O3).
 rb-sys = "0.9"
 
+# `fiber.rs` (#1574, ICR 0126): the fiber bridge's pipe set non-blocking, through `fcntl`'s
+# safe wrapper. Unix only: on Windows the waiting calls block as before.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+
 # The root workspace's lints.
 [lints.rust]
 missing_docs = "warn"
