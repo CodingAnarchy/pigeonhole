@@ -117,7 +117,11 @@ pub(crate) struct FiberBridge(ForkSafe<Arc<Shared>>);
 pub(crate) struct FiberOp(ForkSafe<(Arc<Shared>, Arc<OpInner>)>);
 
 fn io_error(ruby: &Ruby, what: &str, e: &std::io::Error) -> Error {
-    crate::error::uncoded(ruby, "Error", &format!("the fiber bridge's pipe: {what}: {e}"))
+    crate::error::uncoded(
+        ruby,
+        "Error",
+        &format!("the fiber bridge's pipe: {what}: {e}"),
+    )
 }
 
 impl FiberBridge {
@@ -217,7 +221,10 @@ impl FiberOp {
 
     /// `native_done?`: whether its result is waiting to be taken.
     pub(crate) fn is_done(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        Ok(matches!(*lock(&rb_self.0.get(ruby)?.1.state), OpState::Done(_)))
+        Ok(matches!(
+            *lock(&rb_self.0.get(ruby)?.1.state),
+            OpState::Done(_)
+        ))
     }
 
     /// `native_take`: the result, converted (or raised). Once.
