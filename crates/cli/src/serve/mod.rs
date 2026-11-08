@@ -308,6 +308,20 @@ pub(crate) fn run(
             let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());
             r.spawn(Arc::clone(&shared));
         }
+        // `kill -USR1 <pid>`: every feed hub and client's state to stderr, to tell a stream the
+        // transport stopped taking from one whose client stopped following its hub (perf287's
+        // wedged streams on #1397).
+        #[cfg(unix)]
+        if let Ok(mut usr1) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        {
+            let dumping = Arc::clone(&shared);
+            tokio::spawn(async move {
+                while usr1.recv().await.is_some() {
+                    eprint!("{}", dumping.router.service.feeds.dump());
+                }
+            });
+        }
         // At the signal, a running bulk load stops at its next message: it takes no more of
         // its stream, then writes and rebalances what it took (the coordinator on #1580).
         let stopping = Arc::clone(&shared);

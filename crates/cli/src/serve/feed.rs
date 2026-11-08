@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -189,7 +189,39 @@ impl Ring {
     }
 }
 
+/// A client's state for `phdb serve`'s SIGUSR1 dump (perf287's wedged streams on #1397):
+/// where it is in its hub's ring, what it has sent into its buffer and what the transport has
+/// taken from it, and when. Relaxed atomics: a snapshot, not a protocol.
+#[derive(Debug, Default)]
+pub(crate) struct Probe {
+    id: u64,
+    tables: String,
+    /// 0 starting, 1 waiting at the ring's head, 2 sending from the ring, 3 on its own feed,
+    /// 4 waiting for a catch-up slot, 5 waiting for room in its buffer.
+    state: AtomicU8,
+    ring_at: AtomicU64,
+    sent: AtomicU64,
+    taken: AtomicU64,
+    last_send_us: AtomicU64,
+    last_take_us: AtomicU64,
+    hub: Mutex<Weak<Hub>>,
+}
+
+impl Probe {
+    fn set(&self, state: u8) {
+        self.state.store(state, Ordering::Relaxed);
+    }
+}
+
+/// Microseconds since the process's first feed call, for the dump's "how long ago".
+fn now_us() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 struct Hub {
+    /// When the hub last pushed a commit (`now_us`), for the dump.
+    last_push_us: AtomicU64,
     ring: Mutex<Ring>,
     /// The ring's head index, bumped by each commit and by a failure.
     head: watch::Sender<u64>,
@@ -225,6 +257,7 @@ impl Hub {
         }
         let head = r.head();
         drop(r);
+        self.last_push_us.store(now_us(), Ordering::Relaxed);
         self.head.send_replace(head);
     }
 
@@ -300,6 +333,9 @@ pub(crate) struct Feeds {
     limits: FeedLimits,
     pub(crate) stats: Arc<FeedStats>,
     live: Arc<AtomicU64>,
+    /// Every client's probe, for the dump; dead ones are pruned as new ones join.
+    probes: Mutex<Vec<Weak<Probe>>>,
+    next_probe: AtomicU64,
 }
 
 impl std::fmt::Debug for Feeds {
@@ -328,6 +364,8 @@ impl Feeds {
             limits,
             stats: Arc::default(),
             live: Arc::default(),
+            probes: Mutex::new(Vec::new()),
+            next_probe: AtomicU64::new(1),
         })
     }
 
@@ -348,6 +386,76 @@ impl Feeds {
             Some(rt) => rt.spawn(f),
             None => tokio::spawn(f),
         }
+    }
+
+    /// Every hub and client, one per line, for `phdb serve`'s SIGUSR1 dump: a stream that
+    /// stops delivering shows whether the transport stopped taking (`depth` grows, `take`
+    /// ages), the client stopped following its hub (`at` behind `head`, state 1), or the hub
+    /// stopped receiving (`push` ages).
+    pub(crate) fn dump(&self) -> String {
+        use std::fmt::Write as _;
+        let now = now_us();
+        let ago = |t: u64| now.saturating_sub(t) / 1000;
+        let mut out = String::new();
+        let hubs: Vec<Arc<Hub>> = self
+            .hubs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let _ = writeln!(out, "phdb serve: feed dump: {} hubs", hubs.len());
+        for h in &hubs {
+            let r = h.ring();
+            let _ = writeln!(
+                out,
+                "  hub {:p}: head {} base {} entries {} bytes {} passed {} failed {} push {} ms ago",
+                Arc::as_ptr(h),
+                r.head(),
+                r.base,
+                r.entries.len(),
+                r.bytes,
+                r.passed,
+                r.failed,
+                ago(h.last_push_us.load(Ordering::Relaxed)),
+            );
+        }
+        let probes: Vec<Arc<Probe>> = self
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let _ = writeln!(out, "phdb serve: feed dump: {} clients", probes.len());
+        for p in &probes {
+            let hub = p
+                .hub
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .upgrade();
+            let head = hub.as_ref().map(|h| h.ring().head());
+            let (sent, taken) = (
+                p.sent.load(Ordering::Relaxed),
+                p.taken.load(Ordering::Relaxed),
+            );
+            let _ = writeln!(
+                out,
+                "  client {} [{}]: state {} at {} head {} sent {} taken {} depth {} send {} ms ago take {} ms ago hub {:p}",
+                p.id,
+                p.tables,
+                p.state.load(Ordering::Relaxed),
+                p.ring_at.load(Ordering::Relaxed),
+                head.map_or_else(|| "-".to_owned(), |h| h.to_string()),
+                sent,
+                taken,
+                sent.saturating_sub(taken),
+                ago(p.last_send_us.load(Ordering::Relaxed)),
+                ago(p.last_take_us.load(Ordering::Relaxed)),
+                hub.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
+            );
+        }
+        out
     }
 
     pub(crate) fn gauges(&self) -> FeedGauges {
@@ -449,6 +557,7 @@ impl Feeds {
                 })
                 .abort_handle();
             Hub {
+                last_push_us: AtomicU64::new(now_us()),
                 ring: Mutex::new(Ring {
                     start_seqno,
                     passed: start_seqno,
@@ -494,6 +603,22 @@ impl Feeds {
         ));
         let taken = Arc::new(Notify::new());
         let (end_tx, end_rx) = oneshot::channel();
+        let probe = Arc::new(Probe {
+            id: self.next_probe.fetch_add(1, Ordering::Relaxed),
+            tables: spec
+                .tables
+                .iter()
+                .map(|t| t.name().to_owned())
+                .collect::<Vec<_>>()
+                .join(","),
+            hub: Mutex::new(Arc::downgrade(&hub)),
+            ..Probe::default()
+        });
+        {
+            let mut probes = self.probes.lock().unwrap_or_else(PoisonError::into_inner);
+            probes.retain(|p| p.strong_count() > 0);
+            probes.push(Arc::downgrade(&probe));
+        }
         let client = Client {
             feeds: Arc::clone(self),
             hub: Mutex::new(hub),
@@ -504,6 +629,7 @@ impl Feeds {
             tx,
             budget,
             taken: Arc::clone(&taken),
+            probe: Arc::clone(&probe),
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
@@ -534,6 +660,7 @@ impl Feeds {
             events: rx,
             taken,
             end: Some(end_rx),
+            probe,
         })
     }
 }
@@ -610,6 +737,7 @@ struct Client {
     /// Poked each time the client takes an event: a send waiting for room starts its
     /// `--stream-idle-ms` again (simp724's I1 on #1536).
     taken: Arc<Notify>,
+    probe: Arc<Probe>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -675,6 +803,7 @@ impl Client {
     }
 
     async fn catch_up_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.probe.set(4);
         let sem = Arc::clone(&self.feeds.catch_up);
         if let Ok(p) = Arc::clone(&sem).try_acquire_owned() {
             return Ok(p);
@@ -726,6 +855,7 @@ impl Client {
                 return Ok(Source::Own(Box::new(FeedStream::new(feed)), slot));
             }
             if batch.is_empty() {
+                self.probe.set(1);
                 let quiet =
                     tokio::time::sleep_until((pos.last_event + self.feeds.limits.quiet).into());
                 tokio::select! {
@@ -752,9 +882,11 @@ impl Client {
                 }
                 continue;
             }
+            self.probe.set(2);
             for e in batch.drain(..) {
                 at += 1;
                 self.cover_entry(&e, pos).await?;
+                self.probe.ring_at.store(at, Ordering::Relaxed);
             }
         }
     }
@@ -767,6 +899,7 @@ impl Client {
         pos: &mut Position,
     ) -> Result<Source, ApiError> {
         let mut hub_retry: Option<Instant> = None;
+        self.probe.set(3);
         loop {
             // A failed hub: take the key's current one, opening a new one if none (F2), at
             // most once a second so a hub that keeps failing isn't reopened in a loop.
@@ -775,6 +908,11 @@ impl Client {
                 hub_retry = Some(Instant::now());
                 if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
                     *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&new);
+                    *self
+                        .probe
+                        .hub
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&new);
                     hub = new;
                 }
             }
@@ -871,6 +1009,12 @@ impl Client {
         .await
     }
 
+    /// Counts a send into the client's buffer, for the dump.
+    fn sent(&self) {
+        self.probe.sent.fetch_add(1, Ordering::Relaxed);
+        self.probe.last_send_us.store(now_us(), Ordering::Relaxed);
+    }
+
     async fn send(&self, event: Out, pos: &mut Position) -> Result<(), ApiError> {
         let token = event.token().clone();
         // Room in the client's buffer, then a place in its channel, both inside the idle
@@ -892,6 +1036,7 @@ impl Client {
                 Ok(()) => {
                     pos.sent = token;
                     pos.last_event = Instant::now();
+                    self.sent();
                     return Ok(());
                 }
                 Err(mpsc::error::TrySendError::Full((event, room))) => (event, Some(room)),
@@ -901,6 +1046,7 @@ impl Client {
             Err(tokio::sync::TryAcquireError::Closed) => return Err(gone()),
         };
         // The slow path: wait for whichever was missing.
+        let was = self.probe.state.swap(5, Ordering::Relaxed);
         let budget = Arc::clone(&self.budget);
         let queued = async {
             let room = match held {
@@ -923,6 +1069,8 @@ impl Client {
                         Ok(()) => {
                             pos.sent = token;
                             pos.last_event = Instant::now();
+                            self.sent();
+                            self.probe.set(was);
                             Ok(())
                         }
                         // The client went away: end quietly.
@@ -986,6 +1134,7 @@ pub(crate) struct FeedEvents {
     /// Poked on each take, for a send waiting for room.
     taken: Arc<Notify>,
     end: Option<oneshot::Receiver<ApiError>>,
+    probe: Arc<Probe>,
 }
 
 /// An event as it leaves a client: its own, or a ring entry encoded once for every client
@@ -1050,6 +1199,8 @@ impl FeedEvents {
             // Taken: its bytes go back to the client's buffer.
             Poll::Ready(Some((e, room))) => {
                 drop(room);
+                self.probe.taken.fetch_add(1, Ordering::Relaxed);
+                self.probe.last_take_us.store(now_us(), Ordering::Relaxed);
                 self.taken.notify_one();
                 return Poll::Ready(Some(Ok(e)));
             }
@@ -1277,6 +1428,16 @@ mod tests {
             );
             let seqno = t.mutate(b"r").put("f", b"q", b"v").commit().unwrap().seqno;
             assert_eq!(seqnos(&mut events, Duration::from_secs(1)).await, [seqno]);
+            // The SIGUSR1 dump shows the hub and the client: one commit sent, one taken.
+            let dump = feeds.dump();
+            assert!(
+                dump.contains("1 hubs") && dump.contains("1 clients"),
+                "{dump}"
+            );
+            assert!(
+                dump.contains("[t]: state 1") && dump.contains("sent 1 taken 1 depth 0"),
+                "{dump}"
+            );
         });
         drop(t);
         drop(requests);
