@@ -76,6 +76,12 @@ pub(crate) enum ServiceOp {
     VectorBulkLoad(super::bulk::BulkLoadOp),
     Promote(proto::Empty),
     Follow(proto::FollowRequest),
+    TextCreateIndex(proto::CreateTextIndexRequest),
+    TextPut(proto::TextPutRequest),
+    TextDelete(proto::TextDeleteRequest),
+    TextSearch(proto::TextSearchRequest),
+    TextRebuild(proto::TextIndexRequest),
+    TextVerify(proto::TextIndexRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -108,6 +114,9 @@ pub(crate) enum ServiceReply {
     VectorVerify(proto::VectorVerifyResponse),
     Promote(proto::PromoteResponse),
     Follow(super::replica::FollowBatches),
+    TextSearch(proto::TextSearchResponse),
+    TextRebuild(proto::TextRebuildResponse),
+    TextVerify(proto::TextVerifyResponse),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -198,6 +207,12 @@ impl ServiceOp {
             Self::VectorBulkLoad(_) => 34,
             Self::Promote(_) => 35,
             Self::Follow(_) => FOLLOW,
+            Self::TextCreateIndex(_) => 37,
+            Self::TextPut(_) => 38,
+            Self::TextDelete(_) => 39,
+            Self::TextSearch(_) => 40,
+            Self::TextRebuild(_) => 41,
+            Self::TextVerify(_) => 42,
         }
     }
 
@@ -229,12 +244,19 @@ impl ServiceOp {
             | Self::Traverse(_)
             | Self::Nearest(_)
             | Self::VectorSearch(_)
-            | Self::VectorVerify(_) => Scope::Read,
+            | Self::VectorVerify(_)
+            | Self::TextSearch(_)
+            | Self::TextVerify(_) => Scope::Read,
             // An index is a table: creating one is a write, as `Schema.CreateTable` is.
             Self::CreateIndex(_)
             | Self::VectorInsert(_)
             | Self::VectorDelete(_)
-            | Self::VectorBulkLoad(_) => Scope::Write,
+            | Self::VectorBulkLoad(_)
+            // A text index is a table too; a rebuild rewrites it from its source.
+            | Self::TextCreateIndex(_)
+            | Self::TextPut(_)
+            | Self::TextDelete(_)
+            | Self::TextRebuild(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
             // A replica's bootstrap and follow read everything, ids and all (#1436).
             Self::Flush(_)
@@ -294,6 +316,11 @@ impl ServiceOp {
             // The messages hold their own budget, each until the loader takes it.
             Self::VectorBulkLoad(op) => op.index.len() + 16,
             Self::Follow(r) => r.encoded_len(),
+            Self::TextCreateIndex(r) => r.encoded_len(),
+            Self::TextPut(r) => r.encoded_len(),
+            Self::TextDelete(r) => r.encoded_len(),
+            Self::TextSearch(r) => r.encoded_len(),
+            Self::TextRebuild(r) | Self::TextVerify(r) => r.encoded_len(),
         }
     }
 
@@ -320,7 +347,7 @@ pub(crate) const DOWNLOAD: usize = 25;
 /// `Replication.Follow`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const FOLLOW: usize = 36;
 
-pub(crate) const RPCS: [&str; 37] = [
+pub(crate) const RPCS: [&str; 43] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -358,6 +385,12 @@ pub(crate) const RPCS: [&str; 37] = [
     "Vectors.BulkLoad",
     "Admin.Promote",
     "Replication.Follow",
+    "Text.CreateIndex",
+    "Text.Put",
+    "Text.Delete",
+    "Text.Search",
+    "Text.Rebuild",
+    "Text.Verify",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -640,6 +673,10 @@ pub(crate) struct Service {
     pub(crate) indexes: Arc<super::indexes::Indexes>,
     /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
     pub(crate) bulk: super::bulk::BulkLoads,
+    /// The text indexes open, and the running rebuild.
+    pub(crate) texts: Arc<super::texts::Texts>,
+    /// `Text.Rebuild`s at once: one, on a thread of its own.
+    text_rebuilds: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     schema: tokio::sync::Mutex<()>,
@@ -682,6 +719,8 @@ impl Service {
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
             indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None)),
             bulk: super::bulk::BulkLoads::default(),
+            texts: Arc::new(super::texts::Texts::new(db.clone())),
+            text_rebuilds: Arc::new(Semaphore::new(1)),
             schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
@@ -719,11 +758,13 @@ impl Service {
     }
 
     /// The catalog changed under the service (a replica applied a primary's change): the
-    /// cached table and vector index handles go, and the next call on each name opens it
+    /// cached table, vector index and text index handles go, and the next call on each name
+    /// opens it
     /// again.
     pub(crate) fn tables_changed(&self) {
         self.tables.store(Arc::new(HashMap::new()));
         self.indexes.forget();
+        self.texts.forget();
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
@@ -1025,6 +1066,30 @@ impl Service {
                 self.vector_verify(r)
                     .await
                     .map(ServiceReply::VectorVerify)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::TextCreateIndex(r) => {
+                drop(budget);
+                self.text_create_index(r).await.map(ServiceReply::Empty)
+            }
+            ServiceOp::TextPut(r) => self.text_put(r, budget).await.map(ServiceReply::Empty),
+            ServiceOp::TextDelete(r) => self.text_delete(r, budget).await.map(ServiceReply::Empty),
+            ServiceOp::TextSearch(r) => {
+                drop(budget);
+                self.text_search(r)
+                    .await
+                    .map(ServiceReply::TextSearch)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::TextRebuild(r) => {
+                drop(budget);
+                self.text_rebuild(r).await.map(ServiceReply::TextRebuild)
+            }
+            ServiceOp::TextVerify(r) => {
+                drop(budget);
+                self.text_verify(r)
+                    .await
+                    .map(ServiceReply::TextVerify)
                     .map_err(ApiError::for_read)
             }
             ServiceOp::VectorBulkLoad(op) => {
@@ -1643,6 +1708,148 @@ impl Service {
                 lists: stats.lists,
             }),
         })
+    }
+
+    /// The text index `name`, from the cache, or opened on the blocking pool on a miss.
+    async fn text_index(&self, name: &str) -> Result<Arc<pigeonhole_text::Index>, ApiError> {
+        if let Some(i) = self.texts.cached(name) {
+            return Ok(i);
+        }
+        let texts = Arc::clone(&self.texts);
+        let name = name.to_owned();
+        self.blocking(move || texts.get(&name)).await
+    }
+
+    /// `Text.CreateIndex` (ICR 0105): a new index over its source column, or with
+    /// `if_missing` an existing one, as it is.
+    async fn text_create_index(
+        &self,
+        r: proto::CreateTextIndexRequest,
+    ) -> Result<proto::Empty, ApiError> {
+        let options = super::texts::options(&r)?;
+        let table = self.table(&r.source_table).await?;
+        let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
+        let texts = Arc::clone(&self.texts);
+        self.blocking(move || texts.create(&r.name, source, options, r.if_missing))
+            .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Text.Put`: writes the document's text to the source column and indexes it, in one
+    /// transaction. A write: detached, on the blocking pool.
+    async fn text_put(
+        &self,
+        r: proto::TextPutRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::Empty, ApiError> {
+        let index = self.text_index(&r.index).await?;
+        let pool = Arc::clone(&self.blocking);
+        self.detached("Text.Put", budget, async move {
+            blocking(&pool, move || {
+                index.put(&r.id, &r.text)?;
+                Ok(())
+            })
+            .await
+        })
+        .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Text.Delete`: the document's text and its postings, if any. Detached, as `Put`.
+    async fn text_delete(
+        &self,
+        r: proto::TextDeleteRequest,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::Empty, ApiError> {
+        let index = self.text_index(&r.index).await?;
+        let pool = Arc::clone(&self.blocking);
+        self.detached("Text.Delete", budget, async move {
+            blocking(&pool, move || {
+                index.delete(&r.id)?;
+                Ok(())
+            })
+            .await
+        })
+        .await?;
+        Ok(proto::Empty {})
+    }
+
+    /// `Text.Search`: the `k` (at most [`MAX_NEAREST_K`]) best documents by BM25, with
+    /// their text and matches on request. On the blocking pool: a search is sync (D309).
+    async fn text_search(
+        &self,
+        r: proto::TextSearchRequest,
+    ) -> Result<proto::TextSearchResponse, ApiError> {
+        if r.k == 0 || r.k > MAX_NEAREST_K {
+            return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
+        }
+        let query = super::texts::query(&r)?;
+        let index = self.text_index(&r.index).await?;
+        self.blocking(move || {
+            let mut s = index.search(query, r.k as usize).highlight(r.highlight);
+            if !r.id_prefix.is_empty() {
+                s = s.id_prefix(r.id_prefix.to_vec());
+            }
+            let hits = s.run()?;
+            Ok(proto::TextSearchResponse {
+                hits: hits.into_iter().map(super::texts::hit).collect(),
+            })
+        })
+        .await
+    }
+
+    /// `Text.Rebuild`: rewrites the index from its source column. One at a time, on a
+    /// thread of its own off the shards' cores, never the blocking pool (perf287's D1: a
+    /// rebuild reads the whole source). A write: it finishes if the client goes away.
+    async fn text_rebuild(
+        &self,
+        r: proto::TextIndexRequest,
+    ) -> Result<proto::TextRebuildResponse, ApiError> {
+        let index = self.text_index(&r.index).await?;
+        let Ok(slot) = Arc::clone(&self.text_rebuilds).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is already rebuilding a text index",
+            ));
+        };
+        let placement = self.bulk.placement.clone();
+        let (tx, rx) = oneshot::channel();
+        self.texts.spawn_rebuild(move || {
+            if let Some(p) = placement {
+                p.enter();
+            }
+            let r = index.rebuild();
+            drop(index);
+            drop(slot);
+            let _ = tx.send(r);
+        })?;
+        let stats = rx
+            .await
+            .map_err(|_| ApiError::internal("the rebuild's thread ended early"))??;
+        Ok(proto::TextRebuildResponse {
+            documents: stats.documents,
+            changed: stats.changed,
+            invalid_utf8: stats.invalid_utf8,
+        })
+    }
+
+    /// `Text.Verify`: checks the index against itself and its source, on the blocking pool
+    /// (as `Vectors.Verify` does).
+    async fn text_verify(
+        &self,
+        r: proto::TextIndexRequest,
+    ) -> Result<proto::TextVerifyResponse, ApiError> {
+        let index = self.text_index(&r.index).await?;
+        self.blocking(move || {
+            let s = index.verify()?;
+            Ok(proto::TextVerifyResponse {
+                documents: s.documents,
+                terms: s.terms,
+                postings: s.postings,
+                forward_mismatch: s.forward_mismatch,
+                source_mismatch: s.source_mismatch,
+            })
+        })
+        .await
     }
 
     /// `Vectors.Verify`: checks the index's lists against its vectors, on the blocking pool.

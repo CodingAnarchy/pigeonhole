@@ -378,6 +378,67 @@ fn stop_words_keep_their_positions_in_phrases() {
     db.close().unwrap();
 }
 
+/// ICR 0105's amendment for `phdb serve` (D313 ticket 7c): `Query::quoted_phrase` is the
+/// syntax's `"..."~N`, clause for clause and hit for hit, stop words and slop included.
+#[test]
+fn a_quoted_phrase_matches_the_syntax_exactly() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new().stop_words(true));
+    index.put(b"gap", "State of the Art").unwrap();
+    index.put(b"tight", "state art").unwrap();
+    index.put(b"far", "state of the old and new art").unwrap();
+    index.put(b"rev", "art state").unwrap();
+    for (text, slop) in [
+        ("State of the Art", 0),
+        ("state art", 0),
+        ("state art", 2),
+        ("art state", 3),
+        ("the", 0),
+        ("", 0),
+        ("Say \"hi\" ~ there", 1),
+    ] {
+        let built = Query::new().quoted_phrase(text, slop);
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('~', "\\~");
+        let parsed = Query::parse(&format!("\"{escaped}\"~{slop}")).unwrap();
+        assert_eq!(built.clauses(), parsed.clauses(), "{text:?}~{slop}");
+        let hits = |q: Query| -> Vec<(Vec<u8>, u64)> {
+            let mut h = index.search(q, 10).run().unwrap();
+            h.sort_by(|a, b| a.id.cmp(&b.id));
+            h.into_iter().map(|h| (h.id, h.score.to_bits())).collect()
+        };
+        assert_eq!(hits(built), hits(parsed), "{text:?}~{slop}");
+    }
+    // The cases differ as the syntax's do: the gap holds its stop words' places, a phrase
+    // of only stop words or of nothing matches nothing, and a capitalised phrase is
+    // tokenised as the documents were.
+    let ids_of = |q: Query| {
+        let mut v: Vec<Vec<u8>> = index
+            .search(q, 10)
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        ids_of(Query::new().quoted_phrase("State of the Art", 0)),
+        [b"gap".to_vec()]
+    );
+    assert_eq!(
+        ids_of(Query::new().quoted_phrase("state art", 0)),
+        [b"tight".to_vec()]
+    );
+    assert!(ids_of(Query::new().quoted_phrase("the", 0)).is_empty());
+    assert!(ids_of(Query::new().quoted_phrase("", 0)).is_empty());
+    db.close().unwrap();
+}
+
 #[test]
 fn normalisation_matches_any_composition_and_builder_terms_are_normalised() {
     let dir = pigeonhole::doc_support::temp_dir();
