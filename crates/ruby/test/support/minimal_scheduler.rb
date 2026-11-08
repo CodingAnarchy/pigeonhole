@@ -5,6 +5,10 @@
 # scheduler (test/fiber/scheduler.rb): `unblock` may come from any thread, so it goes through
 # a queue and a wake-up pipe.
 class MinimalScheduler
+  # Called as `on_block.call(blocker, timeout)` as each `block` starts: the tests' window
+  # into a wait (test_fiber.rb's absorb check).
+  attr_accessor :on_block
+
   def initialize
     @readable = {}
     @writable = {}
@@ -71,7 +75,8 @@ class MinimalScheduler
     @waiting.delete(Fiber.current)
   end
 
-  def block(_blocker, timeout = nil)
+  def block(blocker, timeout = nil)
+    @on_block&.call(blocker, timeout)
     if timeout
       @waiting[Fiber.current] = clock + timeout
     else

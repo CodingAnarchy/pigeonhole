@@ -162,6 +162,53 @@ module FiberCases
     end
   end
 
+  # D210 / ICR 0126 §4 through the hold seam (test-hooks; cli692 and the coordinator on
+  # #1592): a raised waiter whose op is still waiting (a commit waiting for room) writes
+  # nothing, even when its op is woken afterwards while another fiber drains. Arranged so
+  # the victim is raised while the drainer role is being handed to it: its ensure then hands
+  # the role on (to W) and absorbs that resume, and the op must already be gone, or W's
+  # drain would poll it to "submission".
+  def test_a_raised_waiter_whose_op_still_waits_writes_nothing
+    skip "needs the test-hooks build (PIGEONHOLE_TEST_HOOKS=1 rake compile)" unless defined?(Pigeonhole::Native::Gate)
+
+    drainer, held, other = Array.new(3) { Pigeonhole::Native::Gate.new }
+    rescued = false
+    at_absorb = nil
+    on_scheduler do |spawn|
+      b = Pigeonhole::Native::FiberBridge.current
+      # The minimal scheduler shows the victim's absorb as it starts: its op must be dropped
+      # by then, or a drain during the absorb could submit it.
+      sched = Fiber.scheduler
+      if sched.respond_to?(:on_block=)
+        sched.on_block = lambda do |_blocker, timeout|
+          at_absorb ||= held.counts if timeout # the absorb is the only timed block
+        end
+      end
+      spawn.call { b.await(drainer.op(b.native)) } # parks first: the drainer
+      victim = spawn.call do
+        b.await(held.op(b.native))
+      rescue *STOPS
+        rescued = true
+      end
+      spawn.call { b.await(other.op(b.native)) }
+      sleep 0.01 # all three parked
+      drainer.open # its op is done: the role goes to the victim
+      sleep 0
+      stop(victim)
+      held.open # the victim's op is woken now: had it survived, the next drain submits it
+      sleep 0.05
+      other.open
+    end
+    assert rescued
+    if is_a?(TestFiberMinimal)
+      refute_nil at_absorb, "the victim never absorbed a resume: the test arranged nothing"
+      assert_equal 1, at_absorb[2], "the victim's op was still live while it absorbed"
+    end
+    polls, submits, drops = held.counts
+    assert_equal [1, 0, 1], [polls, submits, drops], "the held op was polled after its waiter was raised"
+    assert_equal 0, bridge.native.pending
+  end
+
   def test_a_forked_child_gets_its_own_bridge
     on_scheduler { @t.put("p", "f", "a", "v", durability: :sync) }
     parent = bridge

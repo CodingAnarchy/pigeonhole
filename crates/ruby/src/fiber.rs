@@ -278,3 +278,94 @@ where
         Box::new(move |ruby: &Ruby| conv(ruby, t)) as Out
     })
 }
+
+/// A hold seam for the bridge's cancellation tests (feature `test-hooks`, as #1547's Python
+/// `_Gate`): an op whose future stays pending until `open`, counting its polls and drops,
+/// driven by the same `start`, waker and drain as every waiting call. A poll once open
+/// stands for the submission of a commit that was waiting for room.
+#[cfg(feature = "test-hooks")]
+pub(crate) mod hooks {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    use magnus::{Error, IntoValue, Ruby};
+
+    use super::{FiberBridge, FiberOp, Out};
+    use crate::convert::lock;
+
+    #[derive(Default)]
+    struct State {
+        open: AtomicBool,
+        polls: AtomicU64,
+        submits: AtomicU64,
+        drops: AtomicU64,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    /// `Pigeonhole::Native::Gate`.
+    #[magnus::wrap(class = "Pigeonhole::Native::Gate", free_immediately, size)]
+    pub(crate) struct Gate(Arc<State>);
+
+    struct Held(Arc<State>);
+
+    impl Future for Held {
+        type Output = Out;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Out> {
+            let s = &self.0;
+            s.polls.fetch_add(1, Ordering::SeqCst);
+            if s.open.load(Ordering::SeqCst) {
+                s.submits.fetch_add(1, Ordering::SeqCst);
+                return Poll::Ready(Box::new(|ruby: &Ruby| {
+                    Ok(ruby.qnil().into_value_with(ruby))
+                }));
+            }
+            *lock(&s.waker) = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Gate {
+        /// `Gate.new`.
+        pub(crate) fn new() -> Self {
+            Self(Arc::default())
+        }
+
+        /// `op(bridge)`: an op on `bridge`, pending until `open`.
+        pub(crate) fn op(
+            ruby: &Ruby,
+            rb_self: &Self,
+            bridge: &FiberBridge,
+        ) -> Result<FiberOp, Error> {
+            let s = Arc::clone(&rb_self.0);
+            FiberBridge::start(ruby, bridge, move || Box::pin(Held(s)))
+        }
+
+        /// `open`: opens the gate and wakes its op, as an engine thread would.
+        pub(crate) fn open(&self) {
+            self.0.open.store(true, Ordering::SeqCst);
+            if let Some(w) = lock(&self.0.waker).take() {
+                w.wake();
+            }
+        }
+
+        /// `[polls, submits, drops]`.
+        pub(crate) fn counts(&self) -> (u64, u64, u64) {
+            let s = &self.0;
+            (
+                s.polls.load(Ordering::SeqCst),
+                s.submits.load(Ordering::SeqCst),
+                s.drops.load(Ordering::SeqCst),
+            )
+        }
+    }
+}

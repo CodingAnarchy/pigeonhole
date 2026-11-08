@@ -9,4 +9,6 @@ require "rb_sys/mkmf"
 # rewritten (a source gem's user gets the versions CI tested).
 create_rust_makefile("pigeonhole/pigeonhole_native") do |r|
   r.extra_cargo_args += ["--locked"]
+  # The tests' hold seams (`test-hooks`, #1574): CI's test build sets this; the gems don't.
+  r.features += ["test-hooks"] if ENV["PIGEONHOLE_TEST_HOOKS"] == "1"
 end

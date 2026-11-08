@@ -87,6 +87,16 @@ fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> 
     c.define_method("take", method!(FiberOp::take, 0))?;
     c.define_method("cancel", method!(FiberOp::cancel, 0))?;
 
+    #[cfg(feature = "test-hooks")]
+    {
+        use fiber::hooks::Gate;
+        let c = class(ruby, native, "Gate")?;
+        c.define_singleton_method("new", function!(Gate::new, 0))?;
+        c.define_method("op", method!(Gate::op, 1))?;
+        c.define_method("open", method!(Gate::open, 0))?;
+        c.define_method("counts", method!(Gate::counts, 0))?;
+    }
+
     let c = m.const_get::<_, RClass>("Mutation")?;
     c.define_private_method("native_commit_op", method!(Mutation::commit_op, 1))?;
     c.define_private_method("native_commit_if_op", method!(Mutation::commit_if_op, 2))?;

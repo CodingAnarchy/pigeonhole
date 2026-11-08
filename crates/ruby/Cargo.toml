@@ -17,6 +17,11 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+[features]
+# `Pigeonhole::Native::Gate`, the fiber bridge's hold seam for its cancellation tests
+# (#1574). Built only for the tests (`PIGEONHOLE_TEST_HOOKS=1 rake compile`), never in a gem.
+test-hooks = []
+
 [dependencies]
 pigeonhole = { path = "../pigeonhole", version = "1.1.0" }
 # `Pigeonhole::Memory` (PR 3a).
