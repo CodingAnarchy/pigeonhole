@@ -235,3 +235,26 @@ class TestFiberMinimal < Minitest::Test
   def stop(fiber) = fiber.raise(StopTest)
 
 end
+
+# Where the bridge exists (ICR 0126, cli692's Q2): everywhere but Windows, where every call
+# blocks as before, scheduler or not.
+class TestFiberPlatforms < Minitest::Test
+  include PigeonholeTest
+
+  def test_windows_keeps_blocking_and_unix_has_the_bridge
+    windows = RbConfig::CONFIG["host_os"].match?(/mswin|mingw|cygwin/)
+    assert_equal !windows, Pigeonhole::Native::FiberBridge::SUPPORTED
+    t = db.table("t").family("f").create
+    seen = :unset
+    Thread.new do
+      Fiber.set_scheduler(MinimalScheduler.new)
+      Fiber.schedule do
+        seen = Pigeonhole::Native::FiberBridge.current
+        t.put("r", "f", "a", "v", durability: :sync)
+      end
+      Fiber.scheduler.close
+    end.join
+    windows ? assert_nil(seen) : assert_kind_of(Pigeonhole::Native::FiberBridge, seen)
+    assert_equal "v", t.get("r", "f", "a").value
+  end
+end
