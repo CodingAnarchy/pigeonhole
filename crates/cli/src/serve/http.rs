@@ -54,6 +54,9 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         proto::vectors_server::VectorsServer::new(super::grpc::VectorsGrpc(Arc::clone(&shared)))
             .max_decoding_message_size(limits.max_request_bytes)
             .max_encoding_message_size(usize::MAX);
+    let text = proto::text_server::TextServer::new(super::grpc::TextGrpc(Arc::clone(&shared)))
+        .max_decoding_message_size(limits.max_request_bytes)
+        .max_encoding_message_size(usize::MAX);
     let feeds = super::grpc::FeedGrpc {
         shared: Arc::clone(&shared),
         max_request_bytes: limits.max_request_bytes,
@@ -98,6 +101,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
             tower::ServiceBuilder::new()
                 .layer(prepay())
                 .service(vectors),
+        )
+        .route_service(
+            "/pigeonhole.v1.Text/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(text),
         )
         .route_service(
             "/pigeonhole.v1.Feed/{*method}",
@@ -311,6 +318,9 @@ async fn call(
         Ok(ServiceReply::Nearest(r)) => json(&r),
         Ok(ServiceReply::VectorSearch(r)) => json(&r),
         Ok(ServiceReply::VectorVerify(r)) => json(&r),
+        Ok(ServiceReply::TextSearch(r)) => json(&r),
+        Ok(ServiceReply::TextRebuild(r)) => json(&r),
+        Ok(ServiceReply::TextVerify(r)) => json(&r),
         Ok(ServiceReply::Download(d)) => download(d),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
@@ -712,6 +722,12 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Vectors", "Delete") => ServiceOp::VectorDelete(parse(body)?),
         ("Vectors", "Search") => ServiceOp::VectorSearch(parse(body)?),
         ("Vectors", "Verify") => ServiceOp::VectorVerify(parse(body)?),
+        ("Text", "CreateIndex") => ServiceOp::TextCreateIndex(parse(body)?),
+        ("Text", "Put") => ServiceOp::TextPut(parse(body)?),
+        ("Text", "Delete") => ServiceOp::TextDelete(parse(body)?),
+        ("Text", "Search") => ServiceOp::TextSearch(parse(body)?),
+        ("Text", "Rebuild") => ServiceOp::TextRebuild(parse(body)?),
+        ("Text", "Verify") => ServiceOp::TextVerify(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

@@ -708,6 +708,55 @@ impl super::bulk::Source for GrpcSource {
     }
 }
 
+/// `Text` over gRPC (D313 ticket 7c): the BM25 index (D309, ICR 0105).
+#[derive(Debug, Clone)]
+pub(crate) struct TextGrpc(pub(crate) Arc<Shared>);
+
+#[tonic::async_trait]
+impl proto::text_server::Text for TextGrpc {
+    async fn create_index(
+        &self,
+        req: Request<proto::CreateTextIndexRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, TextCreateIndex, Empty)
+    }
+
+    async fn put(
+        &self,
+        req: Request<proto::TextPutRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, TextPut, Empty)
+    }
+
+    async fn delete(
+        &self,
+        req: Request<proto::TextDeleteRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, TextDelete, Empty)
+    }
+
+    async fn search(
+        &self,
+        req: Request<proto::TextSearchRequest>,
+    ) -> Result<Response<proto::TextSearchResponse>, Status> {
+        unary!(&self.0, req, TextSearch, TextSearch)
+    }
+
+    async fn rebuild(
+        &self,
+        req: Request<proto::TextIndexRequest>,
+    ) -> Result<Response<proto::TextRebuildResponse>, Status> {
+        unary!(&self.0, req, TextRebuild, TextRebuild)
+    }
+
+    async fn verify(
+        &self,
+        req: Request<proto::TextIndexRequest>,
+    ) -> Result<Response<proto::TextVerifyResponse>, Status> {
+        unary!(&self.0, req, TextVerify, TextVerify)
+    }
+}
+
 /// `Schema` over gRPC (D313 ticket 6).
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaGrpc(pub(crate) Arc<Shared>);

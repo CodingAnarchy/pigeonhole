@@ -145,6 +145,12 @@ No API change.
 - **The test:** on a dense `w`+digits vocabulary, the top 1, 3 and 10 equal the full ranking's prefix with the same scores. A cut that ignores the other clauses' bounds fails it.
 - **Measured** at 100,000 documents on a laptop: fuzzy-1 p50 25 → 2.7 ms (p99 92 → 16 ms), fuzzy-2 30 → 5.5 ms. The AX102 numbers come with #1349.
 
+## Amendment: `Query::quoted_phrase` (D313 ticket 7c)
+- **`Query::quoted_phrase(text, slop: u16)`** adds a [`Clause::QuotedPhrase`]: a phrase given as text, tokenised as documents are, exactly what the syntax's `"..."~N` parses to (stop words keep their places). It's additive: the clause, and its search, already existed. Only the builder was missing.
+- **Why:** `phdb serve`'s `Text.Search` maps the proto's clauses by field name: `term` fields as given (`term`, `fuzzy`), `text` fields tokenised (`text`, and a phrase's `text`). Without the builder, a phrase clause could only be split into exact words, which a lowercased index never matches, or parsed into a query that can't be merged with built clauses in the request's order.
+- **No generic `Query::clause(Clause)`:** it would let callers build clauses the docs don't describe (ai1249). `FuzzyText`'s builder waits until a front end needs it.
+- **Test:** the builder and the parsed `"..."~N` form give the same clauses and the same hits and scores, for stop words, slop, reversed order, a phrase of only stop words or of nothing, and escaped quotes.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 
