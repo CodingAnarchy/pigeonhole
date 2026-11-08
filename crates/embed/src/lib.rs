@@ -55,8 +55,9 @@
 //! - **candle's process-wide pool** for large element-wise steps (64K elements and up: long
 //!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads (by
 //!   default one per physical core, less one), which spin briefly before parking. On Linux,
-//!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. A server that keeps
-//!   latency-sensitive threads on some cores should set both before the first embedding.
+//!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set both in the process's
+//!   environment before it starts (they're read once, and a library can't set them safely):
+//!   `phdb serve` prints the values for its placement.
 
 #![forbid(unsafe_code)]
 

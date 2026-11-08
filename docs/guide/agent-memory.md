@@ -65,7 +65,7 @@ let hits = store
 - **Text past 512 tokens is truncated** (about 350 English words), so split long documents before remembering them.
 - **One embedder, shared:** each `LocalEmbedder` holds the weights (about 133 MB), and it's `Send` and `Sync`. Calls from many threads queue for its pool.
 - **The store's element:** `embedding_model(Element::F16)` (or `BF16`) pins a half-size store. The embeddings stay `f32`, and the store rounds them as it writes.
-- **CPU cost:** the matrix products run on the embedder's own thread pool (`LoadOptions::threads`, by default up to 4), never your application's rayon pool. `LoadOptions::on_thread_start` can place its threads. candle runs large element-wise steps on a process-wide pool of its own, one thread per physical core less one, sized by `CANDLE_NUM_THREADS` and on Linux pinned by `CANDLE_CPU_MASK` (a CPU list). Set both before the first embedding to keep embedding work off cores your latency-sensitive threads use. On a 10-core Apple laptop:
+- **CPU cost:** the matrix products run on the embedder's own thread pool (`LoadOptions::threads`, by default up to 4), never your application's rayon pool. `LoadOptions::on_thread_start` can place its threads. candle runs large element-wise steps on a process-wide pool of its own, one thread per physical core less one, sized by `CANDLE_NUM_THREADS` and on Linux pinned by `CANDLE_CPU_MASK` (a CPU list). Export both before starting the process (they're read once) to keep embedding work off cores your latency-sensitive threads use. `phdb serve` prints the values to use for its placement. On a 10-core Apple laptop:
 
 | Threads | 16 tokens | 64 tokens | 256 tokens | Batches of 32 (16 tokens) |
 |---|---|---|---|---|
