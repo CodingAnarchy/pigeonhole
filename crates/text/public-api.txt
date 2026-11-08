@@ -117,6 +117,7 @@ pub fn pigeonhole_text::Query::new() -> Self
 pub fn pigeonhole_text::Query::parse(&str) -> pigeonhole_text::Result<pigeonhole_text::Query>
 pub fn pigeonhole_text::Query::phrase<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn pigeonhole_text::Query::phrase_with_slop<I, S>(self, I, u16) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn pigeonhole_text::Query::quoted_phrase(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
 pub fn pigeonhole_text::Query::term(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_text::Query::text(self, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<&alloc::string::String> for pigeonhole_text::Query
