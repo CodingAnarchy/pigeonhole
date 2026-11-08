@@ -336,6 +336,10 @@ impl Vfs for UringVfs {
         self.files.remove(path)
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.files.rename(from, to)
+    }
+
     fn exists(&self, path: &Path) -> Result<bool> {
         self.files.exists(path)
     }

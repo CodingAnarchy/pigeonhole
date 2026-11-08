@@ -163,6 +163,15 @@ pub(crate) enum Command {
     /// 0112). Holds the database until stopped with Ctrl-C or SIGTERM, then closes it.
     #[cfg(feature = "serve")]
     Serve(Box<crate::serve::ServeArgs>),
+    /// Turn a replica's database (`phdb serve --replica-of`'s) into a primary, offline: it
+    /// takes writes from then on, at the last of the primary's commits it applied. Stop the
+    /// replica server first, and the old primary's writers: nothing fences the old primary.
+    /// A running replica server is promoted with `Admin.Promote`.
+    #[cfg(feature = "serve")]
+    Promote {
+        /// The replica's database file (`*.phdb`).
+        file: PathBuf,
+    },
 }
 
 /// `phdb mcp`'s agent memory options (D311 T7): a `pigeonhole-memory` store and the tools

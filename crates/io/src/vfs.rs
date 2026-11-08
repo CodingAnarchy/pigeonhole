@@ -52,6 +52,16 @@ pub trait Vfs: Send + Sync + Debug {
     /// Removes a file.
     fn remove(&self, path: &Path) -> Result<()>;
 
+    /// Renames `from` to `to`, replacing `to` if it exists (an atomic replace on POSIX; on
+    /// Windows `MoveFileEx` with replacement, which needs every handle open on `to` to share
+    /// deletes, as this crate's handles do). Durable once the directory is synced. The
+    /// default refuses (`Unsupported`): a wrapper that forwards [`Vfs::remove`] forwards this
+    /// too if it needs it (#1436: a replica's re-bootstrap swaps its file in).
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let _ = (from, to);
+        Err(crate::Error::new(crate::ErrorKind::Unsupported, "rename"))
+    }
+
     /// Whether a path exists.
     fn exists(&self, path: &Path) -> Result<bool>;
 

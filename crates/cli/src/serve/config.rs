@@ -129,6 +129,27 @@ pub(crate) struct ServeArgs {
     /// more are refused (`Overloaded`).
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub max_backups: usize,
+    /// Turn the change feed on, keeping up to this many bytes of history: `Feed.Subscribe`
+    /// and replicas (`Replication.Follow`) read it. Without it, a database whose feed is on
+    /// keeps it (the open inherits it). A replica that falls further behind than this
+    /// bootstraps again.
+    #[arg(long, value_name = "BYTES")]
+    pub change_feed: Option<u64>,
+    /// Serve this database as a replica of the primary server at this URL (`http://` or
+    /// `https://`): it bootstraps from the primary's backup, then follows its durable
+    /// commits, and refuses writes until `Admin.Promote`. Reads see a consistent prefix of
+    /// the primary's commits. The primary needs `--backup-dir` and a change feed of every
+    /// table.
+    #[arg(long, value_name = "URL")]
+    pub replica_of: Option<String>,
+    /// The bearer token the replica sends the primary (admin scope there), alone in the file.
+    /// Also from `PHDB_REPLICA_TOKEN`. Never a flag's value.
+    #[arg(long, value_name = "FILE", requires = "replica_of")]
+    pub replica_token_file: Option<PathBuf>,
+    /// A replica's run: the primary's commits it applies in one commit of its own, at most
+    /// (or 8 MiB). A caught-up replica applies what arrived at once, whatever the count.
+    #[arg(long, value_name = "N", default_value_t = super::replica::RUN_EVENTS, requires = "replica_of")]
+    pub replica_run: usize,
 }
 
 /// What the flags leave the server to do.

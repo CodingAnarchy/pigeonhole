@@ -94,6 +94,7 @@ pub use read::traverse::{
 };
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};
+pub use shard::remove_side_files;
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};

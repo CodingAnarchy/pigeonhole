@@ -399,3 +399,34 @@ fn the_default_shard_count_is_one_per_physical_core() {
         }
     }
 }
+
+/// `Vfs::rename` replaces a file that is still open and locked, as a replica's re-bootstrap
+/// renames its new copy over the served file while the old engine's handle holds the writer
+/// byte (#1436, simp724's A2 on #1583). The held handle keeps reading the old file; a new
+/// open reads the new one. On Windows this relies on every handle sharing deletes, which
+/// the crate's handles do through `std`'s defaults: CI's Windows job runs this.
+#[test]
+fn rename_replaces_a_file_held_open_and_locked() {
+    let (dir, vfs, path) = setup("rename-held");
+    let held = vfs.open(&path, OpenOptions::read_write_create()).unwrap();
+    held.write_at(b"old!", 0).unwrap();
+    held.lock(8192, LockMode::Exclusive).unwrap();
+    let side = dir.0.join("data.phdb.bootstrap");
+    let new = vfs.open(&side, OpenOptions::read_write_create()).unwrap();
+    new.write_at(b"new!", 0).unwrap();
+    drop(new);
+
+    vfs.rename(&side, &path).unwrap();
+    vfs.sync_dir(&dir.0).unwrap();
+
+    assert!(!vfs.exists(&side).unwrap(), "the side file is gone");
+    let mut buf = [0u8; 4];
+    held.read_at(&mut buf, 0).unwrap();
+    assert_eq!(
+        &buf, b"old!",
+        "the held handle still reads the file it opened"
+    );
+    let reopened = vfs.open(&path, OpenOptions::read()).unwrap();
+    reopened.read_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"new!", "the path now names the new file");
+}
