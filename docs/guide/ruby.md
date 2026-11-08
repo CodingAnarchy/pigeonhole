@@ -414,9 +414,44 @@ end
 - **`Pigeonhole::Family.new(max_versions:, ttl:, bloom_bits:, block_size:, blob_threshold:, compression:, zstd_level:)`** sets a family's options. `Family.counter` makes a counter family, and `Family.aggregate(kind, ...)` an aggregate one (`:sum`, `:hll`, `:histogram`, ...).
 - **`table.family_info(name)`** reads a family's stored options. Its Symbol-valued ones (`aggregation`, `compression`, `cache_priority`, `compaction`) come back as Symbols, `counter?` is a predicate, and `ttl` is seconds or `nil`.
 
+## Fiber schedulers
+Under a fiber scheduler (Async, Falcon, or any `Fiber::Scheduler`), a commit lets the thread's other fibers run while it waits, instead of blocking the thread (#1574, ICR 0126). Nothing changes in your code: the same methods behave as Ruby's own `IO`, `Queue` and `sleep` do under a scheduler.
+
+```ruby
+require "async"
+
+Pigeonhole.open(path, create: true) do |db|
+  events = db.table("events").family("f").create
+  Async do |task|
+    # 100 fibers on one thread, each committing while the others run.
+    100.times.map do |i|
+      task.async { events.put("k#{i}", "f", "q", "v", durability: :sync) }
+    end.each(&:wait)
+  end
+  raise "missing" unless events.get("k99", "f", "q")
+end
+```
+
+- **What yields:**
+  - `WriteBatch#commit` and `Transaction#commit`, and the block forms of `write_batch` and `transaction`;
+  - `Database#transact` (its retry pause is `sleep`, which yields already);
+  - `Mutation#commit`, `commit_if`, `commit_returning` and `commit_if_returning`;
+  - `Table#put`, `incr`, `incr_returning` and `delete`.
+
+  Each submits at the call, as before, then waits without holding the thread.
+- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), the change feed's and memory's waits (coming in later releases), and every call on Windows.
+- **Opting out:** `Fiber.blocking { ... }` keeps the calls inside it blocking. `Pigeonhole.fiber_scheduler = false` does it for the whole process, which keeps 1.1's behaviour for an application that can't check its call sites yet.
+- **A commit is now a point where the thread's other fibers run.** So [don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) applies across fibers too. A snapshot or open scan that one fiber keeps while another fiber on the thread commits can make that commit wait for room the snapshot pins, and it ends in `Busy` after the write-stall timeout. Finish or release snapshots and scans before a commit that may yield.
+- **Stopping a waiting fiber** (`Async::Task#stop`, a timeout, `Thread#raise`) ends its wait and raises in it, as for any other wait.
+  - A commit still waiting for room writes nothing.
+  - One already submitted may still land, and its result is lost (D210), so the outcome is unknown, as after `OutcomeUnknown`.
+  - For `incr_returning` and `commit_returning`, a landed commit's values are lost: a gap in a sequence, never a repeat.
+  - `transact` doesn't retry a stopped attempt.
+- **Threads and processes:** each thread's fibers share one small bridge (a pipe and its file descriptors). A forked child makes its own and leaves the parent's open.
+
 ## Readers, threads and processes
 - **Processes:** one process opens a database as the writer (`Pigeonhole.open`). Others open it as readers (`Pigeonhole.open_reader(path)`), which see every commit and can't write: a reader's table raises `Pigeonhole::ReadOnly` on writes ([reader processes](readers.md)).
-- **Threads:** every engine call releases the GVL, so Ruby threads run reads and commits in parallel. The handles are safe to share between threads.
+- **Threads:** every engine call releases the GVL, so Ruby threads run reads and commits in parallel. The handles are safe to share between threads. Under a fiber scheduler, commits also let the thread's other fibers run ([Fiber schedulers](#fiber-schedulers)).
 - **Interrupts:** an engine call can't be interrupted midway. A `Thread#raise`, `Thread#kill` or Ctrl-C that arrives during a call lands when the call returns, and a commit that ran stays committed. Calls are bounded, so the wait is short.
 - **Forking servers (Puma, Unicorn, Pitchfork with `preload_app`):**
   - A forked child can't use a handle it inherited: every call raises `Pigeonhole::Unsupported`.
