@@ -757,6 +757,10 @@ impl Vfs for PreadVfs {
         fs::remove_file(path).map_err(|e| Error::os("remove", e))
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        fs::rename(from, to).map_err(|e| Error::os("rename", e))
+    }
+
     fn exists(&self, path: &Path) -> Result<bool> {
         path.try_exists().map_err(|e| Error::os("exists", e))
     }

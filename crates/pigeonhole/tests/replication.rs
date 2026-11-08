@@ -59,7 +59,11 @@ fn ready(feed: &mut Feed) -> Vec<ReplicatedEvent> {
         .unwrap()
         .is_some()
     {
-        out.push(feed.replicated().expect("an event was delivered"));
+        // Through the wire encoding a replica in another process reads (#1436).
+        let event = feed.replicated().expect("an event was delivered");
+        let decoded = ReplicatedEvent::decode(&event.encode()).unwrap();
+        assert_eq!(decoded, event);
+        out.push(decoded);
     }
     out
 }
@@ -533,4 +537,188 @@ fn a_promoted_replica_takes_writes_and_refuses_applies() {
         .unwrap();
     replica.close().unwrap();
     primary.close().unwrap();
+}
+
+/// `replace_with` (#1436: a replica's re-bootstrap): a handle's file is swapped for a fresh
+/// copy under its locks. Every clone then reads the copy, the old copy's WAL is gone, and a
+/// second process's writer is refused before and after.
+#[test]
+fn replace_with_swaps_a_handle_s_file_for_a_copy_under_its_locks() {
+    let vfs = SimVfs::new(43);
+    let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+    for step in 0..6 {
+        workload(&primary, step);
+    }
+    let replica = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+    replica
+        .table("old")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let clone = replica.clone();
+    let other = || {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(pigeonhole_io::ProcessId {
+                pid: 99,
+                start_time: 1,
+            });
+            Pigeonhole::open("/r/data.phdb", options(&vfs))
+                .err()
+                .map(|e| e.code())
+        })
+        .join()
+        .unwrap()
+    };
+    assert_eq!(other(), Some(ErrorCode::WriterLocked));
+    // A side copy whose last writer (another process) didn't close it is refused: its WAL,
+    // named after the side path, wouldn't be replayed after the rename (simp724's A1).
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/r/crashed.phdb").unwrap();
+    let crashed = pigeonhole_io::ProcessId {
+        pid: 77,
+        start_time: 1,
+    };
+    {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(crashed);
+            let copy = Pigeonhole::open("/r/crashed.phdb", options(&vfs)).unwrap();
+            copy.table("only_in_wal")
+                .unwrap()
+                .family("f", Family::default())
+                .create()
+                .unwrap();
+            std::mem::forget(copy);
+        })
+        .join()
+        .unwrap();
+    }
+    vfs.crash_process(crashed);
+    let refused = replica.replace_with("/r/crashed.phdb").unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    assert!(
+        replica.table("old").unwrap().open().is_ok(),
+        "a refused replace leaves the database as it was"
+    );
+
+    // The bootstrap's way: the copy opened under its own name (its WAL named after it),
+    // changed, closed cleanly, then swapped in. Its WAL goes with the replace.
+    primary.backup_at(&snap, "/r/side.phdb").unwrap();
+    drop(snap);
+    let side = Pigeonhole::open("/r/side.phdb", options(&vfs)).unwrap();
+    side.table("in_side")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    side.close().unwrap();
+    let side_wal = |vfs: &SimVfs| {
+        pigeonhole_io::Vfs::list_dir(vfs, std::path::Path::new("/r"))
+            .unwrap()
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("side.phdb-"))
+            })
+            .count()
+    };
+    assert!(side_wal(&vfs) > 0, "the side copy's open left its own WAL");
+    let before = vfs.shared_regions();
+    replica.replace_with("/r/side.phdb").unwrap();
+    assert_eq!(side_wal(&vfs), 0, "the side copy's WAL and sidecar go");
+    // The new file's region in place of the old one's (simp724's A3).
+    assert_eq!(
+        vfs.shared_regions(),
+        before,
+        "the old file's shm region goes"
+    );
+    assert!(replica.table("in_side").unwrap().open().is_ok());
+    assert_eq!(
+        contents(&clone),
+        contents(&primary),
+        "every clone reads the copy"
+    );
+    assert!(
+        replica.table("old").unwrap().open().is_err(),
+        "the old file is gone"
+    );
+    assert_eq!(other(), Some(ErrorCode::WriterLocked));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// A reader process attached to the old file when `replace_with` swaps a new copy in, and
+/// closing after it, must not remove the new engine's WAL (simp724's B1 on #1583). Its
+/// last-one-out cleanup takes the writer byte on its own (old, now unlocked) inode, and the
+/// WAL files are found by path, which names the new file; the new file still reads clean
+/// until its first root commit. Commits after the swap, before any flush, then live only in
+/// that WAL: a crash and reopen keep them.
+#[test]
+fn a_reader_of_the_replaced_file_never_removes_the_new_file_s_wal() {
+    let vfs = SimVfs::new(44);
+    let primary = Pigeonhole::open("/p/data.phdb", options(&vfs)).unwrap();
+    primary
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, "/r/side.phdb").unwrap();
+    drop(snap);
+    primary.close().unwrap();
+    let db = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+
+    // A reader process on the old file, until told to close.
+    let (attached_tx, attached) = std::sync::mpsc::channel();
+    let (close_tx, close) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let vfs = Arc::clone(&vfs);
+        std::thread::spawn(move || {
+            vfs.enter_process(pigeonhole_io::ProcessId {
+                pid: 88,
+                start_time: 1,
+            });
+            let r = Pigeonhole::open_reader(
+                "/r/data.phdb",
+                pigeonhole::ReaderOptions::default().vfs(Arc::clone(&vfs) as _),
+            )
+            .unwrap();
+            attached_tx.send(()).unwrap();
+            close.recv().unwrap();
+            drop(r);
+        })
+    };
+    attached.recv().unwrap();
+
+    db.replace_with("/r/side.phdb").unwrap();
+    // Writes to a table the copy has: no catalog change, so no root commit, so the new
+    // file still reads clean; the rows are only in its WAL.
+    let t = db.table("t").unwrap().open().unwrap();
+    for i in 0..20u32 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put("f", b"q", b"after the swap")
+            .commit()
+            .unwrap();
+    }
+    close_tx.send(()).unwrap();
+    reader.join().unwrap();
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/r/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    for i in 0..20u32 {
+        assert!(
+            t.get(format!("r{i:02}").as_bytes(), "f", b"q")
+                .unwrap()
+                .is_some(),
+            "r{i:02}, committed after the swap, survives the crash"
+        );
+    }
+    drop(t);
+    db.close().unwrap();
 }
