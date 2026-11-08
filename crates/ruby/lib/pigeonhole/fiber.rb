@@ -92,8 +92,10 @@ module Pigeonhole
         ensure
           @parked.delete(op.id)
           hand_off(scheduler) if @drainer.equal?(entry)
-          absorb(scheduler, op) if entry.resuming
+          # Cancelled before the absorb yields: a drain meanwhile must not poll a commit still
+          # waiting for room to submission (D210; cli692 on #1592).
           op.cancel unless entry.done
+          absorb(scheduler, op) if entry.resuming
         end
         op.take
       end
