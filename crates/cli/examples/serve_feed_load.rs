@@ -5,7 +5,9 @@
 //! scenario opens that many idle `Feed.Subscribe` streams over gRPC (64 to a connection),
 //! then runs a put loop (`Data.Mutate` on `busy`) for a fixed time. Per scenario it prints
 //! the commit throughput, put latency p50/p99/p99.9, the server process's CPU per put (Linux,
-//! from `/proc`), and the events the subscribers received. With `--durability 2` (Buffered,
+//! from `/proc`), the events the subscribers received, and their feed lag: each put's value
+//! starts with its send time, and each subscriber measures send-to-arrival for every commit
+//! it gets (perf287's D3 on #1397). With `--durability 2` (Buffered,
 //! so fsync doesn't set the pace), add `--visible`: a durable feed sees only synced commits.
 //!
 //! The scenarios:
@@ -18,11 +20,14 @@
 //! ```text
 //! cargo build --release -p pigeonhole-cli --features serve --bin phdb --example serve_feed_load
 //! target/release/examples/serve_feed_load --phdb target/release/phdb --dir /mnt/nvme/feedload
+//! # with server flags, e.g. the feed runtime's size (ticket 5's (A)):
+//! target/release/examples/serve_feed_load ... --serve-arg=--feed-threads --serve-arg=4
 //! ```
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -70,6 +75,10 @@ struct Args {
     /// Needed with `--durability 2` (Buffered): a durable feed delivers only synced commits.
     #[arg(long)]
     visible: bool,
+    /// An argument passed through to `phdb serve`, repeatable (for example
+    /// `--serve-arg=--feed-threads --serve-arg=4`).
+    #[arg(long = "serve-arg", allow_hyphen_values = true)]
+    serve_args: Vec<String>,
 }
 
 /// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
@@ -79,13 +88,25 @@ const STREAMS_PER_CONNECTION: usize = 64;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    epoch();
     let file = prepare(&args)?;
     let mut server = Server::start(&args, &file)?;
     let url = format!("http://127.0.0.1:{}", args.port);
     let channel = connect(&url).await?;
+    if !args.serve_args.is_empty() {
+        println!("phdb serve {}", args.serve_args.join(" "));
+    }
     println!(
-        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12}",
-        "scenario", "puts/s", "p50 us", "p99 us", "p999 us", "cpu us/put", "events/sub"
+        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11}",
+        "scenario",
+        "puts/s",
+        "p50 us",
+        "p99 us",
+        "p999 us",
+        "cpu us/put",
+        "events/sub",
+        "lag p50 us",
+        "lag p99 us"
     );
     let busy = |n: usize| vec![vec!["busy".to_owned()]; n];
     let mut scenarios: Vec<(String, Vec<Vec<String>>)> = args
@@ -102,15 +123,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     for (name, subs) in scenarios {
         let r = run(&args, &channel, server.pid(), &subs).await?;
+        let lag = |q: f64| {
+            r.lag
+                .quantile(q)
+                .map_or_else(|| "-".into(), |v| v.to_string())
+        };
         println!(
-            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1}",
+            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1} {:>11} {:>11}",
             r.puts_per_sec,
             r.p50,
             r.p99,
             r.p999,
             r.cpu_us_per_put
                 .map_or_else(|| "n/a".into(), |c| format!("{c:.1}")),
-            r.events_per_sub
+            r.events_per_sub,
+            lag(0.5),
+            lag(0.99)
         );
     }
     server.stop();
@@ -151,6 +179,7 @@ impl Server {
             .arg(format!("127.0.0.1:{}", args.port))
             .arg("--max-streams")
             .arg("1024")
+            .args(&args.serve_args)
             .spawn()?;
         Ok(Self(child))
     }
@@ -187,7 +216,64 @@ async fn connect(url: &str) -> Result<tonic::transport::Channel, Box<dyn std::er
     }
 }
 
+/// When the run started: put values carry their send time as nanoseconds since this, which
+/// the subscribers, in the same process, compare with their arrival.
+fn epoch() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn now_nanos() -> u64 {
+    epoch().elapsed().as_nanos() as u64
+}
+
+/// Feed lag, send to arrival, in microseconds: a log-bucketed histogram (about 5% wide), one
+/// per subscriber so the subscribers share nothing, merged at the end.
+#[derive(Clone)]
+struct Lag(Vec<u64>);
+
+impl Lag {
+    /// Buckets up to about 100 s.
+    const BUCKETS: usize = 400;
+
+    fn new() -> Self {
+        Self(vec![0; Self::BUCKETS])
+    }
+
+    fn bucket(us: u64) -> usize {
+        ((((us + 1) as f64).ln() / 1.05f64.ln()) as usize).min(Self::BUCKETS - 1)
+    }
+
+    fn record(&mut self, us: u64) {
+        self.0[Self::bucket(us)] += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a += b;
+        }
+    }
+
+    /// The `q` quantile's bucket, as its upper bound in microseconds.
+    fn quantile(&self, q: f64) -> Option<u64> {
+        let total: u64 = self.0.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let want = ((total as f64) * q).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (i, n) in self.0.iter().enumerate() {
+            seen += n;
+            if seen >= want {
+                return Some(1.05f64.powi(i as i32 + 1) as u64);
+            }
+        }
+        None
+    }
+}
+
 struct Outcome {
+    lag: Lag,
     puts_per_sec: f64,
     p50: u64,
     p99: u64,
@@ -206,6 +292,7 @@ async fn run(
     // what it gets.
     let subscribers = tables.len();
     let events = Arc::new(AtomicU64::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     let mut subs = Vec::with_capacity(subscribers);
     let url = format!("http://127.0.0.1:{}", args.port);
     let mut connections = Vec::new();
@@ -225,10 +312,31 @@ async fn run(
             .await?
             .into_inner();
         let events = Arc::clone(&events);
+        let mut stop = stop_rx.clone();
         subs.push(tokio::spawn(async move {
-            while let Ok(Some(_)) = stream.message().await {
+            let mut lag = Lag::new();
+            loop {
+                let e = tokio::select! {
+                    m = stream.message() => m,
+                    _ = stop.changed() => break,
+                };
+                let Ok(Some(e)) = e else { break };
                 events.fetch_add(1, Ordering::Relaxed);
+                if let Some(proto::feed_event::Event::Commit(c)) = e.event {
+                    let now = now_nanos();
+                    for ch in &c.changes {
+                        if let Some(proto::Value {
+                            kind: Some(proto::value::Kind::Bytes(b)),
+                        }) = &ch.value
+                            && let Some(sent) = b.get(..8)
+                        {
+                            let sent = u64::from_le_bytes(sent.try_into().unwrap_or_default());
+                            lag.record(now.saturating_sub(sent) / 1000);
+                        }
+                    }
+                }
             }
+            lag
         }));
     }
     // Let the streams settle before measuring.
@@ -239,7 +347,7 @@ async fn run(
     let mut writers = Vec::with_capacity(args.writers);
     for w in 0..args.writers {
         let mut client = DataClient::new(channel.clone());
-        let value = vec![b'v'; args.value_bytes];
+        let value_bytes = args.value_bytes.max(8);
         let durability = args.durability;
         writers.push(tokio::spawn(async move {
             let mut lat = Vec::new();
@@ -247,6 +355,9 @@ async fn run(
             while Instant::now() < end {
                 let row = format!("w{w:03}-{i:012}").into_bytes();
                 i += 1;
+                // The send time first: the subscribers' lag is measured from it.
+                let mut value = vec![b'v'; value_bytes];
+                value[..8].copy_from_slice(&now_nanos().to_le_bytes());
                 let t = Instant::now();
                 let r = client
                     .mutate(proto::MutateRequest {
@@ -261,7 +372,7 @@ async fn run(
                                     qualifier: b"q".to_vec().into(),
                                     timestamp: None,
                                     value: Some(proto::Value {
-                                        kind: Some(proto::value::Kind::Bytes(value.clone().into())),
+                                        kind: Some(proto::value::Kind::Bytes(value.into())),
                                     }),
                                 })),
                             }],
@@ -284,8 +395,10 @@ async fn run(
     let cpu = cpu_before.zip(cpu_seconds(server)).map(|(a, b)| b - a);
     // Give the subscribers a moment to take the last commits, then end them.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    for s in &subs {
-        s.abort();
+    let _ = stop_tx.send(());
+    let mut lag = Lag::new();
+    for s in subs {
+        lag.merge(&s.await?);
     }
     lat.sort_unstable();
     let at = |q: f64| {
@@ -295,6 +408,7 @@ async fn run(
     };
     let puts = lat.len() as f64;
     Ok(Outcome {
+        lag,
         puts_per_sec: puts / elapsed,
         p50: at(0.5),
         p99: at(0.99),

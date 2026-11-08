@@ -386,6 +386,47 @@ impl ConsolidateLoop {
         Ok((passes, failed, stopped))
     }
 
+    /// Waits, without blocking a thread, for the next commit with memory events in the
+    /// loop's namespaces, and records it as [`run_once`](Self::run_once)'s wait does: the
+    /// number of events it read. It runs no pass and has no timeout. Race it against
+    /// [`next_due`](Self::next_due), then call `run_once(Duration::ZERO)` to run the passes
+    /// that are due (ICR 0123, for #1479's asyncio loop). Writer process only, as
+    /// [`Watch::next_async`] is.
+    ///
+    /// **Cancel-safe:** a commit is recorded in the same poll that takes it from the feed, so
+    /// dropping the future (a timeout) loses nothing, and the next step sees its events. The
+    /// loop's position is saved by `run_once` only.
+    ///
+    /// A loop that hasn't run a step yet returns 0 at once (its first `run_once` starts it,
+    /// which may scan the store), and so does one whose feed history was recycled
+    /// (`FeedExpired`): the next `run_once` catches it up by a scan. Neither scan runs here.
+    pub async fn wait_async(&mut self) -> Result<usize> {
+        std::future::poll_fn(|cx| self.poll_wait(cx)).await
+    }
+
+    /// [`wait_async`](Self::wait_async) as a poll: `Ready` with the events recorded, or an
+    /// error; `Pending` with `cx`'s waker registered.
+    pub fn poll_wait(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<usize>> {
+        use std::task::Poll;
+        if self.check().is_err() || self.state.is_none() {
+            // `run_once` reports the error, or starts the loop.
+            return Poll::Ready(Ok(0));
+        }
+        let (watch, saved) = self.state.as_mut().expect("started");
+        match watch.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            // Taken and noted in this one poll, with nothing awaited between (perf287's W6).
+            Poll::Ready(Ok(commit)) => {
+                saved.note(&commit.events);
+                Poll::Ready(Ok(commit.events.len()))
+            }
+            Poll::Ready(Err(Error::Db(e))) if e.code() == ErrorCode::FeedExpired => {
+                Poll::Ready(Ok(0))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
+    }
+
     /// A handle that ends this loop's waits early, from another thread: see
     /// [`LoopInterrupter`].
     pub fn interrupter(&self) -> LoopInterrupter {

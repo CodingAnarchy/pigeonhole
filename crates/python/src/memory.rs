@@ -17,9 +17,10 @@ use std::sync::{Arc, RwLock};
 
 use pigeonhole::ErrorCode;
 use pigeonhole_memory as mem;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 use crate::convert::duration;
 use crate::db::{Database, Reader, Transaction};
@@ -1180,7 +1181,7 @@ fn consolidate_error(
 
 /// A memory store in the writer process (ICR 0107): `Store.create` or `Store.open`.
 #[pyclass(module = "pigeonhole.memory", frozen)]
-pub(crate) struct Store(Arc<StoreSlot>);
+pub(crate) struct Store(Arc<StoreSlot>, Py<Database>);
 
 impl Store {
     fn handle(&self) -> PyResult<mem::Store> {
@@ -1193,10 +1194,23 @@ impl Store {
 
     /// Registers `s` with its database; a database closed meanwhile refuses it, and the
     /// store is dropped here, which stops its forgetter.
-    fn adopt(db: &Database, s: mem::Store) -> PyResult<Self> {
+    fn adopt(db: &Bound<'_, Database>, s: mem::Store) -> PyResult<Self> {
         let slot = Arc::new(RwLock::new(Some(s)));
-        db.adopt_store(&slot)?;
-        Ok(Self(slot))
+        db.get().adopt_store(&slot)?;
+        Ok(Self(slot, db.clone().unbind()))
+    }
+
+    /// `pigeonhole._aio.<name>(self, *args)`: an `async def` helper's coroutine (#1479).
+    fn aio<'py>(
+        slf: &Bound<'py, Self>,
+        name: &str,
+        args: Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let f = py.import("pigeonhole._aio")?.getattr(name)?;
+        let mut all: Vec<Bound<'py, PyAny>> = vec![slf.clone().into_any()];
+        all.extend(args.iter());
+        f.call1(PyTuple::new(py, all)?)
     }
 }
 
@@ -1235,7 +1249,7 @@ impl Store {
         let s = py
             .detach(move || mem::Store::create(&p, &name, o))
             .or_mem()?;
-        Self::adopt(db.get(), s)
+        Self::adopt(db, s)
     }
 
     /// Opens the store `name` for a caller embedding with `model` (`ModelMismatch` for
@@ -1256,7 +1270,7 @@ impl Store {
                 None => mem::Store::open_without_embeddings(&p, &name),
             })
             .or_mem()?;
-        Self::adopt(db.get(), s)
+        Self::adopt(db, s)
     }
 
     /// Opens the store `name` from a reader process: recall, `get` and `verify` only.
@@ -1434,6 +1448,245 @@ impl Store {
             marked: m.marked,
             missing: m.missing.into_iter().map(MemoryId).collect(),
         })
+    }
+
+    /// `link` inside `txn` (ICR 0123): it reads both ends in the transaction, so a
+    /// concurrent delete of either conflicts at commit.
+    #[pyo3(signature = (txn, from_, to, link_type, weight=1.0))]
+    fn link_in(
+        &self,
+        py: Python<'_>,
+        txn: &Bound<'_, Transaction>,
+        from_: &Bound<'_, PyAny>,
+        to: &Bound<'_, PyAny>,
+        link_type: &Bound<'_, PyAny>,
+        weight: f32,
+    ) -> PyResult<()> {
+        let (a, b, ty) = (id_arg(from_)?, id_arg(to)?, link_type_arg(link_type)?);
+        let s = self.handle()?;
+        txn.get()
+            .with_txn(py, move |t| s.link_in(t, &a, &b, ty, weight))?
+            .or_mem()
+    }
+
+    /// `supersede` inside `txn` (ICR 0123).
+    fn supersede_in(
+        &self,
+        py: Python<'_>,
+        txn: &Bound<'_, Transaction>,
+        old: &Bound<'_, PyAny>,
+        new: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let (a, b) = (id_arg(old)?, id_arg(new)?);
+        let s = self.handle()?;
+        txn.get()
+            .with_txn(py, move |t| s.supersede_in(t, &a, &b))?
+            .or_mem()
+    }
+
+    /// `mark_used` inside `txn` (ICR 0123).
+    fn mark_used_in(
+        &self,
+        py: Python<'_>,
+        txn: &Bound<'_, Transaction>,
+        ids: &Bound<'_, PyAny>,
+    ) -> PyResult<Marked> {
+        let ids = ids_arg(ids)?;
+        let s = self.handle()?;
+        let m = txn
+            .get()
+            .with_txn(py, move |t| s.mark_used_in(t, &ids))?
+            .or_mem()?;
+        Ok(Marked {
+            marked: m.marked,
+            missing: m.missing.into_iter().map(MemoryId).collect(),
+        })
+    }
+
+    /// Hands an IVF store's parked writes on, as `remember` and `delete` do after their
+    /// transaction: call it after committing a transaction that ran `remember_in` or
+    /// `delete_in` (ICR 0123). With inline rebalance it may commit splits, so hold no
+    /// snapshot across it. A store without an IVF index does nothing here.
+    fn settle(&self, py: Python<'_>) -> PyResult<()> {
+        let s = self.handle()?;
+        py.detach(move || s.settle());
+        Ok(())
+    }
+
+    /// `remember`'s part before its transaction (private, for `remember_async`).
+    #[pyo3(signature = (ns, text, *, embedding=None, kind=None, importance=None, source=None, session=None, links=None, pinned=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn _prepare_remember(
+        &self,
+        py: Python<'_>,
+        ns: String,
+        text: String,
+        embedding: Option<Vec<f32>>,
+        kind: Option<&str>,
+        importance: Option<f64>,
+        source: Option<String>,
+        session: Option<String>,
+        links: Option<&Bound<'_, PyAny>>,
+        pinned: bool,
+    ) -> PyResult<PreparedMemory> {
+        let m = build(
+            text, embedding, kind, importance, source, session, links, pinned,
+        )?;
+        let s = self.handle()?;
+        let p = py.detach(move || s.prepare_remember(&ns, m)).or_mem()?;
+        Ok(PreparedMemory(p))
+    }
+
+    /// One attempt of `remember`'s transaction, in `txn` (private, for `remember_async`).
+    fn _remember_prepared_in(
+        &self,
+        py: Python<'_>,
+        txn: &Bound<'_, Transaction>,
+        prepared: &Bound<'_, PreparedMemory>,
+    ) -> PyResult<Remembered> {
+        let s = self.handle()?;
+        let p = prepared.clone().unbind();
+        let r = txn
+            .get()
+            .with_txn(py, move |t| s.remember_prepared_in(t, &p.get().0))?
+            .or_mem()?;
+        Ok(r.into())
+    }
+
+    /// Whether `remember`'s near-dedup lookup runs (private, for `remember_async`).
+    fn _near_dedup_on(&self, py: Python<'_>) -> PyResult<bool> {
+        let s = self.handle()?;
+        Ok(py.detach(move || s.near_dedup()).or_mem()?.is_some())
+    }
+
+    /// Whether the store has an IVF index to settle (private, for the async writes).
+    fn _has_ivf(&self) -> PyResult<bool> {
+        Ok(self.handle()?.ivf().is_some())
+    }
+
+    /// The store's database (private, for the async writes' transactions).
+    #[getter]
+    fn _db(&self, py: Python<'_>) -> Py<Database> {
+        self.1.clone_ref(py)
+    }
+
+    /// `remember(...)` as a coroutine (#1479, ICR 0121): the same result. Its commit is
+    /// awaited; the near-dedup lookup (if the store has near dedup) and the IVF settle run on
+    /// a worker thread, and its in-transaction reads may block the loop on a cache miss.
+    #[pyo3(signature = (ns, text, **kwargs))]
+    fn remember_async<'py>(
+        slf: &Bound<'py, Self>,
+        ns: String,
+        text: String,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kw = match kwargs {
+            Some(k) => k.clone(),
+            None => PyDict::new(slf.py()),
+        };
+        Self::aio(
+            slf,
+            "memory_remember",
+            (ns, text, kw).into_pyobject(slf.py())?,
+        )
+    }
+
+    /// `delete(id)` as a coroutine (#1479).
+    fn delete_async<'py>(
+        slf: &Bound<'py, Self>,
+        id: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::aio(slf, "memory_delete", (id,).into_pyobject(slf.py())?)
+    }
+
+    /// `link(...)` as a coroutine (#1479).
+    #[pyo3(signature = (from_, to, link_type, weight=1.0))]
+    fn link_async<'py>(
+        slf: &Bound<'py, Self>,
+        from_: &Bound<'py, PyAny>,
+        to: &Bound<'py, PyAny>,
+        link_type: &Bound<'py, PyAny>,
+        weight: f32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::aio(
+            slf,
+            "memory_link",
+            (from_, to, link_type, weight).into_pyobject(slf.py())?,
+        )
+    }
+
+    /// `supersede(old, new)` as a coroutine (#1479).
+    fn supersede_async<'py>(
+        slf: &Bound<'py, Self>,
+        old: &Bound<'py, PyAny>,
+        new: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::aio(slf, "memory_supersede", (old, new).into_pyobject(slf.py())?)
+    }
+
+    /// `mark_used(ids)` as a coroutine (#1479).
+    fn mark_used_async<'py>(
+        slf: &Bound<'py, Self>,
+        ids: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::aio(slf, "memory_mark_used", (ids,).into_pyobject(slf.py())?)
+    }
+
+    /// A `Watch` of the store's memory events in `namespaces` (a name, or a sequence; every
+    /// namespace by default), through the database's change feed, which must be on. It
+    /// starts now, after the commits `from_snapshot` sees, or after a `resume` token
+    /// (`Watch.token()`). `visible=True` delivers a commit once reads see it rather than once
+    /// it's durable.
+    #[pyo3(signature = (namespaces=None, *, from_snapshot=None, resume=None, visible=false))]
+    fn watch(
+        &self,
+        py: Python<'_>,
+        namespaces: Option<&Bound<'_, PyAny>>,
+        from_snapshot: Option<&Bound<'_, Snapshot>>,
+        resume: Option<Vec<u8>>,
+        visible: bool,
+    ) -> PyResult<Watch> {
+        let ns = namespaces_arg(namespaces)?;
+        let snap = snapshot_arg(from_snapshot)?;
+        let s = self.handle()?;
+        py.detach(move || {
+            let refs: Vec<&str> = ns.iter().map(String::as_str).collect();
+            open_watch(s.watch(&refs), snap, resume, visible)
+        })
+        .or_mem()
+        .map(Watch::new)
+    }
+
+    /// A feed-driven consolidation loop named `name` (D311 T9): each `run_once` reads the
+    /// store's new memories and runs `consolidator` on the namespaces that are due (their
+    /// oldest new memory `policy.min_age` old). `clock_offset` (seconds) shifts the clock
+    /// `min_age` is measured on, for tests.
+    #[pyo3(signature = (name, consolidator, *, policy=None, namespaces=None, clock_offset=None))]
+    fn consolidate_loop(
+        &self,
+        py: Python<'_>,
+        name: String,
+        consolidator: Py<PyAny>,
+        policy: Option<&Bound<'_, ConsolidatePolicy>>,
+        namespaces: Option<&Bound<'_, PyAny>>,
+        clock_offset: Option<f64>,
+    ) -> PyResult<ConsolidateLoop> {
+        if !consolidator.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("consolidator must be callable"));
+        }
+        let ns = namespaces_arg(namespaces)?;
+        let s = self.handle()?;
+        let offset_us = (clock_offset.unwrap_or(0.0) * 1e6) as i64;
+        let mut l = s.consolidate_loop(&name, Arc::new(PyConsolidator(consolidator)));
+        l = l.maybe(policy, |l, p| l.policy(&p.get().0));
+        if !ns.is_empty() {
+            let refs: Vec<&str> = ns.iter().map(String::as_str).collect();
+            l = l.namespaces(&refs);
+        }
+        if offset_us != 0 {
+            l = l.clock(move || now_us().saturating_add_signed(offset_us));
+        }
+        Ok(ConsolidateLoop::new(l, offset_us))
     }
 
     /// One memory, or `None`.
@@ -1759,6 +2012,28 @@ impl ReadStore {
         Ok(py.detach(move || s.verify()).or_mem()?.into())
     }
 
+    /// `Store.watch`, in a reader process: `next` and `try_next` work there, `next_async`
+    /// doesn't (the writer process only).
+    #[pyo3(signature = (namespaces=None, *, from_snapshot=None, resume=None, visible=false))]
+    fn watch(
+        &self,
+        py: Python<'_>,
+        namespaces: Option<&Bound<'_, PyAny>>,
+        from_snapshot: Option<&Bound<'_, Snapshot>>,
+        resume: Option<Vec<u8>>,
+        visible: bool,
+    ) -> PyResult<Watch> {
+        let ns = namespaces_arg(namespaces)?;
+        let snap = snapshot_arg(from_snapshot)?;
+        let s = self.store()?;
+        py.detach(move || {
+            let refs: Vec<&str> = ns.iter().map(String::as_str).collect();
+            open_watch(s.watch(&refs), snap, resume, visible)
+        })
+        .or_mem()
+        .map(Watch::new)
+    }
+
     #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall(
@@ -1880,7 +2155,566 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ConsolidatePass>()?;
     m.add_class::<Store>()?;
     m.add_class::<ReadStore>()?;
+    m.add_class::<Watch>()?;
+    m.add_class::<WatchIter>()?;
+    m.add_class::<MemoryCommit>()?;
+    m.add_class::<MemoryEvent>()?;
+    m.add_class::<ConsolidateLoop>()?;
+    m.add_class::<LoopStep>()?;
     m.add("ModelMismatch", py.get_type::<ModelMismatch>())?;
     m.add("ConsolidateError", py.get_type::<ConsolidateError>())?;
     Ok(())
+}
+
+// ---- Async support, watches and the consolidation loop (#1479 PR 2, ICR 0121 amend. 2) --
+
+/// A memory `Store._prepare_remember` checked and placed (private).
+#[pyclass(module = "pigeonhole.memory", frozen, name = "_PreparedMemory")]
+pub(crate) struct PreparedMemory(mem::PreparedMemory);
+
+/// `namespaces` as a name or a sequence of names; none means every namespace.
+fn namespaces_arg(ob: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+    match ob {
+        None => Ok(Vec::new()),
+        Some(o) if o.is_instance_of::<pyo3::types::PyString>() => Ok(vec![o.extract()?]),
+        Some(o) => o.extract(),
+    }
+}
+
+/// Opens a watch from its builder with the call's options.
+fn open_watch(
+    mut b: mem::WatchBuilder,
+    snap: Option<pigeonhole::Snapshot>,
+    resume: Option<Vec<u8>>,
+    visible: bool,
+) -> mem::Result<mem::Watch> {
+    if let Some(s) = &snap {
+        b = b.from_snapshot(s);
+    }
+    if let Some(t) = resume {
+        b = b.resume(&mem::WatchToken::from_bytes(t));
+    }
+    if visible {
+        b = b.visible();
+    }
+    b.open()
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+impl crate::waits::Source for mem::Watch {
+    type Item = mem::MemoryCommit;
+    type Error = mem::Error;
+    const NAME: &'static str = "watch";
+
+    fn next(&mut self, d: std::time::Duration) -> Result<Option<Self::Item>, Self::Error> {
+        mem::Watch::next(self, d)
+    }
+
+    fn try_next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
+        mem::Watch::try_next(self)
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Item, Self::Error>> {
+        mem::Watch::poll_next(self, cx)
+    }
+
+    fn token(&self) -> Vec<u8> {
+        mem::Watch::token(self).as_bytes().to_vec()
+    }
+
+    fn oldest_retained(&self) -> Option<u64> {
+        mem::Watch::oldest_retained(self)
+    }
+
+    fn to_py(py: Python<'_>, item: Self::Item) -> PyResult<Py<PyAny>> {
+        Ok(Py::new(py, MemoryCommit::new(py, item)?)?.into_any())
+    }
+
+    fn error(e: Self::Error) -> PyErr {
+        err(e)
+    }
+}
+
+/// A store's memory events (D311 T9), through the change feed: `Store.watch(...)`. Like
+/// `Feed`, a cursor: `next(timeout)`, `try_next()`, iteration, and `next_async()` (#1479).
+/// One `next_async` wait at a time; cancelling it loses nothing.
+#[pyclass(module = "pigeonhole.memory", frozen)]
+pub(crate) struct Watch(crate::waits::Waits<mem::Watch>);
+
+impl Watch {
+    fn new(w: mem::Watch) -> Self {
+        Self(crate::waits::Waits::new(w))
+    }
+}
+
+#[pymethods]
+impl Watch {
+    /// The next `MemoryCommit`, waiting up to `timeout` (seconds or a `timedelta`; `None`
+    /// waits until one comes); `None` if none came in time. `FeedExpired` once the history
+    /// it needs is gone.
+    #[pyo3(signature = (timeout=None))]
+    fn next(
+        &self,
+        py: Python<'_>,
+        timeout: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let timeout = timeout.map(duration).transpose()?;
+        self.0
+            .wait(py, timeout)?
+            .map(|c| <mem::Watch as crate::waits::Source>::to_py(py, c))
+            .transpose()
+    }
+
+    /// The next `MemoryCommit` if one is ready, else `None`.
+    fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.0
+            .poll(py, None)?
+            .map(|c| <mem::Watch as crate::waits::Source>::to_py(py, c))
+            .transpose()
+    }
+
+    /// The next `MemoryCommit`, as an `asyncio.Future` of the running loop (#1479). The
+    /// writer process only.
+    fn next_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.0.next_async(py)
+    }
+
+    /// Where the watch is: `Store.watch(resume=...)` continues after it.
+    fn token<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.0.token(py)?))
+    }
+
+    /// Once the watch expired: the oldest commit seqno the feed still holds, when known.
+    #[getter]
+    fn oldest_retained(&self, py: Python<'_>) -> Option<u64> {
+        self.0.oldest_retained(py)
+    }
+
+    /// Whether `close()` ran.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.0.closed()
+    }
+
+    /// The commits as they come; with `timeout`, stops once one doesn't come in time.
+    #[pyo3(signature = (timeout=None))]
+    fn iter(slf: Py<Self>, timeout: Option<&Bound<'_, PyAny>>) -> PyResult<WatchIter> {
+        Ok(WatchIter {
+            watch: slf,
+            timeout: timeout.map(duration).transpose()?,
+        })
+    }
+
+    fn __iter__(slf: Py<Self>) -> WatchIter {
+        WatchIter {
+            watch: slf,
+            timeout: None,
+        }
+    }
+
+    /// Ends the watch now. Calls afterwards raise `Closed`; closing twice does nothing.
+    fn close(&self, py: Python<'_>) {
+        self.0.close(py);
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        ty: &Bound<'_, PyAny>,
+        _value: &Bound<'_, PyAny>,
+        _tb: &Bound<'_, PyAny>,
+    ) -> bool {
+        self.close(ty.py());
+        false
+    }
+}
+
+/// A watch's commits as an iterator.
+#[pyclass(module = "pigeonhole.memory", frozen)]
+pub(crate) struct WatchIter {
+    watch: Py<Watch>,
+    timeout: Option<std::time::Duration>,
+}
+
+#[pymethods]
+impl WatchIter {
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.watch
+            .get()
+            .0
+            .wait(py, self.timeout)?
+            .map(|c| <mem::Watch as crate::waits::Source>::to_py(py, c))
+            .transpose()
+    }
+}
+
+/// One commit's memory events, in commit order.
+#[pyclass(module = "pigeonhole.memory", frozen, get_all)]
+pub(crate) struct MemoryCommit {
+    seqno: u64,
+    timestamp_us: u64,
+    events: Py<PyList>,
+}
+
+impl MemoryCommit {
+    fn new(py: Python<'_>, c: mem::MemoryCommit) -> PyResult<Self> {
+        let events = c
+            .events
+            .into_iter()
+            .map(|e| Py::new(py, MemoryEvent::from(e)))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            seqno: c.seqno,
+            timestamp_us: c.timestamp_us,
+            events: PyList::new(py, events)?.unbind(),
+        })
+    }
+}
+
+#[pymethods]
+impl MemoryCommit {
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.events.bind(py).len()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        format!(
+            "MemoryCommit(seqno={}, timestamp_us={}, events={})",
+            self.seqno,
+            self.timestamp_us,
+            self.events.bind(py).len()
+        )
+    }
+}
+
+/// One memory event: `kind` is `"remembered"`, `"summarized"` (a summary a consolidation
+/// wrote), `"superseded"` (`by` is the newer memory), `"deleted"`, `"updated"`, or
+/// `"unknown"` for a kind a later engine adds.
+#[pyclass(module = "pigeonhole.memory", frozen, get_all)]
+pub(crate) struct MemoryEvent {
+    kind: &'static str,
+    id: MemoryId,
+    by: Option<MemoryId>,
+}
+
+impl From<mem::MemoryEvent> for MemoryEvent {
+    fn from(e: mem::MemoryEvent) -> Self {
+        let id = MemoryId(e.id().clone());
+        let (kind, by) = match e {
+            mem::MemoryEvent::Remembered(_) => ("remembered", None),
+            mem::MemoryEvent::Summarized(_) => ("summarized", None),
+            mem::MemoryEvent::Superseded { by, .. } => ("superseded", Some(MemoryId(by))),
+            mem::MemoryEvent::Deleted(_) => ("deleted", None),
+            mem::MemoryEvent::Updated(_) => ("updated", None),
+            _ => ("unknown", None),
+        };
+        Self { kind, id, by }
+    }
+}
+
+#[pymethods]
+impl MemoryEvent {
+    fn __repr__(&self) -> String {
+        format!("MemoryEvent({:?}, {})", self.kind, self.id.0)
+    }
+}
+
+/// One step of a `ConsolidateLoop`.
+#[pyclass(module = "pigeonhole.memory", frozen, get_all)]
+pub(crate) struct LoopStep {
+    events: usize,
+    passes: Vec<(String, Py<ConsolidatePass>)>,
+    failed: Vec<(String, Py<PyAny>)>,
+    stopped: Vec<(String, Py<ConsolidatePass>)>,
+    interrupted: bool,
+    next_due: Option<u64>,
+    token: Py<PyBytes>,
+}
+
+impl LoopStep {
+    fn new(py: Python<'_>, s: mem::LoopStep) -> PyResult<Self> {
+        let pass = |(ns, p): (String, mem::ConsolidatePass)| -> PyResult<_> {
+            Ok((ns, Py::new(py, ConsolidatePass::from(p))?))
+        };
+        let failed = s
+            .failed
+            .into_iter()
+            .map(|(ns, e)| {
+                let e = match e {
+                    mem::Error::Consolidate { error, pass } => consolidate_error(py, error, pass),
+                    e => err(e),
+                };
+                (ns, e.into_value(py).into_any())
+            })
+            .collect();
+        Ok(Self {
+            events: s.events,
+            passes: s.passes.into_iter().map(pass).collect::<PyResult<_>>()?,
+            failed,
+            stopped: s.stopped.into_iter().map(pass).collect::<PyResult<_>>()?,
+            interrupted: s.interrupted,
+            next_due: s.next_due,
+            token: PyBytes::new(py, s.token.as_bytes()).unbind(),
+        })
+    }
+}
+
+/// The loop, out to a sync `run_once` or in, with the async wait parked on it.
+struct LoopState {
+    /// `None` while a sync `run_once` has it, or once closed.
+    l: Option<mem::ConsolidateLoop>,
+    out: bool,
+    closed: bool,
+    /// An async wait that found the loop out: woken when it's put back.
+    parked: Option<std::task::Waker>,
+    /// `next_due` as of the last step: what the getter answers while a step has the loop
+    /// out, so it never waits a turn (cli692's L1 on #1563: `run_once_async` reads it on the
+    /// event loop's thread).
+    due: Option<u64>,
+}
+
+/// A feed-driven consolidation loop (D311 T9): `Store.consolidate_loop(...)`.
+///
+/// `run_once` waits for new memories with the loop taken out of its state, so nothing waits
+/// holding the lock; another thread's `run_once` takes its turn. `run_once_async` (#1479)
+/// awaits the wait part without a thread (`poll_wait` runs under the lock and never blocks,
+/// parking if a sync step has the loop) and runs the due passes, which call the Python
+/// consolidator, on a worker thread.
+#[pyclass(module = "pigeonhole.memory", frozen)]
+pub(crate) struct ConsolidateLoop {
+    state: Arc<std::sync::Mutex<LoopState>>,
+    turn: Arc<std::sync::Condvar>,
+    interrupter: mem::LoopInterrupter,
+    offset_us: i64,
+}
+
+impl ConsolidateLoop {
+    fn new(l: mem::ConsolidateLoop, offset_us: i64) -> Self {
+        let interrupter = l.interrupter();
+        Self {
+            state: Arc::new(std::sync::Mutex::new(LoopState {
+                l: Some(l),
+                out: false,
+                closed: false,
+                parked: None,
+                due: None,
+            })),
+            turn: Arc::new(std::sync::Condvar::new()),
+            interrupter,
+            offset_us,
+        }
+    }
+
+    fn lock_in(&self) -> std::sync::MutexGuard<'_, LoopState> {
+        let mut g = self.state.lock().expect("not poisoned");
+        while g.out {
+            g = self.turn.wait(g).expect("not poisoned");
+        }
+        g
+    }
+}
+
+/// A sync step's hold on the loop: dropped (even by a panic), it puts the loop back unless
+/// it was closed meanwhile, and wakes the callers taking turns and a parked async wait.
+struct LoopOut<'a> {
+    l: Option<mem::ConsolidateLoop>,
+    home: &'a ConsolidateLoop,
+}
+
+impl Drop for LoopOut<'_> {
+    fn drop(&mut self) {
+        let mut g = self
+            .home
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.out = false;
+        if !g.closed {
+            g.due = self.l.as_ref().and_then(mem::ConsolidateLoop::next_due);
+            g.l = self.l.take();
+        }
+        let parked = g.parked.take();
+        drop(g);
+        self.home.turn.notify_all();
+        if let Some(w) = parked {
+            w.wake();
+        }
+    }
+}
+
+/// `run_once_async`'s wait, polled on the bridge without the GIL.
+struct LoopWait(Arc<std::sync::Mutex<LoopState>>);
+
+impl std::future::Future for LoopWait {
+    type Output = crate::aio::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        let mut g = self.0.lock().expect("not poisoned");
+        if g.closed {
+            return Poll::Ready(Box::new(|_| crate::aio::Entry::Error(loop_closed())));
+        }
+        match g.l.as_mut() {
+            None => {
+                g.parked = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Some(l) => match l.poll_wait(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(r) => Poll::Ready(Box::new(move |py| match r {
+                    Ok(n) => match n.into_py_any(py) {
+                        Ok(v) => crate::aio::Entry::Value(v),
+                        Err(e) => crate::aio::Entry::Error(e),
+                    },
+                    Err(e) => crate::aio::Entry::Error(err(e)),
+                })),
+            },
+        }
+    }
+}
+
+fn loop_closed() -> PyErr {
+    with_code(ErrorCode::Closed, "the consolidation loop is closed")
+}
+
+#[pymethods]
+impl ConsolidateLoop {
+    /// One step: reads the store's new memories for up to `timeout` seconds (less if a pass
+    /// falls due sooner), runs the passes that are due, and saves the loop's position.
+    /// `LoopTakenOver` if another loop of this name now runs.
+    #[pyo3(signature = (timeout=None))]
+    fn run_once(&self, py: Python<'_>, timeout: Option<&Bound<'_, PyAny>>) -> PyResult<LoopStep> {
+        let d = match timeout {
+            Some(t) => duration(t)?,
+            None => std::time::Duration::from_secs(1),
+        };
+        self.step(py, d, 0)
+    }
+
+    /// `run_once(0)` after an async wait that read `waited` events (private, for
+    /// `run_once_async`): the step's `events` counts them too.
+    fn _run_once_after(&self, py: Python<'_>, waited: usize) -> PyResult<LoopStep> {
+        self.step(py, std::time::Duration::ZERO, waited)
+    }
+
+    /// `run_once(timeout)` as a coroutine (#1479): it awaits new memories without holding a
+    /// thread, then runs the due passes (the consolidator) on a worker thread. Unlike the
+    /// sync `run_once`, which reads until its timeout, it returns after the first commit
+    /// with memory events (or the timeout, or a pass falling due): call it in a loop.
+    #[pyo3(signature = (timeout=1.0))]
+    fn run_once_async<'py>(slf: &Bound<'py, Self>, timeout: f64) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        py.import("pigeonhole._aio")?
+            .getattr("memory_loop_step")?
+            .call1((slf, timeout))
+    }
+
+    /// The wait part of `run_once_async` (private): the number of events it read.
+    fn _wait_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let state = Arc::clone(&self.state);
+        crate::aio::start(py, &event_loop, &fut, move || LoopWait(state))?;
+        Ok(fut)
+    }
+
+    /// The loop's clock now, µs since the epoch (private: `clock_offset` applied).
+    fn _now_us(&self) -> u64 {
+        now_us().saturating_add_signed(self.offset_us)
+    }
+
+    /// When the next pass is due, µs since the epoch on the loop's clock; `None` before the
+    /// first step, when nothing is pending, or once closed. It never waits: while another
+    /// thread's `run_once` has the loop, it's the value as of the last step.
+    #[getter]
+    fn next_due(&self, py: Python<'_>) -> Option<u64> {
+        py.detach(|| {
+            let g = self.state.lock().expect("not poisoned");
+            match &g.l {
+                Some(l) => l.next_due(),
+                // A closed loop has nothing due (cli692 on #1563).
+                None if g.closed => None,
+                None => g.due,
+            }
+        })
+    }
+
+    /// Ends the current or next step's wait early, from any thread.
+    fn interrupt(&self) {
+        self.interrupter.interrupt();
+    }
+
+    /// Releases the loop and its feed reader now. Calls afterwards raise `Closed`.
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| {
+            let mut g = self.state.lock().expect("not poisoned");
+            g.closed = true;
+            g.l = None;
+            let parked = g.parked.take();
+            drop(g);
+            if let Some(w) = parked {
+                w.wake();
+            }
+        });
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        ty: &Bound<'_, PyAny>,
+        _value: &Bound<'_, PyAny>,
+        _tb: &Bound<'_, PyAny>,
+    ) -> bool {
+        self.close(ty.py());
+        false
+    }
+}
+
+impl ConsolidateLoop {
+    fn step(&self, py: Python<'_>, d: std::time::Duration, waited: usize) -> PyResult<LoopStep> {
+        let step = py.detach(|| {
+            let mut g = self.lock_in();
+            if g.closed {
+                return Err(None);
+            }
+            let l = g.l.take().ok_or(None)?;
+            g.out = true;
+            drop(g);
+            let mut out = LoopOut {
+                l: Some(l),
+                home: self,
+            };
+            let r = out.l.as_mut().expect("just taken").run_once(d);
+            drop(out);
+            r.map_err(Some)
+        });
+        match step {
+            Ok(mut s) => {
+                s.events += waited;
+                LoopStep::new(py, s)
+            }
+            Err(None) => Err(loop_closed()),
+            Err(Some(e)) => Err(err(e)),
+        }
+    }
 }

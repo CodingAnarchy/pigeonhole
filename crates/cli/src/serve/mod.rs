@@ -185,6 +185,7 @@ pub(crate) fn run(
         &db,
         args.io_threads,
         args.blocking_threads,
+        args.feed_threads,
     ));
     let limits = args.limits();
     let metrics = Arc::new(service::Metrics::default());
@@ -216,6 +217,23 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the runtime", &e))?;
+    // The change feed's own runtime (ticket 5's (A)): its hubs and its streams' delivery run
+    // here, so a put never queues behind them on a request worker. Placed as the network
+    // threads are, and named apart so each runtime's CPU can be told apart (perf287's D3).
+    // The connection side's framing stays with the connection (D4).
+    let enter = Arc::clone(&placement);
+    let feed_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(placement.feed_threads)
+        .thread_name("phdb-serve-feed")
+        .on_thread_start(move || enter.enter())
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::io("start the feed runtime", &e))?;
+    shared
+        .router
+        .service
+        .feeds
+        .run_on(feed_runtime.handle().clone());
 
     let served = runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(args.listen)
@@ -224,11 +242,12 @@ pub(crate) fn run(
         let addr = listener.local_addr().map_err(|e| Failure::io("listen", &e))?;
         let _ = writeln!(
             stderr,
-            "phdb serve: serving {} on {addr} ({}, {}; {} network and {} blocking threads on {} free CPUs, {})",
+            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed and {} blocking threads on {} free CPUs, {})",
             args.file.display(),
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
             placement.io_threads,
+            placement.feed_threads,
             placement.blocking_threads,
             placement.free_cpus,
             placement.mode,
@@ -244,6 +263,9 @@ pub(crate) fn run(
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
+    // The connections are gone, so every client's stream has ended; the hubs end with the
+    // runtime, before the database closes under their feeds.
+    feed_runtime.shutdown_timeout(Duration::from_secs(5));
     // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.

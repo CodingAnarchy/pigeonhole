@@ -856,22 +856,50 @@ impl Store {
     /// With [near dedup](NearDedup), the nearest live memory is looked up first, outside the
     /// transaction, and a close enough one is skipped, merged into or linked to.
     pub fn remember(&self, ns: &str, memory: Memory) -> Result<Remembered> {
+        let p = self.prepare_remember(ns, memory)?;
+        #[cfg(feature = "__unstable-hooks")]
+        if p.near.is_some() {
+            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
+        }
+        let r = self.db.transact(&RetryPolicy::default(), |txn| {
+            self.remember_prepared_in(txn, &p)
+        });
+        self.settle();
+        Ok(r?.0)
+    }
+
+    /// The part of [`remember`](Self::remember) before its transaction (ICR 0123): checks
+    /// the memory, runs the near-dedup lookup if the store has near dedup (a read outside
+    /// any transaction), and fixes the new memory's id and time. Then commit
+    /// [`remember_prepared_in`](Self::remember_prepared_in) in a transaction of your own,
+    /// retrying it as you like (each attempt writes the same memory), and
+    /// [`settle`](Self::settle) after it commits. That's `remember`, step by step, for a
+    /// caller with its own retry loop (#1479's asyncio forms).
+    pub fn prepare_remember(&self, ns: &str, memory: Memory) -> Result<PreparedMemory> {
         self.check_memory(ns, &memory)?;
         let near = match self.near_dedup()? {
             Some(setting) => self.near(ns, &memory, setting)?,
             None => None,
         };
-        #[cfg(feature = "__unstable-hooks")]
-        if near.is_some() {
-            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
-        }
         let now = now_us();
         let rid = new_rid(now)?;
-        let r = self.db.transact(&RetryPolicy::default(), |txn| {
-            self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
-        });
-        self.ivf_settle();
-        Ok(r?.0)
+        Ok(PreparedMemory {
+            ns: ns.to_owned(),
+            memory,
+            rid,
+            now,
+            near,
+        })
+    }
+
+    /// One attempt of [`remember`](Self::remember)'s transaction, in the caller's
+    /// transaction: exact dedup, and the near-dedup outcome `prepare` found (ICR 0123).
+    pub fn remember_prepared_in(
+        &self,
+        txn: &mut Transaction,
+        p: &PreparedMemory,
+    ) -> Result<Remembered> {
+        self.remember_with(txn, &p.ns, &p.memory, p.rid, p.now, p.near.as_ref())
     }
 
     /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
@@ -1099,7 +1127,7 @@ impl Store {
         let r = self
             .db
             .transact(&RetryPolicy::default(), |txn| self.delete_in(txn, id));
-        self.ivf_settle();
+        self.settle();
         Ok(r?.0)
     }
 
@@ -1223,11 +1251,19 @@ impl Store {
             .len()
     }
 
-    /// Hands the parked IVF writes to `after_commit`, which splits or merges (in background
-    /// mode, marks for the rebalancer) the lists they left out of bounds. Its errors are
-    /// dropped: the memories are committed, and a missed rebalance waits for the next write
-    /// to those lists (simp724 on #1342: an `after_commit` failure mustn't fail a write).
-    pub(crate) fn ivf_settle(&self) {
+    /// Hands the IVF index's parked writes to its `after_commit`, which splits or merges the
+    /// lists they left out of bounds (in background mode, marks them for the rebalancer):
+    /// what [`remember`](Self::remember) and [`delete`](Self::delete) do after their
+    /// transaction. Call it after committing a transaction of your own that ran
+    /// [`remember_in`](Self::remember_in) or [`delete_in`](Self::delete_in) (ICR 0123): with
+    /// inline rebalance it may commit splits itself, so hold no snapshot across it (#1513).
+    ///
+    /// Its errors are dropped: the memories are committed, and a missed rebalance waits for
+    /// the next write to those lists (simp724 on #1342: an `after_commit` failure mustn't
+    /// fail a write). Without settling, nothing is wrong for recall: the vectors are in
+    /// their lists, and a list just stays over its bound until a later write settles it. A
+    /// store without an IVF index does nothing here.
+    pub fn settle(&self) {
         let Some(Ivf::W(index, _)) = &self.ivf else {
             return;
         };
@@ -1254,15 +1290,34 @@ impl Store {
         }
         check_weight(weight)?;
         self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            for end in [from, to] {
-                if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
-                    return Err(Error::NotFound(format!("the memory {end}")));
-                }
-            }
-            write_link(txn, t, &from.row(), &to.row(), ty, weight);
-            Ok(())
+            self.link_in(txn, from, to, ty, weight)
         })?;
+        Ok(())
+    }
+
+    /// [`link`](Self::link) inside the caller's transaction (ICR 0123): it reads both ends'
+    /// `content:text` in `txn`, so a concurrent delete of either conflicts at commit.
+    pub fn link_in(
+        &self,
+        txn: &mut Transaction,
+        from: &MemoryId,
+        to: &MemoryId,
+        ty: LinkType,
+        weight: f32,
+    ) -> Result<()> {
+        if from.namespace() != to.namespace() {
+            return Err(Error::InvalidArgument(
+                "links stay within a namespace".into(),
+            ));
+        }
+        check_weight(weight)?;
+        let t = &self.table;
+        for end in [from, to] {
+            if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
+                return Err(Error::NotFound(format!("the memory {end}")));
+            }
+        }
+        write_link(txn, t, &from.row(), &to.row(), ty, weight);
         Ok(())
     }
 
@@ -1276,6 +1331,27 @@ impl Store {
     /// one (supersede that one instead: facts change along a chain). Deleting `new` clears
     /// `old`'s `superseded_by`, so `old` is recalled again.
     pub fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        self.check_supersede(old, new)?;
+        let now = now_us();
+        self.db.transact(&RetryPolicy::default(), |txn| {
+            self.supersede_at(txn, old, new, now)
+        })?;
+        Ok(())
+    }
+
+    /// [`supersede`](Self::supersede) inside the caller's transaction (ICR 0123), with
+    /// `valid_to` the time of the call.
+    pub fn supersede_in(
+        &self,
+        txn: &mut Transaction,
+        old: &MemoryId,
+        new: &MemoryId,
+    ) -> Result<()> {
+        self.check_supersede(old, new)?;
+        self.supersede_at(txn, old, new, now_us())
+    }
+
+    fn check_supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         if self.model.is_some() && !self.embeds {
             return Err(Error::InvalidArgument(
                 "this handle was opened without the store's embedding model, so it can't \
@@ -1288,29 +1364,36 @@ impl Store {
                 "supersede takes two memories of one namespace".into(),
             ));
         }
-        let now = now_us();
-        self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            for end in [old, new] {
-                if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
-                    return Err(Error::NotFound(format!("the memory {end}")));
-                }
+        Ok(())
+    }
+
+    /// The supersede's reads and writes in `txn`, `valid_to` being `now`.
+    fn supersede_at(
+        &self,
+        txn: &mut Transaction,
+        old: &MemoryId,
+        new: &MemoryId,
+        now: u64,
+    ) -> Result<()> {
+        let t = &self.table;
+        for end in [old, new] {
+            if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
+                return Err(Error::NotFound(format!("the memory {end}")));
             }
-            if let Some(cur) = txn
-                .get(t, &old.row(), META, SUPERSEDED_BY)?
-                .map(|c| c.value().to_vec())
-            {
-                if cur == new.row() {
-                    return Ok(());
-                }
-                let cur = MemoryId::from_row(&cur).ok_or_else(|| corrupt("superseded_by"))?;
-                return Err(Error::InvalidArgument(format!(
-                    "{old} is already superseded by {cur}: supersede that one instead"
-                )));
+        }
+        if let Some(cur) = txn
+            .get(t, &old.row(), META, SUPERSEDED_BY)?
+            .map(|c| c.value().to_vec())
+        {
+            if cur == new.row() {
+                return Ok(());
             }
-            supersede_in(txn, t, &old.row(), &new.row(), now);
-            Ok(())
-        })?;
+            let cur = MemoryId::from_row(&cur).ok_or_else(|| corrupt("superseded_by"))?;
+            return Err(Error::InvalidArgument(format!(
+                "{old} is already superseded by {cur}: supersede that one instead"
+            )));
+        }
+        supersede_in(txn, t, &old.row(), &new.row(), now);
         Ok(())
     }
 
@@ -1320,24 +1403,34 @@ impl Store {
     pub fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked> {
         let now = now_us() as i64;
         let (m, _) = self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            let mut m = Marked::default();
-            let mut seen = BTreeSet::new();
-            for id in ids {
-                let row = id.row();
-                if !seen.insert(row.clone()) {
-                    continue;
-                }
-                if txn.get(t, &row, CONTENT, TEXT)?.is_none() {
-                    m.missing.push(id.clone());
-                    continue;
-                }
-                txn.incr(t, &row, STATS, USES, 1)
-                    .aggregate(t, &row, PEAK, LAST_USED, now);
-                m.marked += 1;
-            }
-            Ok::<_, Error>(m)
+            self.mark_used_at(txn, ids, now)
         })?;
+        Ok(m)
+    }
+
+    /// [`mark_used`](Self::mark_used) inside the caller's transaction (ICR 0123), at the
+    /// time of the call.
+    pub fn mark_used_in(&self, txn: &mut Transaction, ids: &[MemoryId]) -> Result<Marked> {
+        self.mark_used_at(txn, ids, now_us() as i64)
+    }
+
+    fn mark_used_at(&self, txn: &mut Transaction, ids: &[MemoryId], now: i64) -> Result<Marked> {
+        let t = &self.table;
+        let mut m = Marked::default();
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            let row = id.row();
+            if !seen.insert(row.clone()) {
+                continue;
+            }
+            if txn.get(t, &row, CONTENT, TEXT)?.is_none() {
+                m.missing.push(id.clone());
+                continue;
+            }
+            txn.incr(t, &row, STATS, USES, 1)
+                .aggregate(t, &row, PEAK, LAST_USED, now);
+            m.marked += 1;
+        }
         Ok(m)
     }
 
@@ -1862,4 +1955,15 @@ fn check_weight(w: f32) -> Result<()> {
             "a link's weight is from 0 to 1, not {w}"
         )))
     }
+}
+
+/// A memory [`Store::prepare_remember`] checked and placed: its near-dedup lookup done and
+/// its id and time fixed, for [`Store::remember_prepared_in`] (ICR 0123).
+#[derive(Debug)]
+pub struct PreparedMemory {
+    ns: String,
+    memory: Memory,
+    rid: [u8; 16],
+    now: u64,
+    near: Option<Near>,
 }
