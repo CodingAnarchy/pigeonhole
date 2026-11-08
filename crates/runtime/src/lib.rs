@@ -1163,6 +1163,7 @@ impl<H: ShardHandler> Runtime<H> {
         let shared = Arc::new(drivers::Drivers::new(
             k,
             config.adaptive_drivers,
+            config.caller_runs,
             Arc::clone(&config.vfs),
             Arc::clone(&submitters),
         ));

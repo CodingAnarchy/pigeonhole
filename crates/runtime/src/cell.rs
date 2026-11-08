@@ -211,6 +211,17 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
             self.signal.add_caller_turn();
         }
         run.caller_busy.fetch_add(spent, Ordering::Relaxed);
+        // Work the turn left for the driver (a refused message, a task it spawned or woke, a
+        // deadline it moved) is flagged as a woken task before the release. The notify
+        // below wakes the driver only while it's announced asleep, and a driver polling
+        // before it parks (`spin_poll`) is announced awake: its looks at the shard, and its
+        // last check before sleeping, read `task_woken`, so they see the flag once they take
+        // the token, and the turn they then run finds the work (#1502 Phase B's
+        // cross-shard-contention hang: the notify alone was lost there, and the driver
+        // parked untimed).
+        if notify {
+            self.signal.mark_task_woken();
+        }
         // Release, then the re-check: whatever the driver must see (work left, a task woken,
         // a deadline moved, a driver that skipped the shard meanwhile) wakes it.
         drop(turn);
@@ -372,6 +383,89 @@ mod loom_tests {
                 );
             }
             let _ = m.handled.load(Ordering::Relaxed);
+        });
+    }
+
+    /// The driver's poll before it parks (`spin_poll`) against a caller's turn that leaves
+    /// work only a driver turn runs (a task its batch spawned, #1502 Phase B's hang). The
+    /// poll announces the shard awake, so the caller's notify alone may find it awake and
+    /// do nothing; the poll's looks and its last check before sleeping must then see the
+    /// work through `task_woken`, which the caller sets before it releases the token.
+    /// Without that flag, the interleaving "awake; the caller releases and notifies; the
+    /// driver's looks find nothing; it announces sleep and parks" leaves the work with no
+    /// thread to run it.
+    #[test]
+    fn loom_work_a_callers_turn_leaves_reaches_a_polling_driver() {
+        loom::model(|| {
+            let woken = Arc::new(AtomicBool::new(false));
+            let m = Arc::new(Model {
+                // The caller holds the token, in its turn.
+                token: AtomicBool::new(true),
+                skipped: AtomicBool::new(false),
+                queued: AtomicBool::new(false),
+                handled: AtomicBool::new(false),
+                woken: Arc::clone(&woken),
+                signal: Signal::new(),
+            });
+            {
+                let woken = Arc::clone(&woken);
+                m.signal
+                    .set_target(WakeTarget::Callback(std::sync::Arc::new(move || {
+                        woken.store(true, Ordering::SeqCst);
+                    })));
+            }
+            // The caller's turn leaves work, then releases (`CallerTurn::try_run` with
+            // `notify` set): flag, release, fence, notify.
+            let caller = {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.signal.mark_task_woken();
+                    m.release();
+                    fence(Ordering::SeqCst);
+                    let _ = m.skipped.load(Ordering::Relaxed);
+                    m.signal.notify();
+                })
+            };
+            // The driver's take, as `ShardCell::driver`: on failure, mark skipped, fence and
+            // retry.
+            let driver = |m: &Model| {
+                if m.try_take() {
+                    return true;
+                }
+                m.skipped.store(true, Ordering::Relaxed);
+                fence(Ordering::SeqCst);
+                m.try_take()
+            };
+            // `spin_poll`: awake, one look (the poll loop's: `task_woken` with the token),
+            // then on a miss the sleep handshake (`check_before_sleep`, or announce sleep and
+            // retry the take when a caller holds it).
+            m.signal.awake();
+            let mut hit = false;
+            if driver(&m) {
+                hit = m.signal.task_woken();
+                m.release();
+            }
+            if !hit {
+                if driver(&m) {
+                    m.signal.prepare_sleep();
+                    hit = m.signal.task_woken();
+                    m.release();
+                } else {
+                    m.signal.prepare_sleep();
+                    if driver(&m) {
+                        m.signal.prepare_sleep();
+                        hit = m.signal.task_woken();
+                        m.release();
+                    }
+                }
+            }
+            caller.join().unwrap();
+            // The driver either found the work (its next turn runs it) or, parking, was
+            // woken.
+            assert!(
+                hit || m.woken.load(Ordering::SeqCst),
+                "a caller's turn left work with the driver parked and unwoken"
+            );
         });
     }
 }

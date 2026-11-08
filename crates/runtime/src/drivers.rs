@@ -166,14 +166,26 @@ pub(crate) struct Drivers<H: ShardHandler> {
     /// A trace was asked for ([`Drivers::trace`], #1015): the controller runs, deciding
     /// without resizing unless `adaptive`, and logs every window.
     tracing: AtomicBool,
+    /// `RuntimeConfig::caller_runs` (#1176): a driver with no deadline parks for at most
+    /// [`CALLER_RUNS_PARK_BACKSTOP`] instead of until woken.
+    caller_runs: bool,
     vfs: VfsRef,
     submitters: Arc<[Submitter<H::Msg>]>,
 }
+
+/// With caller-runs on, the longest a driver parks with no deadline (#1176): a backstop. A
+/// caller's turn hands work back to the driver through `task_woken` and a notify, and a
+/// lost wake there would leave the shard with no thread running it, its waiting commits
+/// with it (#1502 Phase B's cross-shard-contention hang). The handshake is meant to need
+/// no backstop; this bounds the cost of a lost wake not yet found to a stall of this long.
+/// Off, the driver parks untimed, as on main.
+pub(crate) const CALLER_RUNS_PARK_BACKSTOP: Duration = Duration::from_millis(100);
 
 impl<H: ShardHandler> Drivers<H> {
     pub(crate) fn new(
         drivers: usize,
         adaptive: bool,
+        caller_runs: bool,
         vfs: VfsRef,
         submitters: Arc<[Submitter<H::Msg>]>,
     ) -> Self {
@@ -200,6 +212,7 @@ impl<H: ShardHandler> Drivers<H> {
             controller: Mutex::new(controller),
             window_at: AtomicU64::new(0),
             tracing: AtomicBool::new(false),
+            caller_runs,
             vfs,
             submitters,
         }
@@ -772,7 +785,11 @@ pub(crate) fn driver_main<H: ShardHandler>(
                     !pigeonhole_io::in_async_poll(),
                     "an idle shard driver parks inside an async poll (a lost wake, #1226)"
                 );
-                thread::park()
+                if drivers.caller_runs {
+                    thread::park_timeout(CALLER_RUNS_PARK_BACKSTOP);
+                } else {
+                    thread::park();
+                }
             }
             Some(at) => idle_park.park(&*vfs, at),
         }
