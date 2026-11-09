@@ -107,6 +107,7 @@ struct Args {
     /// absolute due times kept by a pacer thread (it sleeps, then spins the last 200 us);
     /// unset, the writers run flat out. With a rate, a put's latency counts from when it was
     /// due, so a server that falls behind can't hide it (perf287's offered-load acceptance).
+    /// The pacer spins one of the client's cores (`--client-cpus` should leave room for it).
     /// Each due put goes to the writer with the fewest outstanding; when every writer is busy it
     /// waits, still timed from its due time. Each row's `pacer:` line says how late puts left
     /// the pacer and how many waited for a writer.
@@ -253,6 +254,15 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
                 p.service(0.999),
                 p.service(1.0)
             );
+            // perf287 on the pacer: more than 0.1% skipped means the client couldn't keep the
+            // schedule, so the row offered less than the rate.
+            if p.late_skipped * 1000 > p.sent {
+                println!(
+                    "  WARNING: the pacer skipped {} of {} puts (over 0.1%): the client couldn't keep the schedule; this row offered less than --put-rate",
+                    p.late_skipped,
+                    p.sent + p.late_skipped
+                );
+            }
         }
     }
     server.stop();
