@@ -740,10 +740,14 @@ async fn run(
                 if Instant::now() >= end {
                     break;
                 }
-                let _ = Command::new("kill")
-                    .arg("-USR1")
-                    .arg(server.to_string())
-                    .status();
+                // On a blocking thread: `status` waits for `kill` (perf287's N2 on #1643).
+                let _ = tokio::task::spawn_blocking(move || {
+                    Command::new("kill")
+                        .arg("-USR1")
+                        .arg(server.to_string())
+                        .status()
+                })
+                .await;
             }
         })
     });
