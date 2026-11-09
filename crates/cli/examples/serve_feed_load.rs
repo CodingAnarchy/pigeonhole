@@ -103,9 +103,14 @@ struct Args {
     /// The client's HTTP/2 per-stream receive window, in bytes (default: hyper's, 2 MiB).
     #[arg(long, value_name = "BYTES")]
     h2_stream_window: Option<u32>,
-    /// Offer puts at this total rate, puts/s across all writers, each on a fixed schedule;
+    /// Offer puts at this total rate, puts/s across all writers, on a fixed schedule of
+    /// absolute due times kept by a pacer thread (it sleeps, then spins the last 200 us);
     /// unset, the writers run flat out. With a rate, a put's latency counts from when it was
     /// due, so a server that falls behind can't hide it (perf287's offered-load acceptance).
+    /// The pacer spins one of the client's cores (`--client-cpus` should leave room for it).
+    /// Each due put goes to the writer with the fewest outstanding; when every writer is busy it
+    /// waits, still timed from its due time. Each row's `pacer:` line says how late puts left
+    /// the pacer and how many waited for a writer.
     #[arg(long, value_name = "PUTS_PER_SEC")]
     put_rate: Option<f64>,
     /// Let the client's HTTP/2 windows follow the measured bandwidth-delay product (on by
@@ -234,6 +239,31 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
             r.rejoined,
             r.dropped
         );
+        if let Some(p) = &r.pacer {
+            println!(
+                "  pacer: {} puts sent ({} waited for a busy writer; at most {} outstanding), {} skipped (pacer late); left late us p50 {} p99 {} max {}; service us (from send) p50 {} p99 {} p999 {} max {}",
+                p.sent,
+                p.queued,
+                p.max_outstanding,
+                p.late_skipped,
+                p.late(0.5),
+                p.late(0.99),
+                p.late(1.0),
+                p.service(0.5),
+                p.service(0.99),
+                p.service(0.999),
+                p.service(1.0)
+            );
+            // perf287 on the pacer: more than 0.1% skipped means the client couldn't keep the
+            // schedule, so the row offered less than the rate.
+            if p.late_skipped * 1000 > p.sent {
+                println!(
+                    "  WARNING: the pacer skipped {} of {} puts (over 0.1%): the client couldn't keep the schedule; this row offered less than --put-rate",
+                    p.late_skipped,
+                    p.sent + p.late_skipped
+                );
+            }
+        }
     }
     server.stop();
     Ok(())
@@ -473,6 +503,115 @@ struct Outcome {
     p999: u64,
     cpu_us_per_put: Option<f64>,
     events_per_sub: f64,
+    /// With `--put-rate`: how the pacer kept its schedule.
+    pacer: Option<Paced>,
+}
+
+/// How the pacer kept its schedule in one scenario.
+struct Paced {
+    /// Puts handed to a writer.
+    sent: u64,
+    /// Of those, puts that found every writer busy and waited behind another (the server was
+    /// behind; their latency still counts from their due time), and the most puts handed out
+    /// and not yet done at once.
+    queued: u64,
+    max_outstanding: u64,
+    /// Puts not offered: the pacer itself reached them after the next was due (descheduled),
+    /// so they're skipped rather than sent late in a burst.
+    late_skipped: u64,
+    /// How late each handed-out put left the pacer, in microseconds, sorted.
+    late_us: Vec<u64>,
+    /// Each put's service time, from its send (not its due time), in microseconds, sorted.
+    service_us: Vec<u64>,
+}
+
+impl Paced {
+    fn late(&self, q: f64) -> u64 {
+        quantile(&self.late_us, q)
+    }
+
+    fn service(&self, q: f64) -> u64 {
+        quantile(&self.service_us, q)
+    }
+}
+
+/// The `q` quantile of sorted microseconds (0 when empty).
+fn quantile(sorted: &[u64], q: f64) -> u64 {
+    let n = sorted.len();
+    sorted
+        .get(((n as f64 * q) as usize).min(n.saturating_sub(1)))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `--put-rate`'s schedule: put `k` is due at `started + k / rate`, an absolute time, so
+/// nothing drifts. Each due time goes to the writers in turn. The thread sleeps until
+/// [`SPIN`] before a due time and spins the rest, so a put leaves within microseconds of it.
+/// It goes to the writer with the fewest outstanding, so a put waits only when every writer is
+/// busy: a server that falls behind is measured from the due times (open loop), never by
+/// dropping its slow puts. Only the pacer's own lateness skips puts, so a descheduled pacer
+/// doesn't send a burst.
+fn pace(
+    started: Instant,
+    end: Instant,
+    rate: f64,
+    writers: Vec<(tokio::sync::mpsc::UnboundedSender<Instant>, Arc<AtomicU64>)>,
+) -> Paced {
+    /// How long before a due time the pacer stops sleeping and spins: past the OS's sleep
+    /// overshoot (tens of microseconds on Linux).
+    const SPIN: Duration = Duration::from_micros(200);
+    let due = |k: u64| started + Duration::from_secs_f64(k as f64 / rate.max(1e-9));
+    let mut paced = Paced {
+        sent: 0,
+        queued: 0,
+        max_outstanding: 0,
+        late_skipped: 0,
+        late_us: Vec::new(),
+        service_us: Vec::new(),
+    };
+    let mut k = 0u64;
+    loop {
+        let at = due(k);
+        if at >= end {
+            break;
+        }
+        let now = Instant::now();
+        if at > now + SPIN {
+            std::thread::sleep(at - now - SPIN);
+        }
+        while Instant::now() < at {
+            std::hint::spin_loop();
+        }
+        let left = Instant::now();
+        // Reached after the next put was due (the thread was descheduled): skip it rather
+        // than send a burst.
+        if left >= due(k + 1) {
+            paced.late_skipped += 1;
+        } else {
+            // The writer with the fewest outstanding, from a rotating start so ties spread. A
+            // writer counts a put from here until the put is done, so an idle one is 0.
+            let n = writers.len();
+            let (tx, waiting) = (0..n)
+                .map(|i| &writers[(k as usize + i) % n])
+                .min_by_key(|(_, w)| w.load(Ordering::Relaxed))
+                .expect("at least one writer");
+            let before = waiting.fetch_add(1, Ordering::Relaxed);
+            if tx.send(at).is_ok() {
+                paced.sent += 1;
+                paced.late_us.push((left - at).as_micros() as u64);
+                if before > 0 {
+                    paced.queued += 1;
+                }
+                let total: u64 = writers.iter().map(|(_, w)| w.load(Ordering::Relaxed)).sum();
+                paced.max_outstanding = paced.max_outstanding.max(total);
+            } else {
+                waiting.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        k += 1;
+    }
+    paced.late_us.sort_unstable();
+    paced
 }
 
 async fn run(
@@ -561,34 +700,52 @@ async fn run(
     let started = Instant::now();
     let end = started + Duration::from_secs(args.seconds);
     let mut writers = Vec::with_capacity(args.writers);
+    // --put-rate: one thread keeps the schedule (perf287 on #1397: tokio's ~1 ms timer made a
+    // paced put's latency, counted from its due time, up to a tick late).
+    let (pacer, mut pacer_rx) = match args.put_rate {
+        Some(rate) => {
+            let (txs, rxs): (Vec<_>, Vec<_>) = (0..args.writers)
+                .map(|_| {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+                    let waiting = Arc::new(AtomicU64::new(0));
+                    ((tx, Arc::clone(&waiting)), (rx, waiting))
+                })
+                .unzip();
+            let pacer = std::thread::Builder::new()
+                .name("pacer".into())
+                .spawn(move || pace(started, end, rate, txs))?;
+            (Some(pacer), Some(rxs))
+        }
+        None => (None, None),
+    };
     for w in 0..args.writers {
         let mut client = DataClient::new(channel.clone());
         let value_bytes = args.value_bytes.max(8);
         let durability = args.durability;
-        // With --put-rate, this writer's share: one put every `every`, staggered across the
-        // writers so the offered load is even.
-        let every = args
-            .put_rate
-            .map(|r| Duration::from_secs_f64(args.writers as f64 / r.max(1e-9)));
-        let first = every.map(|e| started + e.mul_f64(w as f64 / args.writers as f64));
+        // With --put-rate, the pacer thread hands this writer its puts' due times.
+        let mut ticks = pacer_rx.as_mut().map(|rxs| rxs.remove(0));
         writers.push(tokio::spawn(async move {
             let mut lat = Vec::new();
+            // Each put's own time on the wire, from when it was sent: with --put-rate, apart
+            // from any wait for a busy writer.
+            let mut service = Vec::new();
             let mut i = 0u64;
             while Instant::now() < end {
-                // Paced: wait for the put's due time, and count its latency from then.
-                let due = first.zip(every).map(|(f, e)| f + e * (i as u32));
-                if let Some(d) = due {
-                    if d >= end {
-                        break;
-                    }
-                    tokio::time::sleep_until(d.into()).await;
-                }
+                // Paced: the put's due time, and its latency counts from then.
+                let due = match &mut ticks {
+                    Some((rx, _)) => match rx.recv().await {
+                        Some(d) => Some(d),
+                        None => break,
+                    },
+                    None => None,
+                };
                 let row = format!("w{w:03}-{i:012}").into_bytes();
                 i += 1;
                 // The send time first: the subscribers' lag is measured from it.
                 let mut value = vec![b'v'; value_bytes];
                 value[..8].copy_from_slice(&now_nanos().to_le_bytes());
                 let t = due.unwrap_or_else(Instant::now);
+                let sent = Instant::now();
                 let r = client
                     .mutate(proto::MutateRequest {
                         writes: Some(proto::RowWrites {
@@ -612,15 +769,32 @@ async fn run(
                     .await;
                 if r.is_ok() {
                     lat.push(t.elapsed().as_micros() as u64);
+                    service.push(sent.elapsed().as_micros() as u64);
+                }
+                // Done with this put: the pacer may count this writer idle again.
+                if let Some((_, outstanding)) = &ticks {
+                    outstanding.fetch_sub(1, Ordering::Relaxed);
                 }
             }
-            lat
+            (lat, service)
         }));
     }
     let mut lat = Vec::new();
+    let mut service = Vec::new();
     for w in writers {
-        lat.extend(w.await?);
+        let (l, sv) = w.await?;
+        lat.extend(l);
+        service.extend(sv);
     }
+    service.sort_unstable();
+    let pacer = match pacer {
+        Some(p) => {
+            let mut p = p.join().map_err(|_| "the pacer thread panicked")?;
+            p.service_us = service;
+            Some(p)
+        }
+        None => None,
+    };
     let elapsed = started.elapsed().as_secs_f64();
     let cpu = cpu_before.zip(cpu_seconds(server)).map(|(a, b)| b - a);
     // Give the subscribers a moment to take the last commits, then end them.
@@ -655,6 +829,7 @@ async fn run(
         p99: at(0.99),
         p999: at(0.999),
         cpu_us_per_put: cpu.map(|c| c * 1e6 / puts.max(1.0)),
+        pacer,
         events_per_sub: if subscribers == 0 {
             0.0
         } else {

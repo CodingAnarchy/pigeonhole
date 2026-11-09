@@ -1368,8 +1368,12 @@ mod tests {
             release.send(()).unwrap();
             probe.await.unwrap()
         });
+        // Not a tighter bar: the probe waits in the runtime's injection queue, which a worker
+        // checks only every `global_queue_interval` ticks while the yielded hub sits on its
+        // local queue, so how far the hub gets first is Tokio's tuning (feed1248's Q1 on
+        // #1599). Without the yield it gets through all of the backlog.
         assert!(
-            seen < BACKLOG / 2,
+            seen < BACKLOG,
             "the hub kept its worker through {seen} of {BACKLOG} backlogged commits"
         );
         drop(t);

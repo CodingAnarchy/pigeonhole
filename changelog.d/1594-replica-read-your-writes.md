@@ -1,0 +1,2 @@
+### Added
+- `phdb serve` replicas: read your own writes. A client sends its commit's seqno from the primary in the `x-pigeonhole-min-primary-seqno` header (gRPC metadata or HTTP), and a replica answers a read only once it has applied that commit, or fails it with the retry-safe `ReplicaBehind` (`UNAVAILABLE` / 503) at the request's deadline. A primary ignores the header (#1577, ICR 0112 amendment).

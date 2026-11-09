@@ -4,69 +4,56 @@
 //! timestamp, value], ...]]`, which `lib/pigeonhole/api.rb` turns into frozen `Commit` and
 //! `Change` objects.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use magnus::{Error, RArray, RString, Ruby, TryConvert, prelude::*};
-use pigeonhole::{ChangeKind, ErrorCode};
+use pigeonhole::ChangeKind;
 
 use crate::classes::{Feed, Snapshot, Table};
-use crate::convert::{Bytes, Secs, arg_error, binary, frozen, lock};
-use crate::error::{engine, with_code};
+use crate::convert::{Bytes, Secs, arg_error, binary, frozen};
+use crate::error::engine;
 use crate::fork::ForkSafe;
-use crate::gvl::without_gvl;
 use crate::read::{snapshot_arg, typed};
 use crate::table::{Handle, either};
 
-/// The longest a wait runs with the GVL released before it checks for an interrupt
-/// (`Thread#raise`, `Thread#kill`, Ctrl-C), so a consumer blocked in `next` stays
-/// interruptible although one engine call isn't.
-const SLICE: Duration = Duration::from_millis(100);
+/// A feed as a stream's source (`crate::waits`): its sync reads, the fiber wait's poll and
+/// its token, shared with the memory store's watch.
+pub(crate) struct FeedSource(pigeonhole::Feed);
 
-/// A feed's state: the subscription (`None` once closed) behind a mutex, and how many
-/// threads are waiting to take it.
-///
-/// A consumer in `next` holds the mutex for each slice and takes it again right after, and
-/// `std`'s mutex isn't fair, so without `wanted` it kept winning: `token` and `close` from
-/// another thread waited many slices (perf2 measured 1.46 s), with the GVL released and no
-/// way to interrupt them (perf2's S1 on #1411). Every lock goes through
-/// [`acquire`](Self::acquire), which counts the thread in `wanted` while it waits, and
-/// `next` gives way between slices while `wanted` isn't 0, so any other caller, a second
-/// consumer included, waits at most about one slice.
-pub(crate) struct FeedState {
-    feed: Mutex<Option<pigeonhole::Feed>>,
-    wanted: AtomicUsize,
-}
+impl crate::waits::Source for FeedSource {
+    type Item = pigeonhole::Commit;
+    type Error = pigeonhole::Error;
+    const NAME: &'static str = "feed";
 
-impl FeedState {
-    fn new(feed: pigeonhole::Feed) -> Self {
-        Self {
-            feed: Mutex::new(Some(feed)),
-            wanted: AtomicUsize::new(0),
-        }
+    fn next(&mut self, d: Duration) -> pigeonhole::Result<Option<pigeonhole::Commit>> {
+        self.0.next(d).map(Option::<&pigeonhole::Commit>::cloned)
     }
 
-    /// The subscription, counted in `wanted` until the lock is ours.
-    fn acquire(&self) -> MutexGuard<'_, Option<pigeonhole::Feed>> {
-        self.wanted.fetch_add(1, Ordering::SeqCst);
-        let guard = lock(&self.feed);
-        self.wanted.fetch_sub(1, Ordering::SeqCst);
-        guard
+    fn try_next(&mut self) -> pigeonhole::Result<Option<pigeonhole::Commit>> {
+        self.0.try_next().map(Option::<&pigeonhole::Commit>::cloned)
     }
 
-    /// Waits, with the GVL released, until no other thread wants the lock or `limit` (at
-    /// most a slice) has passed: a consumer between slices lets the others in first.
-    fn give_way(&self, ruby: &Ruby, limit: Duration) -> Result<(), Error> {
-        if self.wanted.load(Ordering::SeqCst) == 0 {
-            return Ok(());
-        }
-        without_gvl(ruby, || {
-            let start = Instant::now();
-            while self.wanted.load(Ordering::SeqCst) > 0 && start.elapsed() < limit {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        })
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<pigeonhole::Result<pigeonhole::Commit>> {
+        self.0.poll_next(cx).map(|r| r.cloned())
+    }
+
+    fn token(&self) -> Vec<u8> {
+        self.0.token().as_bytes().to_vec()
+    }
+
+    fn oldest_retained(&self) -> Option<u64> {
+        self.0.oldest_retained()
+    }
+
+    fn to_rb(ruby: &Ruby, item: pigeonhole::Commit) -> Result<magnus::Value, Error> {
+        commit(ruby, &item).map(|a| a.as_value())
+    }
+
+    fn error(ruby: &Ruby, e: pigeonhole::Error) -> Error {
+        crate::error::to_rb(ruby, &e)
     }
 }
 
@@ -125,7 +112,9 @@ impl Table {
             }
             b.open()
         })?;
-        Ok(Feed(ForkSafe::new(FeedState::new(feed))))
+        Ok(Feed(ForkSafe::new(crate::waits::Waits::new(FeedSource(
+            feed,
+        )))))
     }
 }
 
@@ -175,30 +164,6 @@ fn commit(ruby: &Ruby, c: &pigeonhole::Commit) -> Result<RArray, Error> {
 }
 
 impl Feed {
-    /// One wait of at most `slice` (`None`: no wait), with the GVL released. `Closed` for a
-    /// closed feed.
-    fn poll(
-        ruby: &Ruby,
-        rb_self: &Self,
-        slice: Option<Duration>,
-    ) -> Result<Option<pigeonhole::Commit>, Error> {
-        let state = rb_self.0.get(ruby)?;
-        // The mutex is taken only inside the call, so a thread waiting on it (behind a
-        // consumer's slice) never holds the GVL.
-        let polled = engine(ruby, || {
-            let mut guard = state.acquire();
-            let Some(f) = guard.as_mut() else {
-                return Ok(None);
-            };
-            let next = match slice {
-                Some(d) => f.next(d)?,
-                None => f.try_next()?,
-            };
-            Ok(Some(next.cloned()))
-        })?;
-        polled.ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the feed is closed"))
-    }
-
     /// `native_next(timeout)`: the next commit, waiting up to `timeout` seconds (`nil`
     /// waits until one comes), in slices with an interrupt check between them; `nil` if
     /// none came in time.
@@ -207,70 +172,54 @@ impl Feed {
         rb_self: &Self,
         timeout: Option<Secs>,
     ) -> Result<Option<RArray>, Error> {
-        let deadline = timeout.and_then(|t| Instant::now().checked_add(t.0));
         let state = rb_self.0.get(ruby)?;
-        loop {
-            // Another thread waiting for the feed (`token`, `close`, a second consumer) goes
-            // first; then this one checks for interrupts before its next slice.
-            // Never past a short `timeout:`'s deadline (ai1249's nit on #1411).
-            let left = || {
-                deadline.map_or(SLICE, |d| {
-                    d.saturating_duration_since(Instant::now()).min(SLICE)
-                })
-            };
-            state.give_way(ruby, left())?;
-            ruby.thread_check_ints()?;
-            let slice = left();
-            if let Some(c) = Self::poll(ruby, rb_self, Some(slice))? {
-                return commit(ruby, &c).map(Some);
-            }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Ok(None);
-            }
-        }
+        state
+            .wait(ruby, timeout.map(|t| t.0))?
+            .map(|c| commit(ruby, &c))
+            .transpose()
     }
 
     /// `native_try_next`: the next commit if one is ready, else `nil`. Never waits.
     pub(crate) fn try_next(ruby: &Ruby, rb_self: &Self) -> Result<Option<RArray>, Error> {
-        Self::poll(ruby, rb_self, None)?
+        rb_self
+            .0
+            .get(ruby)?
+            .try_next(ruby)?
             .map(|c| commit(ruby, &c))
             .transpose()
+    }
+
+    /// `native_next_op(bridge)`: the next commit as a fiber op (#1574 PR 2).
+    #[cfg(unix)]
+    pub(crate) fn next_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        rb_self.0.get(ruby)?.next_op(ruby, bridge)
     }
 
     /// Where the feed is, as bytes: `Table#feed(resume:)` continues after the last commit
     /// delivered, in this open of the database or a later one.
     pub(crate) fn token(ruby: &Ruby, rb_self: &Self) -> Result<RString, Error> {
-        let state = rb_self.0.get(ruby)?;
-        // A thread waiting in `next` holds the lock for up to a slice, then gives way.
-        let token = without_gvl(ruby, || {
-            state.acquire().as_ref().map(pigeonhole::Feed::token)
-        })?
-        .ok_or_else(|| with_code(ruby, ErrorCode::Closed, "the feed is closed"))?;
-        Ok(binary(ruby, token.as_bytes()))
+        let t = rb_self.0.get(ruby)?.token(ruby)?;
+        Ok(binary(ruby, &t))
     }
 
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     pub(crate) fn oldest_retained(ruby: &Ruby, rb_self: &Self) -> Result<Option<u64>, Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || {
-            state
-                .acquire()
-                .as_ref()
-                .and_then(pigeonhole::Feed::oldest_retained)
-        })
+        rb_self.0.get(ruby)?.oldest_retained(ruby)
     }
 
     /// Ends the subscription now. Calls afterwards raise `Closed`; closing twice does
     /// nothing.
     pub(crate) fn close(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || drop(state.acquire().take()))
+        rb_self.0.get(ruby)?.close(ruby)
     }
 
     /// Whether `close` was called.
     pub(crate) fn is_closed(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || state.acquire().is_none())
+        rb_self.0.get(ruby)?.is_closed(ruby)
     }
 }
 

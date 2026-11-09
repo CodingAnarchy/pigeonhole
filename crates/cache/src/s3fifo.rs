@@ -25,7 +25,14 @@
 //! only the small queue, and a `High` block outlives an equally hot `Normal` one.
 //!
 //! Memory safety (no use-after-evict) comes from `Arc` ownership, not from any locking
-//! protocol: eviction only drops the shard's own reference. The loom models check the
+//! protocol: eviction only drops the shard's own reference.
+//!
+//! **No frees under the lock** (#1559). An entry leaving the index (evicted, replaced or
+//! removed) is usually unpinned, so the shard's reference is its last, and dropping it frees
+//! the value: a glibc free, or an `IoBuf` going back to another thread's pool behind a mutex.
+//! Done under the shard's write lock, that wait became the lock's, and readers queued behind
+//! it (up to ms at 32 readers). So a change moves what it takes out into a [`Taken`] that the
+//! caller declared before taking the lock, and it's dropped after the guard is. The loom models check the
 //! accounting protocol around it (a handle `get` returns is never an entry already evicted
 //! or erased from the shard's books).
 
@@ -53,6 +60,43 @@ const SMALL_PERCENT: usize = 10;
 
 /// Minimum number of ghost keys kept per shard.
 const MIN_GHOSTS: usize = 16;
+
+/// Most values one change takes out of a shard ([`Taken`]). An insert takes out the entry it
+/// replaces and what it evicts, usually one or two. A pass that would take more stops early,
+/// leaving the shard over capacity until its next change evicts again (as a shard whose
+/// entries are all pinned does), and counts it ([`Shard::deferred_evictions`]): never an
+/// allocation under the lock (perf287's R1 on #1559).
+const TAKEN_MAX: usize = 16;
+
+/// The values a change took out of a shard's index under its lock, to drop after the lock is
+/// released (#1559): stack storage, never allocating. Declare it before the guard, so the
+/// guard is dropped first.
+#[must_use = "drop it after the shard's lock is released"]
+pub(crate) struct Taken<V> {
+    items: [Option<Arc<V>>; TAKEN_MAX],
+    n: usize,
+}
+
+impl<V> Taken<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            items: std::array::from_fn(|_| None),
+            n: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.n == TAKEN_MAX
+    }
+
+    /// Keeps `value` to drop later; a full buffer (which callers check first) drops it now.
+    fn push(&mut self, value: Arc<V>) {
+        if let Some(slot) = self.items.get_mut(self.n) {
+            *slot = Some(value);
+            self.n += 1;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Queue {
@@ -100,12 +144,18 @@ pub(crate) struct Shard<K, V> {
     usage: usize,
     small_usage: usize,
     next_id: u64,
+    /// Eviction passes that stopped with a full [`Taken`] ([`TAKEN_MAX`]).
+    deferred_evictions: u64,
 }
 
 impl<K: Copy + Eq + Hash, V> Shard<K, V> {
-    fn new(capacity: usize) -> Self {
+    /// A shard of `capacity` bytes, its index sized for `capacity / entry_hint` entries up
+    /// front (none when `entry_hint` is 0), so filling it doesn't grow the index under the
+    /// lock (#1559).
+    fn new(capacity: usize, entry_hint: usize) -> Self {
+        let entries = capacity.checked_div(entry_hint).unwrap_or(0);
         Self {
-            map: HashMap::with_hasher(BuildKeyHasher),
+            map: HashMap::with_capacity_and_hasher(entries, BuildKeyHasher),
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
@@ -115,6 +165,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
             usage: 0,
             small_usage: 0,
             next_id: 0,
+            deferred_evictions: 0,
         }
     }
 
@@ -148,10 +199,17 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
     }
 
     /// Inserts `value` (the caller keeps a clone, so it is pinned while the caller holds it),
-    /// replacing any entry for `key`, then evicts down to capacity. An entry larger than the
-    /// shard is not cached.
-    pub(crate) fn insert(&mut self, key: K, value: Arc<V>, charge: usize, priority: Priority) {
-        self.remove(&key);
+    /// replacing any entry for `key`, then evicts down to capacity, moving what it takes out
+    /// into `taken`. An entry larger than the shard is not cached.
+    pub(crate) fn insert(
+        &mut self,
+        key: K,
+        value: Arc<V>,
+        charge: usize,
+        priority: Priority,
+        taken: &mut Taken<V>,
+    ) {
+        self.remove(&key, taken);
         if charge > self.capacity {
             return;
         }
@@ -182,18 +240,24 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
                 queue,
             },
         );
-        self.evict();
+        self.evict(taken);
     }
 
     /// Changes the entry for `key` in place, keeping its queue and hit count: `f` gets the
     /// value and returns its new charge, or `None` to drop the entry. Then evicts down to
-    /// capacity. Returns whether the entry is still cached.
-    pub(crate) fn update(&mut self, key: &K, f: impl FnOnce(&mut Arc<V>) -> Option<usize>) -> bool {
+    /// capacity, moving what it takes out into `taken`. Returns whether the entry is still
+    /// cached.
+    pub(crate) fn update(
+        &mut self,
+        key: &K,
+        f: impl FnOnce(&mut Arc<V>) -> Option<usize>,
+        taken: &mut Taken<V>,
+    ) -> bool {
         let Some(slot) = self.map.get_mut(key) else {
             return false;
         };
         let Some(charge) = f(&mut slot.value) else {
-            self.remove(key);
+            self.remove(key, taken);
             return false;
         };
         let (old, small) = (slot.charge, slot.queue == Queue::Small);
@@ -203,36 +267,41 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
             self.small_usage = self.small_usage - old + charge;
         }
         if charge > self.capacity {
-            self.remove(key);
+            self.remove(key, taken);
             return false;
         }
-        self.evict();
+        self.evict(taken);
         self.map.contains_key(key)
     }
 
-    /// Drops `key` from the index (pinned or not). Outstanding handles stay valid.
-    pub(crate) fn remove(&mut self, key: &K) -> bool {
+    /// Drops `key` from the index (pinned or not), moving its value into `taken`.
+    /// Outstanding handles stay valid.
+    pub(crate) fn remove(&mut self, key: &K, taken: &mut Taken<V>) -> bool {
         let Some(slot) = self.map.remove(key) else {
             return false;
         };
         self.forget(&slot);
+        taken.push(slot.value);
         self.maybe_compact();
         true
     }
 
-    /// Drops every unpinned entry whose key matches `pred`.
-    pub(crate) fn remove_unpinned_where(&mut self, mut pred: impl FnMut(&K) -> bool) {
+    /// Drops every unpinned entry whose key matches `pred`, moving their values into `out`
+    /// to drop after the lock (#1559). Rare (deleted files, a closed instance), so `out` may
+    /// grow under the lock; its caller reserves it first and reuses it across shards.
+    pub(crate) fn remove_unpinned_where(
+        &mut self,
+        mut pred: impl FnMut(&K) -> bool,
+        out: &mut Vec<Arc<V>>,
+    ) {
         let mut freed = (0, 0);
-        self.map.retain(|k, slot| {
-            if !pred(k) || slot.pinned() {
-                return true;
-            }
+        for (_, slot) in self.map.extract_if(|k, slot| pred(k) && !slot.pinned()) {
             freed.0 += slot.charge;
             if slot.queue == Queue::Small {
                 freed.1 += slot.charge;
             }
-            false
-        });
+            out.push(slot.value);
+        }
         self.usage -= freed.0;
         self.small_usage -= freed.1;
         self.maybe_compact();
@@ -242,8 +311,8 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
     /// spare capacity to the allocator: an engine releasing a closed instance's memory
     /// (D265). Pinned entries stay indexed, as after `remove_unpinned_where`, until their
     /// holders go and a later `clear` or eviction drops them.
-    pub(crate) fn clear(&mut self) {
-        self.remove_unpinned_where(|_| true);
+    pub(crate) fn clear(&mut self, out: &mut Vec<Arc<V>>) {
+        self.remove_unpinned_where(|_| true, out);
         self.ghost.clear();
         self.ghost_set.clear();
         let map = &self.map;
@@ -270,6 +339,11 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
 
     pub(crate) fn usage(&self) -> usize {
         self.usage
+    }
+
+    /// Eviction passes that stopped early with a full [`Taken`] ([`TAKEN_MAX`]).
+    pub(crate) fn deferred_evictions(&self) -> u64 {
+        self.deferred_evictions
     }
 
     fn forget(&mut self, slot: &Slot<V>) {
@@ -306,7 +380,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         }
     }
 
-    fn evict(&mut self) {
+    fn evict(&mut self, taken: &mut Taken<V>) {
         // A pinned entry is rotated to its queue's tail; once a whole queue has been skipped
         // without any progress, stop using it. Progress is an eviction or anything else that
         // changes what a later pass finds (aging, promotion, dropping a stale entry); each of
@@ -315,6 +389,10 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         let mut skipped_small = 0;
         let mut skipped_main = 0;
         while self.usage > self.capacity {
+            if taken.is_full() {
+                self.deferred_evictions += 1;
+                break;
+            }
             let small_ok = !self.small.is_empty() && skipped_small < self.small.len();
             let main_ok = !self.main.is_empty() && skipped_main < self.main.len();
             let use_small = match (small_ok, main_ok) {
@@ -324,9 +402,9 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
                 (false, false) => break,
             };
             let step = if use_small {
-                self.evict_small()
+                self.evict_small(taken)
             } else {
-                self.evict_main()
+                self.evict_main(taken)
             };
             match step {
                 Step::Evicted => {
@@ -343,7 +421,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         }
     }
 
-    fn evict_small(&mut self) -> Step {
+    fn evict_small(&mut self, taken: &mut Taken<V>) -> Step {
         let Some((key, id)) = self.small.pop_front() else {
             return Step::Other;
         };
@@ -369,13 +447,15 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
             return Step::Other;
         };
         self.forget(&slot);
-        if slot.priority != Priority::Low {
+        let low = slot.priority == Priority::Low;
+        taken.push(slot.value);
+        if !low {
             self.add_ghost(key);
         }
         Step::Evicted
     }
 
-    fn evict_main(&mut self) -> Step {
+    fn evict_main(&mut self, taken: &mut Taken<V>) -> Step {
         let Some((key, id)) = self.main.pop_front() else {
             return Step::Other;
         };
@@ -397,6 +477,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         }
         if let Some(slot) = self.map.remove(&key) {
             self.forget(&slot);
+            taken.push(slot.value);
         }
         Step::Evicted
     }
@@ -441,8 +522,14 @@ pub(crate) struct Sharded<K, V> {
 }
 
 impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
-    /// `shards == 0` picks `min(64, capacity / min_shard_bytes)`, at least 1.
-    pub(crate) fn new(capacity: usize, shards: usize, min_shard_bytes: usize) -> Self {
+    /// `shards == 0` picks `min(64, capacity / min_shard_bytes)`, at least 1. Each shard's
+    /// index is sized up front for `entry_hint`-byte entries (0: not sized).
+    pub(crate) fn new(
+        capacity: usize,
+        shards: usize,
+        min_shard_bytes: usize,
+        entry_hint: usize,
+    ) -> Self {
         let n = if shards == 0 {
             (capacity / min_shard_bytes).clamp(1, 64)
         } else {
@@ -452,7 +539,10 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
             .map(|i| Padded {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
-                lock: RwLock::new(Shard::new(capacity / n + usize::from(i < capacity % n))),
+                lock: RwLock::new(Shard::new(
+                    capacity / n + usize::from(i < capacity % n),
+                    entry_hint,
+                )),
             })
             .collect();
         Self { shards, capacity }
@@ -484,10 +574,23 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
         self.shards.get(((mid * n) >> 32) as usize)
     }
 
-    pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V>)) {
+    /// Runs `f` on each shard under its lock. What `f` moves into the buffer is dropped
+    /// after that shard's lock is released (#1559); the buffer is reserved before the first
+    /// lock and reused.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V>, &mut Vec<Arc<V>>)) {
+        let mut out = Vec::with_capacity(64);
         for s in self.shards.iter() {
-            f(&mut lock(&s.lock));
+            f(&mut lock(&s.lock), &mut out);
+            out.clear();
         }
+    }
+
+    /// Eviction passes that stopped early, over every shard ([`Shard::deferred_evictions`]).
+    pub(crate) fn deferred_evictions(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| lock(&s.lock).deferred_evictions())
+            .sum()
     }
 
     pub(crate) fn usage(&self) -> usize {
@@ -523,11 +626,12 @@ mod tests {
     }
 
     fn shard(cap: usize) -> Shard<u32, Vec<u8>> {
-        Shard::new(cap)
+        Shard::new(cap, 0)
     }
 
     fn put(s: &mut Shard<u32, Vec<u8>>, k: u32, len: usize, p: Priority) {
-        s.insert(k, Arc::new(vec![k as u8; len]), len, p);
+        let mut taken = Taken::new();
+        s.insert(k, Arc::new(vec![k as u8; len]), len, p, &mut taken);
     }
 
     #[test]
@@ -588,7 +692,8 @@ mod tests {
         let pins: Vec<_> = (0..5)
             .map(|k| {
                 let v = Arc::new(vec![0u8; 100]);
-                s.insert(k, Arc::clone(&v), 100, Priority::Normal);
+                let mut taken = Taken::new();
+                s.insert(k, Arc::clone(&v), 100, Priority::Normal, &mut taken);
                 v
             })
             .collect();
@@ -609,7 +714,8 @@ mod tests {
         s.get(&1);
         // Main is [1 (hits banked), 2 (pinned, just inserted)]; 1 must age out, not be kept.
         let v = Arc::new(vec![0u8; 250]);
-        s.insert(2, Arc::clone(&v), 250, Priority::High);
+        let mut taken = Taken::new();
+        s.insert(2, Arc::clone(&v), 250, Priority::High, &mut taken);
         assert!(s.usage() <= 300, "usage {}", s.usage());
         assert!(s.peek(&1).is_none());
     }
@@ -624,6 +730,71 @@ mod tests {
         assert!(s.small.len() + s.main.len() <= 2 + 32 + 1);
     }
 
+    /// What leaves the index goes into the caller's `Taken`, not freed under the lock
+    /// (#1559): the replaced entry and every evicted one, each its value's last reference.
+    #[test]
+    fn evicted_and_replaced_values_are_taken_not_dropped() {
+        let mut s = shard(300);
+        let weak: Vec<_> = (0..3u32)
+            .map(|k| {
+                let v = Arc::new(vec![k as u8; 100]);
+                let w = Arc::downgrade(&v);
+                let mut taken = Taken::new();
+                s.insert(k, v, 100, Priority::Normal, &mut taken);
+                w
+            })
+            .collect();
+        let mut taken = Taken::new();
+        // Replaces key 0 and evicts down to capacity.
+        s.insert(0, Arc::new(vec![9; 250]), 250, Priority::Normal, &mut taken);
+        let evicted: Vec<usize> = (1..3).filter(|&k| s.peek(&(k as u32)).is_none()).collect();
+        assert!(!evicted.is_empty(), "the insert evicted something");
+        // Out of the index, but alive in `taken` until it's dropped.
+        assert!(
+            weak[0].upgrade().is_some(),
+            "the replaced value lives in `taken`"
+        );
+        for &k in &evicted {
+            assert!(weak[k].upgrade().is_some(), "evicted {k} lives in `taken`");
+        }
+        drop(taken);
+        assert!(weak[0].upgrade().is_none(), "freed with `taken`");
+        for &k in &evicted {
+            assert!(
+                weak[k].upgrade().is_none(),
+                "evicted {k} freed with `taken`"
+            );
+        }
+    }
+
+    /// One insert that would evict more than `TAKEN_MAX` entries stops at a full buffer and
+    /// counts it (perf287's R1 on #1559): the shard runs over capacity until its next insert.
+    #[test]
+    fn a_full_taken_stops_eviction_and_counts_it() {
+        let mut s = shard(1000);
+        for k in 0..40u32 {
+            put(&mut s, k, 25, Priority::Normal);
+        }
+        assert_eq!(s.deferred_evictions(), 0);
+        let mut taken = Taken::new();
+        s.insert(
+            100,
+            Arc::new(vec![0; 900]),
+            900,
+            Priority::Normal,
+            &mut taken,
+        );
+        assert!(taken.is_full());
+        assert_eq!(s.deferred_evictions(), 1);
+        assert!(s.usage() > 1000, "over capacity until the next inserts");
+        drop(taken);
+        // Each later insert evicts up to a buffer's worth more, back under capacity.
+        for k in 0..5u32 {
+            put(&mut s, 200 + k, 10, Priority::Normal);
+        }
+        assert!(s.usage() <= 1000, "usage {}", s.usage());
+    }
+
     #[test]
     fn oversized_entry_is_not_cached() {
         let mut s = shard(100);
@@ -635,14 +806,14 @@ mod tests {
 
     #[test]
     fn default_shard_count() {
-        let s: Sharded<u32, ()> = Sharded::new(1 << 30, 0, 1 << 18);
+        let s: Sharded<u32, ()> = Sharded::new(1 << 30, 0, 1 << 18, 0);
         assert_eq!(s.len(), 64);
-        let s: Sharded<u32, ()> = Sharded::new(1000, 0, 1 << 18);
+        let s: Sharded<u32, ()> = Sharded::new(1000, 0, 1 << 18, 0);
         assert_eq!(s.len(), 1);
-        let s: Sharded<u32, ()> = Sharded::new(10, 3, 1 << 18);
+        let s: Sharded<u32, ()> = Sharded::new(10, 3, 1 << 18, 0);
         assert_eq!(s.len(), 3);
         let mut total = 0;
-        s.for_each(|sh| total += sh.capacity);
+        s.for_each(|sh, _| total += sh.capacity);
         assert_eq!(total, 10);
     }
 }
