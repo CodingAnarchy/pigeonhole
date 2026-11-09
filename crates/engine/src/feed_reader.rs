@@ -896,7 +896,7 @@ impl FeedReader {
             } else {
                 &self.shared.waiters
             };
-            waiters.register(self.key, target, Wake::Task(waker.clone()));
+            waiters.register(self.key, target, Wake::Feed(waker.clone()));
             // A feed of every table waits for catalog changes too, which move no seqno:
             // their release wakes the catalog list.
             if self.tables.is_empty() {
