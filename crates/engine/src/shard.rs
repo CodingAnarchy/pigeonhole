@@ -413,11 +413,15 @@ pub(crate) type CloseState = crate::close_gate::CloseGate<Result<()>, Notifier<R
 #[repr(align(64))]
 pub(crate) struct Padded(pub AtomicU64);
 
-/// What a watermark waiter is: an async commit waiting for its seqno to become visible, or
-/// a shard whose freeze is deferred until the watermark passes its memtable (kicked).
+/// What a watermark waiter is: a commit waiting for its seqno to become visible (its
+/// future's waker, or a blocking wait's thread), a change feed reader waiting for the
+/// frontier (D310), or a shard whose freeze is deferred until the watermark passes its
+/// memtable (kicked). Only commits count as `VisibilityCounts::woken`, as only they count
+/// as `waits`.
 #[derive(Debug)]
 pub(crate) enum Wake {
     Task(Waker),
+    Feed(Waker),
     Shard(u16),
 }
 
@@ -730,8 +734,16 @@ impl Shared {
         self.visibility
             .scanned
             .fetch_add(scanned as u64, Ordering::Relaxed);
-        // A publish that missed the registration is seen here (`watermark_waiters`).
-        self.shm.visible_seqno() >= seqno
+        // A publish that missed the registration is seen here (`watermark_waiters`). The
+        // entry is taken back then: left listed, a later publish would wake it, and count
+        // it as `woken`, after this commit moved on (#1581's smoke run: a warmup commit's
+        // wake counted in the measured phase, 20 woken over 19 waits).
+        if self.shm.visible_seqno() >= seqno {
+            self.waiters
+                .forget(crate::watermark_waiters::commit_key(seqno), seqno);
+            return true;
+        }
+        false
     }
 
     /// Whether visibility can no longer advance: the close finished, or a shard died (its
@@ -757,7 +769,7 @@ impl Shared {
     /// Runs a watermark waiter's wake.
     fn wake(&self, w: Wake) {
         match w {
-            Wake::Task(w) => w.wake(),
+            Wake::Task(w) | Wake::Feed(w) => w.wake(),
             Wake::Shard(s) => {
                 let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
             }

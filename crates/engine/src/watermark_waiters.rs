@@ -197,6 +197,51 @@ impl<W> WatermarkWaiters<W> {
         listed
     }
 
+    /// Takes `key`'s entry for `seqno` back, if it is still listed: its registrant's re-read
+    /// after [`register`](Self::register) found the watermark already past `seqno`, so it
+    /// waits for nothing. Left listed, the entry would be woken (and counted) by whichever
+    /// later publish reaches its part, after its waiter moved on (#1581's smoke run counted
+    /// a warmup waiter's wake in the measured phase). Only a registration that raced a
+    /// publish comes here, so it takes the part's lock rarely. Dead entries at the heap's top
+    /// go with it, so `min_needed` and the part's `listed` bit stay those of live entries.
+    /// Out of line and cold, so `wait_visible` stays as small as it was.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn forget(&self, key: u64, seqno: Seqno) {
+        let i = self.part_index(key);
+        let part = &self.parts[i];
+        let mut list = part.lock();
+        let list = &mut *list;
+        if !list.keys.get(&key).is_some_and(|e| e.0 == seqno) {
+            // A pass took it first (its wake is on its way), or it was never listed.
+            return;
+        }
+        list.keys.remove(&key);
+        // The entry's own heap tuple was there, so the heap was non-empty: emptying it here
+        // is a transition, and the bit is cleared under the lock, as `wake_part` does.
+        while let Some(&Reverse((_, k, generation))) = list.heap.peek() {
+            if list.keys.get(&k).is_some_and(|e| e.1 == generation) {
+                break;
+            }
+            list.heap.pop();
+        }
+        part.min_needed.store(list.min(), Ordering::SeqCst);
+        if list.heap.is_empty() {
+            self.mark(i, false);
+        }
+    }
+
+    /// Whether `key` is listed (an inspection helper for tests).
+    #[cfg(test)]
+    fn is_listed(&self, key: u64) -> bool {
+        self.parts[self.part_index(key)]
+            .list
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys
+            .contains_key(&key)
+    }
+
     /// After a watermark publish and a SeqCst fence (which pairs with the one in `register`:
     /// either the publisher sees a registration or the registrant's re-read sees its
     /// watermark): hands `wake` every entry whose seqno is at or below what `visible` reads,
@@ -389,10 +434,15 @@ mod loom_tests {
             );
         }
 
-        /// `wait_visible`: register, then look again. True if the waiter saw it visible.
+        /// `wait_visible`: register, then look again; a waiter that sees it visible takes its
+        /// entry back. True if the waiter saw it visible.
         fn wait(&self, id: usize, seqno: u64) -> bool {
             self.waiters.register(id as u64, seqno, id);
-            self.visible.load(Ordering::Acquire) >= seqno
+            let saw = self.visible.load(Ordering::Acquire) >= seqno;
+            if saw {
+                self.waiters.forget(id as u64, seqno);
+            }
+            saw
         }
     }
 
@@ -406,7 +456,9 @@ mod loom_tests {
     fn loom_a_waiter_registering_as_the_watermark_passes_is_never_lost() {
         // A commit waiting for seqno 1 and a shard waiting for seqno 2 register while two
         // shards publish 1 and 2: each waiter sees its seqno visible on its second look or
-        // is woken, and is woken at most once.
+        // is woken, and is woken at most once. Once both publishes are done no entry is
+        // left listed: one that saw its seqno took its entry back, so no later publish can
+        // wake it (#1581: such a wake was counted in a later measurement window).
         model(|| {
             let s = Shared::new();
             let a = {
@@ -424,6 +476,10 @@ mod loom_tests {
                 let woken = s.woken[id].load(Ordering::Relaxed);
                 assert!(woken <= 1, "waiter {id} woken {woken} times");
                 assert!(saw || woken == 1, "waiter {id} lost its wake");
+                assert!(
+                    !s.waiters.is_listed(id as u64),
+                    "waiter {id} (saw {saw}, woken {woken}) left listed"
+                );
             }
         });
     }
@@ -455,6 +511,11 @@ mod loom_tests {
                 0,
                 "waiter 1 woken early"
             );
+            // Waiter 3 taking its entry back (if it saw 2) left waiter 1's in place, with
+            // its part still marked: the publish of 5 wakes it.
+            assert!(!s.waiters.is_listed(3), "waiter 3 left listed");
+            s.publish(5);
+            assert_eq!(s.woken[1].load(Ordering::Relaxed), 1, "waiter 1 lost");
         });
     }
 
@@ -547,6 +608,34 @@ mod tests {
         // A waiter that registers again after its wake is woken again.
         register(&w, 3, 20);
         assert_eq!(take(&w, 20), [3]);
+    }
+
+    #[test]
+    fn a_forgotten_entry_is_never_woken_and_leaves_its_neighbours_listed() {
+        let w = WatermarkWaiters::new(1);
+        register(&w, 1, 5);
+        register(&w, 3, 10);
+        // A different seqno is another registration's: kept.
+        w.forget(1, 6);
+        quiescent(&w);
+        assert!(w.is_listed(1));
+        // The heap's top goes: the part's minimum is the next live entry's.
+        w.forget(1, 5);
+        quiescent(&w);
+        assert!(!w.is_listed(1));
+        assert_eq!(w.published_and_actual_min(), (10, 10));
+        assert!(take(&w, 9).is_empty());
+        // Forgetting what a pass already took is a no-op.
+        assert_eq!(take(&w, 10), [3]);
+        w.forget(3, 10);
+        quiescent(&w);
+        // The last entry goes: the part is unmarked, and a publish takes no lock.
+        register(&w, 2, 7);
+        w.forget(2, 7);
+        quiescent(&w);
+        assert_eq!(w.published_and_actual_min(), (u64::MAX, u64::MAX));
+        std::sync::atomic::fence(Ordering::SeqCst);
+        assert!(!w.wake_ready_fenced(|| u64::MAX - 1, |_| panic!("woke a forgotten entry")));
     }
 
     #[test]
