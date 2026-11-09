@@ -47,6 +47,21 @@ struct State {
     entry: Option<Entry>,
 }
 
+/// Ends an open that unwound: the slot isn't opening any more, and its waiters try again.
+struct Opening<'a> {
+    slot: &'a MemSlot,
+    armed: bool,
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.slot.state().opening = false;
+            self.slot.opened.notify_all();
+        }
+    }
+}
+
 /// The memory store `--memory` names, as the service holds it.
 pub(crate) struct MemSlot {
     db: Pigeonhole,
@@ -172,11 +187,25 @@ impl MemSlot {
             state.opening = true;
             let (generation, writer) = (state.generation, state.writer);
             drop(state);
+            // A panic in the open (or the create closure) mustn't leave the slot opening for
+            // good, with every later call parked behind it (cli692's R1 on #1639).
+            let mut guard = Opening {
+                slot: self,
+                armed: true,
+            };
             let opened = self.open(writer);
             #[cfg(test)]
-            if let Some(hold) = self.after_open.lock().unwrap().take() {
-                hold(self);
+            {
+                let hold = self
+                    .after_open
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(hold) = hold {
+                    hold(self);
+                }
             }
+            guard.armed = false;
             state = self.state();
             state.opening = false;
             self.opened.notify_all();
@@ -349,6 +378,18 @@ mod tests {
         assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
         assert!(e.message.contains("other-model"), "{}", e.message);
         assert!(matches!(pinned.cached(), Some(Entry::Failed(_))));
+    }
+
+    /// A panic during an open (cli692's R1 on #1639) leaves the slot able to open: the next
+    /// call opens, rather than waiting for good on an open that ended.
+    #[test]
+    fn a_panic_during_an_open_leaves_the_slot_able_to_open() {
+        let (_dir, db) = db();
+        let slot = replica_slot(&db, None);
+        *slot.after_open.lock().unwrap() = Some(Box::new(|_: &MemSlot| panic!("in the open")));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slot.get()));
+        assert!(unwound.is_err());
+        assert!(matches!(slot.get().unwrap(), Entry::Missing));
     }
 
     /// A promote's slot opens as the writer: a store that's missing is created.

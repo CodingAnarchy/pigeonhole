@@ -2278,8 +2278,10 @@ impl Service {
         let entry = match slot.cached() {
             Some(entry) => entry,
             None => {
+                // Under the memory sub-limit (M6): a call waiting for another's open waits on
+                // the semaphore, not in a blocking-pool thread (cli692's R2 on #1639).
                 let slot = Arc::clone(&slot);
-                self.blocking(move || slot.get()).await?
+                self.memory_blocking(move || slot.get()).await?
             }
         };
         match entry {
@@ -2388,7 +2390,11 @@ impl Service {
         // Before the store: a swap from here on ends the watch.
         let swaps = self.memory.as_ref().map(|m| m.swaps());
         let core = self.memory_core().await?;
-        let swaps = swaps.expect("memory_core answers Unsupported without a store");
+        let Some(swaps) = swaps else {
+            return Err(ApiError::unsupported(
+                "this server has no memory store (phdb serve --memory NAME)",
+            ));
+        };
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
