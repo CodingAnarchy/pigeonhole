@@ -926,6 +926,19 @@ impl Service {
         self
     }
 
+    /// The table cache's generation, for a test to run [`table`](Self::table)'s steps with a
+    /// catalog change between them (#1632).
+    #[cfg(test)]
+    pub(crate) fn table_generation(&self) -> u64 {
+        self.tables.load().generation
+    }
+
+    /// Whether the table cache holds a handle for `name`.
+    #[cfg(test)]
+    pub(crate) fn table_cached(&self, name: &str) -> bool {
+        self.tables.load().map.contains_key(name)
+    }
+
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
     #[cfg(test)]
     pub(crate) fn inflight_available(&self) -> usize {
@@ -1360,7 +1373,7 @@ impl Service {
     /// Keeps `table` under `name` unless a handle is there already (then that one is
     /// returned). `None`, keeping nothing, if [`tables_changed`](Self::tables_changed) came
     /// after `generation`, the one the open started at (#1632).
-    fn keep_table(&self, name: &str, table: &Table, generation: u64) -> Option<Table> {
+    pub(crate) fn keep_table(&self, name: &str, table: &Table, generation: u64) -> Option<Table> {
         let mut kept = None;
         self.tables.rcu(|c| {
             if c.generation != generation {
