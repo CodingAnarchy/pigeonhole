@@ -14,8 +14,9 @@ const DB: &str = "/db/data.phdb";
 /// Sixteen zero-fill writes per slot (the WAL writes 256 KiB per call).
 const SEGMENT: u64 = 4 << 20;
 const ZERO_CHUNK: u64 = 256 << 10;
-/// The preparation's writes in flight at most (four), with the commit's WAL write.
-const MAX_IN_FLIGHT: usize = 5;
+/// The preparation's writes in flight at most (one: a chunk is written back before the next
+/// is written), with the commit's WAL write.
+const MAX_IN_FLIGHT: usize = 2;
 
 /// Runs the shard until it has nothing left to do.
 fn idle(shard: &mut EngineShard) {
