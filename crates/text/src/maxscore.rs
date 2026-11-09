@@ -920,6 +920,7 @@ impl Ord for Held {
 /// Where [`TopK::run`] stands in its document loop: what a `Pending` leaves it at, so the
 /// next poll resumes there (#1560). Each read point is resumable on its own ([`Reads`]); this
 /// keeps what a candidate has done between them.
+#[cfg(feature = "async")]
 #[derive(Clone, Copy)]
 enum At {
     /// Choosing the next candidate (after the threshold's re-cut, if it rose).
@@ -945,10 +946,19 @@ enum At {
     Rest { i: usize, partial: f64 },
 }
 
-/// MaxScore's document loop as a resumable run (#1560 §3.2): the sync search runs it to the
-/// end over [`Blocking`], the async one polls it over [`Nonblocking`]. Its state lives here
-/// between polls; [`TopK::run`] copies the scalars into locals and writes them back only on
-/// `Pending` (perf287's T2), so the sync loop keeps them in registers.
+/// MaxScore's document loop as a resumable run, polled by the async search over
+/// [`Nonblocking`] (#1560). Its state lives here between polls; [`TopK::run`] copies the
+/// scalars into locals and writes them back only on `Pending` (perf287's T2).
+///
+/// **Twin of the sync [`top_k`]:** the same control flow (the threshold's re-cut, the
+/// candidate, its essential steps, the unwalked gains, the non-essential lookups, the
+/// score), as phases a `Pending` resumes. **A change to one changes the other** (#1560 PR 2:
+/// one generic loop cost the sync text shapes 3–3.6% in callgrind, so each search has its
+/// own; perf287 and the coordinator accepted it). Every rule the loops apply lives in shared
+/// code: the reads, steps, skips and lookups ([`Walk`], [`Reads`]), the bounds, cuts and solo
+/// expansions ([`Scored`]). Only the loop's control flow is written twice, and
+/// `tests/search_async.rs` checks the two give the same hits and stats on random queries.
+#[cfg(feature = "async")]
 pub(crate) struct TopK<'t, R: Reads> {
     clauses: Vec<Scored<'t, R>>,
     k: usize,
@@ -976,6 +986,7 @@ pub(crate) struct TopK<'t, R: Reads> {
     lookup: Progress,
 }
 
+#[cfg(feature = "async")]
 impl<'t, R: Reads> TopK<'t, R> {
     pub(crate) fn new(clauses: Vec<Scored<'t, R>>, k: usize) -> Self {
         debug_assert!(k > 0, "the search returns before MaxScore at k = 0");
@@ -1263,8 +1274,13 @@ impl<'t, R: Reads> TopK<'t, R> {
 /// The top `k` documents of `clauses` (in their fixed order), by score descending then id
 /// ascending, with their exact scores: the sync search's document loop, as it was before
 /// #1560, over the same clauses and reads as [`TopK`] (a `Blocking` read is always ready).
-/// Not [`TopK::run`]: its resumable phases cost the sync loop about 14 instructions a
-/// candidate on the text shapes (#1560's profile), which the shapes' ceilings don't allow.
+///
+/// **Twin of [`TopK::run`]** (the async search's loop): the same control flow, written
+/// straight. **A change to one changes the other** (#1560 PR 2). Not `TopK::run` itself: its
+/// resumable phases cost about 14 instructions a candidate, and a `Poll`-wrapped read copied
+/// each posting (text-term-hub +3.6%, two-terms +3.0% in callgrind), which the text shapes'
+/// ceilings don't allow. The rules both loops apply are shared ([`Walk`], [`Scored`],
+/// [`Reads`]); `tests/search_async.rs` checks the two agree.
 pub(crate) fn top_k(
     t: &Rows,
     s: &Snapshot,

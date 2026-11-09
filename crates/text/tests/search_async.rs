@@ -15,10 +15,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use common::{Rng, source, text};
+use common::{Rng, seeds, source, text, word};
 use pigeonhole::{Family, Options, Pigeonhole};
 use pigeonhole_io::sim::SimVfs;
-use pigeonhole_text::{Index, IndexOptions};
+use pigeonhole_text::{Fuzziness, Index, IndexOptions, Query};
 
 const PATH: &str = "/db/text.phdb";
 
@@ -150,4 +150,105 @@ fn async_search_futures_are_send() {
     drop(stats);
     drop(index);
     db.close().unwrap();
+}
+
+/// A word with one edit (a dropped, swapped or replaced letter): a fuzzy term's input.
+fn misspell(rng: &mut Rng) -> String {
+    let mut w: Vec<u8> = word(rng).as_bytes().to_vec();
+    let i = rng.below(w.len() as u64) as usize;
+    match rng.below(3) {
+        0 if w.len() > 2 => {
+            w.remove(i);
+        }
+        1 if i + 1 < w.len() => w.swap(i, i + 1),
+        _ => w[i] = b'a' + rng.below(26) as u8,
+    }
+    String::from_utf8(w).expect("ascii")
+}
+
+/// A random disjunction of every clause kind: terms, text, phrases (slop 0 to 3), quoted
+/// phrases and fuzzy terms (every fuzziness).
+fn random_query(rng: &mut Rng) -> Query {
+    let mut q = Query::new();
+    for _ in 0..1 + rng.below(4) {
+        q = match rng.below(6) {
+            0 => q.term(word(rng)),
+            1 => q.text(format!("{} {}", word(rng), word(rng))),
+            2 => {
+                let words: Vec<&str> = (0..2 + rng.below(2)).map(|_| word(rng)).collect();
+                q.phrase_with_slop(words, rng.below(4) as u16)
+            }
+            3 => q.quoted_phrase(format!("{} {}", word(rng), word(rng)), rng.below(3) as u16),
+            4 => {
+                let f = [Fuzziness::Auto, Fuzziness::One, Fuzziness::Two][rng.below(3) as usize];
+                q.fuzzy(misspell(rng), f)
+            }
+            _ => q.fuzzy(word(rng), Fuzziness::Auto),
+        };
+    }
+    q
+}
+
+/// The condition perf287 and the coordinator set on #1560 PR 2's two document loops (the
+/// sync `top_k` and the async `TopK::run`): a seeded property over every query kind. Random
+/// corpora and queries (mixes of every clause kind, `k` from 1 to 100, `id_prefix`,
+/// highlighting, `max_expansions` and `prefix_length`), with deletes and new documents
+/// between rounds: the async search equals the sync one, hits and stats, and reads nothing
+/// synchronously. `TEXT_SEED=<n>` runs one seed (a long sweep passes its seeds that way).
+#[test]
+fn async_equals_sync_over_random_corpora_and_queries() {
+    for seed in seeds(&[11, 12, 13]) {
+        let vfs = SimVfs::new(seed);
+        let db = build(&vfs, 600, seed);
+        let index = Index::open(&db, "docs_text").expect("open index");
+        let mut rng = Rng::new(seed ^ 0x1560);
+        let mut next_doc = 620;
+        for round in 0..3 {
+            if round > 0 {
+                for _ in 0..40 {
+                    let doc = format!("d{:05}", rng.below(next_doc));
+                    index.delete(doc.as_bytes()).unwrap();
+                }
+                for _ in 0..20 {
+                    let doc = format!("d{next_doc:05}");
+                    index.put(doc.as_bytes(), &text(&mut rng, 30)).unwrap();
+                    next_doc += 1;
+                }
+            }
+            for i in 0..40 {
+                let query = random_query(&mut rng);
+                let k = [1, 3, 10, 100][rng.below(4) as usize];
+                let prefix = (rng.below(4) == 0).then(|| format!("d00{}", rng.below(6)));
+                let highlight = rng.below(2) == 0;
+                let max = [1, 3, 50][rng.below(3) as usize];
+                let prefix_length = rng.below(3) as usize;
+                let search = || {
+                    let mut s = index
+                        .search(query.clone(), k)
+                        .highlight(highlight)
+                        .max_expansions(max)
+                        .prefix_length(prefix_length);
+                    if let Some(p) = &prefix {
+                        s = s.id_prefix(p.as_bytes());
+                    }
+                    s
+                };
+                let ctx = format!(
+                    "seed {seed}, round {round}, query {i}: {query:?}, k {k}, prefix {prefix:?}, \
+                     max {max}, prefix_length {prefix_length}"
+                );
+                let before = db.engine_metrics().async_sync_reads;
+                let (got, _) = drive(&vfs, search().run_with_stats_async());
+                let reads = db.engine_metrics().async_sync_reads - before;
+                let (got, got_stats) = got.unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                let (want, want_stats) = search().run_with_stats().expect("run_with_stats");
+                assert_eq!(got, want, "{ctx}");
+                assert_eq!(format!("{got_stats:?}"), format!("{want_stats:?}"), "{ctx}");
+                assert_eq!(reads, 0, "{ctx}: synchronous reads");
+            }
+        }
+        drop(index);
+        vfs.complete_all_io();
+        db.close().unwrap();
+    }
 }
