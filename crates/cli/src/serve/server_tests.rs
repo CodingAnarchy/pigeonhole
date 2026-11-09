@@ -4664,11 +4664,12 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
     }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let upstream = p.url.trim_start_matches("http://").to_owned();
-    // The copy is the primary's whole file (tens of MiB with its preallocation): each
-    // connection takes a few chunks of it, then stalls.
-    // The second connection, the first reconnect after a stall, is closed at once: one more
-    // break, never a restart from zero (cli692's R2 on #1609).
-    let proxy = stalling_proxy(&upstream, 16 << 20, Some(1), Arc::clone(&stop));
+    // Each connection takes one 1 MiB chunk of the copy (and its framing), then stalls: the
+    // copy holds the 3 MiB written above, so every bootstrap stalls at least twice, however
+    // the copy is laid out (#1615 shrank it from tens of MiB to about its data). The second
+    // connection, the first reconnect after a stall, is closed at once: one more break,
+    // never a restart from zero (cli692's R2 on #1609).
+    let proxy = stalling_proxy(&upstream, 3 << 19, Some(1), Arc::clone(&stop));
     let mut short = limits();
     short.stream_idle = Duration::from_millis(500);
     let r = Server::start_replica_with(test_dir(), &proxy, None, short);
