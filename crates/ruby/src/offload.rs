@@ -5,7 +5,9 @@
 //! jobs need them), and complete through a fiber op like any other waiting call.
 //!
 //! A job is queued when its op starts. Dropping the op (its fiber stopped, say) before the
-//! job starts skips it; once started, it runs to its end and its result is dropped.
+//! job starts skips it; once started, it runs to its end and its result is dropped. A job
+//! that panics completes with the panic (the fiber raises), and its thread lives on
+//! (cli692's R1 on #1614).
 //!
 //! After a fork the child's first job finds a different pid and starts a fresh pool: the
 //! parent's threads don't exist there, and its queue is left behind.
@@ -70,11 +72,11 @@ fn submit(job: Job) {
     let mut q = lock(&p.queue);
     q.jobs.push_back(job);
     if q.idle > 0 {
-        drop(q);
         p.more.notify_one();
-        return;
     }
-    if q.threads < cap() {
+    // A thread more unless the idle ones cover every queued job (cli692's N1 on #1614), so
+    // a short job doesn't wait behind a long one while the pool is under its cap.
+    if q.idle < q.jobs.len() && q.threads < cap() {
         q.threads += 1;
         drop(q);
         let worker = Arc::clone(&p);
@@ -118,9 +120,9 @@ fn run(p: &Pool) {
     }
 }
 
-/// A job's result, and the waker of the op waiting for it.
+/// A job's result (or its panic), and the waker of the op waiting for it.
 struct Slot<T> {
-    out: Option<T>,
+    out: Option<std::thread::Result<T>>,
     waker: Option<Waker>,
 }
 
@@ -130,11 +132,11 @@ struct Shared<T> {
     dropped: AtomicBool,
 }
 
-/// The future of one job: `Ready` with its result once the pool has run it.
+/// The future of one job: `Ready` with its result, or its panic, once the pool has run it.
 pub(crate) struct JobFuture<T>(Arc<Shared<T>>);
 
-/// Runs `f` on the pool; the returned future is ready with its result. `f` is queued here,
-/// so an op's first poll (at its call) has already submitted it.
+/// Runs `f` on the pool; the returned future is ready with its result, or `Err` with its
+/// panic. `f` is queued here, so an op's first poll (at its call) has already submitted it.
 pub(crate) fn job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> JobFuture<T> {
     let shared = Arc::new(Shared {
         slot: Mutex::new(Slot {
@@ -148,7 +150,7 @@ pub(crate) fn job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         if s.dropped.load(Ordering::Acquire) {
             return;
         }
-        let out = f();
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let waker = {
             let mut g = lock(&s.slot);
             g.out = Some(out);
@@ -162,9 +164,9 @@ pub(crate) fn job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 impl<T> Future for JobFuture<T> {
-    type Output = T;
+    type Output = std::thread::Result<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut g = lock(&self.0.slot);
         match g.out.take() {
             Some(out) => Poll::Ready(out),

@@ -1329,6 +1329,8 @@ fn drive<R: Send + 'static>(
     };
     let mut raised: Vec<(String, Error)> = Vec::new();
     let mut jump: Option<Error> = None;
+    #[cfg(unix)]
+    let mut reraised = false;
     loop {
         let msg = match waiter {
             Waiter::Blocking => {
@@ -1351,7 +1353,17 @@ fn drive<R: Send + 'static>(
                     // meanwhile (a stop, a timeout), it's recorded as an interrupt is, and
                     // the loop goes on waiting through the bridge until the worker has
                     // ended: no thread outlives the call (§4 of the design note on #1574).
-                    if let Err(e) = fiber::await_groups(ruby, bridge, core, &groups) {
+                    // Raised into again after that (a scheduler that re-raises at every
+                    // yield), it waits in slices with the GVL released instead, so it can't
+                    // spin through the scheduler (cli692's N2 on #1614).
+                    let waited = if reraised {
+                        let g = Arc::clone(&groups);
+                        without_gvl(ruby, move || g.wait_ready(SLICE))
+                    } else {
+                        fiber::await_groups(ruby, bridge, core, &groups)
+                    };
+                    if let Err(e) = waited {
+                        reraised = jump.is_some();
                         jump.get_or_insert(e);
                         trip();
                     }

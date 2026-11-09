@@ -44,6 +44,33 @@ fn out<T: Send + 'static>(
     Box::new(move |ruby: &Ruby| conv(ruby, r.or_mem(ruby)?))
 }
 
+/// An offload job's outcome as a fiber op's result, as [`out`]: a panic in the job raises
+/// `Pigeonhole::Error` in the fiber, as a panic on a blocking path does (cli692's R1 on
+/// #1614).
+fn joined<T: Send + 'static>(
+    r: std::thread::Result<mem::Result<T>>,
+    conv: impl FnOnce(&Ruby, T) -> Result<Value, Error> + Send + 'static,
+) -> Out {
+    match r {
+        Ok(r) => out(r, conv),
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            drop(panic);
+            Box::new(move |ruby: &Ruby| {
+                Err(crate::error::uncoded(
+                    ruby,
+                    "Error",
+                    &format!("a pigeonhole-ruby-offload job panicked: {why}"),
+                ))
+            })
+        }
+    }
+}
+
 impl Store {
     /// `native_prepare_remember(ns, text, embedding, kind, importance, source, session,
     /// links, pinned)`: `remember`'s part before its transaction, here (no near dedup to
@@ -94,7 +121,7 @@ impl Store {
         FiberBridge::start(ruby, bridge, move || {
             let job = offload::job(move || s.prepare_remember(&ns, m));
             Box::pin(async move {
-                out(job.await, |ruby, p| {
+                joined(job.await, |ruby, p| {
                     Ok(PreparedMemory(Arc::new(p)).into_value_with(ruby))
                 })
             }) as Fut
@@ -178,10 +205,9 @@ impl Store {
         let s = rb_self.handle(ruby)?;
         FiberBridge::start(ruby, bridge, move || {
             let job = offload::job(move || s.settle());
-            Box::pin(async move {
-                job.await;
-                Box::new(|ruby: &Ruby| Ok(ruby.qnil().as_value())) as Out
-            }) as Fut
+            Box::pin(
+                async move { joined(job.await.map(Ok), |ruby, ()| Ok(ruby.qnil().as_value())) },
+            ) as Fut
         })
     }
 
@@ -228,7 +254,7 @@ fn recall_job(
 ) -> Result<FiberOp, Error> {
     FiberBridge::start(ruby, bridge, move || {
         let job = offload::job(run);
-        Box::pin(async move { out(job.await, |ruby, h| Ok(hits(ruby, h)?.as_value())) }) as Fut
+        Box::pin(async move { joined(job.await, |ruby, h| Ok(hits(ruby, h)?.as_value())) }) as Fut
     })
 }
 

@@ -571,7 +571,9 @@ module Pigeonhole
 
       # A write under a fiber scheduler, as the crate's own runs it (ICR 0123): the store's
       # `*_in` form in a `transact` (retried as the crate retries, its commit yielding), then
-      # with `settle:` an IVF store's parked writes handed on, on a worker thread.
+      # with `settle:` an IVF store's parked writes handed on, on a worker thread. Unlike the
+      # crate's, a write whose transaction raises doesn't settle: anything parked goes with
+      # the next write's settle, which is harmless for recall (cli692's N3 on #1614).
       def fiber_write(bridge, settle: false)
         out = @db.transact { |t| yield t }
         bridge.await(native_settle_op(bridge.native)) if settle && native_has_ivf
