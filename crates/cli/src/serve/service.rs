@@ -757,8 +757,8 @@ impl Service {
     /// `x-pigeonhole-min-primary-seqno` header), a read waits, until `deadline` at most, for
     /// the replica to apply the primary's commits through it. Reads only: a write is refused
     /// on a replica anyway, and `Info` and `Metrics` answer at once (a monitor must see a
-    /// lagging replica). A server that isn't a replica, or was promoted, ignores it. The wait holds the
-    /// request's slot and budget, as any read in progress does.
+    /// lagging replica). A server that isn't a replica, or was promoted, ignores it. The wait
+    /// holds the request's slot and budget, as any read in progress does.
     pub(crate) async fn await_primary(
         &self,
         op: &ServiceOp,
