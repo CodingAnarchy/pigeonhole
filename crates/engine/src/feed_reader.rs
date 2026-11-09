@@ -365,6 +365,12 @@ pub struct FeedReader {
     stream_reads: u64,
     /// Polls of any kind (an inspection count for tests, #1417).
     polls: u64,
+    /// [`wait`](Self::wait)'s re-polls without parking: its waker's registration found the
+    /// wake already due (an inspection count for tests).
+    unparked_repolls: u64,
+    /// [`wait`](Self::wait)'s parks, each returned by a wake, the backstop or spuriously (an
+    /// inspection count for tests).
+    parks: u64,
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
@@ -574,6 +580,8 @@ impl FeedReader {
             read_through: None,
             stream_reads: 0,
             polls: 0,
+            unparked_repolls: 0,
+            parks: 0,
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
@@ -777,6 +785,7 @@ impl FeedReader {
                 Some(feed) => {
                     let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
                     if self.register_wake(feed, held, &waker, &mut on_hold_list) {
+                        self.unparked_repolls += 1;
                         continue;
                     }
                 }
@@ -792,6 +801,7 @@ impl FeedReader {
                 };
                 park = park.min(Duration::from_nanos(hold));
             }
+            self.parks += 1;
             std::thread::park_timeout(park);
         }
     }
@@ -1241,6 +1251,19 @@ impl FeedReader {
     #[cfg(feature = "test-hooks")]
     pub fn polls(&self) -> u64 {
         self.polls
+    }
+
+    /// [`wait`](Self::wait)'s re-polls that skipped parking since the reader opened: a spin
+    /// shows here, while a spurious park return does not (an inspection count for tests).
+    #[cfg(feature = "test-hooks")]
+    pub fn unparked_repolls(&self) -> u64 {
+        self.unparked_repolls
+    }
+
+    /// [`wait`](Self::wait)'s parks since the reader opened (an inspection count for tests).
+    #[cfg(feature = "test-hooks")]
+    pub fn parks(&self) -> u64 {
+        self.parks
     }
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.

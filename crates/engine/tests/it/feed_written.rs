@@ -936,15 +936,23 @@ fn a_held_blocking_wait_parks_until_the_hold_lets_go() {
         db.feed_frontier(true) < held.seqno,
         "held until a sync covers it"
     );
-    let before = feed.polls();
+    let (polls, repolls, parks) = (feed.polls(), feed.unparked_repolls(), feed.parks());
     assert!(matches!(
         feed.wait(Duration::from_millis(500)).unwrap(),
         Next::Pending
     ));
-    let polls = feed.polls() - before;
+    let (polls, repolls, parks) = (
+        feed.polls() - polls,
+        feed.unparked_repolls() - repolls,
+        feed.parks() - parks,
+    );
+    // It parks rather than spins: no re-poll skips the park. A park may still return early
+    // (`park_timeout` may return spuriously, which #1594's Windows run did 22 times in
+    // 500 ms), and each such return polls once more and parks again, which is right; so
+    // the polls aren't the measure, the skipped parks are.
     assert!(
-        polls < 20,
-        "{polls} polls while held: it re-polled instead of parking"
+        repolls <= 1 && polls <= parks + 1,
+        "{repolls} re-polls without parking, {polls} polls over {parks} parks while held"
     );
     // A waiter on another thread; the hold's release wakes it.
     let waiter = std::thread::spawn(move || {
