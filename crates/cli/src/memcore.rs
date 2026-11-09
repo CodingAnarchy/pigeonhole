@@ -8,6 +8,8 @@
 //! namespace each memory id carries ([`MemoryId::namespace`]), and, for a watch, the
 //! namespaces it would see. A call outside the limit is refused whole, never trimmed.
 
+use std::sync::Arc;
+
 use pigeonhole::{ErrorCode, Pigeonhole, RetryPolicy};
 use pigeonhole_memory::{
     EmbeddingModel, Kind, LinkType, Marked, Memory as NewMemory, MemoryId, OpenOptions, RecallHit,
@@ -181,11 +183,28 @@ pub(crate) struct RecallArgs {
 /// The most hits a recall returns.
 pub(crate) const MAX_K: usize = 1000;
 
+/// How a writer creates a missing store: its options, from the embedder (whose probe gives
+/// the dimension).
+pub(crate) type Create = dyn Fn(Option<&Embedder>) -> std::result::Result<pigeonhole_memory::StoreOptions, Failure>
+    + Send
+    + Sync;
+
+/// Why [`MemCore::open_in`] failed.
+#[derive(Debug)]
+pub(crate) enum OpenError {
+    /// The store is pinned to another model than the server embeds with (or names).
+    Pin(Failure),
+    /// Making a missing store's options failed (the embedder's dimension probe, say).
+    Create(Failure),
+    /// The store's open or create failed.
+    Store(pigeonhole_memory::Error),
+}
+
 /// One memory store, as a server or tool set opens it.
 pub(crate) struct MemCore {
     store: Store,
     db: Pigeonhole,
-    embedder: Option<Embedder>,
+    embedder: Option<Arc<Embedder>>,
     /// A recall's budget when it asks for none, and the largest it may ask for: a recall's
     /// reply is bounded (the coordinator on #1567).
     default_budget: u64,
@@ -193,50 +212,67 @@ pub(crate) struct MemCore {
 }
 
 impl MemCore {
-    /// Opens the store `name` as the writer, creating it with `create` if it doesn't exist.
-    /// An existing store must be pinned to `expected` (the embedder's model, or the one the
-    /// caller names), or have no model when none is expected.
-    pub(crate) fn open(
+    /// Opens the store `name`, creating it with `create` if it doesn't exist. An existing
+    /// store must be pinned to `expected` (the embedder's model, or the one the caller
+    /// names), or have no model when none is expected. Without `create` (a replica, #1618),
+    /// a missing store is `Ok(None)`, and the store starts no thread of
+    /// the crate's: its forgetter and IVF rebalancer are taken and dropped, since nothing may
+    /// write in the background there.
+    pub(crate) fn open_in(
         db: &Pigeonhole,
         name: &str,
-        embedder: Option<Embedder>,
+        embedder: Option<Arc<Embedder>>,
         expected: Option<&str>,
-        create: impl FnOnce(
-            Option<&Embedder>,
-        ) -> std::result::Result<pigeonhole_memory::StoreOptions, Failure>,
+        create: Option<&Create>,
         budget: (u64, u64),
-    ) -> std::result::Result<Self, Failure> {
-        let fail = |e: pigeonhole_memory::Error| {
-            Failure::coded(e.code(), format!("memory store {name}: {e}"))
-        };
+    ) -> std::result::Result<Option<Self>, OpenError> {
         let exists = db.tables().iter().any(|t| *t == format!("mem_{name}"));
         let store = if exists {
-            // A probe reads the pinned model; it owns its forgetter, so it starts no thread.
+            // A probe reads the pinned model; it owns its forgetter and rebalancer, so it
+            // starts no thread.
             let probe = Store::open_with(
                 db,
                 name,
-                OpenOptions::new().without_embeddings().own_forgetter(),
+                OpenOptions::new()
+                    .without_embeddings()
+                    .own_forgetter()
+                    .own_rebalancer(),
             )
-            .map_err(fail)?;
+            .map_err(OpenError::Store)?;
             let pinned = probe.embedding_model().cloned();
+            drop(probe.take_forgetter());
+            drop(probe.take_rebalancer());
             drop(probe);
-            let expected = embedder.as_ref().map(Embedder::model).or(expected);
-            check_pin(name, pinned.as_ref(), expected)?;
-            match pinned {
-                Some(m) => Store::open(db, name, m.id()),
-                None => Store::open_without_embeddings(db, name),
+            let expected = embedder.as_deref().map(Embedder::model).or(expected);
+            check_pin(name, pinned.as_ref(), expected).map_err(OpenError::Pin)?;
+            let options = match &pinned {
+                Some(m) => OpenOptions::new().model(m.id()),
+                None => OpenOptions::new().without_embeddings(),
+            };
+            if create.is_some() {
+                Store::open_with(db, name, options)
+            } else {
+                Store::open_with(db, name, options.own_forgetter().own_rebalancer()).inspect(|s| {
+                    // Dropped: a forgetter kept in the store would hold the store.
+                    drop(s.take_forgetter());
+                    drop(s.take_rebalancer());
+                })
             }
-            .map_err(fail)?
+            .map_err(OpenError::Store)?
         } else {
-            Store::create(db, name, create(embedder.as_ref())?).map_err(fail)?
+            let Some(create) = create else {
+                return Ok(None);
+            };
+            let options = create(embedder.as_deref()).map_err(OpenError::Create)?;
+            Store::create(db, name, options).map_err(OpenError::Store)?
         };
-        Ok(Self {
+        Ok(Some(Self {
             store,
             db: db.clone(),
             embedder,
             default_budget: budget.0,
             max_budget: budget.1.max(budget.0),
-        })
+        }))
     }
 
     /// The store's pinned model.
