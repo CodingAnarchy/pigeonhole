@@ -31,7 +31,7 @@ const EVENTS: usize = 64;
 impl From<MemError> for ApiError {
     fn from(e: MemError) -> Self {
         match e.kind {
-            MemErrorKind::Invalid => Self::invalid(e.message),
+            MemErrorKind::Invalid | MemErrorKind::Rejected => Self::invalid(e.message),
             MemErrorKind::Denied => Self::permission_denied(&e.message),
             MemErrorKind::Engine(code) => Self::from_code(code, &e.message),
             MemErrorKind::Unavailable => Self::unavailable(e.message),
@@ -235,7 +235,7 @@ pub(crate) fn watch(
 ) -> Result<MemoryEvents, ApiError> {
     scope.check_all(&r.namespaces)?;
     let ns: Vec<&str> = r.namespaces.iter().map(String::as_str).collect();
-    let mut builder = core.store().watch(&ns);
+    let mut builder = core.store()?.watch(&ns);
     if !r.resume.is_empty() {
         builder = builder.resume(&WatchToken::from_bytes(r.resume.to_vec()));
     }

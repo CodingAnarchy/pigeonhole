@@ -706,12 +706,20 @@ pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
     }
 }
 
+/// The service's open tables by name, and the generation
+/// [`tables_changed`](Service::tables_changed) bumps (#1632).
+#[derive(Clone, Default)]
+struct TableCache {
+    generation: u64,
+    map: HashMap<String, Table>,
+}
+
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
     pub(crate) db: Pigeonhole,
     /// Read on every call, changed only when a table is first used: a snapshot swapped
     /// whole, never a lock (perf287's note 3 on D313).
-    tables: ArcSwap<HashMap<String, Table>>,
+    tables: ArcSwap<TableCache>,
     /// The in-flight bytes budget (R3), in bytes.
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
@@ -772,7 +780,7 @@ impl Service {
     ) -> Self {
         Self {
             db: db.clone(),
-            tables: ArcSwap::from_pointee(HashMap::new()),
+            tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
@@ -853,12 +861,23 @@ impl Service {
     /// publishes the seqno it applied only after this returns, so a read waiting for that
     /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
-        self.tables.store(Arc::new(HashMap::new()));
-        self.indexes.forget();
-        self.texts.forget();
+        self.handles_changed();
         if let Some(memory) = &self.memory {
             memory.clear();
         }
+    }
+
+    /// The cached table, vector index and text index handles go: a replica's catalog change,
+    /// or a `DropTable` here (#1588), whose name may have been an index's. The next call on
+    /// each name opens it again. A forgotten background index's rebalancer sees its index
+    /// close and ends. An open running across this keeps nothing (#1632).
+    fn handles_changed(&self) {
+        self.tables.rcu(|c| TableCache {
+            generation: c.generation + 1,
+            map: HashMap::new(),
+        });
+        self.indexes.forget();
+        self.texts.forget();
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
@@ -912,6 +931,19 @@ impl Service {
             self.memory_calls = Arc::new(Semaphore::new(calls));
         }
         self
+    }
+
+    /// The table cache's generation, for a test to run [`table`](Self::table)'s steps with a
+    /// catalog change between them (#1632).
+    #[cfg(test)]
+    pub(crate) fn table_generation(&self) -> u64 {
+        self.tables.load().generation
+    }
+
+    /// Whether the table cache holds a handle for `name`.
+    #[cfg(test)]
+    pub(crate) fn table_cached(&self, name: &str) -> bool {
+        self.tables.load().map.contains_key(name)
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -1274,8 +1306,14 @@ impl Service {
             ServiceOp::Forget(r) => {
                 let ids = super::memory::ids(&r.ids)?;
                 self.memory_write("Memory.Forget", caller, budget, move |core, scope| {
-                    let (forgotten, _missing) = core.forget(scope, &ids)?;
-                    Ok(proto::ForgetResponse { forgotten })
+                    // Serve answers the failure; the deletes before it stand.
+                    let done = core.forget(scope, &ids)?;
+                    if let Some((e, _left)) = done.failed {
+                        return Err(e.into());
+                    }
+                    Ok(proto::ForgetResponse {
+                        forgotten: done.deleted,
+                    })
                 })
                 .await
                 .map(ServiceReply::Forget)
@@ -1320,22 +1358,51 @@ impl Service {
     /// serialized with their cache updates (`schema`), so the only stale entry it can leave
     /// is a handle resolved just before a drop, for a name with no table: its errors match
     /// the catalog, and the next create replaces it.
+    ///
+    /// A replica's applied catalog changes don't take `schema`: there, an open that
+    /// [`tables_changed`](Self::tables_changed) overtook keeps nothing and opens again,
+    /// since it may have resolved the name before a drop and create (#1632).
     async fn table(&self, name: &str) -> Result<Table, ApiError> {
-        if let Some(t) = self.tables.load().get(name) {
-            return Ok(t.clone());
+        loop {
+            let generation = {
+                let cache = self.tables.load();
+                if let Some(t) = cache.map.get(name) {
+                    return Ok(t.clone());
+                }
+                cache.generation
+            };
+            reserved(name)?;
+            let db = self.db.clone();
+            let owned = name.to_owned();
+            let table = self
+                .blocking(move || db.table(&owned)?.open().map_err(ApiError::from))
+                .await?;
+            if let Some(t) = self.keep_table(name, &table, generation) {
+                return Ok(t);
+            }
         }
-        reserved(name)?;
-        let db = self.db.clone();
-        let owned = name.to_owned();
-        let table = self
-            .blocking(move || db.table(&owned)?.open().map_err(ApiError::from))
-            .await?;
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.entry(name.to_owned()).or_insert_with(|| table.clone());
-            m
+    }
+
+    /// Keeps `table` under `name` unless a handle is there already (then that one is
+    /// returned). `None`, keeping nothing, if [`tables_changed`](Self::tables_changed) came
+    /// after `generation`, the one the open started at (#1632).
+    pub(crate) fn keep_table(&self, name: &str, table: &Table, generation: u64) -> Option<Table> {
+        let mut kept = None;
+        self.tables.rcu(|c| {
+            if c.generation != generation {
+                kept = None;
+                return Arc::clone(c);
+            }
+            let mut c = TableCache::clone(c);
+            kept = Some(
+                c.map
+                    .entry(name.to_owned())
+                    .or_insert_with(|| table.clone())
+                    .clone(),
+            );
+            Arc::new(c)
         });
-        Ok(table)
+        kept
     }
 
     /// `Schema.CreateTable`: the table with its families, created, or with `if_missing`
@@ -1370,10 +1437,10 @@ impl Service {
                 })
             })
             .await?;
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.insert(r.name.clone(), table.clone());
-            m
+        self.tables.rcu(|c| {
+            let mut c = TableCache::clone(c);
+            c.map.insert(r.name.clone(), table.clone());
+            c
         });
         Ok(describe(&table))
     }
@@ -1385,14 +1452,12 @@ impl Service {
         reserved(&name)?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let owned = name.clone();
-        let dropped = self.blocking(move || Ok(db.drop_table(&owned)?)).await;
-        // Whatever the outcome, the next use resolves the name again.
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.remove(&name);
-            m
-        });
+        let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
+        // Whatever the outcome, the next use resolves every name again: the table's handle,
+        // and a vector or text index's if it was one, with its rebalancer (#1588). Every
+        // cached handle goes, not only the name's: drops are rare, and an open of the name
+        // already running keeps nothing (#1632).
+        self.handles_changed();
         dropped
     }
 

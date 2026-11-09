@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
-use pigeonhole::{ErrorCode, Pigeonhole, RetryPolicy};
+use pigeonhole::{ErrorCode, Pigeonhole, PigeonholeReader, RetryPolicy};
 use pigeonhole_memory::{
-    EmbeddingModel, Kind, LinkType, Marked, Memory as NewMemory, MemoryId, OpenOptions, RecallHit,
-    RecallStats, Remembered, Store, StoredMemory,
+    EmbeddingModel, Kind, LinkType, Marked, Memory as NewMemory, MemoryId, Normalization,
+    OpenOptions, ReadStore, RecallHit, RecallStats, Remembered, Store,
 };
 
 use crate::exit::Failure;
@@ -39,6 +39,10 @@ pub(crate) enum MemErrorKind {
     Unavailable,
     /// The embedding endpoint took longer than its timeout: nothing was applied.
     Deadline,
+    /// The embedding endpoint refused the caller's text (400, 413 or 422): the request's
+    /// fault, apart from `Invalid` so `phdb mcp` keeps answering it as bad input (the
+    /// coordinator on #1648) while serve answers `InvalidArgument`.
+    Rejected,
     /// The embedding endpoint's answer wasn't an embedding the store can take: the
     /// server's configuration (its URL, key or model), not the request.
     Internal,
@@ -142,7 +146,7 @@ impl Embedder {
                 let kind = match fault {
                     EmbedFault::Timeout => MemErrorKind::Deadline,
                     EmbedFault::Unreachable => MemErrorKind::Unavailable,
-                    EmbedFault::Rejected => MemErrorKind::Invalid,
+                    EmbedFault::Rejected => MemErrorKind::Rejected,
                     EmbedFault::BadReply => MemErrorKind::Internal,
                 };
                 MemError::of_kind(kind, f.message())
@@ -189,6 +193,52 @@ pub(crate) type Create = dyn Fn(Option<&Embedder>) -> std::result::Result<pigeon
     + Send
     + Sync;
 
+/// How a writer creates a missing store from the `--memory-*` flags, as both front-ends take
+/// them (8b): the model and its dimension (from `--embed-url`'s probe, or `--memory-model`
+/// with `--memory-dim`), its element type, the episodic TTL and the text normalisation.
+pub(crate) fn create_options(m: &crate::args::MemoryArgs, name: &str) -> Arc<Create> {
+    let (m, name) = (m.clone(), name.to_owned());
+    Arc::new(move |e: Option<&Embedder>| {
+        let mut options = pigeonhole_memory::StoreOptions::new();
+        let model = match (e, &m.memory_model, m.memory_dim) {
+            (Some(e), _, _) => {
+                // The dimension is the endpoint's: one probe embedding tells it. Its failure
+                // is the endpoint's (down, slow, or refusing), not the command line's: an
+                // input error, as `phdb mcp` always reported it (ai1249's R1 on #1648).
+                let dim = e
+                    .embed("dimension probe", EmbedKind::Passage)
+                    .map_err(|e| Failure::input(e.message))?
+                    .len();
+                Some((e.model().to_owned(), dim as u32))
+            }
+            (None, Some(id), Some(dim)) => Some((id.clone(), dim)),
+            _ => None,
+        };
+        if let Some((id, dim)) = model {
+            let element = match m.memory_element.as_str() {
+                "f16" => pigeonhole::Element::F16,
+                "bf16" => pigeonhole::Element::BF16,
+                _ => pigeonhole::Element::F32,
+            };
+            let model = EmbeddingModel::new(id, dim, element)
+                .map_err(|e| Failure::coded(e.code(), format!("memory store {name}: {e}")))?;
+            options = options.embedding(model);
+        }
+        if let Some(hours) = m.memory_episodic_ttl {
+            options =
+                options.episodic_ttl(std::time::Duration::from_secs(hours.saturating_mul(3600)));
+        }
+        if let Some(n) = &m.memory_normalization {
+            options = options.normalization(match n.as_str() {
+                "nfkc" => Normalization::Nfkc,
+                "none" => Normalization::None,
+                _ => Normalization::Nfc,
+            });
+        }
+        Ok(options)
+    })
+}
+
 /// Why [`MemCore::open_in`] failed.
 #[derive(Debug)]
 pub(crate) enum OpenError {
@@ -200,10 +250,27 @@ pub(crate) enum OpenError {
     Store(pigeonhole_memory::Error),
 }
 
+/// The store, in the database's role.
+enum Handle {
+    /// The writer's: every operation.
+    Writer { store: Store, db: Pigeonhole },
+    /// A shared-memory reader's (`phdb mcp` on a reader, 8b): recall only.
+    Reader(ReadStore),
+}
+
+/// What [`MemCore::forget`] did: the deletes before a failure stand.
+#[derive(Debug)]
+pub(crate) struct Forgot {
+    pub deleted: u64,
+    /// The ids that didn't exist.
+    pub missing: Vec<MemoryId>,
+    /// The failure that stopped it, and the ids from the one that failed on, not deleted.
+    pub failed: Option<(MemError, Vec<MemoryId>)>,
+}
+
 /// One memory store, as a server or tool set opens it.
 pub(crate) struct MemCore {
-    store: Store,
-    db: Pigeonhole,
+    handle: Handle,
     embedder: Option<Arc<Embedder>>,
     /// A recall's budget when it asks for none, and the largest it may ask for: a recall's
     /// reply is bounded (the coordinator on #1567).
@@ -267,8 +334,43 @@ impl MemCore {
             Store::create(db, name, options).map_err(OpenError::Store)?
         };
         Ok(Some(Self {
-            store,
-            db: db.clone(),
+            handle: Handle::Writer {
+                store,
+                db: db.clone(),
+            },
+            embedder,
+            default_budget: budget.0,
+            max_budget: budget.1.max(budget.0),
+        }))
+    }
+
+    /// Opens the store `name` through a shared-memory reader, for recall only (`phdb mcp` on
+    /// a reader, 8b). A missing store is `Ok(None)`: a reader can't create one. The pin is
+    /// checked as [`open_in`](Self::open_in) checks it.
+    pub(crate) fn open_reader(
+        reader: &PigeonholeReader,
+        name: &str,
+        embedder: Option<Arc<Embedder>>,
+        expected: Option<&str>,
+        budget: (u64, u64),
+    ) -> std::result::Result<Option<Self>, OpenError> {
+        if !reader.tables().iter().any(|t| *t == format!("mem_{name}")) {
+            return Ok(None);
+        }
+        let probe =
+            Store::open_reader_without_embeddings(reader, name).map_err(OpenError::Store)?;
+        let pinned = probe.embedding_model().cloned();
+        let expected = embedder.as_deref().map(Embedder::model).or(expected);
+        check_pin(name, pinned.as_ref(), expected).map_err(OpenError::Pin)?;
+        let store = match pinned {
+            Some(m) => {
+                drop(probe);
+                Store::open_reader(reader, name, m.id()).map_err(OpenError::Store)?
+            }
+            None => probe,
+        };
+        Ok(Some(Self {
+            handle: Handle::Reader(store),
             embedder,
             default_budget: budget.0,
             max_budget: budget.1.max(budget.0),
@@ -277,12 +379,40 @@ impl MemCore {
 
     /// The store's pinned model.
     pub(crate) fn model(&self) -> Option<&EmbeddingModel> {
-        self.store.embedding_model()
+        match &self.handle {
+            Handle::Writer { store, .. } => store.embedding_model(),
+            Handle::Reader(s) => s.embedding_model(),
+        }
     }
 
-    /// The store, for a watch (serve's stream reads its feed itself).
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
+    /// The store's text normalisation, fixed when it was created.
+    pub(crate) fn normalization(&self) -> Normalization {
+        match &self.handle {
+            Handle::Writer { store, .. } => store.normalization(),
+            Handle::Reader(s) => s.normalization(),
+        }
+    }
+
+    /// Whether writes can succeed: the writer's store, not a reader's.
+    pub(crate) fn writable(&self) -> bool {
+        matches!(self.handle, Handle::Writer { .. })
+    }
+
+    /// The writer's store and database, or `ReadOnly` on a reader.
+    fn writer(&self) -> Result<(&Store, &Pigeonhole)> {
+        match &self.handle {
+            Handle::Writer { store, db } => Ok((store, db)),
+            Handle::Reader(_) => Err(MemError {
+                kind: MemErrorKind::Engine(ErrorCode::ReadOnly),
+                message: "the memory store is open read-only (a reader)".into(),
+            }),
+        }
+    }
+
+    /// The store, for a watch (serve's stream reads its feed itself): the writer's.
+    #[cfg(feature = "serve")]
+    pub(crate) fn store(&self) -> Result<&Store> {
+        self.writer().map(|(s, _)| s)
     }
 
     /// The embedding a call uses: the embedder's for `text`, or the caller's (checked
@@ -343,6 +473,7 @@ impl MemCore {
         supersedes: Option<MemoryId>,
     ) -> Result<(Remembered, Option<MemError>)> {
         scope.check(&r.namespace)?;
+        let (store, db) = self.writer()?;
         if let Some(old) = &supersedes
             && old.namespace() != r.namespace
         {
@@ -390,19 +521,27 @@ impl MemCore {
         let ns = r.namespace.as_str();
         // With `supersedes`, near dedup mustn't stop the write: `remember_in` skips it.
         let done = match &supersedes {
-            Some(_) => self
-                .db
-                .transact(&RetryPolicy::default(), |txn| {
-                    self.store.remember_in(txn, ns, m.clone())
-                })
-                .map(|(r, _)| r),
-            None => self.store.remember(ns, m),
+            Some(_) => {
+                let r = db
+                    .transact(&RetryPolicy::default(), |txn| {
+                        store.remember_in(txn, ns, m.clone())
+                    })
+                    .map(|(r, _)| r);
+                // A write through `remember_in` parks an IVF store's records until a settle
+                // (ICR 0123): settle once it commits, as `remember` does itself (ai1249's N2
+                // on #1617). A transaction that failed parked nothing (their N1 on 8b).
+                if r.is_ok() {
+                    store.settle();
+                }
+                r
+            }
+            None => store.remember(ns, m),
         }
         .map_err(|e| MemError::store_error("remember", &e))?;
         let mut supersede_error = None;
         if let Some(old) = supersedes
             && old != *done.id()
-            && let Err(e) = self.store.supersede(&old, done.id())
+            && let Err(e) = store.supersede(&old, done.id())
         {
             supersede_error = Some(MemError::store_error("supersede", &e));
         }
@@ -441,9 +580,11 @@ impl MemCore {
             return Err(MemError::invalid("a recall needs text or an embedding"));
         }
         let ns: Vec<&str> = a.namespaces.iter().map(String::as_str).collect();
-        let mut r = self
-            .store
-            .recall(&ns)
+        let r = match &self.handle {
+            Handle::Writer { store, .. } => store.recall(&ns),
+            Handle::Reader(s) => s.recall(&ns),
+        };
+        let mut r = r
             .k(a.k)
             .byte_budget(budget)
             .include_superseded(a.include_superseded)
@@ -469,7 +610,8 @@ impl MemCore {
     /// Marks memories used: their ids' namespaces must be the caller's.
     pub(crate) fn mark_used(&self, scope: Scope<'_>, ids: &[MemoryId]) -> Result<Marked> {
         ids.iter().try_for_each(|id| scope.check_id(id))?;
-        self.store
+        self.writer()?
+            .0
             .mark_used(ids)
             .map_err(|e| MemError::store_error("mark_used", &e))
     }
@@ -478,7 +620,8 @@ impl MemCore {
     pub(crate) fn supersede(&self, scope: Scope<'_>, old: &MemoryId, new: &MemoryId) -> Result<()> {
         scope.check_id(old)?;
         scope.check_id(new)?;
-        self.store
+        self.writer()?
+            .0
             .supersede(old, new)
             .map_err(|e| MemError::store_error("supersede", &e))
     }
@@ -499,40 +642,45 @@ impl MemCore {
                 "a supersedes link: use Supersede, which keeps recall in step",
             ));
         }
-        self.store
+        self.writer()?
+            .0
             .link(from, to, ty, weight)
             .map_err(|e| MemError::store_error("link", &e))
     }
 
     /// Deletes memories now: all their namespaces are checked before any is deleted. Stops at
-    /// the first failure, the deletes before it standing; returns how many were deleted and
-    /// the ids that didn't exist.
-    pub(crate) fn forget(
-        &self,
-        scope: Scope<'_>,
-        ids: &[MemoryId],
-    ) -> Result<(u64, Vec<MemoryId>)> {
+    /// the first failure, the deletes before it standing: [`Forgot`] says what was deleted,
+    /// what didn't exist, and the failure with the ids left (`phdb mcp` reports them all,
+    /// simp724's S2 on #1389; serve answers the failure).
+    pub(crate) fn forget(&self, scope: Scope<'_>, ids: &[MemoryId]) -> Result<Forgot> {
         ids.iter().try_for_each(|id| scope.check_id(id))?;
-        let mut deleted = 0;
-        let mut missing = Vec::new();
-        for id in ids {
-            match self.store.delete(id) {
-                Ok(true) => deleted += 1,
-                Ok(false) => missing.push(id.clone()),
+        let (store, _) = self.writer()?;
+        let mut done = Forgot {
+            deleted: 0,
+            missing: Vec::new(),
+            failed: None,
+        };
+        for (i, id) in ids.iter().enumerate() {
+            match store.delete(id) {
+                Ok(true) => done.deleted += 1,
+                Ok(false) => done.missing.push(id.clone()),
                 Err(e) => {
-                    return Err(MemError::store_error(
-                        &format!("forget (after {deleted} deleted)"),
+                    let e = MemError::store_error(
+                        &format!("forget (after {} deleted)", done.deleted),
                         &e,
-                    ));
+                    );
+                    done.failed = Some((e, ids[i..].to_vec()));
+                    break;
                 }
             }
         }
-        Ok((deleted, missing))
+        Ok(done)
     }
 
     /// A memory, for a watch's event.
-    pub(crate) fn get(&self, id: &MemoryId) -> Result<Option<StoredMemory>> {
-        self.store
+    #[cfg(feature = "serve")]
+    pub(crate) fn get(&self, id: &MemoryId) -> Result<Option<pigeonhole_memory::StoredMemory>> {
+        self.store()?
             .get(id)
             .map_err(|e| MemError::store_error("get", &e))
     }
@@ -554,5 +702,65 @@ fn check_pin(
             "memory store {name} has no embedding model, so it can't take {id:?}'s embeddings"
         ))),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pigeonhole::{Element, Options, Pigeonhole};
+    use pigeonhole_memory::{EmbeddingModel, IvfOptions, Store, StoreOptions};
+
+    use super::{Handle, MemCore, Remember, Scope};
+
+    const DIM: usize = 4;
+
+    fn remember(text: &str, seed: f32) -> Remember {
+        Remember {
+            namespace: "ns".into(),
+            text: text.into(),
+            embedding: Some((0..DIM).map(|i| seed + i as f32).collect()),
+            kind: None,
+            importance: None,
+            source: None,
+            session: None,
+            pinned: false,
+            links: Vec::new(),
+        }
+    }
+
+    /// ai1249's N2 on #1617, for 8b: a remember with `supersedes` writes through
+    /// `remember_in` in a transaction of its own, which parks an IVF store's records until a
+    /// settle (ICR 0123). The core settles after it commits, so nothing is left waiting.
+    #[test]
+    fn a_remember_that_supersedes_settles_an_ivf_store() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("m.phdb"), Options::default().shards(1)).unwrap();
+        let model = EmbeddingModel::new("test-model", DIM as u32, Element::F32).unwrap();
+        let ivf = IvfOptions::new().min_namespace_len(1).target_list_len(4);
+        drop(Store::create(&db, "m", StoreOptions::new().embedding(model).ivf(ivf)).unwrap());
+        let core = MemCore::open_in(&db, "m", None, Some("test-model"), None, (1 << 20, 8 << 20))
+            .unwrap()
+            .unwrap();
+        let mut last = None;
+        for i in 0..20 {
+            let (done, _) = core
+                .remember(Scope(None), remember(&format!("fact {i}"), i as f32), None)
+                .unwrap();
+            last = Some(done.id().clone());
+        }
+        let (_, supersede_error) = core
+            .remember(Scope(None), remember("the fact, corrected", 100.0), last)
+            .unwrap();
+        assert!(supersede_error.is_none(), "{supersede_error:?}");
+        let Handle::Writer { store, .. } = &core.handle else {
+            unreachable!("opened as the writer")
+        };
+        assert_eq!(
+            pigeonhole_memory::hooks::ivf_pending(store),
+            0,
+            "the supersede's write is settled"
+        );
+        drop(core);
+        db.close().unwrap();
     }
 }
