@@ -30,6 +30,7 @@ mod http;
 mod indexes;
 mod listener;
 mod memory;
+mod memslot;
 mod placement;
 mod replica;
 mod router;
@@ -120,14 +121,6 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
     let Some(primary) = &args.replica_of else {
         return Ok(None);
     };
-    // A replica can't create the store, and a re-bootstrap would swap the engine under it:
-    // refused before the database opens, until #1618.
-    if let Some(name) = &args.memory.memory {
-        return Err(Failure::usage(&format!(
-            "--memory {name} can't be used with --replica-of yet: a replica doesn't serve a \
-             memory store (#1618). Serve it from the primary"
-        )));
-    }
     if !(primary.starts_with("http://") || primary.starts_with("https://")) {
         return Err(Failure::usage(
             "--replica-of is the primary's URL: http://HOST:PORT or https://HOST:PORT",
@@ -150,14 +143,21 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
     })))
 }
 
-/// The memory store `--memory` names (D313 ticket 8a): opened, or created, as `phdb mcp`
-/// would, with the embedder `--embed-url` gives under `--embed-timeout-ms`.
+/// The memory store `--memory` names (D313 ticket 8a), with the embedder `--embed-url`
+/// gives under `--embed-timeout-ms`, in the slot the service serves it from (#1618).
+///
+/// A primary opens it now, creating it if missing, as `phdb mcp` would, so a bad pin fails
+/// the start. A replica (`writer` false) never creates it: it opens it now only if its copy
+/// already has it (so a pin mismatch fails the start too, cli692's D3), and otherwise when a
+/// call first needs it. The `--memory-*` creation options are then used only if it's
+/// promoted without the store.
 fn memory(
     args: &ServeArgs,
     db: &pigeonhole::Pigeonhole,
+    writer: bool,
     stderr: &mut dyn std::io::Write,
-) -> Result<Option<crate::memcore::MemCore>, Failure> {
-    use crate::memcore::{EmbedKind, Embedder, MemCore};
+) -> Result<Option<memslot::MemSlot>, Failure> {
+    use crate::memcore::{EmbedKind, Embedder};
     let m = &args.memory;
     let Some(name) = &m.memory else {
         return Ok(None);
@@ -171,7 +171,8 @@ fn memory(
         )?)),
         None => None,
     };
-    let create = |e: Option<&Embedder>| {
+    let (m, name) = (m.clone(), name.clone());
+    let create: Arc<crate::memcore::Create> = Arc::new(move |e: Option<&Embedder>| {
         let mut options = pigeonhole_memory::StoreOptions::new();
         let model = match (e, &m.memory_model, m.memory_dim) {
             (Some(e), _, _) => {
@@ -205,19 +206,23 @@ fn memory(
                 _ => pigeonhole_memory::Normalization::Nfc,
             });
         }
-        let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
         Ok(options)
-    };
+    });
+    let name = args.memory.memory.as_deref().unwrap_or_default();
     // A recall's byte budget: 1 MiB when it sets none, 8 MiB at most, as pages are.
-    let core = MemCore::open(
+    let (slot, created) = memslot::MemSlot::start(
         db,
         name,
         embedder,
-        m.memory_model.as_deref(),
+        args.memory.memory_model.as_deref(),
         create,
         (1 << 20, 8 << 20),
+        writer,
     )?;
-    Ok(Some(core))
+    if created {
+        let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
+    }
+    Ok(Some(slot))
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
@@ -327,7 +332,10 @@ pub(crate) fn run(
     .map_err(|e| Failure::usage(&e))?
     // Before `replica`: it rebuilds the indexes, whose rebalancing a replica pauses.
     .placement(&placement)
-    .memory_opt(memory(args, &db, stderr)?, args.memory_calls.unwrap_or(0));
+    .memory_opt(
+        memory(args, &db, replica.is_none(), stderr)?,
+        args.memory_calls.unwrap_or(0),
+    );
     if let Some(r) = &replica {
         service = service.replica(Arc::clone(r));
     }
