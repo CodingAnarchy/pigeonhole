@@ -214,7 +214,11 @@ impl Server {
         for (name, value) in headers {
             req = req.header(*name, *value);
         }
-        let mut resp = req.send_json(body).unwrap();
+        // Names the call: a test makes several, and a transport error says nothing of which
+        // (#1601, a Windows ConnectionAborted).
+        let mut resp = req
+            .send_json(body)
+            .unwrap_or_else(|e| panic!("POST /v1/{path}: {e:?}"));
         let status = resp.status().as_u16();
         let body: Json = resp.body_mut().read_json().unwrap_or(Json::Null);
         (status, body)
