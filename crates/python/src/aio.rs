@@ -17,6 +17,13 @@
 //!   `catch_unwind` (R3, R4). Then it takes the GIL once for the whole drain, converts every
 //!   result, and hands each event loop its batch through one `call_soon_threadsafe` (B2: a
 //!   future completes on the loop it was created on).
+//! - **The poll pool** (`pigeonhole-asyncio-poll-N`, 2 to 8 threads, started on the first
+//!   call that uses it): the same loop on a second queue, each thread taking one task at a
+//!   time, for futures whose polls are CPU work. `start_on_bridge` starts them there without
+//!   the call's inline poll (a memory recall, ai1249's B1 on #1560), so they hold up neither
+//!   the event loop nor the bridge thread that commits complete on. A task stays on the queue
+//!   it started on; a task woken during a poll may be picked up by a second thread, which
+//!   waits on its lock and polls it again, or finds it done.
 //! - **Cancellation:** the asyncio future's done callback, on the loop thread, marks a
 //!   cancelled task and drops its Rust future at once if no poll holds it, else wakes the
 //!   bridge to drop it (C2). A commit waiting for admission (D210) thus never holds its
@@ -33,7 +40,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -76,34 +83,75 @@ struct Bridge {
     pid: u32,
     queue: Mutex<VecDeque<Arc<Task>>>,
     ready: Condvar,
-    /// Set while the bridge waits on `ready`, under `queue`'s lock: a waker signals only then.
-    idle: AtomicBool,
+    /// How many of the bridge's threads wait on `ready`, changed under `queue`'s lock: a
+    /// waker signals only when one does.
+    idle: AtomicUsize,
+    /// Tasks a thread takes per drain: all of them for the bridge (one thread), one for the
+    /// poll pool, so its threads share the work.
+    take: usize,
 }
 
 static BRIDGE: Mutex<Option<Arc<Bridge>>> = Mutex::new(None);
+static POOL: Mutex<Option<Arc<Bridge>>> = Mutex::new(None);
 
 thread_local! {
     /// This thread's handle on the bridge, so a loop's parked awaits don't take `BRIDGE`'s
     /// lock (perf2's F3). Checked against the pid: a forked child starts its own.
     static LOCAL: std::cell::RefCell<Option<Arc<Bridge>>> = const { std::cell::RefCell::new(None) };
+    /// The same for the poll pool.
+    static LOCAL_POOL: std::cell::RefCell<Option<Arc<Bridge>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The process's bridge, started on the first parked await (and again in a forked child).
 fn bridge() -> Arc<Bridge> {
+    cached(&LOCAL, || {
+        shared(&BRIDGE, 1, usize::MAX, "pigeonhole-asyncio")
+    })
+}
+
+/// The poll pool (ai1249's B1 on #1560): a bridge of [`pool_threads`] threads, each taking
+/// one task at a time, for the futures [`start_on_bridge`] starts, whose polls are CPU work
+/// (a memory recall). On the one bridge thread, 16 concurrent recalls ran at a fifth of
+/// `to_thread`'s rate and held commits' completions up behind them. Commits, gets and feed
+/// waits stay on the bridge.
+fn pool() -> Arc<Bridge> {
+    cached(&LOCAL_POOL, || {
+        shared(&POOL, pool_threads(), 1, "pigeonhole-asyncio-poll")
+    })
+}
+
+/// The pool's threads: the machine's parallelism, from 2 to 8.
+fn pool_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, 8)
+}
+
+fn cached(
+    local: &'static std::thread::LocalKey<std::cell::RefCell<Option<Arc<Bridge>>>>,
+    start: impl FnOnce() -> Arc<Bridge>,
+) -> Arc<Bridge> {
     let pid = std::process::id();
-    LOCAL.with(|l| {
+    local.with(|l| {
         let mut l = l.borrow_mut();
         if let Some(b) = l.as_ref().filter(|b| b.pid == pid) {
             return Arc::clone(b);
         }
-        let b = shared_bridge();
+        let b = start();
         *l = Some(Arc::clone(&b));
         b
     })
 }
 
-fn shared_bridge() -> Arc<Bridge> {
-    let mut b = BRIDGE
+/// `slot`'s bridge for this process, started with `threads` threads named `name` if there's
+/// none yet (or only a forked parent's).
+fn shared(
+    slot: &Mutex<Option<Arc<Bridge>>>,
+    threads: usize,
+    take: usize,
+    name: &str,
+) -> Arc<Bridge> {
+    let mut b = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(b) = b.as_ref().filter(|b| b.pid == std::process::id()) {
@@ -113,13 +161,21 @@ fn shared_bridge() -> Arc<Bridge> {
         pid: std::process::id(),
         queue: Mutex::new(VecDeque::new()),
         ready: Condvar::new(),
-        idle: AtomicBool::new(false),
+        idle: AtomicUsize::new(0),
+        take,
     });
-    let run = Arc::clone(&new);
-    std::thread::Builder::new()
-        .name("pigeonhole-asyncio".into())
-        .spawn(move || run.run())
-        .expect("spawn the asyncio bridge thread");
+    for i in 0..threads {
+        let run = Arc::clone(&new);
+        let name = if threads == 1 {
+            name.to_owned()
+        } else {
+            format!("{name}-{i}")
+        };
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || run.run())
+            .expect("spawn an asyncio bridge thread");
+    }
     *b = Some(Arc::clone(&new));
     new
 }
@@ -133,11 +189,19 @@ impl Bridge {
             {
                 let mut q = self.queue.lock().expect("not poisoned");
                 while q.is_empty() {
-                    self.idle.store(true, Ordering::SeqCst);
+                    self.idle.fetch_add(1, Ordering::SeqCst);
                     q = self.ready.wait(q).expect("not poisoned");
-                    self.idle.store(false, Ordering::SeqCst);
+                    self.idle.fetch_sub(1, Ordering::SeqCst);
                 }
-                std::mem::swap(&mut *q, &mut batch);
+                if self.take >= q.len() {
+                    std::mem::swap(&mut *q, &mut batch);
+                } else {
+                    batch.extend(q.drain(..self.take));
+                    if self.idle.load(Ordering::SeqCst) > 0 {
+                        // More than this thread takes: another waiting thread takes some.
+                        self.ready.notify_one();
+                    }
+                }
             }
             let done: Vec<(Arc<Task>, Result<Output, String>)> = batch
                 .drain(..)
@@ -188,7 +252,7 @@ impl Wake for Task {
             .lock()
             .expect("not poisoned")
             .push_back(Arc::clone(self));
-        if b.idle.load(Ordering::SeqCst) {
+        if b.idle.load(Ordering::SeqCst) > 0 {
             b.ready.notify_one();
         }
     }
@@ -446,6 +510,38 @@ where
             Ok(())
         }
     }
+}
+
+/// [`start`] without its inline first poll (ai1249's B1 on #1560): the future is built here
+/// and polled first on the bridge thread, so a call whose polls are mostly CPU work (a
+/// memory recall) never runs that work on the loop thread, and the call returns at once.
+/// Commits keep `start`'s inline poll, which submits them at the call (D210's ordering).
+pub(crate) fn start_on_bridge<'py, M, F>(
+    py: Python<'py>,
+    event_loop: &Bound<'py, PyAny>,
+    fut: &Bound<'py, PyAny>,
+    make: M,
+) -> PyResult<()>
+where
+    M: FnOnce() -> F + Send,
+    F: Future<Output = Output> + Send + 'static,
+{
+    let made = py.detach(|| catch_unwind(AssertUnwindSafe(|| -> BoxFuture { Box::pin(make()) })));
+    let f = match made {
+        Ok(f) => f,
+        Err(panic) => return complete_now(py, fut, entry(py, Err(panic_message(&panic)))),
+    };
+    let task = Arc::new(Task {
+        fut: Mutex::new(Some(f)),
+        queued: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        py: Mutex::new(Some((fut.clone().unbind(), event_loop.clone().unbind()))),
+        bridge: std::sync::OnceLock::new(),
+    });
+    let _ = task.bridge.set(pool());
+    task.wake_by_ref();
+    fut.call_method1("add_done_callback", (CancelHook(task),))?;
+    Ok(())
 }
 
 /// Sets `fut` on the loop thread (a future ready at its first poll, or a value known at

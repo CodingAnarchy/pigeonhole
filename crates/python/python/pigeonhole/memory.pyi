@@ -553,6 +553,49 @@ class Store:
         with_embeddings: bool = False,
         expand: Expand | None = None,
     ) -> tuple[list[RecallHit], RecallStats]: ...
+    def recall_async(
+        self,
+        namespaces: Namespaces,
+        *,
+        text: str | None = None,
+        embedding: Sequence[float] | None = None,
+        k: int | None = None,
+        candidates: int | None = None,
+        byte_budget: int | None = None,
+        snapshot: Snapshot | None = None,
+        now_us: int | None = None,
+        half_life: Seconds | None = None,
+        fusion: Literal["rrf", "linear"] = "rrf",
+        weights: Weights | None = None,
+        include_superseded: bool = False,
+        session: str | None = None,
+        with_signals: bool = False,
+        with_embeddings: bool = False,
+        expand: Expand | None = None,
+    ) -> asyncio.Future[list[RecallHit]]:
+        """`recall(...)` as an asyncio future: the same hits, with the recall's reads
+        asynchronous, started on the bridge thread so its work stays off the event loop."""
+    def recall_with_stats_async(
+        self,
+        namespaces: Namespaces,
+        *,
+        text: str | None = None,
+        embedding: Sequence[float] | None = None,
+        k: int | None = None,
+        candidates: int | None = None,
+        byte_budget: int | None = None,
+        snapshot: Snapshot | None = None,
+        now_us: int | None = None,
+        half_life: Seconds | None = None,
+        fusion: Literal["rrf", "linear"] = "rrf",
+        weights: Weights | None = None,
+        include_superseded: bool = False,
+        session: str | None = None,
+        with_signals: bool = False,
+        with_embeddings: bool = False,
+        expand: Expand | None = None,
+    ) -> asyncio.Future[tuple[list[RecallHit], RecallStats]]:
+        """`recall_with_stats(...)` as an asyncio future."""
     def forget(
         self,
         *,
@@ -646,6 +689,49 @@ class ReadStore:
         with_embeddings: bool = False,
         expand: Expand | None = None,
     ) -> tuple[list[RecallHit], RecallStats]: ...
+    def recall_async(
+        self,
+        namespaces: Namespaces,
+        *,
+        text: str | None = None,
+        embedding: Sequence[float] | None = None,
+        k: int | None = None,
+        candidates: int | None = None,
+        byte_budget: int | None = None,
+        snapshot: Snapshot | None = None,
+        now_us: int | None = None,
+        half_life: Seconds | None = None,
+        fusion: Literal["rrf", "linear"] = "rrf",
+        weights: Weights | None = None,
+        include_superseded: bool = False,
+        session: str | None = None,
+        with_signals: bool = False,
+        with_embeddings: bool = False,
+        expand: Expand | None = None,
+    ) -> asyncio.Future[list[RecallHit]]:
+        """`recall(...)` as an asyncio future: the same hits, with the recall's reads
+        asynchronous, started on the bridge thread so its work stays off the event loop."""
+    def recall_with_stats_async(
+        self,
+        namespaces: Namespaces,
+        *,
+        text: str | None = None,
+        embedding: Sequence[float] | None = None,
+        k: int | None = None,
+        candidates: int | None = None,
+        byte_budget: int | None = None,
+        snapshot: Snapshot | None = None,
+        now_us: int | None = None,
+        half_life: Seconds | None = None,
+        fusion: Literal["rrf", "linear"] = "rrf",
+        weights: Weights | None = None,
+        include_superseded: bool = False,
+        session: str | None = None,
+        with_signals: bool = False,
+        with_embeddings: bool = False,
+        expand: Expand | None = None,
+    ) -> asyncio.Future[tuple[list[RecallHit], RecallStats]]:
+        """`recall_with_stats(...)` as an asyncio future."""
 
 @final
 class MemoryEvent:
