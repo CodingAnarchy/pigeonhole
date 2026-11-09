@@ -8,6 +8,7 @@
 
 use super::auth::Caller;
 use super::errors::ApiError;
+use super::replica::ReadDeadline;
 use super::service::{Service, ServiceOp, ServiceReply};
 
 /// The partition map and the peers, once D317 lands.
@@ -40,5 +41,23 @@ impl Router {
             match *cluster {}
         }
         self.service.call(op, caller, prepaid).await
+    }
+
+    /// [`dispatch`](Self::dispatch) once a replica has applied the client's
+    /// `x-pigeonhole-min-primary-seqno` (#1577), `min_primary_seqno` being the header as
+    /// parsed. Every front-end's calls that may carry it come here, so they can't drift
+    /// apart (cli692's N1 on #1594).
+    pub(crate) async fn dispatch_after_primary(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        min_primary_seqno: Result<Option<u64>, ApiError>,
+        deadline: ReadDeadline,
+    ) -> Result<ServiceReply, ApiError> {
+        self.service
+            .await_primary(&op, min_primary_seqno?, deadline)
+            .await?;
+        self.dispatch(op, caller, prepaid).await
     }
 }
