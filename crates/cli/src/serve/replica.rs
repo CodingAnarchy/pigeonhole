@@ -971,13 +971,16 @@ impl Replica {
                     }
                 }
             };
-            cause.get_or_insert_with(|| broke.clone());
             // Three breaks in a row without progress give up; progress starts the count again
-            // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
+            // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted. It
+            // starts the kept cause again too: an old blip isn't a later failure's reason
+            // (cli692's N5 on #1628).
             if offset > at_last_break {
                 tries = 0;
                 at_last_break = offset;
+                cause = None;
             }
+            cause.get_or_insert_with(|| broke.clone());
             tries += 1;
             if backup_id.is_empty() || tries > 3 {
                 let why = cause.unwrap_or(broke);
