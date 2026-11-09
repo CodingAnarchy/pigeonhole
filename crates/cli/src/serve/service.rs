@@ -862,9 +862,13 @@ impl Service {
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
-    /// cache, the feed hubs and the sessions are of the old engine, and go.
+    /// cache, the feed hubs, the memory store's watches and the sessions are of the old
+    /// engine, and go.
     pub(crate) fn engine_replaced(&self) {
         self.tables_changed();
+        if let Some(memory) = &self.memory {
+            memory.replaced();
+        }
         self.feeds.fail_all();
         self.sessions.drop_idle();
     }
@@ -2381,7 +2385,10 @@ impl Service {
         r: proto::MemoryWatchRequest,
         caller: &Caller,
     ) -> Result<super::memory::MemoryEvents, ApiError> {
+        // Before the store: a swap from here on ends the watch.
+        let swaps = self.memory.as_ref().map(|m| m.swaps());
         let core = self.memory_core().await?;
+        let swaps = swaps.expect("memory_core answers Unsupported without a store");
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -2394,6 +2401,7 @@ impl Service {
             slot,
             Arc::clone(&self.blocking),
             self.limits.stream_idle,
+            swaps,
         )
     }
 

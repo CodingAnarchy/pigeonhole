@@ -9,7 +9,7 @@ fn memory_server(tokens: &str) -> Server {
 
 fn memory_server_with(tokens: &str, l: Limits) -> Server {
     Server::start_custom(tokens, l, 1, |svc| {
-        let (slot, _) = super::memslot::MemSlot::start(
+        let (slot, _) = crate::serve::memslot::MemSlot::start(
             &svc.db,
             "m",
             None,
@@ -404,7 +404,7 @@ fn embedding_memory_server(url: &str) -> Server {
     Server::start_custom("", limits(), 1, move |svc| {
         let endpoint =
             crate::mcp::Endpoint::new(&url, "stub", None, Duration::from_millis(300)).unwrap();
-        let (slot, _) = super::memslot::MemSlot::start(
+        let (slot, _) = crate::serve::memslot::MemSlot::start(
             &svc.db,
             "m",
             Some(crate::memcore::Embedder::Remote(endpoint)),
@@ -503,4 +503,252 @@ fn memory_calls_without_a_store_are_unsupported() {
     let s = Server::start("", limits());
     let (_, e) = remember(&s, "a", "x", None);
     assert_eq!(e["code"].as_str(), Some("Unsupported"), "{e}");
+}
+
+// ---- Memory on a replica (#1618) ----
+
+fn no_model() -> Arc<crate::memcore::Create> {
+    Arc::new(|_| Ok(pigeonhole_memory::StoreOptions::new()))
+}
+
+/// A replica of `p` serving the store `m`: opened at its start if its copy has it, else when
+/// it arrives. Its own change feed is on, for `Watch`.
+fn memory_replica(p: &Server) -> Server {
+    let options = Options::default().change_feed(pigeonhole::FeedRetention::bytes(64 << 20));
+    Server::start_replica_custom(test_dir(), &p.url, None, limits(), options, |svc| {
+        let (slot, created) = crate::serve::memslot::MemSlot::start(
+            &svc.db,
+            "m",
+            None,
+            None,
+            no_model(),
+            (1 << 20, 8 << 20),
+            false,
+        )
+        .unwrap();
+        assert!(!created, "a replica never creates the store");
+        svc.memory_opt(Some(slot), 0)
+    })
+}
+
+/// Recalls `text` in namespace `a`, with more request headers.
+fn recall_with(s: &Server, text: &str, headers: &[(&str, &str)]) -> (u16, Json) {
+    s.rpc_with(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": text, "k": 5}),
+        None,
+        headers,
+    )
+}
+
+/// The recalled memories' texts.
+fn hit_texts(r: &Json) -> Vec<String> {
+    let mut texts: Vec<String> = r["hits"]
+        .as_array()
+        .map(|h| {
+            h.iter()
+                .map(|h| h["text"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    texts.sort();
+    texts
+}
+
+fn memory_client(s: &Server) -> proto::memory_client::MemoryClient<tonic::transport::Channel> {
+    s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::memory_client::MemoryClient::new(channel)
+    })
+}
+
+/// The next memory a watch streams (progress skipped), or its error or end.
+fn next_memory(
+    s: &Server,
+    stream: &mut tonic::Streaming<proto::MemoryEvent>,
+    within: Duration,
+) -> Result<Option<String>, tonic::Status> {
+    s.block_on(async {
+        tokio::time::timeout(within, async {
+            loop {
+                match stream.message().await? {
+                    Some(proto::MemoryEvent {
+                        event: Some(proto::memory_event::Event::Memory(m)),
+                        ..
+                    }) => return Ok(Some(m.text)),
+                    Some(_) => {}
+                    None => return Ok(None),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no memory event within {within:?}"))
+    })
+}
+
+/// A replica serves its store's `Recall` and `Watch` from what it applied, refuses its
+/// writes naming the primary, and a catalog change (which reopens the store) doesn't end an
+/// open `Watch` (cli692's 7 and D2).
+#[test]
+fn a_replica_serves_its_memory_store_and_refuses_its_writes() {
+    let p = memory_server("");
+    assert_eq!(
+        remember(&p, "a", "the deploy key rotates on Fridays", None).0,
+        200
+    );
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    let r = memory_replica(&p);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let (status, hits) = recall_with(&r, "deploy key", &[]);
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hit_texts(&hits), ["the deploy key rotates on Fridays"]);
+
+    let (status, body) = remember(&r, "a", "not here", None);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("ReadOnly")),
+        "{body}"
+    );
+    assert!(body["message"].as_str().unwrap().contains(&p.url), "{body}");
+
+    // A watch on the replica, across a catalog change the replica applies.
+    let mut client = memory_client(&r);
+    let mut stream = r
+        .block_on(client.watch(proto::MemoryWatchRequest {
+            namespaces: vec!["a".into()],
+            resume: Default::default(),
+        }))
+        .unwrap()
+        .into_inner();
+    let (status, body) = p.rpc(
+        "Schema/CreateTable",
+        &json!({"name": "u", "families": [{"name": "f"}]}),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        remember(&p, "a", "the deploy key is in the vault", None).0,
+        200
+    );
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    assert_eq!(
+        next_memory(&r, &mut stream, Duration::from_secs(10)).unwrap(),
+        Some("the deploy key is in the vault".to_owned()),
+        "the watch goes on across the catalog change"
+    );
+    wait_replica(&r, "caught up again", caught_up(&p, None));
+    let (status, hits) = recall_with(&r, "deploy key", &[]);
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(
+        hit_texts(&hits),
+        [
+            "the deploy key is in the vault",
+            "the deploy key rotates on Fridays"
+        ]
+    );
+}
+
+/// A replica whose primary hasn't made the store answers `Unavailable` (and keeps that
+/// answer); once the primary makes it, a read carrying the seqno of the write that made it
+/// recalls it, never the kept answer (cli692's D2, D4 and D5).
+#[test]
+fn a_replica_recalls_a_store_made_after_its_start_from_the_write_s_seqno() {
+    // The primary creates the store at its first memory call, not at its start.
+    let p = Server::start_custom("", limits(), 1, |svc| {
+        let slot = crate::serve::memslot::MemSlot::new(
+            &svc.db,
+            "m",
+            None,
+            None,
+            no_model(),
+            (1 << 20, 8 << 20),
+            true,
+        );
+        svc.memory_opt(Some(slot), 0)
+    });
+    let r = memory_replica(&p);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    for _ in 0..2 {
+        let (status, body) = recall_with(&r, "anything", &[]);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (503, Some("Unavailable")),
+            "{body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("isn't on this replica"),
+            "{body}"
+        );
+    }
+
+    assert_eq!(remember(&p, "a", "made on the primary", None).0, 200);
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+    let seqno = p.shared.router.service.db.visible_seqno().to_string();
+    let header = [(super::replica::MIN_PRIMARY_SEQNO, seqno.as_str())];
+    let (status, hits) = recall_with(&r, "primary", &header);
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hit_texts(&hits), ["made on the primary"]);
+}
+
+/// A swap of the database (a re-bootstrap's) reopens the store from the new copy, and a
+/// watch of the old copy's store ends rather than going on over the new one.
+#[test]
+fn a_swap_reopens_the_memory_store_from_the_new_copy_and_ends_its_watches() {
+    let s = memory_server("");
+    let other = memory_server("");
+    assert_eq!(remember(&other, "a", "theirs", None).0, 200);
+    let side = s.dir.join("side.phdb");
+    {
+        let theirs = &other.shared.router.service.db;
+        let snap = theirs.durable_snapshot().unwrap();
+        theirs.backup_at(&snap, &side).unwrap();
+    }
+    let mut client = memory_client(&s);
+    let mut stream = s
+        .block_on(client.watch(proto::MemoryWatchRequest {
+            namespaces: vec!["a".into()],
+            resume: Default::default(),
+        }))
+        .unwrap()
+        .into_inner();
+    assert_eq!(remember(&s, "a", "ours", None).0, 200);
+    let (_, hits) = recall_with(&s, "ours theirs", &[]);
+    assert_eq!(hit_texts(&hits), ["ours"]);
+    assert_eq!(
+        next_memory(&s, &mut stream, Duration::from_secs(5)).unwrap(),
+        Some("ours".to_owned())
+    );
+
+    s.shared.router.service.db.replace_with(&side).unwrap();
+    s.shared.router.service.engine_replaced();
+
+    let (status, hits) = recall_with(&s, "ours theirs", &[]);
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hit_texts(&hits), ["theirs"], "the new copy's store");
+    assert_eq!(remember(&s, "a", "after the swap", None).0, 200);
+    // The old copy's watch ends, with FeedExpired (its token is of the old copy).
+    match next_memory(&s, &mut stream, Duration::from_secs(10)) {
+        Err(e) => assert_eq!(e.code(), tonic::Code::OutOfRange, "{e:?}"),
+        other => panic!("the old copy's watch went on: {other:?}"),
+    }
+    // A new watch is of the new copy.
+    let mut stream = s
+        .block_on(client.watch(proto::MemoryWatchRequest {
+            namespaces: vec!["a".into()],
+            resume: Default::default(),
+        }))
+        .unwrap()
+        .into_inner();
+    assert_eq!(remember(&s, "a", "watched anew", None).0, 200);
+    assert_eq!(
+        next_memory(&s, &mut stream, Duration::from_secs(5)).unwrap(),
+        Some("watched anew".to_owned())
+    );
 }

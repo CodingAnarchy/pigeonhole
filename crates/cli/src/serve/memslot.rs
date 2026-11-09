@@ -58,6 +58,13 @@ pub(crate) struct MemSlot {
     budget: (u64, u64),
     state: Mutex<State>,
     opened: Condvar,
+    /// How many times the database was swapped under the slot: a watch of the store ends
+    /// when it changes.
+    swaps: tokio::sync::watch::Sender<u64>,
+    /// Runs once after an open, before its result is installed: a hold seam, where a test
+    /// lands a catalog change and a clear during an open (D1).
+    #[cfg(test)]
+    after_open: Mutex<Option<Box<dyn FnOnce(&MemSlot) + Send>>>,
 }
 
 impl MemSlot {
@@ -86,6 +93,9 @@ impl MemSlot {
                 entry: None,
             }),
             opened: Condvar::new(),
+            swaps: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            after_open: Mutex::new(None),
         }
     }
 
@@ -161,6 +171,10 @@ impl MemSlot {
             let (generation, writer) = (state.generation, state.writer);
             drop(state);
             let opened = self.open(writer);
+            #[cfg(test)]
+            if let Some(hold) = self.after_open.lock().unwrap().take() {
+                hold(self);
+            }
             state = self.state();
             state.opening = false;
             self.opened.notify_all();
@@ -209,11 +223,141 @@ impl MemSlot {
         state.entry = None;
     }
 
+    /// The swaps a watch of the store must end at. Take it before the store the watch reads:
+    /// a swap after it ends the watch, and a swap before it has cleared the slot already.
+    pub(crate) fn swaps(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.swaps.subscribe()
+    }
+
+    /// The database was swapped under the slot (a replica's re-bootstrap): what it holds goes,
+    /// and then every watch of the old copy's store ends.
+    pub(crate) fn replaced(&self) {
+        self.clear();
+        self.swaps.send_modify(|n| *n += 1);
+    }
+
     /// The server was promoted: from now on the slot opens as the writer.
     pub(crate) fn promote(&self) {
         let mut state = self.state();
         state.writer = true;
         state.generation += 1;
         state.entry = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use pigeonhole::{Options, Pigeonhole};
+
+    use super::{Entry, MemSlot};
+    use crate::memcore::{Create, MemCore};
+
+    /// A test's directory, removed when dropped.
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn db() -> (Dir, Pigeonhole) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "phdb-memslot-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let db = Pigeonhole::open(
+            dir.0.join("t.phdb"),
+            Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        (dir, db)
+    }
+
+    fn no_model() -> Arc<Create> {
+        Arc::new(|_| Ok(pigeonhole_memory::StoreOptions::new()))
+    }
+
+    /// A replica's slot for the store `m`, expecting `expected`'s pin.
+    fn replica_slot(db: &Pigeonhole, expected: Option<&str>) -> MemSlot {
+        MemSlot::new(
+            db,
+            "m",
+            None,
+            expected,
+            no_model(),
+            (1 << 20, 8 << 20),
+            false,
+        )
+    }
+
+    /// Creates the store `m` (no model) as a primary's writes would.
+    fn create_store(db: &Pigeonhole) {
+        let core = MemCore::open_in(db, "m", None, None, Some(&*no_model()), (1, 1)).unwrap();
+        assert!(core.is_some());
+    }
+
+    /// cli692's D1: the store arrives (and the catalog change clears the slot) while an open
+    /// that found it missing is still running. That open's "missing" is of the old catalog,
+    /// so it isn't kept: the slot opens again and finds the store.
+    #[test]
+    fn an_open_overtaken_by_a_clear_opens_again() {
+        let (_dir, db) = db();
+        let slot = replica_slot(&db, None);
+        let created = db.clone();
+        *slot.after_open.lock().unwrap() = Some(Box::new(move |slot: &MemSlot| {
+            create_store(&created);
+            slot.clear();
+        }));
+        match slot.get().unwrap() {
+            Entry::Core(_) => {}
+            Entry::Missing => panic!("an open from before the store arrived was kept"),
+            Entry::Failed(e) => panic!("{}", e.message),
+        }
+        assert!(matches!(slot.cached(), Some(Entry::Core(_))));
+    }
+
+    /// cli692's D4: "missing" and a pin mismatch are kept until the next clear (a call
+    /// doesn't open again), and a mismatch is the server's configuration:
+    /// `FailedPrecondition`.
+    #[test]
+    fn missing_and_a_pin_mismatch_are_kept_until_a_clear() {
+        let (_dir, db) = db();
+        let slot = replica_slot(&db, None);
+        assert!(slot.cached().is_none(), "nothing opened yet");
+        assert!(matches!(slot.get().unwrap(), Entry::Missing));
+        assert!(matches!(slot.cached(), Some(Entry::Missing)));
+        // The store arrives: still "missing" until the catalog change's clear.
+        create_store(&db);
+        assert!(matches!(slot.get().unwrap(), Entry::Missing));
+        slot.clear();
+        assert!(slot.cached().is_none());
+        assert!(matches!(slot.get().unwrap(), Entry::Core(_)));
+
+        // A store with no model, where the replica names one.
+        let pinned = replica_slot(&db, Some("other-model"));
+        let Entry::Failed(e) = pinned.get().unwrap() else {
+            panic!("a pin mismatch opened");
+        };
+        assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+        assert!(e.message.contains("other-model"), "{}", e.message);
+        assert!(matches!(pinned.cached(), Some(Entry::Failed(_))));
+    }
+
+    /// A promote's slot opens as the writer: a store that's missing is created.
+    #[test]
+    fn a_promoted_slot_creates_a_missing_store() {
+        let (_dir, db) = db();
+        let slot = replica_slot(&db, None);
+        assert!(matches!(slot.get().unwrap(), Entry::Missing));
+        slot.promote();
+        assert!(slot.cached().is_none(), "a promote drops what was kept");
+        assert!(matches!(slot.get().unwrap(), Entry::Core(_)));
+        assert!(slot.exists());
     }
 }

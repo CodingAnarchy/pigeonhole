@@ -191,7 +191,7 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
   - `ReplicaBehind` while the replica is `starting`, `bootstrapping` or `re-bootstrapping`;
   - otherwise `Unavailable`, widened in the table above: the primary may not have created the store yet, or the replica hasn't applied that yet;
   - a store pinned to another model than the server's: `FailedPrecondition`.
-- **An open `Memory.Watch` across a re-bootstrap** ends with an error, as `Feed.Subscribe` streams do (its token is the old copy's: `FeedExpired` or `InvalidArgument`). An applied catalog change doesn't end it.
+- **An open `Memory.Watch` across a re-bootstrap** ends with `FeedExpired`, as `Feed.Subscribe` streams end with an error: its token is the old copy's, so the client watches again without it. An applied catalog change doesn't end it.
 - **A promote** opens the store as the writer at once, creating it if missing with the server's `--memory-*` options. A failure there doesn't fail the promote: it's `ReplicaInfo.last_error` and the log, and memory calls answer it until the next catalog change.
 
 ## Amendment: `Unavailable` (#1617)
