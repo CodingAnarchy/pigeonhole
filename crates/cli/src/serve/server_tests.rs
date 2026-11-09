@@ -713,9 +713,9 @@ fn read_answer(tcp: &mut std::net::TcpStream) -> std::io::Result<(String, String
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        if tcp.read(&mut byte)? == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
+        // `read_exact` retries a read a signal interrupted, as a bare `read` doesn't (EINTR
+        // on a Linux runner), and it reports the connection's end as `UnexpectedEof`.
+        tcp.read_exact(&mut byte)?;
         head.push(byte[0]);
     }
     let head = String::from_utf8_lossy(&head).into_owned();
@@ -4635,10 +4635,6 @@ fn promote_makes_a_replica_take_writes() {
 /// An IVF index made and written on the primary is searched and verified on a replica, and
 /// the replica refuses its writes like any other (#1436 with #1573's index RPCs).
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "#1595: the bootstrap download hangs intermittently on Windows"
-)]
 fn a_replica_serves_ivf_index_reads_and_refuses_its_writes() {
     let p = Server::start("", limits());
     for (name, mode) in [("ix", "REBALANCE_INLINE"), ("bg", "REBALANCE_BACKGROUND")] {
@@ -5176,11 +5172,12 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
     }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let upstream = p.url.trim_start_matches("http://").to_owned();
-    // The copy is the primary's whole file (tens of MiB with its preallocation): each
-    // connection takes a few chunks of it, then stalls.
-    // The second connection, the first reconnect after a stall, is closed at once: one more
-    // break, never a restart from zero (cli692's R2 on #1609).
-    let proxy = stalling_proxy(&upstream, 16 << 20, Some(1), Arc::clone(&stop));
+    // Each connection takes one 1 MiB chunk of the copy (and its framing), then stalls: the
+    // copy holds the 3 MiB written above, so every bootstrap stalls at least twice, however
+    // the copy is laid out (#1615 shrank it from tens of MiB to about its data). The second
+    // connection, the first reconnect after a stall, is closed at once: one more break,
+    // never a restart from zero (cli692's R2 on #1609).
+    let proxy = stalling_proxy(&upstream, 3 << 19, Some(1), Arc::clone(&stop));
     let mut short = limits();
     short.stream_idle = Duration::from_millis(500);
     let r = Server::start_replica_with(test_dir(), &proxy, None, short);

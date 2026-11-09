@@ -395,6 +395,166 @@ module FiberCases
     assert_predicate status, :success?
   end
 
+  # #1574 PR 3: the memory store's writes and recall under the scheduler give the blocking
+  # results, through every path: near dedup's lookup and an IVF store's settle on the
+  # offload pool, and the writes' commits through `transact`.
+  def test_memory_writes_and_recall_give_their_blocking_results
+    m = Pigeonhole::Memory
+    s = m::Store.create(db, "agents", embedding: m::EmbeddingModel.new("m", 4, :f32),
+                                      near_dedup: m::NearDedup.new(0.9, policy: :skip),
+                                      ivf: m::IvfOptions.new(min_namespace_len: 20))
+    rng = Random.new(1574)
+    first = other = newer = nil
+    on_scheduler do
+      first = s.remember("n", "the timeout is 5 s", embedding: [1.0, 0, 0, 0])
+      assert_equal :new, first.outcome
+      near = s.remember("n", "the timeout is five seconds", embedding: [0.99, 0.01, 0, 0])
+      assert_equal [:similar, first.id], [near.outcome, near.id]
+      other = s.remember("n", "tabs, not spaces", embedding: [0, 1.0, 0, 0])
+      assert_nil s.link(first.id, other.id, m::LinkType::SIMILAR_TO, 0.5)
+      newer = s.remember("n", "the timeout is 7 s", embedding: [0, 0, 1.0, 0])
+      assert_nil s.supersede(first.id, newer.id)
+      assert_equal 1, s.mark_used([other.id]).marked
+      s.near_dedup = nil # random 4-d vectors are mostly near duplicates: keep all 30
+      30.times { |i| s.remember("big", "note #{i}", embedding: Array.new(4) { rng.rand }) }
+      hits, stats = s.recall_with_stats("big", embedding: [0.5, 0.5, 0.5, 0.5], k: 5)
+      assert_equal [5, 1], [hits.size, stats.ivf_namespaces]
+      assert s.delete(other.id)
+      refute s.delete(other.id)
+    end
+    assert_nil s.get(other.id)
+    assert_equal newer.id, s.get(first.id).superseded_by
+    assert_predicate s.verify, :consistent?
+    s.close
+  end
+
+  # A recall waits on the offload pool, not the thread: another fiber runs while the pool
+  # is held (the test-hooks seam).
+  def test_a_recall_parks_on_a_worker_while_other_fibers_run
+    skip "needs the test-hooks build (PIGEONHOLE_TEST_HOOKS=1 rake compile)" unless defined?(Pigeonhole::Native::Gate)
+    s = Pigeonhole::Memory::Store.create(db, "agents")
+    3.times { |i| s.remember("n", "note #{i}") }
+    want = s.recall("n", text: "note").map(&:id)
+    got = nil
+    ran_meanwhile = false
+    Pigeonhole::Native.offload_hold(true)
+    begin
+      on_scheduler do |spawn|
+        spawn.call { got = s.recall("n", text: "note").map(&:id) }
+        spawn.call do
+          sleep 0.02
+          ran_meanwhile = got.nil?
+          Pigeonhole::Native.offload_hold(false)
+        end
+      end
+    ensure
+      Pigeonhole::Native.offload_hold(false)
+    end
+    assert ran_meanwhile, "no other fiber ran while the recall waited on its worker"
+    assert_equal want, got
+    s.close
+  end
+
+  # A loop's step under the scheduler: its wait for new memories and the block's groups
+  # yield to the thread's other fibers, and the block may itself yield.
+  def test_a_consolidation_loop_steps_under_the_scheduler
+    m = Pigeonhole::Memory
+    s = m::Store.create(fdb, "agents")
+    ticks = 0
+    in_block = []
+    lp = s.consolidate_loop("main", policy: m::ConsolidatePolicy.new(min_age: 0)) do |group|
+      before = ticks
+      sleep 0.05 # yields to the ticker
+      in_block << (ticks - before)
+      [m::Memory.new("summary of #{group.size}")]
+    end
+    step = nil
+    waited_ticks = nil
+    on_scheduler do |spawn|
+      done = false
+      spawn.call do
+        until done
+          ticks += 1
+          sleep 0.001
+        end
+      end
+      assert_empty lp.run_once(0).passes # starts the loop
+      spawn.call do
+        sleep 0.05
+        fdb.transact { |t| 3.times { |i| s.remember_in(t, "n", "note #{i}", session: "s") } }
+      end
+      before = ticks
+      step = lp.run_once(5)
+      waited_ticks = ticks - before
+      done = true
+    end
+    assert_equal ["n"], step.passes.map(&:first)
+    assert_equal 3, step.events
+    assert_equal 1, step.passes[0][1].committed
+    assert_operator waited_ticks, :>, 0
+    assert in_block.all?(&:positive?), "the ticker didn't run while the block slept: #{in_block}"
+    lp.close
+    s.close
+  end
+
+  # #1606's lesson for the loop: a fiber's step waiting for new memories ends when the loop
+  # is closed, rather than at its timeout.
+  def test_closing_a_loop_ends_a_fiber_step_waiting
+    s = Pigeonhole::Memory::Store.create(fdb, "agents")
+    lp = s.consolidate_loop("main") { |_| [] }
+    lp.run_once(0)
+    raised = took = nil
+    on_scheduler do |spawn|
+      spawn.call do
+        started = clock
+        lp.run_once(30)
+      rescue Pigeonhole::Error => e
+        raised = e
+        took = clock - started
+      end
+      spawn.call do
+        sleep 0.05
+        lp.close
+      end
+    end
+    assert_kind_of Pigeonhole::Error, raised
+    assert_operator took, :<, 1.0
+    s.close
+  end
+
+  # A step stopped while its pass runs: the worker ends and is joined, and the loop is
+  # back for the next step.
+  def test_a_step_stopped_in_its_passes_gives_the_loop_back
+    m = Pigeonhole::Memory
+    s = m::Store.create(fdb, "agents")
+    in_block = false
+    lp = s.consolidate_loop("main", policy: m::ConsolidatePolicy.new(min_age: 0)) do |_|
+      in_block = true
+      sleep 0.2
+      [m::Memory.new("summary")]
+    end
+    lp.run_once(0)
+    fdb.transact { |t| 3.times { |i| s.remember_in(t, "n", "note #{i}", session: "s") } }
+    ended = false
+    on_scheduler do |spawn|
+      stepper = spawn.call do
+        lp.run_once(1)
+      rescue *STOPS
+        nil
+      ensure
+        ended = true
+      end
+      spawn.call do
+        sleep 0.005 until in_block
+        stop(stepper)
+      end
+    end
+    assert ended
+    lp.run_once(0.1) # the loop is back: no "running on another thread"
+    lp.close
+    s.close
+  end
+
   class StopTest < StandardError; end
   # What stopping a fiber raises in it: Async's `Task#stop` raises Async::Stop.
   STOPS = [StopTest, Async::Stop].freeze
