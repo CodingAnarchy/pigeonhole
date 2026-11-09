@@ -261,6 +261,10 @@ The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–
 - **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`.
   - **Amended by #1427 (1.2.0):** `verify` compares the index's ids with the memories that have an embedding, both at `verify`'s snapshot (`pigeonhole_vector::Index::verify_at` and `ids_at`). The new `StoreStats::ivf_missing` and `ivf_stale` count each side, `ivf_mismatched` is their sum, and `is_consistent` counts it. The Python binding gains `StoreStats.ivf_mismatched`, and Ruby's `consistent?` counts it too. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
 - **`Error::Vector(pigeonhole_vector::Error)`**, with the index's database errors mapped to `Error::Db`.
+- **Amended by #1618 (coordinator, 2026-11-09; additive): the application's rebalancer.**
+  - **The API:** `OpenOptions::own_rebalancer()` opens the IVF index with `pigeonhole_vector::Index::open_with_rebalancer` (`create_with_rebalancer` in `create_with`), so no crate thread rebalances. `Store::take_rebalancer() -> Option<pigeonhole_vector::Rebalancer>` hands the rebalancer out once. It's the IVF counterpart of `own_forgetter`/`take_forgetter`, on D284's model (ICR 0100).
+  - **Who uses it:** an application-owned database runs the rebalancer itself. A replica (`phdb serve --memory` with `--replica-of`) drops it, since nothing may write in the background there.
+  - **Without the option:** nothing changes. `take_rebalancer` is `None` for a store without IVF, or once taken.
 
 ## T9, part 1: memory events from the change feed (#1343)
 The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The feed-driven consolidation loop is part 2.

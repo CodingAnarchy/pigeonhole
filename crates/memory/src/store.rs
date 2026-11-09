@@ -149,6 +149,7 @@ pub struct OpenOptions {
     model: Option<String>,
     without_embeddings: bool,
     own_forgetter: bool,
+    own_rebalancer: bool,
 }
 
 impl OpenOptions {
@@ -174,6 +175,16 @@ impl OpenOptions {
     /// [`Store::take_forgetter`] and runs it itself (an application-owned database, D284).
     pub fn own_forgetter(mut self) -> Self {
         self.own_forgetter = true;
+        self
+    }
+
+    /// No IVF rebalancing thread of the crate's own: for a store with an IVF index
+    /// ([`StoreOptions::ivf`]), the application takes its [`Rebalancer`](pigeonhole_vector::Rebalancer)
+    /// with [`Store::take_rebalancer`] and runs it itself (an application-owned database,
+    /// D284), or drops it where nothing may write in the background (a replica, #1618). The
+    /// index is opened as [`pigeonhole_vector::Index::open_with_rebalancer`] opens it.
+    pub fn own_rebalancer(mut self) -> Self {
+        self.own_rebalancer = true;
         self
     }
 }
@@ -512,6 +523,9 @@ struct Shared {
     /// through `remember_in`/`delete_in` never settles, and a dropped record only delays a
     /// split the same way.
     ivf_pending: Mutex<std::collections::VecDeque<pigeonhole_vector::Placed>>,
+    /// The IVF index's rebalancer, kept for [`Store::take_rebalancer`] when opened with
+    /// [`OpenOptions::own_rebalancer`].
+    rebalancer: Mutex<Option<pigeonhole_vector::Rebalancer>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -614,12 +628,23 @@ impl Store {
                 v = v.target_list_len(n);
             }
             // Created before `G` names it, so a store whose `G` has `ivf` has the index.
-            drop(pigeonhole_vector::Index::create(
-                db,
-                &ivf_name(name),
-                m.spec(),
-                v,
-            )?);
+            // With `own_rebalancer`, no crate thread starts here either: the rebalancer the
+            // open below hands out takes from the same queue.
+            if open.own_rebalancer {
+                drop(pigeonhole_vector::Index::create_with_rebalancer(
+                    db,
+                    &ivf_name(name),
+                    m.spec(),
+                    v,
+                )?);
+            } else {
+                drop(pigeonhole_vector::Index::create(
+                    db,
+                    &ivf_name(name),
+                    m.spec(),
+                    v,
+                )?);
+            }
             g = g.put(META, IVF, &o.encode());
         }
         g.commit()?;
@@ -671,14 +696,26 @@ impl Store {
             }
         };
         let index = Index::open(db, &index_name(name))?;
+        let mut rebalancer = None;
         let ivf = match table.get(GLOBAL, META, IVF)? {
-            Some(c) => Some(Ivf::W(
-                pigeonhole_vector::Index::open(db, &ivf_name(name))?,
-                IvfOptions::decode(c.value())?,
-            )),
+            Some(c) => {
+                let index = if options.own_rebalancer {
+                    let (index, r) =
+                        pigeonhole_vector::Index::open_with_rebalancer(db, &ivf_name(name))?;
+                    rebalancer = Some(r);
+                    index
+                } else {
+                    pigeonhole_vector::Index::open(db, &ivf_name(name))?
+                };
+                Some(Ivf::W(index, IvfOptions::decode(c.value())?))
+            }
             None => None,
         };
         let s = Store::assemble(db, table, index, ivf, model, embeds, options.own_forgetter);
+        *s.shared
+            .rebalancer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = rebalancer;
         s.start_forgetter_if_due()?;
         Ok(s)
     }
@@ -707,6 +744,7 @@ impl Store {
                 started: AtomicBool::new(false),
                 own,
                 ivf_pending: Mutex::new(std::collections::VecDeque::new()),
+                rebalancer: Mutex::new(None),
             }),
         }
     }
@@ -743,6 +781,17 @@ impl Store {
     pub fn take_forgetter(&self) -> Option<Forgetter> {
         self.shared
             .forgetter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The IVF index's [`Rebalancer`](pigeonhole_vector::Rebalancer), for an application that
+    /// runs it itself: a store with an IVF index opened with [`OpenOptions::own_rebalancer`].
+    /// `None` otherwise, or once taken.
+    pub fn take_rebalancer(&self) -> Option<pigeonhole_vector::Rebalancer> {
+        self.shared
+            .rebalancer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
