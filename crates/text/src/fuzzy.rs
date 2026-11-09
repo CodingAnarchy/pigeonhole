@@ -94,6 +94,7 @@ pub(crate) async fn expand_async(
     edits: u8,
     prefix_chars: usize,
     max: usize,
+    budget: &mut crate::maxscore::Budget,
 ) -> Result<(Vec<Expansion>, bool)> {
     let q_chars = term.chars().count();
     let mut found = Vec::new();
@@ -106,7 +107,7 @@ pub(crate) async fn expand_async(
                 .unwrap_or(0);
             exact(&mut found, term, df);
         }
-        Some((base, dfa)) => walk_async(t, s, &base, &dfa, &mut found, q_chars).await?,
+        Some((base, dfa)) => walk_async(t, s, &base, &dfa, &mut found, q_chars, budget).await?,
     }
     Ok(finish(found, max))
 }
@@ -253,6 +254,7 @@ async fn walk_async(
     dfa: &DFA,
     found: &mut Vec<Expansion>,
     q_chars: usize,
+    budget: &mut crate::maxscore::Budget,
 ) -> Result<()> {
     use futures_core::Stream;
     let end = prefix_end(base);
@@ -265,9 +267,12 @@ async fn walk_async(
             .family(DF)
             .snapshot(s)
             .stream();
-        while let Some(row) =
+        // A row a step: a dictionary walk under a short head yields like MaxScore does
+        // (ai1249's R1 on #1642).
+        while let Some(row) = {
+            budget.spend(1).await;
             std::future::poll_fn(|cx| std::pin::Pin::new(&mut rows).poll_next(cx)).await
-        {
+        } {
             let row = row?;
             let row = row.view();
             let key = row.key();

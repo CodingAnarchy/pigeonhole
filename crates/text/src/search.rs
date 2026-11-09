@@ -438,6 +438,10 @@ impl<'a> Search<'a> {
                 e.insert(df);
             }
         }
+        // One step budget for the search's work outside MaxScore (ai1249's R1 on #1642): the
+        // fuzzy walks, the phrase position walks and their lengths. Shared, so a poll does
+        // at most a budget's work across them, not a budget per loop.
+        let mut budget = crate::maxscore::Budget::new();
         let mut expanded: Vec<Vec<Expansion>> = Vec::with_capacity(r.fuzzy.len());
         let mut fuzzy_stats = Vec::with_capacity(r.fuzzy.len());
         for f in &r.fuzzy {
@@ -448,6 +452,7 @@ impl<'a> Search<'a> {
                 f.edits,
                 self.prefix_length,
                 self.max_expansions,
+                &mut budget,
             )
             .await?;
             if self.highlight {
@@ -467,7 +472,8 @@ impl<'a> Search<'a> {
         let prefix = self.prefix.as_deref();
         let mut phrase_scores = Vec::with_capacity(r.phrases.len());
         for phrase in &r.phrases {
-            phrase_scores.push(score_phrase_async(t, s, &bm, &df_of, phrase, prefix).await?);
+            phrase_scores
+                .push(score_phrase_async(t, s, &bm, &df_of, phrase, prefix, &mut budget).await?);
         }
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
         let mut want = self.k;
@@ -722,6 +728,7 @@ async fn score_phrase_async(
     df_of: &HashMap<String, i64>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
+    budget: &mut crate::maxscore::Budget,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
     let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
@@ -730,19 +737,23 @@ async fn score_phrase_async(
     let terms = &phrase.terms;
     let mut by_term: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>> = BTreeMap::new();
     let lead_term = terms[plan.lead].0.as_str();
-    let lead = read_positions_async(t, s, lead_term, None, prefix).await?;
+    let lead = read_positions_async(t, s, lead_term, None, prefix, budget).await?;
     by_term.insert(lead_term, lead);
     for (term, _) in terms {
         if by_term.contains_key(term.as_str()) {
             continue;
         }
-        let got = read_positions_async(t, s, term, Some(&by_term[lead_term]), prefix).await?;
+        let keep = Some(&by_term[lead_term]);
+        let got = read_positions_async(t, s, term, keep, prefix, budget).await?;
         by_term.insert(term, got);
     }
     for (doc, lead_ps) in &by_term[lead_term] {
         let Some(freq) = plan.freq(phrase, &by_term, doc, lead_ps) else {
             continue;
         };
+        // A cached get resolves at once: without a budget, a phrase over a hub term's
+        // documents would never yield (ai1249's R1).
+        budget.spend(crate::maxscore::LOOKUP_STEPS).await;
         let len = match t.get_at_async(s, &post_row(lead_term), POST, doc).await? {
             Some(c) => c.as_u64(),
             None => return Err(corrupt("a position has no posting")),
@@ -863,6 +874,7 @@ async fn read_positions_async(
     term: &str,
     keep: Option<&BTreeMap<Vec<u8>, Vec<u32>>>,
     prefix: Option<&[u8]>,
+    budget: &mut crate::maxscore::Budget,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u32>>> {
     let mut out = BTreeMap::new();
     let mut read = t.row(&post_row(term)).family(POS).snapshot(s);
@@ -870,7 +882,11 @@ async fn read_positions_async(
         read = read.qualifier_prefix(p);
     }
     let mut cells = read.cells()?;
-    while let Some(e) = cells.next_async().await? {
+    loop {
+        budget.spend(1).await;
+        let Some(e) = cells.next_async().await? else {
+            break;
+        };
         if keep.is_some_and(|k| !k.contains_key(e.qualifier)) {
             continue;
         }

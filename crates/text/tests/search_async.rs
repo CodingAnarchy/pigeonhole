@@ -252,3 +252,42 @@ fn async_equals_sync_over_random_corpora_and_queries() {
         db.close().unwrap();
     }
 }
+
+/// ai1249's R1 on #1642: the loops outside MaxScore spend one shared step budget, so a warm
+/// search (no read to wait for) still yields. Three phrases over the hub word walk its
+/// position row three times and read their lead terms' lengths, more than a poll's budget
+/// together (less than one each, so a budget per loop wouldn't yield), and so yield with no
+/// I/O in flight; and they still return what the sync search does.
+#[test]
+fn a_warm_phrase_search_yields_without_io() {
+    let vfs = SimVfs::new(5);
+    let db = build(&vfs, 3000, 5);
+    let index = Index::open(&db, "docs_text").expect("open index");
+    let search = || index.search("\"the memory\" \"the store\" \"the agent\" memory~", 10);
+    // Warm the cache.
+    let (warm, _) = drive(&vfs, search().run_async());
+    let want = search().run().expect("run");
+    assert_eq!(warm.expect("run_async"), want);
+    // Warm now: every `Pending` is a yield, with nothing in flight. In a block: the pinned
+    // future borrows the index until its scope ends.
+    let (got, yields) = {
+        let mut fut = std::pin::pin!(search().run_async());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut yields = 0;
+        let got = loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => break v,
+                Poll::Pending => {
+                    assert_eq!(vfs.io_in_flight(), 0, "a warm search waited on I/O");
+                    yields += 1;
+                    assert!(yields < 10_000, "never resolved");
+                }
+            }
+        };
+        (got, yields)
+    };
+    assert_eq!(got.expect("run_async"), want);
+    assert!(yields > 0, "a warm phrase over the hub word never yielded");
+    drop(index);
+    db.close().unwrap();
+}

@@ -51,6 +51,10 @@ use crate::layout::*;
 /// factor `f` costs up to about `f` times more, perf287 on #1377).
 const LOOKUP_IN_STEPS: u64 = 14;
 
+/// [`LOOKUP_IN_STEPS`] as a step budget's charge for a point read (#1560).
+#[cfg(feature = "async")]
+pub(crate) const LOOKUP_STEPS: u32 = LOOKUP_IN_STEPS as u32;
+
 /// A relative slack on every bound (above), so float rounding never prunes a document that
 /// belongs.
 const SLACK: f64 = 1e-9;
@@ -252,6 +256,39 @@ impl Reads for Blocking {
 /// [`LOOKUP_IN_STEPS`].
 #[cfg(feature = "async")]
 pub(crate) const TEXT_POLL_STEPS: u32 = 4096;
+
+/// The step budget of the async search's loops outside MaxScore (ai1249's R1 on #1642): the
+/// fuzzy dictionary walk, the phrase position walks and their length gets. As in
+/// [`TopK::run`], [`TEXT_POLL_STEPS`] a poll, then a yield: a warm cache never makes them
+/// wait, so without one they'd hold the executor thread through a hub term's rows.
+#[cfg(feature = "async")]
+pub(crate) struct Budget(u32);
+
+#[cfg(feature = "async")]
+impl Budget {
+    pub(crate) fn new() -> Self {
+        Budget(TEXT_POLL_STEPS)
+    }
+
+    /// Spends `steps`; once the poll's budget is gone, yields once (waking the task first).
+    pub(crate) async fn spend(&mut self, steps: u32) {
+        if self.0 > steps {
+            self.0 -= steps;
+            return;
+        }
+        self.0 = TEXT_POLL_STEPS;
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+    }
+}
 
 /// The async search's reads: [`RowCells::poll_next`] and `poll_seek`, and point reads as
 /// futures held until they resolve.
