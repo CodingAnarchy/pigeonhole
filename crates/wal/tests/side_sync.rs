@@ -422,15 +422,15 @@ fn a_group_sync_overlapping_a_failed_rollover_sync_does_not_count() {
 
 #[test]
 fn a_stepped_spare_preparation_yields_between_short_steps() {
-    // 5 MiB slots: five zero-fill writes each, so three slots take several steps.
+    // 5 MiB slots: twenty 256 KiB zero-fill writes each, so three slots take several steps.
     let frames = (5 << 20) / pigeonhole_format::wal::FRAME_SIZE as u64;
     let (faults, wal) = setup_with(1397, frames);
     let spares = wal.spares();
     let (r, polls) = prepare_stepped(&faults, &spares, spares.target() + 2);
     assert_eq!(r.unwrap(), 3);
     assert_eq!(spares.ready(), 3);
-    assert_eq!(faults.submitted_writes.load(Ordering::Acquire), 15);
-    assert!(polls >= 4, "{polls} polls for 15 writes");
+    assert_eq!(faults.submitted_writes.load(Ordering::Acquire), 60);
+    assert!(polls >= 4, "{polls} polls for 60 writes");
     // Nothing left to prepare: ready at once.
     assert_eq!(
         prepare_stepped(&faults, &spares, spares.target())
