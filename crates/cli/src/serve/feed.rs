@@ -46,8 +46,9 @@ use super::proto;
 /// The feed fan-out's limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FeedLimits {
-    /// Bytes of commits the rings hold in all (`--feed-ring-bytes`), tokens included (about
-    /// 45 + 16 × shards bytes each): memory outside R3's in-flight budget. Each hub's ring is
+    /// Bytes of commits the rings hold in all (`--feed-ring-bytes`), as their encoded events,
+    /// tokens included (about 45 + 16 × shards bytes each): memory outside R3's in-flight
+    /// budget. Each hub's ring is
     /// capped at this over the live hubs (perf287's K2 on #1518).
     pub ring_bytes: usize,
     /// Hubs at once (`--max-feed-hubs`): distinct table sets subscribed.

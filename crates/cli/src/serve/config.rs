@@ -63,8 +63,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N", default_value_t = 16)]
     pub max_catch_up: usize,
     /// Bytes of recent commits the shared feeds keep for their streams, in all: each table
-    /// set's share is this over the sets subscribed. Each commit counts its changes and its
-    /// resume token (about 45 + 16 × shards bytes). Outside `--inflight-bytes`.
+    /// set's share is this over the sets subscribed. Each commit counts its encoded event, which
+    /// holds its resume token (about 45 + 16 × shards bytes), and about 100 bytes more.
+    /// Outside `--inflight-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 256 << 20)]
     pub feed_ring_bytes: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
