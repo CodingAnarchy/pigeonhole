@@ -10,8 +10,10 @@ pub(crate) use super::sessions::Leases;
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
-    /// The database file (`*.phdb`).
-    pub file: PathBuf,
+    /// The database file (`*.phdb`). Not with `--cluster`, whose directory holds the
+    /// partitions' files.
+    #[arg(required_unless_present = "cluster", conflicts_with = "cluster")]
+    pub file: Option<PathBuf>,
     /// Create the database file if it does not exist.
     #[arg(long)]
     pub create: bool,
@@ -165,6 +167,36 @@ pub(crate) struct ServeArgs {
     /// (or 8 MiB). A caught-up replica applies what arrived at once, whatever the count.
     #[arg(long, value_name = "N", default_value_t = super::replica::RUN_EVENTS, requires = "replica_of")]
     pub replica_run: usize,
+    /// Serve as a node of a partitioned cluster (D317, ICR 0117): DIR holds the node's
+    /// partition map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`). One
+    /// server per DIR. So far the node keeps and distributes the map (`phdb cluster`); serving
+    /// the partitions' data comes with D317's next ticket.
+    #[arg(long, value_name = "DIR", requires = "node_id")]
+    pub cluster: Option<PathBuf>,
+    /// This node's id in the cluster's map (`[a-z0-9_-]`, up to 64).
+    #[arg(long, value_name = "ID", requires = "cluster")]
+    pub node_id: Option<String>,
+    /// The bearer token this node presents to the other nodes (`cluster` scope there), alone
+    /// in the file. Also from `PHDB_CLUSTER_TOKEN`. Never a flag's value.
+    #[arg(long, value_name = "FILE", requires = "cluster")]
+    pub cluster_token_file: Option<PathBuf>,
+    /// A PEM file of the CA certificates this node trusts for its peers' TLS, beside the
+    /// system's roots.
+    #[arg(long, value_name = "PEM", requires = "cluster")]
+    pub cluster_ca: Option<PathBuf>,
+    /// How long `SetMap` waits for each other node to take the map, in milliseconds. A node
+    /// that doesn't pulls it later.
+    #[arg(long, value_name = "MS", default_value_t = 2_000, requires = "cluster")]
+    pub cluster_push_timeout_ms: u64,
+}
+
+impl ServeArgs {
+    /// The database file: present unless `--cluster` (clap requires one of the two).
+    pub(crate) fn db_file(&self) -> &std::path::Path {
+        self.file
+            .as_deref()
+            .expect("clap requires FILE unless --cluster is given")
+    }
 }
 
 /// What the flags leave the server to do.

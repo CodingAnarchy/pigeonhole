@@ -1,5 +1,6 @@
 //! `phdb promote` (#1436): a replica's file becomes a primary that takes writes; a file
-//! that isn't a replica's is refused, and so is `phdb serve --replica-of` on one with tables.
+//! that isn't a replica's is refused, and so is `phdb serve --replica-of` on one with tables;
+//! a replica's memory store pinned to another model fails the start (#1618).
 #![cfg(feature = "serve")]
 
 mod common;
@@ -17,6 +18,11 @@ fn options() -> Options {
 /// A primary with a few rows, and a replica of it bootstrapped as `phdb serve --replica-of`
 /// does: a copy of one durable snapshot, made a replica at that snapshot's feed token.
 fn replica(dir: &TempDir) -> (PathBuf, PathBuf) {
+    replica_with(dir, |_| {})
+}
+
+/// [`replica`], with `more` run on the primary before its snapshot.
+fn replica_with(dir: &TempDir, more: impl FnOnce(&Pigeonhole)) -> (PathBuf, PathBuf) {
     let primary = dir.path().join("primary.phdb");
     let db = Pigeonhole::open(
         &primary,
@@ -35,6 +41,7 @@ fn replica(dir: &TempDir) -> (PathBuf, PathBuf) {
             .commit()
             .unwrap();
     }
+    more(&db);
     db.flush().unwrap();
     let snap = db.durable_snapshot().unwrap();
     let token = db.feed().from_snapshot(&snap).open().unwrap().token();
@@ -106,26 +113,40 @@ fn replica_of_refuses_a_database_of_its_own() {
 }
 
 #[test]
-fn replica_of_refuses_a_memory_store() {
-    // A replica doesn't serve a memory store yet (#1618): refused at startup, before the
-    // database opens, rather than failing to create the store or serving a swapped engine.
+fn a_replica_s_memory_store_pinned_to_another_model_fails_the_start() {
+    // #1618 (cli692's D3): a replica whose copy already has the store opens it at startup,
+    // so a pin mismatch stops `phdb serve` at once rather than failing its first recall. It
+    // opens it read-only: nothing is created, and nothing writes.
     let dir = TempDir::new("replica-of-memory");
+    let (_, copy) = replica_with(&dir, |db| {
+        let model =
+            pigeonhole_memory::EmbeddingModel::new("pinned", 4, pigeonhole::Element::F32).unwrap();
+        let store = pigeonhole_memory::Store::create(
+            db,
+            "m",
+            pigeonhole_memory::StoreOptions::new().embedding(model),
+        )
+        .unwrap();
+        drop(store);
+    });
     let out = phdb(&[
         "serve",
-        dir.path().join("r.phdb").to_str().unwrap(),
-        "--create",
+        copy.to_str().unwrap(),
         "--listen",
         "127.0.0.1:0",
         "--replica-of",
         "http://127.0.0.1:1",
         "--memory",
         "m",
+        "--memory-model",
+        "other",
+        "--memory-dim",
+        "4",
     ]);
     assert_eq!(out.status, 2, "{out:?}");
     assert!(
         out.stderr
-            .contains("--memory m can't be used with --replica-of yet"),
+            .contains("memory store m is pinned to the embedding model \"pinned\", not \"other\""),
         "{out:?}"
     );
-    assert!(!dir.path().join("r.phdb").exists(), "nothing was created");
 }

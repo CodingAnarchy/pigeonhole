@@ -735,8 +735,9 @@ pub(crate) struct Service {
     pub(crate) texts: Arc<super::texts::Texts>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
     text_rebuilds: Arc<Semaphore>,
-    /// The memory store (`--memory`), if the server opened one.
-    memory: Option<Arc<crate::memcore::MemCore>>,
+    /// The memory store (`--memory`), if the server serves one: opened when a call needs
+    /// it, and again after the catalog or the engine changes (#1618).
+    memory: Option<Arc<super::memslot::MemSlot>>,
     /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
     /// can't take every blocking thread (ai1249's M6 on D313 §7).
     memory_calls: Arc<Semaphore>,
@@ -847,16 +848,27 @@ impl Service {
     /// cached table, vector index and text index handles go, and the next call on each name
     /// opens it
     /// again.
+    ///
+    /// The memory store is opened again too (#1618). Its clear is synchronous: the replica
+    /// publishes the seqno it applied only after this returns, so a read waiting for that
+    /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
         self.tables.store(Arc::new(HashMap::new()));
         self.indexes.forget();
         self.texts.forget();
+        if let Some(memory) = &self.memory {
+            memory.clear();
+        }
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
-    /// cache, the feed hubs and the sessions are of the old engine, and go.
+    /// cache, the feed hubs, the memory store's watches and the sessions are of the old
+    /// engine, and go.
     pub(crate) fn engine_replaced(&self) {
         self.tables_changed();
+        if let Some(memory) = &self.memory {
+            memory.replaced();
+        }
         self.feeds.fail_all();
         self.sessions.drop_idle();
     }
@@ -887,15 +899,15 @@ impl Service {
         self
     }
 
-    /// Serves `core`, if any, as the `Memory` service, with at most `calls` memory calls on
-    /// the blocking pool at once (0: half the pool, at least 1).
+    /// Serves the store `slot` holds, if any, as the `Memory` service, with at most `calls`
+    /// memory calls on the blocking pool at once (0: half the pool, at least 1).
     pub(crate) fn memory_opt(
         mut self,
-        core: Option<crate::memcore::MemCore>,
+        slot: Option<super::memslot::MemSlot>,
         calls: usize,
     ) -> Self {
-        let Some(core) = core else { return self };
-        self.memory = Some(Arc::new(core));
+        let Some(slot) = slot else { return self };
+        self.memory = Some(Arc::new(slot));
         if calls > 0 {
             self.memory_calls = Arc::new(Semaphore::new(calls));
         }
@@ -935,7 +947,7 @@ impl Service {
         let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes()) else {
             return self.answer(op, caller, prepaid).await;
         };
-        if op.writes() && caller.scope >= op.scope() {
+        if op.writes() && caller.scope.allows(op.scope()) {
             return Err(ApiError::replica_read_only(replica.primary()));
         }
         match self.answer(op, caller, prepaid).await {
@@ -951,7 +963,7 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
-        if caller.scope < op.scope() {
+        if !caller.scope.allows(op.scope()) {
             return Err(ApiError::permission_denied(&format!("call {}", op.name())));
         }
         let size = op.size();
@@ -1038,6 +1050,8 @@ impl Service {
             ServiceOp::ListTables(_) => {
                 drop(budget);
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Tables(proto::ListTablesResponse { tables }))
             }
@@ -1057,6 +1071,8 @@ impl Service {
                 let db = self.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Info(proto::InfoResponse {
                     path: self.db.path().display().to_string(),
@@ -1112,6 +1128,26 @@ impl Service {
                 // afresh (cli692's F3 on #1583).
                 self.indexes.forget();
                 self.indexes.pause_rebalancing(false);
+                // The memory store opens as the writer now, at once, created if missing
+                // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
+                // is what's promoted): it's the replica's last error, and memory calls answer
+                // it until the next clear.
+                if let Some(memory) = &self.memory {
+                    memory.promote();
+                    let slot = Arc::clone(memory);
+                    let opened = self.blocking(move || slot.get()).await;
+                    let failed = match opened {
+                        Ok(super::memslot::Entry::Failed(e)) | Err(e) => Some(e.message),
+                        Ok(_) => None,
+                    };
+                    if let Some(e) = failed {
+                        eprintln!(
+                            "phdb serve: after the promote, memory store {}: {e}",
+                            memory.name()
+                        );
+                        replica.note_error(format!("memory store {}: {e}", memory.name()));
+                    }
+                }
                 Ok(ServiceReply::Promote(proto::PromoteResponse {
                     primary_token: primary_token.into(),
                 }))
@@ -1247,6 +1283,7 @@ impl Service {
             ServiceOp::MemoryWatch(r) => {
                 drop(budget);
                 self.memory_watch(r, caller)
+                    .await
                     .map(ServiceReply::MemoryWatch)
                     .map_err(ApiError::for_read)
             }
@@ -1287,6 +1324,7 @@ impl Service {
         if let Some(t) = self.tables.load().get(name) {
             return Ok(t.clone());
         }
+        reserved(name)?;
         let db = self.db.clone();
         let owned = name.to_owned();
         let table = self
@@ -1307,6 +1345,7 @@ impl Service {
         &self,
         r: proto::CreateTableRequest,
     ) -> Result<proto::TableResponse, ApiError> {
+        reserved(&r.name)?;
         if r.name.is_empty() {
             return Err(ApiError::invalid("a table needs a name"));
         }
@@ -1343,6 +1382,7 @@ impl Service {
     /// the name. A table created again under it is a new table, with a new id: its feed hubs
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+        reserved(&name)?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let owned = name.clone();
@@ -2233,11 +2273,40 @@ impl Service {
         self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
     }
 
-    /// The memory store, or `Unsupported` without `--memory`.
-    fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        self.memory.clone().ok_or_else(|| {
+    /// The memory store, opened on the blocking pool if the slot holds none (#1618), or
+    /// `Unsupported` without `--memory`. On a replica without the store: `ReplicaBehind`
+    /// while its copy is still arriving, else `Unavailable` (the primary hasn't created it,
+    /// or the replica hasn't applied that yet; ICR 0112).
+    async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
+        use super::memslot::Entry;
+        let slot = self.memory.clone().ok_or_else(|| {
             ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
-        })
+        })?;
+        let entry = match slot.cached() {
+            Some(entry) => entry,
+            None => {
+                // Under the memory sub-limit (M6): a call waiting for another's open waits on
+                // the semaphore, not in a blocking-pool thread (cli692's R2 on #1639).
+                let slot = Arc::clone(&slot);
+                self.memory_blocking(move || slot.get()).await?
+            }
+        };
+        match entry {
+            Entry::Core(core) => Ok(core),
+            Entry::Failed(e) => Err(e),
+            Entry::Missing => {
+                let name = slot.name();
+                match self.replica.as_ref().and_then(|r| r.settling()) {
+                    Some(state) => Err(ApiError::replica_behind(format!(
+                        "this replica is {state}: memory store {name} isn't on it yet"
+                    ))),
+                    None => Err(ApiError::unavailable(format!(
+                        "memory store {name} isn't on this replica yet: the primary hasn't \
+                         created it, or the replica hasn't applied that yet"
+                    ))),
+                }
+            }
+        }
     }
 
     /// `f` on the blocking pool under the memory sub-limit (M6). The wait for a memory slot
@@ -2265,7 +2334,7 @@ impl Service {
         + Send
         + 'static,
     ) -> Result<T, ApiError> {
-        let core = self.memory_core()?;
+        let core = self.memory_core().await?;
         let namespaces = caller.namespaces.clone();
         let (calls, pool, wait) = (
             Arc::clone(&self.memory_calls),
@@ -2307,7 +2376,7 @@ impl Service {
         r: proto::RecallRequest,
         caller: &Caller,
     ) -> Result<proto::RecallResponse, ApiError> {
-        let core = self.memory_core()?;
+        let core = self.memory_core().await?;
         let a = super::memory::recall(r)?;
         let namespaces = caller.namespaces.clone();
         self.memory_blocking(move || {
@@ -2320,12 +2389,19 @@ impl Service {
     }
 
     /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
-    fn memory_watch(
+    async fn memory_watch(
         &self,
         r: proto::MemoryWatchRequest,
         caller: &Caller,
     ) -> Result<super::memory::MemoryEvents, ApiError> {
-        let core = self.memory_core()?;
+        // Before the store: a swap from here on ends the watch.
+        let swaps = self.memory.as_ref().map(|m| m.swaps());
+        let core = self.memory_core().await?;
+        let Some(swaps) = swaps else {
+            return Err(ApiError::unsupported(
+                "this server has no memory store (phdb serve --memory NAME)",
+            ));
+        };
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -2338,6 +2414,7 @@ impl Service {
             slot,
             Arc::clone(&self.blocking),
             self.limits.stream_idle,
+            swaps,
         )
     }
 
@@ -2511,7 +2588,7 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
-        if !r.rows.is_empty() && caller.scope < Scope::Write {
+        if !r.rows.is_empty() && !caller.scope.allows(Scope::Write) {
             return Err(ApiError::permission_denied("commit writes"));
         }
         let rows = self.txn_rows(&r.rows).await?;
@@ -2938,4 +3015,16 @@ async fn budget_within(
             "the server's in-flight request bytes stayed full past the deadline",
         )),
     }
+}
+
+/// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
+/// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
+fn reserved(name: &str) -> Result<(), ApiError> {
+    if name.starts_with(super::cluster::map::RESERVED_PREFIX) {
+        return Err(ApiError::invalid(format!(
+            "table {name:?}: the {} prefix is reserved",
+            super::cluster::map::RESERVED_PREFIX
+        )));
+    }
+    Ok(())
 }

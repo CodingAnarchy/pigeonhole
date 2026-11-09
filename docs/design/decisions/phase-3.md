@@ -4499,6 +4499,37 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
 - **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
 
+<a id="d317"></a>
+## D317 — one database split across `phdb serve` nodes by static key-range partitions (simp724, design; owner sign-off, 2026-11-04; reviewed by perf287 and cli692; cli, #1482, ICR 0117)
+
+**Decided** (the design note on #1482, revision 2, is the full record; the owner set the scope on #1437):
+- **Partitions are whole database files.** A versioned partition map assigns tables, or key ranges of a table (sorted split keys, half-open ranges), to partitions, and partitions to nodes.
+- **The map has two layers.** Which partition holds a key range is fixed once the range holds data. Moving ranges is #1499, in 1.3.0. Which node serves a partition changes by relocation, with a higher epoch.
+- **Every node routes.** Any node takes any call, serves what it owns and forwards the rest over node-to-node gRPC. There are no engine changes: a `Router` in front of D313's service functions, behind the seam D313's ticket 3 landed.
+- **Single-partition operations keep their guarantees.** Writes and transactions that span partitions are refused (`CrossPartition`) before anything is written; transactions and snapshots bind to one partition by a routing key.
+- **Reads fan out.** Scans, multi-gets, KNN and traversal fan out and merge in key order (or to the exact top K). A missing partition fails the read unless the caller opts in to partial results, which name what's missing.
+- **Fencing is manual.** A partition file records its identity and epoch (`__phdb_cluster`). A node writes P only while its newest map names it at that epoch and P isn't fenced. Restarted nodes start fenced.
+- **Later:** cross-node transactions (#1483), failover (#1484), the balancer (#1485) and fencing leases (#1486), all in 1.3.0.
+
+**Tickets:**
+1. the map: proto, validation, distribution and the identity row;
+2. routing and forwarding;
+3. transactions and snapshots bound to one partition;
+4. fan-out reads;
+5. schema in the map;
+6. fencing and relocation;
+7. cluster feeds;
+8. backup and restore, several partitions per node, and the serving guide's cluster chapter, with perf287's partitions-per-node box run.
+
+**Ticket 1** (ICR 0117's first section):
+- **`phdb serve --cluster DIR --node-id ID`** keeps the map in `DIR/cluster-map.json`, written atomically, and holds `DIR/.lock`.
+- **The `Cluster` service:** `GetMap`; `SetMap`, a compare-and-set on the version (a miss is `Conflict`, the coordinator's call); `PushMap`, node to node; and `Status`.
+- **The `cluster` token scope** stands outside read < write < admin.
+- **Pull:** a node pulls a newer map from a peer whose call says it has one.
+- **Divergence:** an equal version with different content is refused and reported as divergent (cli692's M3).
+- **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
+- **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
+
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
 
