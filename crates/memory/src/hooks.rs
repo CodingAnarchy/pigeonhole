@@ -117,3 +117,12 @@ pub fn ivf_pending(store: &crate::Store) -> usize {
 pub fn ivf_list_lens(store: &crate::Store) -> crate::Result<Option<Vec<u64>>> {
     store.ivf_list_lens()
 }
+
+/// Whether the store's IVF index has the crate's own rebalancing thread, or `None` without an
+/// index: an inspection helper. Set when the store opens its index as the writer does
+/// (`pigeonhole_vector::Index::open`); never with [`OpenOptions::own_rebalancer`](
+/// crate::OpenOptions::own_rebalancer), which a replica's or a read-only open uses. It stays
+/// set after the thread ends (#1640).
+pub fn ivf_rebalancer_started(store: &crate::Store) -> Option<bool> {
+    store.ivf_rebalancer_started()
+}

@@ -1290,6 +1290,18 @@ impl Store {
         q.push_back(placed);
     }
 
+    /// Whether the IVF index's own rebalancing thread was started, or `None` without an
+    /// index (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_rebalancer_started(&self) -> Option<bool> {
+        match &self.ivf {
+            Some(Ivf::W(index, _)) => {
+                Some(pigeonhole_vector::hooks::rebalancer_thread_started(index))
+            }
+            _ => None,
+        }
+    }
+
     /// The IVF index's list lengths, in list order (an inspection helper for `hooks`).
     #[cfg(feature = "__unstable-hooks")]
     pub(crate) fn ivf_list_lens(&self) -> Result<Option<Vec<u64>>> {

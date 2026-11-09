@@ -779,10 +779,12 @@ fn ivf_lists(store: &pigeonhole_memory::Store) -> usize {
         .len()
 }
 
-/// A replica's memory store runs no IVF rebalancer, and a promote's open starts one (#1640,
-/// cli692's point on #1618). Counted by the index's lists: a background index's lists only
-/// split when its rebalancer runs. The primary's store holds its own rebalancer and never
-/// runs it, so every split the test sees is the replica's.
+/// A replica's memory store starts no IVF rebalancer, and a promote's open starts one that
+/// runs (#1640, cli692's point on #1618). Whether one started is the vector crate's own flag
+/// (`hooks::ivf_rebalancer_started`): a replica refuses a stray rebalancer's writes, so its
+/// lists can't tell. That one runs after the promote is in the index's lists: a background
+/// index splits a list only when its rebalancer runs. The primary's store holds its own
+/// rebalancer and never runs it, so every split the test sees is the promoted replica's.
 #[test]
 fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
     use pigeonhole_memory::{EmbeddingModel, IvfOptions, Memory, OpenOptions, Store, StoreOptions};
@@ -853,17 +855,22 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
     wait_replica(&r, "caught up", caught_up(&p, None));
     let (status, body) = recall_with(&r, "memory", &[]);
     assert_eq!(status, 200, "{body}");
-    assert_eq!(ivf_lists(served_store(&r).store()), lists);
-    // A rebalancer polls every 50 ms: two seconds is plenty for one to split, and none does.
-    std::thread::sleep(Duration::from_secs(2));
+    let replica_store = served_store(&r);
+    assert_eq!(ivf_lists(replica_store.store()), lists);
     assert_eq!(
-        ivf_lists(served_store(&r).store()),
-        lists,
-        "a replica's store rebalanced"
+        pigeonhole_memory::hooks::ivf_rebalancer_started(replica_store.store()),
+        Some(false),
+        "a replica's store started a rebalancer"
     );
+    drop(replica_store);
 
     let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
     assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        pigeonhole_memory::hooks::ivf_rebalancer_started(served_store(&r).store()),
+        Some(true),
+        "the promote's open started no rebalancer"
+    );
     for i in 0..100 {
         let v = f32_query(&embedding());
         let (status, body) = r.rpc(
