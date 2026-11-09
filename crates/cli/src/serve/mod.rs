@@ -27,6 +27,7 @@ mod convert;
 mod errors;
 mod feed;
 mod grpc;
+mod handles;
 mod http;
 mod indexes;
 mod listener;

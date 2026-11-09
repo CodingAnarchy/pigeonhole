@@ -7,7 +7,6 @@
 //!   given (`Query::term`, `Query::fuzzy`); a `text` field is tokenised as documents are
 //!   (`Query::text`, and a phrase's text as `Query::quoted_phrase`, the syntax's `"..."~N`).
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -21,7 +20,7 @@ use super::proto;
 #[derive(Debug)]
 pub(crate) struct Texts {
     db: Pigeonhole,
-    open: Mutex<HashMap<String, Arc<Index>>>,
+    open: Mutex<super::handles::Handles<Index>>,
     /// The running (or last) `Text.Rebuild`'s thread, for `close` to wait for.
     rebuild: Mutex<Option<JoinHandle<()>>>,
     /// Set by `close` under `rebuild`'s lock: no rebuild starts after it.
@@ -32,7 +31,7 @@ impl Texts {
     pub(crate) fn new(db: Pigeonhole) -> Self {
         Self {
             db,
-            open: Mutex::new(HashMap::new()),
+            open: Mutex::new(super::handles::Handles::default()),
             rebuild: Mutex::new(None),
             closed: AtomicBool::new(false),
         }
@@ -77,7 +76,7 @@ impl Texts {
         }
     }
 
-    fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Index>>> {
+    fn handles(&self) -> std::sync::MutexGuard<'_, super::handles::Handles<Index>> {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -88,13 +87,22 @@ impl Texts {
 
     /// The index `name`, opened if this server hasn't yet. Sync: call it on the blocking
     /// pool. The open runs outside the cache's lock; two first calls racing both open it,
-    /// and the first to finish is kept.
+    /// and the first to finish is kept. An open that a [`forget`](Self::forget) overtook
+    /// opens again, since it may have read the catalog from before it (#1632).
     pub(crate) fn get(&self, name: &str) -> Result<Arc<Index>, ApiError> {
-        if let Some(i) = self.cached(name) {
-            return Ok(i);
+        loop {
+            let generation = {
+                let open = self.handles();
+                if let Some(i) = open.get(name) {
+                    return Ok(Arc::clone(i));
+                }
+                open.generation()
+            };
+            let index = Index::open(&self.db, name)?;
+            if let Some(kept) = self.keep(name, index, generation) {
+                return Ok(kept);
+            }
         }
-        let index = Index::open(&self.db, name)?;
-        Ok(self.keep(name, index))
     }
 
     /// Creates the index `name` over `source`, or with `if_missing` opens an existing one,
@@ -109,6 +117,7 @@ impl Texts {
         if if_missing && self.cached(name).is_some() {
             return Ok(());
         }
+        let generation = self.handles().generation();
         let index = match Index::create(&self.db, name, source, options) {
             Ok(i) => i,
             Err(e) if if_missing && e.code() == pigeonhole::ErrorCode::TableExists => {
@@ -116,24 +125,25 @@ impl Texts {
             }
             Err(e) => return Err(e.into()),
         };
-        self.keep(name, index);
+        // Overtaken by a forget: the next call opens it afresh.
+        self.keep(name, index, generation);
         Ok(())
     }
 
     /// Drops every handle: the catalog changed under the server (a replica applied a
     /// primary's change, or a re-bootstrap swapped the database), so the next call on each
     /// name opens it again (#1436). A call holding a handle finishes on it. An index has no
-    /// thread, so nothing else is left.
+    /// thread, so nothing else is left. An open running across it keeps nothing, and opens
+    /// again (#1632).
     pub(crate) fn forget(&self) {
-        self.handles().clear();
+        self.handles().forget();
     }
 
-    fn keep(&self, name: &str, index: Index) -> Arc<Index> {
-        Arc::clone(
-            self.handles()
-                .entry(name.to_owned())
-                .or_insert_with(|| Arc::new(index)),
-        )
+    /// Keeps `index` under `name` unless another call kept one first (then that one is
+    /// returned). `None`, keeping nothing, if a [`forget`](Self::forget) came after
+    /// `generation`, the one the open started at (#1632).
+    fn keep(&self, name: &str, index: Index, generation: u64) -> Option<Arc<Index>> {
+        self.handles().keep(generation, name, Arc::new(index))
     }
 }
 
@@ -231,5 +241,50 @@ pub(crate) fn hit(h: pigeonhole_text::Hit) -> proto::TextHit {
                 end: m.range.end as u64,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Texts;
+    use pigeonhole::{Family, Options, Pigeonhole};
+    use pigeonhole_text::{Index, IndexOptions, Source};
+
+    /// #1632: an open that a `forget` overtook (a replica's catalog change, or a swap)
+    /// keeps nothing, and the next call opens the index afresh.
+    #[test]
+    fn an_open_overtaken_by_a_forget_keeps_nothing() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        drop(
+            Index::create(
+                &db,
+                "x",
+                Source::new(&table, "f", b"body"),
+                IndexOptions::new(),
+            )
+            .unwrap(),
+        );
+        let texts = Texts::new(db.clone());
+        // The steps of `get`, with a forget between the open and the keep.
+        let started = texts.handles().generation();
+        let index = Index::open(&db, "x").unwrap();
+        texts.forget();
+        assert!(
+            texts.keep("x", index, started).is_none(),
+            "a stale open is not kept"
+        );
+        assert!(texts.cached("x").is_none());
+        // Opened afresh, it is kept.
+        let kept = texts.get("x").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&kept, &texts.cached("x").unwrap()));
+        drop((kept, table));
+        db.close().unwrap();
     }
 }
