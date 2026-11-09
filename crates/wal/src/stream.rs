@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use pigeonhole_format::wal::{
     FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameEncoder, RECORD_HEAD_MAX, SegmentHeader, WalRecord,
@@ -215,6 +215,10 @@ struct Shared {
     /// spare preparation still running settles with its slots blank once its writes in
     /// flight landed, and a held header's chain ends with an error instead of its write.
     closing_io: AtomicBool,
+    /// g44's C-gap arm: syncs of the stream file finished so far, and the waker of a spare
+    /// preparation waiting for the next one to finish (it dirties a zero chunk only in the
+    /// gap right after a sync).
+    gap: Mutex<(u64, Option<Waker>)>,
 }
 
 /// One operation (or a chain of them) a stream submitted and not finished: counted in
@@ -733,6 +737,34 @@ impl Shared {
         if failed {
             self.poisoned.store(true, Ordering::Release);
         }
+        let waker = {
+            let mut gap = lock(&self.gap);
+            gap.0 += 1;
+            gap.1.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// g44's C-gap arm: whether a spare preparation may dirty its next zero chunk now: a sync
+    /// of the stream file finished since its last chunk (`seen`), or none is running. Else
+    /// its waker is kept for the next sync to finish.
+    fn gap_open(&self, seen: &mut u64, cx: &mut Context<'_>) -> bool {
+        {
+            let mut gap = lock(&self.gap);
+            if gap.0 != *seen {
+                *seen = gap.0;
+                return true;
+            }
+            gap.1 = Some(cx.waker().clone());
+        }
+        // Registered first, so a sync that starts and ends after this check still wakes it.
+        if self.syncs().running.is_empty() {
+            *seen = lock(&self.gap).0;
+            return true;
+        }
+        false
     }
 
     /// Tells settled syncs whether the stream is unpoisoned and wakes blocked waiters. Called
@@ -1048,6 +1080,7 @@ impl SpareSegments {
             allocated: false,
             writes: VecDeque::new(),
             writeback: None,
+            seen_syncs: 0,
             buffers: Vec::new(),
             failed: None,
             sync: None,
@@ -1158,6 +1191,8 @@ pub struct SparePrep {
     /// chunk, never most of a slot (#1621: a sync landing mid-fill wrote up to 128 MiB of them
     /// back, 16-64 ms).
     writeback: Option<Completion<()>>,
+    /// g44's C-gap arm: the stream's finished-sync count when the last chunk was written.
+    seen_syncs: u64,
     /// Zero buffers back from completed writes, for the next ones.
     buffers: Vec<IoBuf>,
     /// The first failed allocation or write: no more are submitted, and the slots go back
@@ -1220,6 +1255,10 @@ impl SparePrep {
                 } else {
                     Poll::Pending
                 };
+            }
+            // g44's C-gap arm: dirty the next chunk only in the gap after a sync.
+            if !self.spares.shared.gap_open(&mut self.seen_syncs, cx) {
+                return Poll::Pending;
             }
             let allocates = self.needs_allocation();
             if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
@@ -1658,6 +1697,7 @@ impl WalStream {
                 in_flight: Mutex::new(0),
                 in_flight_done: Condvar::new(),
                 closing_io: AtomicBool::new(false),
+                gap: Mutex::new((0, None)),
             }),
         };
         s.configure_feed(opts);
