@@ -5,7 +5,7 @@ fn main() -> std::process::ExitCode {
     let status = pigeonhole_cli::run(
         std::env::args_os(),
         &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
+        &mut std::io::stderr(),
     );
     status.into()
 }
