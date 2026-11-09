@@ -56,7 +56,7 @@ module Pigeonhole
       result
     ensure
       if completed
-        handle.__send__(:native_commit, nil) if handle.__send__(:native_open?)
+        handle.commit if handle.__send__(:native_open?)
       else
         handle.__send__(:native_discard)
       end
@@ -360,12 +360,20 @@ module Pigeonhole
     # Puts one cell and commits it; returns the commit's sequence number. A String is bytes,
     # an Integer an i64 and a Float an f64.
     def put(row, family, qualifier, value, ts: nil, durability: nil)
-      native_put(row, family, qualifier, value, ts, durability)
+      unless Native::FiberBridge.current
+        return native_put(row, family, qualifier, value, ts, durability)
+      end
+
+      one(row, durability).put(family, qualifier, value, ts: ts).commit
     end
 
     # Adds `delta` to a counter cell and commits it; returns the commit's sequence number.
     def incr(row, family, qualifier, delta, ts: nil, durability: nil)
-      native_incr(row, family, qualifier, delta, ts, durability)
+      unless Native::FiberBridge.current
+        return native_incr(row, family, qualifier, delta, ts, durability)
+      end
+
+      one(row, durability).incr(family, qualifier, delta, ts: ts).commit
     end
 
     # Adds `delta` to a counter cell, commits it, and returns the counter's value after the
@@ -374,19 +382,50 @@ module Pigeonhole
     # exception; ReturnedValueError means the commit applied but reading the value failed, so
     # the increment landed: don't retry it.
     def incr_returning(row, family, qualifier, delta, ts: nil, durability: nil)
-      native_incr_returning(row, family, qualifier, delta, ts, durability)
+      unless Native::FiberBridge.current
+        return native_incr_returning(row, family, qualifier, delta, ts, durability)
+      end
+
+      one(row, durability).incr(family, qualifier, delta, ts: ts).commit_returning
+                          .value(family, qualifier, ts: ts)
     end
 
     # Deletes `row`; with `family`, that family; with `qualifier` too, the column; with `ts:`
     # too, that one version. Returns the commit's sequence number.
     def delete(row, family = nil, qualifier = nil, ts: nil, durability: nil)
-      native_delete(row, family, qualifier, ts, durability)
+      unless Native::FiberBridge.current
+        return native_delete(row, family, qualifier, ts, durability)
+      end
+
+      one(row, durability).delete(family, qualifier, ts: ts).commit
+    end
+
+    private
+
+    # A mutation of `row` at `durability`: a one-shot write's form under a fiber scheduler.
+    def one(row, durability)
+      m = mutate(row)
+      durability ? m.durability(durability) : m
     end
   end
 
   # Writes to one row, committed atomically by `commit` or `commit_if`. Each write method
   # returns self.
   class Mutation
+    # Commits the writes as one atomic row mutation; returns its sequence number. Under a
+    # fiber scheduler, the thread's other fibers run while it waits (ICR 0126).
+    def commit
+      b = Native::FiberBridge.current
+      b ? b.await(native_commit_op(b.native)) : native_commit
+    end
+
+    # Commits only if `condition` holds; returns the sequence number, or nil (nothing
+    # written) when it doesn't. Waits as `commit` does.
+    def commit_if(condition)
+      b = Native::FiberBridge.current
+      b ? b.await(native_commit_if_op(b.native, condition)) : native_commit_if(condition)
+    end
+
     # Puts a cell: a String (bytes), an Integer (i64) or a Float (f64).
     def put(family, qualifier, value, ts: nil)
       native_put(family, qualifier, value, ts)
@@ -446,7 +485,10 @@ module Pigeonhole
     # counter cell the writes incremented or set, as a read at the commit sees it (D314), and
     # the columns `return_previous` asked for, as they were just before it. Concurrent
     # increments of one cell each get their own value.
-    def commit_returning = native_commit_returning.freeze
+    def commit_returning
+      b = Native::FiberBridge.current
+      (b ? b.await(native_commit_returning_op(b.native)) : native_commit_returning).freeze
+    end
 
     # Asks `commit_if_returning` for the column `family`:`qualifier` as the commit left it
     # (`returned.current`), or as the condition saw it when it didn't hold (`seen.current`)
@@ -463,7 +505,12 @@ module Pigeonhole
     # counters) when it applied, or `seen` (a Seen, with `current` as the condition saw it)
     # when it didn't and nothing was written. A mutation with no writes is a check-and-read.
     def commit_if_returning(condition)
-      r = native_commit_if_returning(condition).freeze
+      b = Native::FiberBridge.current
+      r = if b
+            b.await(native_commit_if_returning_op(b.native, condition))
+          else
+            native_commit_if_returning(condition)
+          end.freeze
       r.is_a?(Seen) ? Checked.new(nil, r) : Checked.new(r, nil)
     end
   end
@@ -574,9 +621,11 @@ module Pigeonhole
       end
 
       # Commits; returns the commit's sequence number. A transaction raises `Conflict` if a
-      # cell or family it read changed since its snapshot.
+      # cell or family it read changed since its snapshot. Under a fiber scheduler, the
+      # thread's other fibers run while it waits (ICR 0126).
       def commit(durability: nil)
-        native_commit(durability)
+        b = Native::FiberBridge.current
+        b ? b.await(native_commit_op(b.native, durability)) : native_commit(durability)
       end
     end
   end
