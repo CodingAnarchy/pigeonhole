@@ -336,6 +336,25 @@ fn fuzzy_query(q: &str) -> Query {
     query
 }
 
+/// `MEMRECALL_ASYNC=1`: `recall` runs each query through `Recall::run_async` instead of
+/// `run`, polled on this thread, for the async/sync ratio at concurrency 1 (#1560, the
+/// coordinator's ask after #1657).
+fn run_async() -> bool {
+    std::env::var_os("MEMRECALL_ASYNC").is_some_and(|v| v == "1")
+}
+
+/// Polls `fut` to completion on this thread (as `textratio` does): a warm recall only yields
+/// at its budgets, waking itself, and a cold one is polled again until its read lands.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
 fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
     let f = fixture(fix_dir, dataset);
     let db = open(db_dir);
@@ -381,7 +400,12 @@ fn recall(fix_dir: &Path, db_dir: &Path, dataset: &str, el_name: &str) {
                     r = r.expand(Expand::hops(1));
                 }
                 let start = Instant::now();
-                let hits = r.run().unwrap();
+                let hits = if run_async() {
+                    block_on(r.run_async())
+                } else {
+                    r.run()
+                }
+                .unwrap();
                 let us = start.elapsed().as_micros() as u64;
                 if pass == 1 {
                     let ranked = ranked_of(hits.iter().map(|h| row_key(&h.id)).collect());
