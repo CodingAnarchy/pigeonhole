@@ -255,7 +255,8 @@ async fn serve_one<S>(
         () = tokio::time::sleep(first_byte) => {}
     }
     if !got.load(Ordering::Relaxed) {
-        // Silent since it connected: dropping the connection closes it, and frees its slot.
+        // Silent since it connected: returning drops `conn`, and with it the socket, which
+        // closes; the task's end frees the slot (cli692's N2 on #1653).
         return;
     }
     let _ = conn.await;

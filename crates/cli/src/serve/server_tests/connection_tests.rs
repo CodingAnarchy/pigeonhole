@@ -142,3 +142,28 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
     assert!(closed_within(&mut over, Duration::from_secs(5)));
     assert_eq!(conns.refused(), 1);
 }
+
+/// cli692's N1 on #1653: an HTTP/1.1 keep-alive connection idle between requests has sent
+/// bytes, so the first-byte deadline is past. hyper's header-read timeout
+/// (`--request-timeout-ms`) bounds the wait for its next request: kept while requests come
+/// within it, closed after it, and its slot freed. (An idle HTTP/2 connection is kept: it
+/// answers pings.)
+#[test]
+fn an_idle_keep_alive_connection_is_closed_after_the_request_timeout() {
+    let timeout = Duration::from_millis(400);
+    let s = capped(1, timeout);
+    let mut c = connect(&s);
+    health(&mut c);
+    // A next request within the timeout is served on the same connection.
+    std::thread::sleep(timeout / 4);
+    health(&mut c);
+    let idle = std::time::Instant::now();
+    assert!(
+        closed_within(&mut c, timeout * 4),
+        "an idle keep-alive connection was kept past the request timeout"
+    );
+    assert!(idle.elapsed() >= timeout / 2, "{:?}", idle.elapsed());
+    wait_open(&s, 0);
+    let mut next = connect(&s);
+    health(&mut next);
+}
