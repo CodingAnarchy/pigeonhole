@@ -241,6 +241,21 @@ impl ApiError {
         .after(RETRY_AFTER_MS)
     }
 
+    /// A service the server depends on failed or can't be reached (today the embedding
+    /// endpoint, `--embed-url`): nothing was applied, and the request may be sent again
+    /// (ICR 0112's `Unavailable`, #1617).
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            "Unavailable",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
     pub(crate) fn request_too_large(limit: usize) -> Self {
         Self::new(
             "RequestTooLarge",
