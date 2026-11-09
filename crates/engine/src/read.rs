@@ -724,6 +724,9 @@ struct AsyncScan {
     /// cursors stood ([`Lane::block_stamp`]): a cell step probes again only once they move
     /// to another block, not per cell (perf287 on #1625).
     probed: Option<(usize, u64)>,
+    /// A seek's column is encoded here first, then swapped into `target` if it is the one
+    /// kept: no allocation per seek (perf287 on #1625).
+    scratch: Vec<u8>,
 }
 
 impl AsyncScan {
@@ -1008,9 +1011,13 @@ impl ScanCursor {
                 .and_then(|()| self.step_cell().map(|f| f.is_some()));
             return std::task::Poll::Ready(r);
         };
-        let mut target = Vec::new();
+        // The scratch buffer, not a new one per seek (perf287 on #1625).
+        let mut target = std::mem::take(&mut nb.scratch);
         let out = match self.seek_target(&mut target, qualifier) {
-            Err(e) => std::task::Poll::Ready(Err(e)),
+            Err(e) => {
+                nb.scratch = target;
+                std::task::Poll::Ready(Err(e))
+            }
             Ok(()) => {
                 // A seek replacing one left `Pending` keeps the later column of the two: the
                 // pending one may have moved its lane already, and a seek never moves back
@@ -1025,8 +1032,9 @@ impl ScanCursor {
                 };
                 if replace {
                     nb.seek = Some(family);
-                    nb.target = target;
+                    std::mem::swap(&mut nb.target, &mut target);
                 }
+                nb.scratch = target;
                 self.poll_cell(&mut nb, cx)
             }
         };
@@ -1139,43 +1147,31 @@ impl ScanCursor {
     /// keeping the later column of the two (ai1249's R1 and R2 on #1625). Reads an async
     /// cursor makes here are counted in `Metrics::async_sync_reads`.
     pub fn seek_cell(&mut self, family: FamilyId, qualifier: &[u8]) -> Result<bool> {
-        let mut target = Vec::new();
-        self.seek_target(&mut target, qualifier)?;
-        let mut family = family;
-        let ranks = self
-            .nb
-            .as_ref()
-            .and_then(|nb| nb.seek)
-            .map(|pending| (self.family_rank(pending), self.family_rank(family)));
-        let shared = match self.nb.as_mut() {
-            None => None,
-            Some(nb) => {
-                if let Some(pending) = nb.seek.take()
-                    && let Some((pending_rank, rank)) = ranks
-                    && (pending_rank, nb.target.as_slice()) > (rank, target.as_slice())
-                {
-                    family = pending;
-                    std::mem::swap(&mut target, &mut nb.target);
-                }
-                Some(Arc::clone(&nb.shared))
-            }
-        };
-        let Some(shared) = shared else {
+        let Some(mut nb) = self.nb.take() else {
+            let mut target = Vec::new();
+            self.seek_target(&mut target, qualifier)?;
             self.seek_lanes(family, &target, false)?;
             return Ok(self.step_cell()?.is_some());
         };
-        let ((r, blob_reads), file_reads) = pigeonhole_sst::counting_file_reads(|| {
-            as_async_read(false, || {
-                self.seek_lanes(family, &target, false)?;
-                self.step_cell()
-            })
+        let mut target = std::mem::take(&mut nb.scratch);
+        let mut family = family;
+        let r = self.seek_target(&mut target, qualifier).and_then(|()| {
+            if let Some(pending) = nb.seek.take()
+                && (self.family_rank(pending), nb.target.as_slice())
+                    > (self.family_rank(family), target.as_slice())
+            {
+                family = pending;
+                std::mem::swap(&mut target, &mut nb.target);
+            }
+            let reads = pigeonhole_io::thread_file_reads();
+            let r = self
+                .seek_lanes(family, &target, false)
+                .and_then(|()| self.step_cell());
+            nb.count(pigeonhole_io::thread_file_reads().wrapping_sub(reads));
+            r
         });
-        if blob_reads + file_reads > 0 {
-            shared.async_sync_reads.fetch_add(
-                blob_reads + file_reads,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        nb.scratch = target;
+        self.nb = Some(nb);
         Ok(r?.is_some())
     }
 
@@ -1270,6 +1266,7 @@ impl ScanCursor {
             seek: None,
             target: Vec::new(),
             probed: None,
+            scratch: Vec::new(),
         }));
         self
     }

@@ -491,3 +491,43 @@ fn next_async_is_send() {
     drop(cells);
     db.close().expect("close");
 }
+
+/// ai1249's R3 on #1625: a seek to an unread family is a plain step, so it never replaces a
+/// pending seek: a sync step after both finishes the pending one.
+#[test]
+fn an_unread_family_seek_keeps_a_pending_one() {
+    let (dir, db, t) = build();
+    let s = db.snapshot().expect("snapshot");
+    let post = sync_walk(
+        t.row(HUB)
+            .snapshot(&s)
+            .family("post")
+            .cells()
+            .expect("cells"),
+    );
+    drop(s);
+    drop(t);
+    let (db, t) = reopen(&dir, db);
+    let mut cells = t.row(HUB).family("post").cells().expect("cells");
+    let (first, _) = drive(|cx| {
+        cells
+            .poll_next(cx)
+            .map(|r| r.expect("poll_next").map(|e| entry(&e)))
+    });
+    assert_eq!(first.as_ref(), post.first());
+    let target = qual(15_000);
+    assert!(
+        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        "a seek into an uncached block fetches"
+    );
+    // `side` isn't read by this walk; a pending poll of it leaves `post`'s seek in place.
+    let _ = poll_once(|cx| cells.poll_seek(cx, "side", &qual(0)).map(|r| r.is_ok()));
+    let want = expected_seek(&post, 1, "post", &target, &["post"]);
+    assert_eq!(
+        cells.next().expect("next").map(|e| entry(&e)).as_ref(),
+        post.get(want)
+    );
+    drop(cells);
+    drop(t);
+    db.close().expect("close");
+}

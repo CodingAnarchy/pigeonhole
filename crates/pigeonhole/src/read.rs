@@ -1281,7 +1281,17 @@ struct CellWalk<'t> {
     done: bool,
     /// The column of a seek ([`RowCells::poll_seek`]) that returned `Pending` and isn't
     /// finished: every later step, sync or async, finishes it first (ai1249's R1 on #1625).
-    seek: Option<(FamilyId, Vec<u8>)>,
+    seek: Option<Box<PendingSeek>>,
+    /// A finished seek's buffers, for the next one (no allocation per seek, perf287 on
+    /// #1625). Boxed, so the walk grows by two pointers.
+    spare_seek: Option<Box<PendingSeek>>,
+}
+
+/// A seek's column ([`CellWalk::seek`]).
+#[derive(Debug)]
+struct PendingSeek {
+    family: FamilyId,
+    qualifier: Vec<u8>,
 }
 
 impl<'t> CellWalk<'t> {
@@ -1306,6 +1316,7 @@ impl<'t> CellWalk<'t> {
             family_index: None,
             done: false,
             seek: None,
+            spare_seek: None,
         })
     }
 
@@ -1377,14 +1388,29 @@ impl<'t> CellWalk<'t> {
         let Some((family, qualifier)) = seek else {
             return;
         };
+        let rank = self.walk_rank(family);
         let later = match &self.seek {
             None => true,
-            Some((f, q)) => {
-                (self.walk_rank(family), qualifier) > (self.walk_rank(*f), q.as_slice())
-            }
+            // A family the walk doesn't read makes the seek a plain step (N1): it never
+            // replaces a pending one, whose lane may be unpositioned (ai1249's R3 on #1625).
+            Some(_) if rank == usize::MAX => false,
+            Some(p) => (rank, qualifier) > (self.walk_rank(p.family), p.qualifier.as_slice()),
         };
         if later {
-            self.seek = Some((family, qualifier.to_vec()));
+            let mut p = self
+                .seek
+                .take()
+                .or_else(|| self.spare_seek.take())
+                .unwrap_or_else(|| {
+                    Box::new(PendingSeek {
+                        family,
+                        qualifier: Vec::new(),
+                    })
+                });
+            p.family = family;
+            p.qualifier.clear();
+            p.qualifier.extend_from_slice(qualifier);
+            self.seek = Some(p);
         }
     }
 
@@ -1392,7 +1418,13 @@ impl<'t> CellWalk<'t> {
     #[cold]
     #[inline(never)]
     fn step_seeking(&mut self) -> Result<bool> {
-        let (family, qualifier) = self.seek.take().expect("a pending seek");
+        let p = self.seek.take().expect("a pending seek");
+        let r = self.step_seeking_to(p.family, &p.qualifier);
+        self.spare_seek = Some(p);
+        r
+    }
+
+    fn step_seeking_to(&mut self, family: FamilyId, qualifier: &[u8]) -> Result<bool> {
         loop {
             let Some(cursor) = self.cursor.as_mut() else {
                 let Some(mut next) = self.pending.pop() else {
@@ -1404,7 +1436,7 @@ impl<'t> CellWalk<'t> {
                 continue;
             };
             let found = if cursor.families().contains(&family) {
-                cursor.seek_cell(family, &qualifier)?
+                cursor.seek_cell(family, qualifier)?
             } else if self.pending.iter().any(|c| c.families().contains(&family)) {
                 false
             } else {
@@ -1446,9 +1478,12 @@ impl<'t> CellWalk<'t> {
             Err(e) => Poll::Ready(Err(e)),
             Ok(()) => {
                 let pending = self.seek.take();
-                let r = self.poll_step_inner(cx, pending.as_ref().map(|(f, q)| (*f, &q[..])));
+                let r = self
+                    .poll_step_inner(cx, pending.as_ref().map(|p| (p.family, &p.qualifier[..])));
                 if r.is_pending() {
                     self.seek = pending;
+                } else if pending.is_some() {
+                    self.spare_seek = pending;
                 }
                 r
             }
