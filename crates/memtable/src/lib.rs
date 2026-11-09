@@ -1183,6 +1183,17 @@ impl MemtableReader {
         self.len() == 0
     }
 
+    /// The bytes the memtable's entries take in the arena (its header's count, which the
+    /// writer raises as it inserts): about an upper bound on the SST written from them, as
+    /// [`Memtable::allocated_bytes`] is for the writer. A size estimate only (a backup sizes
+    /// its SSTs' extents by it, #1595): read Relaxed, as the writer stores it, so on a
+    /// memtable still taking inserts it can trail [`len`](Self::len)'s entries.
+    pub fn bytes(&self) -> u64 {
+        self.region
+            .mem
+            .load_u64(self.root as usize + layout::H_BYTES, Ordering::Relaxed)
+    }
+
     /// A cursor, initially unpositioned. Holds its own clone of the reader, so it can be
     /// stored beside the view that keeps the arena memory alive.
     pub fn iter(&self) -> MemIter {

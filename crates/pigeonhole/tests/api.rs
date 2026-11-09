@@ -3739,3 +3739,82 @@ fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
 fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
     v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }
+
+/// #1595: a backup sized each new SST's extent at the target SST size (64 MiB), aligned to
+/// its size, so every family with memtable data took a 64 MiB slot of the copy: six small
+/// families made a copy of over 384 MiB, nearly all free (on Windows, real bytes to write,
+/// hash and send to a replica). Now a memtable's SST is sized from its bytes, so a copy stays
+/// about the size of what it holds: from a snapshot taken now (`backup`), and from an older
+/// one whose memtables have since been flushed (`backup_at`, a replica's bootstrap). The
+/// rewrite of an SST holding commits above the snapshot is the engine's
+/// `backup_below_an_ssts_commits_rewrites_it_without_them`.
+#[test]
+fn a_backup_s_file_is_about_the_size_of_what_it_holds() {
+    const FAMILIES: [&str; 6] = ["f0", "f1", "f2", "f3", "f4", "f5"];
+    let dir = TempDir::new("backup-size");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(2).memtable_budget(4 << 20);
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let mut builder = db.table("t").unwrap();
+    for f in FAMILIES {
+        builder = builder.family(f, Family::default());
+    }
+    let t = builder.create_if_missing().unwrap();
+    let write = |round: u8| {
+        for (i, f) in FAMILIES.iter().enumerate() {
+            for r in 0..20u8 {
+                t.mutate(&[b'r', r])
+                    .put(f, b"q", &[round, i as u8, r])
+                    .commit()
+                    .unwrap();
+            }
+        }
+    };
+    // Every family's commits only in memtables: the copy writes six SSTs from them.
+    write(1);
+    let source = std::fs::metadata(&path).unwrap().len();
+    let held = dir.0.join("held.phdb");
+    db.backup(&held).unwrap();
+    // The file's length, not its blocks: a sparse copy's free tail costs nothing on some file
+    // systems, and every byte on others.
+    let len = std::fs::metadata(&held).unwrap().len();
+    assert!(
+        len < 64 << 20 && len <= source + (8 << 20),
+        "a copy of {} families' memtables is {len} bytes (the source is {source}): a 64 MiB \
+         slot per family's SST",
+        FAMILIES.len()
+    );
+
+    // An older snapshot, then newer commits and a flush: the copy is of the snapshot's view,
+    // its memtables written without the newer commits.
+    let snapshot = db.snapshot().unwrap();
+    write(2);
+    db.flush().unwrap();
+    let older = dir.0.join("older.phdb");
+    db.backup_at(&snapshot, &older).unwrap();
+    let len = std::fs::metadata(&older).unwrap().len();
+    let source = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len < 64 << 20 && len <= source + (8 << 20),
+        "a copy of {} families at an older snapshot is {len} bytes (the source is {source})",
+        FAMILIES.len()
+    );
+    drop(snapshot);
+
+    // Both copies hold what they should.
+    for (copy_path, round) in [(&held, 1u8), (&older, 1u8)] {
+        let copy = Pigeonhole::open(copy_path, opts().create_if_missing(false)).unwrap();
+        let ct = copy.table("t").unwrap().open().unwrap();
+        for (i, f) in FAMILIES.iter().enumerate() {
+            assert_eq!(
+                value(&ct, b"r\x07", f, b"q").as_deref(),
+                Some(&[round, i as u8, 7][..]),
+                "{copy_path:?} {f}"
+            );
+        }
+        drop(ct);
+        copy.close().unwrap();
+    }
+    drop(t);
+    db.close().unwrap();
+}
