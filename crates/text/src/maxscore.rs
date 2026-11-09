@@ -76,6 +76,17 @@ impl Bm25 {
 
 // ---- Where the reads come from (#1560) ----
 
+/// `Poll<Result<T>>` to `T`, returning a `Pending` or an error.
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            Poll::Ready(Ok(v)) => v,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+            Poll::Pending => return Poll::Pending,
+        }
+    };
+}
+
 /// MaxScore's reads: one core, run by the sync search over [`Blocking`] and by the async one
 /// over [`Nonblocking`] (#1560 §3.2). Each read point returns `Poll`; `Blocking`'s are
 /// `#[inline(always)]` and always `Ready`, so monomorphized, the sync core is the loop it
@@ -118,6 +129,32 @@ pub(crate) trait Reads {
         get: &mut Self::Get,
         cx: &mut Self::Cx<'_, '_>,
     ) -> Poll<pigeonhole::Result<Option<Option<u64>>>>;
+
+    /// [`Walk::skip_while`]'s loop. [`Blocking`]'s is the sync walk's loop as it was before
+    /// #1560: `cells.next()?` with nothing between it and the posting's use. Through
+    /// [`Reads::next`] the entry came back wrapped in `Poll` and was copied on every posting
+    /// (`memcpy`, #1560's profile).
+    fn skip_while<'t>(
+        w: &mut Walk<'t, Self>,
+        bm: &Bm25,
+        cx: &mut Self::Cx<'_, '_>,
+        skip: impl Fn(&[u8]) -> bool,
+    ) -> Poll<Result<()>>
+    where
+        Self: Sized,
+    {
+        loop {
+            if Self::spend(cx, 1) {
+                return Poll::Pending;
+            }
+            let e = ready!(Self::next(&mut w.cells, cx));
+            w.stepped += 1;
+            match e {
+                Some(e) if skip(e.qualifier) => continue,
+                e => return Poll::Ready(Walk::<Self>::hold(&mut w.cur, w.weight, bm, e)),
+            }
+        }
+    }
 
     /// Whether a point lookup is in flight: the next lookup resumes it.
     fn get_pending(get: &Self::Get) -> bool;
@@ -165,6 +202,38 @@ impl Reads for Blocking {
         (): &mut (),
     ) -> Poll<pigeonhole::Result<Option<Option<u64>>>> {
         Poll::Ready(t.get_at(s, row, POST, doc).map(|c| c.map(|c| c.as_u64())))
+    }
+
+    #[inline(always)]
+    fn skip_while<'t>(
+        w: &mut Walk<'t, Self>,
+        bm: &Bm25,
+        (): &mut (),
+        skip: impl Fn(&[u8]) -> bool,
+    ) -> Poll<Result<()>> {
+        Poll::Ready(loop {
+            w.stepped += 1;
+            let Some(e) = (match w.cells.next() {
+                Ok(e) => e,
+                Err(e) => break Err(e.into()),
+            }) else {
+                w.cur = None;
+                break Ok(());
+            };
+            if skip(e.qualifier) {
+                continue;
+            }
+            let posting = match e.cell.as_u64() {
+                Some(v) => v,
+                None => break Err(corrupt("a posting isn't a u64")),
+            };
+            let (tf, len) = unposting(posting);
+            w.cur = Some((
+                e.qualifier.to_vec(),
+                w.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
+            ));
+            break Ok(());
+        })
     }
 
     #[inline(always)]
@@ -261,17 +330,6 @@ impl Reads for Nonblocking {
         cx.cx.waker().wake_by_ref();
         true
     }
-}
-
-/// `Poll<Result<T>>` to `T`, returning a `Pending` or an error.
-macro_rules! ready {
-    ($e:expr) => {
-        match $e {
-            Poll::Ready(Ok(v)) => v,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-            Poll::Pending => return Poll::Pending,
-        }
-    };
 }
 
 /// A term's posting row, walked in document order. A posting contributes
@@ -440,17 +498,7 @@ impl<'t, R: Reads> Walk<'t, R> {
         cx: &mut R::Cx<'_, '_>,
         skip: impl Fn(&[u8]) -> bool,
     ) -> Poll<Result<()>> {
-        loop {
-            if R::spend(cx, 1) {
-                return Poll::Pending;
-            }
-            let e = ready!(R::next(&mut self.cells, cx));
-            self.stepped += 1;
-            match e {
-                Some(e) if skip(e.qualifier) => continue,
-                e => return Poll::Ready(Self::hold(&mut self.cur, self.weight, bm, e)),
-            }
-        }
+        R::skip_while(self, bm, cx, skip)
     }
 
     /// Stands on the first posting at or after `doc`, or after it with `past`: by stepping
@@ -1213,18 +1261,164 @@ impl<'t, R: Reads> TopK<'t, R> {
 }
 
 /// The top `k` documents of `clauses` (in their fixed order), by score descending then id
-/// ascending, with their exact scores: the sync search's run of [`TopK`].
+/// ascending, with their exact scores: the sync search's document loop, as it was before
+/// #1560, over the same clauses and reads as [`TopK`] (a `Blocking` read is always ready).
+/// Not [`TopK::run`]: its resumable phases cost the sync loop about 14 instructions a
+/// candidate on the text shapes (#1560's profile), which the shapes' ceilings don't allow.
 pub(crate) fn top_k(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
-    clauses: Vec<Scored<'_, Blocking>>,
+    mut clauses: Vec<Scored<'_, Blocking>>,
     k: usize,
 ) -> Result<Vec<(Vec<u8>, f64)>> {
-    let mut run = TopK::new(clauses, k);
-    match run.run(t, s, bm, &mut ()) {
-        Poll::Ready(r) => r?,
+    debug_assert!(k > 0, "the search returns before MaxScore at k = 0");
+    let n = clauses.len();
+    // Ascending bound; `prefix[i]` sums the first `i` bounds in that order.
+    let mut by_bound: Vec<usize> = (0..n).collect();
+    by_bound.sort_by(|&a, &b| clauses[a].bound.total_cmp(&clauses[b].bound));
+    let mut prefix = vec![0.0; n + 1];
+    for (i, &c) in by_bound.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + clauses[c].bound;
+    }
+    // The held documents, the worst on top.
+    let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
+    // How many of `by_bound`'s first clauses are non-essential.
+    let mut skip = 0;
+    // The threshold the non-essential prefix and the fuzzy cuts were last taken at.
+    let mut cut_at = f64::NEG_INFINITY;
+    // Each clause's contribution to the candidate, `None` for one that doesn't match it.
+    let mut contrib: Vec<Option<f64>> = vec![None; n];
+    // The last document decided: a walk that starts being walked again steps past it. It's
+    // the candidate's own buffer, reused.
+    let mut last: Vec<u8> = Vec::new();
+    let mut decided = false;
+    // Whether an essential fuzzy clause has unwalked expansions: only then does a candidate
+    // pay for the gains below (single fuzzy clauses never do, since #1333's cut already drops
+    // what they'd leave unwalked).
+    let mut unwalked = false;
+    'docs: loop {
+        let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
+        // Only when the threshold has risen since the last pass: nothing else moves the
+        // non-essential prefix or the fuzzy cuts (perf287 and simp724 on #1353).
+        if let Some(th) = threshold.filter(|&th| th > cut_at) {
+            cut_at = th;
+            while skip < n && prefix[skip + 1] < th {
+                skip += 1;
+            }
+            // Inside every fuzzy clause, essential or not, the expansions that can't lift a
+            // document to the threshold even with every other clause at its bound (#1333).
+            // A non-essential one is then looked up over fewer expansions.
+            let total = prefix[n];
+            for c in clauses.iter_mut() {
+                let cut = th - (total - c.bound);
+                c.drop_below(cut);
+            }
+            // Inside every essential fuzzy clause, the expansions walked (#1363). They share
+            // one budget: a document only unwalked expansions match, across every essential
+            // fuzzy clause, scores below their largest bounds summed plus the non-essential
+            // bounds, and that sum stays below the threshold.
+            let mut budget = th - prefix[skip];
+            unwalked = false;
+            for &c in &by_bound[skip..] {
+                sync(clauses[c].set_solo(bm, &mut (), budget, decided.then_some(last.as_slice())))?;
+                let up = clauses[c].unwalked();
+                budget -= up;
+                unwalked |= up > 0.0;
+            }
+        }
+        let essential = &by_bound[skip..];
+        let Some(next) = essential.iter().filter_map(|&c| clauses[c].doc()).min() else {
+            break;
+        };
+        // The candidate, in `last`'s buffer: once it's decided, it's the last document
+        // decided, which the next pass's re-walk steps past. No allocation per candidate; a
+        // document that enters the top `k` is copied.
+        last.clear();
+        last.extend_from_slice(next);
+        decided = true;
+        let doc: &[u8] = &last;
+        contrib.fill(None);
+        let mut partial = 0.0;
+        for &c in essential {
+            if clauses[c].doc() == Some(doc) {
+                let v = clauses[c].here();
+                contrib[c] = Some(v);
+                partial += v;
+                sync(clauses[c].step(bm, &mut ()))?;
+            }
+        }
+        // The essential fuzzy clauses' unwalked expansions (#1363): each can raise its
+        // clause's contribution to at most their largest bound.
+        let mut gains: f64 = if unwalked {
+            essential
+                .iter()
+                .map(|&c| (clauses[c].unwalked() - contrib[c].unwrap_or(0.0)).max(0.0))
+                .sum()
+        } else {
+            0.0
+        };
+        for &c in essential.iter().filter(|_| unwalked) {
+            let up = clauses[c].unwalked();
+            let here = contrib[c].unwrap_or(0.0);
+            if up <= here {
+                continue;
+            }
+            let th = threshold.expect("expansions are unwalked only with k held");
+            if partial + gains + prefix[skip] < th * (1.0 - SLACK) {
+                continue 'docs;
+            }
+            gains -= up - here;
+            let v =
+                sync(clauses[c].lookup_unwalked(t, s, bm, &mut (), doc, &mut Progress::default()))?;
+            if v > here {
+                contrib[c] = Some(v);
+                partial += v - here;
+            }
+        }
+        // The non-essential clauses, largest bound first, while the document can still make it.
+        for i in (0..skip).rev() {
+            let th = threshold.expect("clauses are non-essential only with k held");
+            if partial + prefix[i + 1] < th * (1.0 - SLACK) {
+                continue 'docs;
+            }
+            let c = by_bound[i];
+            let v = sync(clauses[c].lookup(t, s, bm, &mut (), doc, &mut Progress::default()))?;
+            if v != 0.0 {
+                contrib[c] = Some(v);
+                partial += v;
+            }
+        }
+        // The exact score: contributions in the clauses' fixed order.
+        let score = contrib.iter().flatten().fold(0.0, |sum, v| sum + v);
+        if held.len() < k {
+            held.push(Held(score, doc.to_vec()));
+        } else {
+            // Better than the worst held (`Held`'s order: a higher score, or an equal score
+            // and a smaller id): it takes the worst one's place.
+            let worst = held.peek().expect("k > 0 held");
+            let better = match score.total_cmp(&worst.0) {
+                Ordering::Greater => true,
+                Ordering::Equal => doc < worst.1.as_slice(),
+                Ordering::Less => false,
+            };
+            if better {
+                held.pop();
+                held.push(Held(score, doc.to_vec()));
+            }
+        }
+    }
+    // Best first: score descending, then id ascending (`Held` orders the worst greatest).
+    let mut out = held.into_vec();
+    out.sort();
+    Ok(out.into_iter().map(|Held(s, d)| (d, s)).collect())
+}
+
+/// A [`Blocking`] read's result: always ready.
+#[inline(always)]
+fn sync<T>(p: Poll<T>) -> T {
+    match p {
+        Poll::Ready(v) => v,
         Poll::Pending => unreachable!("sync reads are always ready"),
     }
-    Ok(run.finish())
 }
