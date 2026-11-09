@@ -698,16 +698,125 @@ fn raw(url: &str, head: &str) -> std::net::TcpStream {
     tcp
 }
 
+/// Takes `s`'s one request slot (`max_concurrent` 1) with a body that never finishes:
+/// larger than the pre-read reads first (#1601), so the request reaches the limit.
+fn hold_a_slot(s: &Server) -> std::net::TcpStream {
+    raw(
+        &s.url,
+        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{",
+    )
+}
+
+/// One HTTP/1.1 answer off `tcp`: its status line, headers and body (by `Content-Length`).
+fn read_answer(tcp: &mut std::net::TcpStream) -> std::io::Result<(String, String)> {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if tcp.read(&mut byte)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    tcp.read_exact(&mut body)?;
+    Ok((head, String::from_utf8_lossy(&body).into_owned()))
+}
+
 #[test]
-fn health_and_metrics_answer_while_requests_are_shed() {
-    // perf287's F4 on #1501: one slot, held by a request whose body never finishes.
+fn an_answer_before_the_body_arrives_keeps_the_connection() {
+    // #1601: health and a shed request are answered without their bodies. hyper closed the
+    // connection when a body wasn't read yet, the late body drew a reset, and on Windows the
+    // client lost the answer (WSAECONNABORTED). Each is sent with its body 50 ms after its
+    // head; the answer must be whole and the connection must take another request.
+    use std::io::Write as _;
     let mut l = limits();
     l.max_concurrent = 1;
     let s = Server::start("", l);
-    let _held = raw(
+    let mut held = None;
+    // Health first, with the slot free; then a `Get` shed while the slot is held.
+    for (path, status) in [("Admin/Health", "200"), ("Data/Get", "503")] {
+        if path == "Data/Get" {
+            held = Some(hold_a_slot(&s));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut tcp = raw(
+            &s.url,
+            &format!(
+                "POST /v1/{path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n"
+            ),
+        );
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        tcp.write_all(b"{}").unwrap();
+        let (head, body) = read_answer(&mut tcp).unwrap();
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status}")),
+            "{path}: {head}{body}"
+        );
+        // The late body went somewhere: the same connection answers again.
+        tcp.write_all(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap_or_else(|e| panic!("{path}: the connection was closed: {e}"));
+        let (head, body) = read_answer(&mut tcp)
+            .unwrap_or_else(|e| panic!("{path}: the connection was closed: {e}"));
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "{path}, then health: {head}{body}"
+        );
+    }
+    drop(held);
+}
+
+#[test]
+fn a_body_that_never_arrives_is_answered_at_the_request_timeout_and_closed() {
+    // perf287's (1) on #1601: the pre-read waits at most --request-timeout-ms, then answers
+    // DeadlineExceeded and closes the connection rather than keep it with a body half read.
+    use std::io::Read as _;
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(300);
+    let s = Server::start("", l);
+    let mut tcp = raw(
         &s.url,
-        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        "POST /v1/Admin/Health HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
     );
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let started = std::time::Instant::now();
+    let (head, body) = read_answer(&mut tcp).unwrap();
+    assert!(head.starts_with("HTTP/1.1 504"), "{head}{body}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    assert!(body.contains("DeadlineExceeded"), "{body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "answered before its timeout"
+    );
+    let mut rest = Vec::new();
+    assert_eq!(
+        tcp.read_to_end(&mut rest).unwrap_or(0),
+        0,
+        "the connection ends"
+    );
+}
+
+#[test]
+fn health_and_metrics_answer_while_requests_are_shed() {
+    // perf287's F4 on #1501: one slot, held by a request whose body never finishes. Over
+    // the pre-read's 64 KiB (#1601), so it takes the slot before its body is read.
+    let mut l = limits();
+    l.max_concurrent = 1;
+    let s = Server::start("", l);
+    let _held = hold_a_slot(&s);
     std::thread::sleep(Duration::from_millis(200));
     let (status, body) = s.post(
         "Get",

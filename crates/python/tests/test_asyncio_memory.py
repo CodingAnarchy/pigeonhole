@@ -161,6 +161,20 @@ def test_a_cancelled_watch_wait_loses_nothing_and_one_waits_at_a_time(fdb):
         run(main(s, w))
 
 
+def test_closing_a_watch_ends_a_pending_next_async(fdb):
+    """#1606: as for the feed, the close wakes a pending wait, which fails with Closed."""
+
+    async def main(w):
+        waiting = asyncio.ensure_future(w.next_async())
+        await asyncio.sleep(0.05)
+        w.close()
+        with pytest.raises(ph.Closed):
+            await asyncio.wait_for(waiting, 1)
+
+    with mem.Store.create(fdb, "agents") as s:
+        run(main(s.watch("n")))
+
+
 # --- the consolidation loop ---
 
 
