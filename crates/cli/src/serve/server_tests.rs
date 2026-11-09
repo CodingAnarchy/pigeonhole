@@ -821,8 +821,8 @@ fn a_slow_body_counts_toward_the_request_deadline() {
     short.request_timeout = Duration::from_millis(1500);
     let r = Server::start_replica_with(test_dir(), &p.url, None, short);
     wait_replica(&r, "caught up", caught_up(&p, None));
-    let body = json!({"table": "t", "row": b64(b"x"), "family": "f", "qualifier": b64(b"q")})
-        .to_string();
+    let body =
+        json!({"table": "t", "row": b64(b"x"), "family": "f", "qualifier": b64(b"q")}).to_string();
     let mut tcp = raw(
         &r.url,
         &format!(
