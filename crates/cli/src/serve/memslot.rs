@@ -27,6 +27,10 @@ use super::errors::ApiError;
 use crate::exit::Failure;
 use crate::memcore::{Create, Embedder, MemCore, OpenError};
 
+/// The hold seam's hook: run once after an open, before its result is installed.
+#[cfg(test)]
+type AfterOpen = Box<dyn FnOnce(&MemSlot) + Send>;
+
 /// What a slot holds once an open has finished.
 #[derive(Clone)]
 pub(crate) enum Entry {
@@ -64,7 +68,7 @@ pub(crate) struct MemSlot {
     /// Runs once after an open, before its result is installed: a hold seam, where a test
     /// lands a catalog change and a clear during an open (D1).
     #[cfg(test)]
-    after_open: Mutex<Option<Box<dyn FnOnce(&MemSlot) + Send>>>,
+    after_open: Mutex<Option<AfterOpen>>,
 }
 
 impl MemSlot {
