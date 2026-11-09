@@ -20,6 +20,11 @@
 //! - **Tokens** fall between seqnos (§2.5): the last delivered seqno, and per stream where to
 //!   read again and how far the delivered records reached.
 //! - **Expiry** ([`Expiry`]) is sticky.
+//! - **The read-ahead cap** (D320): a pass keeps only records with keys at or below a
+//!   cutoff, which falls once what's kept passes the budget, and delivers up to the smaller
+//!   of the frontier and the cutoff; then it reads again from the token's hints. A stream
+//!   isn't in key order (a Decision can follow Singles with larger seqnos in its group), so
+//!   every pass still reads every stream to its end.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -213,6 +218,12 @@ enum Item {
         ts: Timestamp,
         participants: Vec<StreamId>,
     },
+    /// Past the read-ahead's cutoff (D320): passed over, read again after a rewind.
+    Skipped,
+    /// A Decision past the cutoff: its round is passed over, its shares too.
+    SkippedRound {
+        id: Seqno,
+    },
     Other,
 }
 
@@ -374,9 +385,11 @@ pub struct FeedReader {
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
-    held: HashMap<Seqno, Vec<Held>>,
+    held: BTreeMap<Seqno, Vec<Held>>,
     /// The starts of `ready`'s and `held`'s records, per stream.
     starts: Starts,
+    /// The read-ahead cap (D320).
+    ahead: ReadAhead,
     /// Rounds whose shares rule C dropped (no Decision read, the checkpoint passed): id →
     /// (stream, epoch) of a dropped share. A Decision for one later expires the feed rather
     /// than passing over its commit as recovery's all-or-nothing (simp724's H1 on #1316).
@@ -491,6 +504,86 @@ const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
 /// takes them as removed (the bound a reader snapshot waits for its view too).
 const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 
+/// A reader's read-ahead budget (D320): the bytes of records read but not delivered that it
+/// keeps (`ready` and `held`). Past it, a pass keeps only the smallest keys.
+const READ_AHEAD_BYTES: u64 = 64 << 20;
+/// What a kept record costs beyond its changes' bytes, and what each change costs beyond its
+/// row, qualifier and value: the read-ahead's accounting, not an exact allocation size.
+const RECORD_OVERHEAD: u64 = 96;
+const CHANGE_OVERHEAD: u64 = 64;
+
+/// The read-ahead bytes a record with `changes` counts for.
+fn record_bytes(changes: &[Raw]) -> u64 {
+    RECORD_OVERHEAD
+        + changes
+            .iter()
+            .map(|r| CHANGE_OVERHEAD + (r.row.len() + r.qualifier.len() + r.value.len()) as u64)
+            .sum::<u64>()
+}
+
+/// The read-ahead bytes a record kept in `ready` counts for (a decided round's shares count
+/// in `held`).
+fn pending_bytes(p: &Pending) -> u64 {
+    match p {
+        Pending::Single { changes, .. } => record_bytes(changes),
+        Pending::Decided { .. } => RECORD_OVERHEAD,
+    }
+}
+
+/// The read-ahead cap's state (D320). A pass reads every stream to its end, as without a
+/// cap, but keeps only records with keys at or below the cutoff `C`, which falls whenever
+/// what's kept passes the budget: the largest keys go first. Every record with a key at or
+/// below `C` read since the last rewind is kept, so the reader delivers up to the smaller
+/// of the frontier and `C`. A PREPARE's key is its round's apply seqno, above its id (both
+/// come from the one allocator, the id first), so a share counts at `id + 1`, a lower bound.
+#[derive(Debug)]
+struct ReadAhead {
+    /// The bytes kept now, over `ready` and `held`.
+    bytes: u64,
+    /// The budget for the next eviction: `base`, doubled after a pass that left nothing to
+    /// deliver below a cutoff under the frontier (liveness), and back to `base` on a delivery.
+    budget: u64,
+    base: u64,
+    /// `C`: every record with a key at or below it read since the last rewind is kept.
+    /// `Seqno::MAX` while nothing was passed over.
+    cutoff: Seqno,
+    /// Per stream, the earliest start of a record passed over since the last rewind: where
+    /// the stream must be read again from (and the token's hint at most this).
+    resume: Vec<Option<Lsn>>,
+    /// Rounds passed over since the last rewind (their Decision skipped, or their shares or
+    /// Decision evicted): their shares read later are passed over too, never held. Rule C
+    /// would otherwise drop a held share whose Decision this pass skipped, and the Decision
+    /// read after the rewind would then expire the feed.
+    skipped_rounds: HashSet<Seqno>,
+    /// The decided rounds in `ready`: id to apply seqno.
+    decided: HashMap<Seqno, Seqno>,
+}
+
+impl ReadAhead {
+    fn new(streams: usize, base: u64) -> Self {
+        Self {
+            bytes: 0,
+            budget: base,
+            base,
+            cutoff: Seqno::MAX,
+            resume: vec![None; streams],
+            skipped_rounds: HashSet::new(),
+            decided: HashMap::new(),
+        }
+    }
+
+    /// Stream `s`'s record at `start` was passed over.
+    fn skip(&mut self, s: usize, start: Lsn) {
+        let r = &mut self.resume[s];
+        *r = Some(r.map_or(start, |r| r.min(start)));
+    }
+
+    /// Whether anything was passed over since the last rewind.
+    fn capped(&self) -> bool {
+        self.cutoff != Seqno::MAX
+    }
+}
+
 /// What [`FeedReader::take_round`] found of a decided round.
 enum Round {
     /// Every share, its changes in stream order.
@@ -584,8 +677,9 @@ impl FeedReader {
             parks: 0,
             session: 0,
             ready: BTreeMap::new(),
-            held: HashMap::new(),
+            held: BTreeMap::new(),
             starts: Starts::default(),
+            ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
             out: Commit::default(),
             expired: None,
@@ -707,18 +801,7 @@ impl FeedReader {
             }
         };
         for (s, (at, must_reach)) in starts.into_iter().enumerate() {
-            let mut cursor = FeedCursor::open(
-                &this.shared.vfs,
-                &this.shared.path,
-                StreamId(s as u32),
-                db_id,
-                at,
-            )?;
-            // In the writer's process a stop in the head segment reads no segment headers
-            // (D310 PR 5b's subscriber cost; a reader process has no marks to follow).
-            if let Some(marks) = this.writer.as_ref().and_then(|f| f.marks(s)) {
-                cursor.follow_head(Arc::clone(marks));
-            }
+            let cursor = this.open_cursor(s, at)?;
             this.streams.push(StreamRead {
                 cursor,
                 delivered_end: at,
@@ -739,6 +822,23 @@ impl FeedReader {
             this.load_catalog(start)?;
         }
         Ok(this)
+    }
+
+    /// A cursor on stream `s` from `at`.
+    fn open_cursor(&self, s: usize, at: Lsn) -> Result<FeedCursor> {
+        let mut cursor = FeedCursor::open(
+            &self.shared.vfs,
+            &self.shared.path,
+            StreamId(s as u32),
+            self.shared.pager.db_id(),
+            at,
+        )?;
+        // In the writer's process a stop in the head segment reads no segment headers
+        // (D310 PR 5b's subscriber cost; a reader process has no marks to follow).
+        if let Some(marks) = self.writer.as_ref().and_then(|f| f.marks(s)) {
+            cursor.follow_head(Arc::clone(marks));
+        }
+        Ok(cursor)
     }
 
     /// The next whole commit, without waiting.
@@ -927,6 +1027,35 @@ impl FeedReader {
         self.held.values().map(Vec::len).sum()
     }
 
+    /// The read-ahead kept now (D320): the bytes counted over the records read but not
+    /// delivered, checked against a scan of them (an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn read_ahead_bytes(&self) -> u64 {
+        let scanned = self
+            .ready
+            .values()
+            .map(pending_bytes)
+            .chain(
+                self.held
+                    .values()
+                    .flatten()
+                    .map(|h| record_bytes(&h.changes)),
+            )
+            .sum::<u64>();
+        assert_eq!(self.ahead.bytes, scanned, "the read-ahead's tracked bytes");
+        self.ahead.bytes
+    }
+
+    /// Sets the read-ahead budget (D320) in place of the 64 MiB default: a seam for tests
+    /// that need the cap to bite on a few commits.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_read_ahead(&mut self, bytes: u64) {
+        self.ahead.base = bytes;
+        self.ahead.budget = bytes;
+    }
+
     /// The frontier as of the last poll.
     pub fn frontier(&self) -> Seqno {
         self.frontier
@@ -953,9 +1082,10 @@ impl FeedReader {
     /// or below F was read). An undecided round needs no term: the frontier never passes an
     /// undecided apply seqno. It never goes back: a record read later is above the frontier
     /// of every earlier pass. Before the first poll it is the start's bound, or a token's
-    /// delivered seqno.
+    /// delivered seqno. Under the read-ahead cap (D320) a pass covers only up to its cutoff
+    /// as well: every record at or below both was kept.
     pub fn position(&self) -> FeedPosition {
-        let mut seqno = self.read_through.unwrap_or(0);
+        let mut seqno = self.read_through.unwrap_or(0).min(self.ahead.cutoff);
         if let Some((&key, _)) = self.ready.first_key_value() {
             seqno = seqno.min(key.saturating_sub(1));
         }
@@ -1011,14 +1141,17 @@ impl FeedReader {
     }
 
     /// Where stream `s` must be read again from to deliver everything after `delivered`:
-    /// the earliest record of it read but not delivered (held or pending), else the
-    /// cursor.
+    /// the earliest record of it read but not delivered (held or pending, or passed over
+    /// by the read-ahead cap, D320), else the cursor.
     fn hint(&self, s: usize) -> Lsn {
         let cursor = self.streams[s].cursor.position();
-        let at = self
+        let mut at = self
             .starts
             .first(s)
             .map_or(cursor, |first| first.min(cursor));
+        if let Some(r) = self.ahead.resume[s] {
+            at = at.min(r);
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         debug_assert_eq!(at, self.scanned_hint(s), "stream {s}'s tracked starts");
         at
@@ -1029,6 +1162,9 @@ impl FeedReader {
     #[cfg(any(test, feature = "test-hooks"))]
     fn scanned_hint(&self, s: usize) -> Lsn {
         let mut at = self.streams[s].cursor.position();
+        if let Some(r) = self.ahead.resume[s] {
+            at = at.min(r);
+        }
         for p in self.ready.values() {
             let (stream, start) = match p {
                 Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
@@ -1166,6 +1302,20 @@ impl FeedReader {
             .hooks
             .sites
             .run(crate::engine::hooks::HookSite::ReaderFeedReads);
+        // D320: the read-ahead cap passed records over, and the frontier is past its cutoff
+        // with nothing kept left to deliver below it: the streams are read again from the
+        // first record of each not delivered (the token's hints), as a resume from the
+        // token would be.
+        if self.ahead.capped()
+            && self.ahead.cutoff < frontier
+            && self
+                .ready
+                .first_key_value()
+                .is_none_or(|(&k, _)| k > self.ahead.cutoff)
+            && !self.rewind()?
+        {
+            return Ok(Polled::Expired);
+        }
         // Nothing committed since the streams were last read to their ends under this
         // frontier (it rises with every commit): by M1 every record at or below it was read
         // then, and `emit` above found none left to deliver. Reading again would only find
@@ -1190,42 +1340,145 @@ impl FeedReader {
             }
             return Ok(self.pending_state());
         }
-        self.stream_reads += 1;
-        for s in 0..self.streams.len() {
-            if !self.read_stream(s)? {
+        loop {
+            self.stream_reads += 1;
+            for s in 0..self.streams.len() {
+                if !self.read_stream(s)? {
+                    return Ok(Polled::Expired);
+                }
+            }
+            // The writer may have restarted while the streams were read (simp724's B2): the new
+            // session's records are then in, read as outside the history, and the frontier is
+            // the old one's. Nothing read here is delivered: the caller resubscribes from the
+            // token. A new writer's segments are written after its shared memory exists, so this
+            // check sees every such restart.
+            if self.shm.is_stale() {
+                return Err(Error::SnapshotExpired);
+            }
+            // Only now: simp724's rule holds once every stream was read to its end after the
+            // checkpoints were loaded.
+            let floors: Vec<u32> = (0..self.streams.len()).map(|s| self.floor(s)).collect();
+            if let Some(e) = self.drop_aborted(&checkpoints, &floors) {
+                self.expired = Some(e);
                 return Ok(Polled::Expired);
             }
+            self.frontier = self.frontier.max(frontier);
+            self.read_through = Some(frontier);
+            // A feed of every table (D315): the catalog changes up to the frontier, after it was
+            // loaded. In the writer's process, once the session's sidecar appends stopped no
+            // later change can reach the feed: it expires (simp724 on #1493).
+            if self.tables.is_empty() {
+                self.load_catalog(None)?;
+            }
+            if let Some(p) = self.emit()?.polled() {
+                return Ok(p);
+            }
+            if self.expired.is_some() {
+                return Ok(Polled::Expired);
+            }
+            // D320's liveness: a capped pass left nothing to deliver below a cutoff under the
+            // frontier (shares of rounds in flight around the next commit filled the budget).
+            // It reads again at once, from a rewind, keeping twice as much (a delivery restores
+            // the budget): `Pending` still says every commit up to the frontier was delivered.
+            if self.ahead.cutoff < self.frontier
+                && self
+                    .ready
+                    .first_key_value()
+                    .is_none_or(|(&k, _)| k > self.ahead.cutoff)
+            {
+                self.ahead.budget = self.ahead.budget.saturating_mul(2);
+                if !self.rewind()? {
+                    return Ok(Polled::Expired);
+                }
+                continue;
+            }
+            return Ok(self.pending_state());
         }
-        // The writer may have restarted while the streams were read (simp724's B2): the new
-        // session's records are then in, read as outside the history, and the frontier is
-        // the old one's. Nothing read here is delivered: the caller resubscribes from the
-        // token. A new writer's segments are written after its shared memory exists, so this
-        // check sees every such restart.
-        if self.shm.is_stale() {
-            return Err(Error::SnapshotExpired);
+    }
+
+    /// D320: reads every stream again from its hint (the earliest record not delivered,
+    /// kept or passed over), dropping what's kept: the reads of a resume from this reader's
+    /// token. Returns `false` once the feed expired (retention passed a hint).
+    fn rewind(&mut self) -> Result<bool> {
+        let hints: Vec<Lsn> = (0..self.streams.len()).map(|s| self.hint(s)).collect();
+        for (s, &at) in hints.iter().enumerate() {
+            if at.epoch() != 0 && at.epoch() < self.floor(s) {
+                self.expired = Some(expiry(
+                    "retention passed the feed: a segment it was reading was recycled",
+                ));
+                return Ok(false);
+            }
         }
-        // Only now: simp724's rule holds once every stream was read to its end after the
-        // checkpoints were loaded.
-        let floors: Vec<u32> = (0..self.streams.len()).map(|s| self.floor(s)).collect();
-        if let Some(e) = self.drop_aborted(&checkpoints, &floors) {
-            self.expired = Some(e);
-            return Ok(Polled::Expired);
+        for (s, at) in hints.into_iter().enumerate() {
+            self.streams[s].cursor = self.open_cursor(s, at)?;
         }
-        self.frontier = self.frontier.max(frontier);
-        self.read_through = Some(frontier);
-        // A feed of every table (D315): the catalog changes up to the frontier, after it was
-        // loaded. In the writer's process, once the session's sidecar appends stopped no
-        // later change can reach the feed: it expires (simp724 on #1493).
-        if self.tables.is_empty() {
-            self.load_catalog(None)?;
+        self.ready.clear();
+        self.held.clear();
+        self.starts = Starts::default();
+        let a = &mut self.ahead;
+        a.bytes = 0;
+        a.cutoff = Seqno::MAX;
+        a.resume.iter_mut().for_each(|r| *r = None);
+        a.skipped_rounds.clear();
+        a.decided.clear();
+        self.read_through = None;
+        Ok(true)
+    }
+
+    /// D320: evicts the largest-keyed records kept while the read-ahead is over its budget,
+    /// or past the cutoff, lowering the cutoff below each. A held share counts at its id + 1
+    /// (its round's apply seqno is above its id), and goes with every share of its round; a
+    /// decided round goes with its shares.
+    fn trim(&mut self) {
+        loop {
+            let c = self.ahead.cutoff;
+            let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
+            let top_held = self
+                .held
+                .last_key_value()
+                .map(|(&id, _)| id.saturating_add(1));
+            let over = self.ahead.bytes > self.ahead.budget;
+            if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
+                return;
+            }
+            match (top_ready, top_held) {
+                (Some(k), None) => self.evict_ready(k),
+                (Some(k), Some(h)) if k >= h => self.evict_ready(k),
+                (_, Some(h)) => {
+                    let id = h - 1;
+                    if let Some(apply) = self.ahead.decided.get(&id).copied() {
+                        self.evict_ready(apply);
+                    } else {
+                        self.evict_round(id);
+                    }
+                    self.ahead.cutoff = self.ahead.cutoff.min(id);
+                }
+                (None, None) => return,
+            }
         }
-        if let Some(p) = self.emit()?.polled() {
-            return Ok(p);
+    }
+
+    /// Evicts `ready`'s record at `key` (and a decided round's shares): passed over, to be
+    /// read again after a rewind.
+    fn evict_ready(&mut self, key: Seqno) {
+        let Some(p) = self.ready.remove(&key) else {
+            return;
+        };
+        self.forget_ready(&p);
+        let (stream, start) = p.at();
+        self.ahead.skip(stream, start);
+        if let Pending::Decided { id, .. } = p {
+            self.evict_round(id);
         }
-        if self.expired.is_some() {
-            return Ok(Polled::Expired);
+        self.ahead.cutoff = self.ahead.cutoff.min(key - 1);
+    }
+
+    /// Evicts round `id`'s held shares, and passes over any read later in this pass.
+    fn evict_round(&mut self, id: Seqno) {
+        for h in self.remove_held(id) {
+            self.ahead.skip(h.stream, h.start);
         }
-        Ok(self.pending_state())
+        self.ahead.skipped_rounds.insert(id);
     }
 
     /// Nothing to deliver now: whether the feed's own holds keep the frontier below the
@@ -1316,8 +1569,18 @@ impl FeedReader {
                         },
                     );
                 }
+                Item::Skipped => {
+                    self.ahead.skip(s, start);
+                    continue;
+                }
+                Item::SkippedRound { id } => {
+                    self.ahead.skip(s, start);
+                    self.evict_round(id);
+                    continue;
+                }
                 Item::Prepare { id, changes } => {
                     self.starts.add(s, start);
+                    self.ahead.bytes += record_bytes(&changes);
                     self.held.entry(id).or_default().push(Held {
                         stream: s,
                         start,
@@ -1369,6 +1632,7 @@ impl FeedReader {
                     }
                 }
             }
+            self.trim();
         }
     }
 
@@ -1377,6 +1641,10 @@ impl FeedReader {
     /// expires the feed).
     fn read_one(&mut self, s: usize) -> Result<Option<(Lsn, Lsn, u64, Item)>> {
         let (tables, prefix) = (&self.tables, &self.prefix);
+        // D320: a record past the read-ahead's cutoff is passed over before its mutations
+        // are filtered or copied. One at or below `delivered` takes its usual path.
+        let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
+        let skipped_rounds = &self.ahead.skipped_rounds;
         let filter = |batch: BatchRef<'_>| -> Result<Vec<Raw>> {
             let mut out = Vec::new();
             for m in batch.iter() {
@@ -1427,6 +1695,18 @@ impl FeedReader {
             }
         };
         let item = match record {
+            WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
+            // Its round's apply seqno is above its id.
+            WalRecord::Prepare { seqno, .. }
+                if seqno >= cutoff || skipped_rounds.contains(&seqno) =>
+            {
+                Item::Skipped
+            }
+            WalRecord::Decision {
+                seqno, apply_seqno, ..
+            } if apply_seqno > cutoff && apply_seqno > delivered => {
+                Item::SkippedRound { id: seqno }
+            }
             WalRecord::Batch {
                 seqno,
                 commit_ts,
@@ -1461,17 +1741,31 @@ impl FeedReader {
     fn insert_ready(&mut self, key: Seqno, p: Pending) {
         let (stream, start) = p.at();
         self.starts.add(stream, start);
+        self.ahead.bytes += pending_bytes(&p);
+        if let Pending::Decided { id, .. } = p {
+            self.ahead.decided.insert(id, key);
+        }
         if let Some(old) = self.ready.insert(key, p) {
-            let (stream, start) = old.at();
-            self.starts.remove(stream, start);
+            self.forget_ready(&old);
         }
     }
 
-    /// Takes round `id`'s held shares, uncounting their starts.
+    /// Uncounts a record taken out of `ready`: its start, bytes and decided round.
+    fn forget_ready(&mut self, p: &Pending) {
+        let (stream, start) = p.at();
+        self.starts.remove(stream, start);
+        self.ahead.bytes -= pending_bytes(p);
+        if let Pending::Decided { id, .. } = p {
+            self.ahead.decided.remove(id);
+        }
+    }
+
+    /// Takes round `id`'s held shares, uncounting their starts and bytes.
     fn remove_held(&mut self, id: Seqno) -> Vec<Held> {
         let shares = self.held.remove(&id).unwrap_or_default();
         for h in &shares {
             self.starts.remove(h.stream, h.start);
+            self.ahead.bytes -= record_bytes(&h.changes);
         }
         shares
     }
@@ -1493,6 +1787,7 @@ impl FeedReader {
         drop_undecided(
             &mut self.held,
             &mut self.starts,
+            &mut self.ahead.bytes,
             &mut self.dropped,
             &decided,
             checkpoints,
@@ -1538,8 +1833,11 @@ impl FeedReader {
         loop {
             // A catalog change first, once every commit below its ceiling is delivered: the
             // frontier is past them (F + 1 >= the ceiling), and none of them is still ready.
+            // Up to the frontier, and under the read-ahead cap its cutoff (D320): every
+            // record at or below both was kept.
+            let limit = self.frontier.min(self.ahead.cutoff);
             if let Some(ev) = self.catalog.front()
-                && ev.seqno_ceiling <= self.frontier.saturating_add(1)
+                && ev.seqno_ceiling <= limit.saturating_add(1)
                 && self
                     .ready
                     .first_key_value()
@@ -1554,7 +1852,7 @@ impl FeedReader {
             let Some((&key, _)) = self.ready.first_key_value() else {
                 return Ok(Emitted::Nothing);
             };
-            if key > self.frontier {
+            if key > limit {
                 return Ok(Emitted::Nothing);
             }
             // Before anything is taken: the view can fail (a reader process's attachment
@@ -1581,8 +1879,8 @@ impl FeedReader {
             }
             self.blob_wait = None;
             let (_, p) = self.ready.pop_first().expect("checked");
-            let (stream, start) = p.at();
-            self.starts.remove(stream, start);
+            self.forget_ready(&p);
+            self.ahead.budget = self.ahead.base;
             let (ts, raws) = match p {
                 Pending::Single {
                     ts,
@@ -1679,8 +1977,9 @@ fn gap(key: Seqno) -> Expiry {
 /// stream's checkpoint passed, noting its round in `dropped`, and expires on one only the
 /// floor passed. Forgets dropped rounds whose segment is below the floor.
 fn drop_undecided(
-    held: &mut HashMap<Seqno, Vec<Held>>,
+    held: &mut BTreeMap<Seqno, Vec<Held>>,
     starts: &mut Starts,
+    bytes: &mut u64,
     dropped: &mut HashMap<Seqno, (usize, u32)>,
     decided: &std::collections::HashSet<Seqno>,
     checkpoints: &[Lsn],
@@ -1709,6 +2008,7 @@ fn drop_undecided(
             if passed {
                 dropped.insert(*id, (h.stream, h.start.epoch()));
                 starts.remove(h.stream, h.start);
+                *bytes -= record_bytes(&h.changes);
             }
             !passed
         });
@@ -2265,7 +2565,7 @@ mod tests {
     }
 
     /// `held`'s starts, counted as the reader counts them.
-    fn starts_of(held: &HashMap<Seqno, Vec<Held>>) -> Starts {
+    fn starts_of(held: &BTreeMap<Seqno, Vec<Held>>) -> Starts {
         let mut starts = Starts::default();
         for h in held.values().flatten() {
             starts.add(h.stream, h.start);
@@ -2291,7 +2591,7 @@ mod tests {
         // Stream 0's checkpoint is in epoch 5, stream 1's in epoch 3; the floors are 4 and 2.
         let checkpoints = [Lsn::new(5, 0), Lsn::new(3, 0)];
         let floors = [4, 2];
-        let mut held_map = HashMap::from([
+        let mut held_map = BTreeMap::from([
             // Undecided, passed on stream 0: dropped, and remembered.
             (1, vec![held(0, 4)]),
             // Undecided, not passed (epoch 5 at offset 64 is after the checkpoint): kept.
@@ -2301,9 +2601,12 @@ mod tests {
         ]);
         let mut dropped = HashMap::new();
         let mut starts = starts_of(&held_map);
+        // Each share's read-ahead bytes (D320): four shares with no changes.
+        let mut bytes = 4 * RECORD_OVERHEAD;
         let e = drop_undecided(
             &mut held_map,
             &mut starts,
+            &mut bytes,
             &mut dropped,
             &decided,
             &checkpoints,
@@ -2313,19 +2616,26 @@ mod tests {
         assert!(!held_map.contains_key(&1));
         assert!(held_map.contains_key(&2) && held_map.contains_key(&7));
         assert_eq!(dropped.get(&1), Some(&(0, 4)));
+        assert_eq!(
+            bytes,
+            3 * RECORD_OVERHEAD,
+            "the dropped share's bytes went with it"
+        );
         // The dropped share's start went with it: stream 0's earliest is the decided round's.
         assert_eq!(starts.0, starts_of(&held_map).0);
         assert_eq!(starts.first(0), Some(Lsn::new(1, 64)));
 
         // A share below its stream's floor that the checkpoint didn't pass: a bound broken,
         // so the feed expires and nothing is dropped.
-        let mut held_map = HashMap::from([(3, vec![held(1, 1)])]);
+        let mut held_map = BTreeMap::from([(3, vec![held(1, 1)])]);
         let mut dropped = HashMap::new();
         let checkpoints = [Lsn::new(5, 0), Lsn::new(1, 0)];
         let mut starts = starts_of(&held_map);
+        let mut bytes = RECORD_OVERHEAD;
         let e = drop_undecided(
             &mut held_map,
             &mut starts,
+            &mut bytes,
             &mut dropped,
             &decided,
             &checkpoints,
@@ -2333,12 +2643,14 @@ mod tests {
         );
         assert!(e.is_some_and(|e| e.reason.contains("retention passed a held")));
         assert!(held_map.contains_key(&3) && dropped.is_empty());
+        assert_eq!(bytes, RECORD_OVERHEAD);
 
         // A remembered round is forgotten once the floor passes its segment.
         let mut dropped = HashMap::from([(1, (0, 3)), (2, (0, 4))]);
         let e = drop_undecided(
-            &mut HashMap::new(),
+            &mut BTreeMap::new(),
             &mut Starts::default(),
+            &mut 0,
             &mut dropped,
             &decided,
             &checkpoints,

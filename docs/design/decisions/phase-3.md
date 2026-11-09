@@ -4498,3 +4498,26 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **A4:** `pigeonhole.feed.lag`, with `Feed::progress()` and `visible_seqno()`, stored once per delivered batch.
 - **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
 - **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
+
+<a id="d320"></a>
+## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
+
+**Problem.** A `FeedReader` read every stream to its end on each pass and kept every record it hadn't delivered. A consumer that fell behind kept its whole backlog decoded in memory (278,287 entries in one `phdb serve` hub, #1397 ticket 5).
+
+**A stream isn't in key order,** so a reader can't stop a stream early. A Single is keyed by its seqno and a cross-shard commit by its Decision's apply seqno. The coordinator reserves the apply seqno when it decides and queues the DECISION. The next group's Singles get their seqnos when the group forms, so they are larger, but the Singles queued before the DECISION are logged ahead of it. The inversion stays within one group, and group boundaries aren't visible in the WAL. So "every record after this point has a key above k" can't be known from a stream alone.
+
+**Decided (PR 1).** Each pass still reads every stream to its readable end (M1 and rule C are unchanged), but keeps only records with keys at or below a cutoff **C**:
+- **The budget:** 64 MiB of decoded changes (an engine constant, no public knob), counted over `ready` and `held`.
+- **Eviction:** past the budget, the largest keys go first, and C falls below each one.
+  - A held share counts at its id + 1, a lower bound for its round's apply seqno (the allocator reserves the id first). It goes with every share of its round.
+  - A decided round goes with its shares.
+- **Passing over:** a record past C is passed over after its header, with its mutations never filtered or copied. A Prepare with id ≥ C is passed over too.
+  - A Decision past C passes its round over: its shares are dropped and any read later in the pass are passed over. Leaving them held would let rule C drop them as aborted, and the Decision read after the rewind would then expire the feed.
+- **Delivery and position** go up to min(F, C), and so does a feed of every table's catalog event.
+- **The rewind:** once the frontier is past C and nothing is kept below it, the reader reads every stream again from its hint. That's the earliest record not delivered, kept or passed over, the same hint a token carries, so the rewind is a resume from the reader's own token.
+- **Liveness:** a pass that leaves nothing to deliver below a cutoff under the frontier rewinds at once with twice the budget, and a delivery restores the budget. (Only the shares of rounds in flight around the next commit can fill the budget that way.) `Pending` still means every commit up to the frontier was delivered.
+- **The bound:** the reader keeps at most its budget, plus about twice the in-flight cross-shard shares, plus one commit.
+- **The cost:** a reader that stays a backlog B behind re-reads B (frames and headers only) once per budget delivered.
+- **Reader processes** (`ReadTable::feed`) run the same passes, so the cap applies there too.
+
+**Deferred (PR 2, after PR 1's box run).** The writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it needs a per-session marker: a FORMAT and ICR line.
