@@ -104,3 +104,28 @@ fn replica_of_refuses_a_database_of_its_own() {
         "{out:?}"
     );
 }
+
+#[test]
+fn replica_of_refuses_a_memory_store() {
+    // A replica doesn't serve a memory store yet (#1618): refused at startup, before the
+    // database opens, rather than failing to create the store or serving a swapped engine.
+    let dir = TempDir::new("replica-of-memory");
+    let out = phdb(&[
+        "serve",
+        dir.path().join("r.phdb").to_str().unwrap(),
+        "--create",
+        "--listen",
+        "127.0.0.1:0",
+        "--replica-of",
+        "http://127.0.0.1:1",
+        "--memory",
+        "m",
+    ]);
+    assert_eq!(out.status, 2, "{out:?}");
+    assert!(
+        out.stderr
+            .contains("--memory m can't be used with --replica-of yet"),
+        "{out:?}"
+    );
+    assert!(!dir.path().join("r.phdb").exists(), "nothing was created");
+}

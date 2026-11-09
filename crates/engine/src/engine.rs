@@ -3321,6 +3321,18 @@ impl Engine {
             .into_async(Arc::clone(&self.inner.shared)))
     }
 
+    /// `cursor` as an async scan ([`Engine::scan_async`]) from where it stands: a sync scan
+    /// already on a row can read that row's cells with [`ScanCursor::poll_next_cell`] (a
+    /// lending walk that starts sync and goes on async, #1560). An async cursor is returned
+    /// as it is.
+    pub fn async_scan_from(&self, cursor: ScanCursor) -> ScanCursor {
+        if cursor.is_async() {
+            cursor
+        } else {
+            cursor.into_async(Arc::clone(&self.inner.shared))
+        }
+    }
+
     // ---- maintenance ----
 
     /// Freezes and flushes every memtable; returns when the SSTs are in the manifest. A

@@ -29,6 +29,7 @@ mod grpc;
 mod http;
 mod indexes;
 mod listener;
+mod memory;
 mod placement;
 mod replica;
 mod router;
@@ -119,6 +120,14 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
     let Some(primary) = &args.replica_of else {
         return Ok(None);
     };
+    // A replica can't create the store, and a re-bootstrap would swap the engine under it:
+    // refused before the database opens, until #1618.
+    if let Some(name) = &args.memory.memory {
+        return Err(Failure::usage(&format!(
+            "--memory {name} can't be used with --replica-of yet: a replica doesn't serve a \
+             memory store (#1618). Serve it from the primary"
+        )));
+    }
     if !(primary.starts_with("http://") || primary.starts_with("https://")) {
         return Err(Failure::usage(
             "--replica-of is the primary's URL: http://HOST:PORT or https://HOST:PORT",
@@ -139,6 +148,76 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
         token,
         run_events: args.replica_run.max(1),
     })))
+}
+
+/// The memory store `--memory` names (D313 ticket 8a): opened, or created, as `phdb mcp`
+/// would, with the embedder `--embed-url` gives under `--embed-timeout-ms`.
+fn memory(
+    args: &ServeArgs,
+    db: &pigeonhole::Pigeonhole,
+    stderr: &mut dyn std::io::Write,
+) -> Result<Option<crate::memcore::MemCore>, Failure> {
+    use crate::memcore::{EmbedKind, Embedder, MemCore};
+    let m = &args.memory;
+    let Some(name) = &m.memory else {
+        return Ok(None);
+    };
+    let embedder = match &m.embed_url {
+        Some(url) => Some(Embedder::Remote(crate::mcp::Endpoint::new(
+            url,
+            m.embed_model.as_deref().unwrap_or_default(),
+            m.embed_key_env.as_deref(),
+            Duration::from_millis(args.embed_timeout_ms),
+        )?)),
+        None => None,
+    };
+    let create = |e: Option<&Embedder>| {
+        let mut options = pigeonhole_memory::StoreOptions::new();
+        let model = match (e, &m.memory_model, m.memory_dim) {
+            (Some(e), _, _) => {
+                // The dimension is the endpoint's: one probe embedding tells it.
+                let dim = e
+                    .embed("dimension probe", EmbedKind::Passage)
+                    .map_err(|e| Failure::usage(&e.message))?
+                    .len();
+                Some((e.model().to_owned(), dim as u32))
+            }
+            (None, Some(id), Some(dim)) => Some((id.clone(), dim)),
+            _ => None,
+        };
+        if let Some((id, dim)) = model {
+            let element = match m.memory_element.as_str() {
+                "f16" => pigeonhole::Element::F16,
+                "bf16" => pigeonhole::Element::BF16,
+                _ => pigeonhole::Element::F32,
+            };
+            let model = pigeonhole_memory::EmbeddingModel::new(id, dim, element)
+                .map_err(|e| Failure::coded(e.code(), format!("memory store {name}: {e}")))?;
+            options = options.embedding(model);
+        }
+        if let Some(hours) = m.memory_episodic_ttl {
+            options = options.episodic_ttl(Duration::from_secs(hours.saturating_mul(3600)));
+        }
+        if let Some(n) = &m.memory_normalization {
+            options = options.normalization(match n.as_str() {
+                "nfkc" => pigeonhole_memory::Normalization::Nfkc,
+                "none" => pigeonhole_memory::Normalization::None,
+                _ => pigeonhole_memory::Normalization::Nfc,
+            });
+        }
+        let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
+        Ok(options)
+    };
+    // A recall's byte budget: 1 MiB when it sets none, 8 MiB at most, as pages are.
+    let core = MemCore::open(
+        db,
+        name,
+        embedder,
+        m.memory_model.as_deref(),
+        create,
+        (1 << 20, 8 << 20),
+    )?;
+    Ok(Some(core))
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
@@ -247,7 +326,8 @@ pub(crate) fn run(
     .backups(args.backup_dir.as_deref(), args.max_backups)
     .map_err(|e| Failure::usage(&e))?
     // Before `replica`: it rebuilds the indexes, whose rebalancing a replica pauses.
-    .placement(&placement);
+    .placement(&placement)
+    .memory_opt(memory(args, &db, stderr)?, args.memory_calls.unwrap_or(0));
     if let Some(r) = &replica {
         service = service.replica(Arc::clone(r));
     }

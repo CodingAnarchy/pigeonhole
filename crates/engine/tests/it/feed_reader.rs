@@ -1896,3 +1896,123 @@ fn an_async_feed_of_every_table_is_woken_by_a_catalog_change_on_an_idle_database
     drop(r);
     db.close().unwrap();
 }
+
+/// D320 (#1598): a reader far behind keeps at most its read-ahead budget of records read but
+/// not delivered, and still delivers every commit once, whole and in order, with its
+/// position never going back; a token taken while it's capped resumes the rest.
+#[test]
+fn a_reader_far_behind_keeps_its_read_ahead_within_its_budget() {
+    const BUDGET: u64 = 8 << 10;
+    let vfs = SimVfs::new(3201);
+    let db = open(&vfs, Some(feed(16 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    r.set_read_ahead(BUDGET);
+    // The backlog: singles on both shards and cross-shard rounds, about 100 KiB of changes.
+    let value = [7u8; 100];
+    let mut want = Vec::new();
+    for i in 0..400u32 {
+        let mut wb = WriteBatch::new();
+        let row = format!("r{i:04}");
+        if i % 5 == 0 {
+            put(&mut wb, &a, format!("{row}a").as_bytes(), &value);
+            put(&mut wb, &b, format!("{row}b").as_bytes(), &value);
+        } else {
+            put(
+                &mut wb,
+                if i % 2 == 0 { &a } else { &b },
+                row.as_bytes(),
+                &value,
+            );
+        }
+        want.push(db.commit(wb, Some(Durability::GroupSync)).unwrap().seqno);
+    }
+    let reads_before = r.stream_reads();
+    let mut got = Vec::new();
+    let mut position = r.position().seqno;
+    let mut token = None;
+    while got.len() < want.len() {
+        let c = next(&mut r);
+        assert!(
+            r.read_ahead_bytes() <= BUDGET,
+            "kept {} bytes over the budget",
+            r.read_ahead_bytes()
+        );
+        // Only rounds in flight across the cutoff are remembered as passed over, never every
+        // round of the backlog (simp724's S1 on #1622); this backlog's rounds ran one at a
+        // time.
+        assert!(
+            r.skipped_rounds() <= 1,
+            "{} rounds remembered as passed over",
+            r.skipped_rounds()
+        );
+        let p = r.position().seqno;
+        assert!(
+            p >= position,
+            "the position went back from {position} to {p}"
+        );
+        position = p;
+        got.push(c.seqno);
+        if got.len() == 150 {
+            token = Some(r.token());
+        }
+    }
+    assert_eq!(got, want);
+    // The cap bit: the backlog took many passes, each a rewind.
+    let reads = r.stream_reads() - reads_before;
+    assert!(reads > 5, "only {reads} read passes: the cap never bit");
+    assert!(matches!(r.try_next().unwrap(), Next::Pending));
+    drop(r);
+    // From the token taken while capped: the rest, nothing skipped.
+    let mut r = db
+        .feed(spec(&[&a, &b], FeedStart::Token(token.unwrap())))
+        .unwrap();
+    r.set_read_ahead(BUDGET);
+    let rest: Vec<Seqno> = (150..want.len()).map(|_| next(&mut r).seqno).collect();
+    assert_eq!(rest, want[150..]);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// D320: a feed of every table delivers a catalog change only once every commit below its
+/// ceiling is delivered, even while the read-ahead cap passed some of them over: the change
+/// waits for the cutoff as well as the frontier.
+#[test]
+fn a_capped_feed_of_every_table_delivers_a_catalog_change_after_the_commits_before_it() {
+    let vfs = SimVfs::new(3202);
+    let db = open(&vfs, Some(feed(16 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    // About one record: every pass keeps the next commit or two.
+    r.set_read_ahead(300);
+    let before: Vec<Seqno> = (0..6u32)
+        .map(|i| single(&db, &a, format!("b{i}").as_bytes(), Durability::GroupSync))
+        .collect();
+    db.create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let after: Vec<Seqno> = (0..3u32)
+        .map(|i| single(&db, &a, format!("a{i}").as_bytes(), Durability::GroupSync))
+        .collect();
+    let mut order = Vec::new();
+    while order.len() < before.len() + 1 + after.len() {
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(c) => order.push(Some(c.seqno)),
+            Next::Catalog(ev) => {
+                assert!(ev.seqno_ceiling > before[5], "{ev:?}");
+                order.push(None);
+            }
+            Next::Pending => panic!("nothing within {WAIT:?} after {order:?}"),
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    }
+    let want: Vec<Option<Seqno>> = before
+        .iter()
+        .copied()
+        .map(Some)
+        .chain([None])
+        .chain(after.iter().copied().map(Some))
+        .collect();
+    assert_eq!(order, want);
+    drop(r);
+    db.close().unwrap();
+}

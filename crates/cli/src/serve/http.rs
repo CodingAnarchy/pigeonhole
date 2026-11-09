@@ -59,6 +59,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let text = proto::text_server::TextServer::new(super::grpc::TextGrpc(Arc::clone(&shared)))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(usize::MAX);
+    let memory =
+        proto::memory_server::MemoryServer::new(super::grpc::MemoryGrpc(Arc::clone(&shared)))
+            .max_decoding_message_size(limits.max_request_bytes)
+            .max_encoding_message_size(usize::MAX);
     let feeds = super::grpc::FeedGrpc {
         shared: Arc::clone(&shared),
         max_request_bytes: limits.max_request_bytes,
@@ -107,6 +111,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .route_service(
             "/pigeonhole.v1.Text/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(text),
+        )
+        .route_service(
+            "/pigeonhole.v1.Memory/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(memory),
         )
         .route_service(
             "/pigeonhole.v1.Feed/{*method}",
@@ -184,7 +192,11 @@ async fn preread(State(shared): State<Arc<Shared>>, req: Request, next: Next) ->
         Ok(n) if n > 0 && n <= PREREAD_BYTES => n,
         _ => return next.run(req).await,
     };
-    let (parts, body) = req.into_parts();
+    // The request's deadline starts before its body is read, so a slow body counts toward
+    // it (perf287 on #1613): `call` takes this as its arrival.
+    let arrived = Instant::now();
+    let (mut parts, body) = req.into_parts();
+    parts.extensions.insert(super::grpc::Arrived(arrived));
     let read = tokio::time::timeout(
         shared.limits.request_timeout,
         axum::body::to_bytes(body, length),
@@ -303,8 +315,12 @@ async fn call(
     if length > limit {
         return ApiError::request_too_large(limit).into_response();
     }
-    // The request's one deadline starts here, before the budget wait (cli692's R1 on #1594).
-    let arrived = Instant::now();
+    // The request's one deadline starts here, before the budget wait (cli692's R1 on #1594),
+    // or where `preread` began reading its body.
+    let arrived = req
+        .extensions()
+        .get::<super::grpc::Arrived>()
+        .map_or_else(Instant::now, |a| a.0);
     let budget = match shared.router.service.reserve(length).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -354,6 +370,19 @@ async fn call(
             Err(_) => return ApiError::invalid("Last-Event-ID isn't a feed token").into_response(),
         }
     }
+    // A memory watch resumes from `Last-Event-ID` as a feed does.
+    if let ServiceOp::MemoryWatch(r) = &mut op
+        && let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok())
+    {
+        match serde_json::from_value::<proto::MemoryWatchRequest>(
+            serde_json::json!({ "resume": id }),
+        ) {
+            Ok(parsed) => r.resume = parsed.resume,
+            Err(_) => {
+                return ApiError::invalid("Last-Event-ID isn't a watch token").into_response();
+            }
+        }
+    }
     let rpc = op.index();
     // Read-your-writes on a replica (#1577), within the request timeout from its arrival.
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -388,7 +417,12 @@ async fn call(
         Ok(ServiceReply::TextSearch(r)) => json(&r),
         Ok(ServiceReply::TextRebuild(r)) => json(&r),
         Ok(ServiceReply::TextVerify(r)) => json(&r),
-        Ok(ServiceReply::Download(d)) => download(d),
+        Ok(ServiceReply::Remember(r)) => json(&r),
+        Ok(ServiceReply::Recall(r)) => json(&r),
+        Ok(ServiceReply::MarkUsed(r)) => json(&r),
+        Ok(ServiceReply::Forget(r)) => json(&r),
+        Ok(ServiceReply::MemoryWatch(events)) => stream(&headers, events),
+        Ok(ServiceReply::Download(d)) => download(d).await,
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
@@ -410,6 +444,13 @@ trait Event: Serialize {
 }
 
 impl Event for proto::ScanPage {}
+
+impl Event for proto::MemoryEvent {
+    /// The event's token, so `Last-Event-ID` can resume as for a feed.
+    fn sse_id(&self) -> Option<String> {
+        Some(base64(&self.token))
+    }
+}
 
 impl Event for proto::FeedEvent {
     /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112).
@@ -550,23 +591,55 @@ where
 /// download's id and the whole file's SHA-256 as headers (both known before the first
 /// byte), and `206` plus `Content-Range` for a resume. An error partway ends the body early;
 /// the client's SHA-256 check catches a short copy.
-fn download(d: super::backup::Download) -> Response {
-    struct Data(super::backup::Download);
+/// A download's response. HTTP sends the copy's size and hash as headers, so it waits for a
+/// fresh copy to be written, taking the heartbeats sent meanwhile (#1611: they're gRPC's).
+/// The wait comes after the dispatch, so the request's own count doesn't include it (the
+/// download's task counts `DOWNLOAD` when it ends), and it holds its `--max-streams` slot.
+async fn download(mut d: super::backup::Download) -> Response {
+    use super::backup::Copy;
+    /// The copy's bytes: the first chunk if the wait below took it, then the rest.
+    struct Data(Option<Bytes>, super::backup::Download);
     impl Stream for Data {
         type Item = Result<Bytes, std::io::Error>;
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Pin::new(&mut self.0).poll_next(cx).map(|item| {
-                item.map(|r| {
-                    r.map(|c| c.data)
-                        .map_err(|e| std::io::Error::other(e.message))
-                })
-            })
+            if let Some(first) = self.0.take() {
+                return Poll::Ready(Some(Ok(first)));
+            }
+            // A heartbeat left in the channel when the copy turned ready carries nothing for
+            // the body (cli692's N1 on #1628).
+            loop {
+                match Pin::new(&mut self.1).poll_next(cx) {
+                    Poll::Ready(Some(Ok(c))) if c.data.is_empty() && c.sha256.is_empty() => {}
+                    other => {
+                        return other.map(|item| {
+                            item.map(|r| {
+                                r.map(|c| c.data)
+                                    .map_err(|e| std::io::Error::other(e.message))
+                            })
+                        });
+                    }
+                }
+            }
         }
     }
-    let (total, offset) = (d.total, d.offset);
+    let mut first = None;
+    let kept = loop {
+        if let Copy::Ready(kept) = &*d.copy.borrow() {
+            break kept.clone();
+        }
+        match d.chunks.recv().await {
+            Some(Ok(c)) if c.data.is_empty() => {}
+            // The task sends the copy's bytes only once it saw the copy ready: this is the
+            // first of them, and the watch says ready too.
+            Some(Ok(c)) => first = Some(c.data),
+            Some(Err(e)) => return e.into_response(),
+            None => return ApiError::internal("the download ended early").into_response(),
+        }
+    };
+    let (total, offset) = (kept.total, d.offset);
     let id = d.id.clone();
-    let sha: String = d.sha256.iter().map(|b| format!("{b:02x}")).collect();
-    let mut resp = Body::from_stream(Data(d)).into_response();
+    let sha: String = kept.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    let mut resp = Body::from_stream(Data(first, d)).into_response();
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
@@ -795,6 +868,13 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Text", "Search") => ServiceOp::TextSearch(parse(body)?),
         ("Text", "Rebuild") => ServiceOp::TextRebuild(parse(body)?),
         ("Text", "Verify") => ServiceOp::TextVerify(parse(body)?),
+        ("Memory", "Remember") => ServiceOp::Remember(parse(body)?),
+        ("Memory", "Recall") => ServiceOp::Recall(parse(body)?),
+        ("Memory", "MarkUsed") => ServiceOp::MarkUsed(parse(body)?),
+        ("Memory", "Supersede") => ServiceOp::Supersede(parse(body)?),
+        ("Memory", "Link") => ServiceOp::Link(parse(body)?),
+        ("Memory", "Forget") => ServiceOp::Forget(parse(body)?),
+        ("Memory", "Watch") => ServiceOp::MemoryWatch(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

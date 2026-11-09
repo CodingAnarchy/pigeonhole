@@ -333,6 +333,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D315](phase-3.md#d315) — the change feed's read-replica prerequisites: a feed of every table, catalog events (sidecar `Catalog` entry, `CATALOG_HOLD`), replication apply with original timestamps · feed1248, engine, wal, pigeonhole, #1436, ICR 0114
 - [D316](phase-3.md#d316) — `pigeonhole-otel`: the engine's metrics as observable OpenTelemetry instruments, one reading per collection, `pigeonhole.*` names, units and attributes as a stable contract, counters kept monotonic across recoveries, engine-side commit latency from the now-public histogram; its own 0.N version line · ai1249, otel, pigeonhole, #1458, ICR 0115, ICR 0116 · owner decision
 - [D319](phase-3.md#d319) — GroupSync commits don't queue behind background output: flush and compaction output written back as it goes under a 4 MiB engine-wide budget (`File::submit_writeback`, jobs block for room, flushes keep a quarter), and the WAL record write off the driver thread · perf2 (design, Part A), perf287 (Part B), engine, sst, compaction, io, #1621, ICR 0127
+- [D320](phase-3.md#d320) — a change-feed reader's read-ahead cap: each pass still reads every stream to its end but keeps only keys up to a cutoff C (the largest evicted first once over 64 MiB), delivers up to min(F, C), rewinds through the token's hints, and doubles its budget after a capped pass with nothing to deliver; a stream isn't in key order, so no per-stream bound · feed1248, engine, #1598
 
 ## Open questions
 _None._

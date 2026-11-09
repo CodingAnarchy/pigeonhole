@@ -118,6 +118,21 @@ pub(crate) struct ServeArgs {
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
+    /// The memory store to serve as `Memory` (D313 ticket 8a), with `phdb mcp`'s flags.
+    #[command(flatten)]
+    pub memory: crate::args::MemoryArgs,
+    /// The longest one embedding call to `--embed-url` may take, in milliseconds: shorter
+    /// than `phdb mcp`'s 30 s, since a server's blocking threads wait on it.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 10_000,
+        requires = "embed_url"
+    )]
+    pub embed_timeout_ms: u64,
+    /// Memory calls at once (default: half the blocking threads, at least 1).
+    #[arg(long, value_name = "N", requires = "memory")]
+    pub memory_calls: Option<usize>,
     /// Where `Admin.Backup` writes, and (in `.phdb-serve-downloads`, the server's own, mode
     /// 0700) where `Admin.BackupDownload` keeps its copies for resumes. It must exist.
     /// Without it the server takes no backups. Put it on a disk with room for a copy or two

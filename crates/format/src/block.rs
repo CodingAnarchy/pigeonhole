@@ -737,6 +737,13 @@ pub struct BlockIter<B> {
 }
 
 impl<B: Deref<Target = [u8]>> BlockIter<B> {
+    /// The offset of the current entry in its block (the block's data end when not valid):
+    /// with the block, where the cursor stands (an async walk's "has it moved" check, #1625).
+    #[inline]
+    pub fn entry_offset(&self) -> usize {
+        self.cur
+    }
+
     /// Moves the cursor onto another logical block, unpositioned, with the O(1) checks of
     /// [`Block::new`]. On error the cursor holds `bytes` as an empty block (so it pins
     /// nothing else) and is invalid.

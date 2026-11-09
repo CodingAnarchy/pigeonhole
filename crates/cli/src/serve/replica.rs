@@ -105,12 +105,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// How long a follow must run before the pause after the next error starts short again.
 const STEADY: Duration = Duration::from_secs(30);
 
-/// How long a bootstrap waits for the primary's first answer to a fresh download, which
-/// comes only once the primary has written and hashed its whole copy (#1595). Generous: a
-/// large database's copy takes a while; past it the download breaks and starts again, with
-/// a fresh copy, so a primary whose copy takes longer can't bootstrap a replica until the
-/// primary answers at once and heartbeats while it copies (#1611).
-const COPY_WAIT: Duration = Duration::from_secs(10 * 60);
+/// The least a bootstrap waits for the primary's first answer, and between its heartbeats
+/// while it writes its copy (#1611): three of the heartbeats it sends every second, however
+/// short the stream idle limit (which bounds the waits for the copy's data).
+const BEAT_WAIT: Duration = Duration::from_secs(3);
 
 // ---- The primary's side: `Replication.Follow` ----
 
@@ -839,6 +837,9 @@ impl Replica {
         let (mut backup_id, mut offset, mut token) = (String::new(), 0u64, Vec::new());
         let mut tries = 0;
         let mut at_last_break = 0u64;
+        // The first break's reason that isn't the copy being gone: the error a bootstrap that
+        // gives up reports, so a copy that failed on the primary says why (cli692's R2 on #1628).
+        let mut cause: Option<String> = None;
         loop {
             let req = self.request(proto::BackupDownloadRequest {
                 durable: true,
@@ -846,16 +847,14 @@ impl Replica {
                 offset,
                 replica: true,
             })?;
-            // The primary writes and hashes its whole copy before it answers a fresh
-            // download, so the first answer waits for that, bounded by `COPY_WAIT`; a resumed
-            // one, and each later chunk, by the stream idle limit (#1595: a stalled stream
-            // used to hold the bootstrap for ever, with nothing in Info).
-            let first = if backup_id.is_empty() {
-                self.set_bootstrap("waiting for the primary's copy", offset);
-                COPY_WAIT
-            } else {
-                idle
-            };
+            // The primary answers at once and sends a heartbeat (a chunk with no data) every
+            // second while it writes its copy (#1611), so every wait is bounded however long
+            // the copy takes: `BEAT_WAIT` (or the idle limit, if longer) for the answer and
+            // between heartbeats, the stream idle limit for the copy's data (#1595: a stalled
+            // stream used to hold the bootstrap for ever, with nothing in Info).
+            if offset == 0 {
+                self.set_bootstrap("waiting for the primary's copy", 0);
+            }
             let connected = match client.take() {
                 Some(c) => Ok(c),
                 None => self.connect().await.map(admin),
@@ -864,22 +863,25 @@ impl Replica {
                 Err(e) => e,
                 Ok(mut c) => {
                     // Dropped with this pass: a broken stream's connection isn't reused.
-                    let answered = tokio::time::timeout(first, c.backup_download(req)).await;
+                    let beat_wait = idle.max(BEAT_WAIT);
+                    let answered = tokio::time::timeout(beat_wait, c.backup_download(req)).await;
                     match answered {
                         Err(_) => format!(
                             "{} sent no bootstrap copy within {} ms",
                             self.config.primary,
-                            first.as_millis()
+                            beat_wait.as_millis()
                         ),
                         Ok(Ok(r)) => {
                             let mut stream = r.into_inner();
+                            // Until the copy's data starts, the primary may be writing it.
+                            let mut wait = beat_wait;
                             loop {
-                                let Ok(next) = tokio::time::timeout(idle, stream.message()).await
+                                let Ok(next) = tokio::time::timeout(wait, stream.message()).await
                                 else {
                                     break format!(
                                         "no chunk of the bootstrap copy from {} within {} ms",
                                         self.config.primary,
-                                        idle.as_millis()
+                                        wait.as_millis()
                                     );
                                 };
                                 match next {
@@ -899,7 +901,12 @@ impl Replica {
                                         })?;
                                         hash.update(&chunk.data);
                                         offset += chunk.data.len() as u64;
-                                        self.set_bootstrap("downloading", offset);
+                                        // A heartbeat while the primary writes its copy
+                                        // carries no data: still waiting for the copy.
+                                        if !chunk.data.is_empty() {
+                                            self.set_bootstrap("downloading", offset);
+                                            wait = idle;
+                                        }
                                         if !chunk.sha256.is_empty() {
                                             if hash.finalize().as_slice() != chunk.sha256.as_ref() {
                                                 return Err(
@@ -933,10 +940,38 @@ impl Replica {
                                 status.message()
                             ));
                         }
+                        // The copy is gone: it failed on the primary (its error came first, as
+                        // this break's cause) or expired. Start again with a fresh copy, within
+                        // the same tries (cli692's R2 on #1628).
+                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
+                            backup_id.clear();
+                            offset = 0;
+                            at_last_break = 0;
+                            token.clear();
+                            hash = sha2::Sha256::new();
+                            file = tokio::fs::File::create(side)
+                                .await
+                                .map_err(|e| format!("creating {}: {e}", side.display()))?;
+                            tries += 1;
+                            if tries > 3 {
+                                return Err(format!(
+                                    "downloading the bootstrap copy: {}",
+                                    cause.unwrap_or_else(|| status.message().to_owned())
+                                ));
+                            }
+                            self.status().last_error = format!(
+                                "downloading the bootstrap copy: {}; starting a fresh copy",
+                                status.message()
+                            );
+                            self.set_bootstrap("waiting for the primary's copy", 0);
+                            client = None;
+                            continue;
+                        }
                         Ok(Err(status)) => status.message().to_owned(),
                     }
                 }
             };
+            cause.get_or_insert_with(|| broke.clone());
             // Three breaks in a row without progress give up; progress starts the count again
             // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
             if offset > at_last_break {
@@ -945,7 +980,8 @@ impl Replica {
             }
             tries += 1;
             if backup_id.is_empty() || tries > 3 {
-                return Err(format!("downloading the bootstrap copy: {broke}"));
+                let why = cause.unwrap_or(broke);
+                return Err(format!("downloading the bootstrap copy: {why}"));
             }
             // Info says why it's resuming (#1595), while the state stays `bootstrapping`.
             self.status().last_error = format!("downloading the bootstrap copy: {broke}");

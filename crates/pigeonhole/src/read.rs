@@ -1279,6 +1279,23 @@ struct CellWalk<'t> {
     /// The index in `info` of `family` (cells come grouped by family).
     family_index: Option<(FamilyId, usize)>,
     done: bool,
+    /// The column of a seek ([`RowCells::poll_seek`]) that returned `Pending` and isn't
+    /// finished: every later step, sync or async, finishes it first (ai1249's R1 on #1625).
+    seek: Option<Box<PendingSeek>>,
+    /// A finished seek's buffers, for the next one (no allocation per seek, perf287 on
+    /// #1625). Boxed, so the walk grows by two pointers.
+    spare_seek: Option<Box<PendingSeek>>,
+}
+
+/// A seek's column ([`CellWalk::seek`]).
+#[derive(Debug)]
+struct PendingSeek {
+    family: FamilyId,
+    qualifier: Vec<u8>,
+    /// The walk's current scan while the seek is pending, out of `CellWalk::cursor`: a
+    /// step then finds no scan and checks for a pending seek in its per-row branch, so the
+    /// per-cell step pays nothing for seeks (perf287 on #1625).
+    parked: Option<ScanCursor>,
 }
 
 impl<'t> CellWalk<'t> {
@@ -1302,6 +1319,8 @@ impl<'t> CellWalk<'t> {
             family: None,
             family_index: None,
             done: false,
+            seek: None,
+            spare_seek: None,
         })
     }
 
@@ -1325,6 +1344,11 @@ impl<'t> CellWalk<'t> {
     fn step_inner(&mut self) -> Result<bool> {
         loop {
             let Some(cursor) = self.cursor.as_mut() else {
+                // A pending seek holds the scan (`PendingSeek::parked`): it is checked here,
+                // once per scan, not per cell.
+                if self.seek.is_some() {
+                    return self.step_seeking();
+                }
                 let Some(mut next) = self.pending.pop() else {
                     return Ok(false);
                 };
@@ -1348,6 +1372,217 @@ impl<'t> CellWalk<'t> {
                 self.data = cursor.current_data();
             }
             return Ok(true);
+        }
+    }
+
+    /// The walk's family order: where `family` comes among the families its scans read
+    /// (the current one's, then the ones still to start); a family it doesn't read is last.
+    #[cfg(feature = "async")]
+    fn walk_rank(&self, family: FamilyId) -> usize {
+        // The current scan is parked with a pending seek, if there is one.
+        let parked = self.seek.as_ref().and_then(|p| p.parked.as_ref());
+        self.cursor
+            .iter()
+            .chain(parked)
+            .chain(self.pending.iter().rev())
+            .flat_map(|c| c.families())
+            .position(|&f| f == family)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// `seek` merged with a seek left pending: the later column of the two, so the walk never
+    /// moves back (ai1249's R2 on #1625). Stored as the pending one.
+    #[cfg(feature = "async")]
+    fn merge_seek(&mut self, seek: Option<(FamilyId, &[u8])>) {
+        let Some((family, qualifier)) = seek else {
+            return;
+        };
+        let rank = self.walk_rank(family);
+        // A family the walk doesn't read makes the seek a plain step (N1): never stored, so it
+        // never replaces a pending seek (whose lane may be unpositioned, ai1249's R3 on #1625)
+        // nor outlives its poll to keep a later one from being stored (N5).
+        if rank == usize::MAX {
+            return;
+        }
+        let later = match &self.seek {
+            None => true,
+            Some(p) => (rank, qualifier) > (self.walk_rank(p.family), p.qualifier.as_slice()),
+        };
+        if later {
+            let mut p = self
+                .seek
+                .take()
+                .or_else(|| self.spare_seek.take())
+                .unwrap_or_else(|| {
+                    Box::new(PendingSeek {
+                        family,
+                        qualifier: Vec::new(),
+                        parked: None,
+                    })
+                });
+            p.family = family;
+            p.qualifier.clear();
+            p.qualifier.extend_from_slice(qualifier);
+            self.seek = Some(p);
+        }
+    }
+
+    /// [`CellWalk::step`] with a seek pending, reading synchronously: the seek's cell.
+    #[cold]
+    #[inline(never)]
+    fn step_seeking(&mut self) -> Result<bool> {
+        let mut p = self.seek.take().expect("a pending seek");
+        if let Some(c) = p.parked.take() {
+            self.cursor = Some(c);
+        }
+        let r = self.step_seeking_to(p.family, &p.qualifier);
+        self.spare_seek = Some(p);
+        r
+    }
+
+    fn step_seeking_to(&mut self, family: FamilyId, qualifier: &[u8]) -> Result<bool> {
+        loop {
+            let Some(cursor) = self.cursor.as_mut() else {
+                let Some(mut next) = self.pending.pop() else {
+                    return Ok(false);
+                };
+                if next.next_row()? {
+                    self.cursor = Some(next);
+                }
+                continue;
+            };
+            let found = if cursor.families().contains(&family) {
+                cursor.seek_cell(family, qualifier)?
+            } else if self.pending.iter().any(|c| c.families().contains(&family)) {
+                false
+            } else {
+                cursor.next_cell()?.is_some()
+            };
+            if !found {
+                self.cursor = None;
+                continue;
+            }
+            let cursor = self.cursor.as_mut().expect("on a row");
+            let cell = cursor.cell().expect("held after a step");
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            self.family = Some(cell.family);
+            if cell.stored.len() <= CellData::INLINE_MAX {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = cursor.current_data();
+            }
+            return Ok(true);
+        }
+    }
+
+    /// [`CellWalk::step`] without blocking (#1560): `Pending` while a block the next cell
+    /// needs is fetched, and nothing moves. With `seek` (a family and qualifier), the step
+    /// is to the first cell at or after that column instead, never back.
+    #[cfg(feature = "async")]
+    fn poll_step(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        seek: Option<(FamilyId, &[u8])>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::task::Poll;
+        if self.done {
+            return Poll::Ready(Ok(false));
+        }
+        self.merge_seek(seek);
+        let r = match self.core.db.check_generation(self.generation) {
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(()) => {
+                let mut pending = self.seek.take();
+                if let Some(c) = pending.as_mut().and_then(|p| p.parked.take()) {
+                    self.cursor = Some(c);
+                }
+                let r = self
+                    .poll_step_inner(cx, pending.as_ref().map(|p| (p.family, &p.qualifier[..])));
+                if r.is_pending() {
+                    // Pending with the seek unfinished: the scan is parked with it.
+                    if let Some(p) = pending.as_mut() {
+                        p.parked = self.cursor.take();
+                    }
+                    self.seek = pending;
+                } else if pending.is_some() {
+                    self.spare_seek = pending;
+                }
+                r
+            }
+        };
+        if matches!(r, Poll::Ready(Err(_) | Ok(false))) {
+            self.done = true;
+        }
+        r
+    }
+
+    #[cfg(feature = "async")]
+    fn poll_step_inner(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        seek: Option<(FamilyId, &[u8])>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::task::Poll;
+        loop {
+            let Some(cursor) = self.cursor.as_mut() else {
+                let Some(next) = self.pending.pop() else {
+                    return Poll::Ready(Ok(false));
+                };
+                // The walk's scans go on async from here: one not started yet is made so.
+                let mut next = self.core.with(|e| e.async_scan_from(next));
+                match next.poll_next_row(cx) {
+                    Poll::Pending => {
+                        self.pending.push(next);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(r) => {
+                        if r.map_err(crate::Error::from)? {
+                            self.cursor = Some(next);
+                        }
+                    }
+                }
+                continue;
+            };
+            if !cursor.is_async() {
+                let c = self.cursor.take().expect("checked above");
+                self.cursor = Some(self.core.with(|e| e.async_scan_from(c)));
+                continue;
+            }
+            let polled = match seek {
+                // The column's family is this scan's: seek in it.
+                Some((family, qualifier)) if cursor.families().contains(&family) => {
+                    cursor.poll_seek_cell(cx, family, qualifier)
+                }
+                // A later scan reads it: this one's cells are all before the column.
+                Some((family, _))
+                    if self.pending.iter().any(|c| c.families().contains(&family)) =>
+                {
+                    self.cursor = None;
+                    continue;
+                }
+                // The walk is past the column's family (or never reads it): the next cell.
+                _ => cursor.poll_next_cell(cx),
+            };
+            let found = match polled {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(r) => r.map_err(crate::Error::from)?,
+            };
+            if !found {
+                self.cursor = None;
+                continue;
+            }
+            let cell = cursor.cell().expect("held after a step");
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            self.family = Some(cell.family);
+            // A small value is copied into the reused cell; a large one stays pinned.
+            if cell.stored.len() <= CellData::INLINE_MAX {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = cursor.current_data();
+            }
+            return Poll::Ready(Ok(true));
         }
     }
 
@@ -1501,6 +1736,114 @@ impl RowCells<'_> {
     /// versions: [`RowRead::pages`] ends its pages on column boundaries for that reason.
     pub fn position(&self) -> Option<RowPosition> {
         self.walk.position()
+    }
+
+    /// The cell [`RowCells::poll_next`] or [`RowCells::poll_seek`] stepped to.
+    #[cfg(feature = "async")]
+    fn entry(&mut self) -> CellEntry<'_> {
+        let walk = &mut self.walk;
+        // Caches the family's index in `family_index` (the name is borrowed below, not here).
+        let _ = walk.family_name();
+        let family = walk
+            .family_index
+            .and_then(|(_, i)| walk.info.families.get(i))
+            .map_or("", |f| f.name.as_str());
+        CellEntry {
+            family,
+            qualifier: &walk.qualifier,
+            cell: CellRef::borrowed(&walk.data),
+        }
+    }
+
+    /// [`RowCells::next`] without blocking on the device (#1560): `Pending` while a block the
+    /// next cell needs is fetched, after which the poll is the same step (a `Pending` moves
+    /// nothing). Blocks are fetched one ahead as the walk is polled (D196); a block it still
+    /// misses is read synchronously and counted in the `async_sync_reads` metric. A walk can
+    /// start with [`RowCells::next`] and go on with this.
+    #[cfg(feature = "async")]
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<CellEntry<'_>>>> {
+        match self.walk.poll_step(cx, None) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(false)) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Ready(Ok(true)) => std::task::Poll::Ready(Ok(Some(self.entry()))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Steps to the first cell at or after column (`family`, `qualifier`) in the walk's order
+    /// without blocking: a skip over the cells before it, which reads only the blocks it
+    /// lands in (#1560, perf287's T1). It never moves back: when the walk's next cell is
+    /// already at or past the column, that cell is the one, and so it is for a family of the
+    /// table the walk doesn't read. `None` when no cell is left.
+    ///
+    /// `Pending` while a block the seek lands in is fetched: poll again with the same column.
+    /// Until it completes the walk holds no cell; the next step ([`RowCells::poll_next`],
+    /// [`RowCells::next_async`], or [`RowCells::next`], which reads synchronously) finishes it
+    /// first and returns its cell. A seek to another column replaces it only if that column
+    /// is later.
+    ///
+    /// # Errors
+    /// `FamilyNotFound` if the table has no family `family`.
+    #[cfg(feature = "async")]
+    pub fn poll_seek(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        family: &str,
+        qualifier: &[u8],
+    ) -> std::task::Poll<Result<Option<CellEntry<'_>>>> {
+        let Some(id) = self.walk.info.family(family).map(|f| f.id) else {
+            return std::task::Poll::Ready(Err(crate::table::family_not_found(
+                &self.walk.info.name,
+                family,
+            )));
+        };
+        match self.walk.poll_step(cx, Some((id, qualifier))) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(false)) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Ready(Ok(true)) => std::task::Poll::Ready(Ok(Some(self.entry()))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    /// [`RowCells::next`] as a future that never blocks on the device
+    /// ([`RowCells::poll_next`]).
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+    /// let mut m = g.mutate(b"hub");
+    /// for i in 0u64..100 {
+    ///     m = m.put("out", &i.to_be_bytes(), b"");
+    /// }
+    /// m.commit()?;
+    ///
+    /// let mut degree = 0;
+    /// let mut cells = g.row(b"hub").family("out").cells()?;
+    /// # pigeonhole::doc_support::block_on(async {
+    /// while let Some(e) = cells.next_async().await? {
+    ///     assert_eq!(e.family, "out");
+    ///     degree += 1;
+    /// }
+    /// # Ok::<(), pigeonhole::Error>(())
+    /// # })?;
+    /// assert_eq!(degree, 100);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn next_async(&mut self) -> Result<Option<CellEntry<'_>>> {
+        if !std::future::poll_fn(|cx| self.walk.poll_step(cx, None)).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.entry()))
     }
 }
 

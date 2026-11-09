@@ -82,6 +82,13 @@ pub(crate) enum ServiceOp {
     TextSearch(proto::TextSearchRequest),
     TextRebuild(proto::TextIndexRequest),
     TextVerify(proto::TextIndexRequest),
+    Remember(proto::RememberRequest),
+    Recall(proto::RecallRequest),
+    MarkUsed(proto::MarkUsedRequest),
+    Supersede(proto::SupersedeRequest),
+    Link(proto::LinkRequest),
+    Forget(proto::ForgetRequest),
+    MemoryWatch(proto::MemoryWatchRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -117,6 +124,11 @@ pub(crate) enum ServiceReply {
     TextSearch(proto::TextSearchResponse),
     TextRebuild(proto::TextRebuildResponse),
     TextVerify(proto::TextVerifyResponse),
+    Remember(proto::RememberResponse),
+    Recall(proto::RecallResponse),
+    MarkUsed(proto::MarkUsedResponse),
+    Forget(proto::ForgetResponse),
+    MemoryWatch(super::memory::MemoryEvents),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -213,6 +225,13 @@ impl ServiceOp {
             Self::TextSearch(_) => 40,
             Self::TextRebuild(_) => 41,
             Self::TextVerify(_) => 42,
+            Self::Remember(_) => 43,
+            Self::Recall(_) => 44,
+            Self::MarkUsed(_) => 45,
+            Self::Supersede(_) => 46,
+            Self::Link(_) => 47,
+            Self::Forget(_) => 48,
+            Self::MemoryWatch(_) => MEMORY_WATCH,
         }
     }
 
@@ -246,7 +265,9 @@ impl ServiceOp {
             | Self::VectorSearch(_)
             | Self::VectorVerify(_)
             | Self::TextSearch(_)
-            | Self::TextVerify(_) => Scope::Read,
+            | Self::TextVerify(_)
+            | Self::Recall(_)
+            | Self::MemoryWatch(_) => Scope::Read,
             // An index is a table: creating one is a write, as `Schema.CreateTable` is.
             Self::CreateIndex(_)
             | Self::VectorInsert(_)
@@ -256,7 +277,14 @@ impl ServiceOp {
             | Self::TextCreateIndex(_)
             | Self::TextPut(_)
             | Self::TextDelete(_)
-            | Self::TextRebuild(_) => Scope::Write,
+            | Self::TextRebuild(_)
+            // Memory writes, `Forget` included: forgetting is ordinary agent behaviour, and
+            // a token's namespaces bound its reach (ai1249 on D313 §7).
+            | Self::Remember(_)
+            | Self::MarkUsed(_)
+            | Self::Supersede(_)
+            | Self::Link(_)
+            | Self::Forget(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
             // A replica's bootstrap and follow read everything, ids and all (#1436).
             Self::Flush(_)
@@ -321,6 +349,13 @@ impl ServiceOp {
             Self::TextDelete(r) => r.encoded_len(),
             Self::TextSearch(r) => r.encoded_len(),
             Self::TextRebuild(r) | Self::TextVerify(r) => r.encoded_len(),
+            Self::Remember(r) => r.encoded_len(),
+            Self::Recall(r) => r.encoded_len(),
+            Self::MarkUsed(r) => r.encoded_len(),
+            Self::Supersede(r) => r.encoded_len(),
+            Self::Link(r) => r.encoded_len(),
+            Self::Forget(r) => r.encoded_len(),
+            Self::MemoryWatch(r) => r.encoded_len(),
         }
     }
 
@@ -344,10 +379,24 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
+/// How often a download sends a heartbeat chunk while its copy is written (#1611): well
+/// inside any client's idle limit.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// A download's offset past its copy's end.
+fn past_the_copy(offset: u64, total: u64) -> ApiError {
+    ApiError::invalid(format!(
+        "offset {offset} is past the backup's {total} bytes"
+    ))
+}
+
 /// `Replication.Follow`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const FOLLOW: usize = 36;
 
-pub(crate) const RPCS: [&str; 43] = [
+/// `Memory.Watch`'s index in `RPCS`.
+pub(crate) const MEMORY_WATCH: usize = 49;
+
+pub(crate) const RPCS: [&str; 50] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -391,11 +440,18 @@ pub(crate) const RPCS: [&str; 43] = [
     "Text.Search",
     "Text.Rebuild",
     "Text.Verify",
+    "Memory.Remember",
+    "Memory.Recall",
+    "Memory.MarkUsed",
+    "Memory.Supersede",
+    "Memory.Link",
+    "Memory.Forget",
+    "Memory.Watch",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 45] = [
+pub(crate) const OUTCOMES: [&str; 46] = [
     "ok",
     "Io",
     "Corruption",
@@ -439,6 +495,7 @@ pub(crate) const OUTCOMES: [&str; 45] = [
     "TransactionFinished",
     "FailedPrecondition",
     "ReplicaBehind",
+    "Unavailable",
     "Internal",
     "other",
 ];
@@ -693,6 +750,11 @@ pub(crate) struct Service {
     pub(crate) texts: Arc<super::texts::Texts>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
     text_rebuilds: Arc<Semaphore>,
+    /// The memory store (`--memory`), if the server opened one.
+    memory: Option<Arc<crate::memcore::MemCore>>,
+    /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
+    /// can't take every blocking thread (ai1249's M6 on D313 §7).
+    memory_calls: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     schema: tokio::sync::Mutex<()>,
@@ -737,6 +799,8 @@ impl Service {
             bulk: super::bulk::BulkLoads::default(),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
             text_rebuilds: Arc::new(Semaphore::new(1)),
+            memory: None,
+            memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
@@ -835,6 +899,21 @@ impl Service {
         self.indexes = Arc::new(indexes);
         self.bulk.placement = Some(Arc::clone(placement));
         self.placement = Some(Arc::clone(placement));
+        self
+    }
+
+    /// Serves `core`, if any, as the `Memory` service, with at most `calls` memory calls on
+    /// the blocking pool at once (0: half the pool, at least 1).
+    pub(crate) fn memory_opt(
+        mut self,
+        core: Option<crate::memcore::MemCore>,
+        calls: usize,
+    ) -> Self {
+        let Some(core) = core else { return self };
+        self.memory = Some(Arc::new(core));
+        if calls > 0 {
+            self.memory_calls = Arc::new(Semaphore::new(calls));
+        }
         self
     }
 
@@ -1129,6 +1208,63 @@ impl Service {
                     .map(ServiceReply::TextVerify)
                     .map_err(ApiError::for_read)
             }
+            ServiceOp::Remember(r) => self
+                .remember(r, caller, budget)
+                .await
+                .map(ServiceReply::Remember),
+            ServiceOp::Recall(r) => {
+                drop(budget);
+                self.recall(r, caller)
+                    .await
+                    .map(ServiceReply::Recall)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::MarkUsed(r) => {
+                let ids = super::memory::ids(&r.ids)?;
+                self.memory_write("Memory.MarkUsed", caller, budget, move |core, scope| {
+                    let m = core.mark_used(scope, &ids)?;
+                    Ok(proto::MarkUsedResponse {
+                        marked: m.marked as u64,
+                    })
+                })
+                .await
+                .map(ServiceReply::MarkUsed)
+            }
+            ServiceOp::Supersede(r) => {
+                let (old, new) = (super::memory::id(&r.old)?, super::memory::id(&r.new)?);
+                self.memory_write("Memory.Supersede", caller, budget, move |core, scope| {
+                    core.supersede(scope, &old, &new)?;
+                    Ok(proto::Empty {})
+                })
+                .await
+                .map(ServiceReply::Empty)
+            }
+            ServiceOp::Link(r) => {
+                let (from, to) = (super::memory::id(&r.from)?, super::memory::id(&r.to)?);
+                let ty = super::memory::link_type(r.link_type.as_ref())?;
+                let weight = r.weight;
+                self.memory_write("Memory.Link", caller, budget, move |core, scope| {
+                    core.link(scope, &from, &to, ty, weight)?;
+                    Ok(proto::Empty {})
+                })
+                .await
+                .map(ServiceReply::Empty)
+            }
+            ServiceOp::Forget(r) => {
+                let ids = super::memory::ids(&r.ids)?;
+                self.memory_write("Memory.Forget", caller, budget, move |core, scope| {
+                    let (forgotten, _missing) = core.forget(scope, &ids)?;
+                    Ok(proto::ForgetResponse { forgotten })
+                })
+                .await
+                .map(ServiceReply::Forget)
+            }
+            ServiceOp::MemoryWatch(r) => {
+                drop(budget);
+                self.memory_watch(r, caller)
+                    .map(ServiceReply::MemoryWatch)
+                    .map_err(ApiError::for_read)
+            }
             ServiceOp::VectorBulkLoad(op) => {
                 drop(budget);
                 let index = self.index(&op.index).await?;
@@ -1273,11 +1409,18 @@ impl Service {
     /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
     /// from an offset, streamed in chunks of up to 1 MiB on its own task. It holds a
     /// `--max-streams` slot until it ends, and each send waits at most `--stream-idle-ms`.
+    ///
+    /// It answers at once (#1611): while the copy is written, the task sends a heartbeat (a
+    /// chunk with no data, at the requested offset, with the id and, for a replica, the feed
+    /// token; `total` 0 and no `sha256`, so a client's last-chunk check never fires on one)
+    /// at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
+    /// limit and resumes a break during the copy with the id. HTTP waits for the copy
+    /// instead: it sends the size and hash as headers.
     async fn backup_download(
         &self,
         r: proto::BackupDownloadRequest,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup;
+        use super::backup::{self, Copy};
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -1290,37 +1433,39 @@ impl Service {
                 "a replica can't be a bootstrap source: bootstrap from its primary",
             ));
         }
-        let (id, kept) = if r.backup_id.is_empty() {
+        let (id, copy) = if r.backup_id.is_empty() {
             let (db, durable, replica) = (self.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
-            self.backups
-                .fresh_download(move |p| {
-                    if replica {
-                        // A replica's bootstrap (#1436): a durable snapshot's copy, and the
-                        // token of a feed of every table from that same snapshot.
-                        let snap = db.durable_snapshot()?;
-                        let token = db.feed().from_snapshot(&snap).open()?.token();
-                        db.backup_at(&snap, p)?;
-                        return Ok(token.as_bytes().to_vec());
-                    }
-                    if durable {
-                        db.backup_durable(p)?;
-                    } else {
-                        db.backup(p)?;
-                    }
-                    Ok(Vec::new())
-                })
-                .await?
+            self.backups.fresh_download(move |p, started| {
+                if replica {
+                    // A replica's bootstrap (#1436): a durable snapshot's copy, and the
+                    // token of a feed of every table from that same snapshot, sent with the
+                    // heartbeats once it's known.
+                    let snap = db.durable_snapshot()?;
+                    let token = db.feed().from_snapshot(&snap).open()?.token();
+                    let token = token.as_bytes().to_vec();
+                    started(token.clone());
+                    db.backup_at(&snap, p)?;
+                    return Ok(token);
+                }
+                if durable {
+                    db.backup_durable(p)?;
+                } else {
+                    db.backup(p)?;
+                }
+                Ok(Vec::new())
+            })?
         } else {
             (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
         };
-        if r.offset > kept.total {
+        // A kept copy: an offset past it is refused now. One still being written is checked
+        // once it's ready.
+        if let Copy::Ready(kept) = &*copy.borrow()
+            && r.offset > kept.total
+        {
             self.backups.release(&id);
-            return Err(ApiError::invalid(format!(
-                "offset {} is past the backup's {} bytes",
-                r.offset, kept.total
-            )));
+            return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
         let (backups, pool, idle) = (
@@ -1330,38 +1475,78 @@ impl Service {
         );
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
-        let (task_id, task_kept, start) = (id.clone(), kept.clone(), r.offset);
+        let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
         tokio::spawn(async move {
-            let mut at = start;
+            // Sends `chunk` within the idle limit; `false` once the client went away (it
+            // resumes with the id).
+            let send = |chunk: proto::BackupChunk| {
+                let tx = tx.clone();
+                async move {
+                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
+                        Ok(Ok(())) => Ok(true),
+                        Ok(Err(_)) => Ok(false),
+                        Err(_) => Err(ApiError::deadline(
+                            "the client took no backup chunk for --stream-idle-ms; resume \
+                             with backup_id and the offset it reached",
+                        )),
+                    }
+                }
+            };
             let outcome: Result<(), ApiError> = async {
+                // The copy, with heartbeats while it's written (#1611).
+                let kept = loop {
+                    let state = task_copy.borrow_and_update().clone();
+                    let feed_token = match state {
+                        Copy::Ready(kept) => break kept,
+                        Copy::Failed(e) => return Err(e),
+                        Copy::Writing { feed_token } => feed_token,
+                    };
+                    let beat = proto::BackupChunk {
+                        data: Default::default(),
+                        total: 0,
+                        backup_id: task_id.clone(),
+                        offset: start,
+                        sha256: Default::default(),
+                        feed_token: feed_token.into(),
+                    };
+                    if !send(beat).await? {
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        changed = task_copy.changed() => {
+                            // The table dropped the copy without a last state: never expected
+                            // (it says why it failed first).
+                            if changed.is_err()
+                                && matches!(*task_copy.borrow(), Copy::Writing { .. })
+                            {
+                                return Err(ApiError::internal("the backup's copy vanished"));
+                            }
+                        }
+                        () = tokio::time::sleep(HEARTBEAT) => {}
+                    }
+                };
+                if start > kept.total {
+                    return Err(past_the_copy(start, kept.total));
+                }
+                let mut at = start;
                 loop {
-                    let path = task_kept.path.clone();
+                    let path = kept.path.clone();
                     let data = blocking(&pool, move || backup::read_chunk(&path, at)).await?;
                     let next = at + data.len() as u64;
-                    let last = next >= task_kept.total;
+                    let last = next >= kept.total;
                     let chunk = proto::BackupChunk {
                         data: data.into(),
-                        total: if last { task_kept.total } else { 0 },
+                        total: if last { kept.total } else { 0 },
                         backup_id: task_id.clone(),
                         offset: at,
                         sha256: if last {
-                            task_kept.sha256.to_vec().into()
+                            kept.sha256.to_vec().into()
                         } else {
                             Default::default()
                         },
-                        feed_token: task_kept.feed_token.clone().into(),
+                        feed_token: kept.feed_token.clone().into(),
                     };
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => {}
-                        // The client went away; it resumes with the id.
-                        Ok(Err(_)) => return Ok(()),
-                        Err(_) => {
-                            return Err(ApiError::deadline(
-                                "the client took no backup chunk for --stream-idle-ms; resume                                  with backup_id and the offset it reached",
-                            ));
-                        }
-                    }
-                    if last {
+                    if !send(chunk).await? || last {
                         return Ok(());
                     }
                     at = next;
@@ -1373,17 +1558,18 @@ impl Service {
                 outcome.as_ref().err().map(|e| e.code.as_str()),
                 started.elapsed(),
             );
+            // Within the idle limit, as a chunk: a heartbeat may still sit in the channel, and
+            // a dropped error would end the stream as if it were whole (cli692's R1 on #1628).
             if let Err(e) = outcome {
-                let _ = tx.try_send(Err(e));
+                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
             }
             backups.release(&task_id);
             drop(slot);
         });
         Ok(super::backup::Download {
             id,
-            total: kept.total,
-            sha256: kept.sha256,
             offset: r.offset,
+            copy,
             chunks: rx,
         })
     }
@@ -2062,6 +2248,114 @@ impl Service {
         self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
     }
 
+    /// The memory store, or `Unsupported` without `--memory`.
+    fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
+        self.memory.clone().ok_or_else(|| {
+            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
+        })
+    }
+
+    /// `f` on the blocking pool under the memory sub-limit (M6). The wait for a memory slot
+    /// counts against the request timeout.
+    async fn memory_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let slot = budget_within(&self.memory_calls, 1, self.limits.request_timeout)
+            .await
+            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))?;
+        let r = self.blocking(f).await;
+        drop(slot);
+        r
+    }
+
+    /// A memory write: detached (its real outcome even if the client goes away), on the
+    /// blocking pool under the memory sub-limit, with the caller's namespaces.
+    async fn memory_write<T: Send + std::fmt::Debug + 'static>(
+        &self,
+        rpc: &'static str,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+        f: impl FnOnce(&crate::memcore::MemCore, crate::memcore::Scope<'_>) -> Result<T, ApiError>
+        + Send
+        + 'static,
+    ) -> Result<T, ApiError> {
+        let core = self.memory_core()?;
+        let namespaces = caller.namespaces.clone();
+        let (calls, pool, wait) = (
+            Arc::clone(&self.memory_calls),
+            Arc::clone(&self.blocking),
+            self.limits.request_timeout,
+        );
+        self.detached(rpc, budget, async move {
+            let _slot = budget_within(&calls, 1, wait)
+                .await
+                .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))?;
+            blocking(&pool, move || {
+                f(&core, crate::memcore::Scope(namespaces.as_deref()))
+            })
+            .await
+        })
+        .await
+    }
+
+    /// `Memory.Remember`: a memory in its namespace, embedded by the server if it has an
+    /// embedder. Detached, as every write.
+    async fn remember(
+        &self,
+        r: proto::RememberRequest,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::RememberResponse, ApiError> {
+        let m = super::memory::remember(r)?;
+        self.memory_write("Memory.Remember", caller, budget, move |core, scope| {
+            let (done, _) = core.remember(scope, m, None)?;
+            Ok(super::memory::remembered(&done))
+        })
+        .await
+    }
+
+    /// `Memory.Recall`: the best memories for a query, within a byte budget (the server's
+    /// default when the request sets none, so the reply is bounded).
+    async fn recall(
+        &self,
+        r: proto::RecallRequest,
+        caller: &Caller,
+    ) -> Result<proto::RecallResponse, ApiError> {
+        let core = self.memory_core()?;
+        let a = super::memory::recall(r)?;
+        let namespaces = caller.namespaces.clone();
+        self.memory_blocking(move || {
+            let (hits, _stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+            Ok(proto::RecallResponse {
+                hits: hits.into_iter().map(super::memory::hit).collect(),
+            })
+        })
+        .await
+    }
+
+    /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
+    fn memory_watch(
+        &self,
+        r: proto::MemoryWatchRequest,
+        caller: &Caller,
+    ) -> Result<super::memory::MemoryEvents, ApiError> {
+        let core = self.memory_core()?;
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        super::memory::watch(
+            core,
+            crate::memcore::Scope(caller.namespaces.as_deref()),
+            r,
+            slot,
+            Arc::clone(&self.blocking),
+            self.limits.stream_idle,
+        )
+    }
+
     /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
     /// catch-up stream follow the same table ids), its start checked, and its stream handed to
     /// the fan-out. It holds a `--max-streams` slot until it ends.
@@ -2445,7 +2739,7 @@ fn page_bytes(asked: u64) -> u64 {
 }
 
 /// Runs a sync-only call on the blocking pool, holding one of `pool`'s permits.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     pool: &Arc<Semaphore>,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {

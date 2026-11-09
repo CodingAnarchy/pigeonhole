@@ -33,10 +33,11 @@ use super::service::{ScanPages, ServiceOp, ServiceReply};
 #[derive(Clone, Default)]
 struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
 
-/// When `prepay` saw the request arrive: the start of its one deadline, which the budget wait
-/// and a replica's wait for the client's primary seqno share (cli692's R1 on #1594).
+/// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
+/// deadline, which the budget wait and a replica's wait for the client's primary seqno share
+/// (cli692's R1 on #1594), and an HTTP/1.1 body's pre-read too (perf287 on #1613).
 #[derive(Clone, Copy)]
-struct Arrived(Instant);
+pub(crate) struct Arrived(pub(crate) Instant);
 
 impl Prepaid {
     fn take(&self) -> Option<OwnedSemaphorePermit> {
@@ -781,6 +782,80 @@ impl proto::text_server::Text for TextGrpc {
         req: Request<proto::TextIndexRequest>,
     ) -> Result<Response<proto::TextVerifyResponse>, Status> {
         unary!(&self.0, req, TextVerify, TextVerify)
+    }
+}
+
+/// `Memory` over gRPC (D313 ticket 8a): the server's one memory store.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryGrpc(pub(crate) Arc<Shared>);
+
+/// A memory watch's events as gRPC messages.
+struct GrpcMemoryEvents(super::memory::MemoryEvents);
+
+impl Stream for GrpcMemoryEvents {
+    type Item = Result<proto::MemoryEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::memory_server::Memory for MemoryGrpc {
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<proto::MemoryEvent, Status>> + Send>>;
+
+    async fn remember(
+        &self,
+        req: Request<proto::RememberRequest>,
+    ) -> Result<Response<proto::RememberResponse>, Status> {
+        unary!(&self.0, req, Remember, Remember)
+    }
+
+    async fn recall(
+        &self,
+        req: Request<proto::RecallRequest>,
+    ) -> Result<Response<proto::RecallResponse>, Status> {
+        unary!(&self.0, req, Recall, Recall)
+    }
+
+    async fn mark_used(
+        &self,
+        req: Request<proto::MarkUsedRequest>,
+    ) -> Result<Response<proto::MarkUsedResponse>, Status> {
+        unary!(&self.0, req, MarkUsed, MarkUsed)
+    }
+
+    async fn supersede(
+        &self,
+        req: Request<proto::SupersedeRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Supersede, Empty)
+    }
+
+    async fn link(
+        &self,
+        req: Request<proto::LinkRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Link, Empty)
+    }
+
+    async fn forget(
+        &self,
+        req: Request<proto::ForgetRequest>,
+    ) -> Result<Response<proto::ForgetResponse>, Status> {
+        unary!(&self.0, req, Forget, Forget)
+    }
+
+    async fn watch(
+        &self,
+        req: Request<proto::MemoryWatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        match call(&self.0, req, ServiceOp::MemoryWatch).await? {
+            ServiceReply::MemoryWatch(e) => Ok(Response::new(Box::pin(GrpcMemoryEvents(e)))),
+            _ => Err(unexpected()),
+        }
     }
 }
 

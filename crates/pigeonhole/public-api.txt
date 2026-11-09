@@ -782,6 +782,9 @@ pub pigeonhole::RowCacheStats::write_throughs: u64
 pub struct pigeonhole::RowCells<'t>
 impl pigeonhole::RowCells<'_>
 pub fn pigeonhole::RowCells<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::CellEntry<'_>>>
+pub async fn pigeonhole::RowCells<'_>::next_async(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::CellEntry<'_>>>
+pub fn pigeonhole::RowCells<'_>::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<core::option::Option<pigeonhole::CellEntry<'_>>>>
+pub fn pigeonhole::RowCells<'_>::poll_seek(&mut self, &mut core::task::wake::Context<'_>, &str, &[u8]) -> core::task::poll::Poll<pigeonhole::Result<core::option::Option<pigeonhole::CellEntry<'_>>>>
 pub fn pigeonhole::RowCells<'_>::position(&self) -> core::option::Option<pigeonhole::RowPosition>
 pub struct pigeonhole::RowIter<'t>
 impl pigeonhole::RowIter<'_>

@@ -152,7 +152,7 @@ By default a feed delivers a commit once it's durable at its commit's level. So 
 
 ## When a feed expires
 A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, and stays failed. It never skips silently. This happens when:
-- retention recycled the history it needs: raise `FeedRetention` if a slow consumer falls behind;
+- retention recycled the history it needs: raise `FeedRetention` if a slow consumer falls behind. A feed far enough behind to fill its read-ahead (64 MiB of commits it has read but not delivered) keeps only part of it in memory and reads the rest from the log again later, so retention must keep that history too. A feed that falls that far behind can therefore expire, where one that held every commit in memory wouldn't have;
 - the database was opened since with the feed off, without these tables, or with another explicit shard count;
 - a power loss took commits a `visible()` feed had delivered;
 - a short window after any metadata commit (such as a flush's, a checkpoint's, a compaction's, a schema change's or a shrink's): a power loss before the feed's record of it is synced. A process crash there no longer expires a feed: the next open finishes the record from the metadata commit itself.
