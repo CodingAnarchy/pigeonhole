@@ -88,6 +88,12 @@ impl Endpoint {
             let tls = tls.build();
             let agent = ureq::Agent::config_builder()
                 .timeout_global(Some(timeout))
+                // A connection that isn't up within this is an endpoint that can't be
+                // reached, not a slow one: shorter than the call's own bound, so it ends as
+                // a connect timeout (`EmbedFault::Unreachable`). Windows retries a SYN to a
+                // closed port for about 2 s rather than failing at once (#1617).
+                .timeout_resolve(Some(connect_timeout(timeout)))
+                .timeout_connect(Some(connect_timeout(timeout)))
                 // No redirects: the bearer key goes only to the URL given.
                 .max_redirects(0)
                 .http_status_as_error(false)
@@ -134,6 +140,10 @@ impl Endpoint {
             };
             // A transport error: the call's own timeout, or the endpoint unreachable.
             let transport = |e: ureq::Error| match e {
+                // No connection within its bound: unreachable, like a refused one.
+                ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => {
+                    fail(EmbedFault::Unreachable, e.to_string())
+                }
                 ureq::Error::Timeout(_) => fail(EmbedFault::Timeout, e.to_string()),
                 e => fail(EmbedFault::Unreachable, e.to_string()),
             };
@@ -178,6 +188,13 @@ impl Endpoint {
     }
 }
 
+/// How long an embedding call waits for its connection (name resolution, then connect and
+/// TLS, each): half the call's bound, at most 3 s.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+fn connect_timeout(call: std::time::Duration) -> std::time::Duration {
+    (call / 2).min(std::time::Duration::from_secs(3))
+}
+
 /// What kind of failure an embedding call met (ai1249's R2 on #1617). `phdb serve` answers
 /// each with its own code; `phdb mcp` reports them all alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,8 +202,9 @@ impl Endpoint {
 pub(crate) enum EmbedFault {
     /// The call took longer than the endpoint's timeout.
     Timeout,
-    /// The endpoint couldn't be reached, or answered that it's failing or busy (5xx, 408,
-    /// 429): worth retrying.
+    /// The endpoint couldn't be reached (refused, or no connection within half the call's
+    /// bound, at most 3 s), or answered that it's failing or busy (5xx, 408, 429): worth
+    /// retrying.
     Unreachable,
     /// The endpoint refused the input (400, 413, 422): the caller's text, say too long for
     /// the model.

@@ -3185,18 +3185,24 @@ fn memory_through_an_embedding_endpoint_answers_its_failures_by_kind() {
         );
     }
 
-    // An endpoint that refuses the connection: Unavailable.
+    // An endpoint that refuses the connection, and one whose connect never completes (a
+    // non-routable address: the SYN goes nowhere, or the route is refused at once): both
+    // Unavailable, the second at the connect bound (150 ms here), never DeadlineExceeded.
+    // Windows retries a SYN to a closed port for about 2 s, so even the first took the
+    // second's path there (#1617).
     let closed = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}/v1/embeddings", l.local_addr().unwrap())
     };
-    let s = embedding_memory_server(&closed);
-    let (status, e) = remember(&s, "a", "anything", None);
-    assert_eq!(
-        (status, e["code"].as_str()),
-        (503, Some("Unavailable")),
-        "{e}"
-    );
+    for url in [closed.as_str(), "http://10.255.255.1:9/v1/embeddings"] {
+        let s = embedding_memory_server(url);
+        let (status, e) = remember(&s, "a", "anything", None);
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (503, Some("Unavailable")),
+            "{url}: {e}"
+        );
+    }
 }
 
 #[test]
