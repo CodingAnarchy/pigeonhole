@@ -88,6 +88,8 @@ pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 insta = { version = "1.49", features = ["filters"] }
 # `tests/check_fixtures.rs` rewrites structures with valid checksums.
 pigeonhole-format = { workspace = true }
+# `serve`'s tests: a filesystem that makes a backup download's copy slow (#1611).
+pigeonhole-io = { workspace = true }
 # `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
 ureq = { version = "3.5", default-features = false, features = ["json"] }

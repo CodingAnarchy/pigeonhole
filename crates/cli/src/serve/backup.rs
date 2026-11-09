@@ -85,9 +85,6 @@ pub(crate) struct Backups {
     /// Backups running at once (`--max-backups`).
     running: Arc<Semaphore>,
     reaper: Once,
-    /// A hold before each fresh download's backup, in tests: a copy that takes a while.
-    #[cfg(test)]
-    copy_delay: Mutex<Duration>,
 }
 
 impl std::fmt::Debug for Backups {
@@ -119,8 +116,6 @@ impl Backups {
             kept: Mutex::new(HashMap::new()),
             running: Arc::new(Semaphore::new(max_backups.max(1))),
             reaper: Once::new(),
-            #[cfg(test)]
-            copy_delay: Mutex::new(Duration::ZERO),
         }))
     }
 
@@ -242,11 +237,6 @@ impl Backups {
         self.start_reaper();
         let me = Arc::clone(self);
         let tid = id.clone();
-        #[cfg(test)]
-        let delay = *self
-            .copy_delay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         std::thread::Builder::new()
             .name("phdb-serve-backup".into())
             .spawn(move || {
@@ -273,8 +263,6 @@ impl Backups {
                     error: None,
                     done: false,
                 };
-                #[cfg(test)]
-                std::thread::sleep(delay);
                 let started = |token: Vec<u8>| me.started(&tid, token);
                 let written = take(&path, &started)
                     .and_then(|token| digest(&path).map(|(total, sha)| (total, sha, token)));
@@ -353,6 +341,11 @@ impl Backups {
     fn finish(&self, id: &str, total: u64, sha256: [u8; 32], feed_token: Vec<u8>) {
         let mut kept = self.lock();
         let Some(e) = kept.get_mut(id) else { return };
+        // The token the backup returned is the one it announced (cli692's N3 on #1628).
+        debug_assert!(
+            e.kept.feed_token.is_empty() || e.kept.feed_token == feed_token,
+            "copy {id}'s feed token changed"
+        );
         e.kept.total = total;
         e.kept.sha256 = sha256;
         e.kept.feed_token = feed_token;
@@ -381,15 +374,6 @@ impl Backups {
         e.readers += 1;
         e.last_used = Instant::now();
         Ok(e.state.subscribe())
-    }
-
-    /// Holds each fresh download's backup for `d` before it starts (tests: a slow copy).
-    #[cfg(test)]
-    pub(crate) fn delay_copies(&self, d: Duration) {
-        *self
-            .copy_delay
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = d;
     }
 
     /// A reader of `id` is done.

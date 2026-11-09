@@ -1272,7 +1272,8 @@ impl Service {
     ///
     /// It answers at once (#1611): while the copy is written, the task sends a heartbeat (a
     /// chunk with no data, at the requested offset, with the id and, for a replica, the feed
-    /// token) at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
+    /// token; `total` 0 and no `sha256`, so a client's last-chunk check never fires on one)
+    /// at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
     /// limit and resumes a break during the copy with the id. HTTP waits for the copy
     /// instead: it sends the size and hash as headers.
     async fn backup_download(
@@ -1417,8 +1418,10 @@ impl Service {
                 outcome.as_ref().err().map(|e| e.code.as_str()),
                 started.elapsed(),
             );
+            // Within the idle limit, as a chunk: a heartbeat may still sit in the channel, and
+            // a dropped error would end the stream as if it were whole (cli692's R1 on #1628).
             if let Err(e) = outcome {
-                let _ = tx.try_send(Err(e));
+                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
             }
             backups.release(&task_id);
             drop(slot);
@@ -1429,12 +1432,6 @@ impl Service {
             copy,
             chunks: rx,
         })
-    }
-
-    /// Holds each fresh download's backup for `d` before it starts (tests: a slow copy).
-    #[cfg(test)]
-    pub(crate) fn delay_copies(&self, d: std::time::Duration) {
-        self.backups.delay_copies(d);
     }
 
     /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.

@@ -552,6 +552,8 @@ where
 /// the client's SHA-256 check catches a short copy.
 /// A download's response. HTTP sends the copy's size and hash as headers, so it waits for a
 /// fresh copy to be written, taking the heartbeats sent meanwhile (#1611: they're gRPC's).
+/// The wait comes after the dispatch, so the request's own count doesn't include it (the
+/// download's task counts `DOWNLOAD` when it ends), and it holds its `--max-streams` slot.
 async fn download(mut d: super::backup::Download) -> Response {
     use super::backup::Copy;
     /// The copy's bytes: the first chunk if the wait below took it, then the rest.
@@ -562,12 +564,21 @@ async fn download(mut d: super::backup::Download) -> Response {
             if let Some(first) = self.0.take() {
                 return Poll::Ready(Some(Ok(first)));
             }
-            Pin::new(&mut self.1).poll_next(cx).map(|item| {
-                item.map(|r| {
-                    r.map(|c| c.data)
-                        .map_err(|e| std::io::Error::other(e.message))
-                })
-            })
+            // A heartbeat left in the channel when the copy turned ready carries nothing for
+            // the body (cli692's N1 on #1628).
+            loop {
+                match Pin::new(&mut self.1).poll_next(cx) {
+                    Poll::Ready(Some(Ok(c))) if c.data.is_empty() && c.sha256.is_empty() => {}
+                    other => {
+                        return other.map(|item| {
+                            item.map(|r| {
+                                r.map(|c| c.data)
+                                    .map_err(|e| std::io::Error::other(e.message))
+                            })
+                        });
+                    }
+                }
+            }
         }
     }
     let mut first = None;

@@ -837,6 +837,9 @@ impl Replica {
         let (mut backup_id, mut offset, mut token) = (String::new(), 0u64, Vec::new());
         let mut tries = 0;
         let mut at_last_break = 0u64;
+        // The first break's reason that isn't the copy being gone: the error a bootstrap that
+        // gives up reports, so a copy that failed on the primary says why (cli692's R2 on #1628).
+        let mut cause: Option<String> = None;
         loop {
             let req = self.request(proto::BackupDownloadRequest {
                 durable: true,
@@ -937,10 +940,38 @@ impl Replica {
                                 status.message()
                             ));
                         }
+                        // The copy is gone: it failed on the primary (its error came first, as
+                        // this break's cause) or expired. Start again with a fresh copy, within
+                        // the same tries (cli692's R2 on #1628).
+                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
+                            backup_id.clear();
+                            offset = 0;
+                            at_last_break = 0;
+                            token.clear();
+                            hash = sha2::Sha256::new();
+                            file = tokio::fs::File::create(side)
+                                .await
+                                .map_err(|e| format!("creating {}: {e}", side.display()))?;
+                            tries += 1;
+                            if tries > 3 {
+                                return Err(format!(
+                                    "downloading the bootstrap copy: {}",
+                                    cause.unwrap_or_else(|| status.message().to_owned())
+                                ));
+                            }
+                            self.status().last_error = format!(
+                                "downloading the bootstrap copy: {}; starting a fresh copy",
+                                status.message()
+                            );
+                            self.set_bootstrap("waiting for the primary's copy", 0);
+                            client = None;
+                            continue;
+                        }
                         Ok(Err(status)) => status.message().to_owned(),
                     }
                 }
             };
+            cause.get_or_insert_with(|| broke.clone());
             // Three breaks in a row without progress give up; progress starts the count again
             // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
             if offset > at_last_break {
@@ -949,7 +980,8 @@ impl Replica {
             }
             tries += 1;
             if backup_id.is_empty() || tries > 3 {
-                return Err(format!("downloading the bootstrap copy: {broke}"));
+                let why = cause.unwrap_or(broke);
+                return Err(format!("downloading the bootstrap copy: {why}"));
             }
             // Info says why it's resuming (#1595), while the state stays `bootstrapping`.
             self.status().last_error = format!("downloading the bootstrap copy: {broke}");
