@@ -1193,8 +1193,8 @@ impl SparePrep {
                 match Pin::new(w).poll(cx) {
                     Poll::Ready(Ok(buf)) => {
                         self.buffers.push(buf);
-                        let (_, at, len) = self.writes.pop_front().expect("polled above");
-                        self.write_back(at, len);
+                        // g44's B-only arm: no write-back of the chunk (left dirty, as main).
+                        let _ = self.writes.pop_front().expect("polled above");
                         continue;
                     }
                     Poll::Ready(Err(e)) => {
