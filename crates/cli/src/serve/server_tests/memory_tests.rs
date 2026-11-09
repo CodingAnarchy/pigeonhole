@@ -856,9 +856,9 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
     let (status, body) = recall_with(&r, "memory", &[]);
     assert_eq!(status, 200, "{body}");
     let replica_store = served_store(&r);
-    assert_eq!(ivf_lists(replica_store.store()), lists);
+    assert_eq!(ivf_lists(replica_store.store().unwrap()), lists);
     assert_eq!(
-        pigeonhole_memory::hooks::ivf_rebalancer_started(replica_store.store()),
+        pigeonhole_memory::hooks::ivf_rebalancer_started(replica_store.store().unwrap()),
         Some(false),
         "a replica's store started a rebalancer"
     );
@@ -867,7 +867,7 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
     let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        pigeonhole_memory::hooks::ivf_rebalancer_started(served_store(&r).store()),
+        pigeonhole_memory::hooks::ivf_rebalancer_started(served_store(&r).store().unwrap()),
         Some(true),
         "the promote's open started no rebalancer"
     );
@@ -881,7 +881,7 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
         assert_eq!(status, 200, "{body}");
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while ivf_lists(served_store(&r).store()) <= lists {
+    while ivf_lists(served_store(&r).store().unwrap()) <= lists {
         assert!(
             std::time::Instant::now() < deadline,
             "the promoted replica's store never split a list"
