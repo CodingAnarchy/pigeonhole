@@ -25,8 +25,12 @@ pub(crate) const FRAME: u64 = FRAME_SIZE as u64;
 /// (decision D43).
 pub(crate) const MAX_SEGMENT_SIZE: u64 = (1 << 32) - FRAME;
 
-/// Bytes written per call when zero-filling a slot.
-const ZERO_CHUNK: usize = 1 << 20;
+/// Bytes written per call when zero-filling a slot. A spare's chunk is written back before
+/// the next is written (D319), and a group sync of the stream file waits for the one chunk
+/// dirty or under write-back, so this bounds that wait: at 1 MiB it doubled the
+/// group-commit row's p99.9 (#1646's box run); 256 KiB keeps it to about a tenth of a
+/// millisecond on NVMe.
+const ZERO_CHUNK: usize = 256 << 10;
 
 /// Appends between checks for an early rollover out of an `Extended` slot (D319).
 const EARLY_CHECK_EVERY: u32 = 64;

@@ -757,8 +757,8 @@ fn an_extended_open_segment_is_left_once_a_spare_is_ready() {
 fn a_spare_is_zero_filled_a_chunk_at_a_time_each_written_back_before_the_next() {
     let sim = pigeonhole_io::sim::SimVfs::new(41);
     let vfs: pigeonhole_io::VfsRef = sim.clone();
-    // A segment of three 1 MiB chunks (32 frames of 32 KiB each).
-    let opts = opts(3 * 32, 1);
+    // A segment of three 256 KiB chunks (8 frames of 32 KiB each).
+    let opts = opts(3 * 8, 1);
     let wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
     let spares = wal.spares();
     sim.set_deferred_io(true);
