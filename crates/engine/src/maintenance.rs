@@ -455,7 +455,7 @@ impl Copier<'_> {
                 let mut sources = Vec::new();
                 mem_sources(set, &all, &mut sources);
                 let options = writer_options(&meta.options, t.table, f, t.id, self.created);
-                // Sized as a flush sizes it, from the memtables' bytes (#1595: the target
+                // Sized from the memtables' bytes, as a flush is (#1595: the target
                 // SST size here reserved a 64 MiB-aligned extent per family, so a copy of a
                 // few hundred KiB of memtables was hundreds of MiB, nearly all free).
                 let bytes: u64 = set.readers.iter().map(|r| r.bytes()).sum();

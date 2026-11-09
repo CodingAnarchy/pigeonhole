@@ -1183,10 +1183,10 @@ impl MemtableReader {
         self.len() == 0
     }
 
-    /// The bytes the memtable's entries take in the arena (its header's count, which the
-    /// writer raises as it inserts): about an upper bound on the SST written from them, as
-    /// [`Memtable::allocated_bytes`] is for the writer. A size estimate only (a backup sizes
-    /// its SSTs' extents by it, #1595): read Relaxed, as the writer stores it, so on a
+    /// The bytes written into the arena for its entries (the header's byte field, which the
+    /// writer raises as it inserts; at most the writer's [`Memtable::allocated_bytes`]):
+    /// about an upper bound on the SST written from them. A size estimate only (a backup
+    /// sizes its SSTs' extents by it, #1595): read Relaxed, as the writer stores it, so on a
     /// memtable still taking inserts it can trail [`len`](Self::len)'s entries.
     pub fn bytes(&self) -> u64 {
         self.region
