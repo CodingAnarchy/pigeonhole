@@ -394,6 +394,9 @@ pub(crate) struct FeedStats {
 pub(crate) struct Feeds {
     /// Where hubs and clients run: the server's feed runtime, once `run_on` set it.
     runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// Where the hubs run: the server's hub runtime, once `run_on` set it (#1397: on the
+    /// feed runtime they queued behind the clients' tasks and fell behind their feeds).
+    hub_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     db: pigeonhole::Pigeonhole,
     hubs: Mutex<HashMap<HubKey, Weak<Hub>>>,
     catch_up: Arc<Semaphore>,
@@ -422,6 +425,7 @@ impl Feeds {
     pub(crate) fn new(db: pigeonhole::Pigeonhole, limits: FeedLimits) -> Arc<Self> {
         Arc::new(Self {
             runtime: std::sync::OnceLock::new(),
+            hub_runtime: std::sync::OnceLock::new(),
             db,
             hubs: Mutex::new(HashMap::new()),
             catch_up: Arc::new(Semaphore::new(limits.max_catch_up.max(1))),
@@ -431,11 +435,26 @@ impl Feeds {
         })
     }
 
-    /// Runs the hubs and the clients' delivery on `runtime` from now on, instead of the
-    /// caller's: the server's feed runtime (ticket 5's (A), with perf287's D1: the hubs too),
-    /// so delivery never holds a worker that serves requests. Set once, before serving.
-    pub(crate) fn run_on(&self, runtime: tokio::runtime::Handle) {
+    /// Runs the clients' delivery on `runtime` and the hubs on `hubs` from now on, instead of
+    /// the caller's: the server's feed runtime (ticket 5's (A)), so delivery never holds a
+    /// worker that serves requests, and the hub runtime, so a hub reading its engine feed
+    /// never queues behind its clients' tasks (#1397's 16 hubs × 16). Set once, before
+    /// serving.
+    pub(crate) fn run_on(&self, runtime: tokio::runtime::Handle, hubs: tokio::runtime::Handle) {
         let _ = self.runtime.set(runtime);
+        let _ = self.hub_runtime.set(hubs);
+    }
+
+    /// Spawns a hub's task on the hub runtime, or as [`spawn`](Self::spawn) does without one.
+    fn spawn_hub<F>(&self, f: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self.hub_runtime.get() {
+            Some(rt) => rt.spawn(f),
+            None => self.spawn(f),
+        }
     }
 
     /// Spawns `f` on the feed runtime, or on the caller's without one (tests).
@@ -603,7 +622,7 @@ impl Feeds {
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let weak = weak.clone();
             let task = self
-                .spawn(async move {
+                .spawn_hub(async move {
                     loop {
                         // A poll that finds nothing records how far the feed got, so the ring's
                         // `passed` follows other tables' writes (the engine wakes the hub on each
@@ -1512,7 +1531,7 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
             },
         );
-        feeds.run_on(delivery.handle().clone());
+        feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         let before = delivery.metrics().num_alive_tasks();
         requests.block_on(async {
@@ -1576,7 +1595,7 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
             },
         );
-        feeds.run_on(delivery.handle().clone());
+        feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         let seen = requests.block_on(async {
             let slot = Arc::clone(&slots).try_acquire_owned().unwrap();

@@ -19,6 +19,10 @@ pub(crate) struct Placement {
     pub blocking_threads: usize,
     /// The feed delivery runtime's workers (ticket 5's (A)).
     pub feed_threads: usize,
+    /// The feed hubs' runtime's workers: a quarter of the feed threads, at least 1 (#1397's
+    /// 16 hubs × 16, where the hubs fell behind their engine feeds queued behind the
+    /// clients' tasks on the feed runtime). Placed on the same CPUs, so the OS shares them.
+    pub hub_threads: usize,
     /// The CPUs outside the shards' (Linux, when the engine pinned any).
     #[cfg(target_os = "linux")]
     mask: Option<nix::sched::CpuSet>,
@@ -56,6 +60,7 @@ impl Placement {
         // left the network side short and every split run fell behind; 9 + 3 kept up.
         let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
+            hub_threads: feed_threads.div_ceil(4).max(1),
             io_threads: io
                 .unwrap_or(free.saturating_sub(feed_threads).max(2))
                 .max(1),
@@ -174,6 +179,13 @@ mod tests {
         }
         let given = Placement::plan(&db, Some(3), Some(5), Some(2));
         assert_eq!((given.io_threads, given.feed_threads), (3, 2));
+        // The hubs' threads: a quarter of the feed threads, rounded up, at least 1.
+        for (feed, hubs) in [(1, 1), (2, 1), (3, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
+            assert_eq!(
+                Placement::plan(&db, None, None, Some(feed)).hub_threads,
+                hubs
+            );
+        }
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();
