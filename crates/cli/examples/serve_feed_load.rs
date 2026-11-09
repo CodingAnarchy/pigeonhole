@@ -15,7 +15,12 @@
 //! - one subscriber on `tiny` while `busy` takes the writes (perf287's row: a hub on a table
 //!   nobody writes still reads past the others' records);
 //! - 16 hubs × 16 subscribers: sixteen table sets `{busy, hNN}`, each its own engine
-//!   subscription, sixteen streams on each (perf287's row on #1518: per-hub costs add up).
+//!   subscription, sixteen streams on each (perf287's row on #1518: per-hub costs add up);
+//!   `--hubs` and `--per-hub` scale it.
+//!
+//! A discarded 0-subscriber warm-up runs first (`--warmup false` skips it). `--dump-every
+//! SECS` sends the server SIGUSR1 during each put loop, so its feed dump (each hub's ring and
+//! where its clients are) lands on stderr beside the rows.
 //!
 //! ```text
 //! cargo build --release -p pigeonhole-cli --features serve --bin phdb --example serve_feed_load
@@ -118,6 +123,21 @@ struct Args {
     /// `--h2-adaptive false` uses the fixed windows.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     h2_adaptive: bool,
+    /// Run a 0-subscriber scenario first and discard it: the first scenario on a fresh store
+    /// pays its warm-up (perf287's g21 on #1397: 20-40 ms put p99 against 0.9-3.7 ms in the
+    /// later 0-subscriber rows). `--warmup false` skips it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    warmup: bool,
+    /// The multi-hub row's hubs: table sets `{busy, hNN}`, each its own engine subscription.
+    #[arg(long, default_value_t = 16)]
+    hubs: usize,
+    /// The multi-hub row's streams on each hub.
+    #[arg(long, default_value_t = 16)]
+    per_hub: usize,
+    /// Send the server SIGUSR1 every this many seconds of each scenario's put loop: it writes
+    /// its feed hubs and their clients to stderr (Unix).
+    #[arg(long, value_name = "SECS")]
+    dump_every: Option<u64>,
 }
 
 /// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
@@ -212,11 +232,20 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
         .collect();
     scenarios.push(("1 on tiny".into(), vec![vec!["tiny".to_owned()]]));
     scenarios.push((
-        "16 hubs x 16".into(),
-        (0..16)
-            .flat_map(|h| std::iter::repeat_n(vec!["busy".to_owned(), format!("h{h:02}")], 16))
+        format!("{} hubs x {}", args.hubs, args.per_hub),
+        (0..args.hubs)
+            .flat_map(|h| {
+                std::iter::repeat_n(vec!["busy".to_owned(), format!("h{h:02}")], args.per_hub)
+            })
             .collect(),
     ));
+    if args.warmup {
+        let r = run(&args, &channel, server.pid(), &[]).await?;
+        println!(
+            "{:<22} {:>10.0} {:>9} {:>9} {:>9}   (discarded: the first scenario on a fresh store)",
+            "warm-up", r.puts_per_sec, r.p50, r.p99, r.p999
+        );
+    }
     for (name, subs) in scenarios {
         let r = run(&args, &channel, server.pid(), &subs).await?;
         let lag = |q: f64| {
@@ -284,7 +313,7 @@ fn prepare(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
     for t in ["busy", "tiny"]
         .into_iter()
         .map(str::to_owned)
-        .chain((0..16).map(|i| format!("h{i:02}")))
+        .chain((0..args.hubs).map(|i| format!("h{i:02}")))
     {
         db.table(&t)?.family("f", Family::default()).create()?;
     }
@@ -699,6 +728,25 @@ async fn run(
     let metrics_before = feed_counters(channel).await?;
     let started = Instant::now();
     let end = started + Duration::from_secs(args.seconds);
+    // SIGUSR1 to the server now and then: its feed dump goes to stderr.
+    let dumper = args.dump_every.filter(|_| subscribers > 0).map(|every| {
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(every.max(1))) => {}
+                    _ = stop.changed() => break,
+                }
+                if Instant::now() >= end {
+                    break;
+                }
+                let _ = Command::new("kill")
+                    .arg("-USR1")
+                    .arg(server.to_string())
+                    .status();
+            }
+        })
+    });
     let mut writers = Vec::with_capacity(args.writers);
     // --put-rate: one thread keeps the schedule (perf287 on #1397: tokio's ~1 ms timer made a
     // paced put's latency, counted from its due time, up to a tick late).
@@ -800,6 +848,9 @@ async fn run(
     // Give the subscribers a moment to take the last commits, then end them.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let _ = stop_tx.send(());
+    if let Some(d) = dumper {
+        let _ = d.await;
+    }
     let mut lag = Lag::new();
     for s in subs {
         lag.merge(&s.await?);

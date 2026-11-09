@@ -92,6 +92,28 @@ pub(crate) struct Spec {
     pub start: Start,
 }
 
+/// Where a client is, for the feed dump ([`Feeds::dump`], `phdb serve` on SIGUSR1): two
+/// relaxed stores per batch, read only by the dump.
+#[derive(Debug, Default)]
+struct Tracker {
+    /// [`ON_RING`], [`ON_OWN`] or [`WAITING`].
+    state: AtomicU64,
+    /// On the ring, its next index; on its own stream, the seqno it covered.
+    at: AtomicU64,
+}
+
+const ON_RING: u64 = 0;
+const ON_OWN: u64 = 1;
+/// Waiting for a `--max-catch-up` slot, delivering nothing.
+const WAITING: u64 = 2;
+
+impl Tracker {
+    fn set(&self, state: u64, at: u64) {
+        self.state.store(state, Ordering::Relaxed);
+        self.at.store(at, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct HubKey {
     /// The tables' feed ids, so a table dropped and created again under its name is another
@@ -197,11 +219,20 @@ struct Hub {
     stats: Arc<FeedStats>,
     /// Live hubs, shared: each ring's cap is the total over it.
     live: Arc<AtomicU64>,
+    /// Its clients' trackers, for the dump; a gone client's is pruned there.
+    clients: Mutex<Vec<Weak<Tracker>>>,
 }
 
 impl Hub {
     fn ring(&self) -> MutexGuard<'_, Ring> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn track(&self, tracker: &Arc<Tracker>) {
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::downgrade(tracker));
     }
 
     fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
@@ -370,6 +401,88 @@ impl Feeds {
         }
     }
 
+    /// A report of every live hub and where its clients are, for `phdb serve` on SIGUSR1
+    /// (#1397's 16 hubs × 16): how far each hub's engine feed is behind the database, its
+    /// ring against its share of `--feed-ring-bytes`, and its clients on the ring (entries
+    /// behind its head), on their own streams (seqnos behind the hub) and waiting for a
+    /// `--max-catch-up` slot. Blocking: it takes a snapshot for the database's seqno.
+    pub(crate) fn dump(&self) -> String {
+        use std::fmt::Write as _;
+        fn spread(mut v: Vec<u64>) -> String {
+            if v.is_empty() {
+                return "-".into();
+            }
+            v.sort_unstable();
+            format!("{}/{}/{}", v[0], v[v.len() / 2], v[v.len() - 1])
+        }
+        let db_seqno = self.db.snapshot().map(|s| s.seqno()).ok();
+        let hubs: Vec<(HubKey, Arc<Hub>)> = {
+            let hubs = self.hubs.lock().unwrap_or_else(PoisonError::into_inner);
+            hubs.iter()
+                .filter_map(|(k, w)| w.upgrade().map(|h| (k.clone(), h)))
+                .collect()
+        };
+        let st = &self.stats;
+        let max_catch_up = self.limits.max_catch_up.max(1);
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "phdb serve: feed dump: {} hubs, database seqno {}; catch-up slots {}/{max_catch_up} in use; \
+             fell behind {}, rejoined {}, catch-up waits {}, hub failures {}",
+            hubs.len(),
+            db_seqno.map_or_else(|| "?".into(), |s| s.to_string()),
+            max_catch_up - self.catch_up.available_permits(),
+            st.fell_behind.load(Ordering::Relaxed),
+            st.rejoined.load(Ordering::Relaxed),
+            st.catch_up_waits.load(Ordering::Relaxed),
+            st.hub_failures.load(Ordering::Relaxed),
+        );
+        for (i, (key, hub)) in hubs.iter().enumerate() {
+            let (base, head, entries, bytes, passed, failed) = {
+                let r = hub.ring();
+                (
+                    r.base,
+                    r.head(),
+                    r.entries.len(),
+                    r.bytes,
+                    r.passed,
+                    r.failed,
+                )
+            };
+            let limit = self.limits.ring_bytes / hub.live.load(Ordering::Relaxed).max(1) as usize;
+            let trackers: Vec<Arc<Tracker>> = {
+                let mut c = hub.clients.lock().unwrap_or_else(PoisonError::into_inner);
+                c.retain(|w| w.strong_count() > 0);
+                c.iter().filter_map(Weak::upgrade).collect()
+            };
+            let (mut on_ring, mut own, mut waiting) = (Vec::new(), Vec::new(), 0usize);
+            for t in &trackers {
+                let at = t.at.load(Ordering::Relaxed);
+                match t.state.load(Ordering::Relaxed) {
+                    ON_RING => on_ring.push(head.saturating_sub(at)),
+                    ON_OWN => own.push(passed.saturating_sub(at)),
+                    _ => waiting += 1,
+                }
+            }
+            let _ = writeln!(
+                out,
+                "  hub {i} (feeds {:?}, {}{}): engine feed {} seqnos behind (at {passed}); ring {entries} \
+                 entries [{base}, {head}), {bytes}/{limit} bytes; clients: {} on the ring (entries \
+                 behind its head, min/p50/max {}), {} on their own streams (seqnos behind the hub {}), \
+                 {waiting} waiting for a catch-up slot",
+                key.tables,
+                if key.visible { "visible" } else { "durable" },
+                if failed { ", FAILED" } else { "" },
+                db_seqno.map_or_else(|| "?".into(), |s| s.saturating_sub(passed).to_string()),
+                on_ring.len(),
+                spread(on_ring.clone()),
+                own.len(),
+                spread(own.clone()),
+            );
+        }
+        out
+    }
+
     /// Fails every hub: the database under them was replaced (#1436's re-bootstrap). Their
     /// clients go on from their own tokens on their own streams, and the engine decides
     /// each (a token of the replaced copy is another database's); new subscribers open new
@@ -474,6 +587,7 @@ impl Feeds {
                 task,
                 stats,
                 live,
+                clients: Mutex::default(),
             }
         });
         hubs.insert(key, Arc::downgrade(&hub));
@@ -509,6 +623,8 @@ impl Feeds {
         ));
         let taken = Arc::new(Notify::new());
         let (end_tx, end_rx) = oneshot::channel();
+        let tracker = Arc::new(Tracker::default());
+        hub.track(&tracker);
         let client = Client {
             feeds: Arc::clone(self),
             hub: Mutex::new(hub),
@@ -519,6 +635,7 @@ impl Feeds {
             tx,
             budget,
             taken: Arc::clone(&taken),
+            tracker,
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
@@ -625,6 +742,8 @@ struct Client {
     /// Poked each time the client takes an event: a send waiting for room starts its
     /// `--stream-idle-ms` again (simp724's I1 on #1536).
     taken: Arc<Notify>,
+    /// Where it is, for the dump.
+    tracker: Arc<Tracker>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -698,6 +817,7 @@ impl Client {
             .stats
             .catch_up_waits
             .fetch_add(1, Ordering::Relaxed);
+        self.tracker.set(WAITING, 0);
         tokio::select! {
             // A client that leaves while queued gives up its place.
             () = self.tx.closed() => Err(ApiError::internal("the client went away")),
@@ -716,6 +836,7 @@ impl Client {
         // Reused across wakes: one allocation per client, not one per commit.
         let mut batch: Vec<Arc<Entry>> = Vec::with_capacity(64);
         loop {
+            self.tracker.set(ON_RING, at);
             let (behind, failed) = {
                 let r = hub.ring();
                 if at < r.base {
@@ -789,10 +910,12 @@ impl Client {
             if hub.ring().failed && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
                 hub_retry = Some(Instant::now());
                 if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
+                    new.track(&self.tracker);
                     *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&new);
                     hub = new;
                 }
             }
+            self.tracker.set(ON_OWN, pos.seqno.unwrap_or(0));
             if let Some(seqno) = pos.seqno {
                 let r = hub.ring();
                 if !r.failed
