@@ -20,6 +20,7 @@
 | `phdb mcp <file> [--read-only] [--create] [--memory NAME]` | A Model Context Protocol server on standard input and output, for AI agents, with optional [agent memory tools](ai-agents.md#the-memory-tools): see [Using Pigeonhole from AI agents](ai-agents.md). New in 1.1.0. |
 | `phdb serve <file> [--listen ADDR:PORT] [--tls-cert PEM --tls-key PEM] [--token-file FILE]` | Serve the database over gRPC and HTTP/JSON on one port (ICR 0112): see [`phdb serve`](#phdb-serve). Only in a build with the `serve` feature (`cargo install pigeonhole-cli --features serve`). New in 1.2.0, in progress. |
 | `phdb promote <file>` | Turn a stopped replica's database (`phdb serve --replica-of`) into a primary that takes writes: see [Replicas](#replicas). Only with the `serve` feature. New in 1.2.0. |
+| `phdb cluster (init-partition \| set-map \| show-map \| status)` | Operate a partitioned cluster of `phdb serve --cluster` nodes (D317): see [Clusters](#clusters). Only with the `serve` feature. New in 1.2.0, in progress. |
 
 **Global flags,** before or after the command:
 
@@ -461,6 +462,24 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Retention, and falling behind.** The primary doesn't track its replicas: its feed retention (`--change-feed`) decides how long a replica may be down or behind. Size it to the write rate times the longest replica outage you want to ride out; the primary's `/metrics` reports the feed's retained bytes. A replica that falls off the end, or whose primary's URL now serves another database, bootstraps again: it downloads a new copy while serving its old one (stale, with `lag_ms` growing), then swaps it in. Requests during the swap get `Unavailable` (retry them), and transactions, pinned snapshots and feed streams open on the old copy end. A feed token from the old copy is another database's to the new one: a stream on it, or a resume from it, ends with `InvalidArgument` ("the token is another database's"), so subscribe again from now or from a snapshot.
 - **Promotion.** `Admin.Promote` (admin scope) on a running replica, or `phdb promote <file>` on a stopped one's file, makes it a primary at the last commit it applied: it stops following and takes writes, and its own feed tokens stay valid. It returns the primary's token it stopped at. **Nothing fences the old primary:** stop it (or its writers) before promoting, or the two diverge. A promoted database can't follow again, and `phdb serve --replica-of` refuses to start on it (or on any database with tables that isn't a replica's) rather than replace it; start a new replica from it instead.
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
+
+### Clusters
+
+**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. So far a node keeps and distributes the partition map. Serving the partitions' data comes in the next steps, and this section grows with them.
+
+- **`phdb serve --cluster DIR --node-id ID`** runs a node.
+  - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
+  - One server per `DIR`.
+  - `--cluster-token-file` is the token the node presents to the others. List it as `cluster <token>` in every node's `--token-file`; the `cluster` scope is only for node-to-node calls.
+  - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
+- **`phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`** stamps a partition file with who it is. Run it before the node starts.
+- **`phdb cluster set-map MAP.json --node URL`** sets the map: a compare-and-set against the node's version.
+  - The node validates the map, keeps it, and pushes it to the others.
+  - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
+  - A map may add tables, partitions and nodes, and move a partition to another node with a higher epoch. A table's split keys and partitions are fixed once set.
+- **`phdb cluster status --node URL`** shows every node's map version side by side.
+- **`phdb cluster show-map (--node URL | --file DIR/cluster-map.json)`** prints a map.
+- **Choosing ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
 
 ## Exit status
 

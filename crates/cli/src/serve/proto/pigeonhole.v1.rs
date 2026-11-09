@@ -1488,6 +1488,1447 @@ pub mod admin_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListTablesRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListTablesResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTableRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub families: ::prost::alloc::vec::Vec<FamilySpec>,
+    #[prost(bool, tag = "3")]
+    pub if_missing: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DropTableRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DescribeTableRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TableResponse {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Each family's stored options.
+    #[prost(message, repeated, tag = "2")]
+    pub families: ::prost::alloc::vec::Vec<FamilySpec>,
+}
+/// A family and its options (`Family`, read back as `FamilyInfo`). Unset options take the
+/// library's defaults when creating, and are always set when the server describes a family.
+/// D317's cluster map reuses this message for its placements' schema.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FamilySpec {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Versions kept per column (0: all).
+    #[prost(uint32, optional, tag = "5")]
+    pub max_versions: ::core::option::Option<u32>,
+    /// Cells older than this by timestamp expire.
+    #[prost(uint64, optional, tag = "6")]
+    pub ttl_micros: ::core::option::Option<u64>,
+    #[prost(uint32, optional, tag = "7")]
+    pub bloom_bits: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    pub blob_threshold: ::core::option::Option<u32>,
+    #[prost(message, optional, tag = "9")]
+    pub compression: ::core::option::Option<Compression>,
+    #[prost(uint32, optional, tag = "10")]
+    pub block_size: ::core::option::Option<u32>,
+    #[prost(enumeration = "Priority", tag = "11")]
+    pub cache_priority: i32,
+    #[prost(enumeration = "CompactionStyle", tag = "12")]
+    pub compaction: i32,
+    /// What the family holds; unset: an ordinary family.
+    #[prost(oneof = "family_spec::Kind", tags = "2, 3, 4")]
+    pub kind: ::core::option::Option<family_spec::Kind>,
+}
+/// Nested message and enum types in `FamilySpec`.
+pub mod family_spec {
+    /// What the family holds; unset: an ordinary family.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "2")]
+        Aggregate(super::Aggregation),
+        #[prost(message, tag = "3")]
+        Vector(super::VectorSpec),
+        /// An ordinary family whose `merge` operands go to this registered operator.
+        #[prost(string, tag = "4")]
+        MergeOperator(::prost::alloc::string::String),
+    }
+}
+/// An aggregate family's kind (D294, D298). A counter is `AGGREGATION_KIND_SUM`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Aggregation {
+    #[prost(enumeration = "AggregationKind", tag = "1")]
+    pub kind: i32,
+    /// `HISTOGRAM`: the bucket bounds, ascending.
+    #[prost(double, repeated, tag = "2")]
+    pub histogram_bounds: ::prost::alloc::vec::Vec<f64>,
+    /// `QUANTILES`: the sketch's resolution and size (unset: the library's defaults).
+    #[prost(uint32, optional, tag = "3")]
+    pub quantile_mantissa_bits: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub quantile_max_buckets: ::core::option::Option<u32>,
+    /// `BLOOM`: the filter's size and hash count.
+    #[prost(uint32, tag = "5")]
+    pub bloom_bits: u32,
+    #[prost(uint32, tag = "6")]
+    pub bloom_hashes: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VectorSpec {
+    #[prost(uint32, tag = "1")]
+    pub dim: u32,
+    #[prost(enumeration = "Element", tag = "2")]
+    pub element: i32,
+    #[prost(enumeration = "Metric", tag = "3")]
+    pub metric: i32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Compression {
+    #[prost(enumeration = "CompressionCodec", tag = "1")]
+    pub codec: i32,
+    /// `ZSTD`: libzstd's level, 1 to 22 (0: 3).
+    #[prost(int32, tag = "2")]
+    pub zstd_level: i32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AggregationKind {
+    Unspecified = 0,
+    Sum = 1,
+    Min = 2,
+    Max = 3,
+    Hll = 4,
+    BitOr = 5,
+    BitAnd = 6,
+    BitXor = 7,
+    MinF64 = 8,
+    MaxF64 = 9,
+    SumF64 = 10,
+    MeanVar = 11,
+    Histogram = 12,
+    Quantiles = 13,
+    Bloom = 14,
+    Set = 15,
+}
+impl AggregationKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AGGREGATION_KIND_UNSPECIFIED",
+            Self::Sum => "AGGREGATION_KIND_SUM",
+            Self::Min => "AGGREGATION_KIND_MIN",
+            Self::Max => "AGGREGATION_KIND_MAX",
+            Self::Hll => "AGGREGATION_KIND_HLL",
+            Self::BitOr => "AGGREGATION_KIND_BIT_OR",
+            Self::BitAnd => "AGGREGATION_KIND_BIT_AND",
+            Self::BitXor => "AGGREGATION_KIND_BIT_XOR",
+            Self::MinF64 => "AGGREGATION_KIND_MIN_F64",
+            Self::MaxF64 => "AGGREGATION_KIND_MAX_F64",
+            Self::SumF64 => "AGGREGATION_KIND_SUM_F64",
+            Self::MeanVar => "AGGREGATION_KIND_MEAN_VAR",
+            Self::Histogram => "AGGREGATION_KIND_HISTOGRAM",
+            Self::Quantiles => "AGGREGATION_KIND_QUANTILES",
+            Self::Bloom => "AGGREGATION_KIND_BLOOM",
+            Self::Set => "AGGREGATION_KIND_SET",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGGREGATION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "AGGREGATION_KIND_SUM" => Some(Self::Sum),
+            "AGGREGATION_KIND_MIN" => Some(Self::Min),
+            "AGGREGATION_KIND_MAX" => Some(Self::Max),
+            "AGGREGATION_KIND_HLL" => Some(Self::Hll),
+            "AGGREGATION_KIND_BIT_OR" => Some(Self::BitOr),
+            "AGGREGATION_KIND_BIT_AND" => Some(Self::BitAnd),
+            "AGGREGATION_KIND_BIT_XOR" => Some(Self::BitXor),
+            "AGGREGATION_KIND_MIN_F64" => Some(Self::MinF64),
+            "AGGREGATION_KIND_MAX_F64" => Some(Self::MaxF64),
+            "AGGREGATION_KIND_SUM_F64" => Some(Self::SumF64),
+            "AGGREGATION_KIND_MEAN_VAR" => Some(Self::MeanVar),
+            "AGGREGATION_KIND_HISTOGRAM" => Some(Self::Histogram),
+            "AGGREGATION_KIND_QUANTILES" => Some(Self::Quantiles),
+            "AGGREGATION_KIND_BLOOM" => Some(Self::Bloom),
+            "AGGREGATION_KIND_SET" => Some(Self::Set),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CompressionCodec {
+    /// The library's default (LZ4).
+    Unspecified = 0,
+    None = 1,
+    Lz4 = 2,
+    Zstd = 3,
+}
+impl CompressionCodec {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPRESSION_CODEC_UNSPECIFIED",
+            Self::None => "COMPRESSION_CODEC_NONE",
+            Self::Lz4 => "COMPRESSION_CODEC_LZ4",
+            Self::Zstd => "COMPRESSION_CODEC_ZSTD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPRESSION_CODEC_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPRESSION_CODEC_NONE" => Some(Self::None),
+            "COMPRESSION_CODEC_LZ4" => Some(Self::Lz4),
+            "COMPRESSION_CODEC_ZSTD" => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Priority {
+    Unspecified = 0,
+    Low = 1,
+    Normal = 2,
+    High = 3,
+}
+impl Priority {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRIORITY_UNSPECIFIED",
+            Self::Low => "PRIORITY_LOW",
+            Self::Normal => "PRIORITY_NORMAL",
+            Self::High => "PRIORITY_HIGH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRIORITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRIORITY_LOW" => Some(Self::Low),
+            "PRIORITY_NORMAL" => Some(Self::Normal),
+            "PRIORITY_HIGH" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CompactionStyle {
+    Unspecified = 0,
+    Leveled = 1,
+    Tiered = 2,
+    FifoByTime = 3,
+}
+impl CompactionStyle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "COMPACTION_STYLE_UNSPECIFIED",
+            Self::Leveled => "COMPACTION_STYLE_LEVELED",
+            Self::Tiered => "COMPACTION_STYLE_TIERED",
+            Self::FifoByTime => "COMPACTION_STYLE_FIFO_BY_TIME",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "COMPACTION_STYLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "COMPACTION_STYLE_LEVELED" => Some(Self::Leveled),
+            "COMPACTION_STYLE_TIERED" => Some(Self::Tiered),
+            "COMPACTION_STYLE_FIFO_BY_TIME" => Some(Self::FifoByTime),
+            _ => None,
+        }
+    }
+}
+/// Generated client implementations.
+pub mod schema_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct SchemaClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> SchemaClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> SchemaClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            SchemaClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn list_tables(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListTablesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListTablesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Schema/ListTables",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "ListTables"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Creates a table, or with `if_missing` opens it and adds the families it lacks (existing
+        /// families keep their stored options, as with `TableBuilder::family`).
+        pub async fn create_table(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Schema/CreateTable",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "CreateTable"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Admin scope.
+        pub async fn drop_table(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DropTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Schema/DropTable",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "DropTable"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn describe_table(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DescribeTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Schema/DescribeTable",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "DescribeTable"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod schema_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with SchemaServer.
+    #[async_trait]
+    pub trait Schema: std::marker::Send + std::marker::Sync + 'static {
+        async fn list_tables(
+            &self,
+            request: tonic::Request<super::ListTablesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListTablesResponse>,
+            tonic::Status,
+        >;
+        /// Creates a table, or with `if_missing` opens it and adds the families it lacks (existing
+        /// families keep their stored options, as with `TableBuilder::family`).
+        async fn create_table(
+            &self,
+            request: tonic::Request<super::CreateTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status>;
+        /// Admin scope.
+        async fn drop_table(
+            &self,
+            request: tonic::Request<super::DropTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        async fn describe_table(
+            &self,
+            request: tonic::Request<super::DescribeTableRequest>,
+        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct SchemaServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> SchemaServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for SchemaServer<T>
+    where
+        T: Schema,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Schema/ListTables" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListTablesSvc<T: Schema>(pub Arc<T>);
+                    impl<T: Schema> tonic::server::UnaryService<super::ListTablesRequest>
+                    for ListTablesSvc<T> {
+                        type Response = super::ListTablesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListTablesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Schema>::list_tables(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListTablesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Schema/CreateTable" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateTableSvc<T: Schema>(pub Arc<T>);
+                    impl<
+                        T: Schema,
+                    > tonic::server::UnaryService<super::CreateTableRequest>
+                    for CreateTableSvc<T> {
+                        type Response = super::TableResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateTableRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Schema>::create_table(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateTableSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Schema/DropTable" => {
+                    #[allow(non_camel_case_types)]
+                    struct DropTableSvc<T: Schema>(pub Arc<T>);
+                    impl<T: Schema> tonic::server::UnaryService<super::DropTableRequest>
+                    for DropTableSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DropTableRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Schema>::drop_table(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DropTableSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Schema/DescribeTable" => {
+                    #[allow(non_camel_case_types)]
+                    struct DescribeTableSvc<T: Schema>(pub Arc<T>);
+                    impl<
+                        T: Schema,
+                    > tonic::server::UnaryService<super::DescribeTableRequest>
+                    for DescribeTableSvc<T> {
+                        type Response = super::TableResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DescribeTableRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Schema>::describe_table(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DescribeTableSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for SchemaServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Schema";
+    impl<T> tonic::server::NamedService for SchemaServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
+/// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClusterMap {
+    /// Fixed for a cluster's life: a node refuses a map of another cluster, and each partition
+    /// file records it (`__phdb_cluster`).
+    #[prost(string, tag = "1")]
+    pub cluster_id: ::prost::alloc::string::String,
+    /// Raised by every change; a node refuses a map no newer than its own.
+    #[prost(uint64, tag = "2")]
+    pub map_version: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub nodes: ::prost::alloc::vec::Vec<Node>,
+    /// Which node serves each partition (layer 2: changes by relocation, with a higher epoch).
+    #[prost(message, repeated, tag = "4")]
+    pub partitions: ::prost::alloc::vec::Vec<Partition>,
+    /// Which partition holds each key range (layer 1: fixed once written).
+    #[prost(message, repeated, tag = "5")]
+    pub tables: ::prost::alloc::vec::Vec<TablePlacement>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Node {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The node's listener, `host:port` (TLS unless the cluster runs without it).
+    #[prost(string, tag = "2")]
+    pub address: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Partition {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The node serving it: a `Node.id`.
+    #[prost(string, tag = "2")]
+    pub node: ::prost::alloc::string::String,
+    /// Raised by every relocation; a node writes P only while the map's epoch for P equals
+    /// the epoch in P's file (D317 §2).
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TablePlacement {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// A co-location group (optional): its tables are unsplit and on one partition.
+    #[prost(string, tag = "2")]
+    pub group: ::prost::alloc::string::String,
+    /// The table's schema (D317 §5; reconciled onto the partitions from ticket 5).
+    #[prost(message, repeated, tag = "3")]
+    pub families: ::prost::alloc::vec::Vec<FamilySpec>,
+    /// Sorted, distinct split keys; none: the whole table is one range.
+    #[prost(message, repeated, tag = "4")]
+    pub splits: ::prost::alloc::vec::Vec<SplitKey>,
+    /// `splits.len() + 1` partition ids: range i is `\[splits[i-1\], splits\[i\])`, the first
+    /// starting at the empty key and the last open-ended.
+    #[prost(string, repeated, tag = "5")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
+/// for any bytes. Both forms of one key are the same key.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SplitKey {
+    #[prost(oneof = "split_key::Key", tags = "1, 2")]
+    pub key: ::core::option::Option<split_key::Key>,
+}
+/// Nested message and enum types in `SplitKey`.
+pub mod split_key {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Key {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(bytes, tag = "2")]
+        Raw(::prost::bytes::Bytes),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetMapRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetMapRequest {
+    /// The map version the caller replaces: 0 for a node's first map.
+    #[prost(uint64, tag = "1")]
+    pub expected_map_version: u64,
+    #[prost(message, optional, tag = "2")]
+    pub map: ::core::option::Option<ClusterMap>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetMapResponse {
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub pushed: ::prost::alloc::vec::Vec<NodePush>,
+}
+/// What pushing the map to one node did.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodePush {
+    #[prost(string, tag = "1")]
+    pub node: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub ok: bool,
+    /// Why not, when `ok` is false: the node pulls the map once it's reachable again.
+    #[prost(string, tag = "3")]
+    pub error: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PushMapRequest {
+    #[prost(message, optional, tag = "1")]
+    pub map: ::core::option::Option<ClusterMap>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PushMapResponse {
+    /// The receiver's map version after the push.
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StatusRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NodeStatus {
+    #[prost(string, tag = "1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// 0 before the node has a map.
+    #[prost(uint64, tag = "2")]
+    pub map_version: u64,
+    #[prost(string, tag = "3")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub partitions: ::prost::alloc::vec::Vec<LocalPartition>,
+    /// Peers seen with this node's `map_version` but a different map: the cluster has two maps
+    /// of one version, and an operator must set a newer one.
+    #[prost(string, repeated, tag = "5")]
+    pub divergent: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// A partition file in the node's directory, as its identity row says.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LocalPartition {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    /// Relative to the node's cluster directory.
+    #[prost(string, tag = "3")]
+    pub file: ::prost::alloc::string::String,
+    /// False when the file couldn't be read, or its row doesn't match the map: `error` says why.
+    #[prost(bool, tag = "4")]
+    pub ok: bool,
+    #[prost(string, tag = "5")]
+    pub error: ::prost::alloc::string::String,
+}
+/// Generated client implementations.
+pub mod cluster_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct ClusterClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> ClusterClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> ClusterClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            ClusterClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// The node's newest map. Read, admin or cluster scope.
+        pub async fn get_map(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMapRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClusterMap>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/GetMap",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "GetMap"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Replaces the map: validated, persisted on this node, then pushed to every node in it.
+        /// Answers once it's persisted here, with what each push did (in parallel, each bounded by
+        /// `--cluster-push-timeout-ms`). `Conflict` (`ABORTED`, not applied) when
+        /// `expected_map_version` isn't this node's version: re-read the map and try again; the
+        /// message carries the current version. `InvalidArgument` for a map that fails validation
+        /// or makes a change the map may not make. Admin scope.
+        pub async fn set_map(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetMapRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetMapResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/SetMap",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "SetMap"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Node to node: a newer map, accepted only from the same cluster with a greater
+        /// `map_version` and a valid change; the same version with the same bytes is a no-op.
+        /// `InvalidArgument` otherwise: older, another cluster's, an invalid change, or divergent
+        /// (the same version, different bytes, which `Status` then reports on both nodes).
+        /// Cluster scope, gRPC only.
+        pub async fn push_map(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PushMapRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PushMapResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/PushMap",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "PushMap"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// This node: its id, its map version and the partitions in its directory. Read, admin or
+        /// cluster scope.
+        pub async fn status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::NodeStatus>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Status",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Status"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod cluster_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with ClusterServer.
+    #[async_trait]
+    pub trait Cluster: std::marker::Send + std::marker::Sync + 'static {
+        /// The node's newest map. Read, admin or cluster scope.
+        async fn get_map(
+            &self,
+            request: tonic::Request<super::GetMapRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClusterMap>, tonic::Status>;
+        /// Replaces the map: validated, persisted on this node, then pushed to every node in it.
+        /// Answers once it's persisted here, with what each push did (in parallel, each bounded by
+        /// `--cluster-push-timeout-ms`). `Conflict` (`ABORTED`, not applied) when
+        /// `expected_map_version` isn't this node's version: re-read the map and try again; the
+        /// message carries the current version. `InvalidArgument` for a map that fails validation
+        /// or makes a change the map may not make. Admin scope.
+        async fn set_map(
+            &self,
+            request: tonic::Request<super::SetMapRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetMapResponse>, tonic::Status>;
+        /// Node to node: a newer map, accepted only from the same cluster with a greater
+        /// `map_version` and a valid change; the same version with the same bytes is a no-op.
+        /// `InvalidArgument` otherwise: older, another cluster's, an invalid change, or divergent
+        /// (the same version, different bytes, which `Status` then reports on both nodes).
+        /// Cluster scope, gRPC only.
+        async fn push_map(
+            &self,
+            request: tonic::Request<super::PushMapRequest>,
+        ) -> std::result::Result<tonic::Response<super::PushMapResponse>, tonic::Status>;
+        /// This node: its id, its map version and the partitions in its directory. Read, admin or
+        /// cluster scope.
+        async fn status(
+            &self,
+            request: tonic::Request<super::StatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::NodeStatus>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct ClusterServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> ClusterServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ClusterServer<T>
+    where
+        T: Cluster,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Cluster/GetMap" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMapSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::GetMapRequest>
+                    for GetMapSvc<T> {
+                        type Response = super::ClusterMap;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetMapRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::get_map(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMapSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/SetMap" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetMapSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::SetMapRequest>
+                    for SetMapSvc<T> {
+                        type Response = super::SetMapResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SetMapRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::set_map(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetMapSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/PushMap" => {
+                    #[allow(non_camel_case_types)]
+                    struct PushMapSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::PushMapRequest>
+                    for PushMapSvc<T> {
+                        type Response = super::PushMapResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PushMapRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::push_map(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PushMapSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Status" => {
+                    #[allow(non_camel_case_types)]
+                    struct StatusSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::StatusRequest>
+                    for StatusSvc<T> {
+                        type Response = super::NodeStatus;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for ClusterServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Cluster";
+    impl<T> tonic::server::NamedService for ClusterServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetRequest {
     #[prost(string, tag = "1")]
@@ -4621,784 +6062,6 @@ pub mod replication_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "pigeonhole.v1.Replication";
     impl<T> tonic::server::NamedService for ReplicationServer<T> {
-        const NAME: &'static str = SERVICE_NAME;
-    }
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListTablesRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListTablesResponse {
-    #[prost(string, repeated, tag = "1")]
-    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateTableRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub families: ::prost::alloc::vec::Vec<FamilySpec>,
-    #[prost(bool, tag = "3")]
-    pub if_missing: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DropTableRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DescribeTableRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TableResponse {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Each family's stored options.
-    #[prost(message, repeated, tag = "2")]
-    pub families: ::prost::alloc::vec::Vec<FamilySpec>,
-}
-/// A family and its options (`Family`, read back as `FamilyInfo`). Unset options take the
-/// library's defaults when creating, and are always set when the server describes a family.
-/// D317's cluster map reuses this message for its placements' schema.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FamilySpec {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Versions kept per column (0: all).
-    #[prost(uint32, optional, tag = "5")]
-    pub max_versions: ::core::option::Option<u32>,
-    /// Cells older than this by timestamp expire.
-    #[prost(uint64, optional, tag = "6")]
-    pub ttl_micros: ::core::option::Option<u64>,
-    #[prost(uint32, optional, tag = "7")]
-    pub bloom_bits: ::core::option::Option<u32>,
-    #[prost(uint32, optional, tag = "8")]
-    pub blob_threshold: ::core::option::Option<u32>,
-    #[prost(message, optional, tag = "9")]
-    pub compression: ::core::option::Option<Compression>,
-    #[prost(uint32, optional, tag = "10")]
-    pub block_size: ::core::option::Option<u32>,
-    #[prost(enumeration = "Priority", tag = "11")]
-    pub cache_priority: i32,
-    #[prost(enumeration = "CompactionStyle", tag = "12")]
-    pub compaction: i32,
-    /// What the family holds; unset: an ordinary family.
-    #[prost(oneof = "family_spec::Kind", tags = "2, 3, 4")]
-    pub kind: ::core::option::Option<family_spec::Kind>,
-}
-/// Nested message and enum types in `FamilySpec`.
-pub mod family_spec {
-    /// What the family holds; unset: an ordinary family.
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Kind {
-        #[prost(message, tag = "2")]
-        Aggregate(super::Aggregation),
-        #[prost(message, tag = "3")]
-        Vector(super::VectorSpec),
-        /// An ordinary family whose `merge` operands go to this registered operator.
-        #[prost(string, tag = "4")]
-        MergeOperator(::prost::alloc::string::String),
-    }
-}
-/// An aggregate family's kind (D294, D298). A counter is `AGGREGATION_KIND_SUM`.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Aggregation {
-    #[prost(enumeration = "AggregationKind", tag = "1")]
-    pub kind: i32,
-    /// `HISTOGRAM`: the bucket bounds, ascending.
-    #[prost(double, repeated, tag = "2")]
-    pub histogram_bounds: ::prost::alloc::vec::Vec<f64>,
-    /// `QUANTILES`: the sketch's resolution and size (unset: the library's defaults).
-    #[prost(uint32, optional, tag = "3")]
-    pub quantile_mantissa_bits: ::core::option::Option<u32>,
-    #[prost(uint32, optional, tag = "4")]
-    pub quantile_max_buckets: ::core::option::Option<u32>,
-    /// `BLOOM`: the filter's size and hash count.
-    #[prost(uint32, tag = "5")]
-    pub bloom_bits: u32,
-    #[prost(uint32, tag = "6")]
-    pub bloom_hashes: u32,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct VectorSpec {
-    #[prost(uint32, tag = "1")]
-    pub dim: u32,
-    #[prost(enumeration = "Element", tag = "2")]
-    pub element: i32,
-    #[prost(enumeration = "Metric", tag = "3")]
-    pub metric: i32,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Compression {
-    #[prost(enumeration = "CompressionCodec", tag = "1")]
-    pub codec: i32,
-    /// `ZSTD`: libzstd's level, 1 to 22 (0: 3).
-    #[prost(int32, tag = "2")]
-    pub zstd_level: i32,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum AggregationKind {
-    Unspecified = 0,
-    Sum = 1,
-    Min = 2,
-    Max = 3,
-    Hll = 4,
-    BitOr = 5,
-    BitAnd = 6,
-    BitXor = 7,
-    MinF64 = 8,
-    MaxF64 = 9,
-    SumF64 = 10,
-    MeanVar = 11,
-    Histogram = 12,
-    Quantiles = 13,
-    Bloom = 14,
-    Set = 15,
-}
-impl AggregationKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "AGGREGATION_KIND_UNSPECIFIED",
-            Self::Sum => "AGGREGATION_KIND_SUM",
-            Self::Min => "AGGREGATION_KIND_MIN",
-            Self::Max => "AGGREGATION_KIND_MAX",
-            Self::Hll => "AGGREGATION_KIND_HLL",
-            Self::BitOr => "AGGREGATION_KIND_BIT_OR",
-            Self::BitAnd => "AGGREGATION_KIND_BIT_AND",
-            Self::BitXor => "AGGREGATION_KIND_BIT_XOR",
-            Self::MinF64 => "AGGREGATION_KIND_MIN_F64",
-            Self::MaxF64 => "AGGREGATION_KIND_MAX_F64",
-            Self::SumF64 => "AGGREGATION_KIND_SUM_F64",
-            Self::MeanVar => "AGGREGATION_KIND_MEAN_VAR",
-            Self::Histogram => "AGGREGATION_KIND_HISTOGRAM",
-            Self::Quantiles => "AGGREGATION_KIND_QUANTILES",
-            Self::Bloom => "AGGREGATION_KIND_BLOOM",
-            Self::Set => "AGGREGATION_KIND_SET",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "AGGREGATION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "AGGREGATION_KIND_SUM" => Some(Self::Sum),
-            "AGGREGATION_KIND_MIN" => Some(Self::Min),
-            "AGGREGATION_KIND_MAX" => Some(Self::Max),
-            "AGGREGATION_KIND_HLL" => Some(Self::Hll),
-            "AGGREGATION_KIND_BIT_OR" => Some(Self::BitOr),
-            "AGGREGATION_KIND_BIT_AND" => Some(Self::BitAnd),
-            "AGGREGATION_KIND_BIT_XOR" => Some(Self::BitXor),
-            "AGGREGATION_KIND_MIN_F64" => Some(Self::MinF64),
-            "AGGREGATION_KIND_MAX_F64" => Some(Self::MaxF64),
-            "AGGREGATION_KIND_SUM_F64" => Some(Self::SumF64),
-            "AGGREGATION_KIND_MEAN_VAR" => Some(Self::MeanVar),
-            "AGGREGATION_KIND_HISTOGRAM" => Some(Self::Histogram),
-            "AGGREGATION_KIND_QUANTILES" => Some(Self::Quantiles),
-            "AGGREGATION_KIND_BLOOM" => Some(Self::Bloom),
-            "AGGREGATION_KIND_SET" => Some(Self::Set),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum CompressionCodec {
-    /// The library's default (LZ4).
-    Unspecified = 0,
-    None = 1,
-    Lz4 = 2,
-    Zstd = 3,
-}
-impl CompressionCodec {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "COMPRESSION_CODEC_UNSPECIFIED",
-            Self::None => "COMPRESSION_CODEC_NONE",
-            Self::Lz4 => "COMPRESSION_CODEC_LZ4",
-            Self::Zstd => "COMPRESSION_CODEC_ZSTD",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "COMPRESSION_CODEC_UNSPECIFIED" => Some(Self::Unspecified),
-            "COMPRESSION_CODEC_NONE" => Some(Self::None),
-            "COMPRESSION_CODEC_LZ4" => Some(Self::Lz4),
-            "COMPRESSION_CODEC_ZSTD" => Some(Self::Zstd),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum Priority {
-    Unspecified = 0,
-    Low = 1,
-    Normal = 2,
-    High = 3,
-}
-impl Priority {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PRIORITY_UNSPECIFIED",
-            Self::Low => "PRIORITY_LOW",
-            Self::Normal => "PRIORITY_NORMAL",
-            Self::High => "PRIORITY_HIGH",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PRIORITY_UNSPECIFIED" => Some(Self::Unspecified),
-            "PRIORITY_LOW" => Some(Self::Low),
-            "PRIORITY_NORMAL" => Some(Self::Normal),
-            "PRIORITY_HIGH" => Some(Self::High),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum CompactionStyle {
-    Unspecified = 0,
-    Leveled = 1,
-    Tiered = 2,
-    FifoByTime = 3,
-}
-impl CompactionStyle {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "COMPACTION_STYLE_UNSPECIFIED",
-            Self::Leveled => "COMPACTION_STYLE_LEVELED",
-            Self::Tiered => "COMPACTION_STYLE_TIERED",
-            Self::FifoByTime => "COMPACTION_STYLE_FIFO_BY_TIME",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "COMPACTION_STYLE_UNSPECIFIED" => Some(Self::Unspecified),
-            "COMPACTION_STYLE_LEVELED" => Some(Self::Leveled),
-            "COMPACTION_STYLE_TIERED" => Some(Self::Tiered),
-            "COMPACTION_STYLE_FIFO_BY_TIME" => Some(Self::FifoByTime),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod schema_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    #[derive(Debug, Clone)]
-    pub struct SchemaClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl<T> SchemaClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> SchemaClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            SchemaClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        pub async fn list_tables(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ListTablesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListTablesResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Schema/ListTables",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "ListTables"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Creates a table, or with `if_missing` opens it and adds the families it lacks (existing
-        /// families keep their stored options, as with `TableBuilder::family`).
-        pub async fn create_table(
-            &mut self,
-            request: impl tonic::IntoRequest<super::CreateTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Schema/CreateTable",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "CreateTable"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Admin scope.
-        pub async fn drop_table(
-            &mut self,
-            request: impl tonic::IntoRequest<super::DropTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Schema/DropTable",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "DropTable"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn describe_table(
-            &mut self,
-            request: impl tonic::IntoRequest<super::DescribeTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Schema/DescribeTable",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Schema", "DescribeTable"));
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Generated server implementations.
-pub mod schema_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with SchemaServer.
-    #[async_trait]
-    pub trait Schema: std::marker::Send + std::marker::Sync + 'static {
-        async fn list_tables(
-            &self,
-            request: tonic::Request<super::ListTablesRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ListTablesResponse>,
-            tonic::Status,
-        >;
-        /// Creates a table, or with `if_missing` opens it and adds the families it lacks (existing
-        /// families keep their stored options, as with `TableBuilder::family`).
-        async fn create_table(
-            &self,
-            request: tonic::Request<super::CreateTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status>;
-        /// Admin scope.
-        async fn drop_table(
-            &self,
-            request: tonic::Request<super::DropTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        async fn describe_table(
-            &self,
-            request: tonic::Request<super::DescribeTableRequest>,
-        ) -> std::result::Result<tonic::Response<super::TableResponse>, tonic::Status>;
-    }
-    #[derive(Debug)]
-    pub struct SchemaServer<T> {
-        inner: Arc<T>,
-        accept_compression_encodings: EnabledCompressionEncodings,
-        send_compression_encodings: EnabledCompressionEncodings,
-        max_decoding_message_size: Option<usize>,
-        max_encoding_message_size: Option<usize>,
-    }
-    impl<T> SchemaServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
-        }
-        pub fn from_arc(inner: Arc<T>) -> Self {
-            Self {
-                inner,
-                accept_compression_encodings: Default::default(),
-                send_compression_encodings: Default::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
-        where
-            F: tonic::service::Interceptor,
-        {
-            InterceptedService::new(Self::new(inner), interceptor)
-        }
-        /// Enable decompressing requests with the given encoding.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.accept_compression_encodings.enable(encoding);
-            self
-        }
-        /// Compress responses with the given encoding, if the client supports it.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.send_compression_encodings.enable(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.max_decoding_message_size = Some(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.max_encoding_message_size = Some(limit);
-            self
-        }
-    }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for SchemaServer<T>
-    where
-        T: Schema,
-        B: Body + std::marker::Send + 'static,
-        B::Error: Into<StdError> + std::marker::Send + 'static,
-    {
-        type Response = http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            match req.uri().path() {
-                "/pigeonhole.v1.Schema/ListTables" => {
-                    #[allow(non_camel_case_types)]
-                    struct ListTablesSvc<T: Schema>(pub Arc<T>);
-                    impl<T: Schema> tonic::server::UnaryService<super::ListTablesRequest>
-                    for ListTablesSvc<T> {
-                        type Response = super::ListTablesResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ListTablesRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Schema>::list_tables(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ListTablesSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Schema/CreateTable" => {
-                    #[allow(non_camel_case_types)]
-                    struct CreateTableSvc<T: Schema>(pub Arc<T>);
-                    impl<
-                        T: Schema,
-                    > tonic::server::UnaryService<super::CreateTableRequest>
-                    for CreateTableSvc<T> {
-                        type Response = super::TableResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::CreateTableRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Schema>::create_table(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = CreateTableSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Schema/DropTable" => {
-                    #[allow(non_camel_case_types)]
-                    struct DropTableSvc<T: Schema>(pub Arc<T>);
-                    impl<T: Schema> tonic::server::UnaryService<super::DropTableRequest>
-                    for DropTableSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::DropTableRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Schema>::drop_table(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = DropTableSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Schema/DescribeTable" => {
-                    #[allow(non_camel_case_types)]
-                    struct DescribeTableSvc<T: Schema>(pub Arc<T>);
-                    impl<
-                        T: Schema,
-                    > tonic::server::UnaryService<super::DescribeTableRequest>
-                    for DescribeTableSvc<T> {
-                        type Response = super::TableResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::DescribeTableRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Schema>::describe_table(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = DescribeTableSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
-            }
-        }
-    }
-    impl<T> Clone for SchemaServer<T> {
-        fn clone(&self) -> Self {
-            let inner = self.inner.clone();
-            Self {
-                inner,
-                accept_compression_encodings: self.accept_compression_encodings,
-                send_compression_encodings: self.send_compression_encodings,
-                max_decoding_message_size: self.max_decoding_message_size,
-                max_encoding_message_size: self.max_encoding_message_size,
-            }
-        }
-    }
-    /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Schema";
-    impl<T> tonic::server::NamedService for SchemaServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
