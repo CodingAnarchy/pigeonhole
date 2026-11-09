@@ -2718,16 +2718,17 @@ fn memory_server(tokens: &str) -> Server {
 
 fn memory_server_with(tokens: &str, l: Limits) -> Server {
     Server::start_custom(tokens, l, 1, |svc| {
-        let core = crate::memcore::MemCore::open(
+        let (slot, _) = super::memslot::MemSlot::start(
             &svc.db,
             "m",
             None,
             None,
-            |_| Ok(pigeonhole_memory::StoreOptions::new()),
+            Arc::new(|_| Ok(pigeonhole_memory::StoreOptions::new())),
             (1 << 20, 8 << 20),
+            true,
         )
         .unwrap();
-        svc.memory_opt(Some(core), 0)
+        svc.memory_opt(Some(slot), 0)
     })
 }
 
@@ -3112,21 +3113,22 @@ fn embedding_memory_server(url: &str) -> Server {
     Server::start_custom("", limits(), 1, move |svc| {
         let endpoint =
             crate::mcp::Endpoint::new(&url, "stub", None, Duration::from_millis(300)).unwrap();
-        let core = crate::memcore::MemCore::open(
+        let (slot, _) = super::memslot::MemSlot::start(
             &svc.db,
             "m",
             Some(crate::memcore::Embedder::Remote(endpoint)),
             None,
-            |_| {
+            Arc::new(|_| {
                 let model =
                     pigeonhole_memory::EmbeddingModel::new("stub", 4, pigeonhole::Element::F32)
                         .unwrap();
                 Ok(pigeonhole_memory::StoreOptions::new().embedding(model))
-            },
+            }),
             (1 << 20, 8 << 20),
+            true,
         )
         .unwrap();
-        svc.memory_opt(Some(core), 0)
+        svc.memory_opt(Some(slot), 0)
     })
 }
 
