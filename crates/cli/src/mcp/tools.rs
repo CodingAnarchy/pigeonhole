@@ -77,6 +77,24 @@ const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
 pub(super) type Outcome = Result<Map<String, Value>, Failure>;
 
+impl super::protocol::Host for Tools {
+    fn memory(&self) -> Option<&super::memory::Memory> {
+        Tools::memory(self)
+    }
+
+    fn list(&self) -> Vec<Value> {
+        Tools::list(self)
+    }
+
+    fn names(&self) -> Vec<String> {
+        Tools::names(self)
+    }
+
+    fn call(&self, name: &str, args: &Map<String, Value>) -> Option<Outcome> {
+        Tools::call(self, name, args)
+    }
+}
+
 pub(super) struct Tools {
     db: Db,
     writable: bool,
