@@ -441,9 +441,15 @@ impl FlushTask {
     }
 
     fn report(&mut self, result: Result<ManifestVersion>) {
-        let items = self
-            .items
-            .iter()
+        // The items go before the report, and with them the task's `MemtableReader`s: the
+        // shard reclaims a flushed memtable's chunks when it handles `Flushed`, and a
+        // reader still alive then (the task is dropped only after it returns `Done`) left
+        // them deferred until the shard's next allocation, which an idle shard never makes
+        // (#1512's test failed on Windows that way, #1597). A `MemIter` left from the
+        // write borrows a memtable too.
+        self.iter = None;
+        let items = std::mem::take(&mut self.items)
+            .into_iter()
             .map(|i| FlushedItem {
                 tablet: i.tablet,
                 family: i.family,

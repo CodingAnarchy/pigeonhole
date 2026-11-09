@@ -147,8 +147,12 @@ fn same_database_is_one_open() {
 
 /// ICR 0116 (D316 A2): the memtable gauges. The limit is set from the start and holds every
 /// byte used; writes raise the bytes used, and a flush gives them back. The arena updates
-/// the gauge as chunks are taken and returned, and a flushed memtable's chunks come back
-/// once nothing holds it, so the reads poll briefly.
+/// the gauge as chunks are taken and returned. A flushed memtable's chunks come back when the
+/// shard handles the flush's completion, which `flush()` may return a moment before, so the
+/// reads poll; 5 s is only a hang guard. Nothing else holds the memtable then: the flush task
+/// drops its readers before it reports (#1597: it used to report first, and a shard that won
+/// that race left the chunks deferred until its next allocation, which an idle shard never
+/// makes).
 #[test]
 fn memtable_bytes_rise_with_writes_and_fall_after_a_flush() {
     let db = db();
