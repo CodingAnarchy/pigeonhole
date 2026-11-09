@@ -3,12 +3,19 @@
 //! the blocks it reads instead of reading them synchronously (D196 within a row). The row is
 //! a text index's hub posting row in miniature: many SST blocks across levels, versions,
 //! deletes, a memtable on top, and a second family.
+//!
+//! The store is on the simulated device. An async walk runs with its I/O deferred (completed
+//! after each `Pending`), so no read completes at submit: on real files a cache-only miss
+//! whose read is done at submit (a D292 page-cache copy, or a fast backend) is read in place
+//! and counted, which made "no synchronous read" depend on timing (#1625's macOS run).
 #![cfg(feature = "async")]
 
+use std::sync::Arc;
 use std::task::Poll;
 
 use pigeonhole::doc_support::block_on;
 use pigeonhole::{Family, Options, Pigeonhole, RowCells, Snapshot, Table};
+use pigeonhole_io::sim::SimVfs;
 
 /// (family, qualifier, timestamp, value) per cell, in walk order.
 type Cell = (String, Vec<u8>, u64, Vec<u8>);
@@ -20,12 +27,24 @@ fn qual(i: u32) -> [u8; 4] {
     i.to_be_bytes()
 }
 
+const PATH: &str = "/db/r.phdb";
+
+fn opts(vfs: &Arc<SimVfs>) -> Options {
+    Options::default().vfs(Arc::clone(vfs) as _).shards(1)
+}
+
+/// Closes `db` once the I/O a test left in flight is done.
+fn close(vfs: &SimVfs, db: Pigeonhole) {
+    vfs.set_deferred_io(false);
+    vfs.complete_all_io();
+    db.close().expect("close");
+}
+
 /// The hub row in four flushed rounds (compacted under a fifth), with overwrites, deletes and
 /// a second family, then a memtable on top; reopened, so the block cache starts cold.
-fn build() -> (pigeonhole::doc_support::TempDir, Pigeonhole, Table) {
-    let dir = pigeonhole::doc_support::temp_dir();
-    let opts = || Options::default().shards(1);
-    let db = Pigeonhole::open(dir.join("r.phdb"), opts()).expect("open");
+fn build() -> (Arc<SimVfs>, Pigeonhole, Table) {
+    let vfs = SimVfs::new(1560);
+    let db = Pigeonhole::open(PATH, opts(&vfs)).expect("open");
     let t = db
         .table("t")
         .expect("table")
@@ -61,10 +80,8 @@ fn build() -> (pigeonhole::doc_support::TempDir, Pigeonhole, Table) {
         .put("side", &qual(1), b"mem")
         .commit()
         .expect("commit");
-    db.close().expect("close");
-    let db = Pigeonhole::open(dir.join("r.phdb"), opts()).expect("reopen");
-    let t = db.table("t").expect("table").open().expect("open table");
-    (dir, db, t)
+    let (db, t) = reopen(&vfs, db);
+    (vfs, db, t)
 }
 
 fn entry(e: &pigeonhole::CellEntry<'_>) -> Cell {
@@ -84,16 +101,24 @@ fn sync_walk(mut cells: RowCells<'_>) -> Vec<Cell> {
     out
 }
 
-/// Polls `f` to completion, counting the `Pending`s it returned.
-fn drive<T>(mut f: impl FnMut(&mut std::task::Context<'_>) -> Poll<T>) -> (T, u32) {
+/// Polls `f` to completion with the device's I/O deferred, completing it after each
+/// `Pending`; returns how many `Pending`s there were.
+fn drive<T>(vfs: &SimVfs, mut f: impl FnMut(&mut std::task::Context<'_>) -> Poll<T>) -> (T, u32) {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    vfs.set_deferred_io(true);
     let mut pending = 0;
-    let out = block_on(std::future::poll_fn(|cx| match f(cx) {
-        Poll::Pending => {
-            pending += 1;
-            Poll::Pending
+    let out = loop {
+        match f(&mut cx) {
+            Poll::Ready(v) => break v,
+            Poll::Pending => {
+                pending += 1;
+                assert!(pending < 100_000, "never resolved");
+                assert!(vfs.io_in_flight() > 0, "pending with no I/O in flight");
+                vfs.complete_all_io();
+            }
         }
-        Poll::Ready(v) => Poll::Ready(v),
-    }));
+    };
+    vfs.set_deferred_io(false);
     (out, pending)
 }
 
@@ -115,7 +140,7 @@ fn walk_all(s: &Snapshot, t: &Table, versions: u32) -> Vec<Cell> {
 /// its blocks fetched ahead: `Pending`s, and no synchronous read.
 #[test]
 fn a_cold_async_walk_returns_what_the_sync_one_returns() {
-    let (_dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     for versions in [1, 0] {
         let before = sync_reads(&db);
@@ -128,7 +153,7 @@ fn a_cold_async_walk_returns_what_the_sync_one_returns() {
         let mut got = Vec::new();
         let mut pendings = 0;
         loop {
-            let (step, pending) = drive(|cx| {
+            let (step, pending) = drive(&vfs, |cx| {
                 cells
                     .poll_next(cx)
                     .map(|r| r.expect("poll_next").map(|e| entry(&e)))
@@ -156,7 +181,7 @@ fn a_cold_async_walk_returns_what_the_sync_one_returns() {
         }
     });
     assert_eq!(got, walk_all(&s, &t, 1));
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// What a seek to (`family`, `q`) returns from the walk's position `at` (the index of its next
@@ -178,13 +203,12 @@ const SEEDS: [u64; 3] = [1, 0x5eed, 1560];
 #[test]
 fn cold_seeks_land_where_the_sync_walk_says() {
     for seed in SEEDS {
-        let (dir, db, t) = build();
+        let (vfs, db, t) = build();
         let all = walk_all(&db.snapshot().expect("snapshot"), &t, 1);
         // That walk warmed the cache: reopen, so the seeks start cold.
         drop(t);
-        db.close().expect("close");
-        let db =
-            Pigeonhole::open(dir.join("r.phdb"), Options::default().shards(1)).expect("reopen");
+        close(&vfs, db);
+        let db = Pigeonhole::open(PATH, opts(&vfs)).expect("reopen");
         let t = db.table("t").expect("table").open().expect("open table");
         let s = db.snapshot().expect("snapshot");
         let order = ["post", "side"];
@@ -203,7 +227,7 @@ fn cold_seeks_land_where_the_sync_walk_says() {
         while at < all.len() {
             let r = next();
             let (got, pending) = if r % 4 == 0 {
-                drive(|cx| {
+                drive(&vfs, |cx| {
                     cells
                         .poll_next(cx)
                         .map(|r| r.expect("poll_next").map(|e| entry(&e)))
@@ -220,7 +244,7 @@ fn cold_seeks_land_where_the_sync_walk_says() {
                     }
                 };
                 let want = expected_seek(&all, at, family, &qual(target), &order);
-                let got = drive(|cx| {
+                let got = drive(&vfs, |cx| {
                     cells
                         .poll_seek(cx, family, &qual(target))
                         .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -250,7 +274,7 @@ fn cold_seeks_land_where_the_sync_walk_says() {
             "seed {seed}: synchronous reads"
         );
         assert!(pendings > 0, "seed {seed}: a cold walk fetched nothing");
-        db.close().expect("close");
+        close(&vfs, db);
     }
 }
 
@@ -259,7 +283,7 @@ fn cold_seeks_land_where_the_sync_walk_says() {
 /// first family's lands on the next cell, and a family the table lacks is refused.
 #[test]
 fn seeks_cross_the_scans_of_a_resumed_walk() {
-    let (_dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     let all = walk_all(&s, &t, 1);
     // Resume after the 100th cell, which is in `post`.
@@ -276,7 +300,7 @@ fn seeks_cross_the_scans_of_a_resumed_walk() {
         .cells()
         .expect("cells");
     // A seek into `side` (read by the second scan).
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "side", &qual(900))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -284,24 +308,26 @@ fn seeks_cross_the_scans_of_a_resumed_walk() {
     let at = expected_seek(rest, 0, "side", &qual(900), &["post", "side"]);
     assert_eq!(got.as_ref(), rest.get(at));
     // Back into `post`: the next cell, not a move back.
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "post", &qual(0))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
     });
     assert_eq!(got.as_ref(), rest.get(at + 1));
-    let (err, _) = drive(|cx| cells.poll_seek(cx, "nope", b"q").map(|r| r.err()));
+    let (err, _) = drive(&vfs, |cx| {
+        cells.poll_seek(cx, "nope", b"q").map(|r| r.err())
+    });
     assert_eq!(
         err.expect("refused").code(),
         pigeonhole::ErrorCode::FamilyNotFound
     );
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// A walk that starts sync and goes on async reads on from where it is.
 #[test]
 fn a_walk_goes_on_async_after_sync_steps() {
-    let (_dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     let all = walk_all(&s, &t, 1);
     let mut cells = t.row(HUB).snapshot(&s).cells().expect("cells");
@@ -315,21 +341,25 @@ fn a_walk_goes_on_async_after_sync_steps() {
         }
     });
     assert_eq!(got, all);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// Polls `f` once with a waker that does nothing: whether it was `Pending`, or its value.
-fn poll_once<T>(f: impl FnOnce(&mut std::task::Context<'_>) -> Poll<T>) -> Option<T> {
+/// With its I/O deferred, so a fetch it starts stays in flight.
+fn poll_once<T>(vfs: &SimVfs, f: impl FnOnce(&mut std::task::Context<'_>) -> Poll<T>) -> Option<T> {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    match f(&mut cx) {
+    vfs.set_deferred_io(true);
+    let r = match f(&mut cx) {
         Poll::Pending => None,
         Poll::Ready(v) => Some(v),
-    }
+    };
+    vfs.set_deferred_io(false);
+    r
 }
 
-fn reopen(dir: &pigeonhole::doc_support::TempDir, db: Pigeonhole) -> (Pigeonhole, Table) {
-    db.close().expect("close");
-    let db = Pigeonhole::open(dir.join("r.phdb"), Options::default().shards(1)).expect("reopen");
+fn reopen(vfs: &Arc<SimVfs>, db: Pigeonhole) -> (Pigeonhole, Table) {
+    close(vfs, db);
+    let db = Pigeonhole::open(PATH, opts(vfs)).expect("reopen");
     let t = db.table("t").expect("table").open().expect("open table");
     (db, t)
 }
@@ -339,16 +369,19 @@ fn reopen(dir: &pigeonhole::doc_support::TempDir, db: Pigeonhole) -> (Pigeonhole
 /// held the row) or inside the row.
 #[test]
 fn a_sync_step_finishes_a_pending_seek() {
-    let (dir, db, t) = build();
+    let (vfs, db, t) = build();
     let all = walk_all(&db.snapshot().expect("snapshot"), &t, 1);
     let order = ["post", "side"];
     // Waiting on the row's positioning: the first poll of a cold walk.
     drop(t);
-    let (db, t) = reopen(&dir, db);
+    let (db, t) = reopen(&vfs, db);
     let mut cells = t.row(HUB).cells().expect("cells");
     let target = qual(12_345);
     assert!(
-        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        poll_once(&vfs, |cx| cells
+            .poll_seek(cx, "post", &target)
+            .map(|r| r.is_ok()))
+        .is_none(),
         "a cold walk's first poll fetches"
     );
     let want = expected_seek(&all, 0, "post", &target, &order);
@@ -359,9 +392,9 @@ fn a_sync_step_finishes_a_pending_seek() {
     // Inside the row: one cell read first, then a seek far into it.
     drop(cells);
     drop(t);
-    let (db, t) = reopen(&dir, db);
+    let (db, t) = reopen(&vfs, db);
     let mut cells = t.row(HUB).cells().expect("cells");
-    let (first, _) = drive(|cx| {
+    let (first, _) = drive(&vfs, |cx| {
         cells
             .poll_next(cx)
             .map(|r| r.expect("poll_next").map(|e| entry(&e)))
@@ -369,7 +402,10 @@ fn a_sync_step_finishes_a_pending_seek() {
     assert_eq!(first.as_ref(), all.first());
     let target = qual(15_000);
     assert!(
-        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        poll_once(&vfs, |cx| cells
+            .poll_seek(cx, "post", &target)
+            .map(|r| r.is_ok()))
+        .is_none(),
         "a seek into an uncached block fetches"
     );
     let want = expected_seek(&all, 1, "post", &target, &order);
@@ -383,7 +419,7 @@ fn a_sync_step_finishes_a_pending_seek() {
     );
     drop(cells);
     drop(t);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// ai1249's R2 on #1625: a seek replacing one left `Pending` keeps the later column, so the
@@ -391,22 +427,27 @@ fn a_sync_step_finishes_a_pending_seek() {
 /// seek would; a later family replaces it.
 #[test]
 fn a_replacing_seek_never_moves_back() {
-    let (dir, db, t) = build();
+    let (vfs, db, t) = build();
     let all = walk_all(&db.snapshot().expect("snapshot"), &t, 1);
     let order = ["post", "side"];
     drop(t);
-    let (db, t) = reopen(&dir, db);
+    let (db, t) = reopen(&vfs, db);
     let mut cells = t.row(HUB).cells().expect("cells");
-    let (first, _) = drive(|cx| {
+    let (first, _) = drive(&vfs, |cx| {
         cells
             .poll_next(cx)
             .map(|r| r.expect("poll_next").map(|e| entry(&e)))
     });
     assert_eq!(first.as_ref(), all.first());
     let far = qual(16_000);
-    assert!(poll_once(|cx| cells.poll_seek(cx, "post", &far).map(|r| r.is_ok())).is_none());
+    assert!(
+        poll_once(&vfs, |cx| cells
+            .poll_seek(cx, "post", &far)
+            .map(|r| r.is_ok()))
+        .is_none()
+    );
     // An earlier qualifier: the pending seek's cell.
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "post", &qual(10))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -415,8 +456,10 @@ fn a_replacing_seek_never_moves_back() {
     assert_eq!(got.as_ref(), all.get(at));
     // A later family replaces a pending seek; an earlier family then keeps it.
     let farther = qual(18_000);
-    let pending = poll_once(|cx| cells.poll_seek(cx, "post", &farther).map(|r| r.is_ok()));
-    let (got, _) = drive(|cx| {
+    let pending = poll_once(&vfs, |cx| {
+        cells.poll_seek(cx, "post", &farther).map(|r| r.is_ok())
+    });
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "side", &qual(600))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -428,7 +471,7 @@ fn a_replacing_seek_never_moves_back() {
         "pending: {}",
         pending.is_none()
     );
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "post", &qual(19_000))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -440,14 +483,14 @@ fn a_replacing_seek_never_moves_back() {
     );
     drop(cells);
     drop(t);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// ai1249's N1 on #1625: a seek to a family of the table the walk doesn't read is the next
 /// cell.
 #[test]
 fn a_seek_to_an_unread_family_is_the_next_cell() {
-    let (_dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     let post = sync_walk(
         t.row(HUB)
@@ -462,20 +505,20 @@ fn a_seek_to_an_unread_family_is_the_next_cell() {
         .family("post")
         .cells()
         .expect("cells");
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_next(cx)
             .map(|r| r.expect("poll_next").map(|e| entry(&e)))
     });
     assert_eq!(got.as_ref(), post.first());
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "side", &qual(0))
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
     });
     assert_eq!(got.as_ref(), post.get(1));
     drop(cells);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// ai1249's N2 on #1625: `next_async`'s future is `Send` (the Python bridge polls it on its
@@ -483,20 +526,20 @@ fn a_seek_to_an_unread_family_is_the_next_cell() {
 #[test]
 fn next_async_is_send() {
     fn send<T: Send>(_: &T) {}
-    let (_dir, db, t) = build();
+    let (vfs, db, t) = build();
     let mut cells = t.row(HUB).cells().expect("cells");
     let fut = cells.next_async();
     send(&fut);
     drop(fut);
     drop(cells);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// ai1249's R3 on #1625: a seek to an unread family is a plain step, so it never replaces a
 /// pending seek: a sync step after both finishes the pending one.
 #[test]
 fn an_unread_family_seek_keeps_a_pending_one() {
-    let (dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     let post = sync_walk(
         t.row(HUB)
@@ -507,9 +550,9 @@ fn an_unread_family_seek_keeps_a_pending_one() {
     );
     drop(s);
     drop(t);
-    let (db, t) = reopen(&dir, db);
+    let (db, t) = reopen(&vfs, db);
     let mut cells = t.row(HUB).family("post").cells().expect("cells");
-    let (first, _) = drive(|cx| {
+    let (first, _) = drive(&vfs, |cx| {
         cells
             .poll_next(cx)
             .map(|r| r.expect("poll_next").map(|e| entry(&e)))
@@ -517,11 +560,16 @@ fn an_unread_family_seek_keeps_a_pending_one() {
     assert_eq!(first.as_ref(), post.first());
     let target = qual(15_000);
     assert!(
-        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        poll_once(&vfs, |cx| cells
+            .poll_seek(cx, "post", &target)
+            .map(|r| r.is_ok()))
+        .is_none(),
         "a seek into an uncached block fetches"
     );
     // `side` isn't read by this walk; a pending poll of it leaves `post`'s seek in place.
-    let _ = poll_once(|cx| cells.poll_seek(cx, "side", &qual(0)).map(|r| r.is_ok()));
+    let _ = poll_once(&vfs, |cx| {
+        cells.poll_seek(cx, "side", &qual(0)).map(|r| r.is_ok())
+    });
     let want = expected_seek(&post, 1, "post", &target, &["post"]);
     assert_eq!(
         cells.next().expect("next").map(|e| entry(&e)).as_ref(),
@@ -529,14 +577,14 @@ fn an_unread_family_seek_keeps_a_pending_one() {
     );
     drop(cells);
     drop(t);
-    db.close().expect("close");
+    close(&vfs, db);
 }
 
 /// ai1249's N5 on #1625, the reverse order: a seek to an unread family left `Pending` is a
 /// plain step, so a seek after it lands at or after its own column.
 #[test]
 fn a_pending_unread_family_seek_is_a_plain_step() {
-    let (dir, db, t) = build();
+    let (vfs, db, t) = build();
     let s = db.snapshot().expect("snapshot");
     let post = sync_walk(
         t.row(HUB)
@@ -547,15 +595,18 @@ fn a_pending_unread_family_seek_is_a_plain_step() {
     );
     drop(s);
     drop(t);
-    let (db, t) = reopen(&dir, db);
+    let (db, t) = reopen(&vfs, db);
     let mut cells = t.row(HUB).family("post").cells().expect("cells");
     // `side` isn't read by this walk; a cold walk's first poll fetches.
     assert!(
-        poll_once(|cx| cells.poll_seek(cx, "side", &qual(0)).map(|r| r.is_ok())).is_none(),
+        poll_once(&vfs, |cx| cells
+            .poll_seek(cx, "side", &qual(0))
+            .map(|r| r.is_ok()))
+        .is_none(),
         "a cold walk's first poll fetches"
     );
     let target = qual(15_000);
-    let (got, _) = drive(|cx| {
+    let (got, _) = drive(&vfs, |cx| {
         cells
             .poll_seek(cx, "post", &target)
             .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
@@ -564,5 +615,5 @@ fn a_pending_unread_family_seek_is_a_plain_step() {
     assert_eq!(got.as_ref(), post.get(want));
     drop(cells);
     drop(t);
-    db.close().expect("close");
+    close(&vfs, db);
 }
