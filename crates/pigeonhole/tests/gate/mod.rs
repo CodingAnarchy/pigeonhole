@@ -37,6 +37,16 @@ type HeldWrite = (PathBuf, FileRef, IoBuf, u64, Resolver<IoBuf>);
 type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
 
 /// The test's handle on the VFS's rules and held completions.
+/// Which threads' reads a read hold catches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum HoldScope {
+    /// Every thread's.
+    #[default]
+    Any,
+    /// Only the thread whose read it caught first (`None` until one is).
+    FirstReader(Option<std::thread::ThreadId>),
+}
+
 #[derive(Debug, Default)]
 pub struct Gate {
     rules: Mutex<Rules>,
@@ -47,6 +57,9 @@ pub struct Gate {
     /// Reads whose bytes contain this marker block, on the reading thread, until
     /// [`Gate::release_reads`] (a WAL replay held mid-reopen, say).
     hold_read_marker: Mutex<Option<Vec<u8>>>,
+    /// Which threads' reads the hold catches: every thread's, or only the thread whose read
+    /// it caught first ([`Gate::hold_first_reader_containing`]).
+    hold_scope: Mutex<HoldScope>,
     /// How many reads are held now.
     held_reads: Mutex<usize>,
     reads_released: std::sync::Condvar,
@@ -108,7 +121,22 @@ impl Gate {
     /// Holds, on the reading thread, every later blocking read whose bytes contain `marker`
     /// (or none), until [`Gate::release_reads`].
     pub fn hold_reads_containing(&self, marker: Option<&[u8]>) {
+        *self.hold_scope.lock().unwrap() = HoldScope::Any;
         *self.hold_read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// Like [`Gate::hold_reads_containing`], but holds only the reads of the first thread
+    /// whose read contains `marker`: another thread reading the same bytes (a compaction of
+    /// the SST holding them, say) goes on, so it can't block what waits for it, such as a
+    /// close that joins the engine's threads.
+    pub fn hold_first_reader_containing(&self, marker: &[u8]) {
+        *self.hold_scope.lock().unwrap() = HoldScope::FirstReader(None);
+        *self.hold_read_marker.lock().unwrap() = Some(marker.to_vec());
+    }
+
+    /// How many reads are held now.
+    pub fn held_reads(&self) -> usize {
+        *self.held_reads.lock().unwrap()
     }
 
     /// Waits (up to 10 s) until a read is held.
@@ -350,6 +378,17 @@ impl pigeonhole_io::File for GateFile {
         let held = match &*self.gate.hold_read_marker.lock().unwrap() {
             Some(marker) => buf.windows(marker.len()).any(|w| w == &marker[..]),
             None => false,
+        } && {
+            let mut scope = self.gate.hold_scope.lock().unwrap();
+            let me = std::thread::current().id();
+            match *scope {
+                HoldScope::Any => true,
+                HoldScope::FirstReader(None) => {
+                    *scope = HoldScope::FirstReader(Some(me));
+                    true
+                }
+                HoldScope::FirstReader(Some(first)) => first == me,
+            }
         };
         if held {
             let mut n = self.gate.held_reads.lock().unwrap();
