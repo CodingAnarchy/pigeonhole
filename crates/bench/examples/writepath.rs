@@ -57,7 +57,7 @@ fn main() {
     // backend, which thread completed a read and how many slices the task took depended on
     // timing (#794). Inline I/O and a stepped clock keep its count the same on every run.
     let vfs = (shape == "compact").then(inline_io::InlineVfs::vfs);
-    let (db, shards) = Shards::open(&dir.join("w.phdb"), vfs);
+    let (db, shards) = Shards::open(&dir.join("w.phdb"), vfs, |o| o);
     let t = db
         .table("t")
         .unwrap()
