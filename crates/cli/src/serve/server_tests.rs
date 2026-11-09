@@ -160,6 +160,7 @@ impl Server {
                 let _ = stopped.await;
             },
             Duration::from_secs(2),
+            None,
         ));
         if let Some(r) = &replica {
             let _guard = runtime.enter();

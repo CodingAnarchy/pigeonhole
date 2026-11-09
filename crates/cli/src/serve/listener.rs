@@ -28,6 +28,7 @@ pub(crate) async fn serve(
     app: axum::Router,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
+    send_buffer: Option<usize>,
 ) {
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
@@ -54,6 +55,12 @@ pub(crate) async fn serve(
             .timer(hyper_util::rt::TokioTimer::new())
             .keep_alive_interval(KEEPALIVE)
             .keep_alive_timeout(KEEPALIVE);
+        // What one stream may queue for its client beyond its window (`--http2-send-buffer`;
+        // hyper's 400 KiB by default): with a fixed client window, a feed stream's queue is
+        // its delivery lag (perf287 on #1397).
+        if let Some(n) = send_buffer {
+            builder.http2().max_send_buf_size(n);
+        }
         match &tls {
             None => {
                 let conn = builder

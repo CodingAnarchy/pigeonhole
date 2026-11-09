@@ -315,7 +315,7 @@ pub(crate) fn run(
             shutdown_signal().await;
             stopping.router.service.bulk.stop();
         };
-        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms)).await;
+        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms), args.http2_send_buffer.map(|n| usize::try_from(n).unwrap_or(usize::MAX))).await;
         if let Some(r) = &replica {
             r.stop().await;
         }

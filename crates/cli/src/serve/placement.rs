@@ -52,6 +52,8 @@ impl Placement {
             "unpinned",
         );
         let default = free.max(2);
+        // A quarter. perf287 on #1397: a floor of 4 (8 network + 4 feed on a 12-CPU slice)
+        // left the network side short and every split run fell behind; 9 + 3 kept up.
         let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
             io_threads: io

@@ -22,7 +22,15 @@
 //! target/release/examples/serve_feed_load --phdb target/release/phdb --dir /mnt/nvme/feedload
 //! # with server flags, e.g. the feed runtime's size (ticket 5's (A)):
 //! target/release/examples/serve_feed_load ... --serve-arg=--feed-threads --serve-arg=4
+//! # the load generator and the server on disjoint CPUs (Linux), so the ratio is the server's:
+//! target/release/examples/serve_feed_load ... --client-cpus 0-11 --server-cpus 12-47
 //! ```
+//!
+//! Only one subscriber in `--lag-every` (16) decodes its events for the lag columns; the
+//! others count frames through a codec that decodes nothing, so 256 subscribers cost the
+//! client little (perf287 on #1589). `--h2-conn-window`, `--h2-stream-window` and
+//! `--h2-adaptive` (on by default) set the client's HTTP/2 receive windows, which pace the
+//! server's sends.
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -79,25 +87,105 @@ struct Args {
     /// `--serve-arg=--feed-threads --serve-arg=4`).
     #[arg(long = "serve-arg", allow_hyphen_values = true)]
     serve_args: Vec<String>,
+    /// One subscriber in this many decodes its events and measures lag; the others only
+    /// count frames, so the load generator costs little (perf287 on #1589).
+    #[arg(long, default_value_t = 16)]
+    lag_every: usize,
+    /// Run this process (the writers and subscribers) on these CPUs, e.g. `0-11` (Linux).
+    #[arg(long, value_name = "LIST")]
+    client_cpus: Option<String>,
+    /// Run `phdb serve` on these CPUs, through `taskset -c` (Linux).
+    #[arg(long, value_name = "LIST")]
+    server_cpus: Option<String>,
+    /// The client's HTTP/2 connection receive window, in bytes (default: hyper's, 5 MiB).
+    #[arg(long, value_name = "BYTES")]
+    h2_conn_window: Option<u32>,
+    /// The client's HTTP/2 per-stream receive window, in bytes (default: hyper's, 2 MiB).
+    #[arg(long, value_name = "BYTES")]
+    h2_stream_window: Option<u32>,
+    /// Offer puts at this total rate, puts/s across all writers, each on a fixed schedule;
+    /// unset, the writers run flat out. With a rate, a put's latency counts from when it was
+    /// due, so a server that falls behind can't hide it (perf287's offered-load acceptance).
+    #[arg(long, value_name = "PUTS_PER_SEC")]
+    put_rate: Option<f64>,
+    /// Let the client's HTTP/2 windows follow the measured bandwidth-delay product (on by
+    /// default: fixed windows let about 18 ms of events queue per stream, perf287 on #1397).
+    /// `--h2-adaptive false` uses the fixed windows.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    h2_adaptive: bool,
 }
 
 /// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
 /// (`listener::MAX_STREAMS`), and a subscribe past that waits for a stream forever.
 const STREAMS_PER_CONNECTION: usize = 64;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     epoch();
     let file = prepare(&args)?;
-    let mut server = Server::start(&args, &file)?;
+    // The server first, so it doesn't inherit the client's CPUs.
+    let server = Server::start(&args, &file)?;
+    // Then this process's CPUs, before the runtime starts its threads: they inherit them.
+    if let Some(list) = &args.client_cpus {
+        pin_self(list)?;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_all(args, server))
+}
+
+/// Pins the calling thread, and the threads it starts after, to `list` (Linux).
+#[cfg(target_os = "linux")]
+fn pin_self(list: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut set = nix::sched::CpuSet::new();
+    for cpu in cpu_list(list)? {
+        set.set(cpu)?;
+    }
+    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_self(_list: &str) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--client-cpus needs Linux".into())
+}
+
+/// `0-3,8,10-11` as CPU numbers.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_list(list: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for part in list.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => out.extend(a.trim().parse::<usize>()?..=b.trim().parse::<usize>()?),
+            None => out.push(part.trim().parse()?),
+        }
+    }
+    Ok(out)
+}
+
+async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{}", args.port);
-    let channel = connect(&url).await?;
+    let channel = connect(&url, &args).await?;
+    println!(
+        "client: lag from 1 subscriber in {}; h2 windows: connection {}, stream {}{}; CPUs: client {}, server {}",
+        args.lag_every.max(1),
+        args.h2_conn_window
+            .map_or("default".into(), |w| w.to_string()),
+        args.h2_stream_window
+            .map_or("default".into(), |w| w.to_string()),
+        if args.h2_adaptive { ", adaptive" } else { "" },
+        args.client_cpus.as_deref().unwrap_or("any"),
+        args.server_cpus.as_deref().unwrap_or("any"),
+    );
     if !args.serve_args.is_empty() {
         println!("phdb serve {}", args.serve_args.join(" "));
     }
+    if let Some(rate) = args.put_rate {
+        println!("offered: {rate:.0} puts/s across {} writers", args.writers);
+    }
     println!(
-        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11}",
+        "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11} {:>7} {:>8} {:>8}",
         "scenario",
         "puts/s",
         "p50 us",
@@ -106,7 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cpu us/put",
         "events/sub",
         "lag p50 us",
-        "lag p99 us"
+        "lag p99 us",
+        "behind",
+        "rejoined",
+        "dropped"
     );
     let busy = |n: usize| vec![vec!["busy".to_owned()]; n];
     let mut scenarios: Vec<(String, Vec<Vec<String>>)> = args
@@ -129,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_or_else(|| "-".into(), |v| v.to_string())
         };
         println!(
-            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1} {:>11} {:>11}",
+            "{name:<22} {:>10.0} {:>9} {:>9} {:>9} {:>12} {:>12.1} {:>11} {:>11} {:>7} {:>8} {:>8}",
             r.puts_per_sec,
             r.p50,
             r.p99,
@@ -138,7 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_or_else(|| "n/a".into(), |c| format!("{c:.1}")),
             r.events_per_sub,
             lag(0.5),
-            lag(0.99)
+            lag(0.99),
+            r.fell_behind,
+            r.rejoined,
+            r.dropped
         );
     }
     server.stop();
@@ -172,7 +266,15 @@ struct Server(Child);
 
 impl Server {
     fn start(args: &Args, file: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let child = Command::new(&args.phdb)
+        let mut cmd = match &args.server_cpus {
+            Some(list) => {
+                let mut c = Command::new("taskset");
+                c.arg("-c").arg(list).arg(&args.phdb);
+                c
+            }
+            None => Command::new(&args.phdb),
+        };
+        let child = cmd
             .arg("serve")
             .arg(file)
             .arg("--listen")
@@ -200,19 +302,105 @@ impl Drop for Server {
     }
 }
 
-async fn connect(url: &str) -> Result<tonic::transport::Channel, Box<dyn std::error::Error>> {
+async fn connect(
+    url: &str,
+    args: &Args,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match tonic::transport::Channel::from_shared(url.to_owned())?
-            .connect()
-            .await
-        {
+        let endpoint = tonic::transport::Channel::from_shared(url.to_owned())?
+            .initial_connection_window_size(args.h2_conn_window)
+            .initial_stream_window_size(args.h2_stream_window)
+            .http2_adaptive_window(args.h2_adaptive);
+        match endpoint.connect().await {
             Ok(c) => return Ok(c),
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// The server's feed counters, from `Admin.Metrics` (Prometheus text): name to value.
+async fn feed_counters(
+    channel: &tonic::transport::Channel,
+) -> Result<std::collections::HashMap<String, u64>, Box<dyn std::error::Error>> {
+    let text = proto::admin_client::AdminClient::new(channel.clone())
+        .metrics(proto::Empty {})
+        .await?
+        .into_inner()
+        .text;
+    Ok(text
+        .lines()
+        .filter(|l| l.starts_with("pigeonhole_serve_feed_"))
+        .filter_map(|l| {
+            let (name, value) = l.rsplit_once(' ')?;
+            Some((name.to_owned(), value.parse().ok()?))
+        })
+        .collect())
+}
+
+/// `Feed.Subscribe` with a codec that counts each event's frame and decodes nothing.
+async fn count_frames(
+    conn: tonic::transport::Channel,
+    request: proto::SubscribeRequest,
+) -> Result<tonic::Streaming<usize>, Box<dyn std::error::Error>> {
+    let mut grpc = tonic::client::Grpc::new(conn);
+    grpc.ready().await?;
+    let path =
+        tonic::codegen::http::uri::PathAndQuery::from_static("/pigeonhole.v1.Feed/Subscribe");
+    Ok(grpc
+        .server_streaming(tonic::Request::new(request), path, CountCodec)
+        .await?
+        .into_inner())
+}
+
+/// Encodes a `SubscribeRequest`; decodes each message as its length only.
+struct CountCodec;
+
+impl tonic::codec::Codec for CountCodec {
+    type Encode = proto::SubscribeRequest;
+    type Decode = usize;
+    type Encoder = CountCodec;
+    type Decoder = CountCodec;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        CountCodec
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        CountCodec
+    }
+}
+
+impl tonic::codec::Encoder for CountCodec {
+    type Item = proto::SubscribeRequest;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        use prost::Message;
+        item.encode(dst)
+            .map_err(|e| tonic::Status::internal(e.to_string()))
+    }
+}
+
+impl tonic::codec::Decoder for CountCodec {
+    type Item = usize;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        use prost::bytes::Buf;
+        let n = src.remaining();
+        src.advance(n);
+        Ok(Some(n))
     }
 }
 
@@ -274,6 +462,11 @@ impl Lag {
 
 struct Outcome {
     lag: Lag,
+    /// Server-side: subscribers that fell behind the shared ring, and that rejoined it.
+    fell_behind: u64,
+    rejoined: u64,
+    /// Client-side: streams the server ended before the scenario did.
+    dropped: u64,
     puts_per_sec: f64,
     p50: u64,
     p99: u64,
@@ -292,6 +485,7 @@ async fn run(
     // what it gets.
     let subscribers = tables.len();
     let events = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     let mut subs = Vec::with_capacity(subscribers);
     let url = format!("http://127.0.0.1:{}", args.port);
@@ -300,19 +494,37 @@ async fn run(
         // A connection of its own for each `STREAMS_PER_CONNECTION` subscribers: the
         // writers keep `channel`.
         if i % STREAMS_PER_CONNECTION == 0 {
-            connections.push(connect(&url).await?);
+            connections.push(connect(&url, args).await?);
         }
-        let mut client = FeedClient::new(connections[i / STREAMS_PER_CONNECTION].clone());
-        let mut stream = client
-            .subscribe(proto::SubscribeRequest {
-                tables: set.clone(),
-                visible: args.visible,
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        let conn = connections[i / STREAMS_PER_CONNECTION].clone();
+        let request = proto::SubscribeRequest {
+            tables: set.clone(),
+            visible: args.visible,
+            ..Default::default()
+        };
         let events = Arc::clone(&events);
+        let dropped = Arc::clone(&dropped);
         let mut stop = stop_rx.clone();
+        if i % args.lag_every.max(1) != 0 {
+            // A counting subscriber: frames, not decoded.
+            let mut stream = count_frames(conn, request).await?;
+            subs.push(tokio::spawn(async move {
+                loop {
+                    let n = tokio::select! {
+                        m = stream.message() => m,
+                        _ = stop.changed() => break,
+                    };
+                    let Ok(Some(_)) = n else {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    };
+                    events.fetch_add(1, Ordering::Relaxed);
+                }
+                Lag::new()
+            }));
+            continue;
+        }
+        let mut stream = FeedClient::new(conn).subscribe(request).await?.into_inner();
         subs.push(tokio::spawn(async move {
             let mut lag = Lag::new();
             loop {
@@ -320,7 +532,10 @@ async fn run(
                     m = stream.message() => m,
                     _ = stop.changed() => break,
                 };
-                let Ok(Some(e)) = e else { break };
+                let Ok(Some(e)) = e else {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
                 events.fetch_add(1, Ordering::Relaxed);
                 if let Some(proto::feed_event::Event::Commit(c)) = e.event {
                     let now = now_nanos();
@@ -342,6 +557,7 @@ async fn run(
     // Let the streams settle before measuring.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let cpu_before = cpu_seconds(server);
+    let metrics_before = feed_counters(channel).await?;
     let started = Instant::now();
     let end = started + Duration::from_secs(args.seconds);
     let mut writers = Vec::with_capacity(args.writers);
@@ -349,16 +565,30 @@ async fn run(
         let mut client = DataClient::new(channel.clone());
         let value_bytes = args.value_bytes.max(8);
         let durability = args.durability;
+        // With --put-rate, this writer's share: one put every `every`, staggered across the
+        // writers so the offered load is even.
+        let every = args
+            .put_rate
+            .map(|r| Duration::from_secs_f64(args.writers as f64 / r.max(1e-9)));
+        let first = every.map(|e| started + e.mul_f64(w as f64 / args.writers as f64));
         writers.push(tokio::spawn(async move {
             let mut lat = Vec::new();
             let mut i = 0u64;
             while Instant::now() < end {
+                // Paced: wait for the put's due time, and count its latency from then.
+                let due = first.zip(every).map(|(f, e)| f + e * (i as u32));
+                if let Some(d) = due {
+                    if d >= end {
+                        break;
+                    }
+                    tokio::time::sleep_until(d.into()).await;
+                }
                 let row = format!("w{w:03}-{i:012}").into_bytes();
                 i += 1;
                 // The send time first: the subscribers' lag is measured from it.
                 let mut value = vec![b'v'; value_bytes];
                 value[..8].copy_from_slice(&now_nanos().to_le_bytes());
-                let t = Instant::now();
+                let t = due.unwrap_or_else(Instant::now);
                 let r = client
                     .mutate(proto::MutateRequest {
                         writes: Some(proto::RowWrites {
@@ -400,6 +630,14 @@ async fn run(
     for s in subs {
         lag.merge(&s.await?);
     }
+    let metrics_after = feed_counters(channel).await?;
+    let delta = |name: &str| {
+        metrics_after
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(metrics_before.get(name).copied().unwrap_or(0))
+    };
     lat.sort_unstable();
     let at = |q: f64| {
         lat.get(((lat.len() as f64 * q) as usize).min(lat.len().saturating_sub(1)))
@@ -409,6 +647,9 @@ async fn run(
     let puts = lat.len() as f64;
     Ok(Outcome {
         lag,
+        fell_behind: delta("pigeonhole_serve_feed_fell_behind_total"),
+        rejoined: delta("pigeonhole_serve_feed_rejoined_total"),
+        dropped: dropped.load(Ordering::Relaxed),
         puts_per_sec: puts / elapsed,
         p50: at(0.5),
         p99: at(0.99),
