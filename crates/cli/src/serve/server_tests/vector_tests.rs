@@ -758,3 +758,58 @@ fn a_shutdown_stops_a_running_load_between_messages() {
         limits().inflight_bytes
     );
 }
+
+/// #1588: dropping a vector index's table evicts its cached handle and stops its background
+/// rebalancer. A search then answers `TableNotFound`, and a new index made under the name
+/// (with `if_missing`, which a cached handle used to answer at once) is the one served.
+#[test]
+fn dropping_an_index_s_table_evicts_its_handle_and_its_rebalancer() {
+    let s = Server::start("", limits());
+    let indexes = &s.shared.router.service.indexes;
+    let insert = |id: &[u8], y: f32| {
+        let (status, e) = s.rpc(
+            "Vectors/Insert",
+            &json!({"index": "ix", "id": b64(id), "vector": f32_query(&[0.0, y])}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+    };
+    let search = || {
+        s.rpc(
+            "Vectors/Search",
+            &json!({"index": "ix", "query": f32_query(&[0.0, 0.0]), "k": 10}),
+            None,
+        )
+    };
+    let spec = index_spec("REBALANCE_BACKGROUND");
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    insert(b"old", 1.0);
+    let (status, r) = search();
+    assert_eq!((status, hit_ids(&r)), (200, vec![b64(b"old")]), "{r}");
+    assert_eq!(indexes.rebalancing(), 1);
+
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "ix"}), None);
+    assert_eq!(status, 200, "{e}");
+    let (status, r) = search();
+    assert_eq!(
+        (status, r["code"].as_str()),
+        (404, Some("TableNotFound")),
+        "{r}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while indexes.rebalancing() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped index's rebalancer still runs"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Made again: `if_missing` opens the new index, which the calls then use.
+    let mut again = spec.clone();
+    again["if_missing"] = json!(true);
+    assert_eq!(s.rpc("Vectors/CreateIndex", &again, None).0, 200);
+    insert(b"new", 2.0);
+    let (status, r) = search();
+    assert_eq!((status, hit_ids(&r)), (200, vec![b64(b"new")]), "{r}");
+}

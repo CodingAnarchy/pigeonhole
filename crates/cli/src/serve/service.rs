@@ -861,16 +861,23 @@ impl Service {
     /// publishes the seqno it applied only after this returns, so a read waiting for that
     /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
-        // A new generation: a table open running across this keeps nothing (#1632).
+        self.handles_changed();
+        if let Some(memory) = &self.memory {
+            memory.clear();
+        }
+    }
+
+    /// The cached table, vector index and text index handles go: a replica's catalog change,
+    /// or a `DropTable` here (#1588), whose name may have been an index's. The next call on
+    /// each name opens it again. A forgotten background index's rebalancer sees its index
+    /// close and ends. An open running across this keeps nothing (#1632).
+    fn handles_changed(&self) {
         self.tables.rcu(|c| TableCache {
             generation: c.generation + 1,
             map: HashMap::new(),
         });
         self.indexes.forget();
         self.texts.forget();
-        if let Some(memory) = &self.memory {
-            memory.clear();
-        }
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
@@ -1445,14 +1452,12 @@ impl Service {
         reserved(&name)?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let owned = name.clone();
-        let dropped = self.blocking(move || Ok(db.drop_table(&owned)?)).await;
-        // Whatever the outcome, the next use resolves the name again.
-        self.tables.rcu(|c| {
-            let mut c = TableCache::clone(c);
-            c.map.remove(&name);
-            c
-        });
+        let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
+        // Whatever the outcome, the next use resolves every name again: the table's handle,
+        // and a vector or text index's if it was one, with its rebalancer (#1588). Every
+        // cached handle goes, not only the name's: drops are rare, and an open of the name
+        // already running keeps nothing (#1632).
+        self.handles_changed();
         dropped
     }
 
