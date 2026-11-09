@@ -1290,6 +1290,15 @@ impl Store {
         q.push_back(placed);
     }
 
+    /// The IVF index's list lengths, in list order (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_list_lens(&self) -> Result<Option<Vec<u64>>> {
+        match &self.ivf {
+            Some(Ivf::W(index, _)) => Ok(Some(index.verify()?.list_lens)),
+            _ => Ok(None),
+        }
+    }
+
     /// The IVF records waiting to settle (an inspection helper for `hooks`).
     #[cfg(feature = "__unstable-hooks")]
     pub(crate) fn ivf_pending_len(&self) -> usize {

@@ -756,3 +756,131 @@ fn a_swap_reopens_the_memory_store_from_the_new_copy_and_ends_its_watches() {
         Some("watched anew".to_owned())
     );
 }
+
+/// The store `s` serves, once a call has opened it.
+fn served_store(s: &Server) -> Arc<crate::memcore::MemCore> {
+    let slot = s
+        .shared
+        .router
+        .service
+        .memory_slot()
+        .expect("a memory server");
+    match slot.cached() {
+        Some(crate::serve::memslot::Entry::Core(core)) => core,
+        _ => panic!("the store isn't open"),
+    }
+}
+
+/// How many lists `store`'s IVF index has.
+fn ivf_lists(store: &pigeonhole_memory::Store) -> usize {
+    pigeonhole_memory::hooks::ivf_list_lens(store)
+        .unwrap()
+        .expect("an IVF index")
+        .len()
+}
+
+/// A replica's memory store runs no IVF rebalancer, and a promote's open starts one (#1640,
+/// cli692's point on #1618). Counted by the index's lists: a background index's lists only
+/// split when its rebalancer runs. The primary's store holds its own rebalancer and never
+/// runs it, so every split the test sees is the replica's.
+#[test]
+fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
+    use pigeonhole_memory::{EmbeddingModel, IvfOptions, Memory, OpenOptions, Store, StoreOptions};
+    let options = || {
+        StoreOptions::new()
+            .embedding(EmbeddingModel::new("m4", 4, pigeonhole::Element::F32).unwrap())
+            .ivf(
+                IvfOptions::new()
+                    .min_namespace_len(100)
+                    .target_list_len(8)
+                    .nprobe(2),
+            )
+    };
+    let mut x = 1640u64;
+    let mut embedding = move || -> Vec<f32> {
+        (0..4)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (x >> 40) as f32 / (1u64 << 24) as f32
+            })
+            .collect()
+    };
+
+    let p = Server::start("", limits());
+    let store = Store::create_with(
+        &p.shared.router.service.db,
+        "m",
+        options(),
+        OpenOptions::new().model("m4").own_rebalancer(),
+    )
+    .unwrap();
+    let held = store
+        .take_rebalancer()
+        .expect("the primary's rebalancer, never run");
+    for i in 0..400 {
+        store
+            .remember(
+                "big",
+                Memory::new(format!("big memory {i}")).embedding(embedding()),
+            )
+            .unwrap();
+    }
+    let lists = ivf_lists(&store);
+    assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
+
+    let r = Server::start_replica_custom(
+        test_dir(),
+        &p.url,
+        None,
+        limits(),
+        Options::default(),
+        move |svc| {
+            let (slot, _) = crate::serve::memslot::MemSlot::start(
+                &svc.db,
+                "m",
+                None,
+                Some("m4"),
+                Arc::new(move |_| Ok(options())),
+                (1 << 20, 8 << 20),
+                false,
+            )
+            .unwrap();
+            svc.memory_opt(Some(slot), 0)
+        },
+    );
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let (status, body) = recall_with(&r, "memory", &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ivf_lists(served_store(&r).store()), lists);
+    // A rebalancer polls every 50 ms: two seconds is plenty for one to split, and none does.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        ivf_lists(served_store(&r).store()),
+        lists,
+        "a replica's store rebalanced"
+    );
+
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 200, "{body}");
+    for i in 0..100 {
+        let v = f32_query(&embedding());
+        let (status, body) = r.rpc(
+            "Memory/Remember",
+            &json!({"namespace": "big", "memory": {"text": format!("after {i}"), "embedding": v}}),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while ivf_lists(served_store(&r).store()) <= lists {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the promoted replica's store never split a list"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(held);
+    drop(store);
+}
