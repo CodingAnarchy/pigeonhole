@@ -4519,5 +4519,9 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **The bound:** the reader keeps at most its budget, plus about twice the in-flight cross-shard shares, plus one commit.
 - **The cost:** a reader that stays a backlog B behind re-reads B (frames and headers only) once per budget delivered.
 - **Reader processes** (`ReadTable::feed`) run the same passes, so the cap applies there too.
+- **Retention (simp724's N2 on #1622):** retention follows bytes and age, not subscribers. A capped reader's margin is its hint, as for a token resume: a record it evicted has to be read again from the log. So a rewind can expire a feed that, uncapped, would still hold that record in memory. The guide says so under "When a feed expires".
+- **What the reader remembers between rewinds (simp724's S1 on #1622):** only the passed-over rounds with ids below C, the rounds in flight across C. A share with a larger id is passed over by its id, and C only falls.
+- **`read_through`** is still set after every pass, capped or not. `position()` and the idle fast path take the min with C, and a rewind clears it.
+- **Shares of delivered rounds** that a rewind re-reads without their Decision are never evicted (simp724's N1). Evicting one would put C at or below `delivered` for nothing; rule C drops it.
 
 **Deferred (PR 2, after PR 1's box run).** The writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it needs a per-session marker: a FORMAT and ICR line.

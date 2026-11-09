@@ -553,8 +553,11 @@ struct ReadAhead {
     /// Rounds passed over since the last rewind (their Decision skipped, or their shares or
     /// Decision evicted): their shares read later are passed over too, never held. Rule C
     /// would otherwise drop a held share whose Decision this pass skipped, and the Decision
-    /// read after the rewind would then expire the feed.
-    skipped_rounds: HashSet<Seqno>,
+    /// read after the rewind would then expire the feed. Only ids below the cutoff are kept
+    /// (simp724's S1 on #1622): a share with an id at or above it is passed over by its id
+    /// anyway, and the cutoff only falls until the rewind. So it holds only rounds in flight
+    /// across the cutoff, not every round of a backlog.
+    skipped_rounds: std::collections::BTreeSet<Seqno>,
     /// The decided rounds in `ready`: id to apply seqno.
     decided: HashMap<Seqno, Seqno>,
 }
@@ -567,7 +570,7 @@ impl ReadAhead {
             base,
             cutoff: Seqno::MAX,
             resume: vec![None; streams],
-            skipped_rounds: HashSet::new(),
+            skipped_rounds: std::collections::BTreeSet::new(),
             decided: HashMap::new(),
         }
     }
@@ -576,6 +579,15 @@ impl ReadAhead {
     fn skip(&mut self, s: usize, start: Lsn) {
         let r = &mut self.resume[s];
         *r = Some(r.map_or(start, |r| r.min(start)));
+    }
+
+    /// Lowers the cutoff to at most `c`, forgetting the passed-over rounds its id test now
+    /// covers.
+    fn lower_cutoff(&mut self, c: Seqno) {
+        if c < self.cutoff {
+            self.cutoff = c;
+            self.skipped_rounds.split_off(&c);
+        }
     }
 
     /// Whether anything was passed over since the last rewind.
@@ -1047,6 +1059,14 @@ impl FeedReader {
         self.ahead.bytes
     }
 
+    /// The rounds the read-ahead cap passes over by id until the next rewind (D320; an
+    /// inspection count for tests, simp724's S1 on #1622).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn skipped_rounds(&self) -> usize {
+        self.ahead.skipped_rounds.len()
+    }
+
     /// Sets the read-ahead budget (D320) in place of the 64 MiB default: a seam for tests
     /// that need the cap to bite on a few commits.
     #[cfg(feature = "test-hooks")]
@@ -1433,9 +1453,14 @@ impl FeedReader {
         loop {
             let c = self.ahead.cutoff;
             let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
+            // Not a share of a round whose id + 1 is at or below `delivered` (simp724's N1 on
+            // #1622): a rewind can re-read a delivered round's share without its Decision, and
+            // evicting it would put the cutoff at or below `delivered` for nothing. Rule C
+            // drops it.
             let top_held = self
                 .held
-                .last_key_value()
+                .range(self.delivered..)
+                .next_back()
                 .map(|(&id, _)| id.saturating_add(1));
             let over = self.ahead.bytes > self.ahead.budget;
             if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
@@ -1446,12 +1471,11 @@ impl FeedReader {
                 (Some(k), Some(h)) if k >= h => self.evict_ready(k),
                 (_, Some(h)) => {
                     let id = h - 1;
-                    if let Some(apply) = self.ahead.decided.get(&id).copied() {
-                        self.evict_ready(apply);
-                    } else {
-                        self.evict_round(id);
-                    }
-                    self.ahead.cutoff = self.ahead.cutoff.min(id);
+                    // A decided round's apply seqno is in `ready`, at least id + 1: the arms
+                    // above evict it first, with its shares.
+                    debug_assert!(!self.ahead.decided.contains_key(&id), "round {id} decided");
+                    self.evict_round(id);
+                    self.ahead.lower_cutoff(id);
                 }
                 (None, None) => return,
             }
@@ -1470,7 +1494,7 @@ impl FeedReader {
         if let Pending::Decided { id, .. } = p {
             self.evict_round(id);
         }
-        self.ahead.cutoff = self.ahead.cutoff.min(key - 1);
+        self.ahead.lower_cutoff(key - 1);
     }
 
     /// Evicts round `id`'s held shares, and passes over any read later in this pass.
@@ -1478,7 +1502,9 @@ impl FeedReader {
         for h in self.remove_held(id) {
             self.ahead.skip(h.stream, h.start);
         }
-        self.ahead.skipped_rounds.insert(id);
+        if id < self.ahead.cutoff {
+            self.ahead.skipped_rounds.insert(id);
+        }
     }
 
     /// Nothing to deliver now: whether the feed's own holds keep the frontier below the

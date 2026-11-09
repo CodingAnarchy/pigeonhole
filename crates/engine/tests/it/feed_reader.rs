@@ -1938,6 +1938,14 @@ fn a_reader_far_behind_keeps_its_read_ahead_within_its_budget() {
             "kept {} bytes over the budget",
             r.read_ahead_bytes()
         );
+        // Only rounds in flight across the cutoff are remembered as passed over, never every
+        // round of the backlog (simp724's S1 on #1622); this backlog's rounds ran one at a
+        // time.
+        assert!(
+            r.skipped_rounds() <= 1,
+            "{} rounds remembered as passed over",
+            r.skipped_rounds()
+        );
         let p = r.position().seqno;
         assert!(
             p >= position,
