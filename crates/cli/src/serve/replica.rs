@@ -340,6 +340,20 @@ impl Replica {
         &self.config.primary
     }
 
+    /// The replica's state while its copy is still arriving or being swapped
+    /// (`starting`, `bootstrapping`, `re-bootstrapping`), else `None`: a memory store it
+    /// lacks then is `ReplicaBehind`, not `Unavailable` (#1618).
+    pub(crate) fn settling(&self) -> Option<&'static str> {
+        let state = self.status().state;
+        matches!(state, "starting" | "bootstrapping" | "re-bootstrapping").then_some(state)
+    }
+
+    /// Records `error` as the replica's last error (`Admin.Info`), its state as it is: for a
+    /// failure after a promote that doesn't fail it (#1618's memory store).
+    pub(crate) fn note_error(&self, error: String) {
+        self.status().last_error = error;
+    }
+
     /// Whether the server refuses writes: a replica until it is promoted.
     pub(crate) fn refuses_writes(&self) -> bool {
         !self.promoted.load(Ordering::Acquire)

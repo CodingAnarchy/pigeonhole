@@ -157,18 +157,27 @@ impl Server {
         token: Option<&str>,
         limits: Limits,
     ) -> Self {
+        Self::start_replica_custom(dir, primary, token, limits, Options::default(), |s| s)
+    }
+
+    /// `start_replica_with`, its database opened with `options` and its service changed by
+    /// `f` before it serves.
+    fn start_replica_custom(
+        dir: PathBuf,
+        primary: &str,
+        token: Option<&str>,
+        limits: Limits,
+        options: Options,
+        f: impl FnOnce(Service) -> Service,
+    ) -> Self {
         std::fs::create_dir_all(dir.join("backups")).unwrap();
-        let db = Pigeonhole::open(
-            dir.join("t.phdb"),
-            Options::default().create_if_missing(true),
-        )
-        .unwrap();
+        let db = Pigeonhole::open(dir.join("t.phdb"), options.create_if_missing(true)).unwrap();
         let replica = super::replica::Replica::new(super::replica::ReplicaConfig {
             primary: primary.to_owned(),
             token: token.map(str::to_owned),
             run_events: 4,
         });
-        Self::serve(dir, db, "", limits, Some(replica), |s| s)
+        Self::serve(dir, db, "", limits, Some(replica), f)
     }
 
     fn serve(

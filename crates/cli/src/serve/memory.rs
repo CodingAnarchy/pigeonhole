@@ -231,6 +231,7 @@ pub(crate) fn watch(
     slot: OwnedSemaphorePermit,
     pool: Arc<Semaphore>,
     idle: Duration,
+    mut swaps: tokio::sync::watch::Receiver<u64>,
 ) -> Result<MemoryEvents, ApiError> {
     scope.check_all(&r.namespaces)?;
     let ns: Vec<&str> = r.namespaces.iter().map(String::as_str).collect();
@@ -256,6 +257,17 @@ pub(crate) fn watch(
             // even on a quiet store with no commit to send it (ai1249's R1 on #1617).
             let next = tokio::select! {
                 () = tx.closed() => return,
+                // The database was swapped under the store (a replica's re-bootstrap): the
+                // watch is of the old copy, and ends rather than go quiet (#1618).
+                _ = swaps.changed() => {
+                    let _ = send(Err(ApiError::from_code(
+                        pigeonhole::ErrorCode::FeedExpired,
+                        "the database was replaced (a replica's re-bootstrap): this watch was \
+                         of the old copy; watch again, without its token",
+                    )))
+                    .await;
+                    return;
+                }
                 next = std::future::poll_fn(|cx| w.poll_next(cx)) => next,
             };
             let commit = match next {
