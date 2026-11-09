@@ -66,6 +66,9 @@ fn for_each_piece(
     Ok(())
 }
 
+/// How much a blob writer writes before it writes it back (D319): the SST writer's chunk.
+const WRITEBACK_CHUNK: u64 = 1 << 20;
+
 pub(crate) struct Writer {
     file: FileRef,
     blob_file: BlobFileId,
@@ -74,6 +77,10 @@ pub(crate) struct Writer {
     extents: Vec<ExtentRef>,
     /// Logical bytes appended.
     pos: u64,
+    /// Where written ranges' write-back is counted (D319), and the written range not yet
+    /// written back (file offsets; contiguous within an extent).
+    writeback: Option<std::sync::Arc<crate::Writeback>>,
+    behind: std::ops::Range<u64>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -95,6 +102,37 @@ impl Writer {
             payload: payload_len(size_class),
             extents: Vec::new(),
             pos: 0,
+            writeback: None,
+            behind: 0..0,
+        }
+    }
+
+    pub(crate) fn set_writeback(&mut self, writeback: std::sync::Arc<crate::Writeback>) {
+        if self.file.direct_align().is_none() {
+            self.writeback = Some(writeback);
+        }
+    }
+
+    /// Notes `len` bytes written at `at`, writing back the range behind it once it is a
+    /// chunk long or the next write isn't contiguous with it.
+    fn written(&mut self, at: u64, len: u64) {
+        let Some(wb) = &self.writeback else { return };
+        if self.behind.end != at {
+            wb.submit(
+                &*self.file,
+                self.behind.start,
+                self.behind.end - self.behind.start,
+            );
+            self.behind = at..at;
+        }
+        self.behind.end += len;
+        if self.behind.end - self.behind.start >= WRITEBACK_CHUNK {
+            wb.submit(
+                &*self.file,
+                self.behind.start,
+                self.behind.end - self.behind.start,
+            );
+            self.behind = self.behind.end..self.behind.end;
         }
     }
 
@@ -127,6 +165,7 @@ impl Writer {
             extent_index: self.extents.len() as u32,
         };
         crate::reader::write_any(&self.file, &header.encode(), extent.offset())?;
+        self.written(extent.offset(), BLOB_EXTENT_HEADER_LEN as u64);
         self.extents.push(extent);
         Ok(())
     }
@@ -139,9 +178,17 @@ impl Writer {
         let offset = self.pos;
         let header = encode_record_header(value);
         for (at, bytes) in [(offset, &header[..]), (offset + header.len() as u64, value)] {
+            let mut pieces = Vec::new();
             for_each_piece(&self.extents, self.payload, at, bytes.len(), |_, abs, r| {
-                crate::reader::write_any(&self.file, &bytes[r], abs)
+                crate::reader::write_any(&self.file, &bytes[r.clone()], abs)?;
+                if self.writeback.is_some() {
+                    pieces.push((abs, r.len() as u64));
+                }
+                Ok(())
             })?;
+            for (abs, len) in pieces {
+                self.written(abs, len);
+            }
         }
         self.pos += (BLOB_RECORD_HEADER_LEN + value.len()) as u64;
         Ok(BlobPointer {
@@ -152,6 +199,13 @@ impl Writer {
     }
 
     pub(crate) fn finish(self) -> (Vec<ExtentRef>, u64) {
+        if let Some(wb) = &self.writeback {
+            wb.submit(
+                &*self.file,
+                self.behind.start,
+                self.behind.end - self.behind.start,
+            );
+        }
         (self.extents, self.pos)
     }
 }

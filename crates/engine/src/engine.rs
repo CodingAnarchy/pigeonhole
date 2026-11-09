@@ -240,6 +240,12 @@ pub struct Metrics {
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
+    /// Times a flush or compaction found the background write-back budget full and ended
+    /// its slice to wait for room (D319).
+    pub writeback_waits: u64,
+    /// The most background write-back bytes in flight at once (D319); at most the budget
+    /// plus a chunk per job writing at that moment.
+    pub writeback_peak_bytes: u64,
     /// Reader slots in use and the slot count, `(active, total)` (#693 D1). Both 0 in a
     /// reader process.
     pub reader_slots: (u64, u64),
@@ -3828,6 +3834,8 @@ impl Engine {
                 .map_or(0, crate::row_cache::RowCaches::deferred_evictions),
         );
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
+        m.writeback_waits = shared.writeback.waits();
+        m.writeback_peak_bytes = shared.writeback.peak();
         if self.inner.reader.is_none() {
             let (active, total) = shared.shm.reader_slot_usage();
             m.reader_slots = (u64::from(active), u64::from(total));
@@ -6948,6 +6956,16 @@ impl Shared {
             view: ArcSwap::new(view),
             async_sync_reads: AtomicU64::new(0),
             commit_parks: AtomicU64::new(0),
+            // A job on a shard thread writes nothing back: io-wq would start on the
+            // shard's CPU (D319, #1460).
+            writeback: Arc::new(
+                pigeonhole_sst::Writeback::new(pigeonhole_sst::writeback::DEFAULT_BUDGET).skip_on(
+                    || {
+                        pigeonhole_runtime::Runtime::<crate::shard::ShardState>::current_shard()
+                            .is_some()
+                    },
+                ),
+            ),
             view_lock: Mutex::new(0),
             view_record: Mutex::default(),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(pager))),

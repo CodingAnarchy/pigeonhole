@@ -475,6 +475,10 @@ pub(crate) struct Shared {
     pub async_sync_reads: AtomicU64,
     /// Blocking waits for a commit's reply that parked their thread (ICR 0027; `Metrics`).
     pub commit_parks: AtomicU64,
+    /// The background output's write-back budget (D319): flushes and compactions write
+    /// their output back behind them and wait for room in it; a close waits for it to drain
+    /// (`release_after_io`). Its counters feed `Metrics`.
+    pub writeback: Arc<pigeonhole_sst::Writeback>,
     /// Serializes view publishers (shards creating memtables, manifest commits) and holds
     /// the last published version.
     pub view_lock: Mutex<u64>,
@@ -1116,6 +1120,9 @@ impl Shared {
         for tracker in self.wal_io.iter().filter_map(|t| t.get()) {
             tracker.wait_idle();
         }
+        // Flush and compaction output written back behind its jobs (D319): pacing only, but
+        // nothing of a closed instance stays in flight on the file it hands over.
+        self.writeback.wait_idle();
         if !self.keep_locks.load(Ordering::Acquire) {
             let locks = self
                 .locks

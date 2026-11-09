@@ -138,6 +138,26 @@ pub(crate) fn locality(_file: &fs::File) -> Result<Locality> {
     Ok(Locality::Local)
 }
 
+/// [`crate::File::submit_writeback`]'s work: writes `[offset, offset + len)` back from the
+/// page cache and waits for it (D319).
+#[cfg(target_os = "linux")]
+pub(crate) fn writeback(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+    let start = off(offset, "writeback: offset too large")?;
+    let count = off(len, "writeback: length too large")?;
+    let flags = libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: plain syscall on an fd owned by `file`; no memory is passed.
+    if unsafe { libc::sync_file_range(file.as_raw_fd(), start, count, flags) } == 0 {
+        return Ok(());
+    }
+    Err(Error::os("sync_file_range", io::Error::last_os_error()))
+}
+
+/// [`crate::File::submit_writeback`] elsewhere: nothing to do (D319).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn writeback(_file: &fs::File, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let start = off(offset, "allocate: offset too large")?;

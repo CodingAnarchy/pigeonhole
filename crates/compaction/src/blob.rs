@@ -184,6 +184,8 @@ pub struct BlobSink {
     value_extents: u64,
     open: Option<OpenFile>,
     done: Vec<NewBlobFile>,
+    /// Where written values' write-back is counted (D319).
+    writeback: Option<Arc<pigeonhole_sst::Writeback>>,
 }
 
 impl BlobSink {
@@ -204,7 +206,16 @@ impl BlobSink {
             value_extents: 4,
             open: None,
             done: Vec::new(),
+            writeback: None,
         }
+    }
+
+    /// Writes the values back behind the sink, counted in `writeback` (D319): a flush's or
+    /// compaction's separated values.
+    #[must_use]
+    pub fn writing_back(mut self, writeback: Arc<pigeonhole_sst::Writeback>) -> Self {
+        self.writeback = Some(writeback);
+        self
     }
 
     /// Lets one value span up to `extents` extents (default 4) before a file takes a larger
@@ -233,7 +244,13 @@ impl BlobSink {
             let id = BlobFileId(self.blob_ids.fetch_add(1, Ordering::Relaxed));
             self.open = Some(OpenFile {
                 id,
-                writer: BlobWriter::new(self.pager.data_file().clone(), id, class),
+                writer: {
+                    let w = BlobWriter::new(self.pager.data_file().clone(), id, class);
+                    match &self.writeback {
+                        Some(wb) => w.with_writeback(Arc::clone(wb)),
+                        None => w,
+                    }
+                },
                 extents: Vec::new(),
                 payload: (MIN_EXTENT << class)
                     - pigeonhole_format::blob::BLOB_EXTENT_HEADER_LEN as u64,

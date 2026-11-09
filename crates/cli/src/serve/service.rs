@@ -497,8 +497,8 @@ impl Metrics {
         self.duration_sum_us[rpc].fetch_add(us, Ordering::Relaxed);
     }
 
-    /// Prometheus text: the server's counters, and the engine's `async_sync_reads`
-    /// (perf287's note 2 on D313).
+    /// Prometheus text: the server's counters, the engine's `async_sync_reads` (perf287's
+    /// note 2 on D313), and its write-back budget's (D319).
     pub(crate) fn render(&self, db: &Pigeonhole) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -565,6 +565,21 @@ impl Metrics {
             out,
             "pigeonhole_async_sync_reads_total {}",
             db.engine_metrics().async_sync_reads
+        );
+        // The background write-back budget (D319, ICR 0127): waits for room, and the most
+        // in flight at once.
+        let m = db.engine_metrics();
+        let _ = writeln!(out, "# TYPE pigeonhole_writeback_waits_total counter");
+        let _ = writeln!(
+            out,
+            "pigeonhole_writeback_waits_total {}",
+            m.writeback_waits
+        );
+        let _ = writeln!(out, "# TYPE pigeonhole_writeback_peak_bytes gauge");
+        let _ = writeln!(
+            out,
+            "pigeonhole_writeback_peak_bytes {}",
+            m.writeback_peak_bytes
         );
         out
     }

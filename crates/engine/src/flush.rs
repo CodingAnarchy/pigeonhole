@@ -97,6 +97,9 @@ pub(crate) struct SstSink {
     separation: Option<Separation>,
     /// Blob files finished by [`SstSink::finish_blobs`].
     pub blob_files: Vec<NewBlobFile>,
+    /// Where output chunks' write-back is counted (D319): a flush's, not the open-time or
+    /// maintenance writers'.
+    writeback: Option<Arc<pigeonhole_sst::Writeback>>,
 }
 
 impl SstSink {
@@ -119,7 +122,15 @@ impl SstSink {
             sst_ids,
             separation: None,
             blob_files: Vec::new(),
+            writeback: None,
         }
+    }
+
+    /// Writes the output back behind the sink, counted in `writeback` (D319). Before
+    /// [`SstSink::separating`], so the blob files write back too.
+    pub(crate) fn writing_back(mut self, writeback: Arc<pigeonhole_sst::Writeback>) -> Self {
+        self.writeback = Some(writeback);
+        self
     }
 
     /// Separates values above `threshold` (the family's `blob_threshold`) into blob files
@@ -131,15 +142,17 @@ impl SstSink {
         target_sst_bytes: u64,
     ) -> Self {
         if threshold != u32::MAX {
-            self.separation = Some(Separation {
-                sink: BlobSink::new(
-                    Arc::clone(&self.pager),
-                    blob_ids,
-                    self.estimate / 2,
-                    target_sst_bytes.saturating_mul(4),
-                ),
-                threshold,
-            });
+            let sink = BlobSink::new(
+                Arc::clone(&self.pager),
+                blob_ids,
+                self.estimate / 2,
+                target_sst_bytes.saturating_mul(4),
+            );
+            let sink = match &self.writeback {
+                Some(wb) => sink.writing_back(Arc::clone(wb)),
+                None => sink,
+            };
+            self.separation = Some(Separation { sink, threshold });
         }
         self
     }
@@ -174,10 +187,12 @@ impl SstSink {
             let need = ((key.len() + value.len()) as u64 * 2 + (64 << 10)).max(self.estimate);
             let extent = self.pager.allocate(need.min(MAX_EXTENT))?;
             let id = SstId(self.sst_ids.fetch_add(1, Ordering::Relaxed));
-            self.open = Some((
-                SstWriter::new(self.file.clone(), extent, id, self.options.clone()),
-                extent,
-            ));
+            let writer = SstWriter::new(self.file.clone(), extent, id, self.options.clone());
+            let writer = match &self.writeback {
+                Some(wb) => writer.with_writeback(Arc::clone(wb)),
+                None => writer,
+            };
+            self.open = Some((writer, extent));
         }
         let (w, _) = self.open.as_mut().expect("opened above");
         w.add(key, value)?;
@@ -519,6 +534,7 @@ impl FlushTask {
                         options,
                         item.bytes,
                     )
+                    .writing_back(Arc::clone(&self.shared.writeback))
                     .separating(
                         Arc::clone(&self.shared.blob_ids),
                         item.options.separation_threshold(),
@@ -552,9 +568,14 @@ impl FlushTask {
             while gc.step(it)? {
                 gc.drain(|k, v| sink.add(k, v))?;
                 n += 1;
-                if n.is_multiple_of(CLOCK_EVERY)
-                    && deadline != u64::MAX
-                    && self.shared.vfs.monotonic_nanos() >= deadline
+                if deadline == u64::MAX {
+                    continue;
+                }
+                // A full write-back budget ends the slice at once, whatever the entries'
+                // size; `run_stages` waits for room (D319).
+                if self.shared.writeback.full(true)
+                    || (n.is_multiple_of(CLOCK_EVERY)
+                        && self.shared.vfs.monotonic_nanos() >= deadline)
                 {
                     return Ok(false);
                 }
@@ -741,7 +762,14 @@ impl FlushTask {
                         );
                         self.stage = Stage::Barrier(waiters);
                     }
-                    Ok(false) => return TaskPoll::Pending,
+                    Ok(false) => {
+                        // A full write-back budget: wait for room, never on this thread
+                        // (D319). A flush may use all of it (compactions leave it a share).
+                        if !self.shared.writeback.admit(true, self.waker.get(waker)) {
+                            return TaskPoll::Blocked;
+                        }
+                        return TaskPoll::Pending;
+                    }
                     Err(e) => {
                         self.fail(e);
                         return TaskPoll::Done;

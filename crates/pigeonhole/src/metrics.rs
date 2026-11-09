@@ -105,6 +105,14 @@ pub struct EngineMetrics {
     /// cache, a block the cache could not keep, or a read that missed too often. 0 when
     /// async reads never block their executor thread.
     pub async_sync_reads: u64,
+    /// Times a flush or compaction found the background write-back budget full and paused
+    /// to let the device catch up (D319, ICR 0127). Flushes and compactions write their
+    /// output back as they go, so a commit's sync never queues behind tens of MiB of it. A
+    /// steady rise means background output outruns the device.
+    pub writeback_waits: u64,
+    /// The most background write-back bytes in flight at once (D319, ICR 0127): at most the
+    /// 4 MiB budget plus about 1 MiB per flush or compaction writing at that moment.
+    pub writeback_peak_bytes: u64,
     /// Nanoseconds the engine-owned shard threads spent working (handling messages and
     /// background tasks; not spinning or parked), summed over shards. Its rise over an
     /// interval, divided by the interval, is how many shards' worth of work the database
@@ -392,6 +400,8 @@ impl EngineMetrics {
             file_growths: m.file_growths.0,
             file_growth_nanos: m.file_growths.1,
             async_sync_reads: m.async_sync_reads,
+            writeback_waits: m.writeback_waits,
+            writeback_peak_bytes: m.writeback_peak_bytes,
             shard_busy_nanos: m.shard_busy_nanos,
             memtable_bytes: m.memtable_bytes,
             memtable_limit_bytes: m.memtable_limit,

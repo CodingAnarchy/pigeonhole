@@ -11,7 +11,7 @@ use pigeonhole_format::{BlobFileId, Cursor, Seqno, SstId, TableId, Timestamp};
 use pigeonhole_io::VfsRef;
 use pigeonhole_pager::Pager;
 use pigeonhole_sst::{
-    BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions,
+    BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions, Writeback,
 };
 
 use crate::blob::{
@@ -203,6 +203,10 @@ pub struct JobContext {
     /// Clock for [`CompactionJob::run`] deadlines (`Vfs::monotonic_nanos`). Without one,
     /// each `run` call does a fixed slice of work, or all of it for a `u64::MAX` deadline.
     pub clock: Option<VfsRef>,
+    /// The engine's write-back budget (D319): output chunks are written back behind the
+    /// job, and [`CompactionJob::run`] ends its slice early while the budget is full for a
+    /// compaction ([`Writeback::full`]). `None` writes nothing back.
+    pub writeback: Option<Arc<Writeback>>,
 }
 
 impl JobContext {
@@ -230,6 +234,7 @@ impl JobContext {
             gc,
             target_sst_bytes: 64 << 20,
             clock: None,
+            writeback: None,
         }
     }
 }
@@ -355,6 +360,8 @@ struct Sink {
     last_row: Vec<u8>,
     /// Separated values (created on first use).
     blobs: Option<BlobSink>,
+    /// Where output chunks' write-back is counted (D319).
+    writeback: Option<Arc<Writeback>>,
     blob_ids: Arc<AtomicU32>,
     /// Puts whose payload is longer than this are separated (`u32::MAX`: never).
     blob_threshold: u32,
@@ -399,12 +406,16 @@ impl Sink {
     fn blob_sink(&mut self) -> &mut BlobSink {
         let (input, target) = (self.input_bytes, self.target);
         self.blobs.get_or_insert_with(|| {
-            BlobSink::new(
+            let sink = BlobSink::new(
                 Arc::clone(&self.pager),
                 Arc::clone(&self.blob_ids),
                 input / 2,
                 target.saturating_mul(4),
-            )
+            );
+            match &self.writeback {
+                Some(wb) => sink.writing_back(Arc::clone(wb)),
+                None => sink,
+            }
         })
     }
 
@@ -444,10 +455,12 @@ impl Sink {
             let extent = self.pager.allocate(self.extent_bytes(need))?;
             let id = SstId(self.sst_ids.fetch_add(1, Ordering::Relaxed));
             let file = self.pager.data_file().clone();
-            self.open = Some(Open {
-                writer: SstWriter::new(file, extent, id, self.options.clone()),
-                extent,
-            });
+            let writer = SstWriter::new(file, extent, id, self.options.clone());
+            let writer = match &self.writeback {
+                Some(wb) => writer.with_writeback(Arc::clone(wb)),
+                None => writer,
+            };
+            self.open = Some(Open { writer, extent });
         }
         let Some(o) = &mut self.open else {
             unreachable!("opened above");
@@ -710,6 +723,7 @@ impl CompactionJob {
                 output_refs: Vec::new(),
                 last_row: Vec::new(),
                 blobs: None,
+                writeback: context.writeback.clone(),
                 blob_ids: context.blob_ids,
                 blob_threshold: context.family.separation_threshold(),
                 gc_files,
@@ -775,6 +789,11 @@ impl CompactionJob {
             }
             units += 1;
             if deadline_nanos != u64::MAX {
+                // A full write-back budget ends the slice at once, whatever the units' size:
+                // the engine then waits for room before the next one (D319).
+                if self.sink.writeback.as_ref().is_some_and(|w| w.full(false)) {
+                    return Ok(JobPoll::Pending);
+                }
                 match &self.clock {
                     Some(c) if units.is_multiple_of(CLOCK_EVERY) => {
                         if c.monotonic_nanos() >= deadline_nanos {

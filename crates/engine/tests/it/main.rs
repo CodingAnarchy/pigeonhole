@@ -113,3 +113,4 @@ mod vote_on_append;
 mod wal_hold_wake;
 mod wal_pin;
 mod wal_spares_steps;
+mod writeback_budget;

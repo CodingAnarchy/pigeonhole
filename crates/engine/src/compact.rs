@@ -621,6 +621,7 @@ impl CompactionWork {
             }
             ctx.target_sst_bytes = shared.picker.target_sst_bytes;
             ctx.clock = Some(Arc::clone(&shared.vfs));
+            ctx.writeback = Some(Arc::clone(&shared.writeback));
             Some(CompactionJob::new(task.clone(), inputs, ctx))
         } else {
             None
@@ -1084,6 +1085,11 @@ impl Task for CompactionWork {
                         Some(mut job) => match job.run(deadline_nanos) {
                             Ok(JobPoll::Pending) => {
                                 self.job = Some(job);
+                                // A slice the write-back budget ended waits for room,
+                                // never on this thread (D319).
+                                if !self.shared.writeback.admit(false, self.waker.get(waker)) {
+                                    return TaskPoll::Blocked;
+                                }
                                 return TaskPoll::Pending;
                             }
                             Ok(JobPoll::Done) => match job.finish_with_blob_refs() {

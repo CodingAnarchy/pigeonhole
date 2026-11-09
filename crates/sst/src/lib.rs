@@ -27,6 +27,7 @@
 mod blob;
 mod iter;
 mod reader;
+pub mod writeback;
 mod writer;
 
 use std::fmt;
@@ -44,6 +45,7 @@ pub use iter::{ReadaheadRamp, SstIter};
 pub use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_io::FileRef;
 pub use reader::Fetch;
+pub use writeback::Writeback;
 
 /// Tag bit separating blob-file cache namespaces from SST ones.
 const BLOB_NAMESPACE: u64 = 1 << 63;
@@ -314,6 +316,14 @@ impl SstWriter {
         Self {
             inner: writer::Writer::new(file, extent, id, options),
         }
+    }
+
+    /// Writes each 1 MiB chunk back as soon as it is written, counted in `writeback`
+    /// (D319): a flush's or compaction's output. A direct-I/O handle ignores it.
+    #[must_use]
+    pub fn with_writeback(mut self, writeback: std::sync::Arc<Writeback>) -> Self {
+        self.inner.set_writeback(writeback);
+        self
     }
 
     /// Whether an entry of these sizes still fits, leaving room for index, filters and
@@ -619,6 +629,14 @@ impl BlobWriter {
         Self {
             inner: blob::Writer::new(file, blob_file, size_class),
         }
+    }
+
+    /// Writes the values back behind it, about 1 MiB at a time, counted in `writeback`
+    /// (D319). A direct-I/O handle ignores it.
+    #[must_use]
+    pub fn with_writeback(mut self, writeback: std::sync::Arc<Writeback>) -> Self {
+        self.inner.set_writeback(writeback);
+        self
     }
 
     /// Whether appending a value of `len` bytes needs more extents first.

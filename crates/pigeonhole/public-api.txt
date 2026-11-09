@@ -400,6 +400,8 @@ pub pigeonhole::EngineMetrics::transactions: u64
 pub pigeonhole::EngineMetrics::unpinned_reason: core::option::Option<&'static str>
 pub pigeonhole::EngineMetrics::write_stall_nanos: u64
 pub pigeonhole::EngineMetrics::write_stalls: u64
+pub pigeonhole::EngineMetrics::writeback_peak_bytes: u64
+pub pigeonhole::EngineMetrics::writeback_waits: u64
 impl pigeonhole::EngineMetrics
 pub fn pigeonhole::EngineMetrics::commit_latency(&self, pigeonhole::Durability) -> pigeonhole::LatencyHistogram
 pub fn pigeonhole::EngineMetrics::commits(&self, pigeonhole::Durability) -> pigeonhole::CommitStats

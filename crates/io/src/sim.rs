@@ -1360,6 +1360,13 @@ impl File for SimFile {
         self.sync(true)
     }
 
+    /// Nothing to write back in memory; deferred like any operation under deferred I/O, so a
+    /// test sees the write-back budget in use (D319). Not a write: it carries no data, so
+    /// [`SimVfs::inline_writes_in_flight`] doesn't count it.
+    fn submit_writeback(&self, _offset: u64, _len: u64) -> Completion<()> {
+        self.vfs.submit(self, false, false, |_| Ok(()))
+    }
+
     fn submit_sync_all(&self) -> Completion<()> {
         self.vfs.submit(self, true, true, SimFile::sync_all)
     }

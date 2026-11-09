@@ -64,6 +64,8 @@ pub(crate) struct Writer {
     addr_buf: Vec<u8>,
     /// Kept across the blocks this SST seals (no per-block table or buffer zero-fill).
     compressor: Compressor,
+    /// Where each written chunk's write-back is counted (D319): `None` writes nothing back.
+    writeback: Option<std::sync::Arc<crate::Writeback>>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -115,6 +117,7 @@ impl Writer {
             scratch: Vec::new(),
             addr_buf: Vec::new(),
             compressor: Compressor::default(),
+            writeback: None,
             opts,
         }
     }
@@ -294,6 +297,14 @@ impl Writer {
         Ok(())
     }
 
+    /// Counts this writer's written chunks' write-back in `writeback` (D319). A direct-I/O
+    /// handle's writes are already on the device, so it writes nothing back.
+    pub(crate) fn set_writeback(&mut self, writeback: std::sync::Arc<crate::Writeback>) {
+        if self.direct.is_none() {
+            self.writeback = Some(writeback);
+        }
+    }
+
     fn flush(&mut self) -> Result<()> {
         if self.out.is_empty() {
             return Ok(());
@@ -302,6 +313,9 @@ impl Writer {
         match self.direct {
             None => {
                 self.file.write_at(&self.out, at)?;
+                if let Some(wb) = &self.writeback {
+                    wb.submit(&*self.file, at, self.out.len() as u64);
+                }
                 self.flushed += self.out.len() as u64;
                 self.out.clear();
             }
