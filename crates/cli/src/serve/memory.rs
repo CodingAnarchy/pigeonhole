@@ -235,7 +235,7 @@ pub(crate) fn watch(
 ) -> Result<MemoryEvents, ApiError> {
     scope.check_all(&r.namespaces)?;
     let ns: Vec<&str> = r.namespaces.iter().map(String::as_str).collect();
-    let mut builder = core.store().watch(&ns);
+    let mut builder = core.store()?.watch(&ns);
     if !r.resume.is_empty() {
         builder = builder.resume(&WatchToken::from_bytes(r.resume.to_vec()));
     }

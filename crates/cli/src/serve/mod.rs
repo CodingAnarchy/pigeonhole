@@ -159,7 +159,7 @@ fn memory(
     writer: bool,
     stderr: &mut dyn std::io::Write,
 ) -> Result<Option<memslot::MemSlot>, Failure> {
-    use crate::memcore::{EmbedKind, Embedder};
+    use crate::memcore::Embedder;
     let m = &args.memory;
     let Some(name) = &m.memory else {
         return Ok(None);
@@ -173,43 +173,7 @@ fn memory(
         )?)),
         None => None,
     };
-    let (m, name) = (m.clone(), name.clone());
-    let create: Arc<crate::memcore::Create> = Arc::new(move |e: Option<&Embedder>| {
-        let mut options = pigeonhole_memory::StoreOptions::new();
-        let model = match (e, &m.memory_model, m.memory_dim) {
-            (Some(e), _, _) => {
-                // The dimension is the endpoint's: one probe embedding tells it.
-                let dim = e
-                    .embed("dimension probe", EmbedKind::Passage)
-                    .map_err(|e| Failure::usage(&e.message))?
-                    .len();
-                Some((e.model().to_owned(), dim as u32))
-            }
-            (None, Some(id), Some(dim)) => Some((id.clone(), dim)),
-            _ => None,
-        };
-        if let Some((id, dim)) = model {
-            let element = match m.memory_element.as_str() {
-                "f16" => pigeonhole::Element::F16,
-                "bf16" => pigeonhole::Element::BF16,
-                _ => pigeonhole::Element::F32,
-            };
-            let model = pigeonhole_memory::EmbeddingModel::new(id, dim, element)
-                .map_err(|e| Failure::coded(e.code(), format!("memory store {name}: {e}")))?;
-            options = options.embedding(model);
-        }
-        if let Some(hours) = m.memory_episodic_ttl {
-            options = options.episodic_ttl(Duration::from_secs(hours.saturating_mul(3600)));
-        }
-        if let Some(n) = &m.memory_normalization {
-            options = options.normalization(match n.as_str() {
-                "nfkc" => pigeonhole_memory::Normalization::Nfkc,
-                "none" => pigeonhole_memory::Normalization::None,
-                _ => pigeonhole_memory::Normalization::Nfc,
-            });
-        }
-        Ok(options)
-    });
+    let create = crate::memcore::create_options(m, name);
     let name = args.memory.memory.as_deref().unwrap_or_default();
     // A recall's byte budget: 1 MiB when it sets none, 8 MiB at most, as pages are.
     let (slot, created) = memslot::MemSlot::start(
