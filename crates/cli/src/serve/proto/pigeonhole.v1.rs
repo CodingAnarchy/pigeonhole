@@ -603,6 +603,14 @@ pub struct ReplicaInfo {
     /// The last error the replica loop met, if it's in `error` or retrying.
     #[prost(string, tag = "7")]
     pub last_error: ::prost::alloc::string::String,
+    /// While it bootstraps, the step it's at: "connecting", "waiting for the primary's copy"
+    /// (the primary writes the whole copy before sending any of it), "downloading", "opening
+    /// the copy" or "swapping". Empty otherwise.
+    #[prost(string, tag = "8")]
+    pub bootstrap_phase: ::prost::alloc::string::String,
+    /// While it bootstraps, the bytes of the primary's copy received so far.
+    #[prost(uint64, tag = "9")]
+    pub bootstrap_bytes: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthResponse {

@@ -52,6 +52,12 @@ message ReplicaInfo {
   uint64 lag_ms = 6;
   // The last error the replica loop met, if it's in `error` or retrying.
   string last_error = 7;
+  // While it bootstraps, the step it's at: "connecting", "waiting for the primary's copy"
+  // (the primary writes the whole copy before sending any of it), "downloading", "opening
+  // the copy" or "swapping". Empty otherwise.
+  string bootstrap_phase = 8;
+  // While it bootstraps, the bytes of the primary's copy received so far.
+  uint64 bootstrap_bytes = 9;
 }
 
 message HealthResponse {
