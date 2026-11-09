@@ -354,6 +354,7 @@ impl Reader {
             return Ok(Cell::in_block(h, range));
         }
         let total = BLOB_RECORD_HEADER_LEN + ptr.len as usize;
+        pigeonhole_io::note_thread_file_read();
         // Bounds and extent headers first, so a bad pointer never sizes a buffer past the
         // blob file.
         for_each_piece(&self.extents, self.payload, ptr.offset, total, |i, _, _| {

@@ -1279,6 +1279,9 @@ struct CellWalk<'t> {
     /// The index in `info` of `family` (cells come grouped by family).
     family_index: Option<(FamilyId, usize)>,
     done: bool,
+    /// The column of a seek ([`RowCells::poll_seek`]) that returned `Pending` and isn't
+    /// finished: every later step, sync or async, finishes it first (ai1249's R1 on #1625).
+    seek: Option<(FamilyId, Vec<u8>)>,
 }
 
 impl<'t> CellWalk<'t> {
@@ -1302,6 +1305,7 @@ impl<'t> CellWalk<'t> {
             family: None,
             family_index: None,
             done: false,
+            seek: None,
         })
     }
 
@@ -1333,6 +1337,9 @@ impl<'t> CellWalk<'t> {
                 }
                 continue;
             };
+            if self.seek.is_some() {
+                return self.step_seeking();
+            }
             let Some(cell) = cursor.next_cell()? else {
                 self.cursor = None;
                 continue;
@@ -1343,6 +1350,76 @@ impl<'t> CellWalk<'t> {
             // A small value is copied into the reused cell; a large one stays pinned.
             let small = cell.stored.len() <= CellData::INLINE_MAX;
             if small {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = cursor.current_data();
+            }
+            return Ok(true);
+        }
+    }
+
+    /// The walk's family order: where `family` comes among the families its scans read
+    /// (the current one's, then the ones still to start); a family it doesn't read is last.
+    #[cfg(feature = "async")]
+    fn walk_rank(&self, family: FamilyId) -> usize {
+        self.cursor
+            .iter()
+            .chain(self.pending.iter().rev())
+            .flat_map(|c| c.families())
+            .position(|&f| f == family)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// `seek` merged with a seek left pending: the later column of the two, so the walk never
+    /// moves back (ai1249's R2 on #1625). Stored as the pending one.
+    #[cfg(feature = "async")]
+    fn merge_seek(&mut self, seek: Option<(FamilyId, &[u8])>) {
+        let Some((family, qualifier)) = seek else {
+            return;
+        };
+        let later = match &self.seek {
+            None => true,
+            Some((f, q)) => {
+                (self.walk_rank(family), qualifier) > (self.walk_rank(*f), q.as_slice())
+            }
+        };
+        if later {
+            self.seek = Some((family, qualifier.to_vec()));
+        }
+    }
+
+    /// [`CellWalk::step`] with a seek pending, reading synchronously: the seek's cell.
+    #[cold]
+    #[inline(never)]
+    fn step_seeking(&mut self) -> Result<bool> {
+        let (family, qualifier) = self.seek.take().expect("a pending seek");
+        loop {
+            let Some(cursor) = self.cursor.as_mut() else {
+                let Some(mut next) = self.pending.pop() else {
+                    return Ok(false);
+                };
+                if next.next_row()? {
+                    self.cursor = Some(next);
+                }
+                continue;
+            };
+            let found = if cursor.families().contains(&family) {
+                cursor.seek_cell(family, &qualifier)?
+            } else if self.pending.iter().any(|c| c.families().contains(&family)) {
+                false
+            } else {
+                cursor.next_cell()?.is_some()
+            };
+            if !found {
+                self.cursor = None;
+                continue;
+            }
+            let cursor = self.cursor.as_mut().expect("on a row");
+            let cell = cursor.cell().expect("held after a step");
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            self.family = Some(cell.family);
+            if cell.stored.len() <= CellData::INLINE_MAX {
                 self.data.set_inline(cell.ts, cell.stored);
             } else {
                 self.data = cursor.current_data();
@@ -1364,9 +1441,17 @@ impl<'t> CellWalk<'t> {
         if self.done {
             return Poll::Ready(Ok(false));
         }
+        self.merge_seek(seek);
         let r = match self.core.db.check_generation(self.generation) {
             Err(e) => Poll::Ready(Err(e)),
-            Ok(()) => self.poll_step_inner(cx, seek),
+            Ok(()) => {
+                let pending = self.seek.take();
+                let r = self.poll_step_inner(cx, pending.as_ref().map(|(f, q)| (*f, &q[..])));
+                if r.is_pending() {
+                    self.seek = pending;
+                }
+                r
+            }
         };
         if matches!(r, Poll::Ready(Err(_) | Ok(false))) {
             self.done = true;
@@ -1599,6 +1684,7 @@ impl RowCells<'_> {
     #[cfg(feature = "async")]
     fn entry(&mut self) -> CellEntry<'_> {
         let walk = &mut self.walk;
+        // Caches the family's index in `family_index` (the name is borrowed below, not here).
         let _ = walk.family_name();
         let family = walk
             .family_index
@@ -1632,10 +1718,14 @@ impl RowCells<'_> {
     /// Steps to the first cell at or after column (`family`, `qualifier`) in the walk's order
     /// without blocking: a skip over the cells before it, which reads only the blocks it
     /// lands in (#1560, perf287's T1). It never moves back: when the walk's next cell is
-    /// already at or past the column, that cell is the one. `None` when no cell is left.
+    /// already at or past the column, that cell is the one, and so it is for a family of the
+    /// table the walk doesn't read. `None` when no cell is left.
     ///
     /// `Pending` while a block the seek lands in is fetched: poll again with the same column.
-    /// Until it completes the walk holds no cell; [`RowCells::poll_next`] finishes it first.
+    /// Until it completes the walk holds no cell; the next step ([`RowCells::poll_next`],
+    /// [`RowCells::next_async`], or [`RowCells::next`], which reads synchronously) finishes it
+    /// first and returns its cell. A seek to another column replaces it only if that column
+    /// is later.
     ///
     /// # Errors
     /// `FamilyNotFound` if the table has no family `family`.

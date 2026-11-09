@@ -42,3 +42,22 @@ pub fn in_async_poll() -> bool {
     #[cfg(not(debug_assertions))]
     false
 }
+
+thread_local! {
+    static FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a block or value read from a file on this thread (called where the read happens,
+/// never on a cache hit): what an async cell step reads synchronously is the difference of
+/// [`thread_file_reads`] around it (#1625, perf287: two thread-local loads per step, not a
+/// counting scope).
+#[cold]
+pub fn note_thread_file_read() {
+    FILE_READS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The file reads this thread has made ([`note_thread_file_read`]), wrapping.
+#[inline]
+pub fn thread_file_reads() -> u64 {
+    FILE_READS.with(std::cell::Cell::get)
+}

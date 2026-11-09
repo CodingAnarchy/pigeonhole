@@ -638,6 +638,17 @@ impl Lane {
         Ok(())
     }
 
+    /// Where the lane's SST cursors stand, by data block ([`Source::block_stamp`]), folded
+    /// into one value that changes when any of them moves to another block.
+    #[inline]
+    fn block_stamp(&self) -> u64 {
+        self.resolver
+            .cursor()
+            .sources()
+            .iter()
+            .fold(0u64, |h, s| h.rotate_left(17) ^ s.block_stamp())
+    }
+
     /// The held cell's column prefix (only while `pending`).
     fn col(&self) -> &[u8] {
         self.resolver.current().map_or(&[], |c| column_of(c.key))
@@ -709,6 +720,10 @@ struct AsyncScan {
     /// family, its column prefix in `target`. The next poll finishes it first.
     seek: Option<FamilyId>,
     target: Vec<u8>,
+    /// The lane last probed for its next block ([`AsyncScan::prefetch`]) and where its
+    /// cursors stood ([`Lane::block_stamp`]): a cell step probes again only once they move
+    /// to another block, not per cell (perf287 on #1625).
+    probed: Option<(usize, u64)>,
 }
 
 impl AsyncScan {
@@ -913,6 +928,7 @@ impl ScanCursor {
                 Ok(Some(row)) => {
                     // Blocks stepped past need not stay pinned.
                     nb.pinned.clear();
+                    nb.probed = None;
                     break Ok(row);
                 }
                 Err(e) => break Err(e),
@@ -973,8 +989,10 @@ impl ScanCursor {
     /// A seek that moves the family's cursors seeks them cache-only; a block the cache lacks
     /// is fetched, and the seek returns `Pending` (perf287's T1 on #1560). Poll it again with
     /// the same column. Until it completes the cursor holds no cell; a step
-    /// ([`ScanCursor::poll_next_cell`], [`ScanCursor::poll_next_row`]) finishes it first, and
-    /// a seek to another column replaces it. On a sync cursor it reads synchronously.
+    /// ([`ScanCursor::poll_next_cell`], [`ScanCursor::poll_next_row`],
+    /// [`ScanCursor::seek_cell`]) finishes it first, and a seek to another column
+    /// replaces it if that column is later, never moving back. On a sync cursor it reads
+    /// synchronously.
     pub fn poll_seek_cell(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -990,13 +1008,25 @@ impl ScanCursor {
                 .and_then(|()| self.step_cell().map(|f| f.is_some()));
             return std::task::Poll::Ready(r);
         };
-        let mut target = std::mem::take(&mut nb.target);
-        let encoded = self.seek_target(&mut target, qualifier);
-        nb.target = target;
-        let out = match encoded {
+        let mut target = Vec::new();
+        let out = match self.seek_target(&mut target, qualifier) {
             Err(e) => std::task::Poll::Ready(Err(e)),
             Ok(()) => {
-                nb.seek = Some(family);
+                // A seek replacing one left `Pending` keeps the later column of the two: the
+                // pending one may have moved its lane already, and a seek never moves back
+                // (ai1249's R2 on #1625). Columns order by family in walk order, then
+                // qualifier; a family the walk doesn't read is last.
+                let replace = match nb.seek {
+                    None => true,
+                    Some(pending) => {
+                        (self.family_rank(family), target.as_slice())
+                            > (self.family_rank(pending), nb.target.as_slice())
+                    }
+                };
+                if replace {
+                    nb.seek = Some(family);
+                    nb.target = target;
+                }
                 self.poll_cell(&mut nb, cx)
             }
         };
@@ -1049,16 +1079,24 @@ impl ScanCursor {
             if !self.in_row {
                 return Poll::Ready(Ok(false));
             }
-            // The lane whose cell was handed out steps next: fetch what it reads first.
+            // The lane whose cell was handed out steps next: fetch what it reads first. Its
+            // next block is asked for once per block it stands in, not per cell.
             if !nb.sync
                 && let Some(i) = self.last_lane
-                && nb.prefetch(&self.lanes[i])
             {
-                continue;
+                let stamp = self.lanes[i].block_stamp();
+                if nb.probed != Some((i, stamp)) {
+                    if nb.prefetch(&self.lanes[i]) {
+                        continue;
+                    }
+                    nb.probed = Some((i, stamp));
+                }
             }
-            let ((stepped, blob_reads), file_reads) =
-                pigeonhole_sst::counting_file_reads(|| as_async_read(false, || self.step_cell()));
-            nb.count(blob_reads + file_reads);
+            // The reads a step makes synchronously (a block not predicted, a separated
+            // value): a per-thread total around it, not a counting scope (perf287 on #1625).
+            let reads = pigeonhole_io::thread_file_reads();
+            let stepped = self.step_cell();
+            nb.count(pigeonhole_io::thread_file_reads().wrapping_sub(reads));
             if stepped.is_ok() {
                 // Blocks stepped past need not stay pinned.
                 nb.pinned.clear();
@@ -1093,6 +1131,60 @@ impl ScanCursor {
                 Ok(true)
             }
         }
+    }
+
+    /// [`ScanCursor::poll_seek_cell`] reading synchronously, on any cursor: holds the first
+    /// cell at or after column (`family`, `qualifier`), never moving back (`true`), or finds
+    /// the row done there (`false`). A seek an async cursor left `Pending` is finished by it,
+    /// keeping the later column of the two (ai1249's R1 and R2 on #1625). Reads an async
+    /// cursor makes here are counted in `Metrics::async_sync_reads`.
+    pub fn seek_cell(&mut self, family: FamilyId, qualifier: &[u8]) -> Result<bool> {
+        let mut target = Vec::new();
+        self.seek_target(&mut target, qualifier)?;
+        let mut family = family;
+        let ranks = self
+            .nb
+            .as_ref()
+            .and_then(|nb| nb.seek)
+            .map(|pending| (self.family_rank(pending), self.family_rank(family)));
+        let shared = match self.nb.as_mut() {
+            None => None,
+            Some(nb) => {
+                if let Some(pending) = nb.seek.take()
+                    && let Some((pending_rank, rank)) = ranks
+                    && (pending_rank, nb.target.as_slice()) > (rank, target.as_slice())
+                {
+                    family = pending;
+                    std::mem::swap(&mut target, &mut nb.target);
+                }
+                Some(Arc::clone(&nb.shared))
+            }
+        };
+        let Some(shared) = shared else {
+            self.seek_lanes(family, &target, false)?;
+            return Ok(self.step_cell()?.is_some());
+        };
+        let ((r, blob_reads), file_reads) = pigeonhole_sst::counting_file_reads(|| {
+            as_async_read(false, || {
+                self.seek_lanes(family, &target, false)?;
+                self.step_cell()
+            })
+        });
+        if blob_reads + file_reads > 0 {
+            shared.async_sync_reads.fetch_add(
+                blob_reads + file_reads,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(r?.is_some())
+    }
+
+    /// `family`'s place in the walk's family order; a family the walk doesn't read is last.
+    fn family_rank(&self, family: FamilyId) -> usize {
+        self.families
+            .iter()
+            .position(|&f| f == family)
+            .unwrap_or(usize::MAX)
     }
 
     /// `qualifier`'s column prefix in the current row, into `out`.
@@ -1177,6 +1269,7 @@ impl ScanCursor {
             sync: false,
             seek: None,
             target: Vec::new(),
+            probed: None,
         }));
         self
     }

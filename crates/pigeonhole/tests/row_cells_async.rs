@@ -317,3 +317,177 @@ fn a_walk_goes_on_async_after_sync_steps() {
     assert_eq!(got, all);
     db.close().expect("close");
 }
+
+/// Polls `f` once with a waker that does nothing: whether it was `Pending`, or its value.
+fn poll_once<T>(f: impl FnOnce(&mut std::task::Context<'_>) -> Poll<T>) -> Option<T> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match f(&mut cx) {
+        Poll::Pending => None,
+        Poll::Ready(v) => Some(v),
+    }
+}
+
+fn reopen(dir: &pigeonhole::doc_support::TempDir, db: Pigeonhole) -> (Pigeonhole, Table) {
+    db.close().expect("close");
+    let db = Pigeonhole::open(dir.join("r.phdb"), Options::default().shards(1)).expect("reopen");
+    let t = db.table("t").expect("table").open().expect("open table");
+    (db, t)
+}
+
+/// ai1249's R1 on #1625: a sync `next` after a seek left `Pending` finishes the seek and
+/// returns its cell, whether the seek was waiting on the row's positioning (before the scan
+/// held the row) or inside the row.
+#[test]
+fn a_sync_step_finishes_a_pending_seek() {
+    let (dir, db, t) = build();
+    let all = walk_all(&db.snapshot().expect("snapshot"), &t, 1);
+    let order = ["post", "side"];
+    // Waiting on the row's positioning: the first poll of a cold walk.
+    drop(t);
+    let (db, t) = reopen(&dir, db);
+    let mut cells = t.row(HUB).cells().expect("cells");
+    let target = qual(12_345);
+    assert!(
+        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        "a cold walk's first poll fetches"
+    );
+    let want = expected_seek(&all, 0, "post", &target, &order);
+    assert_eq!(
+        cells.next().expect("next").map(|e| entry(&e)).as_ref(),
+        all.get(want)
+    );
+    // Inside the row: one cell read first, then a seek far into it.
+    drop(cells);
+    drop(t);
+    let (db, t) = reopen(&dir, db);
+    let mut cells = t.row(HUB).cells().expect("cells");
+    let (first, _) = drive(|cx| {
+        cells
+            .poll_next(cx)
+            .map(|r| r.expect("poll_next").map(|e| entry(&e)))
+    });
+    assert_eq!(first.as_ref(), all.first());
+    let target = qual(15_000);
+    assert!(
+        poll_once(|cx| cells.poll_seek(cx, "post", &target).map(|r| r.is_ok())).is_none(),
+        "a seek into an uncached block fetches"
+    );
+    let want = expected_seek(&all, 1, "post", &target, &order);
+    assert_eq!(
+        cells.next().expect("next").map(|e| entry(&e)).as_ref(),
+        all.get(want)
+    );
+    assert_eq!(
+        cells.next().expect("next").map(|e| entry(&e)).as_ref(),
+        all.get(want + 1)
+    );
+    drop(cells);
+    drop(t);
+    db.close().expect("close");
+}
+
+/// ai1249's R2 on #1625: a seek replacing one left `Pending` keeps the later column, so the
+/// walk never moves back: an earlier qualifier, or an earlier family, lands where the pending
+/// seek would; a later family replaces it.
+#[test]
+fn a_replacing_seek_never_moves_back() {
+    let (dir, db, t) = build();
+    let all = walk_all(&db.snapshot().expect("snapshot"), &t, 1);
+    let order = ["post", "side"];
+    drop(t);
+    let (db, t) = reopen(&dir, db);
+    let mut cells = t.row(HUB).cells().expect("cells");
+    let (first, _) = drive(|cx| {
+        cells
+            .poll_next(cx)
+            .map(|r| r.expect("poll_next").map(|e| entry(&e)))
+    });
+    assert_eq!(first.as_ref(), all.first());
+    let far = qual(16_000);
+    assert!(poll_once(|cx| cells.poll_seek(cx, "post", &far).map(|r| r.is_ok())).is_none());
+    // An earlier qualifier: the pending seek's cell.
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_seek(cx, "post", &qual(10))
+            .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
+    });
+    let at = expected_seek(&all, 1, "post", &far, &order);
+    assert_eq!(got.as_ref(), all.get(at));
+    // A later family replaces a pending seek; an earlier family then keeps it.
+    let farther = qual(18_000);
+    let pending = poll_once(|cx| cells.poll_seek(cx, "post", &farther).map(|r| r.is_ok()));
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_seek(cx, "side", &qual(600))
+            .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
+    });
+    let side = expected_seek(&all, at + 1, "side", &qual(600), &order);
+    assert_eq!(
+        got.as_ref(),
+        all.get(side),
+        "pending: {}",
+        pending.is_none()
+    );
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_seek(cx, "post", &qual(19_000))
+            .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
+    });
+    assert_eq!(
+        got.as_ref(),
+        all.get(side + 1),
+        "never back into an earlier family"
+    );
+    drop(cells);
+    drop(t);
+    db.close().expect("close");
+}
+
+/// ai1249's N1 on #1625: a seek to a family of the table the walk doesn't read is the next
+/// cell.
+#[test]
+fn a_seek_to_an_unread_family_is_the_next_cell() {
+    let (_dir, db, t) = build();
+    let s = db.snapshot().expect("snapshot");
+    let post = sync_walk(
+        t.row(HUB)
+            .snapshot(&s)
+            .family("post")
+            .cells()
+            .expect("cells"),
+    );
+    let mut cells = t
+        .row(HUB)
+        .snapshot(&s)
+        .family("post")
+        .cells()
+        .expect("cells");
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_next(cx)
+            .map(|r| r.expect("poll_next").map(|e| entry(&e)))
+    });
+    assert_eq!(got.as_ref(), post.first());
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_seek(cx, "side", &qual(0))
+            .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
+    });
+    assert_eq!(got.as_ref(), post.get(1));
+    drop(cells);
+    db.close().expect("close");
+}
+
+/// ai1249's N2 on #1625: `next_async`'s future is `Send` (the Python bridge polls it on its
+/// own thread, PR 4).
+#[test]
+fn next_async_is_send() {
+    fn send<T: Send>(_: &T) {}
+    let (_dir, db, t) = build();
+    let mut cells = t.row(HUB).cells().expect("cells");
+    let fut = cells.next_async();
+    send(&fut);
+    drop(fut);
+    drop(cells);
+    db.close().expect("close");
+}
