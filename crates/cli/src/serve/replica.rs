@@ -107,7 +107,9 @@ const STEADY: Duration = Duration::from_secs(30);
 
 /// How long a bootstrap waits for the primary's first answer to a fresh download, which
 /// comes only once the primary has written and hashed its whole copy (#1595). Generous: a
-/// large database's copy takes a while; past it the download breaks and starts again.
+/// large database's copy takes a while; past it the download breaks and starts again, with
+/// a fresh copy, so a primary whose copy takes longer can't bootstrap a replica until the
+/// primary answers at once and heartbeats while it copies (#1611).
 const COPY_WAIT: Duration = Duration::from_secs(10 * 60);
 
 // ---- The primary's side: `Replication.Follow` ----
@@ -825,8 +827,11 @@ impl Replica {
     async fn download(&self, side: &Path, idle: Duration) -> Result<Vec<u8>, String> {
         use tokio::io::AsyncWriteExt;
         self.set_bootstrap("connecting", 0);
-        let mut client = proto::admin_client::AdminClient::new(self.connect().await?)
-            .max_decoding_message_size(usize::MAX);
+        let admin =
+            |c| proto::admin_client::AdminClient::new(c).max_decoding_message_size(usize::MAX);
+        // `None` after a break: the next pass connects again, and a failed connect is that
+        // pass's break (cli692's R2 on #1609), so a blip doesn't restart a long download.
+        let mut client = Some(admin(self.connect().await?));
         let mut file = tokio::fs::File::create(side)
             .await
             .map_err(|e| format!("creating {}: {e}", side.display()))?;
@@ -851,72 +856,86 @@ impl Replica {
             } else {
                 idle
             };
-            let answered = tokio::time::timeout(first, client.backup_download(req)).await;
-            let broke = match answered {
-                Err(_) => format!(
-                    "{} sent no bootstrap copy within {} ms",
-                    self.config.primary,
-                    first.as_millis()
-                ),
-                Ok(Ok(r)) => {
-                    let mut stream = r.into_inner();
-                    loop {
-                        let Ok(next) = tokio::time::timeout(idle, stream.message()).await else {
-                            break format!(
-                                "no chunk of the bootstrap copy from {} within {} ms",
-                                self.config.primary,
-                                idle.as_millis()
-                            );
-                        };
-                        match next {
-                            Ok(Some(chunk)) => {
-                                if chunk.offset != offset {
-                                    return Err(format!(
-                                        "the bootstrap copy's chunk is at {}, expected {offset}",
-                                        chunk.offset
-                                    ));
-                                }
-                                backup_id = chunk.backup_id;
-                                if token.is_empty() {
-                                    token = chunk.feed_token.to_vec();
-                                }
-                                file.write_all(&chunk.data)
-                                    .await
-                                    .map_err(|e| format!("writing {}: {e}", side.display()))?;
-                                hash.update(&chunk.data);
-                                offset += chunk.data.len() as u64;
-                                self.set_bootstrap("downloading", offset);
-                                if !chunk.sha256.is_empty() {
-                                    if hash.finalize().as_slice() != chunk.sha256.as_ref() {
-                                        return Err(
-                                            "the bootstrap copy's SHA-256 doesn't match".to_owned()
-                                        );
+            let connected = match client.take() {
+                Some(c) => Ok(c),
+                None => self.connect().await.map(admin),
+            };
+            let broke = match connected {
+                Err(e) => e,
+                Ok(mut c) => {
+                    // Dropped with this pass: a broken stream's connection isn't reused.
+                    let answered = tokio::time::timeout(first, c.backup_download(req)).await;
+                    match answered {
+                        Err(_) => format!(
+                            "{} sent no bootstrap copy within {} ms",
+                            self.config.primary,
+                            first.as_millis()
+                        ),
+                        Ok(Ok(r)) => {
+                            let mut stream = r.into_inner();
+                            loop {
+                                let Ok(next) = tokio::time::timeout(idle, stream.message()).await
+                                else {
+                                    break format!(
+                                        "no chunk of the bootstrap copy from {} within {} ms",
+                                        self.config.primary,
+                                        idle.as_millis()
+                                    );
+                                };
+                                match next {
+                                    Ok(Some(chunk)) => {
+                                        if chunk.offset != offset {
+                                            return Err(format!(
+                                                "the bootstrap copy's chunk is at {}, expected {offset}",
+                                                chunk.offset
+                                            ));
+                                        }
+                                        backup_id = chunk.backup_id;
+                                        if token.is_empty() {
+                                            token = chunk.feed_token.to_vec();
+                                        }
+                                        file.write_all(&chunk.data).await.map_err(|e| {
+                                            format!("writing {}: {e}", side.display())
+                                        })?;
+                                        hash.update(&chunk.data);
+                                        offset += chunk.data.len() as u64;
+                                        self.set_bootstrap("downloading", offset);
+                                        if !chunk.sha256.is_empty() {
+                                            if hash.finalize().as_slice() != chunk.sha256.as_ref() {
+                                                return Err(
+                                                    "the bootstrap copy's SHA-256 doesn't match"
+                                                        .to_owned(),
+                                                );
+                                            }
+                                            file.sync_all().await.map_err(|e| {
+                                                format!("syncing {}: {e}", side.display())
+                                            })?;
+                                            if token.is_empty() {
+                                                return Err(format!(
+                                                    "{} sent no feed token with its bootstrap copy",
+                                                    self.config.primary
+                                                ));
+                                            }
+                                            return Ok(token);
+                                        }
                                     }
-                                    file.sync_all()
-                                        .await
-                                        .map_err(|e| format!("syncing {}: {e}", side.display()))?;
-                                    if token.is_empty() {
-                                        return Err(format!(
-                                            "{} sent no feed token with its bootstrap copy",
-                                            self.config.primary
-                                        ));
+                                    Ok(None) => {
+                                        break "the stream ended before the last chunk".to_owned();
                                     }
-                                    return Ok(token);
+                                    Err(status) => break status.message().to_owned(),
                                 }
                             }
-                            Ok(None) => break "the stream ended before the last chunk".to_owned(),
-                            Err(status) => break status.message().to_owned(),
                         }
+                        Ok(Err(status)) if backup_id.is_empty() => {
+                            return Err(format!(
+                                "bootstrap from {}: {}",
+                                self.config.primary,
+                                status.message()
+                            ));
+                        }
+                        Ok(Err(status)) => status.message().to_owned(),
                     }
                 }
-                Ok(Err(status)) if backup_id.is_empty() => {
-                    return Err(format!(
-                        "bootstrap from {}: {}",
-                        self.config.primary,
-                        status.message()
-                    ));
-                }
-                Ok(Err(status)) => status.message().to_owned(),
             };
             // Three breaks in a row without progress give up; progress starts the count again
             // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
@@ -932,8 +951,7 @@ impl Replica {
             self.status().last_error = format!("downloading the bootstrap copy: {broke}");
             tokio::time::sleep(Duration::from_millis(200 * tries)).await;
             // On a new connection: a stalled one stays stalled for every later request on it.
-            client = proto::admin_client::AdminClient::new(self.connect().await?)
-                .max_decoding_message_size(usize::MAX);
+            client = None;
         }
     }
 }

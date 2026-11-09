@@ -603,12 +603,13 @@ pub struct ReplicaInfo {
     /// The last error the replica loop met, if it's in `error` or retrying.
     #[prost(string, tag = "7")]
     pub last_error: ::prost::alloc::string::String,
-    /// While it bootstraps, the step it's at: "connecting", "waiting for the primary's copy"
-    /// (the primary writes the whole copy before sending any of it), "downloading", "opening
-    /// the copy" or "swapping". Empty otherwise.
+    /// The step its bootstrap is at, or stopped at: "connecting", "waiting for the primary's
+    /// copy" (the primary writes the whole copy before sending any of it), "downloading",
+    /// "opening the copy" or "swapping". A bootstrap that failed keeps its last step beside
+    /// `last_error` until the next one starts; empty once one has finished.
     #[prost(string, tag = "8")]
     pub bootstrap_phase: ::prost::alloc::string::String,
-    /// While it bootstraps, the bytes of the primary's copy received so far.
+    /// The bytes of the primary's copy received, with `bootstrap_phase` (0 when that's empty).
     #[prost(uint64, tag = "9")]
     pub bootstrap_bytes: u64,
 }
