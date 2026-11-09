@@ -11,9 +11,9 @@ use pigeonhole_format::Durability;
 use pigeonhole_io::sim::{SimOp, SimVfs};
 
 const DB: &str = "/db/data.phdb";
-/// Four zero-fill writes per slot (the WAL writes 1 MiB per call).
+/// Sixteen zero-fill writes per slot (the WAL writes 256 KiB per call).
 const SEGMENT: u64 = 4 << 20;
-const ZERO_CHUNK: u64 = 1 << 20;
+const ZERO_CHUNK: u64 = 256 << 10;
 /// The preparation's writes in flight at most (four), with the commit's WAL write.
 const MAX_IN_FLIGHT: usize = 5;
 
@@ -23,7 +23,7 @@ fn idle(shard: &mut EngineShard) {
 }
 
 /// Zero-fill writes of a spare slot the simulated device ran since recording started: whole
-/// 1 MiB writes at a slot-aligned offset past the first segment.
+/// 256 KiB writes at a slot-aligned offset past the first segment.
 fn zero_fills(vfs: &SimVfs) -> usize {
     vfs.recorded_ops()
         .iter()
@@ -80,13 +80,14 @@ fn spare_slots_are_zero_filled_by_submitted_writes() {
         max_in_flight = max_in_flight.max(vfs.io_in_flight());
         vfs.complete_all_io();
     }
-    // Then the preparation finishes: the slot's four writes, and its sync.
-    for _ in 0..16 {
+    // Then the preparation finishes: the slot's sixteen writes, each written back, and its
+    // sync.
+    for _ in 0..64 {
         idle(shard);
         max_in_flight = max_in_flight.max(vfs.io_in_flight());
         vfs.complete_all_io();
     }
-    assert_eq!(zero_fills(&vfs), 4, "the spare slot was zero-filled");
+    assert_eq!(zero_fills(&vfs), 16, "the spare slot was zero-filled");
     assert!(
         vfs.recorded_ops()
             .iter()
