@@ -1351,6 +1351,98 @@ impl<'t> CellWalk<'t> {
         }
     }
 
+    /// [`CellWalk::step`] without blocking (#1560): `Pending` while a block the next cell
+    /// needs is fetched, and nothing moves. With `seek` (a family and qualifier), the step
+    /// is to the first cell at or after that column instead, never back.
+    #[cfg(feature = "async")]
+    fn poll_step(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        seek: Option<(FamilyId, &[u8])>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::task::Poll;
+        if self.done {
+            return Poll::Ready(Ok(false));
+        }
+        let r = match self.core.db.check_generation(self.generation) {
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(()) => self.poll_step_inner(cx, seek),
+        };
+        if matches!(r, Poll::Ready(Err(_) | Ok(false))) {
+            self.done = true;
+        }
+        r
+    }
+
+    #[cfg(feature = "async")]
+    fn poll_step_inner(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        seek: Option<(FamilyId, &[u8])>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::task::Poll;
+        loop {
+            let Some(cursor) = self.cursor.as_mut() else {
+                let Some(next) = self.pending.pop() else {
+                    return Poll::Ready(Ok(false));
+                };
+                // The walk's scans go on async from here: one not started yet is made so.
+                let mut next = self.core.with(|e| e.async_scan_from(next));
+                match next.poll_next_row(cx) {
+                    Poll::Pending => {
+                        self.pending.push(next);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(r) => {
+                        if r.map_err(crate::Error::from)? {
+                            self.cursor = Some(next);
+                        }
+                    }
+                }
+                continue;
+            };
+            if !cursor.is_async() {
+                let c = self.cursor.take().expect("checked above");
+                self.cursor = Some(self.core.with(|e| e.async_scan_from(c)));
+                continue;
+            }
+            let polled = match seek {
+                // The column's family is this scan's: seek in it.
+                Some((family, qualifier)) if cursor.families().contains(&family) => {
+                    cursor.poll_seek_cell(cx, family, qualifier)
+                }
+                // A later scan reads it: this one's cells are all before the column.
+                Some((family, _))
+                    if self.pending.iter().any(|c| c.families().contains(&family)) =>
+                {
+                    self.cursor = None;
+                    continue;
+                }
+                // The walk is past the column's family (or never reads it): the next cell.
+                _ => cursor.poll_next_cell(cx),
+            };
+            let found = match polled {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(r) => r.map_err(crate::Error::from)?,
+            };
+            if !found {
+                self.cursor = None;
+                continue;
+            }
+            let cell = cursor.cell().expect("held after a step");
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            self.family = Some(cell.family);
+            // A small value is copied into the reused cell; a large one stays pinned.
+            if cell.stored.len() <= CellData::INLINE_MAX {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = cursor.current_data();
+            }
+            return Poll::Ready(Ok(true));
+        }
+    }
+
     /// [`CellWalk::step`] straight into `buf` (the cell's qualifier unescaped into its
     /// qualifiers, a small value copied, a large one pinned): `false` at the end of the walk.
     /// `qualifier`, `data` and `family` are not set.
@@ -1501,6 +1593,109 @@ impl RowCells<'_> {
     /// versions: [`RowRead::pages`] ends its pages on column boundaries for that reason.
     pub fn position(&self) -> Option<RowPosition> {
         self.walk.position()
+    }
+
+    /// The cell [`RowCells::poll_next`] or [`RowCells::poll_seek`] stepped to.
+    #[cfg(feature = "async")]
+    fn entry(&mut self) -> CellEntry<'_> {
+        let walk = &mut self.walk;
+        let _ = walk.family_name();
+        let family = walk
+            .family_index
+            .and_then(|(_, i)| walk.info.families.get(i))
+            .map_or("", |f| f.name.as_str());
+        CellEntry {
+            family,
+            qualifier: &walk.qualifier,
+            cell: CellRef::borrowed(&walk.data),
+        }
+    }
+
+    /// [`RowCells::next`] without blocking on the device (#1560): `Pending` while a block the
+    /// next cell needs is fetched, after which the poll is the same step (a `Pending` moves
+    /// nothing). Blocks are fetched one ahead as the walk is polled (D196); a block it still
+    /// misses is read synchronously and counted in the `async_sync_reads` metric. A walk can
+    /// start with [`RowCells::next`] and go on with this.
+    #[cfg(feature = "async")]
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<CellEntry<'_>>>> {
+        match self.walk.poll_step(cx, None) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(false)) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Ready(Ok(true)) => std::task::Poll::Ready(Ok(Some(self.entry()))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Steps to the first cell at or after column (`family`, `qualifier`) in the walk's order
+    /// without blocking: a skip over the cells before it, which reads only the blocks it
+    /// lands in (#1560, perf287's T1). It never moves back: when the walk's next cell is
+    /// already at or past the column, that cell is the one. `None` when no cell is left.
+    ///
+    /// `Pending` while a block the seek lands in is fetched: poll again with the same column.
+    /// Until it completes the walk holds no cell; [`RowCells::poll_next`] finishes it first.
+    ///
+    /// # Errors
+    /// `FamilyNotFound` if the table has no family `family`.
+    #[cfg(feature = "async")]
+    pub fn poll_seek(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        family: &str,
+        qualifier: &[u8],
+    ) -> std::task::Poll<Result<Option<CellEntry<'_>>>> {
+        let Some(id) = self.walk.info.family(family).map(|f| f.id) else {
+            return std::task::Poll::Ready(Err(crate::table::family_not_found(
+                &self.walk.info.name,
+                family,
+            )));
+        };
+        match self.walk.poll_step(cx, Some((id, qualifier))) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(false)) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Ready(Ok(true)) => std::task::Poll::Ready(Ok(Some(self.entry()))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    /// [`RowCells::next`] as a future that never blocks on the device
+    /// ([`RowCells::poll_next`]).
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+    /// let mut m = g.mutate(b"hub");
+    /// for i in 0u64..100 {
+    ///     m = m.put("out", &i.to_be_bytes(), b"");
+    /// }
+    /// m.commit()?;
+    ///
+    /// let mut degree = 0;
+    /// let mut cells = g.row(b"hub").family("out").cells()?;
+    /// # pigeonhole::doc_support::block_on(async {
+    /// while let Some(e) = cells.next_async().await? {
+    ///     assert_eq!(e.family, "out");
+    ///     degree += 1;
+    /// }
+    /// # Ok::<(), pigeonhole::Error>(())
+    /// # })?;
+    /// assert_eq!(degree, 100);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn next_async(&mut self) -> Result<Option<CellEntry<'_>>> {
+        if !std::future::poll_fn(|cx| self.walk.poll_step(cx, None)).await? {
+            return Ok(None);
+        }
+        Ok(Some(self.entry()))
     }
 }
 

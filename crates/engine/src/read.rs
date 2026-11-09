@@ -705,6 +705,66 @@ struct AsyncScan {
     /// the cache keeps nothing, it positions synchronously (counted).
     fetches: u32,
     sync: bool,
+    /// A seek within the row ([`ScanCursor::poll_seek_cell`]) that returned `Pending`: its
+    /// family, its column prefix in `target`. The next poll finishes it first.
+    seek: Option<FamilyId>,
+    target: Vec<u8>,
+}
+
+impl AsyncScan {
+    /// Polls the fetch in flight, if any: `Ready(Ok)` once its block is admitted (pinned until
+    /// the cursor steps past it). A cache that keeps nothing switches the scan to synchronous
+    /// reads (counted once).
+    #[inline]
+    fn poll_fetch(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let Some((completion, fetch)) = &mut self.fetch else {
+            return Poll::Ready(Ok(()));
+        };
+        let buf = match std::pin::Pin::new(completion).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(r) => r,
+        };
+        let admitted = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?));
+        let kept = fetch.is_kept();
+        self.fetch = None;
+        self.pinned.extend(admitted?);
+        if !kept {
+            // The cache keeps nothing: prefetching or positioning cache-only would fetch the
+            // same block again; read synchronously from now on (counted).
+            self.sync = true;
+            self.shared
+                .async_sync_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Starts fetching the first uncached block `lane`'s sources read next (one ahead, D196):
+    /// whether one was started.
+    fn prefetch(&mut self, lane: &Lane) -> bool {
+        let mut upcoming = Vec::new();
+        for source in lane.resolver.cursor().sources() {
+            source.upcoming(1, &mut upcoming);
+            if let Some(fetch) = upcoming.pop() {
+                let completion = fetch.submit();
+                self.fetch = Some((completion, Box::new(fetch)));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Counts the file reads an attempt made synchronously.
+    #[inline]
+    fn count(&self, reads: u64) {
+        if reads > 0 {
+            self.shared
+                .async_sync_reads
+                .fetch_add(reads, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl std::fmt::Debug for AsyncScan {
@@ -767,34 +827,25 @@ impl ScanCursor {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<bool>> {
         let _poll = pigeonhole_io::async_poll_scope();
-        use std::future::Future;
         use std::sync::atomic::Ordering;
         use std::task::Poll;
         let Some(mut nb) = self.nb.take() else {
             return Poll::Ready(self.next_row());
         };
         let out = loop {
-            if let Some((completion, fetch)) = &mut nb.fetch {
-                let buf = match std::pin::Pin::new(completion).poll(cx) {
-                    Poll::Pending => {
-                        self.nb = Some(nb);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(r) => r,
-                };
-                let admitted = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?));
-                let kept = fetch.is_kept();
-                nb.fetch = None;
-                match admitted {
-                    Ok(h) => nb.pinned.extend(h),
-                    Err(e) => break Err(e),
+            match nb.poll_fetch(cx) {
+                Poll::Pending => {
+                    self.nb = Some(nb);
+                    return Poll::Pending;
                 }
-                if !kept {
-                    // The cache keeps nothing: prefetching or positioning cache-only would
-                    // fetch the same block again; read synchronously from now on (counted).
-                    nb.sync = true;
-                    nb.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
-                }
+                Poll::Ready(Err(e)) => break Err(e),
+                Poll::Ready(Ok(())) => {}
+            }
+            // A seek within the row left `Pending` moved lanes: finish it before the row ends.
+            match self.finish_seek(&mut nb) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => break Err(e),
             }
             if self.done {
                 break Ok(false);
@@ -838,25 +889,9 @@ impl ScanCursor {
                     }
                 }
             }
-            if !nb.sync {
-                // One block ahead per cursor; fetched one at a time.
-                let mut upcoming = Vec::new();
-                for lane in &self.lanes {
-                    for source in lane.resolver.cursor().sources() {
-                        source.upcoming(1, &mut upcoming);
-                        if !upcoming.is_empty() {
-                            break;
-                        }
-                    }
-                    if !upcoming.is_empty() {
-                        break;
-                    }
-                }
-                if let Some(fetch) = upcoming.into_iter().next() {
-                    let completion = fetch.submit();
-                    nb.fetch = Some((completion, Box::new(fetch)));
-                    continue;
-                }
+            // One block ahead per cursor; fetched one at a time.
+            if !nb.sync && self.lanes.iter().any(|lane| nb.prefetch(lane)) {
+                continue;
             }
             let ((stepped, blob_reads), file_reads) = pigeonhole_sst::counting_file_reads(|| {
                 as_async_read(false, || {
@@ -905,6 +940,233 @@ impl ScanCursor {
         out
     }
 
+    /// The next cell of the current row in an async scan, as [`ScanCursor::next_cell`]
+    /// (D196 within a row, #1560): `Ready(Ok(true))` when the cursor holds one (read it with
+    /// [`ScanCursor::cell`] or [`ScanCursor::current_data`]), `Ready(Ok(false))` when the row
+    /// is done.
+    ///
+    /// Before the step it fetches the next block the stepping lane's SST cursors read, if
+    /// uncached (one ahead, as [`ScanCursor::poll_next_row`] does), and returns `Pending`
+    /// without moving: a `Pending` changes nothing the cursor shows, and the next poll is the
+    /// same step. A block it still misses is read synchronously and counted in
+    /// `Metrics::async_sync_reads`. On a sync cursor this is `next_cell`.
+    pub fn poll_next_cell(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<bool>> {
+        let _poll = pigeonhole_io::async_poll_scope();
+        let Some(mut nb) = self.nb.take() else {
+            return std::task::Poll::Ready(self.step_cell().map(|f| f.is_some()));
+        };
+        let out = self.poll_cell(&mut nb, cx);
+        self.nb = Some(nb);
+        out
+    }
+
+    /// Moves the current row's walk to its first cell at or after column (`family`,
+    /// `qualifier`), and holds it as [`ScanCursor::poll_next_cell`] does: `Ready(Ok(true))`
+    /// with a cell, `Ready(Ok(false))` when the row has none there. It never moves back: when
+    /// the walk's next cell is already at or past the column, that cell is the one, read as
+    /// [`ScanCursor::poll_next_cell`] reads it. The families the walk reads before `family`
+    /// are passed; a family the walk doesn't read ends the row.
+    ///
+    /// A seek that moves the family's cursors seeks them cache-only; a block the cache lacks
+    /// is fetched, and the seek returns `Pending` (perf287's T1 on #1560). Poll it again with
+    /// the same column. Until it completes the cursor holds no cell; a step
+    /// ([`ScanCursor::poll_next_cell`], [`ScanCursor::poll_next_row`]) finishes it first, and
+    /// a seek to another column replaces it. On a sync cursor it reads synchronously.
+    pub fn poll_seek_cell(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        family: FamilyId,
+        qualifier: &[u8],
+    ) -> std::task::Poll<Result<bool>> {
+        let _poll = pigeonhole_io::async_poll_scope();
+        let Some(mut nb) = self.nb.take() else {
+            let mut target = Vec::new();
+            let r = self
+                .seek_target(&mut target, qualifier)
+                .and_then(|()| self.seek_lanes(family, &target, false))
+                .and_then(|()| self.step_cell().map(|f| f.is_some()));
+            return std::task::Poll::Ready(r);
+        };
+        let mut target = std::mem::take(&mut nb.target);
+        let encoded = self.seek_target(&mut target, qualifier);
+        nb.target = target;
+        let out = match encoded {
+            Err(e) => std::task::Poll::Ready(Err(e)),
+            Ok(()) => {
+                nb.seek = Some(family);
+                self.poll_cell(&mut nb, cx)
+            }
+        };
+        self.nb = Some(nb);
+        out
+    }
+
+    /// The cell [`ScanCursor::poll_next_cell`] or [`ScanCursor::poll_seek_cell`] holds, or
+    /// `None` when the row is done (or before its first cell).
+    pub fn cell(&self) -> Option<ScanCell<'_>> {
+        let lane = &self.lanes[self.last_lane?];
+        Some(ScanCell {
+            family: lane.family,
+            qualifier: &self.qual_buf,
+            ts: lane.ts,
+            stored: lane.value(),
+        })
+    }
+
+    /// `next_cell`'s step, its qualifier into `qual_buf` ([`ScanCursor::cell`]).
+    fn step_cell(&mut self) -> Result<Option<FamilyId>> {
+        let mut qual = std::mem::take(&mut self.qual_buf);
+        qual.clear();
+        let next = self.next_cell_into(&mut qual);
+        self.qual_buf = qual;
+        next
+    }
+
+    /// [`ScanCursor::poll_next_cell`]'s loop, finishing a seek `nb` holds first.
+    fn poll_cell(
+        &mut self,
+        nb: &mut AsyncScan,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::task::Poll;
+        loop {
+            match nb.poll_fetch(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    nb.seek = None;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            match self.finish_seek(nb) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            if !self.in_row {
+                return Poll::Ready(Ok(false));
+            }
+            // The lane whose cell was handed out steps next: fetch what it reads first.
+            if !nb.sync
+                && let Some(i) = self.last_lane
+                && nb.prefetch(&self.lanes[i])
+            {
+                continue;
+            }
+            let ((stepped, blob_reads), file_reads) =
+                pigeonhole_sst::counting_file_reads(|| as_async_read(false, || self.step_cell()));
+            nb.count(blob_reads + file_reads);
+            if stepped.is_ok() {
+                // Blocks stepped past need not stay pinned.
+                nb.pinned.clear();
+            }
+            return Poll::Ready(stepped.map(|f| f.is_some()));
+        }
+    }
+
+    /// Moves the lanes for the seek `nb` holds, if any, cache-only unless the scan reads
+    /// synchronously: `Ok(true)` once none is left, `Ok(false)` after starting the fetch of a
+    /// block it lacks (the next attempt seeks again).
+    fn finish_seek(&mut self, nb: &mut AsyncScan) -> Result<bool> {
+        let Some(family) = nb.seek else {
+            return Ok(true);
+        };
+        let ((r, blob_reads), file_reads) = pigeonhole_sst::counting_file_reads(|| {
+            as_async_read(false, || self.seek_lanes(family, &nb.target, !nb.sync))
+        });
+        nb.count(blob_reads + file_reads);
+        match r {
+            Err(Error::WouldBlock(mut fetch)) => {
+                let completion = fetch.start();
+                nb.fetch = Some((completion, fetch));
+                Ok(false)
+            }
+            Err(e) => {
+                nb.seek = None;
+                Err(e)
+            }
+            Ok(()) => {
+                nb.seek = None;
+                Ok(true)
+            }
+        }
+    }
+
+    /// `qualifier`'s column prefix in the current row, into `out`.
+    fn seek_target(&self, out: &mut Vec<u8>, qualifier: &[u8]) -> Result<()> {
+        out.clear();
+        pigeonhole_format::key::encode_column_prefix(out, &self.row, qualifier)?;
+        Ok(())
+    }
+
+    /// Positions the current row's lanes for a seek to `target` (a column prefix) in
+    /// `family`, so that the next step hands out the first cell at or after it: passes the
+    /// lanes of earlier families, and reseeks `family`'s lane if its next cell is before the
+    /// column (or a failed seek left it unpositioned). A lane reseeked holds its landing cell;
+    /// one left in place steps past its handed-out cell as usual. With `cache_only`, a block
+    /// the cache lacks fails the reseek with `Error::WouldBlock` and leaves the lane
+    /// unpositioned until the next attempt.
+    fn seek_lanes(&mut self, family: FamilyId, target: &[u8], cache_only: bool) -> Result<()> {
+        if !self.in_row {
+            return Ok(());
+        }
+        let rank = |f: FamilyId| self.families.iter().position(|&x| x == f);
+        let Some(want) = rank(family) else {
+            // Not a family of the walk: the row is done.
+            self.last_lane = None;
+            self.lane_idx = self.lanes.len();
+            return Ok(());
+        };
+        while self.lane_idx < self.lanes.len()
+            && rank(self.lanes[self.lane_idx].family).is_some_and(|r| r < want)
+        {
+            // A handed-out cell's lane is passed with it: the row's end drops the rest.
+            if self.last_lane == Some(self.lane_idx) {
+                self.last_lane = None;
+            }
+            self.lane_idx += 1;
+        }
+        let i = self.lane_idx;
+        let Some(lane) = self.lanes.get_mut(i).filter(|l| l.family == family) else {
+            return Ok(());
+        };
+        let row_len = self.row_esc.len() + TERMINATOR.len();
+        let unpositioned = !lane.pending && !lane.done;
+        let before = lane.pending && {
+            let col = lane.col();
+            col.len() >= row_len
+                && col.starts_with(&self.row_esc)
+                && col[self.row_esc.len()..row_len] == TERMINATOR
+                && col < target
+        };
+        if !(unpositioned || before) {
+            return Ok(());
+        }
+        if self.last_lane == Some(i) {
+            self.last_lane = None;
+        }
+        if cache_only {
+            for source in lane.resolver.cursor_mut().sources_mut() {
+                source.set_cache_only(true);
+            }
+        }
+        let r = reduce::ReduceLane::reseek(lane, target);
+        if cache_only {
+            for source in lane.resolver.cursor_mut().sources_mut() {
+                source.set_cache_only(false);
+            }
+        }
+        if r.is_err() {
+            // Unpositioned (not pending, not done) until the next attempt.
+            lane.pending = false;
+            lane.done = false;
+        }
+        self.snapshot.checked(r)
+    }
+
     /// The cursor of an async scan ([`ScanCursor::poll_next_row`]).
     pub(crate) fn into_async(mut self, shared: Arc<crate::shard::Shared>) -> Self {
         self.nb = Some(Box::new(AsyncScan {
@@ -913,6 +1175,8 @@ impl ScanCursor {
             pinned: Vec::new(),
             fetches: 0,
             sync: false,
+            seek: None,
+            target: Vec::new(),
         }));
         self
     }
@@ -1220,6 +1484,16 @@ impl ScanCursor {
     #[inline(never)]
     fn check_fork(&self) -> Result<()> {
         self.snapshot.check_process()
+    }
+
+    /// The families the scan reads, in the order a row's cells come out by family.
+    pub fn families(&self) -> &[FamilyId] {
+        &self.families
+    }
+
+    /// Whether this is an async scan ([`Engine::scan_async`](crate::Engine::scan_async)).
+    pub fn is_async(&self) -> bool {
+        self.nb.is_some()
     }
 
     /// The current row key.
