@@ -455,7 +455,11 @@ impl Copier<'_> {
                 let mut sources = Vec::new();
                 mem_sources(set, &all, &mut sources);
                 let options = writer_options(&meta.options, t.table, f, t.id, self.created);
-                let mut sink = self.copy_at(options, sources)?;
+                // Sized from the memtables' bytes, as a flush is (#1595: the target
+                // SST size here reserved a 64 MiB-aligned extent per family, so a copy of a
+                // few hundred KiB of memtables was hundreds of MiB, nearly all free).
+                let bytes: u64 = set.readers.iter().map(|r| r.bytes()).sum();
+                let mut sink = self.copy_at(options, sources, bytes)?;
                 mem_edits.extend(sink.take_edits(t.id, f, 0));
             }
         }
@@ -496,7 +500,10 @@ impl Copier<'_> {
                 reader.iter(all.clone(), ReadOptions::default()).into(),
             )];
             let options = writer_options(&info.options, t.table, family, tablet, self.created);
-            let mut sink = self.copy_at(options, sources)?;
+            // About the source's length: it loses commits, never gains any, but the family's
+            // options (compression, block size, filter) may have changed since the source was
+            // written, hence the slack. An underestimate only cuts one more SST.
+            let mut sink = self.copy_at(options, sources, meta.len.saturating_mul(2))?;
             for (out, refs) in sink.outputs.drain(..).zip(sink.refs.drain(..)) {
                 for &(tablet, family, level) in &slots {
                     rewritten.push(Edit::AddSst {
@@ -542,12 +549,19 @@ impl Copier<'_> {
     /// snapshot's into new SSTs of the copy; returns the sink holding them and their blob
     /// references. Values are written as they are: a blob pointer keeps naming its blob file,
     /// which the copy holds under the same id.
-    fn copy_at(&self, options: SstWriterOptions, sources: Vec<Source>) -> Result<SstSink> {
+    fn copy_at(
+        &self,
+        options: SstWriterOptions,
+        sources: Vec<Source>,
+        bytes: u64,
+    ) -> Result<SstSink> {
+        // `bytes` bounds what `sources` hold: each SST's extent is asked for at that size (at
+        // most the target SST size, as a flush), so a small one takes a small extent.
         let mut sink = SstSink::new(
             Arc::clone(self.pager),
             Arc::clone(&self.sst_ids),
             options,
-            self.shared.picker.target_sst_bytes,
+            bytes.min(self.shared.picker.target_sst_bytes),
         );
         if sources.is_empty() {
             return Ok(sink);
