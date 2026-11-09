@@ -27,9 +27,13 @@ impl Shards {
     /// Opens `path` (one shard, `Buffered`, no tablet changes, a memtable budget no setup
     /// reaches, a 256 MiB block cache) on `vfs` if given (`support/inline_io.rs`, for a shape
     /// whose I/O must complete on the thread that submitted it), else the default backend,
-    /// each shard driven by a thread.
-    pub fn open(path: &Path, vfs: Option<pigeonhole_io::VfsRef>) -> (Pigeonhole, Shards) {
-        let (db, drivers, ctl) = open(path, vfs);
+    /// each shard driven by a thread. `tune` adjusts those options last (a shape's own).
+    pub fn open(
+        path: &Path,
+        vfs: Option<pigeonhole_io::VfsRef>,
+        tune: impl FnOnce(Options) -> Options,
+    ) -> (Pigeonhole, Shards) {
+        let (db, drivers, ctl) = open(path, vfs, tune);
         (db, Shards { drivers, ctl })
     }
 
@@ -107,6 +111,7 @@ impl Ctl {
 fn open(
     path: &Path,
     vfs: Option<pigeonhole_io::VfsRef>,
+    tune: impl FnOnce(Options) -> Options,
 ) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
     let mut options = Options::default();
     if let Some(vfs) = vfs {
@@ -114,16 +119,18 @@ fn open(
     }
     let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
         path,
-        options
-            .shards(1)
-            .tablet_changes(false)
-            .durability(Durability::Buffered)
-            .memtable_budget(1 << 30)
-            .block_cache(256 << 20)
-            // A waiting client's poll (D198) runs a number of times that depends on thread
-            // timing: counted, it would make the commit shapes nondeterministic.
-            .commit_spin(std::time::Duration::ZERO)
-            .row_cache(row_cache()),
+        tune(
+            options
+                .shards(1)
+                .tablet_changes(false)
+                .durability(Durability::Buffered)
+                .memtable_budget(1 << 30)
+                .block_cache(256 << 20)
+                // A waiting client's poll (D198) runs a number of times that depends on
+                // thread timing: counted, it would make the commit shapes nondeterministic.
+                .commit_spin(std::time::Duration::ZERO)
+                .row_cache(row_cache()),
+        ),
     )
     .expect("open");
     let ctl = Arc::new(Ctl {

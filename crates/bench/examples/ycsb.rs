@@ -47,6 +47,9 @@ const WARM_MEMTABLE: usize = 10_000;
 /// Measured operations the shapes cycle through.
 const POOL: usize = 20_000;
 const PER_ITERATION: usize = 200;
+/// The WAL segment size: more than twice what the setup and the measured operations write
+/// (see `main`).
+const WAL_SEGMENT: u64 = 256 << 20;
 
 fn config(kind: WorkloadKind, operations: usize) -> WorkloadConfig {
     WorkloadConfig {
@@ -116,7 +119,14 @@ fn main() {
     };
     let dir = base.join(format!("phdb-ycsb-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let (db, shards) = Shards::open(&dir.join("y.phdb"), None);
+    // The setup writes about half of a default 64 MiB WAL segment, where the stream starts
+    // preparing spare slots (#143): that zero-fill, the early rollover out of the open-time
+    // slot once a spare is ready, and the refill after it (D319) would land in the measured
+    // window or not depending on thread timing. A segment the run never fills halfway keeps
+    // them all out of both counts.
+    let (db, shards) = Shards::open(&dir.join("y.phdb"), None, |o| {
+        o.wal_segment_size(WAL_SEGMENT)
+    });
     let t = db
         .table("bench")
         .unwrap()
