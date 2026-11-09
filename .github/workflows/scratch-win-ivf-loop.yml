@@ -1,0 +1,40 @@
+# SCRATCH (do not merge): loops the IVF replica test un-ignored on Windows to catch #1595's
+# fix (#1615, with main for #1609's Info phase). Runs only for the scratch/win-ivf-loop-1615 branch's PR.
+name: scratch win ivf loop
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    if: github.head_ref == 'scratch/win-ivf-loop-1615'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        shell: bash
+        run: cargo test -p pigeonhole-cli --all-features --no-run
+      - name: loop
+        shell: bash
+        run: |
+          fails=0
+          for i in $(seq 1 40); do
+            start=$(date +%s)
+            if cargo test -q -p pigeonhole-cli --all-features serve::server_tests::a_replica_serves_ivf_index_reads_and_refuses_its_writes -- --exact --include-ignored > out.txt 2>&1; then
+              echo "run $i ok in $(( $(date +%s) - start ))s"
+            else
+              fails=$((fails + 1))
+              echo "::group::run $i FAILED in $(( $(date +%s) - start ))s"
+              cat out.txt
+              echo "::endgroup::"
+            fi
+          done
+          echo "FAILS=$fails of 40"
+          [ "$fails" -eq 0 ]
