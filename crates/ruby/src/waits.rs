@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use magnus::{Error, Ruby, Value};
@@ -56,6 +56,10 @@ struct State<S: Source> {
     slot: Option<(S::Item, Vec<u8>)>,
     /// The generation of the fiber wait in progress, if one is.
     waiting: Option<u64>,
+    /// That wait's waker while it's pending: `close` wakes it, so a parked fiber finds the
+    /// source gone and raises `Closed` (the source's own wakers go with it, unwoken; cli692's
+    /// R1 on #1605).
+    waker: Option<Waker>,
     generation: u64,
 }
 
@@ -88,6 +92,7 @@ impl<S: Source> Waits<S> {
                 closed: false,
                 slot: None,
                 waiting: None,
+                waker: None,
                 generation: 0,
             })),
             turn: Condvar::new(),
@@ -232,15 +237,19 @@ impl<S: Source> Waits<S> {
     }
 
     /// Closes the stream: the source is dropped without the GVL. A sync read that has it out
-    /// drops it when it comes back; a fiber wait finds it gone and raises `Closed`.
+    /// drops it when it comes back; a parked fiber wait is woken, finds it gone and raises
+    /// `Closed`.
     pub(crate) fn close(&self, ruby: &Ruby) -> Result<(), Error> {
         without_gvl(ruby, || {
-            let (source, slot) = {
+            let (source, slot, waker) = {
                 let mut g = lock(&self.state);
                 g.closed = true;
-                (g.source.take(), g.slot.take())
+                (g.source.take(), g.slot.take(), g.waker.take())
             };
             drop((source, slot));
+            if let Some(w) = waker {
+                w.wake();
+            }
         })
     }
 
@@ -357,6 +366,7 @@ impl<S: Source> Drop for Claim<S> {
         let mut g = lock(&self.state);
         if g.waiting == Some(self.generation) {
             g.waiting = None;
+            g.waker = None;
         }
     }
 }
@@ -378,9 +388,14 @@ impl<S: Source> Future for NextWait<S> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         let state = Arc::clone(&this.state);
+        // Lock order: `state`, then the source's own (the engine's feed) inside `poll_next`,
+        // never the reverse: nothing on the engine's side takes `state` (cli692's N1).
         let mut g = lock(&state);
+        g.waker = None;
         if g.waiting != Some(this.generation) {
-            // Superseded: the wait was dropped and a newer one (or a sync read) went on.
+            // Superseded: the wait was dropped and a newer one (or a sync read) went on. Never
+            // reaches Ruby: a dropped wait's op is gone from the bridge, so nothing takes this
+            // (cli692's N3).
             this.finished = true;
             return Poll::Ready(Box::new(|ruby: &Ruby| Err(Waits::<S>::closed_err(ruby))));
         }
@@ -395,7 +410,10 @@ impl<S: Source> Future for NextWait<S> {
             return Poll::Ready(Box::new(|ruby: &Ruby| Err(Waits::<S>::closed_err(ruby))));
         };
         match source.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                g.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
             Poll::Ready(Ok(item)) => {
                 let token = this.token.take().unwrap_or_default();
                 g.slot = Some((item, token));

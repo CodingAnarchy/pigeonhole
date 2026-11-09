@@ -323,6 +323,30 @@ module FiberCases
     feed.close
   end
 
+  # cli692's R1 on #1605: a fiber parked in `next` with no timeout is woken by the stream's
+  # close, and raises `Closed`, rather than waiting for a commit that can't come.
+  def test_closing_a_stream_ends_a_parked_fiber_wait
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    raised = nil
+    took = nil
+    on_scheduler do |spawn|
+      spawn.call do
+        started = clock
+        feed.next
+      rescue Pigeonhole::Closed => e
+        raised = e
+        took = clock - started
+      end
+      spawn.call do
+        sleep 0.05
+        feed.close
+      end
+    end
+    assert_kind_of Pigeonhole::Closed, raised
+    assert_operator took, :<, 1.0
+  end
+
   def test_a_memory_watch_waits_under_the_scheduler
     s = Pigeonhole::Memory::Store.create(fdb, "agents")
     w = s.watch("n")
