@@ -94,6 +94,8 @@ pub(crate) fn run(
         Command::Info { file } => info::run(&cli, file),
         #[cfg(feature = "serve")]
         Command::Promote { file } => promote::run(&cli, file),
+        #[cfg(feature = "serve")]
+        Command::Cluster(cmd) => crate::serve::cluster_run(&cli, cmd),
         Command::Check {
             file,
             deep,

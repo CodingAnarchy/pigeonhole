@@ -142,6 +142,7 @@ A few rare cases still read synchronously, inside the future or, for a read whos
 - a separated (blob) value larger than the blob cache limit (an eighth of the block cache, capped at 1 MiB);
 - a block the cache cannot keep (a cache of size 0, or a block larger than a cache shard), or a single read needing more than 64 fetches;
 - a scan step that needs a block the stream did not predict (for example, after a long skip over deleted or filtered cells).
+- a row longer than one block, read through a set of keys: the multi-get (`KeyRows::next_async`), a traversal (`Traverse::run_async`) and a nearest-neighbour search over keys. Each key's first block is fetched asynchronously, and its later blocks are read synchronously. Until [#1652](https://github.com/CodingAnarchy/pigeonhole/issues/1652) closes this, a `pigeonhole-memory` recall (`Recall::run_async`) reads at most a block or two synchronously. In tests, 28 of 7,680 cold recalls under load read one, and none read two.
 
 Making scan steps resumable, so the last case never blocks, is tracked in [#398](https://github.com/CodingAnarchy/pigeonhole/issues/398).
 

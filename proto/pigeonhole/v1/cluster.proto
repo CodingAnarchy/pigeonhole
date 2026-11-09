@@ -1,0 +1,134 @@
+// Pigeonhole's network API, v1: static partitions across `phdb serve` nodes (D317, ICR 0117).
+// The partition map, and the `Cluster` service that sets, distributes and reports it.
+syntax = "proto3";
+
+package pigeonhole.v1;
+
+import "pigeonhole/v1/schema.proto";
+
+service Cluster {
+  // The node's newest map. Read, admin or cluster scope.
+  rpc GetMap(GetMapRequest) returns (ClusterMap);
+  // Replaces the map: validated, persisted on this node, then pushed to every node in it.
+  // Answers once it's persisted here, with what each push did (in parallel, each bounded by
+  // `--cluster-push-timeout-ms`). `Conflict` (`ABORTED`, not applied) when
+  // `expected_map_version` isn't this node's version: re-read the map and try again; the
+  // message carries the current version. `InvalidArgument` for a map that fails validation
+  // or makes a change the map may not make. Admin scope.
+  rpc SetMap(SetMapRequest) returns (SetMapResponse);
+  // Node to node: a newer map, accepted only from the same cluster with a greater
+  // `map_version` and a valid change; the same version with the same bytes is a no-op.
+  // `InvalidArgument` otherwise: older, another cluster's, an invalid change, or divergent
+  // (the same version, different bytes, which `Status` then reports on both nodes).
+  // Cluster scope, gRPC only.
+  rpc PushMap(PushMapRequest) returns (PushMapResponse);
+  // This node: its id, its map version and the partitions in its directory. Read, admin or
+  // cluster scope.
+  rpc Status(StatusRequest) returns (NodeStatus);
+}
+
+// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
+// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).
+message ClusterMap {
+  // Fixed for a cluster's life: a node refuses a map of another cluster, and each partition
+  // file records it (`__phdb_cluster`).
+  string cluster_id = 1;
+  // Raised by every change; a node refuses a map no newer than its own.
+  uint64 map_version = 2;
+  repeated Node nodes = 3;
+  // Which node serves each partition (layer 2: changes by relocation, with a higher epoch).
+  repeated Partition partitions = 4;
+  // Which partition holds each key range (layer 1: fixed once written).
+  repeated TablePlacement tables = 5;
+}
+
+message Node {
+  string id = 1;
+  // The node's listener, `host:port` (TLS unless the cluster runs without it).
+  string address = 2;
+}
+
+message Partition {
+  string id = 1;
+  // The node serving it: a `Node.id`.
+  string node = 2;
+  // Raised by every relocation; a node writes P only while the map's epoch for P equals
+  // the epoch in P's file (D317 §2).
+  uint64 epoch = 3;
+}
+
+message TablePlacement {
+  string name = 1;
+  // A co-location group (optional): its tables are unsplit and on one partition.
+  string group = 2;
+  // The table's schema (D317 §5; reconciled onto the partitions from ticket 5).
+  repeated FamilySpec families = 3;
+  // Sorted, distinct split keys; none: the whole table is one range.
+  repeated SplitKey splits = 4;
+  // `splits.len() + 1` partition ids: range i is `[splits[i-1], splits[i])`, the first
+  // starting at the empty key and the last open-ended.
+  repeated string partitions = 5;
+}
+
+// A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
+// for any bytes. Both forms of one key are the same key.
+message SplitKey {
+  oneof key {
+    string text = 1;
+    bytes raw = 2;
+  }
+}
+
+message GetMapRequest {}
+
+message SetMapRequest {
+  // The map version the caller replaces: 0 for a node's first map.
+  uint64 expected_map_version = 1;
+  ClusterMap map = 2;
+}
+
+message SetMapResponse {
+  uint64 map_version = 1;
+  repeated NodePush pushed = 2;
+}
+
+// What pushing the map to one node did.
+message NodePush {
+  string node = 1;
+  bool ok = 2;
+  // Why not, when `ok` is false: the node pulls the map once it's reachable again.
+  string error = 3;
+}
+
+message PushMapRequest {
+  ClusterMap map = 1;
+}
+
+message PushMapResponse {
+  // The receiver's map version after the push.
+  uint64 map_version = 1;
+}
+
+message StatusRequest {}
+
+message NodeStatus {
+  string node_id = 1;
+  // 0 before the node has a map.
+  uint64 map_version = 2;
+  string cluster_id = 3;
+  repeated LocalPartition partitions = 4;
+  // Peers seen with this node's `map_version` but a different map: the cluster has two maps
+  // of one version, and an operator must set a newer one.
+  repeated string divergent = 5;
+}
+
+// A partition file in the node's directory, as its identity row says.
+message LocalPartition {
+  string id = 1;
+  uint64 epoch = 2;
+  // Relative to the node's cluster directory.
+  string file = 3;
+  // False when the file couldn't be read, or its row doesn't match the map: `error` says why.
+  bool ok = 4;
+  string error = 5;
+}

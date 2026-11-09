@@ -25,7 +25,18 @@
   - A seek moves its family's cursors cache-only, fetching the block it lands in on a miss.
   - A `Pending` changes nothing the walk shows, and a seek left `Pending` is finished by the next step, async or sync.
   - A block still missed is read synchronously and counted in `Metrics::async_sync_reads`.
-- **Text and memory run the same cores as their sync forms,** generic over their reads, so the results are identical. The sync forms keep their codegen: a const-generic yield budget compiles out of them.
+- **Text and memory share their scoring with their sync forms,** generic over their reads, so the results are identical.
+- **Amendment (#1560 PR 2, 2026-11-10; perf287 and the coordinator accepted it):** the text search has two document loops, not the one generic core the design note planned. The sync `top_k` keeps its pre-#1560 loop, and the async search runs `TopK::run`'s resumable phases.
+  - **Why:** the single core cost the sync text shapes +3.6% (text-term-hub) and +3.0% (text-two-terms) in callgrind. The phase dispatch costs about 14 instructions per candidate, and a `Poll`-wrapped read copied every posting. With two loops the sync shapes measure -0.13% and -0.2% against main.
+  - **What's duplicated:** only the loop's control flow. The reads, steps, skips, lookups, bounds, cuts and solo expansions are shared (`Walk`, `Scored`, `Reads`).
+  - **Guard:** a seeded property test (`tests/search_async.rs`) checks that `run_async` equals `run` over random queries of every kind. Each loop's doc names its twin.
+
+- **Amendment (#1560 PR 3):** memory's async recall.
+  - **Shared decisions:** the recall's decisions are shared with the sync form: the gather's pass (`Pass`), the IVF choice and fall-back (`Ivf::search` and `found`), and the expansion's hop and budget arithmetic (`Walk`, `Hop`). Only the reads differ, and each async method's doc names its sync twin.
+  - **M1:** memory's `edges` already was a one-hop `Traverse` with the budget, plus a row read for the weights. So the async form is `Traverse::run_async` plus `RowRead::read_async`, with the same arithmetic, not `read_within_async`.
+  - **The reads awaited together:** each namespace's vector, keyword and recency lists, by an in-crate join that adds no dependency.
+  - **Reader processes:** every read a recall makes has an async form in a reader process, so `ReadStore`'s async recall refuses nothing beyond what its sync recall refuses.
+  - **Not exactly zero synchronous reads:** the engine's async key-set reads still read a row past its first block synchronously (#1652). That covers the multi-get's memory rows, the expansion's traversal and the IVF search's list rows. So the property test bounds the count rather than asserting zero: under load, 28 of 7,680 recalls counted one such read, and none counted two. #1652 then tightens the bound to 0.
 
 ## Why
 #1479's tier 2: an async server or agent loop must not block an executor thread on a text search's or a recall's reads.
