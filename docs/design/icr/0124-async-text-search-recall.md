@@ -31,6 +31,13 @@
   - **What's duplicated:** only the loop's control flow. The reads, steps, skips, lookups, bounds, cuts and solo expansions are shared (`Walk`, `Scored`, `Reads`).
   - **Guard:** a seeded property test (`tests/search_async.rs`) checks that `run_async` equals `run` over random queries of every kind. Each loop's doc names its twin.
 
+- **Amendment (#1560 PR 3):** memory's async recall.
+  - **Shared decisions:** the recall's decisions are shared with the sync form: the gather's pass (`Pass`), the IVF choice and fall-back (`Ivf::search` and `found`), and the expansion's hop and budget arithmetic (`Walk`, `Hop`). Only the reads differ, and each async method's doc names its sync twin.
+  - **M1:** memory's `edges` already was a one-hop `Traverse` with the budget, plus a row read for the weights. So the async form is `Traverse::run_async` plus `RowRead::read_async`, with the same arithmetic, not `read_within_async`.
+  - **The reads awaited together:** each namespace's vector, keyword and recency lists, by an in-crate join that adds no dependency.
+  - **Reader processes:** every read a recall makes has an async form in a reader process, so `ReadStore`'s async recall refuses nothing beyond what its sync recall refuses.
+  - **Not exactly zero synchronous reads:** the engine's async key-set reads still read a row past its first block synchronously (#1652). That covers the multi-get's memory rows, the expansion's traversal and the IVF search's list rows. So the property test bounds the count rather than asserting zero: under load, 28 of 7,680 recalls counted one such read, and none counted two. #1652 then tightens the bound to 0.
+
 ## Why
 #1479's tier 2: an async server or agent loop must not block an executor thread on a text search's or a recall's reads.
 

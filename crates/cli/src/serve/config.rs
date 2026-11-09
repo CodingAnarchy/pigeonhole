@@ -49,6 +49,10 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
+    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is closed as soon
+    /// as it's accepted. Default: half the open-file limit (`ulimit -n`), at most 4096.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<usize>,
     /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
     /// outlives its request's slot in `--max-concurrent`, so it has its own cap.
     #[arg(long, value_name = "N", default_value_t = 64)]
@@ -205,6 +209,8 @@ pub(crate) struct Limits {
     pub max_request_bytes: usize,
     pub inflight_bytes: usize,
     pub max_concurrent: usize,
+    /// Open connections at once (`--max-connections`, #1604).
+    pub max_connections: usize,
     pub max_scans: usize,
     pub max_streams: usize,
     pub max_feed_hubs: usize,
@@ -226,6 +232,12 @@ impl ServeArgs {
             max_request_bytes: self.max_request_bytes,
             inflight_bytes: self.inflight_bytes.max(self.max_request_bytes),
             max_concurrent: self.max_concurrent.max(1),
+            max_connections: self
+                .max_connections
+                .unwrap_or_else(|| {
+                    super::listener::default_max_connections(super::listener::open_file_limit())
+                })
+                .max(1),
             max_scans: self.max_scans.max(1),
             max_streams: self.max_streams.max(1),
             max_feed_hubs: self.max_feed_hubs.max(1),
