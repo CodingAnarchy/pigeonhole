@@ -1030,14 +1030,17 @@ fn recall_future<'py>(
     let (event_loop, fut) = crate::aio::new_future(py)?;
     crate::aio::start_on_bridge(py, &event_loop, &fut, move || async move {
         let ns: Vec<&str> = a.namespaces.iter().map(String::as_str).collect();
+        // SCRATCH (g45 A/B): PIGEONHOLE_RECALL_OFFLOAD=1 runs the sync recall on the pool
+        // thread, in one poll.
+        let offload = std::env::var("PIGEONHOLE_RECALL_OFFLOAD").as_deref() == Ok("1");
         let out = match &store {
             Recaller::W(s) => {
                 let r = s.recall(&ns);
-                a.run_async(r).await
+                if offload { a.run(r) } else { a.run_async(r).await }
             }
             Recaller::R(s) => {
                 let r = s.recall(&ns);
-                a.run_async(r).await
+                if offload { a.run(r) } else { a.run_async(r).await }
             }
         };
         Box::new(move |py: Python<'_>| {

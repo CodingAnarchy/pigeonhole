@@ -16,6 +16,7 @@ on the default executor's threads.
 import argparse
 import asyncio
 import json
+import os
 import random
 import statistics
 import tempfile
@@ -72,7 +73,7 @@ async def run_mode(mode: str, store, table, ns: list[str], seconds: float, concu
         while time.perf_counter() < stop:
             q = query(rng)
             started = time.perf_counter()
-            if mode == "recall_async":
+            if mode in ("recall_async", "offload"):
                 await store.recall_async(ns, **q)
             else:
                 await asyncio.to_thread(store.recall, ns, **q)
@@ -118,7 +119,11 @@ def main():
         for _ in range(50):
             store.recall(ns, **query(rng))
         # Each mode twice, alternating, so drift shows.
-        for mode in ("recall_async", "to_thread", "to_thread", "recall_async"):
+        modes = ["recall_async", "to_thread", "offload", "offload", "to_thread", "recall_async"]
+        if not hasattr(store, "recall_async"):
+            modes = ["to_thread", "to_thread"]
+        for mode in modes:
+            os.environ["PIGEONHOLE_RECALL_OFFLOAD"] = "1" if mode == "offload" else "0"
             r = asyncio.run(run_mode(mode, store, table, ns, args.seconds, args.concurrency,
                                      args.seed))
             print(json.dumps(r), flush=True)
