@@ -265,6 +265,7 @@ The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–
   - **The API:** `OpenOptions::own_rebalancer()` opens the IVF index with `pigeonhole_vector::Index::open_with_rebalancer` (`create_with_rebalancer` in `create_with`), so no crate thread rebalances. `Store::take_rebalancer() -> Option<pigeonhole_vector::Rebalancer>` hands the rebalancer out once. It's the IVF counterpart of `own_forgetter`/`take_forgetter`, on D284's model (ICR 0100).
   - **Who uses it:** an application-owned database runs the rebalancer itself. A replica (`phdb serve --memory` with `--replica-of`) drops it, since nothing may write in the background there.
   - **Without the option:** nothing changes. `take_rebalancer` is `None` for a store without IVF, or once taken.
+- **Amendment 2, by #1651 (coordinator, 2026-11-09; additive): a store's table names.** `Store::table_names(name) -> Vec<String>` names the tables a store named `name` keeps its data in: its own (`mem_NAME`), its text index's and its IVF index's (one that exists only with `StoreOptions::ivf`). It's for an application that must leave a store's tables alone: `phdb serve --memory NAME` refuses `Schema.DropTable` of them. A test checks the names against the tables a store with IVF creates.
 
 ## T9, part 1: memory events from the change feed (#1343)
 The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The feed-driven consolidation loop is part 2.

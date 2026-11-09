@@ -559,3 +559,20 @@ fn an_application_runs_its_own_ivf_rebalancer() {
     drop(plain);
     db.close().unwrap();
 }
+
+/// `Store::table_names` (#1651) names exactly the tables a store with an IVF index creates,
+/// so an application refusing to drop them misses none.
+#[test]
+fn table_names_are_the_tables_a_store_creates() {
+    let (_dir, db) = open();
+    let before: BTreeSet<String> = db.tables().into_iter().collect();
+    let store = create(&db, small());
+    let made: BTreeSet<String> = db
+        .tables()
+        .into_iter()
+        .filter(|t| !before.contains(t))
+        .collect();
+    let named: BTreeSet<String> = Store::table_names("notes").into_iter().collect();
+    assert_eq!(made, named);
+    drop(store);
+}

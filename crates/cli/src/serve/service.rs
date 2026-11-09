@@ -1454,6 +1454,18 @@ impl Service {
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
         reserved(&name)?;
+        // The memory store this server serves keeps its data in its own tables: dropping one
+        // would leave the slot over a dropped table, and a restart would re-create the store
+        // empty (cli692's N1 on #1650, #1651). The crate names them.
+        if let Some(memory) = &self.memory {
+            let store = memory.name();
+            if pigeonhole_memory::Store::table_names(store).contains(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} belongs to the memory store {store} this server serves \
+                     (--memory {store}): stop the server to drop it"
+                )));
+            }
+        }
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
