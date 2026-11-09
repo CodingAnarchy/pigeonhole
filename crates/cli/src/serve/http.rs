@@ -133,6 +133,11 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                 .service(replication),
         )
         .with_state(Arc::clone(&shared))
+        // A read's reply holds its share of the budget until its body has been written
+        // (#1567): the layer moves the response's charge into its body.
+        .layer(axum::middleware::map_response(super::charge::attach(
+            limits.stream_idle,
+        )))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
         // alone would queue callers in `poll_ready`.
         .layer(
@@ -296,10 +301,12 @@ async fn call(
     }
     let headers = req.headers().clone();
     let query = req.uri().query().unwrap_or("").to_owned();
-    let caller = match shared.caller(auth_header(&headers)) {
+    let mut caller = match shared.caller(auth_header(&headers)) {
         Ok(c) => c,
         Err(_) => return ApiError::unauthenticated().into_response(),
     };
+    // A read reserves twice its reply's cap for JSON (#1567, cli692's D2).
+    caller.json = true;
     // A client stream: NDJSON, its lines reserved as they arrive.
     if (service.as_str(), method.as_str()) == ("Vectors", "BulkLoad") {
         return bulk_load(&shared, &caller, req).await;
@@ -396,7 +403,15 @@ async fn call(
         .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
         .await;
     shared.count(rpc, started, &reply);
-    match reply {
+    // A read's charge (#1567): fitted to the rendered body, then held until it's written.
+    let (reply, charge) = match reply {
+        Ok(r) => {
+            let (r, c) = r.uncharge();
+            (Ok(r), c)
+        }
+        Err(e) => (Err(e), None),
+    };
+    let resp = match reply {
         Ok(ServiceReply::Get(r)) => json(&r),
         Ok(ServiceReply::MultiGet(r)) => json(&r),
         Ok(ServiceReply::ReadRow(r)) => json(&r),
@@ -432,8 +447,37 @@ async fn call(
         Ok(ServiceReply::Follow(_)) => {
             ApiError::unsupported("Replication is gRPC only").into_response()
         }
+        Ok(ServiceReply::Charged(..)) => ApiError::internal("a charge on a charge").into_response(),
         Err(e) => e.into_response(),
+    };
+    match charge {
+        Some(c) => charged(&shared, resp, c).await,
+        None => resp,
     }
+}
+
+/// `resp` holding `charge`: fitted to its rendered body (larger than the protobuf it was
+/// reserved for, or smaller), waiting for the difference if need be (cli692's D2 on #1567).
+async fn charged(
+    shared: &Shared,
+    mut resp: Response,
+    mut charge: super::charge::Charge,
+) -> Response {
+    use http_body::Body as _;
+    if let Some(len) = resp.body().size_hint().exact()
+        && let Err(e) = charge
+            .fit(
+                usize::try_from(len).unwrap_or(usize::MAX),
+                shared.limits.inflight_bytes,
+                shared.limits.request_timeout,
+            )
+            .await
+    {
+        return e.into_response();
+    }
+    resp.extensions_mut()
+        .insert(super::charge::Charged::new(charge));
+    resp
 }
 
 /// A message of a server stream: its JSON, and its SSE `id:` if it has one.

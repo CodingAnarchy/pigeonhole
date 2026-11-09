@@ -129,6 +129,33 @@ pub(crate) enum ServiceReply {
     MarkUsed(proto::MarkUsedResponse),
     Forget(proto::ForgetResponse),
     MemoryWatch(super::memory::MemoryEvents),
+    /// A unary read's reply with its share of `--inflight-bytes` (#1567): held until the
+    /// reply's body has been written ([`super::charge`]).
+    Charged(Box<ServiceReply>, super::charge::Charge),
+}
+
+impl ServiceReply {
+    /// The reply, and its charge if it has one.
+    pub(crate) fn uncharge(self) -> (ServiceReply, Option<super::charge::Charge>) {
+        match self {
+            ServiceReply::Charged(r, c) => (*r, Some(c)),
+            r => (r, None),
+        }
+    }
+
+    /// A charged reply's message size, encoded: what a gRPC reply is charged (#1567).
+    fn encoded_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            ServiceReply::Get(r) => r.encoded_len(),
+            ServiceReply::MultiGet(r) => r.encoded_len(),
+            ServiceReply::ReadRow(r) => r.encoded_len(),
+            ServiceReply::Traverse(r) => r.encoded_len(),
+            ServiceReply::Nearest(r) => r.encoded_len(),
+            ServiceReply::Recall(r) => r.encoded_len(),
+            _ => 0,
+        }
+    }
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -760,6 +787,8 @@ pub(crate) struct Service {
     /// The open connections against `--max-connections` (#1604): the listener counts them,
     /// the metrics show them.
     pub(crate) connections: Arc<super::listener::Connections>,
+    /// The unary read replies' charges (#1567).
+    pub(crate) replies: Arc<super::charge::ReplyStats>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
@@ -783,6 +812,7 @@ impl Service {
     ) -> Self {
         Self {
             connections: super::listener::Connections::new(limits.max_connections),
+            replies: Arc::new(super::charge::ReplyStats::default()),
             db: db.clone(),
             tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
@@ -1027,20 +1057,38 @@ impl Service {
         match op {
             // A read that fails on `Io` changed nothing, so it may be sent
             // again (`retry_from` REQUEST, ICR 0112).
+            // The unary reads charge their replies to the budget (#1567): the request's share
+            // goes first, so a read never holds it while it waits for its reply's.
             ServiceOp::Get(r) => {
-                let reply = self.get(r, caller).await.map(ServiceReply::Get);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                let reply = self
+                    .get(r, caller)
+                    .await
+                    .map(ServiceReply::Get)
+                    .map_err(ApiError::for_read)?;
+                // One cell, with no cap to reserve against: its size, after the read.
+                let charge = self.reserve_reply(caller, reply.encoded_len()).await?;
+                Ok(self.charged(caller, reply, charge))
             }
             ServiceOp::MultiGet(r) => {
-                let reply = self.multi_get(r, caller).await.map(ServiceReply::MultiGet);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                let charge = self.reserve_reply(caller, cap(r.page_bytes)).await?;
+                let reply = self
+                    .multi_get(r, caller)
+                    .await
+                    .map(ServiceReply::MultiGet)
+                    .map_err(ApiError::for_read)?;
+                Ok(self.charged(caller, reply, charge))
             }
             ServiceOp::ReadRow(r) => {
-                let reply = self.read_row(r, caller).await.map(ServiceReply::ReadRow);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                let charge = self.reserve_reply(caller, cap(r.page_bytes)).await?;
+                let reply = self
+                    .read_row(r, caller)
+                    .await
+                    .map(ServiceReply::ReadRow)
+                    .map_err(ApiError::for_read)?;
+                Ok(self.charged(caller, reply, charge))
             }
             ServiceOp::Scan(r) => self
                 .scan(r, caller, budget)
@@ -1211,17 +1259,23 @@ impl Service {
             }
             ServiceOp::Traverse(r) => {
                 drop(budget);
-                self.traverse(r, caller)
+                let charge = self.reserve_reply(caller, cap(r.page_bytes)).await?;
+                let reply = self
+                    .traverse(r, caller)
                     .await
                     .map(ServiceReply::Traverse)
-                    .map_err(ApiError::for_read)
+                    .map_err(ApiError::for_read)?;
+                Ok(self.charged(caller, reply, charge))
             }
             ServiceOp::Nearest(r) => {
                 drop(budget);
-                self.nearest(r, caller)
+                let charge = self.reserve_reply(caller, cap(r.page_bytes)).await?;
+                let reply = self
+                    .nearest(r, caller)
                     .await
                     .map(ServiceReply::Nearest)
-                    .map_err(ApiError::for_read)
+                    .map_err(ApiError::for_read)?;
+                Ok(self.charged(caller, reply, charge))
             }
             ServiceOp::CreateIndex(r) => {
                 drop(budget);
@@ -1277,10 +1331,8 @@ impl Service {
                 .map(ServiceReply::Remember),
             ServiceOp::Recall(r) => {
                 drop(budget);
-                self.recall(r, caller)
-                    .await
-                    .map(ServiceReply::Recall)
-                    .map_err(ApiError::for_read)
+                let (reply, charge) = self.recall(r, caller).await.map_err(ApiError::for_read)?;
+                Ok(self.charged(caller, ServiceReply::Recall(reply), charge))
             }
             ServiceOp::MarkUsed(r) => {
                 let ids = super::memory::ids(&r.ids)?;
@@ -1355,6 +1407,42 @@ impl Service {
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
         }
+    }
+
+    /// A unary read's reply share (#1567): `cap` bytes, twice that for an HTTP/JSON reply
+    /// (cli692's D2), within the request timeout, else `Overloaded`.
+    async fn reserve_reply(
+        &self,
+        caller: &Caller,
+        cap: usize,
+    ) -> Result<super::charge::Charge, ApiError> {
+        let want = if caller.json {
+            cap.saturating_mul(2)
+        } else {
+            cap
+        };
+        super::charge::Charge::reserve(
+            &self.inflight,
+            self.limits.inflight_bytes,
+            want,
+            self.limits.request_timeout,
+            &self.replies,
+        )
+        .await
+    }
+
+    /// `reply` with its charge: a gRPC reply's trimmed to its encoded message now; an
+    /// HTTP/JSON one's fitted to its rendered body by the front-end.
+    fn charged(
+        &self,
+        caller: &Caller,
+        reply: ServiceReply,
+        mut charge: super::charge::Charge,
+    ) -> ServiceReply {
+        if !caller.json {
+            charge.trim(reply.encoded_len() + super::charge::GRPC_FRAME);
+        }
+        ServiceReply::Charged(Box::new(reply), charge)
     }
 
     async fn budget(&self, size: usize) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -1487,6 +1575,7 @@ impl Service {
     pub(crate) fn metrics_text(&self) -> String {
         let mut text = self.metrics.render(&self.db);
         self.connections.render(&mut text);
+        self.replies.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);
@@ -2463,17 +2552,28 @@ impl Service {
         &self,
         r: proto::RecallRequest,
         caller: &Caller,
-    ) -> Result<proto::RecallResponse, ApiError> {
+    ) -> Result<(proto::RecallResponse, super::charge::Charge), ApiError> {
         let core = self.memory_core().await?;
+        // Its reply's share, before a memory-call slot (cli692's point on #1567): a recall
+        // waiting for budget doesn't hold one.
+        let charge = self
+            .reserve_reply(
+                caller,
+                usize::try_from(core.reply_cap(r.byte_budget)).unwrap_or(usize::MAX),
+            )
+            .await?;
         let a = super::memory::recall(r)?;
         let namespaces = caller.namespaces.clone();
-        self.memory_blocking(move || {
-            let (hits, _stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
-            Ok(proto::RecallResponse {
-                hits: hits.into_iter().map(super::memory::hit).collect(),
+        let reply = self
+            .memory_blocking(move || {
+                let (hits, _stats) =
+                    core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+                Ok(proto::RecallResponse {
+                    hits: hits.into_iter().map(super::memory::hit).collect(),
+                })
             })
-        })
-        .await
+            .await?;
+        Ok((reply, charge))
     }
 
     /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
@@ -2878,6 +2978,11 @@ impl Service {
             cells,
         })
     }
+}
+
+/// A page-budgeted read's reply cap, as the read applies it (#1567).
+fn cap(asked: u64) -> usize {
+    usize::try_from(page_bytes(asked)).unwrap_or(usize::MAX)
 }
 
 fn page_bytes(asked: u64) -> u64 {

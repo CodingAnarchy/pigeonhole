@@ -21,6 +21,10 @@ path = "src/main.rs"
 name = "serve_feed_load"
 required-features = ["serve"]
 
+[[example]]
+name = "serve_read_load"
+required-features = ["serve"]
+
 [features]
 default = ["embed"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,
@@ -32,7 +36,7 @@ serve = [
     "dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde",
     "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",
     "dep:sha2", "dep:arc-swap", "dep:num_cpus", "dep:nix", "dep:futures-core",
-    "dep:pigeonhole-vector", "dep:pigeonhole-text", "dep:half",
+    "dep:pigeonhole-vector", "dep:pigeonhole-text", "dep:half", "dep:http-body",
     # `--replica-of` (#1436): the replica side of replication, hidden in the library.
     "pigeonhole/__unstable-replication",
 ]
@@ -79,6 +83,8 @@ sha2 = { version = "0.10", optional = true }
 arc-swap = { version = "1", optional = true }
 num_cpus = { version = "1", optional = true }
 futures-core = { workspace = true, optional = true }
+# `serve`: a charged reply's body, which holds its share of --inflight-bytes until written (#1567).
+http-body = { version = "1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `serve`: the Tokio threads' affinity mask (R1), through nix's safe `sched_setaffinity`.
@@ -103,6 +109,8 @@ pigeonhole-memory = { workspace = true, features = ["__unstable-hooks"] }
 # `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
 ureq = { version = "3.5", default-features = false, features = ["json"] }
+# `serve`'s test of a gRPC client that never opens its window to its reply (#1567).
+h2 = "0.4"
 # `serve`'s idle-limit tests on a paused clock, so a slow runner can't fire a deadline (#1531).
 tokio = { version = "1", features = ["test-util"] }
 

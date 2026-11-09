@@ -196,3 +196,16 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
 
 ## Amendment: `Unavailable` (#1617)
 - **A new server code, `Unavailable`,** in the table above (the coordinator approved it on #1617, ai1249's R2): a service the server depends on failed or can't be reached, so nothing was applied and the request may be sent again. Today that's `Memory`'s embedding endpoint (`--embed-url`) refusing the connection, not connecting within half of `--embed-timeout-ms` (at most 3 s; a connect that hangs is an unreachable endpoint, not a slow one), or answering 5xx, 408 or 429. The endpoint's other failures map to existing codes: its timeout (`--embed-timeout-ms`) is `DeadlineExceeded`; a 400, 413 or 422 (the caller's text) is `InvalidArgument`; any other answer, or a reply that isn't an embedding of the store's dimension, is `Internal` (the server's configuration). Clients that don't know the code see it as an unknown server code with its HTTP status and `retry_from`.
+
+## Amendment: unary read replies count against `--inflight-bytes` (#1567)
+The design is on #1567, with cli692's review (D1, D2).
+- **Which replies, and what they reserve before reading:**
+  - `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest`: their `page_bytes` cap (1 MiB when 0, at most 8 MiB);
+  - `Memory.Recall`: its byte budget;
+  - twice that for HTTP/JSON (D2);
+  - `Get`: its cell's size, after the read.
+- **Trimmed, then held:** a built reply keeps only its own size (the encoded message, or the rendered JSON), and holds it until it has been written to the connection.
+- **New answers:**
+  - a unary read whose share isn't free within `--request-timeout-ms` is `Overloaded`, retry-safe, with nothing read;
+  - a reply whose client takes nothing of it for `--stream-idle-ms` is dropped and its share freed (D1). Over gRPC its stream then ends with `DEADLINE_EXCEEDED` in the trailers, after an incomplete message; over HTTP/1.1 the body is cut off. A client sees either once it reads again or its connection closes.
+- **Metrics:** `pigeonhole_serve_inflight_reply_bytes` (charged now) and `pigeonhole_serve_reply_idle_drops_total`.

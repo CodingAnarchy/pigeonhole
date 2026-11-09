@@ -349,7 +349,8 @@ fn a_write_whose_client_went_away_still_commits() {
     let landed = (0..100).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
         let r = s.block_on(service.call(get(), &Caller::anonymous(), None)).unwrap();
-        matches!(r, super::service::ServiceReply::Get(g) if g.cell.as_ref().is_some_and(|c| &c.value[..] == b"landed"))
+        // A read's reply comes with its charge (#1567).
+        matches!(r.uncharge().0, super::service::ServiceReply::Get(g) if g.cell.as_ref().is_some_and(|c| &c.value[..] == b"landed"))
     });
     assert!(landed, "the detached commit landed");
     // The task counts the lost reply once its commit returns, which can be just after the

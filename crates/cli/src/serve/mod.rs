@@ -21,6 +21,7 @@ use crate::exit::Failure;
 mod auth;
 mod backup;
 mod bulk;
+mod charge;
 mod cluster;
 mod config;
 mod convert;
