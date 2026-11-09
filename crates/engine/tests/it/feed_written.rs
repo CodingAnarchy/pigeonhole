@@ -946,13 +946,19 @@ fn a_held_blocking_wait_parks_until_the_hold_lets_go() {
         feed.unparked_repolls() - repolls,
         feed.parks() - parks,
     );
-    // It parks rather than spins: no re-poll skips the park. A park may still return early
-    // (`park_timeout` may return spuriously, which #1594's Windows run did 22 times in
-    // 500 ms), and each such return polls once more and parks again, which is right; so
-    // the polls aren't the measure, the skipped parks are.
-    assert!(
-        repolls <= 1 && polls <= parks + 1,
-        "{repolls} re-polls without parking, {polls} polls over {parks} parks while held"
+    // It parks rather than spins: while held, no re-poll skips the park. A park may still
+    // return early (`park_timeout` may return spuriously, which #1594's Windows run did 22
+    // times in 500 ms), and each such return polls once more and parks again, which is
+    // right; so the polls aren't the measure, the skipped parks are. Each turn of the loop
+    // polls once, then returns, re-polls or parks, so the counts add up exactly.
+    assert_eq!(
+        repolls, 0,
+        "{repolls} re-polls without parking ({polls} polls over {parks} parks) while held"
+    );
+    assert_eq!(
+        polls,
+        parks + repolls + 1,
+        "one poll per turn of the wait's loop"
     );
     // A waiter on another thread; the hold's release wakes it.
     let waiter = std::thread::spawn(move || {
