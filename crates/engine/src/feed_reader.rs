@@ -238,6 +238,17 @@ enum Pending {
     },
 }
 
+impl Pending {
+    /// The stream and start of its record.
+    fn at(&self) -> (usize, Lsn) {
+        match self {
+            Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
+                (*stream, *start)
+            }
+        }
+    }
+}
+
 /// A PREPARE waiting for its Decision.
 #[derive(Debug)]
 struct Held {
@@ -257,6 +268,35 @@ struct StreamRead {
     delivered_end: Lsn,
     /// From a token: the delivered records reached here, so the stream must too.
     must_reach: Option<Lsn>,
+}
+
+/// Each stream's starts of the records read but not delivered (`ready` and `held`), as a
+/// count per start, so [`FeedReader::token`]'s hint per stream is its first key rather than
+/// a scan of every pending record (cli692 on ticket 5: a hub behind by 10K commits spent
+/// milliseconds per token). Kept in step wherever `ready` or `held` gains or loses one.
+#[derive(Debug, Default)]
+struct Starts(Vec<BTreeMap<Lsn, u32>>);
+
+impl Starts {
+    fn add(&mut self, stream: usize, start: Lsn) {
+        if self.0.len() <= stream {
+            self.0.resize_with(stream + 1, BTreeMap::new);
+        }
+        *self.0[stream].entry(start).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, stream: usize, start: Lsn) {
+        let starts = &mut self.0[stream];
+        let n = starts.get_mut(&start).expect("a pending start is counted");
+        *n -= 1;
+        if *n == 0 {
+            starts.remove(&start);
+        }
+    }
+
+    fn first(&self, stream: usize) -> Option<Lsn> {
+        self.0.get(stream)?.first_key_value().map(|(&l, _)| l)
+    }
 }
 
 /// The sessions whose segments the feed's history runs through (the mark rule).
@@ -329,6 +369,8 @@ pub struct FeedReader {
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
     held: HashMap<Seqno, Vec<Held>>,
+    /// The starts of `ready`'s and `held`'s records, per stream.
+    starts: Starts,
     /// Rounds whose shares rule C dropped (no Decision read, the checkpoint passed): id →
     /// (stream, epoch) of a dropped share. A Decision for one later expires the feed rather
     /// than passing over its commit as recovery's all-or-nothing (simp724's H1 on #1316).
@@ -535,6 +577,7 @@ impl FeedReader {
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
+            starts: Starts::default(),
             dropped: HashMap::new(),
             out: Commit::default(),
             expired: None,
@@ -961,6 +1004,20 @@ impl FeedReader {
     /// the earliest record of it read but not delivered (held or pending), else the
     /// cursor.
     fn hint(&self, s: usize) -> Lsn {
+        let cursor = self.streams[s].cursor.position();
+        let at = self
+            .starts
+            .first(s)
+            .map_or(cursor, |first| first.min(cursor));
+        #[cfg(any(test, feature = "test-hooks"))]
+        debug_assert_eq!(at, self.scanned_hint(s), "stream {s}'s tracked starts");
+        at
+    }
+
+    /// [`hint`](Self::hint) by a scan of every pending record: the invariant check of
+    /// `starts`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn scanned_hint(&self, s: usize) -> Lsn {
         let mut at = self.streams[s].cursor.position();
         for p in self.ready.values() {
             let (stream, start) = match p {
@@ -1225,7 +1282,7 @@ impl FeedReader {
                         self.expired = Some(gap(seqno));
                         return Ok(false);
                     }
-                    self.ready.insert(
+                    self.insert_ready(
                         seqno,
                         Pending::Single {
                             ts,
@@ -1237,6 +1294,7 @@ impl FeedReader {
                     );
                 }
                 Item::Prepare { id, changes } => {
+                    self.starts.add(s, start);
                     self.held.entry(id).or_default().push(Held {
                         stream: s,
                         start,
@@ -1252,7 +1310,7 @@ impl FeedReader {
                     participants,
                 } => {
                     if apply <= self.delivered {
-                        self.held.remove(&id);
+                        self.remove_held(id);
                         let st = &mut self.streams[s];
                         st.delivered_end = st.delivered_end.max(end);
                         continue;
@@ -1265,7 +1323,7 @@ impl FeedReader {
                         self.expired = Some(gap(apply));
                         return Ok(false);
                     }
-                    self.ready.insert(
+                    self.insert_ready(
                         apply,
                         Pending::Decided {
                             id,
@@ -1375,6 +1433,26 @@ impl FeedReader {
         Ok(Some((start, end, session, item)))
     }
 
+    /// Adds a record read to `ready`, counting its start. A key already there (never expected:
+    /// one record per seqno) gives up its start with its record.
+    fn insert_ready(&mut self, key: Seqno, p: Pending) {
+        let (stream, start) = p.at();
+        self.starts.add(stream, start);
+        if let Some(old) = self.ready.insert(key, p) {
+            let (stream, start) = old.at();
+            self.starts.remove(stream, start);
+        }
+    }
+
+    /// Takes round `id`'s held shares, uncounting their starts.
+    fn remove_held(&mut self, id: Seqno) -> Vec<Held> {
+        let shares = self.held.remove(&id).unwrap_or_default();
+        for h in &shares {
+            self.starts.remove(h.stream, h.start);
+        }
+        shares
+    }
+
     /// Drops held PREPAREs of rounds that ended without a Decision: their stream's
     /// checkpoint (loaded before the frontier) passed them and no Decision for them was read
     /// (rule C). A held share the floor passed but the checkpoint didn't expires the feed:
@@ -1391,6 +1469,7 @@ impl FeedReader {
             .collect();
         drop_undecided(
             &mut self.held,
+            &mut self.starts,
             &mut self.dropped,
             &decided,
             checkpoints,
@@ -1403,7 +1482,7 @@ impl FeedReader {
     /// recovery replays all or nothing), or a gap that expires the feed. Each share's stream
     /// is past it.
     fn take_round(&mut self, id: Seqno, participants: &[StreamId], session: u64) -> Round {
-        let shares = self.held.remove(&id).unwrap_or_default();
+        let shares = self.remove_held(id);
         // A round rule C dropped a share of: never passed over silently.
         let dropped = self.dropped.remove(&id).is_some();
         // Every participant's PREPARE was in its file before the Decision was written, so it
@@ -1479,6 +1558,8 @@ impl FeedReader {
             }
             self.blob_wait = None;
             let (_, p) = self.ready.pop_first().expect("checked");
+            let (stream, start) = p.at();
+            self.starts.remove(stream, start);
             let (ts, raws) = match p {
                 Pending::Single {
                     ts,
@@ -1576,6 +1657,7 @@ fn gap(key: Seqno) -> Expiry {
 /// floor passed. Forgets dropped rounds whose segment is below the floor.
 fn drop_undecided(
     held: &mut HashMap<Seqno, Vec<Held>>,
+    starts: &mut Starts,
     dropped: &mut HashMap<Seqno, (usize, u32)>,
     decided: &std::collections::HashSet<Seqno>,
     checkpoints: &[Lsn],
@@ -1603,6 +1685,7 @@ fn drop_undecided(
             let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
             if passed {
                 dropped.insert(*id, (h.stream, h.start.epoch()));
+                starts.remove(h.stream, h.start);
             }
             !passed
         });
@@ -2158,6 +2241,15 @@ mod tests {
         assert_eq!(chain(&unknown, 2, &t), [2]);
     }
 
+    /// `held`'s starts, counted as the reader counts them.
+    fn starts_of(held: &HashMap<Seqno, Vec<Held>>) -> Starts {
+        let mut starts = Starts::default();
+        for h in held.values().flatten() {
+            starts.add(h.stream, h.start);
+        }
+        starts
+    }
+
     fn held(stream: usize, epoch: u32) -> Held {
         Held {
             stream,
@@ -2185,18 +2277,37 @@ mod tests {
             (7, vec![held(0, 1), held(1, 1)]),
         ]);
         let mut dropped = HashMap::new();
-        let e = drop_undecided(&mut held_map, &mut dropped, &decided, &checkpoints, &floors);
+        let mut starts = starts_of(&held_map);
+        let e = drop_undecided(
+            &mut held_map,
+            &mut starts,
+            &mut dropped,
+            &decided,
+            &checkpoints,
+            &floors,
+        );
         assert!(e.is_none());
         assert!(!held_map.contains_key(&1));
         assert!(held_map.contains_key(&2) && held_map.contains_key(&7));
         assert_eq!(dropped.get(&1), Some(&(0, 4)));
+        // The dropped share's start went with it: stream 0's earliest is the decided round's.
+        assert_eq!(starts.0, starts_of(&held_map).0);
+        assert_eq!(starts.first(0), Some(Lsn::new(1, 64)));
 
         // A share below its stream's floor that the checkpoint didn't pass: a bound broken,
         // so the feed expires and nothing is dropped.
         let mut held_map = HashMap::from([(3, vec![held(1, 1)])]);
         let mut dropped = HashMap::new();
         let checkpoints = [Lsn::new(5, 0), Lsn::new(1, 0)];
-        let e = drop_undecided(&mut held_map, &mut dropped, &decided, &checkpoints, &floors);
+        let mut starts = starts_of(&held_map);
+        let e = drop_undecided(
+            &mut held_map,
+            &mut starts,
+            &mut dropped,
+            &decided,
+            &checkpoints,
+            &floors,
+        );
         assert!(e.is_some_and(|e| e.reason.contains("retention passed a held")));
         assert!(held_map.contains_key(&3) && dropped.is_empty());
 
@@ -2204,6 +2315,7 @@ mod tests {
         let mut dropped = HashMap::from([(1, (0, 3)), (2, (0, 4))]);
         let e = drop_undecided(
             &mut HashMap::new(),
+            &mut Starts::default(),
             &mut dropped,
             &decided,
             &checkpoints,

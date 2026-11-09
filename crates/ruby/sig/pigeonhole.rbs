@@ -30,6 +30,11 @@ module Pigeonhole
   # Keys or seeds: an Array of Strings, or another Enumerable of them (a Set).
   type keys = Array[String] | Enumerable[String]
 
+  # Whether the waiting calls yield to a running fiber scheduler (default true); false keeps
+  # them blocking process-wide (ICR 0126).
+  def self.fiber_scheduler: () -> bool
+  def self.fiber_scheduler=: (boolish on) -> boolish
+
   def self.open: (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
                   ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
                   ?shm_dir: path?, ?read_only_fallback: bool?, ?change_feed: Integer?,

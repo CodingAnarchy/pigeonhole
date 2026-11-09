@@ -272,3 +272,56 @@ fn a_row_read_keeps_no_memtable_alive_on_its_thread() {
     );
     rig.close();
 }
+
+#[test]
+fn a_finished_flush_task_pins_no_memtable_until_it_is_dropped() {
+    // A flush task reports to its shard, and is dropped only after it returns. It held its
+    // memtables' readers until then, so a shard that handled the report first found the
+    // memtable still pinned and deferred its chunks to its next allocation, which an idle
+    // shard never makes (#1597's Windows CI run). The hook keeps the reported task alive
+    // across the shard's handling: the chunks must come back regardless, with nothing
+    // written after the flush (a write would allocate, and release them anyway).
+    let vfs = SimVfs::new(49);
+    let mut rig = Rig::open(&vfs);
+    let t = rig
+        .db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    for i in 0..1000u32 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            f,
+            format!("row{i:04}").as_bytes(),
+            b"q",
+            None,
+            ValueRef::Bytes(&[7u8; 1000]),
+        )
+        .unwrap();
+        let p = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();
+        rig.wait(p).unwrap();
+    }
+    let written = rig.db.metrics().memtable_bytes;
+    assert!(written > 1 << 20, "about 1 MiB written: {written}");
+
+    rig.db.park_finished_flushes(true);
+    let p = rig.db.flush_pending().unwrap();
+    rig.wait(p).unwrap();
+    rig.idle();
+    assert_eq!(
+        rig.db.parked_flushes(),
+        1,
+        "the finished flush task is still alive"
+    );
+    let after = rig.db.metrics().memtable_bytes;
+    assert!(
+        after < written,
+        "the flushed memtable's chunks waited for the task: {after} of {written} bytes still used"
+    );
+
+    rig.db.park_finished_flushes(false);
+    rig.idle();
+    assert_eq!(rig.db.parked_flushes(), 0);
+    rig.close();
+}

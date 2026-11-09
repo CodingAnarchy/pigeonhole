@@ -22,6 +22,8 @@ mod convert;
 mod db;
 mod error;
 mod feed;
+#[cfg(unix)]
+mod fiber;
 mod fork;
 mod gvl;
 mod index;
@@ -66,6 +68,51 @@ mod entry {
     fn init(ruby: &magnus::Ruby) -> Result<(), magnus::Error> {
         super::init(ruby)
     }
+}
+
+/// The fiber bridge's native classes and the ops of each waiting call (#1574, ICR 0126).
+/// Unix only: without them, `lib/pigeonhole/fiber.rb` keeps every call blocking.
+#[cfg(unix)]
+fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> {
+    use fiber::{FiberBridge, FiberOp};
+    m.singleton_class()?
+        .define_private_method("native_fiber_bridge", function!(FiberBridge::new, 0))?;
+    let c = class(ruby, native, "FiberBridgeCore")?;
+    c.define_method("fd", method!(FiberBridge::fd, 0))?;
+    c.define_method("drain", method!(FiberBridge::drain, 0))?;
+    c.define_method("pending", method!(FiberBridge::pending, 0))?;
+    let c = class(ruby, native, "FiberOp")?;
+    c.define_method("id", method!(FiberOp::id, 0))?;
+    c.define_method("done?", method!(FiberOp::is_done, 0))?;
+    c.define_method("take", method!(FiberOp::take, 0))?;
+    c.define_method("cancel", method!(FiberOp::cancel, 0))?;
+
+    #[cfg(feature = "test-hooks")]
+    {
+        use fiber::hooks::Gate;
+        let c = class(ruby, native, "Gate")?;
+        c.define_singleton_method("new", function!(Gate::new, 0))?;
+        c.define_method("op", method!(Gate::op, 1))?;
+        c.define_method("open", method!(Gate::open, 0))?;
+        c.define_method("counts", method!(Gate::counts, 0))?;
+    }
+
+    let c = m.const_get::<_, RClass>("Mutation")?;
+    c.define_private_method("native_commit_op", method!(Mutation::commit_op, 1))?;
+    c.define_private_method("native_commit_if_op", method!(Mutation::commit_if_op, 2))?;
+    c.define_private_method(
+        "native_commit_returning_op",
+        method!(Mutation::commit_returning_op, 1),
+    )?;
+    c.define_private_method(
+        "native_commit_if_returning_op",
+        method!(Mutation::commit_if_returning_op, 2),
+    )?;
+    let c = m.const_get::<_, RClass>("WriteBatch")?;
+    c.define_private_method("native_commit_op", method!(WriteBatch::commit_op, 2))?;
+    let c = m.const_get::<_, RClass>("Transaction")?;
+    c.define_private_method("native_commit_op", method!(Transaction::commit_op, 2))?;
+    Ok(())
 }
 
 /// Defines the `Pigeonhole` module, its classes and their native methods.
@@ -144,8 +191,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_put_vector", method!(Mutation::put_vector, 4))?;
     c.define_private_method("native_delete", method!(Mutation::delete, 3))?;
     c.define_private_method("native_durability", method!(Mutation::set_durability, 1))?;
-    c.define_method("commit", method!(Mutation::commit, 0))?;
-    c.define_method("commit_if", method!(Mutation::commit_if, 1))?;
+    c.define_private_method("native_commit", method!(Mutation::commit, 0))?;
+    c.define_private_method("native_commit_if", method!(Mutation::commit_if, 1))?;
     c.define_private_method(
         "native_return_previous",
         method!(Mutation::return_previous, 2),
@@ -296,6 +343,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("close", method!(ScanCursor::close, 0))?;
     memory_classes(ruby, m)?;
     index_classes(ruby, m)?;
+    #[cfg(unix)]
+    fiber_classes(ruby, m, native)?;
     Ok(())
 }
 
