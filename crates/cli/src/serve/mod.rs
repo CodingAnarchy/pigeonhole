@@ -390,6 +390,23 @@ pub(crate) fn run(
         .run_on(feed_runtime.handle().clone());
 
     let served = runtime.block_on(async {
+        // SIGUSR1 writes a report of the feed hubs and their clients to stderr (#1397).
+        #[cfg(unix)]
+        {
+            let feeds = Arc::clone(&shared.router.service.feeds);
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+                    return;
+                };
+                while usr1.recv().await.is_some() {
+                    let f = Arc::clone(&feeds);
+                    if let Ok(text) = tokio::task::spawn_blocking(move || f.dump()).await {
+                        eprint!("{text}");
+                    }
+                }
+            });
+        }
         let listener = tokio::net::TcpListener::bind(args.listen)
             .await
             .map_err(|e| Failure::io(&format!("listen on {}", args.listen), &e))?;
