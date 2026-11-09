@@ -404,14 +404,15 @@ impl<S: Source> Future for NextWait<S> {
         // Lock order: `state`, then the source's own (the engine's feed) inside `poll_next`,
         // never the reverse: nothing on the engine's side takes `state` (cli692's N1).
         let mut g = lock(&state);
-        g.waker = None;
         if g.waiting != Some(this.generation) {
             // Superseded: the wait was dropped and a newer one (or a sync read) went on. Never
             // reaches Ruby: a dropped wait's op is gone from the bridge, so nothing takes this
-            // (cli692's N3).
+            // (cli692's N3). The stored waker is the newer wait's, so it stays (as perf2's R1
+            // on #1610 has Python's do).
             this.finished = true;
             return Poll::Ready(Box::new(|ruby: &Ruby| Err(Waits::<S>::closed_err(ruby))));
         }
+        g.waker = None;
         if g.slot.is_some() {
             // An item a stopped wait left: this wait takes it.
             this.finished = true;

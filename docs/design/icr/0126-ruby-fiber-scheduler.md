@@ -35,6 +35,22 @@ This is the design note on #1574, §3:
 - **The core:** `crates/ruby/src/waits.rs`, a port of the Python bindings' `waits` core (#1479), now holds both streams' state. A sync read takes the source out, other sync callers take turns (#1411's fairness kept), and a generation counter retires a dropped wait.
 - **Deadlines** live on the bridge (cli692's R2): the drainer waits on the pipe up to the nearest deadline and resumes expired waiters itself. A stopped or timed-out fiber's op is dropped at once, a pending future or an unclaimed result alike.
 
+## Amendment 2: the memory store (#1574 PR 3)
+- **Behaviour (Changed):** under a scheduler, these let the thread's other fibers run while they wait:
+  - memory `Store#remember`, `delete`, `link`, `supersede` and `mark_used`;
+  - `recall` and `recall_with_stats` (on `Store` and `ReadStore`);
+  - `ConsolidateLoop#run_once`.
+
+  The results and errors are unchanged. `Store#delete` and `supersede` are now Ruby methods over private natives, with the same names and signatures.
+- **Writes** run as the crate's own do, step by step (ICR 0123): the store's `*_in` form inside `Database#transact`, whose commit yields through the bridge (retried by the same `RetryPolicy`), then `settle` for an IVF store. `remember` first runs `prepare_remember`.
+- **The worker-thread jobs** (§3.5 of the design note): `recall`, `remember`'s near-dedup lookup (when the store has near dedup) and `settle` run on `pigeonhole-ruby-offload`, a pool of the binding's own of at most `min(available_parallelism, 8)` threads, started as jobs need them, and complete through a fiber op. A job not yet started when its op is dropped is skipped; once started, it runs to its end and its result is dropped. A forked child starts a fresh pool.
+- **`ConsolidateLoop#run_once`:**
+  - **The wait** goes through the bridge, one commit at a time with `ConsolidateLoop::poll_wait`, until the timeout or the next pass falls due, as the blocking step's read does. The wait holds the loop meanwhile, and `close` wakes it, so it raises at once (#1606's lesson).
+  - **The step** then runs `run_once(0)` on its worker, as before, but the fiber waits for the consolidator's groups through the bridge, and calls the block on itself, so the block may yield.
+  - **A stop during the passes** is recorded as an interrupt is: later groups are refused, the fiber keeps waiting through the bridge until the worker ends, and then the stop is raised. So no thread outlives the call, and the loop is ready for the next step. (This replaces the design note's `handle_interrupt(:never)`, which doesn't mask a scheduler's `Fiber#raise`.)
+  - **A loop's first step** starts it without waiting, because a loop that hasn't stepped has no position to wait from.
+- **New internals** (under `Pigeonhole::Native`, not public API): `PreparedMemory`; the private natives `native_prepare_remember`, `native_prepare_remember_op`, `native_remember_prepared_in`, `native_link_in`, `native_supersede_in`, `native_mark_used_in`, `native_near_dedup_on`, `native_has_ivf`, `native_settle_op` and `native_recall_op` on the stores; and `native_wait_op` and `native_run_once_fiber` on `ConsolidateLoop`. With `test-hooks`, `Native.offload_hold` holds the pool's jobs, a hold seam for the tests.
+
 ## Cancellation
 A fiber raised into while it waits drops its op's future, as D210 defines:
 - a commit still waiting for room writes nothing;
@@ -46,4 +62,4 @@ So it's the same outcome as Python's asyncio forms (ICR 0121).
 
 ## Known effects
 - **After a fork,** the child leaves the parent's bridge open (two file descriptors for each thread that had waited) and makes its own (S1).
-- **Memory recall and the consolidation loop's step** follow in #1574's later PRs, and they're named here when they land.
+- **`recall`** moves from the offload pool to `Recall::run_async` once #1560 PR 3 lands (#1574 PR 4), with no Ruby-visible change.
