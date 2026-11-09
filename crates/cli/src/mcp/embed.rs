@@ -118,9 +118,25 @@ impl Endpoint {
     /// `text`'s embedding. A failure's message names the endpoint and what went wrong, never
     /// the key.
     pub(crate) fn embed(&self, text: &str) -> Result<Vec<f32>, Failure> {
+        self.embed_classified(text).map_err(|(_, f)| f)
+    }
+
+    /// [`embed`](Self::embed), with what kind of failure it was, for a server to answer by
+    /// (ai1249's R2 on #1617).
+    pub(crate) fn embed_classified(&self, text: &str) -> Result<Vec<f32>, (EmbedFault, Failure)> {
         #[cfg(feature = "embed")]
         {
-            let fail = |m: String| Failure::input(format!("embedding endpoint {}: {m}", self.url));
+            let fail = |kind: EmbedFault, m: String| {
+                (
+                    kind,
+                    Failure::input(format!("embedding endpoint {}: {m}", self.url)),
+                )
+            };
+            // A transport error: the call's own timeout, or the endpoint unreachable.
+            let transport = |e: ureq::Error| match e {
+                ureq::Error::Timeout(_) => fail(EmbedFault::Timeout, e.to_string()),
+                e => fail(EmbedFault::Unreachable, e.to_string()),
+            };
             let body = serde_json::json!({"model": self.model, "input": text}).to_string();
             let mut req = self
                 .agent
@@ -129,27 +145,65 @@ impl Endpoint {
             if let Some(k) = &self.key {
                 req = req.header("Authorization", &format!("Bearer {k}"));
             }
-            let mut resp = req.send(body).map_err(|e| fail(e.to_string()))?;
+            let mut resp = req.send(body).map_err(transport)?;
             let status = resp.status().as_u16();
             let text = resp
                 .body_mut()
                 .with_config()
                 .limit(MAX_RESPONSE_BYTES)
                 .read_to_string()
-                .map_err(|e| fail(format!("reading the response: {e}")))?;
+                .map_err(|e| match e {
+                    ureq::Error::BodyExceedsLimit(_) => {
+                        fail(EmbedFault::BadReply, format!("reading the response: {e}"))
+                    }
+                    e => transport(e),
+                })?;
             if status != 200 {
                 let mut brief: String = text.chars().take(300).collect();
                 if brief.len() < text.len() {
                     brief.push('…');
                 }
-                return Err(fail(format!("HTTP {status}: {brief}")));
+                return Err(fail(
+                    EmbedFault::of_status(status),
+                    format!("HTTP {status}: {brief}"),
+                ));
             }
-            parse(&text).map_err(fail)
+            parse(&text).map_err(|m| fail(EmbedFault::BadReply, m))
         }
         #[cfg(not(feature = "embed"))]
         {
             let _ = text;
             unreachable!("an Endpoint is only made with the embed feature")
+        }
+    }
+}
+
+/// What kind of failure an embedding call met (ai1249's R2 on #1617). `phdb serve` answers
+/// each with its own code; `phdb mcp` reports them all alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+pub(crate) enum EmbedFault {
+    /// The call took longer than the endpoint's timeout.
+    Timeout,
+    /// The endpoint couldn't be reached, or answered that it's failing or busy (5xx, 408,
+    /// 429): worth retrying.
+    Unreachable,
+    /// The endpoint refused the input (400, 413, 422): the caller's text, say too long for
+    /// the model.
+    Rejected,
+    /// Any other answer (a bad key, a wrong path), or a reply that isn't an embedding: the
+    /// server's configuration.
+    BadReply,
+}
+
+impl EmbedFault {
+    /// The kind of a non-200 answer.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    fn of_status(status: u16) -> Self {
+        match status {
+            400 | 413 | 422 => Self::Rejected,
+            408 | 429 | 500..=599 => Self::Unreachable,
+            _ => Self::BadReply,
         }
     }
 }

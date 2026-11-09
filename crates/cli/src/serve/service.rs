@@ -440,7 +440,7 @@ pub(crate) const RPCS: [&str; 50] = [
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 45] = [
+pub(crate) const OUTCOMES: [&str; 46] = [
     "ok",
     "Io",
     "Corruption",
@@ -484,6 +484,7 @@ pub(crate) const OUTCOMES: [&str; 45] = [
     "TransactionFinished",
     "FailedPrecondition",
     "ReplicaBehind",
+    "Unavailable",
     "Internal",
     "other",
 ];
@@ -2171,9 +2172,6 @@ impl Service {
         self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
     }
 
-    /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
-    /// catch-up stream follow the same table ids), its start checked, and its stream handed to
-    /// the fan-out. It holds a `--max-streams` slot until it ends.
     /// The memory store, or `Unsupported` without `--memory`.
     fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
         self.memory.clone().ok_or_else(|| {
@@ -2282,6 +2280,9 @@ impl Service {
         )
     }
 
+    /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
+    /// catch-up stream follow the same table ids), its start checked, and its stream handed to
+    /// the fan-out. It holds a `--max-streams` slot until it ends.
     async fn subscribe(
         &self,
         r: proto::SubscribeRequest,

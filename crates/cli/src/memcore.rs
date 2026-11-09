@@ -15,7 +15,7 @@ use pigeonhole_memory::{
 };
 
 use crate::exit::Failure;
-use crate::mcp::Endpoint;
+use crate::mcp::{EmbedFault, Endpoint};
 
 /// A memory operation's failure, by what the front-ends answer.
 #[derive(Debug)]
@@ -32,12 +32,27 @@ pub(crate) enum MemErrorKind {
     Denied,
     /// The store or an engine call failed with this code.
     Engine(ErrorCode),
+    /// The embedding endpoint couldn't be reached, or answered that it's failing or busy:
+    /// nothing was applied, and the call may be retried (ai1249's R2 on #1617).
+    Unavailable,
+    /// The embedding endpoint took longer than its timeout: nothing was applied.
+    Deadline,
+    /// The embedding endpoint's answer wasn't an embedding the store can take: the
+    /// server's configuration (its URL, key or model), not the request.
+    Internal,
 }
 
 impl MemError {
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             kind: MemErrorKind::Invalid,
+            message: message.into(),
+        }
+    }
+
+    fn of_kind(kind: MemErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
             message: message.into(),
         }
     }
@@ -121,9 +136,15 @@ impl Embedder {
     pub(crate) fn embed(&self, text: &str, kind: EmbedKind) -> Result<Vec<f32>> {
         let _ = kind;
         match self {
-            Self::Remote(e) => e
-                .embed(text)
-                .map_err(|f| MemError::invalid(f.message().to_owned())),
+            Self::Remote(e) => e.embed_classified(text).map_err(|(fault, f)| {
+                let kind = match fault {
+                    EmbedFault::Timeout => MemErrorKind::Deadline,
+                    EmbedFault::Unreachable => MemErrorKind::Unavailable,
+                    EmbedFault::Rejected => MemErrorKind::Invalid,
+                    EmbedFault::BadReply => MemErrorKind::Internal,
+                };
+                MemError::of_kind(kind, f.message())
+            }),
         }
     }
 }
@@ -247,12 +268,15 @@ impl MemCore {
             if let Some(m) = self.model()
                 && v.len() != m.dim() as usize
             {
-                return Err(MemError::invalid(format!(
-                    "the embedding endpoint returned {} dimensions; the store is pinned to {} ({})",
-                    v.len(),
-                    m.dim(),
-                    m.id()
-                )));
+                return Err(MemError::of_kind(
+                    MemErrorKind::Internal,
+                    format!(
+                        "the embedding endpoint returned {} dimensions; the store is pinned to {} ({})",
+                        v.len(),
+                        m.dim(),
+                        m.id()
+                    ),
+                ));
             }
             return Ok(Some(v));
         }

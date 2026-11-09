@@ -34,6 +34,9 @@ impl From<MemError> for ApiError {
             MemErrorKind::Invalid => Self::invalid(e.message),
             MemErrorKind::Denied => Self::permission_denied(&e.message),
             MemErrorKind::Engine(code) => Self::from_code(code, &e.message),
+            MemErrorKind::Unavailable => Self::unavailable(e.message),
+            MemErrorKind::Deadline => Self::deadline(e.message),
+            MemErrorKind::Internal => Self::internal(e.message),
         }
     }
 }
@@ -249,7 +252,13 @@ pub(crate) fn watch(
             }
         };
         loop {
-            let commit = match std::future::poll_fn(|cx| w.poll_next(cx)).await {
+            // A client that went away ends the watch here, and gives its stream slot back,
+            // even on a quiet store with no commit to send it (ai1249's R1 on #1617).
+            let next = tokio::select! {
+                () = tx.closed() => return,
+                next = std::future::poll_fn(|cx| w.poll_next(cx)) => next,
+            };
+            let commit = match next {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = send(Err(MemError::store_error("watch", &e).into())).await;

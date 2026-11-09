@@ -2713,7 +2713,11 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
 
 /// A server with the memory store `m` (no embedding model: recall by keyword and recency).
 fn memory_server(tokens: &str) -> Server {
-    Server::start_custom(tokens, limits(), 1, |svc| {
+    memory_server_with(tokens, limits())
+}
+
+fn memory_server_with(tokens: &str, l: Limits) -> Server {
+    Server::start_custom(tokens, l, 1, |svc| {
         let core = crate::memcore::MemCore::open(
             &svc.db,
             "m",
@@ -3001,6 +3005,198 @@ fn a_memory_watch_streams_new_memories_and_resumes() {
             break;
         }
     }
+}
+
+#[test]
+fn a_memory_watch_whose_client_leaves_gives_its_stream_slot_back() {
+    // ai1249's R1 on #1617: a quiet store sends nothing, so a watch noticed its client gone
+    // only at the next memory commit, holding its --max-streams slot until then. With one
+    // slot, a second watch after the first client left must get it, with no commit between.
+    let mut l = limits();
+    l.max_streams = 1;
+    let s = memory_server_with("", l);
+    let watch = |s: &Server| {
+        s.block_on(async {
+            let channel = tonic::transport::Channel::from_shared(s.url.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            proto::memory_client::MemoryClient::new(channel)
+                .watch(proto::MemoryWatchRequest {
+                    namespaces: vec!["a".into()],
+                    resume: Default::default(),
+                })
+                .await
+        })
+    };
+    let first = watch(&s).unwrap();
+    let busy = watch(&s).unwrap_err();
+    assert_eq!(busy.code(), tonic::Code::Unavailable, "{busy:?}");
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match watch(&s) {
+            Ok(_) => break,
+            Err(e) if std::time::Instant::now() < deadline => {
+                assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the first watch kept its slot after its client left: {e:?}"),
+        }
+    }
+}
+
+/// A stand-in for an `/embeddings` endpoint, by the input's prefix: `FAIL:` answers 500,
+/// `BIG:` 413, `AUTH:` 401, `SHAPE:` a 200 that isn't an embedding, `DIM:` a 3-dimension
+/// one, `SLOW:` after a second; anything else a 4-dimension embedding.
+#[cfg(feature = "embed")]
+fn embed_stub() -> String {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/embeddings", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(conn.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let body: Json = serde_json::from_slice(&body).unwrap();
+                let input = body["input"].as_str().unwrap_or("").to_owned();
+                let embedding = |dim: usize| {
+                    let e: Vec<f32> = (0..dim).map(|i| (input.len() + i) as f32).collect();
+                    json!({"data": [{"embedding": e}]})
+                };
+                let (status, reply) = match input.split_once(':').map(|(p, _)| p) {
+                    Some("FAIL") => ("500 Internal Server Error", json!({"error": "boom"})),
+                    Some("BIG") => ("413 Payload Too Large", json!({"error": "too long"})),
+                    Some("AUTH") => ("401 Unauthorized", json!({"error": "bad key"})),
+                    Some("SHAPE") => ("200 OK", json!({"data": []})),
+                    Some("DIM") => ("200 OK", embedding(3)),
+                    Some("SLOW") => {
+                        std::thread::sleep(Duration::from_secs(1));
+                        ("200 OK", embedding(4))
+                    }
+                    _ => ("200 OK", embedding(4)),
+                };
+                let reply = reply.to_string();
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            });
+        }
+    });
+    url
+}
+
+/// A memory server whose store is pinned to the stub's 4-dimension model and embeds through
+/// `url`, each call bounded by 300 ms.
+#[cfg(feature = "embed")]
+fn embedding_memory_server(url: &str) -> Server {
+    let url = url.to_owned();
+    Server::start_custom("", limits(), 1, move |svc| {
+        let endpoint =
+            crate::mcp::Endpoint::new(&url, "stub", None, Duration::from_millis(300)).unwrap();
+        let core = crate::memcore::MemCore::open(
+            &svc.db,
+            "m",
+            Some(crate::memcore::Embedder::Remote(endpoint)),
+            None,
+            |_| {
+                let model =
+                    pigeonhole_memory::EmbeddingModel::new("stub", 4, pigeonhole::Element::F32)
+                        .unwrap();
+                Ok(pigeonhole_memory::StoreOptions::new().embedding(model))
+            },
+            (1 << 20, 8 << 20),
+        )
+        .unwrap();
+        svc.memory_opt(Some(core), 0)
+    })
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn memory_through_an_embedding_endpoint_answers_its_failures_by_kind() {
+    // ai1249's N5 and R2 on #1617: the server embeds the text itself, refuses an embedding
+    // sent with it, and answers each kind of endpoint failure with its own code: unreachable
+    // or failing is Unavailable (retry-safe), its timeout DeadlineExceeded, a refusal of the
+    // text InvalidArgument, and anything else (its key, its reply) Internal.
+    let s = embedding_memory_server(&embed_stub());
+    let (status, r) = remember(&s, "a", "the deploy key rotates", None);
+    assert_eq!(status, 200, "{r}");
+    let (status, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "deploy key", "k": 5}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["hits"].as_array().map(Vec::len), Some(1), "{r}");
+    let given = json!({"namespace": "a", "memory": {"text": "x", "embedding": f32_query(&[0.1, 0.2, 0.3, 0.4])}});
+    let (status, e) = s.rpc("Memory/Remember", &given, None);
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{e}"
+    );
+
+    for (text, want) in [
+        ("FAIL: x", (503, "Unavailable")),
+        ("BIG: x", (400, "InvalidArgument")),
+        ("AUTH: x", (500, "Internal")),
+        ("SHAPE: x", (500, "Internal")),
+        ("DIM: x", (500, "Internal")),
+        ("SLOW: x", (504, "DeadlineExceeded")),
+    ] {
+        let (status, e) = remember(&s, "a", text, None);
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (want.0, Some(want.1)),
+            "{text}: {e}"
+        );
+        if want.1 == "Unavailable" {
+            assert_eq!(e["retry_from"], "RETRY_FROM_REQUEST", "{e}");
+        }
+        // A recall's query text goes the same way.
+        let (status, e) = s.rpc(
+            "Memory/Recall",
+            &json!({"namespaces": ["a"], "text": text, "k": 5}),
+            None,
+        );
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (want.0, Some(want.1)),
+            "recall {text}: {e}"
+        );
+    }
+
+    // An endpoint that refuses the connection: Unavailable.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/v1/embeddings", l.local_addr().unwrap())
+    };
+    let s = embedding_memory_server(&closed);
+    let (status, e) = remember(&s, "a", "anything", None);
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (503, Some("Unavailable")),
+        "{e}"
+    );
 }
 
 #[test]

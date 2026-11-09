@@ -120,6 +120,14 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
     let Some(primary) = &args.replica_of else {
         return Ok(None);
     };
+    // A replica can't create the store, and a re-bootstrap would swap the engine under it:
+    // refused before the database opens, until #1618.
+    if let Some(name) = &args.memory.memory {
+        return Err(Failure::usage(&format!(
+            "--memory {name} can't be used with --replica-of yet: a replica doesn't serve a \
+             memory store (#1618). Serve it from the primary"
+        )));
+    }
     if !(primary.starts_with("http://") || primary.starts_with("https://")) {
         return Err(Failure::usage(
             "--replica-of is the primary's URL: http://HOST:PORT or https://HOST:PORT",
