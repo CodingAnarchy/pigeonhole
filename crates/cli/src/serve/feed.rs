@@ -184,8 +184,9 @@ pub(crate) struct Entry {
     encoded: Option<Bytes>,
 }
 
-/// An entry's size beside its bytes: the `Arc`, the struct and the ring's slot.
-const ENTRY_OVERHEAD: usize = 96;
+/// An entry's size beside its bytes: the struct (88), the `Arc`'s counts (16) and the ring's
+/// slot (8) (perf287 on #1655).
+const ENTRY_OVERHEAD: usize = 112;
 
 impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
@@ -222,7 +223,9 @@ impl Entry {
     /// filter of the commit gives them.
     fn for_prefix(&self, prefix: &[u8]) -> Option<proto::FeedEvent> {
         let bytes = self.encoded.as_ref()?;
-        let mut event = <proto::FeedEvent as prost::Message>::decode(&bytes[..]).ok()?;
+        // From the `Bytes` itself: protogen's `bytes(["."])` makes the row, qualifier, value
+        // and token fields slices of it, not copies (perf287 on #1655).
+        let mut event = <proto::FeedEvent as prost::Message>::decode(bytes.clone()).ok()?;
         let Some(proto::feed_event::Event::Commit(c)) = &mut event.event else {
             return None;
         };
@@ -1235,7 +1238,7 @@ impl Out {
             Out::Event(e) => e,
             Out::Shared(e) => e
                 .encoded()
-                .and_then(|b| <proto::FeedEvent as prost::Message>::decode(&b[..]).ok())
+                .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
                 .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
         }
     }
