@@ -441,9 +441,15 @@ impl FlushTask {
     }
 
     fn report(&mut self, result: Result<ManifestVersion>) {
-        let items = self
-            .items
-            .iter()
+        // The items go before the report, and with them the task's `MemtableReader`s: the
+        // shard reclaims a flushed memtable's chunks when it handles `Flushed`, and a
+        // reader still alive then (the task is dropped only after it returns `Done`) left
+        // them deferred until the shard's next allocation, which an idle shard never makes
+        // (#1512's test failed so in #1597's Windows CI run). A `MemIter` left from the
+        // write borrows a memtable too.
+        self.iter = None;
+        let items = std::mem::take(&mut self.items)
+            .into_iter()
             .map(|i| FlushedItem {
                 tablet: i.tablet,
                 family: i.family,
@@ -709,8 +715,9 @@ impl FlushTask {
     }
 }
 
-impl Task for FlushTask {
-    fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+impl FlushTask {
+    /// One run of the task's stages: write, barrier, commit, then done.
+    fn run_stages(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
         crate::shard::trace!(
             "flush task shard {}: run in stage {}",
             self.shard.0,
@@ -812,6 +819,39 @@ impl Task for FlushTask {
                 Stage::Done => return TaskPoll::Done,
             }
         }
+    }
+
+    /// Test hook: whether `Engine::park_finished_flushes` holds this finished task alive,
+    /// its waker kept for the release. The task has reported, so it only waits to be woken
+    /// and finish (#1597's window, now harmless: it holds no memtable).
+    #[cfg(feature = "test-hooks")]
+    fn parked_after_report(&self, waker: &TaskWaker) -> bool {
+        let hooks = &self.shared.hooks;
+        if !hooks.flush_done_park.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut parked = hooks
+            .flush_done_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Rechecked under the lock the release takes: a release that cleared the flag
+        // before this push wakes nobody, so the task doesn't park.
+        if !hooks.flush_done_park.load(Ordering::Acquire) {
+            return false;
+        }
+        parked.push(waker.clone());
+        true
+    }
+}
+
+impl Task for FlushTask {
+    fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        let poll = self.run_stages(deadline_nanos, waker);
+        #[cfg(feature = "test-hooks")]
+        if matches!(poll, TaskPoll::Done) && self.parked_after_report(waker) {
+            return TaskPoll::Blocked;
+        }
+        poll
     }
 
     fn name(&self) -> &'static str {
