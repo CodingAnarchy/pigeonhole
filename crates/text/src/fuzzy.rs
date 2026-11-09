@@ -73,36 +73,93 @@ pub(crate) fn expand(
 ) -> Result<(Vec<Expansion>, bool)> {
     let q_chars = term.chars().count();
     let mut found = Vec::new();
-    if edits == 0 {
-        let df = df_at(t, s, &post_row(term))?;
-        if df > 0 {
-            found.push(Expansion {
-                term: term.to_owned(),
-                distance: 0,
-                df,
-                boost: 1.0,
-            });
+    match plan(term, edits, prefix_chars) {
+        None => {
+            let df = df_at(t, s, &post_row(term))?;
+            exact(&mut found, term, df);
         }
-    } else {
-        let split = term
-            .char_indices()
-            .nth(prefix_chars)
-            .map_or(term.len(), |(i, _)| i);
-        let (head, tail) = term.split_at(split);
-        let dfa = builder(edits).build_dfa(tail);
-        walk(t, s, &post_row(head), &dfa, |key, distance, df| {
-            let t_term = std::str::from_utf8(key).map_err(|_| corrupt("a term isn't UTF-8"))?;
-            if let Some(boost) = boost(q_chars, t_term.chars().count(), distance) {
-                found.push(Expansion {
-                    term: t_term.to_owned(),
-                    distance,
-                    df,
-                    boost,
-                });
-            }
-            Ok(())
-        })?;
+        Some((base, dfa)) => walk(t, s, &base, &dfa, |key, distance, df| {
+            found_hit(&mut found, q_chars, key, distance, df)
+        })?,
     }
+    Ok(finish(found, max))
+}
+
+/// [`expand`] as a future (#1560): the same expansions, its dictionary walk a scan stream.
+#[cfg(feature = "async")]
+pub(crate) async fn expand_async(
+    t: &Rows,
+    s: &Snapshot,
+    term: &str,
+    edits: u8,
+    prefix_chars: usize,
+    max: usize,
+    budget: &mut crate::maxscore::Budget,
+) -> Result<(Vec<Expansion>, bool)> {
+    let q_chars = term.chars().count();
+    let mut found = Vec::new();
+    match plan(term, edits, prefix_chars) {
+        None => {
+            let df = t
+                .get_at_async(s, &post_row(term), DF, N)
+                .await?
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0);
+            exact(&mut found, term, df);
+        }
+        Some((base, dfa)) => walk_async(t, s, &base, &dfa, &mut found, q_chars, budget).await?,
+    }
+    Ok(finish(found, max))
+}
+
+/// The dictionary walk's base (the row prefix plus the fixed head) and automaton for the
+/// rest, or `None` for an exact term (no edits).
+fn plan(term: &str, edits: u8, prefix_chars: usize) -> Option<(Vec<u8>, DFA)> {
+    if edits == 0 {
+        return None;
+    }
+    let split = term
+        .char_indices()
+        .nth(prefix_chars)
+        .map_or(term.len(), |(i, _)| i);
+    let (head, tail) = term.split_at(split);
+    Some((post_row(head), builder(edits).build_dfa(tail)))
+}
+
+/// An exact term's one expansion, if it's in the index.
+fn exact(found: &mut Vec<Expansion>, term: &str, df: i64) {
+    if df > 0 {
+        found.push(Expansion {
+            term: term.to_owned(),
+            distance: 0,
+            df,
+            boost: 1.0,
+        });
+    }
+}
+
+/// A term the walk matched, `distance` edits away, kept if its boost is above 0.
+fn found_hit(
+    found: &mut Vec<Expansion>,
+    q_chars: usize,
+    key: &[u8],
+    distance: u8,
+    df: i64,
+) -> Result<()> {
+    let t_term = std::str::from_utf8(key).map_err(|_| corrupt("a term isn't UTF-8"))?;
+    if let Some(boost) = boost(q_chars, t_term.chars().count(), distance) {
+        found.push(Expansion {
+            term: t_term.to_owned(),
+            distance,
+            df,
+            boost,
+        });
+    }
+    Ok(())
+}
+
+/// The expansions in order, at most `max`, and whether `max` cut any.
+fn finish(mut found: Vec<Expansion>, max: usize) -> (Vec<Expansion>, bool) {
     found.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
@@ -111,7 +168,41 @@ pub(crate) fn expand(
     });
     let cut = found.len() > max;
     found.truncate(max);
-    Ok((found, cut))
+    (found, cut)
+}
+
+/// What the walk does at a dictionary row.
+enum Visit {
+    /// The automaton accepts the row's term at this distance.
+    Hit(u8),
+    /// It doesn't, but a later row may match.
+    Skip,
+    /// It rejected the term partway: every key up to `base` + this dies there too.
+    Seek(Vec<u8>),
+    /// Nothing after this row can match.
+    End,
+}
+
+/// Runs `dfa` over `key`'s rest past `base_len`. `states[i]` is the state before `rest[i]`.
+fn visit(dfa: &DFA, base_len: usize, key: &[u8], states: &mut Vec<u32>) -> Visit {
+    let rest = &key[base_len..];
+    states.clear();
+    let mut state = dfa.initial_state();
+    for (i, &b) in rest.iter().enumerate() {
+        states.push(state);
+        state = dfa.transition(state, b);
+        if state == SINK_STATE {
+            // Every key from here to the seek target dies where this one did.
+            return match next_live(dfa, rest, states, i) {
+                Some(next) => Visit::Seek(next),
+                None => Visit::End,
+            };
+        }
+    }
+    match dfa.distance(state) {
+        Distance::Exact(d) => Visit::Hit(d),
+        Distance::AtLeast(_) => Visit::Skip,
+    }
 }
 
 /// Walks the `P` rows under `base` (the row prefix plus the fixed head) whose rest `dfa`
@@ -135,39 +226,69 @@ fn walk(
             .iter()?;
         while let Some(row) = rows.next_ref()? {
             let key = row.key();
-            let rest = &key[base.len()..];
-            // `states[i]`: the state before `rest[i]`.
-            states.clear();
-            let mut state = dfa.initial_state();
-            let mut dead = None;
-            for (i, &b) in rest.iter().enumerate() {
-                states.push(state);
-                state = dfa.transition(state, b);
-                if state == SINK_STATE {
-                    dead = Some(i);
-                    break;
+            match visit(dfa, base.len(), key, &mut states) {
+                Visit::Hit(d) => {
+                    let df = row.get(DF, N).and_then(|c| c.as_i64()).unwrap_or(0);
+                    if df > 0 {
+                        hit(&key[POST_PREFIX.len()..], d, df)?;
+                    }
                 }
+                Visit::Skip => {}
+                Visit::Seek(next) => {
+                    from = [base, &next].concat();
+                    continue 'seek;
+                }
+                Visit::End => return Ok(()),
             }
-            match dead {
-                None => {
-                    if let Distance::Exact(d) = dfa.distance(state) {
-                        let df = row.get(DF, N).and_then(|c| c.as_i64()).unwrap_or(0);
-                        if df > 0 {
-                            let term = &key[POST_PREFIX.len()..];
-                            hit(term, d, df)?;
-                        }
+        }
+        return Ok(());
+    }
+}
+
+/// [`walk`] as a future: the same rows, from a scan stream, each re-seek a new one.
+#[cfg(feature = "async")]
+async fn walk_async(
+    t: &Rows,
+    s: &Snapshot,
+    base: &[u8],
+    dfa: &DFA,
+    found: &mut Vec<Expansion>,
+    q_chars: usize,
+    budget: &mut crate::maxscore::Budget,
+) -> Result<()> {
+    use futures_core::Stream;
+    let end = prefix_end(base);
+    let mut from = base.to_vec();
+    let mut states = Vec::new();
+    'seek: loop {
+        let end_bound = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+        let mut rows = t
+            .scan_bounds(Bound::Included(&from), end_bound)
+            .family(DF)
+            .snapshot(s)
+            .stream();
+        // A row a step: a dictionary walk under a short head yields like MaxScore does
+        // (ai1249's R1 on #1642).
+        while let Some(row) = {
+            budget.spend(1).await;
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut rows).poll_next(cx)).await
+        } {
+            let row = row?;
+            let row = row.view();
+            let key = row.key();
+            match visit(dfa, base.len(), key, &mut states) {
+                Visit::Hit(d) => {
+                    let df = row.get(DF, N).and_then(|c| c.as_i64()).unwrap_or(0);
+                    if df > 0 {
+                        found_hit(found, q_chars, &key[POST_PREFIX.len()..], d, df)?;
                     }
                 }
-                Some(j) => {
-                    // Every key from here to the seek target dies where this one did.
-                    match next_live(dfa, rest, &states, j) {
-                        Some(next) => {
-                            from = [base, &next].concat();
-                            continue 'seek;
-                        }
-                        None => return Ok(()),
-                    }
+                Visit::Skip => {}
+                Visit::Seek(next) => {
+                    from = [base, &next].concat();
+                    continue 'seek;
                 }
+                Visit::End => return Ok(()),
             }
         }
         return Ok(());

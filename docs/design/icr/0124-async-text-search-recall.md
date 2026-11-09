@@ -25,7 +25,11 @@
   - A seek moves its family's cursors cache-only, fetching the block it lands in on a miss.
   - A `Pending` changes nothing the walk shows, and a seek left `Pending` is finished by the next step, async or sync.
   - A block still missed is read synchronously and counted in `Metrics::async_sync_reads`.
-- **Text and memory run the same cores as their sync forms,** generic over their reads, so the results are identical. The sync forms keep their codegen: a const-generic yield budget compiles out of them.
+- **Text and memory share their scoring with their sync forms,** generic over their reads, so the results are identical.
+- **Amendment (#1560 PR 2, 2026-11-10; perf287 and the coordinator accepted it):** the text search has two document loops, not the one generic core the design note planned. The sync `top_k` keeps its pre-#1560 loop, and the async search runs `TopK::run`'s resumable phases.
+  - **Why:** the single core cost the sync text shapes +3.6% (text-term-hub) and +3.0% (text-two-terms) in callgrind. The phase dispatch costs about 14 instructions per candidate, and a `Poll`-wrapped read copied every posting. With two loops the sync shapes measure -0.13% and -0.2% against main.
+  - **What's duplicated:** only the loop's control flow. The reads, steps, skips, lookups, bounds, cuts and solo expansions are shared (`Walk`, `Scored`, `Reads`).
+  - **Guard:** a seeded property test (`tests/search_async.rs`) checks that `run_async` equals `run` over random queries of every kind. Each loop's doc names its twin.
 
 ## Why
 #1479's tier 2: an async server or agent loop must not block an executor thread on a text search's or a recall's reads.
