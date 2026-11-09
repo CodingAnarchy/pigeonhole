@@ -785,6 +785,80 @@ impl proto::text_server::Text for TextGrpc {
     }
 }
 
+/// `Memory` over gRPC (D313 ticket 8a): the server's one memory store.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryGrpc(pub(crate) Arc<Shared>);
+
+/// A memory watch's events as gRPC messages.
+struct GrpcMemoryEvents(super::memory::MemoryEvents);
+
+impl Stream for GrpcMemoryEvents {
+    type Item = Result<proto::MemoryEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::memory_server::Memory for MemoryGrpc {
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<proto::MemoryEvent, Status>> + Send>>;
+
+    async fn remember(
+        &self,
+        req: Request<proto::RememberRequest>,
+    ) -> Result<Response<proto::RememberResponse>, Status> {
+        unary!(&self.0, req, Remember, Remember)
+    }
+
+    async fn recall(
+        &self,
+        req: Request<proto::RecallRequest>,
+    ) -> Result<Response<proto::RecallResponse>, Status> {
+        unary!(&self.0, req, Recall, Recall)
+    }
+
+    async fn mark_used(
+        &self,
+        req: Request<proto::MarkUsedRequest>,
+    ) -> Result<Response<proto::MarkUsedResponse>, Status> {
+        unary!(&self.0, req, MarkUsed, MarkUsed)
+    }
+
+    async fn supersede(
+        &self,
+        req: Request<proto::SupersedeRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Supersede, Empty)
+    }
+
+    async fn link(
+        &self,
+        req: Request<proto::LinkRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Link, Empty)
+    }
+
+    async fn forget(
+        &self,
+        req: Request<proto::ForgetRequest>,
+    ) -> Result<Response<proto::ForgetResponse>, Status> {
+        unary!(&self.0, req, Forget, Forget)
+    }
+
+    async fn watch(
+        &self,
+        req: Request<proto::MemoryWatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        match call(&self.0, req, ServiceOp::MemoryWatch).await? {
+            ServiceReply::MemoryWatch(e) => Ok(Response::new(Box::pin(GrpcMemoryEvents(e)))),
+            _ => Err(unexpected()),
+        }
+    }
+}
+
 /// `Schema` over gRPC (D313 ticket 6).
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaGrpc(pub(crate) Arc<Shared>);

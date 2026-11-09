@@ -153,7 +153,9 @@ message MemoryWatchRequest {
 }
 
 message MemoryEvent {
-  // Where to resume after this event. Opaque.
+  // Where to resume after this event's commit. Opaque. Every event of one commit carries
+  // the same token, which points after the whole commit, so resume from it once every
+  // event of that commit is handled: resuming from an earlier one skips the commit's rest.
   bytes token = 1;
   oneof event {
     WatchedMemory memory = 2;

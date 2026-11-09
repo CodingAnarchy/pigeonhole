@@ -905,7 +905,11 @@ fn backup_copies_extents_and_flushes_the_memtables() {
 #[test]
 fn backup_below_an_ssts_commits_rewrites_it_without_them() {
     let vfs = SimVfs::new(30);
-    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    // The engine's default target SST size, so a rewritten SST's extent sized at the target
+    // rather than from its source shows in the copy's length (#1595).
+    let mut options = owned(Arc::clone(&vfs), 1);
+    options.compaction.target_sst_bytes = 64 << 20;
+    let db = Engine::open(Path::new(DB), options).unwrap();
     // Separated values: the rewrite keeps the pointers of the commits it keeps.
     let mut f = FamilyOptions::default();
     f.blob_threshold = 100;
@@ -938,8 +942,15 @@ fn backup_below_an_ssts_commits_rewrites_it_without_them() {
     db.close().unwrap();
     // Stored, not just hidden by the copy's seqno ceiling: its next commits take the seqnos
     // above the snapshot, which copied entries must not hold.
-    let (r, _, _) = check_copy(&vfs);
+    let (r, free, _) = check_copy(&vfs);
     assert_eq!(r.counts.sst_entries, 100, "{:?}", r.counts);
+    // Each rewritten SST's extent is sized from its source (#1595), not the target SST size:
+    // at 64 MiB, aligned to its size, each one left the copy a 64 MiB slot nearly all free.
+    assert!(
+        r.file_bytes < 16 << 20,
+        "the copy is {} bytes, {free} of them free",
+        r.file_bytes
+    );
 
     let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
     let ct = copy.table("t").unwrap();

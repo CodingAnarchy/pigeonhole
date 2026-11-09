@@ -3451,7 +3451,9 @@ pub struct MemoryWatchRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryEvent {
-    /// Where to resume after this event. Opaque.
+    /// Where to resume after this event's commit. Opaque. Every event of one commit carries
+    /// the same token, which points after the whole commit, so resume from it once every
+    /// event of that commit is handled: resuming from an earlier one skips the commit's rest.
     #[prost(bytes = "bytes", tag = "1")]
     pub token: ::prost::bytes::Bytes,
     #[prost(oneof = "memory_event::Event", tags = "2, 3")]
