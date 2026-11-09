@@ -143,14 +143,7 @@ impl Texts {
     /// returned). `None`, keeping nothing, if a [`forget`](Self::forget) came after
     /// `generation`, the one the open started at (#1632).
     fn keep(&self, name: &str, index: Index, generation: u64) -> Option<Arc<Index>> {
-        let mut open = self.handles();
-        if !open.current(generation) {
-            return None;
-        }
-        Some(Arc::clone(
-            open.entry(name.to_owned())
-                .or_insert_with(|| Arc::new(index)),
-        ))
+        self.handles().keep(generation, name, Arc::new(index))
     }
 }
 

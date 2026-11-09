@@ -182,9 +182,8 @@ impl Indexes {
                 }
             }
         }
-        let index = Arc::new(index);
-        open.insert(name.to_owned(), Arc::clone(&index));
-        Ok(Some(index))
+        // Current, checked above under this same lock.
+        Ok(open.keep(generation, name, Arc::new(index)))
     }
 
     /// Drops every handle, so the next call opens its index again: the catalog changed under
@@ -227,7 +226,7 @@ impl Indexes {
         {
             let mut open = self.handles();
             self.closed.store(true, Ordering::Release);
-            open.clear();
+            open.forget();
         }
         let threads = std::mem::take(
             &mut *self

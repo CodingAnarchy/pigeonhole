@@ -10,7 +10,6 @@
 //! rule as the memory slot's).
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 /// Open handles by name, and the generation [`forget`](Self::forget) bumps.
@@ -30,6 +29,11 @@ impl<V> Default for Handles<V> {
 }
 
 impl<V> Handles<V> {
+    /// The handle kept for `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&Arc<V>> {
+        self.map.get(name)
+    }
+
     /// The generation an open starts at: keep its handle only while it's still this one.
     pub(crate) fn generation(&self) -> u64 {
         self.generation
@@ -40,24 +44,23 @@ impl<V> Handles<V> {
         self.generation == generation
     }
 
+    /// Keeps `handle`, opened at `generation`, under `name`, unless a handle is kept there
+    /// already (then that one is returned). `None`, keeping nothing, if a forget came since
+    /// `generation`. The only way in: nothing is kept past the generation check (cli692's
+    /// N1 on #1647).
+    pub(crate) fn keep(&mut self, generation: u64, name: &str, handle: Arc<V>) -> Option<Arc<V>> {
+        if !self.current(generation) {
+            return None;
+        }
+        Some(Arc::clone(
+            self.map.entry(name.to_owned()).or_insert(handle),
+        ))
+    }
+
     /// Drops every handle, and makes every open that started before this one stale.
     pub(crate) fn forget(&mut self) {
         self.generation += 1;
         self.map.clear();
-    }
-}
-
-impl<V> Deref for Handles<V> {
-    type Target = HashMap<String, Arc<V>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.map
-    }
-}
-
-impl<V> DerefMut for Handles<V> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.map
     }
 }
 
@@ -78,6 +81,18 @@ mod tests {
         assert!(
             h.current(h.generation()),
             "an open started after it is current"
+        );
+        // Kept only at the current generation; the first kept wins.
+        assert!(h.keep(started, "a", std::sync::Arc::new(1)).is_none());
+        assert!(h.get("a").is_none());
+        let now = h.generation();
+        assert_eq!(
+            h.keep(now, "a", std::sync::Arc::new(2)).as_deref(),
+            Some(&2)
+        );
+        assert_eq!(
+            h.keep(now, "a", std::sync::Arc::new(3)).as_deref(),
+            Some(&2)
         );
     }
 }
