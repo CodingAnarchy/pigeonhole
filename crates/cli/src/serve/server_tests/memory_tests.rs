@@ -891,3 +891,37 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
     drop(held);
     drop(store);
 }
+
+/// #1651 (cli692's N1 on #1650): `DropTable` of the served store's own tables is refused with
+/// `FailedPrecondition`, and the store keeps working; a table that only looks like one drops.
+#[test]
+fn the_served_memory_store_s_tables_cannot_be_dropped() {
+    let s = memory_server("");
+    assert_eq!(remember(&s, "a", "kept through the refusals", None).0, 200);
+    for table in pigeonhole_memory::Store::table_names("m") {
+        let (status, body) = s.rpc("Schema/DropTable", &json!({"name": table}), None);
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (409, Some("FailedPrecondition")),
+            "{table}: {body}"
+        );
+        assert!(
+            body["message"].as_str().unwrap().contains("--memory m"),
+            "{body}"
+        );
+    }
+    let (status, hits) = recall_with(&s, "refusals", &[]);
+    assert_eq!(status, 200, "{hits}");
+    assert_eq!(hit_texts(&hits), ["kept through the refusals"]);
+    // Another store's name, and a prefix of the served one's, still drop.
+    for table in ["mem_other", "mem_m_extra"] {
+        let (status, e) = s.rpc(
+            "Schema/CreateTable",
+            &json!({"name": table, "families": [{"name": "f"}]}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+        let (status, e) = s.rpc("Schema/DropTable", &json!({"name": table}), None);
+        assert_eq!(status, 200, "{table}: {e}");
+    }
+}

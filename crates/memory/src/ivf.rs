@@ -160,40 +160,84 @@ impl Ivf {
         count: u64,
         nprobe: Option<u32>,
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        let o = self.options();
-        let first = nprobe.or(o.nprobe);
-        let run = |search: pigeonhole_vector::Search<'_>| -> Result<_> {
-            let search = match first {
-                Some(p) => search.nprobe(p),
-                None => search,
-            };
-            // Unset, the index's own `nprobe` is the first probe. `max_probe` never goes below
-            // the first probe, so the floor of 1 here means "the index's `nprobe`" (perf287's
-            // nit on #1424; `IndexOptions` doesn't expose `nprobe`).
-            let first = first.unwrap_or(1);
-            let cap = u32::try_from(count / SEEK_CELLS)
-                .unwrap_or(u32::MAX)
-                .max(first);
-            Ok(search
-                .id_prefix(prefix)
-                .max_probe(cap)
-                .snapshot(s)
-                .run_with_stats()?)
-        };
         let (hits, stats) = match self {
-            Ivf::W(i, _) => run(i.search_f32(q, n))?,
-            Ivf::R(i, _) => run(i.search_f32(q, n))?,
-        };
-        if hits.len() < n && stats.lists_probed < stats.lists {
-            return Ok(None);
+            Ivf::W(i, _) => self.search(i.search_f32(q, n), s, prefix, count, nprobe),
+            Ivf::R(i, _) => self.search(i.search_f32(q, n), s, prefix, count, nprobe),
         }
-        Ok(Some(hits.into_iter().map(|h| h.id).collect()))
+        .run_with_stats()?;
+        Ok(found(hits, stats, n))
     }
+
+    /// [`nearest`](Self::nearest), async: its async twin.
+    #[cfg(feature = "async")]
+    pub(crate) async fn nearest_async(
+        &self,
+        s: &Snapshot,
+        prefix: &[u8],
+        q: &[f32],
+        n: usize,
+        count: u64,
+        nprobe: Option<u32>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let (hits, stats) = match self {
+            Ivf::W(i, _) => self.search(i.search_f32(q, n), s, prefix, count, nprobe),
+            Ivf::R(i, _) => self.search(i.search_f32(q, n), s, prefix, count, nprobe),
+        }
+        .run_async_with_stats()
+        .await?;
+        Ok(found(hits, stats, n))
+    }
+
+    /// `search` as [`nearest`](Self::nearest) runs it: its first probe, widening up to
+    /// the cap, under `prefix`, at `s`.
+    fn search<'s>(
+        &self,
+        search: pigeonhole_vector::Search<'s>,
+        s: &'s Snapshot,
+        prefix: &'s [u8],
+        count: u64,
+        nprobe: Option<u32>,
+    ) -> pigeonhole_vector::Search<'s> {
+        let first = nprobe.or(self.options().nprobe);
+        let search = match first {
+            Some(p) => search.nprobe(p),
+            None => search,
+        };
+        // Unset, the index's own `nprobe` is the first probe. `max_probe` never goes below
+        // the first probe, so the floor of 1 here means "the index's `nprobe`" (perf287's
+        // nit on #1424; `IndexOptions` doesn't expose `nprobe`).
+        let first = first.unwrap_or(1);
+        let cap = u32::try_from(count / SEEK_CELLS)
+            .unwrap_or(u32::MAX)
+            .max(first);
+        search.id_prefix(prefix).max_probe(cap).snapshot(s)
+    }
+}
+
+/// A search's rows, or `None` when the widening hit its cap first with fewer than `n`.
+fn found(
+    hits: Vec<pigeonhole_vector::Hit>,
+    stats: pigeonhole_vector::SearchStats,
+    n: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if hits.len() < n && stats.lists_probed < stats.lists {
+        return None;
+    }
+    Some(hits.into_iter().map(|h| h.id).collect())
 }
 
 /// The namespace counter at `s`: memories with an embedding (0 when absent).
 pub(crate) fn count(rows: &Rows<'_>, s: &Snapshot, ns: &str) -> Result<u64> {
     let n = rows.counter_at(s, &count_row(ns), STATS, EMBEDDED)?;
+    Ok(n.unwrap_or(0).max(0) as u64)
+}
+
+/// [`count`], async.
+#[cfg(feature = "async")]
+pub(crate) async fn count_async(rows: &Rows<'_>, s: &Snapshot, ns: &str) -> Result<u64> {
+    let n = rows
+        .counter_at_async(s, &count_row(ns), STATS, EMBEDDED)
+        .await?;
     Ok(n.unwrap_or(0).max(0) as u64)
 }
 

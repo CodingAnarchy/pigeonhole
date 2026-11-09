@@ -550,6 +550,22 @@ fn index_name(name: &str) -> String {
 }
 
 impl Store {
+    /// The tables a store named `name` keeps its data in: its own, its text index's, and its
+    /// IVF index's (a table that exists only with [`StoreOptions::ivf`]). For an application
+    /// that must leave a store's tables alone: `phdb serve --memory` refuses to drop them
+    /// (#1651).
+    ///
+    /// ```
+    /// use pigeonhole_memory::Store;
+    ///
+    /// let names = Store::table_names("notes");
+    /// assert!(names.contains(&"mem_notes".to_owned()));
+    /// assert_eq!(names.len(), 3);
+    /// ```
+    pub fn table_names(name: &str) -> Vec<String> {
+        vec![table_name(name), index_name(name), ivf_name(name)]
+    }
+
     /// Creates the store `name`: the table `mem_{name}` and its text index
     /// `mem_{name}_text`, the index without positions (recall queries are rarely phrases;
     /// owner, 2026-11-02), and opens it with its own model (as [`open`](Self::open) would).

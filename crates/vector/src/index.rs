@@ -2619,7 +2619,11 @@ impl<'a> Search<'a> {
 
     /// [`run_async`](Self::run_async), with what it read, as
     /// [`run_with_stats`](Self::run_with_stats) reports it. The future is `Send`.
+    ///
+    /// `pigeonhole`, `pigeonhole-text` and `pigeonhole-memory` name this
+    /// `run_with_stats_async`, which finds it in the docs' search (#1560).
     #[cfg(feature = "async")]
+    #[doc(alias = "run_with_stats_async")]
     pub async fn run_async_with_stats(self) -> Result<(Vec<Hit>, SearchStats)> {
         let index = self.index;
         self.query.check(index.spec())?;

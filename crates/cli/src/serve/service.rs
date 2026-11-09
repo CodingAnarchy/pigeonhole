@@ -757,6 +757,9 @@ pub(crate) struct Service {
     scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
+    /// The open connections against `--max-connections` (#1604): the listener counts them,
+    /// the metrics show them.
+    pub(crate) connections: Arc<super::listener::Connections>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
@@ -779,6 +782,7 @@ impl Service {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            connections: super::listener::Connections::new(limits.max_connections),
             db: db.clone(),
             tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
@@ -1456,6 +1460,18 @@ impl Service {
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
         reserved(&name)?;
+        // The memory store this server serves keeps its data in its own tables: dropping one
+        // would leave the slot over a dropped table, and a restart would re-create the store
+        // empty (cli692's N1 on #1650, #1651). The crate names them.
+        if let Some(memory) = &self.memory {
+            let store = memory.name();
+            if pigeonhole_memory::Store::table_names(store).contains(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} belongs to the memory store {store} this server serves \
+                     (--memory {store}): stop the server to drop it"
+                )));
+            }
+        }
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
@@ -1470,6 +1486,7 @@ impl Service {
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
     pub(crate) fn metrics_text(&self) -> String {
         let mut text = self.metrics.render(&self.db);
+        self.connections.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);

@@ -883,6 +883,12 @@ pub(crate) fn run(
             Duration::from_millis(args.shutdown_grace_ms),
             args.http2_send_buffer
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+            listener::Bounds {
+                connections: listener::Connections::new(listener::default_max_connections(
+                    listener::open_file_limit(),
+                )),
+                first_byte: Duration::from_secs(30),
+            },
         )
         .await;
         Ok::<_, Failure>(())
