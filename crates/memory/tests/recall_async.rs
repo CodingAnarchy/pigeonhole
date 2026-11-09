@@ -451,3 +451,64 @@ fn async_recall_futures_are_send() {
     drop(store);
     db.close().unwrap();
 }
+
+/// ai1249's R1: a warm recall whose filter doubles its lists to a large namespace's size
+/// yields between its rows (256 per poll, shared by its recency lists and multi-gets)
+/// rather than reading them all in one poll, and still returns what `run` does.
+#[test]
+fn a_warm_filtered_recall_yields_between_its_rows() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct Count(AtomicU32);
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let vfs = SimVfs::new(31);
+    let db = build(&vfs, 31);
+    let store = Store::open(&db, "notes", MODEL).expect("open store");
+    let s = db.snapshot().unwrap();
+    let recall = || {
+        store
+            .recall(&["a"])
+            .text("memory deploy")
+            .candidates(150)
+            .k(20)
+            .session("s2")
+            .snapshot(&s)
+            .now_us(1_900_000_000_000_000)
+    };
+    // Warm: the sync recall reads every block the async one will.
+    let want = recall().run_with_stats().unwrap();
+    let count = Arc::new(Count(AtomicU32::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let (got, pendings) = {
+        let mut fut = std::pin::pin!(recall().run_with_stats_async());
+        let mut pendings = 0;
+        let got = loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(r) => break r.unwrap(),
+                Poll::Pending => {
+                    pendings += 1;
+                    // Warm: every `Pending` is a yield, its task already woken.
+                    assert_eq!(
+                        count.0.load(Ordering::Relaxed),
+                        pendings,
+                        "a Pending without a wake"
+                    );
+                }
+            }
+        };
+        (got, pendings)
+    };
+    assert_eq!(got, want);
+    // The session filter doubles `n` past the namespace's 300 memories: its newest list
+    // and the multi-gets read hundreds of rows.
+    assert!(pendings >= 2, "{pendings} yields");
+    drop(store);
+    db.close().unwrap();
+}

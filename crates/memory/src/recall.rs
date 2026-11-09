@@ -1423,10 +1423,16 @@ impl Idx<'_> {
 /// with each read's async form and the same shared decisions (`Pass`, `Hop`, `Walk`).
 #[cfg(feature = "async")]
 impl<'a> Recall<'a> {
-    /// [`run`](Self::run) as a future: the same hits, with every read the recall makes
-    /// asynchronous, so it doesn't block an executor thread on the cache's misses. Each
-    /// namespace's vector, keyword and recency lists are read together. The future is
-    /// `Send`.
+    /// [`run`](Self::run) as a future: the same hits, with the recall's reads asynchronous,
+    /// so it doesn't block an executor thread on the cache's misses. Each namespace's
+    /// vector, keyword and recency lists are read together. A poll yields after 256 rows
+    /// of its own (its recency lists' and candidates' rows), so a warm recall over a large
+    /// namespace doesn't hold the thread either. The future is `Send`.
+    ///
+    /// One gap remains (#1652): a row longer than a block in the engine's key-set reads (the
+    /// candidates' multi-get, a graph expansion's traversal, an IVF list) has its later
+    /// blocks read synchronously, counted in `EngineMetrics::async_sync_reads`: at most a
+    /// block or two per recall.
     ///
     /// The same refusals as `run`. It works in a reader process
     /// ([`ReadStore::recall`](crate::ReadStore::recall)) too: every read a recall makes has
@@ -1448,13 +1454,15 @@ impl<'a> Recall<'a> {
             return Ok((Vec::new(), RecallStats::default()));
         }
         let mut stats = RecallStats::default();
+        // The row loops' yield budget, shared by every list and multi-get (ai1249's R1).
+        let rows = Yields::new();
         // 1. Candidates.
         let ivf_counts = self.ivf_counts_async(s).await?;
-        let (mut cands, fell_back) = self.gather_async(&plan, &ivf_counts).await?;
+        let (mut cands, fell_back) = self.gather_async(&plan, &ivf_counts, &rows).await?;
         // 2. The graph expansion, seeded by the fused order without it.
         if let Some(x) = self.expand {
             let seeds = self.seeds(&mut cands);
-            self.expand_graph_async(&plan, &mut cands, seeds, x, &mut stats)
+            self.expand_graph_async(&plan, &mut cands, seeds, x, &mut stats, &rows)
                 .await?;
             unscore(&mut cands);
         }
@@ -1482,6 +1490,7 @@ impl<'a> Recall<'a> {
         &self,
         plan: &Plan<'_>,
         ivf_counts: &BTreeMap<&str, u64>,
+        rows: &Yields,
     ) -> Result<(Vec<Cand>, BTreeSet<&str>)> {
         let s = plan.s;
         let mut n = self.per_signal.max(1);
@@ -1514,7 +1523,7 @@ impl<'a> Recall<'a> {
                         None => Ok(None),
                     }
                 };
-                let newest = self.rows.newest_async(s, &prefix, n);
+                let newest = self.rows.newest_async(s, &prefix, n, rows);
                 let (vector, keyword, newest) = join3(vector, keyword, newest).await;
                 if let Some((l, fell)) = vector? {
                     if fell {
@@ -1529,7 +1538,7 @@ impl<'a> Recall<'a> {
             }
             let mut eligible: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
             self.rows
-                .read_each_async(s, &pass.keys(), |key, row| {
+                .read_each_async(s, &pass.keys(), rows, |key, row| {
                     self.admit(&mut eligible, key, row, plan)
                 })
                 .await?;
@@ -1549,6 +1558,7 @@ impl<'a> Recall<'a> {
         seeds: Vec<(Vec<u8>, f64)>,
         x: Expand,
         stats: &mut RecallStats,
+        rows: &Yields,
     ) -> Result<()> {
         let s = plan.s;
         let mut walk = Walk::new(cands, seeds, x, self.byte_budget);
@@ -1573,7 +1583,9 @@ impl<'a> Recall<'a> {
             if !unknown.is_empty() {
                 let set = KeySet::from_unsorted(unknown.iter().copied());
                 self.rows
-                    .read_each_async(s, &set, |key, row| self.admit(&mut fresh, key, row, plan))
+                    .read_each_async(s, &set, rows, |key, row| {
+                        self.admit(&mut fresh, key, row, plan)
+                    })
                     .await?;
                 walk.filtered_out(&unknown, &fresh);
             }
@@ -1583,6 +1595,46 @@ impl<'a> Recall<'a> {
         }
         stats.expanded = walk.graphed;
         Ok(())
+    }
+}
+
+/// Rows an async recall reads and handles in one poll before it yields: its recency
+/// lists' and multi-gets' rows together (ai1249's R1 on #1654). A filtered recall's
+/// doubling can grow a list to its namespace's size, so without it a warm recall over a
+/// large namespace would read three lists' worth of rows in one poll. The reads it calls
+/// (the vector, text and traversal searches) yield on their own budgets.
+#[cfg(feature = "async")]
+const RECALL_POLL_ROWS: u32 = 256;
+
+/// An async recall's shared row budget ([`RECALL_POLL_ROWS`]): an atomic, so the joined
+/// lists share it and the future stays `Send`.
+#[cfg(feature = "async")]
+struct Yields(std::sync::atomic::AtomicU32);
+
+#[cfg(feature = "async")]
+impl Yields {
+    fn new() -> Self {
+        Yields(std::sync::atomic::AtomicU32::new(RECALL_POLL_ROWS))
+    }
+
+    /// Counts a row; after [`RECALL_POLL_ROWS`] of them, wakes the task and returns
+    /// `Pending` once, with the budget renewed.
+    async fn row(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.0.fetch_sub(1, Relaxed) > 1 {
+            return;
+        }
+        self.0.store(RECALL_POLL_ROWS, Relaxed);
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
     }
 }
 
@@ -1661,7 +1713,13 @@ impl Rows<'_> {
     }
 
     /// [`newest`](Self::newest), async: the scan as a stream.
-    async fn newest_async(&self, s: &Snapshot, prefix: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
+    async fn newest_async(
+        &self,
+        s: &Snapshot,
+        prefix: &[u8],
+        n: usize,
+        yields: &Yields,
+    ) -> Result<Vec<Vec<u8>>> {
         use futures_core::Stream;
         let scan = match self {
             Rows::W(t) => t.scan_prefix(prefix),
@@ -1671,6 +1729,7 @@ impl Rows<'_> {
         let mut out = Vec::new();
         while let Some(r) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
             out.push(r?.key().to_vec());
+            yields.row().await;
         }
         Ok(out)
     }
@@ -1717,6 +1776,7 @@ impl Rows<'_> {
         &self,
         s: &Snapshot,
         keys: &KeySet,
+        yields: &Yields,
         mut f: impl FnMut(&[u8], &pigeonhole::RowRef<'_>) -> Result<()>,
     ) -> Result<()> {
         let read = match self {
@@ -1734,6 +1794,7 @@ impl Rows<'_> {
         while let Some((_, row)) = rows.next_async().await? {
             let key = row.key().to_vec();
             f(&key, &row)?;
+            yields.row().await;
         }
         Ok(())
     }
