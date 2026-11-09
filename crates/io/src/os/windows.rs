@@ -550,3 +550,8 @@ pub(crate) fn process_id() -> u32 {
     static PROCESS_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PROCESS_ID.get_or_init(std::process::id)
 }
+
+/// [`crate::File::submit_writeback`] on Windows: nothing to do (D319).
+pub(crate) fn writeback(_file: &fs::File, _offset: u64, _len: u64) -> Result<()> {
+    Ok(())
+}

@@ -633,6 +633,25 @@ impl File for UringFile {
         })
     }
 
+    /// On the ring this thread submits to (an io-wq worker runs it), inline where the
+    /// thread's I/O runs inline (D319). A range past `u32::MAX` bytes is written back up to
+    /// that: pacing, not durability.
+    fn submit_writeback(&self, offset: u64, len: u64) -> Completion<()> {
+        if len == 0 {
+            // `sync_file_range` reads a zero length as "to the end of the file".
+            return Completion::ready(Ok(()));
+        }
+        if self.inline_here() {
+            return Completion::ready(self.file.writeback(offset, len));
+        }
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        self.submit(|resolver| Kind::Writeback {
+            offset,
+            len,
+            resolver,
+        })
+    }
+
     fn sync_all(&self) -> Result<()> {
         self.file.sync_all()
     }
@@ -713,6 +732,13 @@ enum Kind {
         data_only: bool,
         resolver: Resolver<()>,
     },
+    /// Writes `len` bytes at `offset` back from the page cache and waits for them
+    /// (`sync_file_range`, D319): io_uring always runs it on an io-wq worker.
+    Writeback {
+        offset: u64,
+        len: u32,
+        resolver: Resolver<()>,
+    },
 }
 
 impl Op {
@@ -763,6 +789,10 @@ impl Op {
                 };
                 opcode::Fsync::new(fd).flags(flags).build()
             }
+            Kind::Writeback { offset, len, .. } => opcode::SyncFileRange::new(fd, *len)
+                .offset(*offset)
+                .flags(libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER)
+                .build(),
         }
         .user_data(user_data)
         .flags(self.flags)
@@ -782,6 +812,9 @@ impl Op {
                 }
                 Kind::Sync { resolver, .. } => {
                     Box::new(move || resolver.resolve(Err(Error::os("sync", e))))
+                }
+                Kind::Writeback { resolver, .. } => {
+                    Box::new(move || resolver.resolve(Err(Error::os("sync_file_range", e))))
                 }
             });
         }
@@ -808,8 +841,9 @@ impl Op {
                 };
                 Step::Done(Box::new(move || resolver.resolve(Ok(buf))))
             }
-            Kind::Sync { .. } => {
-                let Kind::Sync { resolver, .. } = self.kind else {
+            Kind::Sync { .. } | Kind::Writeback { .. } => {
+                let (Kind::Sync { resolver, .. } | Kind::Writeback { resolver, .. }) = self.kind
+                else {
                     unreachable!()
                 };
                 Step::Done(Box::new(move || resolver.resolve(Ok(()))))
@@ -978,6 +1012,9 @@ fn abandon(op: Op, e: io::Error) {
             resolver.resolve(Err(Error::os("write", e)));
         }
         Kind::Sync { resolver, .. } => resolver.resolve(Err(Error::os("sync", e))),
+        Kind::Writeback { resolver, .. } => {
+            resolver.resolve(Err(Error::os("sync_file_range", e)));
+        }
     }
 }
 
@@ -1251,6 +1288,9 @@ fn fail(op: Op, e: io::Error) {
         Kind::Read { resolver, .. } => resolver.resolve(Err(Error::os("read", e))),
         Kind::Write { resolver, .. } => resolver.resolve(Err(Error::os("write", e))),
         Kind::Sync { resolver, .. } => resolver.resolve(Err(Error::os("sync", e))),
+        Kind::Writeback { resolver, .. } => {
+            resolver.resolve(Err(Error::os("sync_file_range", e)));
+        }
     }
 }
 

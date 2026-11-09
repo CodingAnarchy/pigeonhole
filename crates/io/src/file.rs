@@ -110,6 +110,21 @@ pub trait File: Send + Sync + Debug {
     /// Submits a write of `buf` at `offset` and returns at once.
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion;
 
+    /// Writes back `[offset, offset + len)` from the page cache, completing once those pages
+    /// reached the device (Linux `sync_file_range` with `SYNC_FILE_RANGE_WRITE` and
+    /// `SYNC_FILE_RANGE_WAIT_AFTER`). Pacing only: it makes nothing durable (no metadata, no
+    /// device cache flush), so durability stays with [`File::sync_data`]. A background writer
+    /// writes its output back behind it, so a later sync never finds tens of MiB to write at
+    /// once, which a WAL sync would queue behind (D319, #1621).
+    ///
+    /// Inside an [`crate::inline_io`] scope it runs before returning. The default completes at
+    /// once and does nothing: other platforms, the simulated backend outside deferred I/O,
+    /// and wrappers that don't forward it.
+    fn submit_writeback(&self, offset: u64, len: u64) -> Completion<()> {
+        let _ = (offset, len);
+        Completion::ready(Ok(()))
+    }
+
     /// Makes written data durable (fdatasync / F_FULLFSYNC / FlushFileBuffers).
     ///
     /// Callers may not rely on it to make a length change durable: after `set_len`,

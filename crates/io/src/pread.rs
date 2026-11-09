@@ -238,6 +238,11 @@ pub(crate) struct PreadFile {
 
 #[cfg(target_os = "linux")]
 impl PreadFile {
+    /// [`File::submit_writeback`]'s work, on the calling thread (D319).
+    pub(crate) fn writeback(&self, offset: u64, len: u64) -> Result<()> {
+        self.inner.writeback(offset, len)
+    }
+
     /// [`FileInner::check_aligned`], for a backend that submits this file's I/O itself.
     pub(crate) fn check_aligned(&self, ptr: *const u8, len: usize, offset: u64) -> Result<()> {
         self.inner.check_aligned(ptr, len, offset)
@@ -336,6 +341,11 @@ impl FileInner {
 
     fn sync_data(&self) -> Result<()> {
         self.file().sync_data().map_err(|e| Error::os("sync", e))
+    }
+
+    /// [`File::submit_writeback`]'s work, on the calling thread (D319).
+    pub(crate) fn writeback(&self, offset: u64, len: u64) -> Result<()> {
+        os::writeback(self.file(), offset, len)
     }
 }
 
@@ -646,6 +656,22 @@ impl File for PreadFile {
             .file()
             .sync_all()
             .map_err(|e| Error::os("sync", e))
+    }
+
+    /// On the pool, as a sync is (Linux; elsewhere it completes at once, D319).
+    fn submit_writeback(&self, offset: u64, len: u64) -> Completion<()> {
+        if !cfg!(target_os = "linux") {
+            return Completion::ready(Ok(()));
+        }
+        if crate::own::in_inline_io() {
+            return Completion::ready(self.inner.writeback(offset, len));
+        }
+        let (done, resolver) = Completion::pair();
+        let inner = Arc::clone(&self.inner);
+        self.inner.pool.submit(Box::new(move || {
+            resolver.resolve(inner.writeback(offset, len))
+        }));
+        done
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
