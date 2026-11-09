@@ -244,7 +244,7 @@ On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157
 | 10k namespace, fused | 15.3 ms | 13.7 ms | |
 
 - **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (T5's split).
-- **Writers scale to 16 threads, with or without the index.** Threads remembering into the large namespace, 8 s per thread count, three runs (`memrecall … ivf` and `… flat`, the same store without the index, #1477):
+- **Writers gain up to 16 threads, with or without the index, though less past 8.** Threads remembering into the large namespace, 8 s per thread count, three runs (`memrecall … ivf` and `… flat`, the same store without the index, #1477):
 
   | writers | memories/s with the index | without it | remember p99 with the index |
   |--:|--:|--:|--:|
@@ -252,6 +252,8 @@ On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157
   | 4 | 3,230–3,910 | 3,650–4,800 | 3.3–4.2 ms |
   | 8 | 5,820–6,880 | 7,090–7,900 | 5.8–7.9 ms |
   | 16 | 7,850–8,410 | 9,430–10,160 | 10.0–10.6 ms |
+
+  The 4-writer phase runs first after the build, behind its flush and compaction backlog, so it reads a little low.
 
   - **How many to use:** up to 8 writers when remember latency matters (p99 under about 8 ms), and 16 for bulk imports. More than 16 wasn't measured.
   - **The index costs about 10–20% of write throughput,** for the vector copy and list upkeep.

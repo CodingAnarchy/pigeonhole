@@ -548,7 +548,7 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
 /// With `index` false (the `flat` mode), the same build and writer phases run on a store
 /// without the index, as the IVF-off baseline for the writer rows (#1477); the recall passes
 /// are skipped, and the rows are `flat-build`, `flat-writers` and `flat-verify`.
-fn ivf(fix_dir: &Path, db_dir: &Path, n: usize, index: bool) {
+fn indexed_store(fix_dir: &Path, db_dir: &Path, n: usize, index: bool) {
     let mode = if index { "ivf" } else { "flat" };
     let f = fixture(fix_dir, "lme_m");
     let mut seen = BTreeSet::new();
@@ -746,7 +746,7 @@ fn main() {
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),
         ),
-        Some(mode @ ("ivf" | "flat")) => ivf(
+        Some(mode @ ("ivf" | "flat")) => indexed_store(
             &fix,
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),
