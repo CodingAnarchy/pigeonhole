@@ -229,11 +229,20 @@ impl Hub {
     }
 
     /// The hub's feed found nothing at `position`: the ring holds everything up to it.
+    ///
+    /// The token is made outside the ring's lock: its cost grows with what the feed holds
+    /// unreturned, and clients and subscribes take that lock on network threads (#1397's
+    /// fan-out wedge). Only the hub's own task moves `passed`, so it can't move between the
+    /// check and the store.
     fn note_passed(&self, position: u64, token: impl FnOnce() -> Bytes) {
+        if position <= self.ring().passed {
+            return;
+        }
+        let token = token();
         let mut r = self.ring();
         if position > r.passed {
             r.passed = position;
-            r.passed_token = token();
+            r.passed_token = token;
         }
     }
 
@@ -436,6 +445,12 @@ impl Feeds {
                             Some(Ok(commit)) => {
                                 let at = stream.position().seqno();
                                 hub.push(commit, token_of(&stream), at, limit);
+                                drop(hub);
+                                // A feed with a backlog is always ready, and it isn't part of
+                                // Tokio's budget: without this, a hub that fell behind keeps its
+                                // worker, and other hubs and the clients on the feed runtime
+                                // starve (#1397's fan-out wedge).
+                                tokio::task::coop::consume_budget().await;
                             }
                             // An expiry, `Closed`, damage: each client goes on from its own
                             // token on its own stream, and the engine decides each (feed1248's
@@ -1278,6 +1293,85 @@ mod tests {
             let seqno = t.mutate(b"r").put("f", b"q", b"v").commit().unwrap().seqno;
             assert_eq!(seqnos(&mut events, Duration::from_secs(1)).await, [seqno]);
         });
+        drop(t);
+        drop(requests);
+        drop(delivery);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hub_with_a_backlog_yields_its_feed_worker() {
+        // #1397's fan-out wedge: a hub that fell behind is always ready, and its feed isn't
+        // part of Tokio's budget. It must still give its worker back now and then, or other
+        // hubs and every client on the feed runtime starve until its backlog is gone.
+        const BACKLOG: u64 = 3000;
+        let (_, db, dir) = commits("hubyield", 0);
+        let requests = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let delivery = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 64 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(10),
+                stream_idle: Duration::from_secs(30),
+                client_events: CLIENT_EVENTS,
+                client_bytes: CLIENT_BYTES,
+            },
+        );
+        feeds.run_on(delivery.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        let seen = requests.block_on(async {
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let spec = Spec {
+                tables: vec![t.clone()],
+                prefix: Vec::new(),
+                visible: false,
+                start: Start::Now,
+            };
+            let _events = feeds.subscribe(spec, slot, |_| {}).unwrap();
+            // Park the feed runtime's one worker while the backlog is written, so the hub
+            // finds all of it ready at once.
+            let (park, parked) = std::sync::mpsc::channel::<()>();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            delivery.spawn(async move {
+                park.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            parked.recv().unwrap();
+            for i in 0..BACKLOG {
+                t.mutate(format!("r{i}").as_bytes())
+                    .put("f", b"q", b"v")
+                    .commit()
+                    .unwrap();
+            }
+            // Queued behind the hub's wake: it runs once the hub gives the worker back.
+            let probe = {
+                let feeds = Arc::clone(&feeds);
+                delivery.spawn(async move {
+                    let hubs = feeds.hubs.lock().unwrap();
+                    let hub = hubs.values().next().unwrap().upgrade().unwrap();
+                    hub.ring().head()
+                })
+            };
+            release.send(()).unwrap();
+            probe.await.unwrap()
+        });
+        assert!(
+            seen < BACKLOG / 2,
+            "the hub kept its worker through {seen} of {BACKLOG} backlogged commits"
+        );
         drop(t);
         drop(requests);
         drop(delivery);

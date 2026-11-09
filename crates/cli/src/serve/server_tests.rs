@@ -2916,6 +2916,10 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
     // One-event buffers, so a stalled round takes clients off the ring.
     l.feed_client_events = 1;
     l.max_catch_up = 2;
+    // A client stalls for runs of rounds by design; on a slow runner a run outlasted the 5 s
+    // idle limit and the stream ended DeadlineExceeded (Windows, #1592's CI). Idling out has
+    // its own tests: here a stall only takes a client off the ring.
+    l.stream_idle = Duration::from_secs(600);
     let s = Server::start_with("", l, 2);
     let prefixes: [&[u8]; 4] = [b"", b"a", b"b", b"ab"];
     let t = s
