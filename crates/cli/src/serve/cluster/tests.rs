@@ -73,6 +73,10 @@ fn serve(
             },
             Duration::from_millis(100),
             None,
+            crate::serve::listener::Bounds {
+                connections: crate::serve::listener::Connections::new(64),
+                first_byte: Duration::from_secs(5),
+            },
         )
         .await;
     });
