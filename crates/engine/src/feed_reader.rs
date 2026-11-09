@@ -189,16 +189,119 @@ pub struct CatalogEvent {
     pub names: Vec<(TableId, String)>,
 }
 
-/// A mutation as read, before its commit's timestamp is known.
-#[derive(Debug, Clone)]
-struct Raw {
+/// A mutation as read, before its commit's timestamp is known: its fixed fields, and its
+/// bytes' lengths in its record's buffer ([`Raws`]).
+#[derive(Debug, Clone, Copy)]
+struct RawHead {
     table: TableId,
     family: FamilyId,
     kind: Kind,
     ts: Option<Timestamp>,
-    row: Vec<u8>,
-    qualifier: Vec<u8>,
-    value: Vec<u8>,
+    row: u32,
+    qualifier: u32,
+    value: u32,
+}
+
+/// A record's followed mutations, packed into two allocations sized exactly: their fixed
+/// fields, and their rows, qualifiers and values back to back (#1637). A reader keeps up to
+/// its read-ahead budget of these, so one allocation per mutation field (and a spine grown
+/// to four) made a small commit cost about three times what the cap counted.
+#[derive(Debug, Default)]
+struct Raws {
+    heads: Box<[RawHead]>,
+    bytes: Box<[u8]>,
+}
+
+/// A mutation of a [`Raws`].
+struct RawRef<'a> {
+    table: TableId,
+    family: FamilyId,
+    kind: Kind,
+    ts: Option<Timestamp>,
+    row: &'a [u8],
+    qualifier: &'a [u8],
+    value: &'a [u8],
+}
+
+impl Raws {
+    fn iter(&self) -> impl Iterator<Item = RawRef<'_>> {
+        let mut at = 0usize;
+        self.heads.iter().map(move |h| {
+            let (r, q, v) = (h.row as usize, h.qualifier as usize, h.value as usize);
+            let row = &self.bytes[at..at + r];
+            let qualifier = &self.bytes[at + r..at + r + q];
+            let value = &self.bytes[at + r + q..at + r + q + v];
+            at += r + q + v;
+            RawRef {
+                table: h.table,
+                family: h.family,
+                kind: h.kind,
+                ts: h.ts,
+                row,
+                qualifier,
+                value,
+            }
+        })
+    }
+
+    /// The heap memory it holds: its two allocations, each rounded to the allocator's
+    /// smallest size class.
+    fn memory(&self) -> u64 {
+        alloc_size(std::mem::size_of_val(&*self.heads)) + alloc_size(self.bytes.len())
+    }
+}
+
+/// An allocation of `n` bytes, rounded up to a 16-byte size class (none for 0).
+fn alloc_size(n: usize) -> u64 {
+    (n as u64).next_multiple_of(16)
+}
+
+/// Packs `batch`'s mutations of `tables` (every table but a replica's state table, if
+/// empty) and rows starting with `prefix`. `heads` and `bytes` are scratch space, so the
+/// result's two allocations are made once, at their exact size.
+fn pack(
+    batch: BatchRef<'_>,
+    tables: &[TableId],
+    prefix: &[u8],
+    heads: &mut Vec<RawHead>,
+    bytes: &mut Vec<u8>,
+) -> Result<Raws> {
+    heads.clear();
+    bytes.clear();
+    let len = |b: &[u8]| {
+        u32::try_from(b.len())
+            .map_err(|_| Error::Corruption("a logged mutation's field is over 4 GiB".into()))
+    };
+    for m in batch.iter() {
+        let m = m?;
+        // The table first, then the row: a mutation outside is skipped by its lengths,
+        // never copied (§2.7). An empty list is every table (D315), but a replica's state
+        // table: a commit only to it is passed over (D315 PR 3).
+        let followed = if tables.is_empty() {
+            m.table != pigeonhole_format::manifest::REPLICA_TABLE
+        } else {
+            tables.binary_search(&m.table).is_ok()
+        };
+        if !followed || !m.row.starts_with(prefix) {
+            continue;
+        }
+        heads.push(RawHead {
+            table: m.table,
+            family: m.family,
+            kind: m.kind,
+            ts: m.ts,
+            row: len(m.row)?,
+            qualifier: len(m.qualifier)?,
+            value: len(m.value)?,
+        });
+        bytes.extend_from_slice(m.row);
+        bytes.extend_from_slice(m.qualifier);
+        bytes.extend_from_slice(m.value);
+    }
+    Ok(Raws {
+        heads: heads.as_slice().into(),
+        bytes: bytes.as_slice().into(),
+    })
 }
 
 /// A record as read, owned.
@@ -206,11 +309,11 @@ enum Item {
     Single {
         seqno: Seqno,
         ts: Timestamp,
-        changes: Vec<Raw>,
+        changes: Raws,
     },
     Prepare {
         id: Seqno,
-        changes: Vec<Raw>,
+        changes: Raws,
     },
     Decision {
         id: Seqno,
@@ -232,7 +335,7 @@ enum Item {
 enum Pending {
     Single {
         ts: Timestamp,
-        changes: Vec<Raw>,
+        changes: Raws,
         stream: usize,
         start: Lsn,
         end: Lsn,
@@ -266,7 +369,7 @@ struct Held {
     stream: usize,
     start: Lsn,
     end: Lsn,
-    changes: Vec<Raw>,
+    changes: Raws,
     /// Read in a segment outside the feed's history (the mark rule): delivering it expires.
     outside: bool,
 }
@@ -385,7 +488,12 @@ pub struct FeedReader {
     /// The newest session of any record read (the token's anchor).
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
-    held: BTreeMap<Seqno, Vec<Held>>,
+    /// The PREPAREs read and waiting for their Decision, by round id and stream: one entry
+    /// per share, so a share costs its entry and no spine (#1637).
+    held: BTreeMap<(Seqno, usize), Held>,
+    /// Scratch for [`pack`].
+    pack_heads: Vec<RawHead>,
+    pack_bytes: Vec<u8>,
     /// The starts of `ready`'s and `held`'s records, per stream.
     starts: Starts,
     /// The read-ahead cap (D320).
@@ -507,27 +615,30 @@ const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 /// A reader's read-ahead budget (D320): the bytes of records read but not delivered that it
 /// keeps (`ready` and `held`). Past it, a pass keeps only the smallest keys.
 const READ_AHEAD_BYTES: u64 = 64 << 20;
-/// What a kept record costs beyond its changes' bytes, and what each change costs beyond its
-/// row, qualifier and value: the read-ahead's accounting, not an exact allocation size.
-const RECORD_OVERHEAD: u64 = 96;
-const CHANGE_OVERHEAD: u64 = 64;
+/// What one entry of `ready` costs in its B-tree, with its start's entry in `starts`: each
+/// key and value twice over, since a node of entries appended in order (keys only grow
+/// there) is about half full (#1637).
+const READY_ENTRY: u64 = 2 * (std::mem::size_of::<(Seqno, Pending)>() + START_ENTRY) as u64;
+/// The same for one share in `held`.
+const HELD_ENTRY: u64 = 2 * (std::mem::size_of::<((Seqno, usize), Held)>() + START_ENTRY) as u64;
+/// One entry of a stream's `starts`.
+const START_ENTRY: usize = std::mem::size_of::<(Lsn, u32)>();
 
-/// The read-ahead bytes a record with `changes` counts for.
-fn record_bytes(changes: &[Raw]) -> u64 {
-    RECORD_OVERHEAD
-        + changes
-            .iter()
-            .map(|r| CHANGE_OVERHEAD + (r.row.len() + r.qualifier.len() + r.value.len()) as u64)
-            .sum::<u64>()
+/// The read-ahead bytes a record kept in `ready` counts for: what it really holds, its map
+/// entry and its allocations (#1637; a decided round's shares count in `held`).
+fn pending_bytes(p: &Pending) -> u64 {
+    READY_ENTRY
+        + match p {
+            Pending::Single { changes, .. } => changes.memory(),
+            Pending::Decided { participants, .. } => {
+                alloc_size(participants.capacity() * std::mem::size_of::<StreamId>())
+            }
+        }
 }
 
-/// The read-ahead bytes a record kept in `ready` counts for (a decided round's shares count
-/// in `held`).
-fn pending_bytes(p: &Pending) -> u64 {
-    match p {
-        Pending::Single { changes, .. } => record_bytes(changes),
-        Pending::Decided { .. } => RECORD_OVERHEAD,
-    }
+/// The read-ahead bytes a held share counts for, as for [`pending_bytes`].
+fn held_bytes(h: &Held) -> u64 {
+    HELD_ENTRY + h.changes.memory()
 }
 
 /// The read-ahead cap's state (D320). A pass reads every stream to its end, as without a
@@ -596,10 +707,16 @@ impl ReadAhead {
     }
 }
 
+/// A delivered commit's packed changes: a single's record, or a round's shares.
+enum Packs {
+    One(Raws),
+    Many(Vec<Raws>),
+}
+
 /// What [`FeedReader::take_round`] found of a decided round.
 enum Round {
-    /// Every share, its changes in stream order.
-    Whole(Vec<Raw>),
+    /// Every share's changes, in stream order.
+    Whole(Vec<Raws>),
     /// Dropped whole by an earlier session's recovery: never happened.
     Dropped,
     /// A share is missing or outside the history: the feed expires.
@@ -690,6 +807,8 @@ impl FeedReader {
             session: 0,
             ready: BTreeMap::new(),
             held: BTreeMap::new(),
+            pack_heads: Vec::new(),
+            pack_bytes: Vec::new(),
             starts: Starts::default(),
             ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
@@ -1036,7 +1155,7 @@ impl FeedReader {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn held_prepares(&self) -> usize {
-        self.held.values().map(Vec::len).sum()
+        self.held.len()
     }
 
     /// The read-ahead kept now (D320): the bytes counted over the records read but not
@@ -1048,12 +1167,7 @@ impl FeedReader {
             .ready
             .values()
             .map(pending_bytes)
-            .chain(
-                self.held
-                    .values()
-                    .flatten()
-                    .map(|h| record_bytes(&h.changes)),
-            )
+            .chain(self.held.values().map(held_bytes))
             .sum::<u64>();
         assert_eq!(self.ahead.bytes, scanned, "the read-ahead's tracked bytes");
         self.ahead.bytes
@@ -1195,7 +1309,7 @@ impl FeedReader {
                 at = at.min(start);
             }
         }
-        for h in self.held.values().flatten() {
+        for h in self.held.values() {
             if h.stream == s {
                 at = at.min(h.start);
             }
@@ -1459,9 +1573,9 @@ impl FeedReader {
             // drops it.
             let top_held = self
                 .held
-                .range(self.delivered..)
+                .range((self.delivered, 0)..)
                 .next_back()
-                .map(|(&id, _)| id.saturating_add(1));
+                .map(|(&(id, _), _)| id.saturating_add(1));
             let over = self.ahead.bytes > self.ahead.budget;
             if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
                 return;
@@ -1605,15 +1719,21 @@ impl FeedReader {
                     continue;
                 }
                 Item::Prepare { id, changes } => {
-                    self.starts.add(s, start);
-                    self.ahead.bytes += record_bytes(&changes);
-                    self.held.entry(id).or_default().push(Held {
+                    let h = Held {
                         stream: s,
                         start,
                         end,
                         changes,
                         outside: !inside,
-                    });
+                    };
+                    self.starts.add(s, start);
+                    self.ahead.bytes += held_bytes(&h);
+                    // One share per stream: one already there (never expected) gives up its
+                    // start and bytes with it.
+                    if let Some(old) = self.held.insert((id, s), h) {
+                        self.starts.remove(old.stream, old.start);
+                        self.ahead.bytes -= held_bytes(&old);
+                    }
                 }
                 Item::Decision {
                     id,
@@ -1671,34 +1791,8 @@ impl FeedReader {
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let filter = |batch: BatchRef<'_>| -> Result<Vec<Raw>> {
-            let mut out = Vec::new();
-            for m in batch.iter() {
-                let m = m?;
-                // The table first, then the row: a mutation outside is skipped by its
-                // lengths, never copied (§2.7).
-                // An empty list is every table (D315), but a replica's state table: a
-                // commit only to it is passed over (D315 PR 3).
-                let followed = if tables.is_empty() {
-                    m.table != pigeonhole_format::manifest::REPLICA_TABLE
-                } else {
-                    tables.binary_search(&m.table).is_ok()
-                };
-                if !followed || !m.row.starts_with(prefix) {
-                    continue;
-                }
-                out.push(Raw {
-                    table: m.table,
-                    family: m.family,
-                    kind: m.kind,
-                    ts: m.ts,
-                    row: m.row.to_vec(),
-                    qualifier: m.qualifier.to_vec(),
-                    value: m.value.to_vec(),
-                });
-            }
-            Ok(out)
-        };
+        let (heads, bytes) = (&mut self.pack_heads, &mut self.pack_bytes);
+        let mut filter = |batch: BatchRef<'_>| pack(batch, tables, prefix, heads, bytes);
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -1788,10 +1882,17 @@ impl FeedReader {
 
     /// Takes round `id`'s held shares, uncounting their starts and bytes.
     fn remove_held(&mut self, id: Seqno) -> Vec<Held> {
-        let shares = self.held.remove(&id).unwrap_or_default();
-        for h in &shares {
+        let streams: Vec<usize> = self
+            .held
+            .range((id, 0)..=(id, usize::MAX))
+            .map(|(&(_, s), _)| s)
+            .collect();
+        let mut shares = Vec::with_capacity(streams.len());
+        for s in streams {
+            let h = self.held.remove(&(id, s)).expect("listed");
             self.starts.remove(h.stream, h.start);
-            self.ahead.bytes -= record_bytes(&h.changes);
+            self.ahead.bytes -= held_bytes(&h);
+            shares.push(h);
         }
         shares
     }
@@ -1844,11 +1945,11 @@ impl FeedReader {
         if !complete || shares.iter().any(|h| h.outside) {
             return Round::Gap;
         }
-        let mut raws = Vec::new();
+        let mut raws = Vec::with_capacity(shares.len());
         for h in shares {
             let st = &mut self.streams[h.stream];
             st.delivered_end = st.delivered_end.max(h.end);
-            raws.extend(h.changes);
+            raws.push(h.changes);
         }
         Round::Whole(raws)
     }
@@ -1917,7 +2018,7 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
-                    (ts, changes)
+                    (ts, Packs::One(changes))
                 }
                 Pending::Decided {
                     id,
@@ -1931,7 +2032,7 @@ impl FeedReader {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
                     match self.take_round(id, &participants, session) {
-                        Round::Whole(raws) => (ts, raws),
+                        Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
                             self.delivered = key;
                             continue;
@@ -1946,19 +2047,21 @@ impl FeedReader {
             self.delivered = key;
             // A dropped table's changes, in a commit routed before its drop and logged after
             // it (a feed of every table, D315): the drop discarded them.
-            let mut raws = raws;
-            if !self.dropped_tables.is_empty() {
-                raws.retain(|r| !self.dropped_tables.contains(&r.table));
-            }
-            if raws.is_empty() {
+            let packs: &[Raws] = match &raws {
+                Packs::One(r) => std::slice::from_ref(r),
+                Packs::Many(v) => v,
+            };
+            let dropped = &self.dropped_tables;
+            let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
+            if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
                 continue;
             }
             self.out.seqno = key;
             self.out.ts = ts;
             self.out.changes.clear();
-            for r in raws {
-                let value = match blob_pointer(&r.value) {
-                    None => r.value,
+            for r in packs.iter().flat_map(Raws::iter).filter(kept) {
+                let value = match blob_pointer(r.value) {
+                    None => r.value.to_vec(),
                     // The blob GC horizon follows the oldest retained segment, not readers: a
                     // file the view no longer lists under a slow reader means retention
                     // passed it (S1). Any other failure, a checksum's included, is an error.
@@ -1983,8 +2086,8 @@ impl FeedReader {
                     family: r.family,
                     kind: r.kind,
                     ts: r.ts.unwrap_or(ts),
-                    row: r.row,
-                    qualifier: r.qualifier,
+                    row: r.row.to_vec(),
+                    qualifier: r.qualifier.to_vec(),
                     value,
                 });
             }
@@ -2003,7 +2106,7 @@ fn gap(key: Seqno) -> Expiry {
 /// stream's checkpoint passed, noting its round in `dropped`, and expires on one only the
 /// floor passed. Forgets dropped rounds whose segment is below the floor.
 fn drop_undecided(
-    held: &mut BTreeMap<Seqno, Vec<Held>>,
+    held: &mut BTreeMap<(Seqno, usize), Held>,
     starts: &mut Starts,
     bytes: &mut u64,
     dropped: &mut HashMap<Seqno, (usize, u32)>,
@@ -2012,33 +2115,28 @@ fn drop_undecided(
     floors: &[u32],
 ) -> Option<Expiry> {
     let floor_of = |s: usize| floors.get(s).copied().unwrap_or(0);
-    for (id, shares) in held.iter() {
-        if decided.contains(id) {
+    for (&(id, _), h) in held.iter() {
+        if decided.contains(&id) {
             continue;
         }
-        for h in shares {
-            let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
-            if !passed && h.start.epoch() < floor_of(h.stream) {
-                return Some(expiry(
-                    "retention passed a held cross-shard share the checkpoint had not",
-                ));
-            }
+        let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
+        if !passed && h.start.epoch() < floor_of(h.stream) {
+            return Some(expiry(
+                "retention passed a held cross-shard share the checkpoint had not",
+            ));
         }
     }
-    held.retain(|id, shares| {
-        if decided.contains(id) {
+    held.retain(|&(id, _), h| {
+        if decided.contains(&id) {
             return true;
         }
-        shares.retain(|h| {
-            let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
-            if passed {
-                dropped.insert(*id, (h.stream, h.start.epoch()));
-                starts.remove(h.stream, h.start);
-                *bytes -= record_bytes(&h.changes);
-            }
-            !passed
-        });
-        !shares.is_empty()
+        let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
+        if passed {
+            dropped.insert(id, (h.stream, h.start.epoch()));
+            starts.remove(h.stream, h.start);
+            *bytes -= held_bytes(h);
+        }
+        !passed
     });
     dropped.retain(|_, &mut (s, epoch)| epoch >= floor_of(s));
     None
@@ -2047,9 +2145,9 @@ fn drop_undecided(
 impl FeedReader {
     /// Whether `view` lists every blob file pending commit `p`'s values point into.
     fn blobs_listed(&self, view: &crate::snapshot::View, p: &Pending) -> bool {
-        let listed = |raws: &[Raw]| {
+        let listed = |raws: &Raws| {
             raws.iter().all(|r| {
-                blob_pointer(&r.value)
+                blob_pointer(r.value)
                     .is_none_or(|ptr| view.ssts.blob_reader(ptr.blob_file).is_some())
             })
         };
@@ -2057,8 +2155,8 @@ impl FeedReader {
             Pending::Single { changes, .. } => listed(changes),
             Pending::Decided { id, .. } => self
                 .held
-                .get(id)
-                .is_none_or(|shares| shares.iter().all(|h| listed(&h.changes))),
+                .range((*id, 0)..=(*id, usize::MAX))
+                .all(|(_, h)| listed(&h.changes)),
         }
     }
 
@@ -2591,9 +2689,9 @@ mod tests {
     }
 
     /// `held`'s starts, counted as the reader counts them.
-    fn starts_of(held: &BTreeMap<Seqno, Vec<Held>>) -> Starts {
+    fn starts_of(held: &BTreeMap<(Seqno, usize), Held>) -> Starts {
         let mut starts = Starts::default();
-        for h in held.values().flatten() {
+        for h in held.values() {
             starts.add(h.stream, h.start);
         }
         starts
@@ -2604,7 +2702,7 @@ mod tests {
             stream,
             start: Lsn::new(epoch, 64),
             end: Lsn::new(epoch, 128),
-            changes: Vec::new(),
+            changes: Raws::default(),
             outside: false,
         }
     }
@@ -2619,16 +2717,17 @@ mod tests {
         let floors = [4, 2];
         let mut held_map = BTreeMap::from([
             // Undecided, passed on stream 0: dropped, and remembered.
-            (1, vec![held(0, 4)]),
+            ((1, 0), held(0, 4)),
             // Undecided, not passed (epoch 5 at offset 64 is after the checkpoint): kept.
-            (2, vec![held(0, 5)]),
+            ((2, 0), held(0, 5)),
             // Decided: kept whatever the marks say.
-            (7, vec![held(0, 1), held(1, 1)]),
+            ((7, 0), held(0, 1)),
+            ((7, 1), held(1, 1)),
         ]);
         let mut dropped = HashMap::new();
         let mut starts = starts_of(&held_map);
         // Each share's read-ahead bytes (D320): four shares with no changes.
-        let mut bytes = 4 * RECORD_OVERHEAD;
+        let mut bytes = 4 * HELD_ENTRY;
         let e = drop_undecided(
             &mut held_map,
             &mut starts,
@@ -2639,12 +2738,12 @@ mod tests {
             &floors,
         );
         assert!(e.is_none());
-        assert!(!held_map.contains_key(&1));
-        assert!(held_map.contains_key(&2) && held_map.contains_key(&7));
+        assert!(!held_map.contains_key(&(1, 0)));
+        assert!(held_map.contains_key(&(2, 0)) && held_map.contains_key(&(7, 1)));
         assert_eq!(dropped.get(&1), Some(&(0, 4)));
         assert_eq!(
             bytes,
-            3 * RECORD_OVERHEAD,
+            3 * HELD_ENTRY,
             "the dropped share's bytes went with it"
         );
         // The dropped share's start went with it: stream 0's earliest is the decided round's.
@@ -2653,11 +2752,11 @@ mod tests {
 
         // A share below its stream's floor that the checkpoint didn't pass: a bound broken,
         // so the feed expires and nothing is dropped.
-        let mut held_map = BTreeMap::from([(3, vec![held(1, 1)])]);
+        let mut held_map = BTreeMap::from([((3, 1), held(1, 1))]);
         let mut dropped = HashMap::new();
         let checkpoints = [Lsn::new(5, 0), Lsn::new(1, 0)];
         let mut starts = starts_of(&held_map);
-        let mut bytes = RECORD_OVERHEAD;
+        let mut bytes = HELD_ENTRY;
         let e = drop_undecided(
             &mut held_map,
             &mut starts,
@@ -2668,8 +2767,8 @@ mod tests {
             &floors,
         );
         assert!(e.is_some_and(|e| e.reason.contains("retention passed a held")));
-        assert!(held_map.contains_key(&3) && dropped.is_empty());
-        assert_eq!(bytes, RECORD_OVERHEAD);
+        assert!(held_map.contains_key(&(3, 1)) && dropped.is_empty());
+        assert_eq!(bytes, HELD_ENTRY);
 
         // A remembered round is forgotten once the floor passes its segment.
         let mut dropped = HashMap::from([(1, (0, 3)), (2, (0, 4))]);

@@ -4533,3 +4533,10 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
 
 Revisit PR 2 only if a profile shows the re-reads costing more than that.
+
+**Amendment, 2026-11-09: the budget counts what's allocated (#1637).** perf287's heap profile of the 16 × 16 run found the readers holding about 2.5–3× what the cap counted. A single-mutation commit was counted at about 270 B but held about 700–800 B: a `Vec` of mutations grown to four, three allocations per mutation (row, qualifier, value), and its `ready` node.
+- **Packed:** a record's followed mutations are now packed into two allocations of exactly their size. One holds the fixed fields; the other holds the rows, qualifiers and values back to back.
+- **One entry per share:** a held PREPARE is one entry keyed by (round id, stream), with no per-round `Vec`.
+- **The count:** each record's map entry (with its `starts` entry, twice over for a half-full B-tree node) plus its allocations, each rounded to a 16-byte size class.
+- **Measured:** a counting-allocator test holds what's kept to within 1.25× of the count (`tests/feed_memory.rs`: 0.93×, where main was 2.6×). The same backlog takes about half the memory it did.
+- **The cost:** delivery copies each change's bytes out of the pack, where it used to move the vectors. That's one copy of what's delivered.
