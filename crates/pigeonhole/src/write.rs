@@ -3296,6 +3296,7 @@ impl Returned {
     }
 
     /// With the previous values a [`RowMutation::return_previous`] commit asked for.
+    #[cfg(feature = "async")]
     pub(crate) fn with_previous(mut self, previous: Vec<pigeonhole_engine::Previous>) -> Self {
         if !previous.is_empty() {
             self.previous = previous_cells(previous);

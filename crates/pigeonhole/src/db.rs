@@ -139,6 +139,7 @@ pub(crate) struct Watch {
 impl Watch {
     /// For a transaction's commit: `SnapshotExpired` once the swap is in, as its sync
     /// commit gets.
+    #[cfg(feature = "async")]
     pub(crate) fn transaction(mut self) -> Self {
         self.transaction = true;
         self
@@ -321,6 +322,7 @@ impl Db {
     /// after, a swap in between records the new generation, and a refusal by the failed
     /// engine then looks as if nothing swapped (`Closed` instead of `Busy`).
     #[inline]
+    #[cfg(feature = "async")]
     pub(crate) fn watch(&self) -> Watch {
         self.watch_at(self.generation())
     }
