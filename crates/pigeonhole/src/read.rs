@@ -1292,6 +1292,10 @@ struct CellWalk<'t> {
 struct PendingSeek {
     family: FamilyId,
     qualifier: Vec<u8>,
+    /// The walk's current scan while the seek is pending, out of `CellWalk::cursor`: a
+    /// step then finds no scan and checks for a pending seek in its per-row branch, so the
+    /// per-cell step pays nothing for seeks (perf287 on #1625).
+    parked: Option<ScanCursor>,
 }
 
 impl<'t> CellWalk<'t> {
@@ -1340,6 +1344,11 @@ impl<'t> CellWalk<'t> {
     fn step_inner(&mut self) -> Result<bool> {
         loop {
             let Some(cursor) = self.cursor.as_mut() else {
+                // A pending seek holds the scan (`PendingSeek::parked`): it is checked here,
+                // once per scan, not per cell.
+                if self.seek.is_some() {
+                    return self.step_seeking();
+                }
                 let Some(mut next) = self.pending.pop() else {
                     return Ok(false);
                 };
@@ -1348,9 +1357,6 @@ impl<'t> CellWalk<'t> {
                 }
                 continue;
             };
-            if self.seek.is_some() {
-                return self.step_seeking();
-            }
             let Some(cell) = cursor.next_cell()? else {
                 self.cursor = None;
                 continue;
@@ -1373,8 +1379,11 @@ impl<'t> CellWalk<'t> {
     /// (the current one's, then the ones still to start); a family it doesn't read is last.
     #[cfg(feature = "async")]
     fn walk_rank(&self, family: FamilyId) -> usize {
+        // The current scan is parked with a pending seek, if there is one.
+        let parked = self.seek.as_ref().and_then(|p| p.parked.as_ref());
         self.cursor
             .iter()
+            .chain(parked)
             .chain(self.pending.iter().rev())
             .flat_map(|c| c.families())
             .position(|&f| f == family)
@@ -1408,6 +1417,7 @@ impl<'t> CellWalk<'t> {
                     Box::new(PendingSeek {
                         family,
                         qualifier: Vec::new(),
+                        parked: None,
                     })
                 });
             p.family = family;
@@ -1421,7 +1431,10 @@ impl<'t> CellWalk<'t> {
     #[cold]
     #[inline(never)]
     fn step_seeking(&mut self) -> Result<bool> {
-        let p = self.seek.take().expect("a pending seek");
+        let mut p = self.seek.take().expect("a pending seek");
+        if let Some(c) = p.parked.take() {
+            self.cursor = Some(c);
+        }
         let r = self.step_seeking_to(p.family, &p.qualifier);
         self.spare_seek = Some(p);
         r
@@ -1480,10 +1493,17 @@ impl<'t> CellWalk<'t> {
         let r = match self.core.db.check_generation(self.generation) {
             Err(e) => Poll::Ready(Err(e)),
             Ok(()) => {
-                let pending = self.seek.take();
+                let mut pending = self.seek.take();
+                if let Some(c) = pending.as_mut().and_then(|p| p.parked.take()) {
+                    self.cursor = Some(c);
+                }
                 let r = self
                     .poll_step_inner(cx, pending.as_ref().map(|p| (p.family, &p.qualifier[..])));
                 if r.is_pending() {
+                    // Pending with the seek unfinished: the scan is parked with it.
+                    if let Some(p) = pending.as_mut() {
+                        p.parked = self.cursor.take();
+                    }
                     self.seek = pending;
                 } else if pending.is_some() {
                     self.spare_seek = pending;

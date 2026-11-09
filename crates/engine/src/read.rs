@@ -1591,10 +1591,12 @@ impl ScanCursor {
         &self.row
     }
 
-    /// The next cell of the current row, or `None` when the row is done. `#[inline]`: a row
-    /// page walk (`pigeonhole`'s `RowPages`) inlines it, and without the hint an unrelated
-    /// change to this crate tipped it out of line (+1.3% `wide-row-pages` on #1562).
-    #[inline]
+    /// The next cell of the current row, or `None` when the row is done. `#[inline(always)]`:
+    /// the row walks (`pigeonhole`'s `RowPages` and `RowCells`) inline it, and a hint wasn't
+    /// enough. An unrelated change to this crate tipped it out of line (+1.3%
+    /// `wide-row-pages` on #1562), and so did a second call site in `CellWalk` (+1.5–2.2% on
+    /// every text shape on #1625).
+    #[inline(always)]
     pub fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>> {
         let mut qual = std::mem::take(&mut self.qual_buf);
         qual.clear();
