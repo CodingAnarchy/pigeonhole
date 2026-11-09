@@ -105,12 +105,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// How long a follow must run before the pause after the next error starts short again.
 const STEADY: Duration = Duration::from_secs(30);
 
-/// How long a bootstrap waits for the primary's first answer to a fresh download, which
-/// comes only once the primary has written and hashed its whole copy (#1595). Generous: a
-/// large database's copy takes a while; past it the download breaks and starts again, with
-/// a fresh copy, so a primary whose copy takes longer can't bootstrap a replica until the
-/// primary answers at once and heartbeats while it copies (#1611).
-const COPY_WAIT: Duration = Duration::from_secs(10 * 60);
+/// The least a bootstrap waits for the primary's first answer, and between its heartbeats
+/// while it writes its copy (#1611): three of the heartbeats it sends every second, however
+/// short the stream idle limit (which bounds the waits for the copy's data).
+const BEAT_WAIT: Duration = Duration::from_secs(3);
 
 // ---- The primary's side: `Replication.Follow` ----
 
@@ -846,16 +844,14 @@ impl Replica {
                 offset,
                 replica: true,
             })?;
-            // The primary writes and hashes its whole copy before it answers a fresh
-            // download, so the first answer waits for that, bounded by `COPY_WAIT`; a resumed
-            // one, and each later chunk, by the stream idle limit (#1595: a stalled stream
-            // used to hold the bootstrap for ever, with nothing in Info).
-            let first = if backup_id.is_empty() {
-                self.set_bootstrap("waiting for the primary's copy", offset);
-                COPY_WAIT
-            } else {
-                idle
-            };
+            // The primary answers at once and sends a heartbeat (a chunk with no data) every
+            // second while it writes its copy (#1611), so every wait is bounded however long
+            // the copy takes: `BEAT_WAIT` (or the idle limit, if longer) for the answer and
+            // between heartbeats, the stream idle limit for the copy's data (#1595: a stalled
+            // stream used to hold the bootstrap for ever, with nothing in Info).
+            if offset == 0 {
+                self.set_bootstrap("waiting for the primary's copy", 0);
+            }
             let connected = match client.take() {
                 Some(c) => Ok(c),
                 None => self.connect().await.map(admin),
@@ -864,22 +860,25 @@ impl Replica {
                 Err(e) => e,
                 Ok(mut c) => {
                     // Dropped with this pass: a broken stream's connection isn't reused.
-                    let answered = tokio::time::timeout(first, c.backup_download(req)).await;
+                    let beat_wait = idle.max(BEAT_WAIT);
+                    let answered = tokio::time::timeout(beat_wait, c.backup_download(req)).await;
                     match answered {
                         Err(_) => format!(
                             "{} sent no bootstrap copy within {} ms",
                             self.config.primary,
-                            first.as_millis()
+                            beat_wait.as_millis()
                         ),
                         Ok(Ok(r)) => {
                             let mut stream = r.into_inner();
+                            // Until the copy's data starts, the primary may be writing it.
+                            let mut wait = beat_wait;
                             loop {
-                                let Ok(next) = tokio::time::timeout(idle, stream.message()).await
+                                let Ok(next) = tokio::time::timeout(wait, stream.message()).await
                                 else {
                                     break format!(
                                         "no chunk of the bootstrap copy from {} within {} ms",
                                         self.config.primary,
-                                        idle.as_millis()
+                                        wait.as_millis()
                                     );
                                 };
                                 match next {
@@ -899,7 +898,12 @@ impl Replica {
                                         })?;
                                         hash.update(&chunk.data);
                                         offset += chunk.data.len() as u64;
-                                        self.set_bootstrap("downloading", offset);
+                                        // A heartbeat while the primary writes its copy
+                                        // carries no data: still waiting for the copy.
+                                        if !chunk.data.is_empty() {
+                                            self.set_bootstrap("downloading", offset);
+                                            wait = idle;
+                                        }
                                         if !chunk.sha256.is_empty() {
                                             if hash.finalize().as_slice() != chunk.sha256.as_ref() {
                                                 return Err(

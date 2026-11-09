@@ -388,7 +388,7 @@ async fn call(
         Ok(ServiceReply::TextSearch(r)) => json(&r),
         Ok(ServiceReply::TextRebuild(r)) => json(&r),
         Ok(ServiceReply::TextVerify(r)) => json(&r),
-        Ok(ServiceReply::Download(d)) => download(d),
+        Ok(ServiceReply::Download(d)) => download(d).await,
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
         Ok(ServiceReply::OpenSnapshot(r)) => json(&r),
@@ -550,12 +550,19 @@ where
 /// download's id and the whole file's SHA-256 as headers (both known before the first
 /// byte), and `206` plus `Content-Range` for a resume. An error partway ends the body early;
 /// the client's SHA-256 check catches a short copy.
-fn download(d: super::backup::Download) -> Response {
-    struct Data(super::backup::Download);
+/// A download's response. HTTP sends the copy's size and hash as headers, so it waits for a
+/// fresh copy to be written, taking the heartbeats sent meanwhile (#1611: they're gRPC's).
+async fn download(mut d: super::backup::Download) -> Response {
+    use super::backup::Copy;
+    /// The copy's bytes: the first chunk if the wait below took it, then the rest.
+    struct Data(Option<Bytes>, super::backup::Download);
     impl Stream for Data {
         type Item = Result<Bytes, std::io::Error>;
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Pin::new(&mut self.0).poll_next(cx).map(|item| {
+            if let Some(first) = self.0.take() {
+                return Poll::Ready(Some(Ok(first)));
+            }
+            Pin::new(&mut self.1).poll_next(cx).map(|item| {
                 item.map(|r| {
                     r.map(|c| c.data)
                         .map_err(|e| std::io::Error::other(e.message))
@@ -563,10 +570,24 @@ fn download(d: super::backup::Download) -> Response {
             })
         }
     }
-    let (total, offset) = (d.total, d.offset);
+    let mut first = None;
+    let kept = loop {
+        if let Copy::Ready(kept) = &*d.copy.borrow() {
+            break kept.clone();
+        }
+        match d.chunks.recv().await {
+            Some(Ok(c)) if c.data.is_empty() => {}
+            // The task sends the copy's bytes only once it saw the copy ready: this is the
+            // first of them, and the watch says ready too.
+            Some(Ok(c)) => first = Some(c.data),
+            Some(Err(e)) => return e.into_response(),
+            None => return ApiError::internal("the download ended early").into_response(),
+        }
+    };
+    let (total, offset) = (kept.total, d.offset);
     let id = d.id.clone();
-    let sha: String = d.sha256.iter().map(|b| format!("{b:02x}")).collect();
-    let mut resp = Body::from_stream(Data(d)).into_response();
+    let sha: String = kept.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    let mut resp = Body::from_stream(Data(first, d)).into_response();
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,

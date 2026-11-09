@@ -344,6 +344,17 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
+/// How often a download sends a heartbeat chunk while its copy is written (#1611): well
+/// inside any client's idle limit.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// A download's offset past its copy's end.
+fn past_the_copy(offset: u64, total: u64) -> ApiError {
+    ApiError::invalid(format!(
+        "offset {offset} is past the backup's {total} bytes"
+    ))
+}
+
 /// `Replication.Follow`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const FOLLOW: usize = 36;
 
@@ -1258,11 +1269,17 @@ impl Service {
     /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
     /// from an offset, streamed in chunks of up to 1 MiB on its own task. It holds a
     /// `--max-streams` slot until it ends, and each send waits at most `--stream-idle-ms`.
+    ///
+    /// It answers at once (#1611): while the copy is written, the task sends a heartbeat (a
+    /// chunk with no data, at the requested offset, with the id and, for a replica, the feed
+    /// token) at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
+    /// limit and resumes a break during the copy with the id. HTTP waits for the copy
+    /// instead: it sends the size and hash as headers.
     async fn backup_download(
         &self,
         r: proto::BackupDownloadRequest,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup;
+        use super::backup::{self, Copy};
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -1275,37 +1292,39 @@ impl Service {
                 "a replica can't be a bootstrap source: bootstrap from its primary",
             ));
         }
-        let (id, kept) = if r.backup_id.is_empty() {
+        let (id, copy) = if r.backup_id.is_empty() {
             let (db, durable, replica) = (self.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
-            self.backups
-                .fresh_download(move |p| {
-                    if replica {
-                        // A replica's bootstrap (#1436): a durable snapshot's copy, and the
-                        // token of a feed of every table from that same snapshot.
-                        let snap = db.durable_snapshot()?;
-                        let token = db.feed().from_snapshot(&snap).open()?.token();
-                        db.backup_at(&snap, p)?;
-                        return Ok(token.as_bytes().to_vec());
-                    }
-                    if durable {
-                        db.backup_durable(p)?;
-                    } else {
-                        db.backup(p)?;
-                    }
-                    Ok(Vec::new())
-                })
-                .await?
+            self.backups.fresh_download(move |p, started| {
+                if replica {
+                    // A replica's bootstrap (#1436): a durable snapshot's copy, and the
+                    // token of a feed of every table from that same snapshot, sent with the
+                    // heartbeats once it's known.
+                    let snap = db.durable_snapshot()?;
+                    let token = db.feed().from_snapshot(&snap).open()?.token();
+                    let token = token.as_bytes().to_vec();
+                    started(token.clone());
+                    db.backup_at(&snap, p)?;
+                    return Ok(token);
+                }
+                if durable {
+                    db.backup_durable(p)?;
+                } else {
+                    db.backup(p)?;
+                }
+                Ok(Vec::new())
+            })?
         } else {
             (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
         };
-        if r.offset > kept.total {
+        // A kept copy: an offset past it is refused now. One still being written is checked
+        // once it's ready.
+        if let Copy::Ready(kept) = &*copy.borrow()
+            && r.offset > kept.total
+        {
             self.backups.release(&id);
-            return Err(ApiError::invalid(format!(
-                "offset {} is past the backup's {} bytes",
-                r.offset, kept.total
-            )));
+            return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
         let (backups, pool, idle) = (
@@ -1315,38 +1334,78 @@ impl Service {
         );
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
-        let (task_id, task_kept, start) = (id.clone(), kept.clone(), r.offset);
+        let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
         tokio::spawn(async move {
-            let mut at = start;
+            // Sends `chunk` within the idle limit; `false` once the client went away (it
+            // resumes with the id).
+            let send = |chunk: proto::BackupChunk| {
+                let tx = tx.clone();
+                async move {
+                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
+                        Ok(Ok(())) => Ok(true),
+                        Ok(Err(_)) => Ok(false),
+                        Err(_) => Err(ApiError::deadline(
+                            "the client took no backup chunk for --stream-idle-ms; resume \
+                             with backup_id and the offset it reached",
+                        )),
+                    }
+                }
+            };
             let outcome: Result<(), ApiError> = async {
+                // The copy, with heartbeats while it's written (#1611).
+                let kept = loop {
+                    let state = task_copy.borrow_and_update().clone();
+                    let feed_token = match state {
+                        Copy::Ready(kept) => break kept,
+                        Copy::Failed(e) => return Err(e),
+                        Copy::Writing { feed_token } => feed_token,
+                    };
+                    let beat = proto::BackupChunk {
+                        data: Default::default(),
+                        total: 0,
+                        backup_id: task_id.clone(),
+                        offset: start,
+                        sha256: Default::default(),
+                        feed_token: feed_token.into(),
+                    };
+                    if !send(beat).await? {
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        changed = task_copy.changed() => {
+                            // The table dropped the copy without a last state: never expected
+                            // (it says why it failed first).
+                            if changed.is_err()
+                                && matches!(*task_copy.borrow(), Copy::Writing { .. })
+                            {
+                                return Err(ApiError::internal("the backup's copy vanished"));
+                            }
+                        }
+                        () = tokio::time::sleep(HEARTBEAT) => {}
+                    }
+                };
+                if start > kept.total {
+                    return Err(past_the_copy(start, kept.total));
+                }
+                let mut at = start;
                 loop {
-                    let path = task_kept.path.clone();
+                    let path = kept.path.clone();
                     let data = blocking(&pool, move || backup::read_chunk(&path, at)).await?;
                     let next = at + data.len() as u64;
-                    let last = next >= task_kept.total;
+                    let last = next >= kept.total;
                     let chunk = proto::BackupChunk {
                         data: data.into(),
-                        total: if last { task_kept.total } else { 0 },
+                        total: if last { kept.total } else { 0 },
                         backup_id: task_id.clone(),
                         offset: at,
                         sha256: if last {
-                            task_kept.sha256.to_vec().into()
+                            kept.sha256.to_vec().into()
                         } else {
                             Default::default()
                         },
-                        feed_token: task_kept.feed_token.clone().into(),
+                        feed_token: kept.feed_token.clone().into(),
                     };
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => {}
-                        // The client went away; it resumes with the id.
-                        Ok(Err(_)) => return Ok(()),
-                        Err(_) => {
-                            return Err(ApiError::deadline(
-                                "the client took no backup chunk for --stream-idle-ms; resume                                  with backup_id and the offset it reached",
-                            ));
-                        }
-                    }
-                    if last {
+                    if !send(chunk).await? || last {
                         return Ok(());
                     }
                     at = next;
@@ -1366,11 +1425,16 @@ impl Service {
         });
         Ok(super::backup::Download {
             id,
-            total: kept.total,
-            sha256: kept.sha256,
             offset: r.offset,
+            copy,
             chunks: rx,
         })
+    }
+
+    /// Holds each fresh download's backup for `d` before it starts (tests: a slow copy).
+    #[cfg(test)]
+    pub(crate) fn delay_copies(&self, d: std::time::Duration) {
+        self.backups.delay_copies(d);
     }
 
     /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.
