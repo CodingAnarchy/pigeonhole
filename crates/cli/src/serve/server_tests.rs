@@ -810,6 +810,43 @@ fn a_body_that_never_arrives_is_answered_at_the_request_timeout_and_closed() {
 }
 
 #[test]
+fn a_slow_body_counts_toward_the_request_deadline() {
+    // perf287's nit on #1613: the pre-read's time is part of the request's one deadline, so
+    // a body that arrives late leaves the rest of the request less time, not a fresh
+    // --request-timeout-ms. A replica read waiting for a seqno it will never apply waits out
+    // that deadline: from the head's arrival, not from when the body finished.
+    use std::io::Write as _;
+    let p = Server::start("", limits());
+    let mut short = limits();
+    short.request_timeout = Duration::from_millis(1500);
+    let r = Server::start_replica_with(test_dir(), &p.url, None, short);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let body =
+        json!({"table": "t", "row": b64(b"x"), "family": "f", "qualifier": b64(b"q")}).to_string();
+    let mut tcp = raw(
+        &r.url,
+        &format!(
+            "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{}: 999999999\r\nContent-Length: {}\r\n\r\n",
+            super::replica::MIN_PRIMARY_SEQNO,
+            body.len()
+        ),
+    );
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let started = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(1000));
+    tcp.write_all(body.as_bytes()).unwrap();
+    let (head, answer) = read_answer(&mut tcp).unwrap();
+    let took = started.elapsed();
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}{answer}");
+    assert!(answer.contains("ReplicaBehind"), "{answer}");
+    // About 1.5 s from the head; counted from the body's end it would be about 2.5 s.
+    assert!(
+        took >= Duration::from_millis(1400) && took < Duration::from_millis(2200),
+        "answered after {took:?}: the deadline didn't start at the head"
+    );
+}
+
+#[test]
 fn health_and_metrics_answer_while_requests_are_shed() {
     // perf287's F4 on #1501: one slot, held by a request whose body never finishes. Over
     // the pre-read's 64 KiB (#1601), so it takes the slot before its body is read.
