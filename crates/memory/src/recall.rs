@@ -1429,11 +1429,6 @@ impl<'a> Recall<'a> {
     /// of its own (its recency lists' and candidates' rows), so a warm recall over a large
     /// namespace doesn't hold the thread either. The future is `Send`.
     ///
-    /// One gap remains (#1652): a row longer than a block in the engine's key-set reads (the
-    /// candidates' multi-get, a graph expansion's traversal, an IVF list) has its later
-    /// blocks read synchronously, counted in `EngineMetrics::async_sync_reads`: at most a
-    /// block or two per recall.
-    ///
     /// The same refusals as `run`. It works in a reader process
     /// ([`ReadStore::recall`](crate::ReadStore::recall)) too: every read a recall makes has
     /// an async form there, so none is refused.

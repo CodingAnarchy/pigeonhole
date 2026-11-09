@@ -309,6 +309,16 @@ struct AsyncKeys {
     /// The cache keeps nothing, or a key needed too many fetches: read synchronously from now
     /// on (counted).
     sync: bool,
+    /// A block the current key's next cell step reads, being fetched
+    /// ([`KeyCursor::poll_cell_ready`], #1652).
+    cell_fetch: Option<(pigeonhole_io::Completion, Box<pigeonhole_sst::Fetch>)>,
+    /// Blocks fetched for the current key's cell steps, until its lane moves past.
+    cell_pinned: Vec<pigeonhole_cache::BlockHandle>,
+    /// The lane last probed for its next block and where its cursors stood
+    /// ([`Lane::block_stamp`]): probed again only once they move to another block.
+    cell_probed: Option<(usize, u64)>,
+    /// Where that lane stood when its last cell fetch started.
+    cell_pinned_at: Option<(usize, u64)>,
 }
 
 /// Where positioning on one key left the cursor.
@@ -582,6 +592,9 @@ impl KeyCursor {
                 Ok(Step::Key(i)) => {
                     nb.fetches = 0;
                     nb.pinned.retain(|(k, _)| *k > i);
+                    nb.cell_pinned.clear();
+                    nb.cell_probed = None;
+                    nb.cell_pinned_at = None;
                     for r in &mut self.reads {
                         for source in r.lane.resolver.cursor_mut().sources_mut() {
                             source.set_cache_only(false);
@@ -617,6 +630,76 @@ impl KeyCursor {
         };
         self.nb = Some(nb);
         Poll::Ready(out)
+    }
+
+    /// Whether the current key's next cell step reads only cached blocks (D196 within a
+    /// row, #1652), for a reader stepping an async multi-get's cells with
+    /// [`KeyCursor::next_cell`] inside [`KeyCursor::counted`]: `Ready(Ok(()))` when it does, or
+    /// once the block it reads is fetched (a fetch that completes at once is admitted and the
+    /// next block asked for, in the same poll); `Pending` while one is in flight, its
+    /// completion registered to wake the task. It never moves the cursor. Every source the
+    /// step moves is asked in turn, so a shadowed version's older SST is fetched too
+    /// (perf287 on #1652). On a cursor never polled, or one reading synchronously, it is
+    /// `Ready` at once. Out of line: the sync steps stay as they are (#1167).
+    #[inline(never)]
+    pub fn poll_cell_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let Some(mut nb) = self.nb.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        let out = self.cell_ready(&mut nb, cx);
+        self.nb = Some(nb);
+        out
+    }
+
+    fn cell_ready(&mut self, nb: &mut AsyncKeys, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        use std::future::Future;
+        loop {
+            if let Some((completion, fetch)) = &mut nb.cell_fetch {
+                let buf = match std::pin::Pin::new(completion).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(buf) => buf,
+                };
+                let admitted = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?));
+                let kept = fetch.is_kept();
+                nb.cell_fetch = None;
+                match admitted {
+                    Ok(handle) => nb.cell_pinned.extend(handle),
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+                if !kept {
+                    // The cache keeps nothing: read synchronously from now on (counted).
+                    nb.sync = true;
+                    self.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if nb.sync || self.current.is_none() {
+                return Poll::Ready(Ok(()));
+            }
+            let Some(i) = self.last_lane else {
+                // No cell handed out yet: the key's positioning read its first cells.
+                return Poll::Ready(Ok(()));
+            };
+            let lane = &self.reads[i].lane;
+            let stamp = lane.block_stamp();
+            if nb.cell_probed == Some((i, stamp)) {
+                return Poll::Ready(Ok(()));
+            }
+            if nb.cell_pinned_at.is_some_and(|at| at != (i, stamp)) {
+                // Past the block it stood in when the fetch started: it holds what it reads.
+                nb.cell_pinned.clear();
+                nb.cell_pinned_at = None;
+            }
+            match super::submit_next_block(lane) {
+                Some(f) => {
+                    nb.cell_fetch = Some(f);
+                    nb.cell_pinned_at = Some((i, stamp));
+                }
+                None => {
+                    nb.cell_probed = Some((i, stamp));
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
     }
 
     /// Runs `f` on this cursor counting the file reads it makes synchronously into

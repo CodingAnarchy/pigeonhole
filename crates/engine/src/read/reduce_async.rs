@@ -47,17 +47,27 @@ enum Source {
 /// A cursor that lends the current row's cells one at a time.
 trait RowCells {
     fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>>;
+    /// Fetches the block the next step reads first (#1652): `Pending` while it's in flight.
+    fn poll_cell_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<()>>;
 }
 
 impl RowCells for ScanCursor {
     fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>> {
         ScanCursor::next_cell(self)
     }
+
+    fn poll_cell_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<()>> {
+        ScanCursor::poll_cell_ready(self, cx)
+    }
 }
 
 impl RowCells for KeyCursor {
     fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>> {
         KeyCursor::next_cell(self)
+    }
+
+    fn poll_cell_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<()>> {
+        KeyCursor::poll_cell_ready(self, cx)
     }
 }
 
@@ -120,6 +130,8 @@ struct Row {
 enum Step {
     /// The poll's bound ran out: the row goes on next poll.
     Yield,
+    /// The next cell is in a block being fetched (#1652): the row goes on once it lands.
+    Fetch,
     /// The row ended: on to the next.
     RowDone,
     /// The rest of the row is dropped unread (a visitor's `NextRow`).
@@ -222,8 +234,8 @@ where
                 bytes: &mut bytes,
             };
             let step = match &mut self.source {
-                Source::Scan(c) => c.counted(|c| read.read(c)),
-                Source::Keys { cursor, .. } => cursor.counted(|c| read.read(c)),
+                Source::Scan(c) => c.counted(|c| read.read(c, cx)),
+                Source::Keys { cursor, .. } => cursor.counted(|c| read.read(c, cx)),
             }?;
             match step {
                 Step::Yield => {
@@ -231,6 +243,8 @@ where
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
+                // The row's place is kept; the fetch's completion wakes the task.
+                Step::Fetch => return Poll::Pending,
                 Step::RowDone => self.row.reading = false,
                 Step::SkipRow => {
                     // A scan's next row drops the rest itself (#1550); a key's is dropped here.
@@ -261,10 +275,17 @@ where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
 {
-    fn read(&mut self, cursor: &mut impl RowCells) -> Result<Step> {
+    fn read(
+        &mut self,
+        cursor: &mut impl RowCells,
+        cx: &mut std::task::Context<'_>,
+    ) -> Result<Step> {
         loop {
             if *self.cells == 0 || *self.bytes == 0 {
                 return Ok(Step::Yield);
+            }
+            if cursor.poll_cell_ready(cx)?.is_pending() {
+                return Ok(Step::Fetch);
             }
             let Some(c) = cursor.next_cell()? else {
                 return Ok(Step::RowDone);

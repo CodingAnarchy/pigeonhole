@@ -658,6 +658,7 @@ impl<'t> KeysRead<'t> {
             core: Cow::Borrowed(self.core),
             generation,
             done: false,
+            filling: None,
         })
     }
 }
@@ -679,6 +680,9 @@ pub struct KeyRows<'t> {
     core: Cow<'t, Arc<TableCore>>,
     generation: u64,
     done: bool,
+    /// The key whose row an async read is filling `buf` with, cell by cell (#1652): a fill
+    /// stops at a cell whose block is being fetched, and goes on at the next poll.
+    filling: Option<usize>,
 }
 
 impl<'t> KeyRows<'t> {
@@ -713,6 +717,12 @@ impl<'t> KeyRows<'t> {
     }
 
     fn fill(&mut self) -> Result<Option<usize>> {
+        // An async read stopped mid-row: the sync step finishes that row, so no key is lost
+        // (perf287's point 4 on #1652).
+        if let Some(i) = self.filling.take() {
+            while self.cursor.push_next_cell(&mut self.buf)? {}
+            return Ok(Some(i));
+        }
         let Some(i) = self.cursor.next_key()? else {
             return Ok(None);
         };
@@ -776,6 +786,7 @@ impl<'t> KeyRows<'t> {
             core: Cow::Owned(self.core.into_owned()),
             generation: self.generation,
             done: self.done,
+            filling: self.filling,
         })
     }
 
@@ -794,15 +805,44 @@ impl<'t> KeyRows<'t> {
         if let Err(e) = self.core.db.check_generation(self.generation) {
             return Poll::Ready(Err(e));
         }
-        Poll::Ready(match self.cursor.poll_next_key(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Ok(Some(i))) => {
-                let buf = &mut self.buf;
-                self.cursor.counted(|c| fill_key(c, buf)).map(|()| Some(i))
+        let i = match self.filling {
+            Some(i) => i,
+            None => match self.cursor.poll_next_key(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(Some(i))) => {
+                    self.buf.clear();
+                    self.buf.key.extend_from_slice(self.cursor.row());
+                    self.filling = Some(i);
+                    i
+                }
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+            },
+        };
+        // The row's cells, each step's block fetched first (D196 within the row, #1652).
+        let buf = &mut self.buf;
+        let filled = self.cursor.counted(|c| -> Result<bool> {
+            loop {
+                match c.poll_cell_ready(cx) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(r) => r?,
+                }
+                if !c.push_next_cell(buf)? {
+                    return Ok(true);
+                }
             }
-            Poll::Ready(Ok(None)) => Ok(None),
-            Poll::Ready(Err(e)) => Err(e.into()),
-        })
+        });
+        match filled {
+            Ok(false) => Poll::Pending,
+            Ok(true) => {
+                self.filling = None;
+                Poll::Ready(Ok(Some(i)))
+            }
+            Err(e) => {
+                self.filling = None;
+                Poll::Ready(Err(e))
+            }
+        }
     }
 
     /// The next row, owned, for [`KeyStream`](crate::nonblocking::KeyStream).
