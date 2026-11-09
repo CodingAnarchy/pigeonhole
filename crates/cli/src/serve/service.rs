@@ -1306,8 +1306,14 @@ impl Service {
             ServiceOp::Forget(r) => {
                 let ids = super::memory::ids(&r.ids)?;
                 self.memory_write("Memory.Forget", caller, budget, move |core, scope| {
-                    let (forgotten, _missing) = core.forget(scope, &ids)?;
-                    Ok(proto::ForgetResponse { forgotten })
+                    // Serve answers the failure; the deletes before it stand.
+                    let done = core.forget(scope, &ids)?;
+                    if let Some((e, _left)) = done.failed {
+                        return Err(e.into());
+                    }
+                    Ok(proto::ForgetResponse {
+                        forgotten: done.deleted,
+                    })
                 })
                 .await
                 .map(ServiceReply::Forget)

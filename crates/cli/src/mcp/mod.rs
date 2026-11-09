@@ -26,7 +26,6 @@ use crate::open::{self, Db};
 mod cursor;
 mod embed;
 // `phdb serve`'s memory core embeds through it (D313 ticket 8a); stdio with 8b.
-#[cfg(feature = "serve")]
 pub(crate) use embed::{EmbedFault, Endpoint};
 mod memory;
 mod tools;

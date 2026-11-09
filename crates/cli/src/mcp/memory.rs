@@ -17,17 +17,18 @@
 //! be the store's. With `--embed-url`, the server embeds the text itself and refuses a
 //! client's vectors. A store without a model recalls by keyword and recency only.
 
-use pigeonhole::{Element, Pigeonhole, RetryPolicy};
-use pigeonhole_memory::{
-    EmbeddingModel, Kind, LinkType, Memory as NewMemory, MemoryId, OpenOptions, ReadStore,
-    Remembered, Store, StoreOptions,
-};
+use std::sync::Arc;
+
+use pigeonhole_memory::{EmbeddingModel, Kind, LinkType, MemoryId, Remembered};
 use serde_json::{Map, Value, json};
 
 use super::embed::Endpoint;
 use super::tools::{Args, Outcome, tool};
 use crate::args::MemoryArgs;
 use crate::exit::Failure;
+use crate::memcore::{
+    self, Embedder, MemCore, MemError, MemErrorKind, OpenError, RecallArgs, Remember, Scope,
+};
 use crate::open::Db;
 
 /// The most hits one recall may ask for, and its default.
@@ -43,23 +44,16 @@ const DEFAULT_NAMESPACE: &str = "default";
 /// The guide served as `memory://guide`, and the MCP guide's memory section.
 pub(super) const GUIDE: &str = include_str!("memory_guide.md");
 
-/// The store, in the database's role.
-enum Handle {
-    Writer(Store),
-    Reader(ReadStore),
-}
-
-/// The memory tools over one store.
+/// The memory tools over one store: `phdb mcp`'s arguments and answers around the store's
+/// operations in [`MemCore`], the one implementation `phdb serve`'s `Memory` service shares
+/// (D313 ticket 8b).
 pub(super) struct Memory {
     name: String,
-    store: Handle,
+    core: MemCore,
     /// Whether writes can succeed.
     writable: bool,
-    /// The database, as the writer: `memory_remember` with `supersedes` remembers in a
-    /// transaction of its own.
-    db: Option<Pigeonhole>,
     /// `--embed-url`: the server embeds text itself.
-    endpoint: Option<Endpoint>,
+    embeds: bool,
     /// The default recall budget (`--max-result-bytes`).
     result_bytes: usize,
 }
@@ -77,120 +71,82 @@ impl Memory {
         let Some(name) = args.memory.clone() else {
             return Ok(None);
         };
-        let endpoint = match &args.embed_url {
-            Some(url) => Some(Endpoint::new(
+        let embedder = match &args.embed_url {
+            Some(url) => Some(Arc::new(Embedder::Remote(Endpoint::new(
                 url,
                 args.embed_model.as_deref().unwrap_or_default(),
                 args.embed_key_env.as_deref(),
                 super::embed::TIMEOUT,
-            )?),
+            )?))),
             None => None,
         };
-        // The model the caller expects: the endpoint's, or the client's `--memory-model`.
-        let expected = endpoint
-            .as_ref()
-            .map(|e| e.model().to_owned())
-            .or_else(|| args.memory_model.clone());
-        let fail = |e: pigeonhole_memory::Error| failure(&format!("memory store {name}"), e);
+        let embeds = embedder.is_some();
+        // A recall's budget: `--max-result-bytes` when it asks for none, any larger it asks.
+        let budget = (result_bytes as u64, u64::MAX);
+        let open = |e: OpenError| match e {
+            OpenError::Pin(f) | OpenError::Create(f) => f,
+            OpenError::Store(e) => failure(&format!("memory store {name}"), e),
+        };
         let exists = db.tables().iter().any(|t| *t == format!("mem_{name}"));
-        let store = match db {
-            Db::Writer(p) if exists => {
-                // A probe reads the pinned model; it owns its forgetter, so it starts no
-                // thread (ai1249's M2 on #1389). Then the real handle, as the expected caller.
-                let probe = Store::open_with(
+        let core = match db {
+            Db::Writer(p) => {
+                let create = memcore::create_options(args, &name);
+                MemCore::open_in(
                     p,
                     &name,
-                    OpenOptions::new().without_embeddings().own_forgetter(),
+                    embedder,
+                    args.memory_model.as_deref(),
+                    writable.then_some(&*create),
+                    budget,
                 )
-                .map_err(fail)?;
-                let pinned = probe.embedding_model().cloned();
-                drop(probe);
-                check_pin(&name, pinned.as_ref(), expected.as_deref(), args)?;
-                Handle::Writer(
-                    match pinned {
-                        Some(m) => Store::open(p, &name, m.id()),
-                        None => Store::open_without_embeddings(p, &name),
-                    }
-                    .map_err(fail)?,
-                )
-            }
-            Db::Writer(p) if writable => {
-                let mut options = StoreOptions::new();
-                let model = match (&endpoint, &args.memory_model, args.memory_dim) {
-                    (Some(e), _, _) => {
-                        // The dimension is the endpoint's: one probe embedding tells it.
-                        let dim = e.embed("dimension probe")?.len();
-                        Some((e.model().to_owned(), dim as u32))
-                    }
-                    (None, Some(id), Some(dim)) => Some((id.clone(), dim)),
-                    _ => None,
-                };
-                if let Some((id, dim)) = &model {
-                    let element = match args.memory_element.as_str() {
-                        "f16" => Element::F16,
-                        "bf16" => Element::BF16,
-                        _ => Element::F32,
-                    };
-                    options = options
-                        .embedding(EmbeddingModel::new(id.clone(), *dim, element).map_err(fail)?);
-                }
-                if let Some(hours) = args.memory_episodic_ttl {
-                    options = options
-                        .episodic_ttl(std::time::Duration::from_secs(hours.saturating_mul(3600)));
-                }
-                if let Some(n) = &args.memory_normalization {
-                    options = options.normalization(normalization(n));
-                }
-                let store = Store::create(p, &name, options).map_err(fail)?;
-                let _ = writeln!(
-                    stderr,
-                    "phdb mcp: created memory store {name} ({})",
-                    match &model {
-                        Some((id, dim)) => format!("embedding model {id}, {dim} dimensions"),
-                        None => "no embedding model: recall is by keyword and recency, and \
-                                 the store can never take embeddings"
-                            .into(),
-                    }
-                );
-                Handle::Writer(store)
-            }
-            Db::Writer(_) => {
-                return Err(Failure::usage(&format!(
-                    "--memory {name}: the store doesn't exist, and the database is read-only"
-                )));
+                .map_err(open)?
+                .ok_or_else(|| {
+                    Failure::usage(&format!(
+                        "--memory {name}: the store doesn't exist, and the database is read-only"
+                    ))
+                })?
             }
             Db::Reader(r) => {
-                if !exists {
-                    return Err(Failure::usage(&format!(
-                        "--memory {name}: the store doesn't exist (a reader can't create it)"
-                    )));
-                }
-                let probe = Store::open_reader_without_embeddings(r, &name).map_err(fail)?;
-                let pinned = probe.embedding_model().cloned();
-                check_pin(&name, pinned.as_ref(), expected.as_deref(), args)?;
-                match pinned {
-                    Some(m) => {
-                        drop(probe);
-                        Handle::Reader(Store::open_reader(r, &name, m.id()).map_err(fail)?)
-                    }
-                    None => Handle::Reader(probe),
-                }
+                MemCore::open_reader(r, &name, embedder, args.memory_model.as_deref(), budget)
+                    .map_err(open)?
+                    .ok_or_else(|| {
+                        Failure::usage(&format!(
+                            "--memory {name}: the store doesn't exist (a reader can't create it)"
+                        ))
+                    })?
             }
         };
+        if !exists {
+            let _ = writeln!(
+                stderr,
+                "phdb mcp: created memory store {name} ({})",
+                match core.model() {
+                    Some(m) => format!("embedding model {}, {} dimensions", m.id(), m.dim()),
+                    None => "no embedding model: recall is by keyword and recency, and the \
+                             store can never take embeddings"
+                        .into(),
+                }
+            );
+        }
+        // An existing store's dimension against `--memory-dim`.
+        if let (Some(m), Some(dim)) = (core.model(), args.memory_dim)
+            && m.dim() != dim
+        {
+            return Err(Failure::usage(&format!(
+                "memory store {name} is pinned to {} dimensions, not {dim}",
+                m.dim()
+            )));
+        }
         // The normalisation is fixed at create: a flag naming another one for an existing
         // store fails at startup, as a model that doesn't match does (#1405).
-        if let Some(want) = &args.memory_normalization {
-            let have = match &store {
-                Handle::Writer(s) => s.normalization(),
-                Handle::Reader(s) => s.normalization(),
-            };
-            if have != normalization(want) {
-                return Err(Failure::usage(&format!(
-                    "--memory-normalization {want}: memory store {name}'s text index is {}, \
-                     fixed when it was created",
-                    normalization_name(have)
-                )));
-            }
+        if let Some(want) = &args.memory_normalization
+            && core.normalization() != normalization(want)
+        {
+            return Err(Failure::usage(&format!(
+                "--memory-normalization {want}: memory store {name}'s text index is {}, fixed \
+                 when it was created",
+                normalization_name(core.normalization())
+            )));
         }
         if exists && (args.memory_episodic_ttl.is_some() || args.memory_dim.is_some()) {
             let _ = writeln!(
@@ -199,50 +155,43 @@ impl Memory {
                  apply only to a new store"
             );
         }
-        let writable = writable && matches!(store, Handle::Writer(_));
-        let db = match db {
-            Db::Writer(p) => Some(p.clone()),
-            Db::Reader(_) => None,
-        };
+        let writable = writable && core.writable();
         Ok(Some(Self {
             name,
-            store,
+            core,
             writable,
-            db,
-            endpoint,
+            embeds,
             result_bytes,
         }))
     }
 
     /// The store's pinned model.
     fn model(&self) -> Option<&EmbeddingModel> {
-        match &self.store {
-            Handle::Writer(s) => s.embedding_model(),
-            Handle::Reader(s) => s.embedding_model(),
-        }
+        self.core.model()
     }
 
-    fn writer(&self) -> Result<&Store, Failure> {
-        match &self.store {
-            Handle::Writer(s) if self.writable => Ok(s),
-            _ => Err(Failure::read_only("reader")),
+    fn writer(&self) -> Result<(), Failure> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(Failure::read_only("reader"))
         }
     }
 
     /// The memory paragraph of the server's instructions.
     pub(super) fn instructions(&self) -> String {
-        let embeddings = match (&self.endpoint, self.model()) {
-            (Some(_), _) => {
+        let embeddings = match (self.embeds, self.model()) {
+            (true, _) => {
                 "The server computes embeddings: send text only, never an embedding.".to_owned()
             }
-            (None, Some(m)) => format!(
+            (false, Some(m)) => format!(
                 "The store is pinned to the embedding model {:?} ({} dimensions): send an \
                  embedding only if it comes from exactly that model, with embedding_model set \
                  to its id; otherwise send text only and recall falls back to keywords.",
                 m.id(),
                 m.dim()
             ),
-            (None, None) => {
+            (false, None) => {
                 "The store has no embedding model: send text only; recall is by keyword and \
                  recency."
                     .to_owned()
@@ -297,37 +246,22 @@ impl Memory {
 
     /// Drops the store (and its forgetter) before the database closes.
     pub(super) fn close(self) {
-        drop(self.store);
-        drop(self.db);
+        drop(self.core);
     }
 
-    /// The embedding a call uses: the endpoint's for `text`, or the client's (checked
-    /// against the pinned model), or none.
-    fn embedding(&self, a: &Args<'_>, text: Option<&str>) -> Result<Option<Vec<f32>>, Failure> {
+    /// A client's embedding, checked as `phdb mcp` documents it: with `--embed-url` there's
+    /// none (the server embeds the text); otherwise it must name `embedding_model`, the
+    /// store's, and fit its dimension. The store's core checks it again.
+    fn client_embedding(&self, a: &Args<'_>) -> Result<Option<Vec<f32>>, Failure> {
         let given = a.get("embedding");
         let named = a.opt_str("embedding_model")?;
-        if let Some(e) = &self.endpoint {
+        if self.embeds {
             if given.is_some() || named.is_some() {
                 return Err(Failure::usage(
                     "this server computes the embeddings (--embed-url): send text only",
                 ));
             }
-            let Some(text) = text else {
-                return Ok(None);
-            };
-            let v = e.embed(text)?;
-            if let Some(m) = self.model()
-                && v.len() != m.dim() as usize
-            {
-                return Err(Failure::input(format!(
-                    "the embedding endpoint returned {} dimensions; the store is pinned to {} \
-                     ({})",
-                    v.len(),
-                    m.dim(),
-                    m.id()
-                )));
-            }
-            return Ok(Some(v));
+            return Ok(None);
         }
         let Some(given) = given else {
             if named.is_some() {
@@ -382,49 +316,30 @@ impl Memory {
             "links",
             "supersedes",
         ])?;
-        let store = self.writer()?;
+        self.writer()?;
         let ns = namespace(&a)?;
         let text = a.str("text")?;
         let supersedes = a.opt_str("supersedes")?.map(memory_id).transpose()?;
-        // Before the write: a memory supersedes one of its own namespace only (ai1249's M1).
-        if let Some(old) = &supersedes
-            && old.namespace() != ns
+        let embedding = self.client_embedding(&a)?;
+        if embedding.is_none()
+            && !self.embeds
+            && let Some(model) = self.model()
         {
             return Err(Failure::usage(&format!(
-                "supersedes: {old} is in namespace {:?}, not {ns:?}",
-                old.namespace()
+                "this store is pinned to the embedding model {:?}: a memory needs its \
+                 embedding (with embedding_model)",
+                model.id()
             )));
         }
-        let mut m = NewMemory::new(text);
-        match self.embedding(&a, Some(text))? {
-            Some(v) => m = m.embedding(v),
-            None => {
-                if let Some(model) = self.model() {
-                    return Err(Failure::usage(&format!(
-                        "this store is pinned to the embedding model {:?}: a memory needs its \
-                         embedding (with embedding_model)",
-                        model.id()
-                    )));
-                }
-            }
-        }
-        if let Some(k) = a.opt_str("kind")? {
-            m = m.kind(kind(k)?);
-        }
-        if let Some(v) = a.get("importance") {
-            let i = v
-                .as_f64()
-                .filter(|i| (0.0..=1.0).contains(i))
-                .ok_or_else(|| Failure::usage("importance: a number from 0 to 1"))?;
-            m = m.importance(i);
-        }
-        if let Some(s) = a.opt_str("source")? {
-            m = m.source(s);
-        }
-        if let Some(s) = a.opt_str("session")? {
-            m = m.session(s);
-        }
-        m = m.pinned(a.bool_or("pinned", false)?);
+        let importance = match a.get("importance") {
+            None => None,
+            Some(v) => Some(
+                v.as_f64()
+                    .filter(|i| (0.0..=1.0).contains(i))
+                    .ok_or_else(|| Failure::usage("importance: a number from 0 to 1"))?,
+            ),
+        };
+        let mut links = Vec::new();
         for l in a.list("links")? {
             let Value::Object(l) = l else {
                 return Err(Failure::usage("links: a list of {to, type, weight}"));
@@ -432,19 +347,26 @@ impl Memory {
             let l = Args(l);
             l.only(&["to", "type", "weight"])
                 .map_err(|f| f.within("links"))?;
-            m = m.link(memory_id(l.str("to")?)?, link_type(&l)?, weight(&l)?);
+            links.push((memory_id(l.str("to")?)?, link_type(&l)?, weight(&l)?));
         }
-        // A correction is near what it corrects, so with `supersedes` near dedup mustn't stop
-        // the write (simp724's S1 on #1389): `remember_in` skips it, keeping exact dedup.
-        let done = match (&supersedes, &self.db) {
-            (Some(_), Some(db)) => db
-                .transact(&RetryPolicy::default(), |txn| {
-                    store.remember_in(txn, ns, m.clone())
-                })
-                .map(|(r, _)| r),
-            _ => store.remember(ns, m),
-        }
-        .map_err(|e| failure("remember", e))?;
+        let r = Remember {
+            namespace: ns.to_owned(),
+            text: text.to_owned(),
+            embedding,
+            kind: a.opt_str("kind")?.map(kind).transpose()?,
+            importance,
+            source: a.opt_str("source")?.map(str::to_owned),
+            session: a.opt_str("session")?.map(str::to_owned),
+            pinned: a.bool_or("pinned", false)?,
+            links,
+        };
+        // A correction is near what it corrects, so with `supersedes` the core skips near
+        // dedup (simp724's S1 on #1389), keeping exact dedup; the supersede is a second
+        // transaction whose failure comes back with the stored id (simp724's S2).
+        let (done, supersede_error) = self
+            .core
+            .remember(ALL, r, supersedes.clone())
+            .map_err(mem_failure)?;
         let (outcome, id) = match &done {
             Remembered::New(id) => ("new", id),
             Remembered::Merged(id) => ("merged", id),
@@ -455,13 +377,9 @@ impl Memory {
         out.insert("id".into(), json!(id.to_string()));
         out.insert("outcome".into(), json!(outcome));
         if let Some(old) = supersedes {
-            // A second transaction: a crash between the two leaves `old` unsuperseded. A
-            // failure returns the stored memory's id with the error (simp724's S2), so the
-            // agent can retry the supersede alone.
-            let mut superseded = old != *id;
-            if superseded && let Err(e) = store.supersede(&old, id) {
-                superseded = false;
-                out.insert("supersede_error".into(), failure("supersede", e).json());
+            let superseded = old != *id && supersede_error.is_none();
+            if let Some(e) = supersede_error {
+                out.insert("supersede_error".into(), mem_failure(e).json());
             }
             out.insert("superseded".into(), json!(superseded));
         }
@@ -487,12 +405,7 @@ impl Memory {
             return Err(Failure::usage("namespace or namespaces, not both"));
         }
         let text = a.opt_str("text")?;
-        // Keyword-only recall on a pinned store is fine: the vector signal just has no rank.
-        let embedding = if self.model().is_some() || self.endpoint.is_some() {
-            self.embedding(&a, text)?
-        } else {
-            self.embedding(&a, None)?
-        };
+        let embedding = self.client_embedding(&a)?;
         if text.is_none() && embedding.is_none() {
             return Err(Failure::usage("memory_recall needs text or an embedding"));
         }
@@ -503,25 +416,25 @@ impl Memory {
             MIN_RECALL_BYTES,
             u64::MAX,
         )?;
-        let ns: Vec<&str> = namespaces.iter().map(String::as_str).collect();
-        let mut r = match &self.store {
-            Handle::Writer(s) => s.recall(&ns),
-            Handle::Reader(s) => s.recall(&ns),
-        };
-        r = r
-            .k(k as usize)
-            .byte_budget(max_bytes)
-            .include_superseded(a.bool_or("include_superseded", false)?);
-        if let Some(t) = text {
-            r = r.text(t);
-        }
-        if let Some(e) = embedding {
-            r = r.embedding(e);
-        }
-        if let Some(s) = a.opt_str("session")? {
-            r = r.session(s);
-        }
-        let (hits, stats) = r.run_with_stats().map_err(|e| failure("recall", e))?;
+        let (hits, stats) = self
+            .core
+            .recall(
+                ALL,
+                RecallArgs {
+                    namespaces,
+                    text: text.map(str::to_owned),
+                    embedding,
+                    k: k as usize,
+                    byte_budget: max_bytes,
+                    expand_hops: 0,
+                    exact: false,
+                    include_superseded: a.bool_or("include_superseded", false)?,
+                    session: a.opt_str("session")?.map(str::to_owned),
+                    with_embeddings: false,
+                    with_signals: false,
+                },
+            )
+            .map_err(mem_failure)?;
         let hits: Vec<Value> = hits
             .into_iter()
             .map(|h| {
@@ -546,9 +459,9 @@ impl Memory {
 
     fn mark_used(&self, a: Args<'_>) -> Outcome {
         a.only(&["ids"])?;
-        let store = self.writer()?;
+        self.writer()?;
         let ids = ids(&a, "ids")?;
-        let m = store.mark_used(&ids).map_err(|e| failure("mark_used", e))?;
+        let m = self.core.mark_used(ALL, &ids).map_err(mem_failure)?;
         let missing: Vec<String> = m.missing.iter().map(ToString::to_string).collect();
         Ok(super::tools::object(
             json!({"marked": m.marked, "missing": missing}),
@@ -557,51 +470,43 @@ impl Memory {
 
     fn supersede(&self, a: Args<'_>) -> Outcome {
         a.only(&["old", "new"])?;
-        let store = self.writer()?;
+        self.writer()?;
         let old = memory_id(a.str("old")?)?;
         let new = memory_id(a.str("new")?)?;
-        store
-            .supersede(&old, &new)
-            .map_err(|e| failure("supersede", e))?;
+        self.core.supersede(ALL, &old, &new).map_err(mem_failure)?;
         Ok(Map::new())
     }
 
     fn link(&self, a: Args<'_>) -> Outcome {
         a.only(&["from", "to", "type", "weight"])?;
-        let store = self.writer()?;
+        self.writer()?;
         let from = memory_id(a.str("from")?)?;
         let to = memory_id(a.str("to")?)?;
-        store
-            .link(&from, &to, link_type(&a)?, weight(&a)?)
-            .map_err(|e| failure("link", e))?;
+        self.core
+            .link(ALL, &from, &to, link_type(&a)?, weight(&a)?)
+            .map_err(mem_failure)?;
         Ok(Map::new())
     }
 
     fn forget(&self, a: Args<'_>) -> Outcome {
         a.only(&["ids"])?;
-        let store = self.writer()?;
+        self.writer()?;
         let ids = ids(&a, "ids")?;
-        let mut deleted = 0;
-        let mut missing = Vec::new();
-        for (i, id) in ids.iter().enumerate() {
-            match store.delete(id) {
-                Ok(true) => deleted += 1,
-                Ok(false) => missing.push(id.to_string()),
-                Err(e) => {
-                    // The deletes before it stand: report them, the error, and what's left
-                    // (simp724's S2 on #1389).
-                    let left: Vec<String> = ids[i..].iter().map(ToString::to_string).collect();
-                    return Ok(super::tools::object(json!({
-                        "deleted": deleted,
-                        "missing": missing,
-                        "error": failure("forget", e).json(),
-                        "not_deleted": left,
-                    })));
-                }
-            }
+        let done = self.core.forget(ALL, &ids).map_err(mem_failure)?;
+        let missing: Vec<String> = done.missing.iter().map(ToString::to_string).collect();
+        if let Some((e, left)) = done.failed {
+            // The deletes before it stand: report them, the error, and what's left
+            // (simp724's S2 on #1389).
+            let left: Vec<String> = left.iter().map(ToString::to_string).collect();
+            return Ok(super::tools::object(json!({
+                "deleted": done.deleted,
+                "missing": missing,
+                "error": mem_failure(e).json(),
+                "not_deleted": left,
+            })));
         }
         Ok(super::tools::object(
-            json!({"deleted": deleted, "missing": missing}),
+            json!({"deleted": done.deleted, "missing": missing}),
         ))
     }
 
@@ -693,9 +598,9 @@ impl Memory {
 
     /// What a tool description says about embeddings.
     fn embedding_note(&self) -> String {
-        match (&self.endpoint, self.model()) {
-            (Some(_), _) => "The server computes the embedding: send text only.".into(),
-            (None, Some(m)) => format!(
+        match (self.embeds, self.model()) {
+            (true, _) => "The server computes the embedding: send text only.".into(),
+            (false, Some(m)) => format!(
                 "The store is pinned to the embedding model {:?} ({} dimensions): an embedding \
                  must come from exactly that model, with embedding_model set to {:?}; never \
                  send another model's.",
@@ -703,7 +608,7 @@ impl Memory {
                 m.dim(),
                 m.id()
             ),
-            (None, None) => "The store has no embedding model: send text only.".into(),
+            (false, None) => "The store has no embedding model: send text only.".into(),
         }
     }
 }
@@ -729,29 +634,21 @@ fn normalization_name(n: pigeonhole_memory::Normalization) -> &'static str {
 
 /// The store's pin against the flags: `--embed-model`/`--memory-model` must name the pinned
 /// model, and `--memory-dim` its dimension.
-fn check_pin(
-    name: &str,
-    pinned: Option<&EmbeddingModel>,
-    expected: Option<&str>,
-    args: &MemoryArgs,
-) -> Result<(), Failure> {
-    match (pinned, expected) {
-        (Some(m), Some(id)) if m.id() != id => Err(Failure::usage(&format!(
-            "memory store {name} is pinned to the embedding model {:?}, not {id:?}: embeddings \
-             of another model would ruin its recall",
-            m.id()
-        ))),
-        (Some(m), _) if args.memory_dim.is_some_and(|d| d != m.dim()) => {
-            Err(Failure::usage(&format!(
-                "memory store {name} is pinned to {} dimensions, not {}",
-                m.dim(),
-                args.memory_dim.unwrap_or_default()
-            )))
-        }
-        (None, Some(id)) => Err(Failure::usage(&format!(
-            "memory store {name} has no embedding model, so it can't take {id:?}'s embeddings"
-        ))),
-        _ => Ok(()),
+/// `phdb mcp` has no namespace limit: every call may touch every namespace.
+const ALL: Scope<'static> = Scope(None);
+
+/// A store operation's failure as `phdb mcp` reports it: the request's arguments as usage,
+/// the store's by its code, and the embedding endpoint's, its refusal of the text included,
+/// as bad input (exit ERROR), as `phdb mcp` always has: scripts may check the exit code (the
+/// coordinator on #1648).
+fn mem_failure(e: MemError) -> Failure {
+    match e.kind {
+        MemErrorKind::Invalid | MemErrorKind::Denied => Failure::usage(&e.message),
+        MemErrorKind::Engine(code) => Failure::coded(code, e.message),
+        MemErrorKind::Rejected
+        | MemErrorKind::Unavailable
+        | MemErrorKind::Deadline
+        | MemErrorKind::Internal => Failure::input(e.message),
     }
 }
 
@@ -976,6 +873,90 @@ fn forget_tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coordinator on #1648 (ai1249's R1): moving onto the shared core changes no code
+    /// `phdb mcp` answers. Every embedding-endpoint failure, its refusal of the text
+    /// included, stays bad input (exit ERROR); the arguments' faults stay usage.
+    #[test]
+    fn the_cores_failures_keep_phdb_mcps_codes() {
+        let code = |kind| {
+            let f = mem_failure(MemError {
+                kind,
+                message: "m".into(),
+            });
+            (f.json()["code"].as_str().unwrap().to_owned(), f.status())
+        };
+        let bad_input = ("BadInput".to_owned(), crate::ExitStatus::ERROR);
+        for kind in [
+            MemErrorKind::Rejected,
+            MemErrorKind::Unavailable,
+            MemErrorKind::Deadline,
+            MemErrorKind::Internal,
+        ] {
+            assert_eq!(code(kind), bad_input, "{kind:?}");
+        }
+        assert_eq!(
+            code(MemErrorKind::Invalid),
+            ("Usage".to_owned(), crate::ExitStatus::USAGE)
+        );
+        assert_eq!(
+            code(MemErrorKind::Engine(pigeonhole::ErrorCode::TableNotFound)).0,
+            "TableNotFound"
+        );
+    }
+
+    /// 8b's fix, as ai1249's R1 on 8b asks: `phdb mcp` not writable on a writer database
+    /// opens the store without its forgetter. On main it opened the store as the writer does,
+    /// whose forgetter runs a pass at once and deletes an episodic memory past its TTL from a
+    /// session meant to be read-only.
+    #[test]
+    fn a_read_only_open_on_a_writer_starts_no_forgetter() {
+        use pigeonhole_memory::{Memory as NewMemory, OpenOptions, Store, StoreOptions};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("m.phdb"),
+            pigeonhole::Options::default().shards(1),
+        )
+        .unwrap();
+        let store = Store::create(
+            &db,
+            "m",
+            StoreOptions::new().episodic_ttl(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        // The store's own forgetter is taken, so nothing deletes until the open under test.
+        drop(store.take_forgetter());
+        let id = store
+            .remember("ns", NewMemory::new("an episode").kind(Kind::Episodic))
+            .unwrap()
+            .id()
+            .clone();
+        drop(store);
+        // Past its TTL by the time the open below could start a forgetter.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let args = MemoryArgs {
+            memory: Some("m".into()),
+            ..MemoryArgs::default()
+        };
+        let mut notes = Vec::new();
+        let memory = Memory::open(&Db::Writer(db.clone()), &args, false, 1 << 20, &mut notes)
+            .unwrap()
+            .unwrap();
+        // A forgetter's first pass runs as it starts: give one the time it would need.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let probe = Store::open_with(
+            &db,
+            "m",
+            OpenOptions::new().without_embeddings().own_forgetter(),
+        )
+        .unwrap();
+        assert!(
+            probe.get(&id).unwrap().is_some(),
+            "a read-only open deleted an expired memory"
+        );
+        drop((probe, memory));
+        db.close().unwrap();
+    }
 
     #[test]
     fn link_types_and_weights_parse_and_refuse() {
