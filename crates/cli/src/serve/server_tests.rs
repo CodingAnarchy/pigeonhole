@@ -3854,7 +3854,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
 // ---- Replication (#1436) ----
 
 /// Waits until the replica's `Admin.Info` replica section passes `ok`, and returns it.
-fn wait_replica(r: &Server, what: &str, ok: impl Fn(&Json) -> bool) -> Json {
+fn wait_replica(r: &Server, what: &str, mut ok: impl FnMut(&Json) -> bool) -> Json {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let (status, info) = r.rpc("Admin/Info", &json!({}), None);
@@ -4568,5 +4568,150 @@ fn a_promotion_releases_waiting_reads_and_a_client_deadline_answers_deadline_exc
         started.elapsed() < Duration::from_secs(10),
         "answered at the promotion, not the 20 s deadline: {:?}",
         started.elapsed()
+    );
+}
+
+/// A TCP proxy to `upstream` (`host:port`) that forwards each connection's first `budget`
+/// bytes from the server, then stalls it: it keeps the connection open and forwards nothing
+/// more (#1595: a primary's stream that stops without ending). Connection number `refuse`
+/// (from 0), if any, is closed as soon as it's accepted: a reconnect that fails. Stops when
+/// `stop` is set.
+fn stalling_proxy(
+    upstream: &str,
+    budget: usize,
+    refuse: Option<usize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let upstream = upstream.to_owned();
+    std::thread::spawn(move || {
+        let mut accepted = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let client = match listener.accept() {
+                Ok((c, _)) => c,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
+            accepted += 1;
+            if refuse == Some(accepted - 1) {
+                drop(client);
+                continue;
+            }
+            client.set_nonblocking(false).unwrap();
+            let server = std::net::TcpStream::connect(&upstream).unwrap();
+            let (mut c_read, mut s_write) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 16 << 10];
+                while let Ok(n) = c_read.read(&mut buf) {
+                    if n == 0 || s_write.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let (mut s_read, mut c_write) = (server, client);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut left = budget;
+                let mut buf = [0u8; 16 << 10];
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    match s_read.read(&mut buf[..want]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if c_write.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                            left -= n;
+                        }
+                    }
+                }
+                // Stalled: both ends stay open, and nothing more goes through.
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+    });
+    url
+}
+
+#[test]
+fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
+    // #1595: a primary's stream that stops sending without ending used to hold a replica in
+    // `bootstrapping` for ever, with nothing in Info. Each chunk's wait is now bounded by
+    // `--stream-idle-ms`; a stall is a break, recorded in `last_error`, and the download
+    // resumes from its offset on a new connection.
+    let p = Server::start("", limits());
+    // Data that doesn't compress, so the copy spans many 1 MiB chunks.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..48 {
+        let value: Vec<u8> = (0..64 << 10)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let (status, body) = p.post(
+            "Mutate",
+            &put(&format!("r{i:02}"), "f", "q", json!({"bytes": b64(&value)})),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let upstream = p.url.trim_start_matches("http://").to_owned();
+    // The copy is the primary's whole file (tens of MiB with its preallocation): each
+    // connection takes a few chunks of it, then stalls.
+    // The second connection, the first reconnect after a stall, is closed at once: one more
+    // break, never a restart from zero (cli692's R2 on #1609).
+    let proxy = stalling_proxy(&upstream, 16 << 20, Some(1), Arc::clone(&stop));
+    let mut short = limits();
+    short.stream_idle = Duration::from_millis(500);
+    let r = Server::start_replica_with(test_dir(), &proxy, None, short);
+    let mut stalled = false;
+    let mut refused = false;
+    let mut downloading = false;
+    let (mut most, mut restarted) = (0u64, false);
+    let info = wait_replica(&r, "caught up", |info| {
+        let error = info["last_error"].as_str().unwrap_or("");
+        stalled |= error.contains("no chunk of the bootstrap copy");
+        // tonic's `connect` doesn't wait for the handshake, so a connection closed at once
+        // fails the request on it ("transport error"); a refused TCP connect would fail
+        // the connect ("connecting to …"). Either is a break.
+        refused |= error.contains("transport error") || error.contains("connecting to");
+        downloading |= info["bootstrap_phase"] == "downloading";
+        if let Some(bytes) = info["bootstrap_bytes"].as_str() {
+            let bytes: u64 = bytes.parse().unwrap();
+            restarted |= bytes < most;
+            most = most.max(bytes);
+        }
+        caught_up(&p, None)(info)
+    });
+    stop.store(true, Ordering::Relaxed);
+    assert!(stalled, "the stall was recorded as a break: {info}");
+    assert!(
+        refused,
+        "the failed reconnect was recorded as a break: {info}"
+    );
+    assert!(
+        !restarted,
+        "the download resumed, never restarted from zero"
+    );
+    assert!(downloading, "Info showed the download's step");
+    assert!(
+        info.get("bootstrap_phase").is_none(),
+        "no bootstrap step once it's done: {info}"
+    );
+    assert_eq!(
+        get_value(&r, "t", "r47", None),
+        get_value(&p, "t", "r47", None)
     );
 }
