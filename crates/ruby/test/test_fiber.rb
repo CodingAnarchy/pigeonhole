@@ -209,6 +209,180 @@ module FiberCases
     assert_equal 0, bridge.native.pending
   end
 
+  # --- the change feed and the memory watch (#1574 PR 2) ---
+
+  # A database with the change feed on, closed by teardown.
+  def fdb
+    @fdb ||= Pigeonhole.open(File.join(@dir, "feed.phdb"), create: true, shards: 1, change_feed: 16 << 20)
+  end
+
+  def teardown
+    @fdb&.close
+    super
+  end
+
+  def test_a_feed_wait_lets_other_fibers_run_and_delivers
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    got = nil
+    ticks = 0
+    on_scheduler do |spawn|
+      spawn.call { got = feed.next(timeout: 5) }
+      spawn.call do
+        5.times do
+          ticks += 1
+          sleep 0.01
+        end
+        t.put("r", "f", "q", "v")
+      end
+    end
+    assert_equal ["r"], got.changes.map(&:row)
+    assert_equal 5, ticks, "the writer fiber ran while the reader waited"
+    assert_operator bridge.parks, :>, 0
+    feed.close
+  end
+
+  def test_a_feed_wait_times_out_and_loses_nothing
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    first = second = nil
+    took = nil
+    on_scheduler do
+      started = clock
+      first = feed.next(timeout: 0.1)
+      took = clock - started
+      t.put("r", "f", "q", "v")
+      second = feed.next(timeout: 5)
+    end
+    assert_nil first
+    assert_operator took, :>=, 0.09
+    assert_equal ["r"], second.changes.map(&:row)
+    feed.close
+  end
+
+  def test_one_fiber_waits_on_a_feed_at_a_time
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    refused = nil
+    on_scheduler do |spawn|
+      spawn.call { feed.next(timeout: 0.3) }
+      spawn.call do
+        sleep 0.05
+        feed.next(timeout: 0.1)
+      rescue Pigeonhole::Error => e
+        refused = e
+      end
+    end
+    assert_match(/one consumer at a time/, refused&.message.to_s)
+    feed.close
+  end
+
+  # A stopped waiter loses no commit: whichever way the race goes (it took the commit before
+  # it was stopped, or the commit waits in the slot), the commit is delivered exactly once.
+  # Under the minimal scheduler the order is fixed: the commit's wake is in the pipe before
+  # any fiber runs, the drainer marks the victim's op done and queues its resume behind this
+  # fiber's, and this fiber stops it first, so the commit must come from the slot, with the
+  # token from before it.
+  def test_a_stopped_feed_waiter_loses_no_commit
+    skip "needs the test-hooks build (PIGEONHOLE_TEST_HOOKS=1 rake compile)" unless defined?(Pigeonhole::Native::Gate)
+
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    before = feed.token
+    gate = Pigeonhole::Native::Gate.new
+    delivered = []
+    from_slot = false
+    on_scheduler do |spawn|
+      b = Pigeonhole::Native::FiberBridge.current
+      spawn.call { b.await(gate.op(b.native)) } # parks first: the drainer
+      victim = spawn.call do
+        delivered << feed.next(timeout: 5)
+      rescue *STOPS
+        nil
+      end
+      begin
+        sleep 0.01 # both parked
+        Fiber.blocking do
+          t.put("r", "f", "q", "v")
+          sleep 0.05 # the feed's wake reaches the pipe
+        end
+        sleep 0 # the drainer runs: the victim's op is done
+        if victim.alive? && delivered.empty?
+          stop(victim)
+          assert_equal before, feed.token, "the slot's commit isn't delivered yet"
+          from_slot = true
+          delivered << feed.next(timeout: 5)
+        end
+      ensure
+        gate.open
+      end
+    end
+    assert_equal [["r"]], delivered.compact.map { |c| c.changes.map(&:row) }
+    assert_nil feed.try_next, "delivered once"
+    assert from_slot, "the victim was stopped with its commit in the slot" if is_a?(TestFiberMinimal)
+    feed.close
+  end
+
+  # cli692's R1 on #1605: a fiber parked in `next` with no timeout is woken by the stream's
+  # close, and raises `Closed`, rather than waiting for a commit that can't come.
+  def test_closing_a_stream_ends_a_parked_fiber_wait
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    raised = nil
+    took = nil
+    on_scheduler do |spawn|
+      spawn.call do
+        started = clock
+        feed.next
+      rescue Pigeonhole::Closed => e
+        raised = e
+        took = clock - started
+      end
+      spawn.call do
+        sleep 0.05
+        feed.close
+      end
+    end
+    assert_kind_of Pigeonhole::Closed, raised
+    assert_operator took, :<, 1.0
+  end
+
+  def test_a_memory_watch_waits_under_the_scheduler
+    s = Pigeonhole::Memory::Store.create(fdb, "agents")
+    w = s.watch("n")
+    got = nil
+    id = nil
+    on_scheduler do |spawn|
+      spawn.call { got = w.next(timeout: 5) }
+      spawn.call do
+        sleep 0.02
+        id = s.remember("n", "hello").id
+      end
+    end
+    assert_equal [[:remembered, id]], got.events.map { |e| [e.kind, e.id] }
+    w.close
+    s.close
+  end
+
+  def test_a_reader_process_watch_cannot_wait_on_a_fiber
+    s = Pigeonhole::Memory::Store.create(fdb, "agents")
+    s.remember("n", "hello")
+    Pigeonhole.open_reader(File.join(@dir, "feed.phdb")) do |r|
+      Pigeonhole::Memory::Store.open_reader(r, "agents", model: nil) do |rs|
+        rs.watch do |rw|
+          raised = nil
+          on_scheduler do
+            rw.next(timeout: 1)
+          rescue Pigeonhole::Unsupported => e
+            raised = e
+          end
+          assert raised, "a reader's fiber wait is Unsupported (it can wait on a thread)"
+        end
+      end
+    end
+    s.close
+  end
+
   def test_a_forked_child_gets_its_own_bridge
     on_scheduler { @t.put("p", "f", "a", "v", durability: :sync) }
     parent = bridge

@@ -1879,7 +1879,9 @@ fn open_watch(
         w = w.visible();
     }
     let watch = call(ruby, move || w.open())?;
-    Ok(Watch(ForkSafe::new(crate::index::Fair::new(Some(watch)))))
+    Ok(Watch(ForkSafe::new(crate::waits::Waits::new(WatchSource(
+        watch,
+    )))))
 }
 
 impl Store {
@@ -1898,29 +1900,47 @@ impl ReadStore {
     }
 }
 
-const WATCH_CLOSED: &str = "the watch is closed";
+/// A memory watch as a stream's source (`crate::waits`), as the change feed is.
+pub(crate) struct WatchSource(mem::Watch);
 
-impl Watch {
-    /// One wait of at most `slice` (`None`: no wait), with the GVL released.
-    fn poll(
-        ruby: &Ruby,
-        rb_self: &Self,
-        slice: Option<Duration>,
-    ) -> Result<Option<mem::MemoryCommit>, Error> {
-        let state = rb_self.0.get(ruby)?;
-        let polled = without_gvl(ruby, || {
-            let mut g = state.acquire();
-            g.as_mut().map(|w| match slice {
-                Some(d) => w.next(d),
-                None => w.try_next(),
-            })
-        })?;
-        match polled {
-            None => Err(with_code(ruby, ErrorCode::Closed, WATCH_CLOSED)),
-            Some(r) => r.or_mem(ruby),
-        }
+impl crate::waits::Source for WatchSource {
+    type Item = mem::MemoryCommit;
+    type Error = mem::Error;
+    const NAME: &'static str = "watch";
+
+    fn next(&mut self, d: Duration) -> mem::Result<Option<mem::MemoryCommit>> {
+        self.0.next(d)
     }
 
+    fn try_next(&mut self) -> mem::Result<Option<mem::MemoryCommit>> {
+        self.0.try_next()
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<mem::Result<mem::MemoryCommit>> {
+        self.0.poll_next(cx)
+    }
+
+    fn token(&self) -> Vec<u8> {
+        self.0.token().as_bytes().to_vec()
+    }
+
+    fn oldest_retained(&self) -> Option<u64> {
+        self.0.oldest_retained()
+    }
+
+    fn to_rb(ruby: &Ruby, item: mem::MemoryCommit) -> Result<Value, Error> {
+        memory_commit(ruby, &item).map(|a| a.as_value())
+    }
+
+    fn error(ruby: &Ruby, e: mem::Error) -> Error {
+        err(ruby, e)
+    }
+}
+
+impl Watch {
     /// `native_next(timeout)`: as `Feed#next`, in slices with an interrupt check between
     /// them, giving way to other threads that want the watch (#1411).
     pub(crate) fn next(
@@ -1928,58 +1948,50 @@ impl Watch {
         rb_self: &Self,
         timeout: Option<Secs>,
     ) -> Result<Option<RArray>, Error> {
-        let deadline = timeout.and_then(|t| std::time::Instant::now().checked_add(t.0));
-        let state = rb_self.0.get(ruby)?;
-        loop {
-            let left = || {
-                deadline.map_or(SLICE, |d| {
-                    d.saturating_duration_since(std::time::Instant::now())
-                        .min(SLICE)
-                })
-            };
-            state.give_way(ruby, left())?;
-            ruby.thread_check_ints()?;
-            if let Some(c) = Self::poll(ruby, rb_self, Some(left()))? {
-                return memory_commit(ruby, &c).map(Some);
-            }
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                return Ok(None);
-            }
-        }
-    }
-
-    pub(crate) fn try_next(ruby: &Ruby, rb_self: &Self) -> Result<Option<RArray>, Error> {
-        Self::poll(ruby, rb_self, None)?
+        rb_self
+            .0
+            .get(ruby)?
+            .wait(ruby, timeout.map(|t| t.0))?
             .map(|c| memory_commit(ruby, &c))
             .transpose()
     }
 
+    pub(crate) fn try_next(ruby: &Ruby, rb_self: &Self) -> Result<Option<RArray>, Error> {
+        rb_self
+            .0
+            .get(ruby)?
+            .try_next(ruby)?
+            .map(|c| memory_commit(ruby, &c))
+            .transpose()
+    }
+
+    /// `native_next_op(bridge)`: the next commit with memory events, as a fiber op (#1574
+    /// PR 2). The writer process only: in a reader process it raises `Unsupported`.
+    #[cfg(unix)]
+    pub(crate) fn next_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        rb_self.0.get(ruby)?.next_op(ruby, bridge)
+    }
+
     /// Where the watch is, as bytes, for `Store#watch(resume:)`.
     pub(crate) fn token(ruby: &Ruby, rb_self: &Self) -> Result<RString, Error> {
-        let state = rb_self.0.get(ruby)?;
-        let t = without_gvl(ruby, || state.acquire().as_ref().map(mem::Watch::token))?
-            .ok_or_else(|| with_code(ruby, ErrorCode::Closed, WATCH_CLOSED))?;
-        Ok(crate::convert::binary(ruby, t.as_bytes()))
+        let t = rb_self.0.get(ruby)?.token(ruby)?;
+        Ok(crate::convert::binary(ruby, &t))
     }
 
     pub(crate) fn oldest_retained(ruby: &Ruby, rb_self: &Self) -> Result<Option<u64>, Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || {
-            state
-                .acquire()
-                .as_ref()
-                .and_then(mem::Watch::oldest_retained)
-        })
+        rb_self.0.get(ruby)?.oldest_retained(ruby)
     }
 
     pub(crate) fn close(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || drop(state.acquire().take()))
+        rb_self.0.get(ruby)?.close(ruby)
     }
 
     pub(crate) fn is_closed(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        let state = rb_self.0.get(ruby)?;
-        without_gvl(ruby, || state.acquire().is_none())
+        rb_self.0.get(ruby)?.is_closed(ruby)
     }
 }
 

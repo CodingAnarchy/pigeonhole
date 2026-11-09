@@ -39,8 +39,11 @@ module Pigeonhole
 
       # A parked call: its op, its fiber, and whether it's done, has been handed the drainer
       # role, or has a resume on its way.
-      Entry = Struct.new(:op, :fiber, :done, :drain, :resuming)
+      Entry = Struct.new(:op, :fiber, :done, :drain, :resuming, :deadline)
       private_constant :Entry
+
+      # What `await` returns when its deadline passed first.
+      TIMED_OUT = Object.new.freeze
 
       # This thread's bridge when the calling fiber should yield, else nil.
       def self.current
@@ -55,6 +58,9 @@ module Pigeonhole
         b
       end
 
+      # The monotonic deadline `timeout` seconds from now, for `await`.
+      def self.deadline(timeout) = Bridge.now + timeout
+
       attr_reader :pid, :native
       # Calls that parked here (their first poll wasn't enough): read by the tests.
       attr_reader :parks
@@ -68,16 +74,23 @@ module Pigeonhole
         @parks = 0
       end
 
-      # Waits for `op` (started on this bridge) and returns its result. Raised into while it
-      # waits (`Async::Task#stop`, a timeout, `Thread#raise`), it drops the op's future: a
-      # commit still waiting for room writes nothing, and one already submitted may land (D210).
-      def await(op)
+      # Waits for `op` (started on this bridge) and returns its result, or TIMED_OUT once
+      # `deadline` (a monotonic clock reading) passes. Raised into while it waits
+      # (`Async::Task#stop`, a timeout, `Thread#raise`), or timed out, it drops the op: a
+      # commit still waiting for room writes nothing, and one already submitted may land
+      # (D210); a stream's item already taken stays in its slot for the next caller.
+      def await(op, deadline: nil)
         return op.take if op.done?
 
+        if deadline && Bridge.now >= deadline
+          op.cancel
+          return TIMED_OUT
+        end
         scheduler = Fiber.current_scheduler
-        entry = Entry.new(op, Fiber.current, false, false, false)
+        entry = Entry.new(op, Fiber.current, false, false, false, deadline)
         @parks += 1
         @parked[op.id] = entry
+        taken = false
         begin
           until entry.done
             if @drainer.nil? || entry.drain
@@ -89,16 +102,24 @@ module Pigeonhole
               entry.resuming = false
             end
           end
+          taken = entry.done == true
         ensure
           @parked.delete(op.id)
           hand_off(scheduler) if @drainer.equal?(entry)
           # Cancelled before the absorb yields: a drain meanwhile must not poll a commit still
-          # waiting for room to submission (D210; cli692 on #1592).
-          op.cancel unless entry.done
+          # waiting for room to submission (D210; cli692 on #1592). An op done but not to be
+          # taken (raised into, or timed out) is dropped too, so a stream's wait ends at once.
+          op.cancel unless taken
           absorb(scheduler, op) if entry.resuming
         end
-        op.take
+        taken ? op.take : TIMED_OUT
       end
+
+      # The monotonic clock deadlines are read against.
+      module Bridge
+        def self.now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+      private_constant :Bridge
 
       private
 
@@ -114,20 +135,36 @@ module Pigeonhole
         Thread.handle_interrupt(Object => :never) { scheduler.block(op, ABSORB_LIMIT) }
       end
 
-      # The drainer's loop: waits on the pipe through the scheduler, polls the woken ops, and
-      # resumes the fibers whose ops are done, until its own is.
+      # The drainer's loop: waits on the pipe through the scheduler, until the nearest
+      # parked deadline at most, polls the woken ops, and resumes the fibers whose ops are
+      # done or whose deadlines passed, until its own is either. Deadlines live here, never in
+      # `block`, so every resume of a parked fiber comes from the drainer, once (cli692's R2).
       def drain_until(me, scheduler)
         until me.done
-          @io.wait_readable
-          @native.drain.each do |id|
-            e = @parked[id] or next
-            e.done = true
-            next if e.equal?(me) || e.resuming
-
-            e.resuming = true
-            scheduler.unblock(e.op, e.fiber)
+          @io.wait_readable(wait_limit)
+          @native.drain.each { |id| (e = @parked[id]) && finish(e, true, me, scheduler) }
+          now = Bridge.now
+          @parked.each_value do |e|
+            finish(e, :timeout, me, scheduler) if !e.done && e.deadline && now >= e.deadline
           end
         end
+      end
+
+      # Marks `e` done (`true`) or timed out, and resumes its fiber unless it's the drainer
+      # or a resume is already on its way.
+      def finish(e, how, me, scheduler)
+        e.done = how
+        return if e.equal?(me) || e.resuming
+
+        e.resuming = true
+        scheduler.unblock(e.op, e.fiber)
+      end
+
+      # How long the drainer may wait on the pipe: until the nearest deadline of a parked
+      # call still waiting, or for ever (nil).
+      def wait_limit
+        nearest = @parked.each_value.filter_map { |e| e.deadline unless e.done }.min
+        nearest && [nearest - Bridge.now, 0].max
       end
 
       # Passes the drainer role to a parked fiber that isn't done and has no resume coming:
