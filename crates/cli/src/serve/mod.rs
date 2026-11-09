@@ -335,6 +335,17 @@ pub(crate) fn run(
         args.feed_threads,
     ));
     let limits = args.limits();
+    // A cap above half the open-file limit leaves the database too few descriptors: said,
+    // not refused (cli692 on #1604).
+    if let (Some(max), Some(files)) = (args.max_connections, listener::open_file_limit())
+        && u64::try_from(max).unwrap_or(u64::MAX) > files / 2
+    {
+        let _ = writeln!(
+            stderr,
+            "phdb serve: --max-connections {max} is above half the open-file limit ({files}): \
+             raise ulimit -n, or the server can run out of descriptors for the database"
+        );
+    }
     let metrics = Arc::new(service::Metrics::default());
     let mut service = service::Service::new(
         db.clone(),
@@ -434,7 +445,11 @@ pub(crate) fn run(
             shutdown_signal().await;
             stopping.router.service.bulk.stop();
         };
-        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms), args.http2_send_buffer.map(|n| usize::try_from(n).unwrap_or(usize::MAX))).await;
+        let bounds = listener::Bounds {
+            connections: Arc::clone(&shared.router.service.connections),
+            first_byte: shared.limits.request_timeout,
+        };
+        listener::serve(listener, tls, http::router(Arc::clone(&shared)), signal, Duration::from_millis(args.shutdown_grace_ms), args.http2_send_buffer.map(|n| usize::try_from(n).unwrap_or(usize::MAX)), bounds).await;
         if let Some(r) = &replica {
             r.stop().await;
         }

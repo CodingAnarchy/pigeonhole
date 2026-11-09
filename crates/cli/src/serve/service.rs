@@ -757,6 +757,9 @@ pub(crate) struct Service {
     scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
+    /// The open connections against `--max-connections` (#1604): the listener counts them,
+    /// the metrics show them.
+    pub(crate) connections: Arc<super::listener::Connections>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
@@ -779,6 +782,7 @@ impl Service {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            connections: super::listener::Connections::new(limits.max_connections),
             db: db.clone(),
             tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
@@ -1458,6 +1462,7 @@ impl Service {
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
     pub(crate) fn metrics_text(&self) -> String {
         let mut text = self.metrics.render(&self.db);
+        self.connections.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);

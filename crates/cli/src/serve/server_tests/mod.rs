@@ -21,6 +21,7 @@ use super::{bulk, cluster, errors, feed, replica, service, tls};
 
 mod admin_tests;
 mod cluster_tests;
+mod connection_tests;
 mod data_tests;
 mod feed_tests;
 mod http1_tests;
@@ -61,6 +62,7 @@ fn limits() -> Limits {
         max_request_bytes: 1 << 20,
         inflight_bytes: 16 << 20,
         max_concurrent: 64,
+        max_connections: 64,
         max_scans: 4,
         max_streams: 16,
         max_feed_hubs: 8,
@@ -221,6 +223,10 @@ impl Server {
             },
             Duration::from_secs(2),
             None,
+            listener::Bounds {
+                connections: Arc::clone(&shared.router.service.connections),
+                first_byte: limits.request_timeout,
+            },
         ));
         if let Some(r) = &replica {
             let _guard = runtime.enter();
