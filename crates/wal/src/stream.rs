@@ -950,6 +950,10 @@ fn zero_fill(file: &FileRef, segment_size: u64, slot: usize, zeros: &[u8]) -> Re
 #[derive(Clone)]
 pub struct SpareSegments {
     file: FileRef,
+    /// g44's direct arm: the stream file opened for direct I/O, if the file system allows it:
+    /// a spare's zeros are written through it, so none sit dirty in the page cache for a group
+    /// sync to write or wait on, and no write-back is needed.
+    direct: Option<FileRef>,
     segment_size: u64,
     target: u32,
     shared: Arc<Shared>,
@@ -1194,7 +1198,9 @@ impl SparePrep {
                     Poll::Ready(Ok(buf)) => {
                         self.buffers.push(buf);
                         let (_, at, len) = self.writes.pop_front().expect("polled above");
-                        self.write_back(at, len);
+                        if self.spares.direct.is_none() {
+                            self.write_back(at, len);
+                        }
                         continue;
                     }
                     Poll::Ready(Err(e)) => {
@@ -1285,10 +1291,15 @@ impl SparePrep {
         };
         let at = start + self.next_offset;
         self.writes.push_back((
-            self.spares.file.submit_write(buf, at).map(move |r| {
-                drop(token);
-                r
-            }),
+            self.spares
+                .direct
+                .as_ref()
+                .unwrap_or(&self.spares.file)
+                .submit_write(buf, at)
+                .map(move |r| {
+                    drop(token);
+                    r
+                }),
             at,
             len as u64,
         ));
@@ -1751,8 +1762,12 @@ impl WalStream {
 
     /// A handle for preparing spare slots on a background task.
     pub fn spares(&self) -> SpareSegments {
+        let mut direct = OpenOptions::read();
+        direct.write = true;
+        direct.direct = true;
         SpareSegments {
             file: Arc::clone(&self.file),
+            direct: self.vfs.open(&self.path, direct).ok(),
             segment_size: self.segment_size,
             target: self.spare,
             shared: Arc::clone(&self.shared),
