@@ -33,10 +33,11 @@ use super::service::{ScanPages, ServiceOp, ServiceReply};
 #[derive(Clone, Default)]
 struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
 
-/// When `prepay` saw the request arrive: the start of its one deadline, which the budget wait
-/// and a replica's wait for the client's primary seqno share (cli692's R1 on #1594).
+/// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
+/// deadline, which the budget wait and a replica's wait for the client's primary seqno share
+/// (cli692's R1 on #1594), and an HTTP/1.1 body's pre-read too (perf287 on #1613).
 #[derive(Clone, Copy)]
-struct Arrived(Instant);
+pub(crate) struct Arrived(pub(crate) Instant);
 
 impl Prepaid {
     fn take(&self) -> Option<OwnedSemaphorePermit> {

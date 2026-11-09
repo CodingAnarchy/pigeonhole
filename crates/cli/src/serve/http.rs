@@ -184,7 +184,11 @@ async fn preread(State(shared): State<Arc<Shared>>, req: Request, next: Next) ->
         Ok(n) if n > 0 && n <= PREREAD_BYTES => n,
         _ => return next.run(req).await,
     };
-    let (parts, body) = req.into_parts();
+    // The request's deadline starts before its body is read, so a slow body counts toward
+    // it (perf287 on #1613): `call` takes this as its arrival.
+    let arrived = Instant::now();
+    let (mut parts, body) = req.into_parts();
+    parts.extensions.insert(super::grpc::Arrived(arrived));
     let read = tokio::time::timeout(
         shared.limits.request_timeout,
         axum::body::to_bytes(body, length),
@@ -303,8 +307,12 @@ async fn call(
     if length > limit {
         return ApiError::request_too_large(limit).into_response();
     }
-    // The request's one deadline starts here, before the budget wait (cli692's R1 on #1594).
-    let arrived = Instant::now();
+    // The request's one deadline starts here, before the budget wait (cli692's R1 on #1594),
+    // or where `preread` began reading its body.
+    let arrived = req
+        .extensions()
+        .get::<super::grpc::Arrived>()
+        .map_or_else(Instant::now, |a| a.0);
     let budget = match shared.router.service.reserve(length).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
