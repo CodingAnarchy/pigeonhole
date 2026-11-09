@@ -211,3 +211,50 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     assert_eq!(hits.len(), 1);
     assert_eq!(&hits[0].id[..], b"doc:1");
 }
+
+/// #1588: dropping a text index's table evicts its cached handle. A search then answers
+/// `TableNotFound`, and a new index made under the name (with `if_missing`, which a cached
+/// handle used to answer at once) is the one served.
+#[test]
+fn dropping_a_text_index_s_table_evicts_its_handle() {
+    let s = Server::start("", limits());
+    let spec = json!({"name": "tx", "source_table": "t", "source_family": "f",
+                      "source_qualifier": b64(b"body")});
+    let put = |id: &[u8], text: &str| {
+        let (status, e) = s.rpc(
+            "Text/Put",
+            &json!({"index": "tx", "id": b64(id), "text": text}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+    };
+    let search = || {
+        s.rpc(
+            "Text/Search",
+            &json!({"index": "tx", "syntax": "meeting", "k": 10}),
+            None,
+        )
+    };
+    assert_eq!(s.rpc("Text/CreateIndex", &spec, None).0, 200);
+    put(b"old", "the old meeting");
+    let (status, r) = search();
+    assert_eq!((status, text_hits(&r)), (200, vec![b64(b"old")]), "{r}");
+
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "tx"}), None);
+    assert_eq!(status, 200, "{e}");
+    let (status, r) = search();
+    assert_eq!(
+        (status, r["code"].as_str()),
+        (404, Some("TableNotFound")),
+        "{r}"
+    );
+
+    // Made again over a new source column: `if_missing` opens the new index.
+    let mut again = spec.clone();
+    again["if_missing"] = json!(true);
+    again["source_qualifier"] = json!(b64(b"body2"));
+    assert_eq!(s.rpc("Text/CreateIndex", &again, None).0, 200);
+    put(b"new", "the new meeting");
+    let (status, r) = search();
+    assert_eq!((status, text_hits(&r)), (200, vec![b64(b"new")]), "{r}");
+}
