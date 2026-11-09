@@ -105,6 +105,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// How long a follow must run before the pause after the next error starts short again.
 const STEADY: Duration = Duration::from_secs(30);
 
+/// How long a bootstrap waits for the primary's first answer to a fresh download, which
+/// comes only once the primary has written and hashed its whole copy (#1595). Generous: a
+/// large database's copy takes a while; past it the download breaks and starts again.
+const COPY_WAIT: Duration = Duration::from_secs(10 * 60);
+
 // ---- The primary's side: `Replication.Follow` ----
 
 /// A `Follow` stream: batches as the follower's thread reads them, then its error if it
@@ -273,6 +278,10 @@ struct Status {
     /// Since when the replica hasn't been caught up (when not).
     behind_since: Instant,
     last_error: String,
+    /// While a bootstrap runs, its step and the copy's bytes received (#1595: a bootstrap
+    /// that stops says where).
+    bootstrap_phase: &'static str,
+    bootstrap_bytes: u64,
 }
 
 /// A replica server's loop and its state.
@@ -315,6 +324,8 @@ impl Replica {
                 caught_up: false,
                 behind_since: Instant::now(),
                 last_error: String::new(),
+                bootstrap_phase: "",
+                bootstrap_bytes: 0,
             }),
             promoted: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
@@ -340,6 +351,18 @@ impl Replica {
 
     fn set_state(&self, state: &'static str) {
         self.status().state = state;
+    }
+
+    /// A bootstrap's step, and the copy's bytes received so far ("" and 0 once it ends).
+    fn set_bootstrap(&self, phase: &'static str, bytes: u64) {
+        let mut s = self.status();
+        s.bootstrap_phase = phase;
+        s.bootstrap_bytes = bytes;
+    }
+
+    /// A bootstrap's step, its bytes as they are.
+    fn set_bootstrap_phase(&self, phase: &'static str) {
+        self.status().bootstrap_phase = phase;
     }
 
     fn fail(&self, state: &'static str, error: String) {
@@ -414,6 +437,8 @@ impl Replica {
                 u64::try_from(s.behind_since.elapsed().as_millis()).unwrap_or(u64::MAX)
             },
             last_error: s.last_error.clone(),
+            bootstrap_phase: s.bootstrap_phase.to_owned(),
+            bootstrap_bytes: s.bootstrap_bytes,
         })
     }
 
@@ -753,7 +778,7 @@ impl Replica {
         // A stop mid-download leaves a partial side file: harmless, since the next
         // bootstrap truncates it (`File::create`) before writing (cli692's N4 on #1583).
         let token = tokio::select! {
-            r = self.download(&side) => r.map_err(Halt::Failed)?,
+            r = self.download(&side, shared.limits.stream_idle) => r.map_err(Halt::Failed)?,
             _ = stop.changed() => return Err(Halt::Stopped),
         };
         // From here the served engine may be the new copy, whose applied seqno can be below
@@ -762,14 +787,23 @@ impl Replica {
         // The follow after the swap reads the copy's own from its stored state.
         self.set_applied(0);
         let swap_side = side.clone();
-        let swapped = tokio::task::spawn_blocking(move || {
+        self.set_bootstrap_phase("opening the copy");
+        let opened = tokio::task::spawn_blocking(move || {
             let copy = Pigeonhole::open(&swap_side, pigeonhole::Options::default())?;
             copy.begin_replication(&FeedToken::from_bytes(token))?;
-            copy.close()?;
-            db.replace_with(&swap_side)
+            copy.close()
         })
         .await
         .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        if let Err(e) = opened {
+            let _ = std::fs::remove_file(&side);
+            return Err(Halt::Failed(format!("bootstrap: {e}")));
+        }
+        self.set_bootstrap_phase("swapping");
+        let swap_side = side.clone();
+        let swapped = tokio::task::spawn_blocking(move || db.replace_with(&swap_side))
+            .await
+            .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
         // The side file is the database now, or the bootstrap failed: either way it goes.
         let _ = std::fs::remove_file(&side);
         // The served handle is on the new engine (or closed, if the swap failed late):
@@ -780,13 +814,17 @@ impl Replica {
         s.caught_up = false;
         s.behind_since = Instant::now();
         s.last_error.clear();
+        // Done: Info shows no bootstrap step. A failed one keeps its last, for the error.
+        s.bootstrap_phase = "";
+        s.bootstrap_bytes = 0;
         Ok(())
     }
 
     /// `Admin.BackupDownload` with `replica` into `side`, resumed after a broken stream,
     /// checked against its SHA-256. Returns the copy's feed token.
-    async fn download(&self, side: &Path) -> Result<Vec<u8>, String> {
+    async fn download(&self, side: &Path, idle: Duration) -> Result<Vec<u8>, String> {
         use tokio::io::AsyncWriteExt;
+        self.set_bootstrap("connecting", 0);
         let mut client = proto::admin_client::AdminClient::new(self.connect().await?)
             .max_decoding_message_size(usize::MAX);
         let mut file = tokio::fs::File::create(side)
@@ -803,11 +841,34 @@ impl Replica {
                 offset,
                 replica: true,
             })?;
-            let broke = match client.backup_download(req).await {
-                Ok(r) => {
+            // The primary writes and hashes its whole copy before it answers a fresh
+            // download, so the first answer waits for that, bounded by `COPY_WAIT`; a resumed
+            // one, and each later chunk, by the stream idle limit (#1595: a stalled stream
+            // used to hold the bootstrap for ever, with nothing in Info).
+            let first = if backup_id.is_empty() {
+                self.set_bootstrap("waiting for the primary's copy", offset);
+                COPY_WAIT
+            } else {
+                idle
+            };
+            let answered = tokio::time::timeout(first, client.backup_download(req)).await;
+            let broke = match answered {
+                Err(_) => format!(
+                    "{} sent no bootstrap copy within {} ms",
+                    self.config.primary,
+                    first.as_millis()
+                ),
+                Ok(Ok(r)) => {
                     let mut stream = r.into_inner();
                     loop {
-                        match stream.message().await {
+                        let Ok(next) = tokio::time::timeout(idle, stream.message()).await else {
+                            break format!(
+                                "no chunk of the bootstrap copy from {} within {} ms",
+                                self.config.primary,
+                                idle.as_millis()
+                            );
+                        };
+                        match next {
                             Ok(Some(chunk)) => {
                                 if chunk.offset != offset {
                                     return Err(format!(
@@ -824,6 +885,7 @@ impl Replica {
                                     .map_err(|e| format!("writing {}: {e}", side.display()))?;
                                 hash.update(&chunk.data);
                                 offset += chunk.data.len() as u64;
+                                self.set_bootstrap("downloading", offset);
                                 if !chunk.sha256.is_empty() {
                                     if hash.finalize().as_slice() != chunk.sha256.as_ref() {
                                         return Err(
@@ -847,14 +909,14 @@ impl Replica {
                         }
                     }
                 }
-                Err(status) if backup_id.is_empty() => {
+                Ok(Err(status)) if backup_id.is_empty() => {
                     return Err(format!(
                         "bootstrap from {}: {}",
                         self.config.primary,
                         status.message()
                     ));
                 }
-                Err(status) => status.message().to_owned(),
+                Ok(Err(status)) => status.message().to_owned(),
             };
             // Three breaks in a row without progress give up; progress starts the count again
             // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted.
@@ -866,7 +928,12 @@ impl Replica {
             if backup_id.is_empty() || tries > 3 {
                 return Err(format!("downloading the bootstrap copy: {broke}"));
             }
+            // Info says why it's resuming (#1595), while the state stays `bootstrapping`.
+            self.status().last_error = format!("downloading the bootstrap copy: {broke}");
             tokio::time::sleep(Duration::from_millis(200 * tries)).await;
+            // On a new connection: a stalled one stays stalled for every later request on it.
+            client = proto::admin_client::AdminClient::new(self.connect().await?)
+                .max_decoding_message_size(usize::MAX);
         }
     }
 }

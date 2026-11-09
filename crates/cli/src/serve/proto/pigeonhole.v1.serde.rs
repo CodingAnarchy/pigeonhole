@@ -12440,6 +12440,12 @@ impl serde::Serialize for ReplicaInfo {
         if !self.last_error.is_empty() {
             len += 1;
         }
+        if !self.bootstrap_phase.is_empty() {
+            len += 1;
+        }
+        if self.bootstrap_bytes != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ReplicaInfo", len)?;
         if !self.primary.is_empty() {
             struct_ser.serialize_field("primary", &self.primary)?;
@@ -12470,6 +12476,14 @@ impl serde::Serialize for ReplicaInfo {
         if !self.last_error.is_empty() {
             struct_ser.serialize_field("last_error", &self.last_error)?;
         }
+        if !self.bootstrap_phase.is_empty() {
+            struct_ser.serialize_field("bootstrap_phase", &self.bootstrap_phase)?;
+        }
+        if self.bootstrap_bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("bootstrap_bytes", ToString::to_string(&self.bootstrap_bytes).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -12492,6 +12506,10 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
             "lagMs",
             "last_error",
             "lastError",
+            "bootstrap_phase",
+            "bootstrapPhase",
+            "bootstrap_bytes",
+            "bootstrapBytes",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -12503,6 +12521,8 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
             LagCommits,
             LagMs,
             LastError,
+            BootstrapPhase,
+            BootstrapBytes,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -12531,6 +12551,8 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
                             "lagCommits" | "lag_commits" => Ok(GeneratedField::LagCommits),
                             "lagMs" | "lag_ms" => Ok(GeneratedField::LagMs),
                             "lastError" | "last_error" => Ok(GeneratedField::LastError),
+                            "bootstrapPhase" | "bootstrap_phase" => Ok(GeneratedField::BootstrapPhase),
+                            "bootstrapBytes" | "bootstrap_bytes" => Ok(GeneratedField::BootstrapBytes),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -12557,6 +12579,8 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
                 let mut lag_commits__ = None;
                 let mut lag_ms__ = None;
                 let mut last_error__ = None;
+                let mut bootstrap_phase__ = None;
+                let mut bootstrap_bytes__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Primary => {
@@ -12609,6 +12633,20 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
                             }
                             last_error__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::BootstrapPhase => {
+                            if bootstrap_phase__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("bootstrapPhase"));
+                            }
+                            bootstrap_phase__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::BootstrapBytes => {
+                            if bootstrap_bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("bootstrapBytes"));
+                            }
+                            bootstrap_bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(ReplicaInfo {
@@ -12619,6 +12657,8 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
                     lag_commits: lag_commits__.unwrap_or_default(),
                     lag_ms: lag_ms__.unwrap_or_default(),
                     last_error: last_error__.unwrap_or_default(),
+                    bootstrap_phase: bootstrap_phase__.unwrap_or_default(),
+                    bootstrap_bytes: bootstrap_bytes__.unwrap_or_default(),
                 })
             }
         }
