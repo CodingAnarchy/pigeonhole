@@ -488,3 +488,74 @@ fn verify_checks_the_index_s_membership_at_its_own_snapshot() {
     );
     assert!(!st.is_consistent(), "{st:?}");
 }
+
+/// `OpenOptions::own_rebalancer` (#1618): no crate thread splits the IVF lists. The
+/// rebalancer is the application's, from `take_rebalancer`, and running it does the splits
+/// the writes queued; the store stays consistent. Without the option there is none to take.
+#[test]
+fn an_application_runs_its_own_ivf_rebalancer() {
+    use pigeonhole_memory::OpenOptions;
+    let (_dir, db) = open();
+    let model = EmbeddingModel::new("test-model", DIM as u32, Element::F32).unwrap();
+    let store = Store::create_with(
+        &db,
+        "notes",
+        StoreOptions::new().embedding(model).ivf(small()),
+        OpenOptions::new().model("test-model").own_rebalancer(),
+    )
+    .unwrap();
+    let rebalancer = store.take_rebalancer().expect("the store's rebalancer");
+    assert!(store.take_rebalancer().is_none(), "taken once");
+    let mut rng = Rng(1618);
+    fill(&store, &mut rng);
+    // 420 memories in lists of 8 queue splits. A crate thread would take them within this
+    // wait (it polls every 50 ms); none runs, so they are all still queued after it. Only a
+    // failure depends on the timing: with no thread, the splits wait however long it is.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let mut rebalancer = rebalancer;
+    let mut ran = 0;
+    while rebalancer
+        .run_once(std::time::Duration::from_millis(50))
+        .unwrap()
+    {
+        ran += 1;
+        assert!(ran < 10_000, "the rebalancer never ran dry");
+    }
+    assert!(
+        ran > 0,
+        "the writes left splits for the application's rebalancer"
+    );
+    assert!(store.verify().unwrap().is_consistent());
+    let q = emb(&mut rng);
+    let exact = store
+        .recall(&["big"])
+        .embedding(q.clone())
+        .weights(vector_only())
+        .exact(true)
+        .run()
+        .unwrap();
+    let all = store
+        .recall(&["big"])
+        .embedding(q)
+        .weights(vector_only())
+        .nprobe(10_000)
+        .run()
+        .unwrap();
+    assert_eq!(ids(&all), ids(&exact));
+    drop(rebalancer);
+    drop(store);
+
+    // Reopened with the option, there is a rebalancer to take; without it, none.
+    let owned = Store::open_with(
+        &db,
+        "notes",
+        OpenOptions::new().model("test-model").own_rebalancer(),
+    )
+    .unwrap();
+    assert!(owned.take_rebalancer().is_some());
+    drop(owned);
+    let plain = Store::open(&db, "notes", "test-model").unwrap();
+    assert!(plain.take_rebalancer().is_none());
+    drop(plain);
+    db.close().unwrap();
+}
