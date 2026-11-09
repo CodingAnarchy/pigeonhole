@@ -78,6 +78,33 @@ impl Server {
         Self::start_custom(tokens, limits, shards, |s| s)
     }
 
+    /// A server whose backup downloads' copies are slow (#1611): opening a copy's file takes
+    /// `delay`, through a filesystem the test wraps around the real one ([`SlowCopies`]),
+    /// and then fails if `fail`.
+    fn start_slow_copies(delay: Duration, fail: bool) -> Self {
+        let dir = test_dir();
+        let vfs: pigeonhole_io::VfsRef = Arc::new(SlowCopies {
+            inner: pigeonhole_io::pread::PreadVfs::new(0),
+            delay,
+            fail,
+        });
+        let db = Pigeonhole::open(
+            dir.join("t.phdb"),
+            Options::default()
+                .create_if_missing(true)
+                .shards(1)
+                .change_feed(pigeonhole::FeedRetention::bytes(64 << 20))
+                .vfs(vfs),
+        )
+        .unwrap();
+        db.table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        Self::serve(dir, db, "", limits(), None, |s| s)
+    }
+
     /// `start_with`, its service changed by `f` before it serves.
     fn start_custom(
         tokens: &str,
@@ -5256,4 +5283,319 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
         get_value(&r, "t", "r47", None),
         get_value(&p, "t", "r47", None)
     );
+}
+
+#[test]
+fn a_backup_download_answers_at_once_and_heartbeats_while_its_copy_is_written() {
+    // #1611: a fresh download used to answer only once the whole copy was written and
+    // hashed. Over gRPC it now answers at once with a heartbeat (no data, its id), then one
+    // about every second; a resume with the id while the copy is written waits for that same
+    // copy. HTTP still waits for the copy, whose size and hash are its headers.
+    use sha2::{Digest, Sha256};
+    let s = Server::start_slow_copies(Duration::from_millis(2500), false);
+    for i in 0..20u32 {
+        let value = json!({"bytes": b64(&vec![b'v'; 4096])});
+        assert_eq!(
+            s.post("Mutate", &put(&format!("r{i:02}"), "f", "q", value), None)
+                .0,
+            200
+        );
+    }
+    let downloads = s.dir.join("backups").join(".phdb-serve-downloads");
+    let bytes = s.block_on(async {
+        let mut admin = proto::admin_client::AdminClient::new(
+            tonic::transport::Channel::from_shared(s.url.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let mut stream = admin
+            .backup_download(proto::BackupDownloadRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.message())
+            .await
+            .expect("an answer before the copy is written")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(first.data.is_empty(), "a heartbeat carries no data");
+        assert_eq!(first.offset, 0);
+        assert!(!first.backup_id.is_empty());
+        let second = tokio::time::timeout(Duration::from_millis(1500), stream.message())
+            .await
+            .expect("another heartbeat within the second")
+            .unwrap()
+            .unwrap();
+        assert!(second.data.is_empty());
+        assert_eq!(second.backup_id, first.backup_id);
+        // The client breaks off and resumes with the id while the copy is still written.
+        drop(stream);
+        let mut stream = admin
+            .backup_download(proto::BackupDownloadRequest {
+                backup_id: first.backup_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let (mut bytes, mut beats, mut last) = (Vec::new(), 0, None);
+        while let Some(c) = stream.message().await.unwrap() {
+            assert_eq!(c.backup_id, first.backup_id);
+            assert_eq!(c.offset, bytes.len() as u64);
+            if c.data.is_empty() && c.sha256.is_empty() {
+                beats += 1;
+            }
+            bytes.extend_from_slice(&c.data);
+            last = Some(c);
+        }
+        let last = last.unwrap();
+        assert!(beats >= 1, "the resume waited for the copy with heartbeats");
+        assert_eq!(last.total, bytes.len() as u64);
+        assert_eq!(&last.sha256[..], &Sha256::digest(&bytes)[..]);
+        bytes
+    });
+    assert_eq!(
+        std::fs::read_dir(&downloads).unwrap().count(),
+        1,
+        "the resume read the same copy, never a second"
+    );
+    let copy = s.dir.join("download.phdb");
+    std::fs::write(&copy, &bytes).unwrap();
+    assert_eq!(rows_in_backup(&copy).0, 20);
+    // Over HTTP the response waits for the copy, then has its size and hash as headers.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(format!("{}/v1/Admin/BackupDownload", s.url))
+        .send_json(json!({}))
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let sha = resp
+        .headers()
+        .get("x-pigeonhole-backup-sha256")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = resp.body_mut().read_to_vec().unwrap();
+    let want: String = Sha256::digest(&body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(sha, want);
+    assert_eq!(
+        rows_in_backup(&{
+            let p = s.dir.join("download-http.phdb");
+            std::fs::write(&p, &body).unwrap();
+            p
+        })
+        .0,
+        20
+    );
+}
+
+#[test]
+fn a_bootstrap_from_a_primary_whose_copy_outlasts_the_idle_limit_succeeds() {
+    // #1611 (cli692's R1 on #1609): a replica waited a fixed 10 minutes for the primary's
+    // first answer, so a longer copy could never bootstrap one. With heartbeats, a wait
+    // between them is 3 s (the idle limit here is 500 ms), against a copy that takes 5 s,
+    // and nothing breaks.
+    let p = Server::start_slow_copies(Duration::from_secs(5), false);
+    for i in 0..8u32 {
+        let (status, body) = p.post(
+            "Mutate",
+            &put(&format!("r{i}"), "f", "q", json!({"bytes": b64(b"v")})),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    let mut short = limits();
+    short.stream_idle = Duration::from_millis(500);
+    let r = Server::start_replica_with(test_dir(), &p.url, None, short);
+    let mut waited = false;
+    let info = wait_replica(&r, "caught up", |info| {
+        let error = info["last_error"].as_str().unwrap_or("");
+        assert!(
+            error.is_empty(),
+            "a break while the copy was written: {info}"
+        );
+        waited |= info["bootstrap_phase"] == "waiting for the primary's copy";
+        caught_up(&p, None)(info)
+    });
+    assert!(waited, "Info showed the wait for the copy: {info}");
+    assert_eq!(
+        get_value(&r, "t", "r7", None),
+        get_value(&p, "t", "r7", None)
+    );
+}
+
+/// The real filesystem, but opening a file in the server's download directory (a backup
+/// download's copy) first waits `delay`: a copy that takes a while to write (#1611). With
+/// `fail`, the open then fails: a copy that fails after its download's first heartbeat.
+#[derive(Debug)]
+struct SlowCopies {
+    inner: pigeonhole_io::VfsRef,
+    delay: Duration,
+    fail: bool,
+}
+
+/// What a failing [`SlowCopies`] says.
+const REFUSED: &str = "the test's filesystem refuses the copy";
+
+impl pigeonhole_io::Vfs for SlowCopies {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        opts: pigeonhole_io::OpenOptions,
+    ) -> pigeonhole_io::Result<pigeonhole_io::FileRef> {
+        if path
+            .parent()
+            .is_some_and(|d| d.ends_with(super::backup::DOWNLOADS))
+        {
+            std::thread::sleep(self.delay);
+            if self.fail {
+                return Err(pigeonhole_io::Error::new(
+                    pigeonhole_io::ErrorKind::Other,
+                    REFUSED,
+                ));
+            }
+        }
+        self.inner.open(path, opts)
+    }
+    fn remove(&self, path: &std::path::Path) -> pigeonhole_io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> pigeonhole_io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn exists(&self, path: &std::path::Path) -> pigeonhole_io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn list_dir(&self, dir: &std::path::Path) -> pigeonhole_io::Result<Vec<PathBuf>> {
+        self.inner.list_dir(dir)
+    }
+    fn sync_dir(&self, dir: &std::path::Path) -> pigeonhole_io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+    fn submit_sync_dir(&self, dir: &std::path::Path) -> pigeonhole_io::Completion<()> {
+        self.inner.submit_sync_dir(dir)
+    }
+    fn open_shared(
+        &self,
+        name: &str,
+        dir: Option<&std::path::Path>,
+        len: u64,
+        mode: pigeonhole_io::SharedOpen,
+    ) -> pigeonhole_io::Result<pigeonhole_io::SharedRegion> {
+        self.inner.open_shared(name, dir, len, mode)
+    }
+    fn remove_shared(
+        &self,
+        name: &str,
+        dir: Option<&std::path::Path>,
+    ) -> pigeonhole_io::Result<()> {
+        self.inner.remove_shared(name, dir)
+    }
+    fn now_micros(&self) -> u64 {
+        self.inner.now_micros()
+    }
+    fn monotonic_nanos(&self) -> u64 {
+        self.inner.monotonic_nanos()
+    }
+    fn current_process(&self) -> pigeonhole_io::ProcessId {
+        self.inner.current_process()
+    }
+    fn attach_thread(&self) {
+        self.inner.attach_thread();
+    }
+    fn random_u64(&self) -> u64 {
+        self.inner.random_u64()
+    }
+}
+
+#[test]
+fn a_copy_that_fails_after_a_heartbeat_reports_why() {
+    // cli692's R1 and R2 on #1628: a copy that fails while its download sends heartbeats
+    // must reach the client as its error, not as a stream that ends as if whole (a heartbeat
+    // sitting in the channel made the error's `try_send` fail); and a replica must give up
+    // with that cause, not with the NotFound of its resumes.
+    let s = Server::start_slow_copies(Duration::from_millis(1200), true);
+    // Straight through the service, its chunks taken only when the test polls: a heartbeat
+    // fills the channel (one chunk) while the copy fails, and the error must still follow.
+    let service = &s.shared.router.service;
+    let reply = s.block_on(service.call(
+        ServiceOp::BackupDownload(proto::BackupDownloadRequest::default()),
+        &Caller::anonymous(),
+        None,
+    ));
+    let Ok(super::service::ServiceReply::Download(mut d)) = reply else {
+        panic!("a download: {reply:?}");
+    };
+    std::thread::sleep(Duration::from_millis(1600));
+    let mut beats = 0;
+    let e = s.block_on(async {
+        loop {
+            match d.chunks.recv().await {
+                Some(Ok(c)) => {
+                    assert!(c.data.is_empty(), "no data from a failed copy");
+                    beats += 1;
+                    // The task's next heartbeat refills the channel, and the copy's failure
+                    // comes after it: the error must wait for room, not be dropped.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Some(Err(e)) => break e,
+                None => panic!("the download ended as if whole after {beats} heartbeats"),
+            }
+        }
+    });
+    assert!(beats >= 1);
+    assert!(e.message.contains(REFUSED), "{e:?}");
+    s.block_on(async {
+        let mut admin = proto::admin_client::AdminClient::new(
+            tonic::transport::Channel::from_shared(s.url.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap(),
+        );
+        let mut stream = admin
+            .backup_download(proto::BackupDownloadRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        // Take no chunk for a while, so a heartbeat sits in the channel when the copy fails.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let mut beats = 0;
+        let e = loop {
+            match stream.message().await {
+                Ok(Some(c)) => {
+                    assert!(c.data.is_empty(), "no data from a failed copy");
+                    beats += 1;
+                }
+                Ok(None) => panic!("the stream ended as if whole after {beats} heartbeats"),
+                Err(e) => break e,
+            }
+        };
+        assert!(beats >= 1);
+        assert!(e.message().contains(REFUSED), "{e:?}");
+    });
+    // Over HTTP: the copy's error, not "ended early".
+    let (status, e) = s.rpc("Admin/BackupDownload", &json!({}), None);
+    assert_ne!(status, 200);
+    assert!(
+        e["message"].as_str().unwrap_or("").contains(REFUSED),
+        "{status}: {e}"
+    );
+    // A replica's bootstrap gives up with the cause, after starting fresh copies.
+    let r = Server::start_replica(test_dir(), &s.url, None);
+    let info = wait_replica(&r, "a failed bootstrap", |info| info["state"] == "retrying");
+    let error = info["last_error"].as_str().unwrap_or("");
+    assert!(error.contains(REFUSED), "{info}");
+    assert!(!error.contains("no such backup download"), "{info}");
 }
