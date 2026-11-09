@@ -185,6 +185,16 @@ impl Source {
         }
     }
 
+    /// Where an SST source's cursor stands, by data block ([`SstIter::block_stamp`]); 0 for
+    /// other sources.
+    #[inline]
+    pub(crate) fn block_stamp(&self) -> u64 {
+        match self {
+            Source::Mem(_) => 0,
+            Source::Sst(s) => s.iter.block_stamp(),
+        }
+    }
+
     /// The current value, pinned without a copy where the source allows it.
     ///
     /// # Panics

@@ -1735,6 +1735,7 @@ dependencies = [
  "pigeonhole",
  "pigeonhole-arrow",
  "pigeonhole-format",
+ "pigeonhole-io",
  "pigeonhole-memory",
  "pigeonhole-text",
  "pigeonhole-vector",

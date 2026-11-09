@@ -4529,3 +4529,38 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Divergence:** an equal version with different content is refused and reported as divergent (cli692's M3).
 - **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
 - **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
+
+<a id="d320"></a>
+## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
+
+**Problem.** A `FeedReader` read every stream to its end on each pass and kept every record it hadn't delivered. A consumer that fell behind kept its whole backlog decoded in memory (278,287 entries in one `phdb serve` hub, #1397 ticket 5).
+
+**A stream isn't in key order,** so a reader can't stop a stream early. A Single is keyed by its seqno and a cross-shard commit by its Decision's apply seqno. The coordinator reserves the apply seqno when it decides and queues the DECISION. The next group's Singles get their seqnos when the group forms, so they are larger, but the Singles queued before the DECISION are logged ahead of it. The inversion stays within one group, and group boundaries aren't visible in the WAL. So "every record after this point has a key above k" can't be known from a stream alone.
+
+**Decided (PR 1).** Each pass still reads every stream to its readable end (M1 and rule C are unchanged), but keeps only records with keys at or below a cutoff **C**:
+- **The budget:** 64 MiB of decoded changes (an engine constant, no public knob), counted over `ready` and `held`.
+- **Eviction:** past the budget, the largest keys go first, and C falls below each one.
+  - A held share counts at its id + 1, a lower bound for its round's apply seqno (the allocator reserves the id first). It goes with every share of its round.
+  - A decided round goes with its shares.
+- **Passing over:** a record past C is passed over after its header, with its mutations never filtered or copied. A Prepare with id ≥ C is passed over too.
+  - A Decision past C passes its round over: its shares are dropped and any read later in the pass are passed over. Leaving them held would let rule C drop them as aborted, and the Decision read after the rewind would then expire the feed.
+- **Delivery and position** go up to min(F, C), and so does a feed of every table's catalog event.
+- **The rewind:** once the frontier is past C and nothing is kept below it, the reader reads every stream again from its hint. That's the earliest record not delivered, kept or passed over, the same hint a token carries, so the rewind is a resume from the reader's own token.
+- **Liveness:** a pass that leaves nothing to deliver below a cutoff under the frontier rewinds at once with twice the budget, and a delivery restores the budget. (Only the shares of rounds in flight around the next commit can fill the budget that way.) `Pending` still means every commit up to the frontier was delivered.
+- **The bound:** the reader keeps at most its budget, plus about twice the in-flight cross-shard shares, plus one commit.
+- **The cost:** a reader that stays a backlog B behind re-reads B (frames and headers only) once per budget delivered.
+- **Reader processes** (`ReadTable::feed`) run the same passes, so the cap applies there too.
+- **Retention (simp724's N2 on #1622):** retention follows bytes and age, not subscribers. A capped reader's margin is its hint, as for a token resume: a record it evicted has to be read again from the log. So a rewind can expire a feed that, uncapped, would still hold that record in memory. The guide says so under "When a feed expires".
+- **What the reader remembers between rewinds (simp724's S1 on #1622):** only the passed-over rounds with ids below C, the rounds in flight across C. A share with a larger id is passed over by its id, and C only falls.
+- **`read_through`** is still set after every pass, capped or not. `position()` and the idle fast path take the min with C, and a rewind clears it.
+- **Shares of delivered rounds** that a rewind re-reads without their Decision are never evicted (simp724's N1). Evicting one would put C at or below `delivered` for nothing; rule C drops it.
+
+**Deferred (PR 2): not needed (coordinator, 2026-11-09, on perf287's ticket 5 re-run, #1598).** The option: the writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it would need a per-session marker (a FORMAT and ICR line). The AX102 run (#1397 ticket 5; main 6aca49f1 against d3378ff8, the full table ×2) showed it isn't worth that:
+- **16 hubs × 16 subscribers,** the scenario that falls behind:
+  - `phdb` peak RSS fell from 8.9–15.9 GB to 4.7–5.1 GB, and no longer depends on how far the run falls behind;
+  - each subscriber got 1.3–2.6× more events;
+  - server CPU per put rose 5–6% (180 → 186–191 µs). That's the re-read cost, and all PR 2 could save.
+- **Every other scenario** (0, 1, 16 and 256 subscribers, and tiny) was level between the arms.
+- **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
+
+Revisit PR 2 only if a profile shows the re-reads costing more than that.
