@@ -515,6 +515,7 @@ dependencies = [
 name = "pigeonhole-sst"
 version = "3.0.0"
 dependencies = [
+ "loom",
  "pigeonhole-cache",
  "pigeonhole-format",
  "pigeonhole-io",
