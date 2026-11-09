@@ -713,9 +713,9 @@ fn read_answer(tcp: &mut std::net::TcpStream) -> std::io::Result<(String, String
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        if tcp.read(&mut byte)? == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
+        // `read_exact` retries a read a signal interrupted, as a bare `read` doesn't (EINTR
+        // on a Linux runner), and it reports the connection's end as `UnexpectedEof`.
+        tcp.read_exact(&mut byte)?;
         head.push(byte[0]);
     }
     let head = String::from_utf8_lossy(&head).into_owned();
