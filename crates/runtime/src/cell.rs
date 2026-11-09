@@ -68,6 +68,17 @@ struct RunWord {
     /// (`ShardCell::check_backstop`). Should stay 0. Written by the hosting driver only;
     /// read through the inbox's caller entry, so 0 with caller-runs off.
     backstop_wakes: AtomicU64,
+    /// SCRATCH capture (#1502 box run, `PH_BACKSTOP_TRACE=1`): the last token holder, the
+    /// source line of the driver's last take, and what the last caller release saw.
+    trace_holder: AtomicU8,
+    trace_take_line: std::sync::atomic::AtomicU32,
+    trace_release: AtomicU8,
+}
+
+/// SCRATCH capture switch (#1502): `PH_BACKSTOP_TRACE=1`.
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PH_BACKSTOP_TRACE").is_ok_and(|v| v == "1"))
 }
 
 /// A shard a committing client may run (#1176): the runtime's entry, on the shard's inbox.
@@ -108,6 +119,9 @@ impl<H: ShardHandler> ShardCell<H> {
                 skipped: AtomicBool::new(false),
                 caller_busy: AtomicU64::new(0),
                 backstop_wakes: AtomicU64::new(0),
+                trace_holder: AtomicU8::new(FREE),
+                trace_take_line: std::sync::atomic::AtomicU32::new(0),
+                trace_release: AtomicU8::new(0),
             },
             id,
             signal,
@@ -126,6 +140,7 @@ impl<H: ShardHandler> ShardCell<H> {
 
     /// Takes the token for `holder` if no thread holds it and the shard is neither failed
     /// nor closed. Never waits.
+    #[track_caller]
     fn try_take(&self, holder: u8) -> Option<Turn<'_, H>> {
         let guard = match self.core.try_lock() {
             Ok(g) => g,
@@ -134,6 +149,14 @@ impl<H: ShardHandler> ShardCell<H> {
         };
         guard.as_ref()?;
         self.run.state.store(holder, Ordering::Relaxed);
+        if trace_on() {
+            self.run.trace_holder.store(holder, Ordering::Relaxed);
+            if holder == DRIVER {
+                self.run
+                    .trace_take_line
+                    .store(std::panic::Location::caller().line(), Ordering::Relaxed);
+            }
+        }
         if holder == DRIVER {
             self.run.skipped.store(false, Ordering::Relaxed);
             self.run.driver_wants.store(false, Ordering::Relaxed);
@@ -145,6 +168,7 @@ impl<H: ShardHandler> ShardCell<H> {
     /// the shard skipped, fences, and tries once more: either it gets the token now (the
     /// caller released in between), or the caller's release sees `skipped` and wakes it
     /// (the Dekker pair of #1176's note, §4).
+    #[track_caller]
     pub(crate) fn driver(&self) -> Option<Turn<'_, H>> {
         if let Some(t) = self.try_take(DRIVER) {
             return Some(t);
@@ -157,6 +181,7 @@ impl<H: ShardHandler> ShardCell<H> {
     /// The driver's take where it must have the shard (start, a move, close): waits out a
     /// caller's turn, which is bounded (`CALLER_BATCH` messages, no blocking I/O). `None`
     /// only for a failed shard.
+    #[track_caller]
     pub(crate) fn driver_wait(&self) -> Option<Turn<'_, H>> {
         loop {
             if let Some(t) = self.try_take(DRIVER) {
@@ -192,7 +217,29 @@ impl<H: ShardHandler> ShardCell<H> {
         if wakes() != wakes_before {
             return;
         }
-        if !self.try_take(DRIVER).is_some_and(|mut t| t.has_work()) {
+        // SCRATCH capture (#1502): the flags as the park left them, before this take.
+        let before = trace_on().then(|| {
+            let r = &self.run;
+            format!(
+                "state {} sleeping {} skipped {} wants {} task_woken {} last_holder {} last_driver_take_line {} last_release(saw_skipped,notify,task_woken,notified) {:04b}",
+                r.state.load(Ordering::Relaxed),
+                self.signal.trace_sleeping(),
+                r.skipped.load(Ordering::Relaxed),
+                r.driver_wants.load(Ordering::Relaxed),
+                self.signal.task_woken(),
+                r.trace_holder.load(Ordering::Relaxed),
+                r.trace_take_line.load(Ordering::Relaxed),
+                r.trace_release.load(Ordering::Relaxed),
+            )
+        });
+        let mut work = String::new();
+        if !self.try_take(DRIVER).is_some_and(|mut t| {
+            let w = t.has_work();
+            if w && trace_on() {
+                work = t.trace_work();
+            }
+            w
+        }) {
             return;
         }
         let grace = std::time::Instant::now() + BACKSTOP_GRACE;
@@ -203,6 +250,12 @@ impl<H: ShardHandler> ShardCell<H> {
             std::thread::yield_now();
         }
         if wakes() == wakes_before {
+            if let Some(before) = before {
+                eprintln!(
+                    "PH_BACKSTOP_TRACE lost wake: shard {} wakes {wakes_before} | {before} | work: {work}",
+                    self.id.0
+                );
+            }
             self.run.backstop_wakes.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -278,8 +331,20 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
         // a deadline moved, a driver that skipped the shard meanwhile) wakes it.
         drop(turn);
         fence(Ordering::SeqCst);
-        if notify || run.skipped.load(Ordering::Relaxed) || self.signal.task_woken() {
+        let saw_skipped = run.skipped.load(Ordering::Relaxed);
+        let woken = self.signal.task_woken();
+        let notified = notify || saw_skipped || woken;
+        if notified {
             self.signal.notify();
+        }
+        if trace_on() {
+            run.trace_release.store(
+                u8::from(saw_skipped) << 3
+                    | u8::from(notify) << 2
+                    | u8::from(woken) << 1
+                    | u8::from(notified),
+                Ordering::Relaxed,
+            );
         }
         true
     }
