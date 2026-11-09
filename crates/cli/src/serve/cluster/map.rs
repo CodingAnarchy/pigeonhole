@@ -38,9 +38,9 @@ pub(crate) fn id_ok(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
-/// Checks `map` on its own. `loopback_only`: the node runs without TLS or tokens
-/// (`--insecure-no-tls-no-auth`), so every node it would dial must be on loopback, as its
-/// own listener must be (cli692's M2 on D317 ticket 1).
+/// Checks `map` on its own. `loopback_only`: the node dials its peers without TLS, so every
+/// node it would dial must be on loopback, or its cluster token would cross a network in
+/// the clear (cli692's M2 and R3 on D317 ticket 1).
 pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refusal> {
     if !id_ok(&map.cluster_id) {
         return Err(format!(
@@ -64,8 +64,8 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
         }
         if loopback_only && !loopback(&n.address) {
             return Err(format!(
-                "node {:?}'s address {} isn't loopback: a cluster without TLS and tokens \
-                 (--insecure-no-tls-no-auth) may only dial nodes on this machine",
+                "node {:?}'s address {} isn't loopback: a node without TLS dials only nodes \
+                 on this machine (add --tls-cert and --tls-key)",
                 n.id, n.address
             ));
         }
@@ -170,10 +170,14 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
     Ok(())
 }
 
-/// Checks that `new` may replace `old` (both valid): the same cluster, a newer version, and
-/// only the changes D317 §1 allows. Placements are fixed once written (re-splitting a range
-/// that holds data needs range moves, #1499); a partition moves only with a higher epoch.
-pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+/// Checks that a node at `old` may take `new` (valid) from a peer, whatever happened in the
+/// versions between them: the same cluster and a newer version, nothing more. The change
+/// rules ([`validate_change`]) hold one step at a time, not across a jump: a table dropped
+/// in one version and created again with other splits in a later one, or a partition
+/// dropped and added back at a lower epoch, would refuse a node that missed both steps,
+/// for good (cli692's R1). They're enforced where a map is set (`SetMap`), against the
+/// setter's current map; a pushed or pulled map is one that passed them there.
+pub(crate) fn validate_catch_up(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
     if new.cluster_id != old.cluster_id {
         return Err(format!(
             "the map is for cluster {:?}, but this node is in cluster {:?}",
@@ -186,6 +190,15 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
             new.map_version, old.map_version
         ));
     }
+    Ok(())
+}
+
+/// Checks that `new` may replace `old` (both valid) as one step, where a map is set: the
+/// same cluster, a newer version, and only the changes D317 §1 allows. Placements are fixed
+/// once written (re-splitting a range that holds data needs range moves, #1499); a
+/// partition moves only with a higher epoch.
+pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    validate_catch_up(old, new)?;
     let new_tables: HashMap<&str, _> = new.tables.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut used = HashSet::new();
     for t in &old.tables {
@@ -504,6 +517,25 @@ mod tests {
         let mut m = next();
         m.partitions.retain(|p| p.id != "p3");
         refused(validate_change(&old, &m), "can't be dropped");
+    }
+
+    #[test]
+    fn a_node_catching_up_checks_only_the_cluster_and_the_order() {
+        // v2 dropped `users` and p3, v3 created `users` again with other splits and added
+        // p3 back at a lower epoch: each step was a valid change, the jump isn't one, and a
+        // node at v1 must still reach v3 (cli692's R1).
+        let mut old = map();
+        old.partitions[2].epoch = 5;
+        let mut v3 = map();
+        v3.map_version = 3;
+        v3.tables[0].splits = vec![text("q")];
+        validate(&v3, true).unwrap();
+        refused(validate_change(&old, &v3), "fixed once written");
+        validate_catch_up(&old, &v3).unwrap();
+        refused(validate_catch_up(&old, &map()), "isn't newer");
+        let mut other = v3.clone();
+        other.cluster_id = "c2".into();
+        refused(validate_catch_up(&old, &other), "cluster");
     }
 
     #[test]

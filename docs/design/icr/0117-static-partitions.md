@@ -19,9 +19,9 @@
   - `partitions.len() == splits.len() + 1`;
   - families are valid `FamilySpec`s;
   - a co-location group's tables are unsplit, on one partition.
-- **Plaintext clusters:** under `--insecure-no-tls-no-auth`, every node address must resolve to loopback.
+- **Plaintext clusters:** on a node without TLS (`--insecure-no-tls-no-auth`, or tokens on a loopback listener), every node address must resolve to loopback, since the node would send its cluster token to them in the clear.
 
-**What a change may do:**
+**What a change may do:** these rules apply one step at a time, where a map is set (`SetMap`, against the node's current map). A node taking a map from a peer (`PushMap`, a pull, catching up at start) checks only that it's valid, of the same `cluster_id`, and newer. It may have missed several steps, and the rules don't hold across a jump: a table dropped and created again with other splits, or a partition dropped and added back at a lower epoch.
 - The same `cluster_id` and a greater `map_version`.
 - Existing placements keep their split keys (compared as bytes), partitions and group. Moving ranges is #1499.
 - A partition that holds a placement isn't dropped.
@@ -59,7 +59,7 @@
 - **The answer:** sent once the map is persisted here, with each push's result. A node the push missed pulls the map later (below).
 
 **`PushMap`:**
-- **Accepted:** a valid map with a greater version and the same cluster, through a valid change.
+- **Accepted:** a valid map with a greater version and the same cluster (the change rules were checked where it was set).
 - **The same version with the same canonical JSON** is a no-op answering ok.
 - **The same version with different content** is divergent. It's refused, and both nodes report it in `Status.divergent` until a newer map is set.
 

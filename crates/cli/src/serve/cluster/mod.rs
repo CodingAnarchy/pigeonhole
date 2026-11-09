@@ -128,11 +128,16 @@ struct Peers {
 pub(crate) struct Node {
     dir: PathBuf,
     id: String,
-    /// The node runs without TLS or tokens, so it dials only loopback peers (cli692's M2).
+    /// The node dials its peers without TLS, so it dials only loopback ones (cli692's M2
+    /// and R3): otherwise its cluster token would cross a network in the clear.
     loopback_only: bool,
     tokens: Tokens,
     peers: Peers,
+    /// Held briefly, never across an fsync or an await.
     state: Mutex<MapState>,
+    /// Serializes installs (check, persist, publish), so the file and `state` take maps in
+    /// one order; held only on blocking threads (cli692's R2).
+    installing: Mutex<()>,
 }
 
 impl Node {
@@ -169,36 +174,71 @@ impl Node {
             .ok_or_else(|| ApiError::not_found("this node has no cluster map yet"))
     }
 
-    /// Validates and persists `map` as the node's newest; `check` decides, under the lock,
-    /// whether it may replace the current one. Returns the new version.
+    /// Validates and persists `map` as the node's newest; `check` decides, under the state
+    /// lock, whether it may replace the current one. `step`: a map being set here, which must
+    /// be a valid change from the current one; otherwise a peer's, which only has to be the
+    /// same cluster's and newer (`map::validate_catch_up`, cli692's R1). Returns the new
+    /// version.
+    ///
+    /// **Blocking** (address resolution, an fsync): run it on a blocking thread
+    /// ([`Node::install_async`]). The state lock is held only to check and to publish; the
+    /// persist runs under `installing` alone.
     fn install(
         &self,
         map: &ClusterMap,
+        step: bool,
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError>,
     ) -> Result<u64, ApiError> {
         map::validate(map, self.loopback_only).map_err(ApiError::invalid)?;
-        let mut st = self.state();
-        if let Some(same) = check(&mut st)? {
-            return Ok(same);
-        }
-        match &st.map {
-            None if !map.nodes.iter().any(|n| n.id == self.id) => {
-                return Err(ApiError::invalid(format!(
-                    "this node's first map must name it: node {:?} isn't in the map",
-                    self.id
-                )));
+        let _one = self
+            .installing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        {
+            let mut st = self.state();
+            if let Some(same) = check(&mut st)? {
+                return Ok(same);
             }
-            None => {}
-            Some((old, _)) => map::validate_change(old, map).map_err(ApiError::invalid)?,
+            match &st.map {
+                None if !map.nodes.iter().any(|n| n.id == self.id) => {
+                    return Err(ApiError::invalid(format!(
+                        "this node's first map must name it: node {:?} isn't in the map",
+                        self.id
+                    )));
+                }
+                None => {}
+                Some((old, _)) if step => {
+                    map::validate_change(old, map).map_err(ApiError::invalid)?;
+                }
+                Some((old, _)) => {
+                    map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
+                }
+            }
         }
         let canonical = map::canonical(map);
         let json = map::canonical_json(&canonical);
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
         let version = canonical.map_version;
+        let mut st = self.state();
         st.map = Some((canonical, json));
         st.divergent.clear();
+        // Versions at or below this one need no pull again (cli692's N3).
+        st.pulled.retain(|v| *v > version);
         Ok(version)
+    }
+
+    /// [`Node::install`] on a blocking thread.
+    async fn install_async(
+        self: &Arc<Self>,
+        map: ClusterMap,
+        step: bool,
+        check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError> + Send + 'static,
+    ) -> Result<u64, ApiError> {
+        let node = Arc::clone(self);
+        tokio::task::spawn_blocking(move || node.install(&map, step, check))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
     }
 
     /// `Cluster.SetMap`: compare-and-set on the version, then push to the others.
@@ -206,19 +246,21 @@ impl Node {
         let map = req
             .map
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
-        let version = self.install(&map, |st| {
-            let current = st.version();
-            if req.expected_map_version != current {
-                return Err(ApiError::from_code(
-                    ErrorCode::Conflict,
-                    &format!(
-                        "the cluster map is at version {current}, not {}: re-read it and set it again",
-                        req.expected_map_version
-                    ),
-                ));
-            }
-            Ok(None)
-        })?;
+        let expected = req.expected_map_version;
+        let version = self
+            .install_async(map, true, move |st| {
+                let current = st.version();
+                if expected != current {
+                    return Err(ApiError::from_code(
+                        ErrorCode::Conflict,
+                        &format!(
+                            "the cluster map is at version {current}, not {expected}: re-read it and set it again",
+                        ),
+                    ));
+                }
+                Ok(None)
+            })
+            .await?;
         let pushed = self.push_all().await;
         Ok(SetMapResponse {
             map_version: version,
@@ -288,7 +330,7 @@ impl Node {
             .await;
             if let Ok(Ok(theirs)) = fetched
                 && theirs.map_version > self.state().version()
-                && let Err(e) = self.push_map(theirs, Some(&n.id))
+                && let Err(e) = self.push_map_async(theirs, Some(n.id.clone())).await
             {
                 eprintln!(
                     "phdb serve: node {}'s newer cluster map: {}",
@@ -299,9 +341,22 @@ impl Node {
         self.push_all().await;
     }
 
+    /// [`Node::push_map`] on a blocking thread.
+    async fn push_map_async(
+        self: &Arc<Self>,
+        map: ClusterMap,
+        from: Option<String>,
+    ) -> Result<PushMapResponse, ApiError> {
+        let node = Arc::clone(self);
+        tokio::task::spawn_blocking(move || node.push_map(map, from.as_deref()))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    }
+
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
+    /// Blocking ([`Node::install`]).
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
-        let version = self.install(&map, |st| {
+        let version = self.install(&map, false, |st| {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
             };
@@ -392,6 +447,24 @@ impl Node {
                 }
             }
             partitions.push(lp);
+        }
+        // Partitions the map places here with no file in DIR: what an operator most needs
+        // to see before the node serves them (cli692's N1).
+        if let Some(m) = &map {
+            for p in m.partitions.iter().filter(|p| p.node == self.id) {
+                if !partitions.iter().any(|lp| lp.id == p.id) {
+                    partitions.push(LocalPartition {
+                        id: p.id.clone(),
+                        epoch: p.epoch,
+                        file: format!("{}.phdb", p.id),
+                        ok: false,
+                        error: format!(
+                            "the map places it here, but the directory has no {}.phdb",
+                            p.id
+                        ),
+                    });
+                }
+            }
         }
         NodeStatus {
             node_id: self.id.clone(),
@@ -496,7 +569,11 @@ impl Node {
                     .map_err(|s| s.message().to_owned())
             };
             let result = match tokio::time::timeout(node.peers.push_timeout, pulled).await {
-                Ok(Ok(map)) => node.push_map(map, Some(&from)).map_err(|e| e.message),
+                Ok(Ok(map)) => node
+                    .push_map_async(map, Some(from.clone()))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.message),
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err("timed out".to_owned()),
             };
@@ -510,6 +587,8 @@ impl Node {
 }
 
 /// The marker a divergent push's refusal carries, so the pusher records the divergence too.
+/// Matched in the refusal's message (cli692's N4): a field of its own (a status detail, say)
+/// would be sturdier across versions, once a client other than a node needs it.
 const DIVERGENT: &str = "divergent map";
 
 /// The `Cluster` service over gRPC.
@@ -567,7 +646,9 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .into_inner()
             .map
             .ok_or_else(|| ApiError::invalid("PushMap needs a map"))?;
-        Ok(tonic::Response::new(self.0.push_map(map, from.as_deref())?))
+        Ok(tonic::Response::new(
+            self.0.push_map_async(map, from).await?,
+        ))
     }
 
     async fn status(
@@ -640,7 +721,9 @@ async fn http_health() -> Response {
 }
 
 /// The node's routes: the `Cluster` service over gRPC, its HTTP/JSON forms (`PushMap` is
-/// gRPC only), and health.
+/// gRPC only), and health. Peers call each other over gRPC only, so only gRPC calls carry
+/// the map-version headers that start a pull; the HTTP forms are for operators (cli692's
+/// N6).
 fn router(node: Arc<Node>, max_request_bytes: usize) -> axum::Router {
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node)))
         .max_decoding_message_size(max_request_bytes);
@@ -736,7 +819,9 @@ pub(crate) fn run(
         None => None,
     };
     let _lock = lock_dir(dir)?;
-    let loopback_only = args.insecure_no_tls_no_auth;
+    // Without TLS the node dials its peers in the clear, with its cluster token: only on
+    // loopback (cli692's R3), whether or not it requires tokens itself.
+    let loopback_only = tls.is_none();
     let mut state = MapState::default();
     if let Some(m) = read_map(dir).map_err(|e| Failure::usage(&e))? {
         map::validate(&m, loopback_only)
@@ -757,6 +842,7 @@ pub(crate) fn run(
             push_timeout: Duration::from_millis(args.cluster_push_timeout_ms.max(1)),
         },
         state: Mutex::new(state),
+        installing: Mutex::new(()),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.io_threads.unwrap_or(2).max(1))

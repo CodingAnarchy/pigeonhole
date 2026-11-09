@@ -49,6 +49,7 @@ fn node(dir: &Path, id: &str) -> Arc<Node> {
             push_timeout: Duration::from_millis(500),
         },
         state: Mutex::new(state),
+        installing: Mutex::new(()),
     })
 }
 
@@ -336,7 +337,10 @@ fn status_reads_a_partitions_identity_row_and_checks_it_against_the_map() {
     .unwrap();
 
     let n = node(&dir, "a");
-    n.push_map(the_map(1, &[7001, 7002, 7003]), None).unwrap();
+    let mut m = the_map(1, &[7001, 7002, 7003]);
+    // p2 placed here too, with no file in the directory.
+    m.partitions[1].node = "a".into();
+    n.push_map(m, None).unwrap();
     let s = n.status();
     assert_eq!((s.node_id.as_str(), s.map_version), ("a", 1));
     let parts: Vec<(&str, &str, u64, bool, &str)> = s
@@ -362,6 +366,36 @@ fn status_reads_a_partitions_identity_row_and_checks_it_against_the_map() {
         !parts[1].3 && parts[1].4.contains("init-partition"),
         "{parts:?}"
     );
+    // The map's partition with no file is reported, not left out (cli692's N1).
+    assert_eq!(parts.len(), 3, "{parts:?}");
+    assert_eq!((parts[2].0, parts[2].1), ("p2", "p2.phdb"));
+    assert!(
+        !parts[2].3 && parts[2].4.contains("has no p2.phdb"),
+        "{parts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_node_that_missed_a_drop_and_a_recreate_still_catches_up() {
+    // v2 dropped `users` and p3 (at epoch 5); v3 created `users` again with other splits and
+    // p3 back at epoch 1. Each step was a valid change where it was set; a node still at v1
+    // takes v3 from a peer all the same (cli692's R1), and refuses only another cluster's
+    // map or one no newer.
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    let ports = [7001, 7002, 7003];
+    let mut v1 = the_map(1, &ports);
+    v1.partitions[2].epoch = 5;
+    n.push_map(v1, None).unwrap();
+    let mut v3 = the_map(3, &ports);
+    v3.tables[0].splits = vec![text("q")];
+    assert_eq!(n.push_map(v3.clone(), Some("b")).unwrap().map_version, 3);
+    assert_eq!(read_map(&dir).unwrap().unwrap(), super::map::canonical(&v3));
+    assert!(n.push_map(the_map(2, &ports), Some("b")).is_err());
+    let mut other = the_map(4, &ports);
+    other.cluster_id = "c2".into();
+    assert!(n.push_map(other, Some("b")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -78,8 +78,10 @@ pub(crate) fn write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
     Ok(())
 }
 
-/// The identity of the partition file at `path`, read through a read-only open (no partition
-/// is open for writing while ticket 1's node runs).
+/// The identity of the partition file at `path`, read through a read-only open: no partition
+/// is open while ticket 1's node runs. Once ticket 2's node holds its partitions open for
+/// writing, `Status` reads the identity from the open handle ([`read`]) instead, rather than
+/// opening each file beside its writer (cli692's N2).
 pub(crate) fn read_file(path: &Path) -> Result<Option<Identity>, String> {
     let db = Pigeonhole::open(path, Options::default().read_only(true))
         .map_err(|e| format!("open: {e}"))?;
