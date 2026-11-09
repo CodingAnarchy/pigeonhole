@@ -267,6 +267,9 @@ pub fn pigeonhole_memory::Recall<'a>::text(self, impl core::convert::Into<alloc:
 pub fn pigeonhole_memory::Recall<'a>::weights(self, pigeonhole_memory::Weights) -> Self
 pub fn pigeonhole_memory::Recall<'a>::with_embeddings(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::with_signals(self, bool) -> Self
+impl<'a> pigeonhole_memory::Recall<'a>
+pub async fn pigeonhole_memory::Recall<'a>::run_async(self) -> pigeonhole_memory::Result<alloc::vec::Vec<pigeonhole_memory::RecallHit>>
+pub async fn pigeonhole_memory::Recall<'a>::run_with_stats_async(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
 impl core::fmt::Debug for pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Recall<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::RecallHit
