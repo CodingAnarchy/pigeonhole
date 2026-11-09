@@ -36,7 +36,6 @@ type HeldWrite = (PathBuf, FileRef, IoBuf, u64, Resolver<IoBuf>);
 /// A held sync: the file, its completion's resolver, and the sync's real outcome.
 type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
 
-/// The test's handle on the VFS's rules and held completions.
 /// Which threads' reads a read hold catches.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum HoldScope {
@@ -47,6 +46,7 @@ enum HoldScope {
     FirstReader(Option<std::thread::ThreadId>),
 }
 
+/// The test's handle on the VFS's rules and held completions.
 #[derive(Debug, Default)]
 pub struct Gate {
     rules: Mutex<Rules>,
@@ -379,6 +379,8 @@ impl pigeonhole_io::File for GateFile {
             Some(marker) => buf.windows(marker.len()).any(|w| w == &marker[..]),
             None => false,
         } && {
+            // Taken inside `hold_read_marker`'s guard (the `&&` keeps it alive): the one
+            // place the two nest, always in this order.
             let mut scope = self.gate.hold_scope.lock().unwrap();
             let me = std::thread::current().id();
             match *scope {
