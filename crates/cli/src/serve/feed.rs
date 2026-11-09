@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -100,6 +100,9 @@ struct Tracker {
     state: AtomicU64,
     /// On the ring, its next index; on its own stream, the seqno it covered.
     at: AtomicU64,
+    /// The hub it's counted under (its address): a client that moved to a failed hub's
+    /// replacement is counted there only (perf287's N1 on #1643).
+    hub: AtomicUsize,
 }
 
 const ON_RING: u64 = 0;
@@ -264,11 +267,20 @@ impl Hub {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
+    /// moved to another hub are pruned here whenever the list reaches a power of two, so it
+    /// stays bounded on a server nobody dumps (perf287's R1 on #1643), and in the dump.
     fn track(&self, tracker: &Arc<Tracker>) {
-        self.clients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::downgrade(tracker));
+        let me = std::ptr::from_ref(self) as usize;
+        tracker.hub.store(me, Ordering::Relaxed);
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if clients.len() >= 16 && clients.len().is_power_of_two() {
+            clients.retain(|w| {
+                w.upgrade()
+                    .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
+            });
+        }
+        clients.push(Arc::downgrade(tracker));
     }
 
     fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
@@ -417,6 +429,8 @@ impl Feeds {
     /// ring against its share of `--feed-ring-bytes`, and its clients on the ring (entries
     /// behind its head), on their own streams (seqnos behind the hub) and waiting for a
     /// `--max-catch-up` slot. Blocking: it takes a snapshot for the database's seqno.
+    /// Only a Unix server has the signal, hence the allowance elsewhere (Windows CI on #1643).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn dump(&self) -> String {
         use std::fmt::Write as _;
         fn spread(mut v: Vec<u64>) -> String {
@@ -461,9 +475,13 @@ impl Feeds {
                 )
             };
             let limit = self.limits.ring_bytes / hub.live.load(Ordering::Relaxed).max(1) as usize;
+            let me = Arc::as_ptr(hub) as usize;
             let trackers: Vec<Arc<Tracker>> = {
                 let mut c = hub.clients.lock().unwrap_or_else(PoisonError::into_inner);
-                c.retain(|w| w.strong_count() > 0);
+                c.retain(|w| {
+                    w.upgrade()
+                        .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
+                });
                 c.iter().filter_map(Weak::upgrade).collect()
             };
             let (mut on_ring, mut own, mut waiting) = (Vec::new(), Vec::new(), 0usize);
@@ -1267,6 +1285,50 @@ mod tests {
         }
         drop((feed, t));
         (out, db, dir)
+    }
+
+    /// A hub's tracker list stays bounded without a dump (perf287's R1 on #1643): gone
+    /// clients and those counted under another hub are pruned as it grows.
+    #[test]
+    fn a_hubs_tracker_list_stays_bounded_without_a_dump() {
+        let (head, _) = watch::channel(0);
+        let hub = |head: watch::Sender<u64>| Hub {
+            ring: Mutex::default(),
+            head,
+            task: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .spawn(async {})
+                .abort_handle(),
+            stats: Arc::default(),
+            live: Arc::new(AtomicU64::new(1)),
+            clients: Mutex::default(),
+        };
+        let (a, b) = (hub(head.clone()), hub(head));
+        // Ten thousand clients that came and went.
+        for _ in 0..10_000 {
+            a.track(&Arc::new(Tracker::default()));
+        }
+        assert!(a.clients.lock().unwrap().len() <= 32, "pruned as it grew");
+        // Live clients stay; one that moved to `b` is no longer counted under `a`.
+        let live: Vec<Arc<Tracker>> = (0..20).map(|_| Arc::new(Tracker::default())).collect();
+        for t in &live {
+            a.track(t);
+        }
+        b.track(&live[0]);
+        for _ in 0..64 {
+            a.track(&Arc::new(Tracker::default()));
+        }
+        let me = std::ptr::from_ref(&a) as usize;
+        let counted = a
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|t| t.hub.load(Ordering::Relaxed) == me)
+            .count();
+        assert_eq!(counted, 19, "the 19 live clients still on `a`");
     }
 
     fn ring(start: u64, commits: &[Commit], evicted: usize) -> Ring {
