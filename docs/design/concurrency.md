@@ -710,6 +710,20 @@ I/O (`reap_orphan_io`, ICR 0028), and only then `std::thread::park()`s. `commit_
     `cache.invalidate`) is the only lock taken, and it is released before the `present`
     Relaxed store. The commit's first write to each row reads the slot's previous value from
     the same `fetch_max` (`RowEpochTable::note_write_prev`, Release, ICR 0082).
+12. `pigeonhole-cache`'s shard locks (the block cache's and the row cache's `RwLock<Shard>`,
+    `s3fifo::Sharded`) are leaves. Since #1559, nothing else is taken under one either:
+    - An entry a change takes out of a shard (an eviction, the entry an insert replaces, a
+      removal) is moved into a `Taken` the caller declared before the guard. It's dropped,
+      and its value freed, after the guard. Before, that drop ran under the write lock: a
+      glibc free, or an `IoBuf` going back to another thread's recycle pool behind its
+      `Mutex`. Those waits became the lock's, and readers queued behind them (#1537's 3.4 ms).
+    - `erase_files` and `clear` (`Sharded::for_each`) drop each shard's removed values after
+      that shard's lock. `cache.erase_files` under the manifest writer (item 2) therefore
+      frees outside the cache's locks, but still inside the manifest's, as before.
+    - The pin protocol is unchanged: an entry is evicted only when its `Arc` count is 1 under
+      the lock, and handles are made only from the index under the lock. So once an entry is
+      out of the index, the `Arc` in `Taken` is the only one, and dropping it later is
+      invisible to every other thread.
 
 ### Bounded polls (no wake source)
 

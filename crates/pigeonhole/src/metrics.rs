@@ -444,6 +444,11 @@ pub(crate) fn internal(
         ("shard_spin_time_nanos", m.shard_spin_time_nanos),
         ("shard_commit_inflight_nanos", m.shard_commit_inflight_nanos),
         ("commit_parks", m.commit_parks),
+        (
+            "block_cache_deferred_evictions",
+            m.cache_deferred_evictions.0,
+        ),
+        ("row_cache_deferred_evictions", m.cache_deferred_evictions.1),
         ("reader_pin_view_lag", m.reader_pin_lag.0),
         ("visibility_waits", m.visibility_waits.0),
         ("visibility_waiters_ahead", m.visibility_waits.1),

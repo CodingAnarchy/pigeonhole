@@ -254,6 +254,12 @@ impl RowCaches {
         self.cache.usage()
     }
 
+    /// The row cache's eviction passes that stopped early (#1559 A,
+    /// `RowCache::deferred_evictions`).
+    pub(crate) fn deferred_evictions(&self) -> u64 {
+        self.cache.deferred_evictions()
+    }
+
     pub(crate) fn stats(&self) -> RowCacheStats {
         RowCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
