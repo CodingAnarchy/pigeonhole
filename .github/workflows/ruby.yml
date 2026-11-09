@@ -78,6 +78,9 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Compile the extension
         run: bundle exec rake compile
+        # With the tests' hold seams (`test-hooks`, #1574); the gems are built without them.
+        env:
+          PIGEONHOLE_TEST_HOOKS: '1'
       # crates/ruby is a workspace of its own (the root's `cargo --workspace` jobs don't see it):
       # lint, document and licence-check it here, once.
       - name: clippy, rustdoc and fmt
@@ -86,6 +89,7 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
         run: |
           cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features test-hooks -- -D warnings
           cargo doc --locked --no-deps
           cargo fmt --check
       - uses: taiki-e/install-action@v2

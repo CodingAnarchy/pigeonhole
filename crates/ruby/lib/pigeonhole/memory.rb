@@ -285,7 +285,14 @@ module Pigeonhole
       # `timeout: nil` waits until a commit comes or the thread is interrupted (perf2's N2 on
       # #1441). `FeedExpired` once the history it needs is gone.
       def next(timeout: nil)
-        c = native_next(timeout)
+        b = Native::FiberBridge.current
+        c = if b
+              r = b.await(native_next_op(b.native),
+                          deadline: timeout && Native::FiberBridge.deadline(timeout))
+              r.equal?(Native::FiberBridge::TIMED_OUT) ? nil : r
+            else
+              native_next(timeout)
+            end
         c && Build.commit(c)
       end
 
