@@ -90,6 +90,10 @@ jobs:
       # passes clippy and serves MCP, refusing `--embed-url`.
       - run: cargo clippy -p pigeonhole-cli --all-targets --no-default-features -- -D warnings
       - run: cargo test -p pigeonhole-cli --no-default-features --test mcp
+      # pigeonhole with `default-features = false` (no `async`), as an application may build
+      # it (#1626). The library alone: with `--all-targets`, its dev-dependencies (memory,
+      # text, vector) depend on it with default features, which turns `async` back on.
+      - run: cargo clippy -p pigeonhole --no-default-features -- -D warnings
       # The golden files frozen at 1.0 (#695): the golden test checks each against its line in
       # golden-frozen.txt, and this checks that a PR only appends lines there.
       - name: frozen golden files only gain siblings
