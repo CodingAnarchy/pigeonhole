@@ -483,9 +483,9 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.caller.get().is_some_and(|c| c.is_free())
     }
 
-    /// Driver passes that found work on the target shard only after the driver's park ran
-    /// out its caller-runs backstop: wakes the caller-to-driver handshake lost (#1176, #1502;
-    /// should stay 0). 0 with caller-runs off. Relaxed.
+    /// Lost wakes the caller-runs park backstop recovered on the target shard: work it had
+    /// when its driver's park ran out that no notify had signalled (#1176, #1502; should
+    /// stay 0). 0 with caller-runs off. Relaxed.
     #[doc(hidden)]
     pub fn caller_backstop_wakes(&self) -> u64 {
         self.inbox.caller.get().map_or(0, |c| c.backstop_wakes())
@@ -940,6 +940,18 @@ impl<H: ShardHandler> ShardCore<H> {
     }
 
     /// Announces sleep, then re-checks for work. Returns whether work remains.
+    /// Caller-runs' lost-wake count (#1502): whether a driver's turn would find work on the
+    /// shard now (a queued or stashed message, a woken task, a task back from the workers),
+    /// looked at without announcing anything. A queued message moves to the stash, which the
+    /// next turn runs first, so order holds.
+    #[cold]
+    fn has_work(&mut self) -> bool {
+        if self.stash.is_none() {
+            self.stash = self.rx.try_recv().ok();
+        }
+        self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back()
+    }
+
     fn check_before_sleep(&mut self) -> bool {
         self.signal().prepare_sleep();
         if self.stash.is_none() {

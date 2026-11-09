@@ -200,9 +200,9 @@ pub struct Metrics {
     /// Caller-runs (#1176): turns committing clients ran on the shards that handled a
     /// message, summed over shards; 0 with it off.
     pub caller_turns: u64,
-    /// Caller-runs (#1176): driver turns that found work only after the driver's park ran
-    /// out its 100 ms backstop, summed over shards: wakes the caller-to-driver handshake
-    /// lost (#1502). Should stay 0; 0 with caller-runs off.
+    /// Caller-runs (#1176): lost wakes the drivers' 100 ms park backstop recovered, summed
+    /// over shards: a shard had work when its driver's park ran out and no notify had
+    /// signalled it (#1502). Should stay 0; 0 with caller-runs off.
     pub caller_backstop_wakes: u64,
     /// Caller-runs' evaluation split (the `caller-stats` feature; zeros without it):
     /// caller-run commits resolved in the client's own turn, another client's, and the

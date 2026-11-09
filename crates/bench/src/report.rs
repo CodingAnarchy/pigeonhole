@@ -717,8 +717,8 @@ pub struct Stalls {
     /// Caller-runs (#1176): turns committing clients ran on their shards.
     #[serde(default)]
     pub caller_turns: u64,
-    /// Caller-runs: driver turns that found work only after the 100 ms park backstop (a
-    /// lost wake, #1502; should be 0).
+    /// Caller-runs: lost wakes the 100 ms park backstop recovered: a shard had work when the
+    /// park ran out and no notify had signalled it (#1502; should be 0).
     #[serde(default)]
     pub caller_backstop_wakes: u64,
     /// Caller-runs' evaluation split (the bench's `caller-stats` feature; 0 without it):

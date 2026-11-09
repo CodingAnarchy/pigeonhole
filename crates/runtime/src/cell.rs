@@ -29,6 +29,10 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use crate::signal::Signal;
 use crate::{Inbox, ShardCore, ShardHandler, ShardId};
 
+/// How long `ShardCell::check_backstop` waits for a notify already under way (a producer
+/// between its publish and its notify) before it counts a lost wake.
+const BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// No thread holds the token.
 pub(crate) const FREE: u8 = 0;
 /// The shard's driver holds it, for a turn.
@@ -58,11 +62,11 @@ struct RunWord {
     /// (rev 3.1: charged to that driver's busy time, so the controller sizes it for the
     /// moments it takes over).
     caller_busy: AtomicU64,
-    /// Driver passes on this shard that found work after the driver's park ran out its
-    /// caller-runs backstop (`CALLER_RUNS_PARK_BACKSTOP`): each is a wake the handshake lost
-    /// and the backstop recovered, so it should stay 0 (#1502's re-run reports it per row).
-    /// Written by the hosting driver only; read through the inbox's caller entry, so 0 with
-    /// caller-runs off.
+    /// Lost wakes the caller-runs park backstop (`CALLER_RUNS_PARK_BACKSTOP`) recovered on
+    /// this shard: when the hosting driver's park ran out the backstop, the shard had work
+    /// and no notify had found it announced asleep, even after a grace for one in flight
+    /// (`ShardCell::check_backstop`). Should stay 0. Written by the hosting driver only;
+    /// read through the inbox's caller entry, so 0 with caller-runs off.
     backstop_wakes: AtomicU64,
 }
 
@@ -77,8 +81,8 @@ pub(crate) trait CallerTurn: Send + Sync {
     /// polling: rev 3.1, C1).
     fn is_free(&self) -> bool;
 
-    /// Driver passes that found work on the shard only after the backstop ran out (a lost
-    /// wake; see `RunWord::backstop_wakes`). Relaxed.
+    /// Lost wakes the park backstop recovered on the shard (see `RunWord::backstop_wakes`).
+    /// Relaxed.
     fn backstop_wakes(&self) -> u64;
 }
 
@@ -170,10 +174,37 @@ impl<H: ShardHandler> ShardCell<H> {
         self.run.driver_wants.store(true, Ordering::Relaxed);
     }
 
-    /// The hosting driver's turn found work on the shard after its park ran out the
-    /// caller-runs backstop: a lost wake the backstop recovered.
-    pub(crate) fn backstop_woke(&self) {
-        self.run.backstop_wakes.fetch_add(1, Ordering::Relaxed);
+    /// The hosting driver's park timed out (the caller-runs backstop, or a sleeping task's
+    /// deadline): counts a lost wake if the shard has work, other than what the deadline was
+    /// for, that no notify signalled. `wakes_before` is the signal's wake count
+    /// (`Signal::idle_counts`) read before the park.
+    ///
+    /// A notify that finds the shard announced asleep counts a wake as it wakes the thread,
+    /// so a count that moved since `wakes_before` means the wake was delivered: it only
+    /// landed after the timer had already fired, which the elapsed time alone can't tell
+    /// apart (#1502's re-run counted those; the cross-shard stress test reproduced them, every
+    /// one with its wake counted). Work found with the count unchanged, and still unchanged
+    /// after a grace for a producer between its publish and its notify, is work whose wake
+    /// was lost. A caller holding the token is left alone: its release looks at the shard.
+    #[cold]
+    pub(crate) fn check_backstop(&self, wakes_before: u64) {
+        let wakes = || self.signal.idle_counts().1;
+        if wakes() != wakes_before {
+            return;
+        }
+        if !self.try_take(DRIVER).is_some_and(|mut t| t.has_work()) {
+            return;
+        }
+        let grace = std::time::Instant::now() + BACKSTOP_GRACE;
+        while std::time::Instant::now() < grace {
+            if wakes() != wakes_before {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        if wakes() == wakes_before {
+            self.run.backstop_wakes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Callers' turn time since the last call, for the hosting driver's busy count.

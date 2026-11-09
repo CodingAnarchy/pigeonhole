@@ -7,7 +7,8 @@
 //! row reads back exactly that, and no commit hangs (a watchdog names what each client was
 //! waiting on if none returns for a minute).
 //!
-//! `PIGEONHOLE_STRESS_OPS` sets the operations per client (default 400).
+//! `PIGEONHOLE_STRESS_OPS` sets the operations per client (default 400; the cross-shard test
+//! runs ten times that). `PIGEONHOLE_IO=uring` runs them on io_uring (Linux).
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -25,7 +26,12 @@ const ROWS_PER_CLIENT: u64 = 16;
 const STALL: Duration = Duration::from_secs(60);
 
 fn options(spin_extend_nanos: u64) -> EngineOptions {
-    let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
+    let vfs: pigeonhole_io::VfsRef = match std::env::var("PIGEONHOLE_IO").as_deref() {
+        #[cfg(target_os = "linux")]
+        Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring"),
+        _ => pigeonhole_io::pread::PreadVfs::new(0),
+    };
+    let mut o = EngineOptions::new(vfs);
     o.create_if_missing = true;
     o.shards = SHARDS;
     o.memtable_budget = 16 << 20;
@@ -189,13 +195,13 @@ fn run(spin_extend_nanos: u64) {
     let turns = db.caller_turns();
     assert!(turns > 0, "no client ran its shard's turn");
     eprintln!("caller turns: {turns} for {} ops", ops * CLIENTS as u64);
-    // A driver turn that found work only after its park ran out the backstop is a wake the
-    // caller-to-driver handshake lost (#1502 Phase B's hang, which the backstop now turns
+    // Work a shard had when its driver's park ran out the backstop, with no notify for it, is
+    // a wake the caller-to-driver handshake lost (#1502 Phase B's hang, which the backstop now turns
     // into a 100 ms stall rather than a hang): there must be none.
     assert_eq!(
         db.metrics().caller_backstop_wakes,
         0,
-        "a driver found work only after its park's backstop ran out: a lost wake"
+        "a shard had work no notify signalled when its driver's park backstop ran out: a lost wake"
     );
     #[cfg(feature = "caller-stats")]
     {
@@ -215,6 +221,131 @@ fn run(spin_extend_nanos: u64) {
         assert_eq!(got.as_deref(), Some(&want[..]), "table {t} row {r:?}");
     }
     drop(snap);
+    db.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Cross-shard contention under caller-runs, with idle gaps (#1502's re-run counted 2, 9 and
+/// 2 backstop wakes on buffered cross-shard-contention, and none elsewhere). The bench row's
+/// shape: one table per shard, hot rows every client shares, half the commits writing one row
+/// and half one row in each of 2-4 tables, all `Buffered`, with adaptive drivers and tablet
+/// changes on as in the bench. So PREPAREs meet rows other commits hold, refusals and their
+/// wakes run (D245, D249), and callers' single-shard turns interleave with the drivers' 2PC
+/// rounds. Every `PAUSE` commits all clients stop together for longer than the backstop, so
+/// every driver's park runs it out, and the next burst lands right as the timers fire: the
+/// count must tell a wake that arrived late (a notify found the shard announced asleep) from
+/// a lost one. Before `ShardCell::check_backstop`, this test counted one or two a run, every
+/// one a delivered wake. No commit may hang, and no wake may be lost.
+#[test]
+fn callers_amid_contended_cross_shard_commits_lose_no_wake() {
+    const XSHARDS: usize = 16;
+    const XCLIENTS: usize = 16;
+    const HOT: u64 = 64;
+    const PAUSE: u64 = 200;
+    let ops: u64 = std::env::var("PIGEONHOLE_STRESS_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400)
+        * 10;
+    let dir = std::env::temp_dir().join(format!("phdb-caller-runs-xshard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = options(0);
+    o.shards = XSHARDS;
+    o.adaptive_drivers = true;
+    o.tablet_changes = true;
+    // `CpuProfile::Embedded`'s adaptive spin (#1201).
+    o.shard_spin_cap_nanos = 1_000_000;
+    let barrier = std::sync::Barrier::new(XCLIENTS);
+    let db = Engine::open(&dir.join("xshard.phdb"), o).unwrap();
+    let tables: Vec<(TableId, FamilyId)> = (0..XSHARDS)
+        .map(|t| {
+            let info = db
+                .create_table(&format!("x{t}"), &[("f".into(), FamilyOptions::default())])
+                .unwrap();
+            (info.id, info.families[0].id)
+        })
+        .collect();
+    let doing: Vec<Mutex<String>> = (0..XCLIENTS).map(|_| Mutex::new(String::new())).collect();
+    let done = AtomicU64::new(0);
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let clients: Vec<_> = (0..XCLIENTS)
+            .map(|c| {
+                let (db, tables, doing, done) = (&db, &tables, &doing[c], &done);
+                let barrier = &barrier;
+                s.spawn(move || {
+                    // A small xorshift per client: the run's shape, not its seed, matters.
+                    let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ (c as u64 + 1);
+                    let mut next = move || {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x
+                    };
+                    for i in 0..ops {
+                        let r = next();
+                        let parts = if r & 1 == 0 { 1 } else { 2 + (r >> 1) % 3 } as usize;
+                        let first = (r >> 8) as usize % XSHARDS;
+                        *doing.lock().unwrap() = format!("op {i}: {parts} part(s) from {first}");
+                        let mut wb = WriteBatch::new();
+                        for k in 0..parts {
+                            let row = format!("hot{:02}", next() % HOT).into_bytes();
+                            put(
+                                &mut wb,
+                                tables[(first + k) % XSHARDS],
+                                &row,
+                                &i.to_le_bytes(),
+                            );
+                        }
+                        db.commit(wb, Some(Durability::Buffered)).unwrap();
+                        done.fetch_add(1, Ordering::Relaxed);
+                        // Idle gaps past the drivers' 100 ms park backstop, so parks reach
+                        // it and the hand-back's wakes are tested from a parked driver.
+                        if i % PAUSE == PAUSE - 1 {
+                            barrier.wait();
+                            std::thread::sleep(Duration::from_millis(110 + (r % 40)));
+                        }
+                    }
+                    *doing.lock().unwrap() = "finished".into();
+                })
+            })
+            .collect();
+        s.spawn(|| {
+            let (mut last, mut since) = (0, Instant::now());
+            while !finished.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(200));
+                let now = done.load(Ordering::Relaxed);
+                if now != last {
+                    (last, since) = (now, Instant::now());
+                } else if since.elapsed() > STALL {
+                    let what: Vec<String> = doing
+                        .iter()
+                        .enumerate()
+                        .map(|(c, d)| format!("client {c}: {}", d.lock().unwrap()))
+                        .collect();
+                    panic!(
+                        "no commit returned for {STALL:?} after {now} ops:\n{}",
+                        what.join("\n")
+                    );
+                }
+            }
+        });
+        for h in clients {
+            h.join().unwrap();
+        }
+        finished.store(true, Ordering::Release);
+    });
+    let m = db.metrics();
+    eprintln!(
+        "caller turns: {} for {} ops; backstop wakes {}",
+        db.caller_turns(),
+        ops * XCLIENTS as u64,
+        m.caller_backstop_wakes
+    );
+    assert_eq!(
+        m.caller_backstop_wakes, 0,
+        "a shard had work no notify signalled when its driver's park backstop ran out: a lost wake"
+    );
     db.close().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

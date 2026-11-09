@@ -604,10 +604,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
     // Sized from this thread's idle gaps (#1176); made at the first spin, from a shard's
     // settings (a driver may start with none).
     let mut gaps: Option<GapWindow> = None;
-    // The last park ran out the caller-runs backstop: work the next pass finds was left by
-    // a lost wake (counted per shard, `ShardCell::backstop_woke`). Always false with
-    // caller-runs off.
-    let mut backstop = false;
+    // Caller-runs only: each shard's wake count before a park, for the lost-wake check when
+    // the park times out (`ShardCell::check_backstop`).
+    let mut wakes_before: Vec<u64> = Vec::new();
     vfs.attach_thread();
     for cell in &cores {
         if let Some(mut t) = cell.driver_wait() {
@@ -678,9 +677,6 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 stats.ops.fetch_add(worked, Ordering::Relaxed);
                 if worked > 0 {
                     sibling_wait += start.saturating_sub(pass_start);
-                    if backstop {
-                        cell.backstop_woke();
-                    }
                 }
                 core.inbox().is_closed()
             };
@@ -696,7 +692,6 @@ pub(crate) fn driver_main<H: ShardHandler>(
             }
             i += 1;
         }
-        backstop = false;
         if !cores.is_empty() {
             stats.passes.fetch_add(1, Ordering::Relaxed);
             if sibling_wait > 0 {
@@ -787,7 +782,11 @@ pub(crate) fn driver_main<H: ShardHandler>(
         for cell in &cores {
             cell.signal().parked();
         }
-        match next_deadline(&cores) {
+        if drivers.caller_runs {
+            wakes_before.clear();
+            wakes_before.extend(cores.iter().map(|c| c.signal().idle_counts().1));
+        }
+        let timed_out = match next_deadline(&cores) {
             None => {
                 debug_assert!(
                     !pigeonhole_io::in_async_poll(),
@@ -796,12 +795,20 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 if drivers.caller_runs {
                     let parked_at = Instant::now();
                     thread::park_timeout(CALLER_RUNS_PARK_BACKSTOP);
-                    backstop = parked_at.elapsed() >= CALLER_RUNS_PARK_BACKSTOP;
+                    parked_at.elapsed() >= CALLER_RUNS_PARK_BACKSTOP
                 } else {
                     thread::park();
+                    false
                 }
             }
             Some(at) => idle_park.park(&*vfs, at),
+        };
+        // A park that timed out with work no notify signalled is a lost wake that the
+        // backstop, or a deadline that happened to be due, recovered (#1502).
+        if drivers.caller_runs && timed_out {
+            for (cell, &w) in cores.iter().zip(&wakes_before) {
+                cell.check_backstop(w);
+            }
         }
         record_gap(&mut gaps, idle_from);
     }
