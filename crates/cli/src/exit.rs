@@ -200,6 +200,12 @@ impl Failure {
         }
     }
 
+    /// The message alone.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn status(&self) -> ExitStatus {
         self.status
     }

@@ -59,6 +59,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let text = proto::text_server::TextServer::new(super::grpc::TextGrpc(Arc::clone(&shared)))
         .max_decoding_message_size(limits.max_request_bytes)
         .max_encoding_message_size(usize::MAX);
+    let memory =
+        proto::memory_server::MemoryServer::new(super::grpc::MemoryGrpc(Arc::clone(&shared)))
+            .max_decoding_message_size(limits.max_request_bytes)
+            .max_encoding_message_size(usize::MAX);
     let feeds = super::grpc::FeedGrpc {
         shared: Arc::clone(&shared),
         max_request_bytes: limits.max_request_bytes,
@@ -107,6 +111,10 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .route_service(
             "/pigeonhole.v1.Text/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(text),
+        )
+        .route_service(
+            "/pigeonhole.v1.Memory/{*method}",
+            tower::ServiceBuilder::new().layer(prepay()).service(memory),
         )
         .route_service(
             "/pigeonhole.v1.Feed/{*method}",
@@ -354,6 +362,19 @@ async fn call(
             Err(_) => return ApiError::invalid("Last-Event-ID isn't a feed token").into_response(),
         }
     }
+    // A memory watch resumes from `Last-Event-ID` as a feed does.
+    if let ServiceOp::MemoryWatch(r) = &mut op
+        && let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok())
+    {
+        match serde_json::from_value::<proto::MemoryWatchRequest>(
+            serde_json::json!({ "resume": id }),
+        ) {
+            Ok(parsed) => r.resume = parsed.resume,
+            Err(_) => {
+                return ApiError::invalid("Last-Event-ID isn't a watch token").into_response();
+            }
+        }
+    }
     let rpc = op.index();
     // Read-your-writes on a replica (#1577), within the request timeout from its arrival.
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -388,6 +409,11 @@ async fn call(
         Ok(ServiceReply::TextSearch(r)) => json(&r),
         Ok(ServiceReply::TextRebuild(r)) => json(&r),
         Ok(ServiceReply::TextVerify(r)) => json(&r),
+        Ok(ServiceReply::Remember(r)) => json(&r),
+        Ok(ServiceReply::Recall(r)) => json(&r),
+        Ok(ServiceReply::MarkUsed(r)) => json(&r),
+        Ok(ServiceReply::Forget(r)) => json(&r),
+        Ok(ServiceReply::MemoryWatch(events)) => stream(&headers, events),
         Ok(ServiceReply::Download(d)) => download(d),
         Ok(ServiceReply::Begin(r)) => json(&r),
         Ok(ServiceReply::Commit(r)) => json(&r),
@@ -410,6 +436,13 @@ trait Event: Serialize {
 }
 
 impl Event for proto::ScanPage {}
+
+impl Event for proto::MemoryEvent {
+    /// The event's token, so `Last-Event-ID` can resume as for a feed.
+    fn sse_id(&self) -> Option<String> {
+        Some(base64(&self.token))
+    }
+}
 
 impl Event for proto::FeedEvent {
     /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112).
@@ -795,6 +828,13 @@ fn decode(service: &str, method: &str, body: &Bytes) -> Result<ServiceOp, ApiErr
         ("Text", "Search") => ServiceOp::TextSearch(parse(body)?),
         ("Text", "Rebuild") => ServiceOp::TextRebuild(parse(body)?),
         ("Text", "Verify") => ServiceOp::TextVerify(parse(body)?),
+        ("Memory", "Remember") => ServiceOp::Remember(parse(body)?),
+        ("Memory", "Recall") => ServiceOp::Recall(parse(body)?),
+        ("Memory", "MarkUsed") => ServiceOp::MarkUsed(parse(body)?),
+        ("Memory", "Supersede") => ServiceOp::Supersede(parse(body)?),
+        ("Memory", "Link") => ServiceOp::Link(parse(body)?),
+        ("Memory", "Forget") => ServiceOp::Forget(parse(body)?),
+        ("Memory", "Watch") => ServiceOp::MemoryWatch(parse(body)?),
         _ => {
             return Err(ApiError::not_found(format!(
                 "no RPC /v1/{service}/{method} in this build"

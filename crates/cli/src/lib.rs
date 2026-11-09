@@ -15,6 +15,10 @@ mod args;
 mod cmd;
 mod exit;
 mod mcp;
+// The memory core: `phdb serve`'s `Memory` service today, `phdb mcp`'s memory tools with
+// ticket 8b (which drops this gate).
+#[cfg(feature = "serve")]
+mod memcore;
 mod open;
 mod output;
 #[cfg(feature = "serve")]

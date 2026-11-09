@@ -1,0 +1,2 @@
+### Added
+- **`phdb serve --memory NAME`: agent memory over the network** (`Memory.Remember`, `Recall`, `MarkUsed`, `Supersede`, `Link`, `Forget`, `Watch`; D313 ticket 8a, ICR 0107 and 0112, #1397), over gRPC and HTTP/JSON, with `phdb mcp`'s memory flags. A token's `ns=` limits it to those namespaces on every call. Embedding calls are bounded by `--embed-timeout-ms` (10 s) and memory calls by `--memory-calls`, so a slow embedding endpoint can't starve the server.
