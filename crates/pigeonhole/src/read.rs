@@ -1389,11 +1389,14 @@ impl<'t> CellWalk<'t> {
             return;
         };
         let rank = self.walk_rank(family);
+        // A family the walk doesn't read makes the seek a plain step (N1): never stored, so it
+        // never replaces a pending seek (whose lane may be unpositioned, ai1249's R3 on #1625)
+        // nor outlives its poll to keep a later one from being stored (N5).
+        if rank == usize::MAX {
+            return;
+        }
         let later = match &self.seek {
             None => true,
-            // A family the walk doesn't read makes the seek a plain step (N1): it never
-            // replaces a pending one, whose lane may be unpositioned (ai1249's R3 on #1625).
-            Some(_) if rank == usize::MAX => false,
             Some(p) => (rank, qualifier) > (self.walk_rank(p.family), p.qualifier.as_slice()),
         };
         if later {

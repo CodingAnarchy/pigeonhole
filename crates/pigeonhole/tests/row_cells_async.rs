@@ -531,3 +531,38 @@ fn an_unread_family_seek_keeps_a_pending_one() {
     drop(t);
     db.close().expect("close");
 }
+
+/// ai1249's N5 on #1625, the reverse order: a seek to an unread family left `Pending` is a
+/// plain step, so a seek after it lands at or after its own column.
+#[test]
+fn a_pending_unread_family_seek_is_a_plain_step() {
+    let (dir, db, t) = build();
+    let s = db.snapshot().expect("snapshot");
+    let post = sync_walk(
+        t.row(HUB)
+            .snapshot(&s)
+            .family("post")
+            .cells()
+            .expect("cells"),
+    );
+    drop(s);
+    drop(t);
+    let (db, t) = reopen(&dir, db);
+    let mut cells = t.row(HUB).family("post").cells().expect("cells");
+    // `side` isn't read by this walk; a cold walk's first poll fetches.
+    assert!(
+        poll_once(|cx| cells.poll_seek(cx, "side", &qual(0)).map(|r| r.is_ok())).is_none(),
+        "a cold walk's first poll fetches"
+    );
+    let target = qual(15_000);
+    let (got, _) = drive(|cx| {
+        cells
+            .poll_seek(cx, "post", &target)
+            .map(|r| r.expect("poll_seek").map(|e| entry(&e)))
+    });
+    let want = expected_seek(&post, 0, "post", &target, &["post"]);
+    assert_eq!(got.as_ref(), post.get(want));
+    drop(cells);
+    drop(t);
+    db.close().expect("close");
+}
