@@ -2083,13 +2083,12 @@ impl WalStream {
     /// every [`EARLY_CHECK_EVERY`] appends, so a stream whose spares never get prepared pays
     /// a counter decrement per append, and the pool's lock only that often. A retained slot
     /// doesn't count: taking it costs the change feed's history, a full segment's worth.
+    /// `rollover` takes the slot through `take_slot`, which prefers a recyclable or prepared
+    /// slot over a blank or new one, so the slot found ready here is the one it takes (perf2
+    /// on #1646): a reorder there would make this roll over into a slot that needs filling.
     #[cold]
     #[inline(never)]
     fn leave_extended(&mut self) -> Result<()> {
-        self.early -= 1;
-        if self.early != 0 {
-            return Ok(());
-        }
         self.early = EARLY_CHECK_EVERY;
         if self.held.is_some() || self.append_pos() <= FRAME {
             return Ok(());
@@ -2184,7 +2183,12 @@ impl WalStream {
         if self.append_pos() + need > self.segment_size {
             self.rollover()?;
         } else if self.early != 0 {
-            self.leave_extended()?;
+            // Inline, so an append in an `Extended` segment pays a decrement, and the call
+            // only every `EARLY_CHECK_EVERY` appends.
+            self.early -= 1;
+            if self.early == 0 {
+                self.leave_extended()?;
+            }
         }
         let end = self.enc.encode_parts(parts, &mut self.buf);
         Ok(Lsn::new(self.epoch, end as u32))
