@@ -11883,6 +11883,33 @@ impl ShardHandler for ShardState {
     /// Caller-runs: a batch runs on a client's thread only while nothing in it can wait
     /// there: no close, no room wait or stall (their timers are the driver's), and a WAL
     /// stream that can take the append without waiting for a rollover sync.
+    fn trace_msg(&self, msg: &ShardMsg) -> String {
+        let kind = match msg {
+            ShardMsg::Commit(req) => {
+                return format!(
+                    "Commit {:?} pred {} validate {} retry {} returning {} caller_may_take {}",
+                    req.durability,
+                    req.predicate.is_some(),
+                    req.validate.is_some(),
+                    req.retry.is_some(),
+                    !matches!(req.reply, Reply::Commit(_)),
+                    self.caller_may_take(msg)
+                );
+            }
+            ShardMsg::Coordinate(_) => "Coordinate",
+            ShardMsg::Prepare(_) => "Prepare",
+            ShardMsg::Prepared { .. } => "Prepared",
+            ShardMsg::Wake { .. } => "Wake",
+            ShardMsg::Released { .. } => "Released",
+            ShardMsg::Decide { .. } => "Decide",
+            ShardMsg::Applied { .. } => "Applied",
+            ShardMsg::SyncDone { .. } => "SyncDone",
+            ShardMsg::Kick => "Kick",
+            _ => "other",
+        };
+        format!("{kind} caller_may_take {}", self.caller_may_take(msg))
+    }
+
     fn caller_may_run(&self) -> bool {
         !self.closing
             && !self.wait_room

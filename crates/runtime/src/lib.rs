@@ -245,6 +245,12 @@ pub trait ShardHandler: Send + 'static {
     fn caller_may_run(&self) -> bool {
         false
     }
+
+    /// SCRATCH capture (#1502): a short description of `msg` for `PH_BACKSTOP_TRACE`.
+    #[doc(hidden)]
+    fn trace_msg(&self, _msg: &Self::Msg) -> String {
+        String::new()
+    }
 }
 
 /// The handler's view of the runtime while it runs on its shard.
@@ -950,6 +956,22 @@ impl<H: ShardHandler> ShardCore<H> {
             self.stash = self.rx.try_recv().ok();
         }
         self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back()
+    }
+
+    /// SCRATCH capture (#1502): what `has_work` found.
+    fn trace_work(&self) -> String {
+        let inbox = self.inbox();
+        format!(
+            "stash [{}] task_woken {} back {} runnable {} sent {} drained {}",
+            self.stash
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |m| self.handler.trace_msg(m)),
+            self.signal().task_woken(),
+            self.spawner.has_back(),
+            self.spawner.local.has_runnable(),
+            inbox.sent.load(std::sync::atomic::Ordering::Relaxed),
+            inbox.drained.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn check_before_sleep(&mut self) -> bool {

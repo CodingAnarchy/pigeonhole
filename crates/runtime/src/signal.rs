@@ -181,6 +181,11 @@ impl Signal {
     }
 
     /// Consumer side: back to work (producers need not wake us).
+    /// SCRATCH capture (#1502): the sleep announcement.
+    pub(crate) fn trace_sleeping(&self) -> bool {
+        self.sleeping.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn awake(&self) {
         self.sleeping.store(false, Ordering::Relaxed);
     }
