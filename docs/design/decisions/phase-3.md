@@ -4549,6 +4549,10 @@ PR 3 adds an in-process two-database replication test with process and power-los
 
 **Part A** (perf2) moves GroupSync's WAL record write off the driver thread, chained before its sync; its section follows when it lands.
 
+**Amendment 1: the WAL's spare slots** (perf287; the coordinator, 2026-11-09; #1621's probes, c6744258295 to c6746603073). Part B left the 16–64 ms fsync tail in place: the slow fsyncs were the WAL's own, and every one was the spare slots' zero-fill. `SparePrep` wrote a 64 MiB slot's zeros as 1 MiB writes, four in flight, into the stream file the groups `fdatasync`, and nothing wrote them back until the slot's sync. A group sync landing mid-fill wrote up to 128 MiB of zeros, or waited on another sync writing them (107 of 107 slow WAL fsyncs, `/root/scratch/perf287/out-fs4`).
+- **C, the zero-fill written behind:** one zero write in flight, and each chunk's write-back (`File::submit_writeback`, tracked as the stream's I/O for close) completes before the next write. A group sync then finds at most about one chunk of zeros dirty or under write-back. The slot's final `sync_all` stays (D35).
+- **B, the open-time slot left early** (perf2's design, c6745761180): a segment in an `Extended` slot (allocated past the file's end, unwritten extents, so each sync of it converts extents, an XFS transaction and a log force) rolls over at a record boundary to the first recyclable or prepared slot, once one is ready. It's checked every 64 appends, it uses the usual chained rollover, and there's no format change. A retained slot doesn't count. `WalCounters::early_rollovers` counts them.
+
 **Acceptance (#1621):** on the AX102, at 70% of the 1-subscriber maximum with the writer default, put p99 within 2× the Buffered row, no `Data.Mutate` over 25 ms, and no fsync over 15 ms in burst intervals (`xfsdist`). The gate's GroupSync rows and the write-heavy rows that load flush and compaction (ycsb-a load, the bulk fill, memrecall's writer rows) mustn't regress in throughput, compaction debt or stall counts.
 
 <a id="d320"></a>

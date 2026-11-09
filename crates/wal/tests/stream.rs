@@ -679,3 +679,108 @@ fn a_new_streams_creation_is_durable_once_its_file_and_directory_syncs_finish() 
         Some(true)
     );
 }
+
+/// D319 (#1621): the open-time segment's `Extended` slot (unwritten extents, so each sync of
+/// it converts extents) is left at a record boundary once a spare is ready, before it fills,
+/// through the usual chained rollover; recovery replays across it.
+#[test]
+fn an_extended_open_segment_is_left_once_a_spare_is_ready() {
+    let vfs = sim(31);
+    let opts = opts(64, 1);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    let mut seqno = 0;
+    let mut tickets = Vec::new();
+    for _ in 0..10 {
+        seqno += 1;
+        tickets.push(
+            wal.append(&batch(seqno, 100).record(), Durability::GroupSync)
+                .unwrap(),
+        );
+    }
+    wal.sync().unwrap();
+    drop(wal);
+    // Reopened: every slot holds a segment past no checkpoint and nothing is prepared, so the
+    // open-time segment goes into a slot extended past the file's end.
+    let (_, r) = replay(&vfs, Lsn::default()).unwrap();
+    let mut wal = r.into_stream(opts).unwrap();
+    let opened = wal.written().epoch();
+    // No spare yet: appends stay in the extended segment, however many checks pass.
+    for _ in 0..300 {
+        seqno += 1;
+        tickets.push(
+            wal.append(&batch(seqno, 100).record(), Durability::GroupSync)
+                .unwrap(),
+        );
+    }
+    wal.sync().unwrap();
+    assert_eq!(wal.written().epoch(), opened, "no spare: it stays");
+    assert_eq!(wal.early_rollovers(), 0);
+    // A spare is ready: within a check's worth of appends the stream moves to it, long
+    // before the segment (64 frames) fills, and without an inline sync.
+    assert_eq!(wal.spares().prepare(1).unwrap(), 1);
+    for _ in 0..70 {
+        seqno += 1;
+        tickets.push(
+            wal.append(&batch(seqno, 100).record(), Durability::GroupSync)
+                .unwrap(),
+        );
+    }
+    wal.sync().unwrap();
+    assert_eq!(wal.written().epoch(), opened + 1, "left early");
+    assert_eq!(wal.early_rollovers(), 1);
+    assert_eq!(wal.inline_rollover_syncs(), 0);
+    assert_eq!(wal.inline_grows(), 0);
+    // Once out, no more early rollovers: the new segment is a prepared slot.
+    for _ in 0..200 {
+        seqno += 1;
+        tickets.push(
+            wal.append(&batch(seqno, 100).record(), Durability::GroupSync)
+                .unwrap(),
+        );
+    }
+    wal.sync().unwrap();
+    assert_eq!(wal.written().epoch(), opened + 1);
+    assert_eq!(wal.early_rollovers(), 1);
+    drop(wal);
+    // Every record replays in order, across the early rollover.
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), (1..=seqno).collect::<Vec<_>>());
+    assert_eq!(got.end, tickets.last().unwrap().end);
+}
+
+/// D319 (#1621): a spare slot's zero-fill never has more than one chunk in flight or written
+/// but not yet written back. Each 1 MiB chunk's write is followed by its write-back, and the
+/// next write waits for it, so a group sync of the stream file finds at most a chunk of the
+/// spare's zeros to write. Before, four writes ran at once and nothing was written back until
+/// the slot's sync, and a group sync landing mid-fill wrote up to 128 MiB of zeros (16-64 ms).
+#[test]
+fn a_spare_is_zero_filled_a_chunk_at_a_time_each_written_back_before_the_next() {
+    let sim = pigeonhole_io::sim::SimVfs::new(41);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    // A segment of three 1 MiB chunks (32 frames of 32 KiB each).
+    let opts = opts(3 * 32, 1);
+    let wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    let spares = wal.spares();
+    sim.set_deferred_io(true);
+    let mut prep = std::pin::pin!(spares.start(1));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut completed = 0;
+    let prepared = loop {
+        if let std::task::Poll::Ready(r) = prep.as_mut().poll(&mut cx) {
+            break r.unwrap();
+        }
+        assert!(
+            sim.io_in_flight() <= 1,
+            "one zero-fill operation at a time, not {}",
+            sim.io_in_flight()
+        );
+        if sim.complete_io() {
+            completed += 1;
+        }
+    };
+    sim.set_deferred_io(false);
+    assert_eq!(prepared, 1);
+    // Three writes, each written back, then the slot's sync.
+    assert_eq!(completed, 3 + 3 + 1);
+    assert_eq!(spares.ready(), 1);
+}
