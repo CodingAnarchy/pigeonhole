@@ -4545,4 +4545,12 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **`read_through`** is still set after every pass, capped or not. `position()` and the idle fast path take the min with C, and a rewind clears it.
 - **Shares of delivered rounds** that a rewind re-reads without their Decision are never evicted (simp724's N1). Evicting one would put C at or below `delivered` for nothing; rule C drops it.
 
-**Deferred (PR 2, after PR 1's box run).** The writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it needs a per-session marker: a FORMAT and ICR line.
+**Deferred (PR 2): not needed (coordinator, 2026-11-09, on perf287's ticket 5 re-run, #1598).** The option: the writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it would need a per-session marker (a FORMAT and ICR line). The AX102 run (#1397 ticket 5; main 6aca49f1 against d3378ff8, the full table ×2) showed it isn't worth that:
+- **16 hubs × 16 subscribers,** the scenario that falls behind:
+  - `phdb` peak RSS fell from 8.9–15.9 GB to 4.7–5.1 GB, and no longer depends on how far the run falls behind;
+  - each subscriber got 1.3–2.6× more events;
+  - server CPU per put rose 5–6% (180 → 186–191 µs). That's the re-read cost, and all PR 2 could save.
+- **Every other scenario** (0, 1, 16 and 256 subscribers, and tiny) was level between the arms.
+- **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
+
+Revisit PR 2 only if a profile shows the re-reads costing more than that.
