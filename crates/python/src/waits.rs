@@ -384,12 +384,13 @@ impl<S: Source> Future for NextWait<S> {
         let this = &mut *self;
         let state = Arc::clone(&this.state);
         let mut g = state.lock().expect("not poisoned");
-        g.waker = None;
         if g.generation != this.generation {
-            // Superseded: the future was cancelled and a newer wait owns the source.
+            // Superseded: the future was cancelled and a newer wait owns the source. The
+            // stored waker is that wait's, so it stays (perf2's R1 on #1610).
             this.finished = true;
             return Poll::Ready(Box::new(|py| crate::aio::Entry::Value(py.None())));
         }
+        g.waker = None;
         if g.slot.is_some() {
             // Left by a superseded wait that took it after its cancel.
             this.finished = true;
