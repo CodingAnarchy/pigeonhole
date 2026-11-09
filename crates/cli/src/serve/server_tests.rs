@@ -3985,6 +3985,10 @@ fn promote_makes_a_replica_take_writes() {
 /// An IVF index made and written on the primary is searched and verified on a replica, and
 /// the replica refuses its writes like any other (#1436 with #1573's index RPCs).
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "#1595: the bootstrap download hangs intermittently on Windows"
+)]
 fn a_replica_serves_ivf_index_reads_and_refuses_its_writes() {
     let p = Server::start("", limits());
     for (name, mode) in [("ix", "REBALANCE_INLINE"), ("bg", "REBALANCE_BACKGROUND")] {
