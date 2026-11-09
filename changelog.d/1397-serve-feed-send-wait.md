@@ -1,0 +1,2 @@
+### Changed
+- `phdb serve`: a change-feed stream whose client's buffer is full no longer wakes the server's sending task, and re-arms its `--stream-idle-ms` timer, on every event the client takes. The take records its time, and the waiting send's one timer checks it when it fires. At 16 table sets × 16 streams this was the feed's largest self time (#1397). The idle limit still counts from the client's last take.

@@ -37,7 +37,7 @@ use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
 use pigeonhole::{Commit, FeedToken, Snapshot, Table};
 use prost::bytes::Bytes;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::convert;
 use super::errors::ApiError;
@@ -115,6 +115,42 @@ impl Tracker {
     fn set(&self, state: u64, at: u64) {
         self.state.store(state, Ordering::Relaxed);
         self.at.store(at, Ordering::Relaxed);
+    }
+}
+
+/// When a client last took an event, for a send waiting for room: its `--stream-idle-ms`
+/// counts from the last take (simp724's I1 on #1536). A take stores the time; it wakes no
+/// one. A waiting send's one timer, when it fires, reads it and waits on if the client took
+/// something meanwhile (perf287's profile on #1397: a wake and a new timer per take, per
+/// subscriber, were `Client::send`'s 9.6% self at 16 hubs × 16).
+#[derive(Debug)]
+struct TakeClock {
+    /// On Tokio's clock, so a paused test clock pauses it too.
+    base: tokio::time::Instant,
+    /// Nanoseconds from `base` to the last take; 0 before the first.
+    last: AtomicU64,
+}
+
+impl TakeClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// A take, now.
+    fn took(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.store(nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// When the last take was, or `None` before the first.
+    fn last(&self) -> Option<tokio::time::Instant> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(self.base + Duration::from_nanos(n)),
+        }
     }
 }
 
@@ -651,7 +687,7 @@ impl Feeds {
         let budget = Arc::new(Semaphore::new(
             self.limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS),
         ));
-        let taken = Arc::new(Notify::new());
+        let taken = Arc::new(TakeClock::new());
         let (end_tx, end_rx) = oneshot::channel();
         let tracker = Arc::new(Tracker::default());
         hub.track(&tracker);
@@ -769,9 +805,9 @@ struct Client {
     tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
     /// The client's buffer's free bytes: each event in its channel holds its encoded size.
     budget: Arc<Semaphore>,
-    /// Poked each time the client takes an event: a send waiting for room starts its
-    /// `--stream-idle-ms` again (simp724's I1 on #1536).
-    taken: Arc<Notify>,
+    /// When the client last took an event: a send waiting for room counts its
+    /// `--stream-idle-ms` from it (simp724's I1 on #1536).
+    taken: Arc<TakeClock>,
     /// Where it is, for the dump.
     tracker: Arc<Tracker>,
 }
@@ -1085,9 +1121,13 @@ impl Client {
         tokio::pin!(queued);
         // The idle limit counts from the client's last take, not from the start of the wait:
         // a large event may wait for most of the buffer to drain, and a client taking events
-        // all along is slow, not idle (simp724's I1 on #1536).
+        // all along is slow, not idle (simp724's I1 on #1536). One timer: when it fires, a
+        // take since the wait began moves the deadline on, and it waits again.
+        let idle = self.feeds.limits.stream_idle;
+        let began = tokio::time::Instant::now();
+        let timer = tokio::time::sleep_until(began + idle);
+        tokio::pin!(timer);
         loop {
-            let taken = self.taken.notified();
             tokio::select! {
                 // The send first: room that is there wins over a timer that fired meanwhile.
                 biased;
@@ -1102,13 +1142,17 @@ impl Client {
                         Err(()) => Err(gone()),
                     };
                 }
-                () = taken => {}
                 () = self.tx.closed() => return Err(gone()),
-                () = tokio::time::sleep(self.feeds.limits.stream_idle) => {
+                () = &mut timer => {
+                    let from = self.taken.last().map_or(began, |t| t.max(began));
+                    if from + idle > tokio::time::Instant::now() {
+                        timer.as_mut().reset(from + idle);
+                        continue;
+                    }
                     return Err(ApiError::deadline(format!(
                         "the client took no feed event for --stream-idle-ms ({} ms); resume \
                          from the last event's token",
-                        self.feeds.limits.stream_idle.as_millis()
+                        idle.as_millis()
                     )));
                 }
             }
@@ -1156,8 +1200,8 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 #[derive(Debug)]
 pub(crate) struct FeedEvents {
     events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
-    /// Poked on each take, for a send waiting for room.
-    taken: Arc<Notify>,
+    /// Each take's time, for a send waiting for room.
+    taken: Arc<TakeClock>,
     end: Option<oneshot::Receiver<ApiError>>,
 }
 
@@ -1223,7 +1267,7 @@ impl FeedEvents {
             // Taken: its bytes go back to the client's buffer.
             Poll::Ready(Some((e, room))) => {
                 drop(room);
-                self.taken.notify_one();
+                self.taken.took();
                 return Poll::Ready(Some(Ok(e)));
             }
             Poll::Pending => return Poll::Pending,
@@ -1665,6 +1709,105 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             assert_eq!(got, want);
+            drop((c, hub));
+        });
+        drop(t);
+        drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_that_stops_taking_times_out_an_idle_limit_after_its_last_take() {
+        // The other half of simp724's I1 on #1536, for the one-timer wait (perf287's profile
+        // on #1397): while one large event waits for the client's buffer to drain, the client
+        // takes events, then stops. It's ended exactly `--stream-idle-ms` after its last
+        // take: not when the limit has passed since the wait began (that was during the
+        // takes), and not later. On a paused clock, so the times are exact.
+        let (_, db, dir) = commits("idle-from-take", 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let idle = Duration::from_millis(250);
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 16 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(3600),
+                stream_idle: idle,
+                client_events: CLIENT_EVENTS,
+                client_bytes: 4096,
+            },
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let mut direct = t.feed().open().unwrap();
+        let ended: Arc<Mutex<Option<(tokio::time::Instant, String)>>> = Arc::default();
+        rt.block_on(async {
+            let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            hub.task.abort();
+            let end = Arc::clone(&ended);
+            let mut c = feeds
+                .subscribe(
+                    Spec {
+                        tables: vec![t.clone()],
+                        prefix: Vec::new(),
+                        visible: false,
+                        start: Start::Now,
+                    },
+                    Arc::clone(&slots).try_acquire_owned().unwrap(),
+                    move |e| {
+                        *end.lock().unwrap() = Some((
+                            tokio::time::Instant::now(),
+                            e.map_or_else(String::new, |e| e.code.clone()),
+                        ));
+                    },
+                )
+                .unwrap();
+            // 60 events of over 200 bytes (the buffer holds under 20 of them), then one larger
+            // than the whole buffer, which waits for all of it to drain.
+            for i in 0..61 {
+                let value = if i < 60 {
+                    vec![b'v'; 100]
+                } else {
+                    vec![7u8; 8192]
+                };
+                t.mutate(format!("r{i:04}").as_bytes())
+                    .put("f", b"q", &value)
+                    .commit()
+                    .unwrap();
+                let commit = direct
+                    .next(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .clone();
+                let token = Bytes::copy_from_slice(direct.token().as_bytes());
+                hub.push(commit, token, direct.position().seqno(), 16 << 20);
+            }
+            // 50 takes, 100 ms apart (each under the limit), then none: the large event began
+            // waiting after about 40, so its wait spans the last ten or so.
+            let mut last = tokio::time::Instant::now();
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                use futures_core::Stream as _;
+                std::future::poll_fn(|cx| Pin::new(&mut c).poll_next(cx))
+                    .await
+                    .expect("the stream goes on")
+                    .expect("an event");
+                last = tokio::time::Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let (at, code) = ended.lock().unwrap().clone().expect("the stream ended");
+            assert_eq!(code, "DeadlineExceeded");
+            assert_eq!(
+                at - last,
+                idle,
+                "the idle limit counts from the last take, exactly"
+            );
             drop((c, hub));
         });
         drop(t);
