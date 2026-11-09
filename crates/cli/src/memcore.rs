@@ -39,6 +39,10 @@ pub(crate) enum MemErrorKind {
     Unavailable,
     /// The embedding endpoint took longer than its timeout: nothing was applied.
     Deadline,
+    /// The embedding endpoint refused the caller's text (400, 413 or 422): the request's
+    /// fault, apart from `Invalid` so `phdb mcp` keeps answering it as bad input (the
+    /// coordinator on #1648) while serve answers `InvalidArgument`.
+    Rejected,
     /// The embedding endpoint's answer wasn't an embedding the store can take: the
     /// server's configuration (its URL, key or model), not the request.
     Internal,
@@ -142,7 +146,7 @@ impl Embedder {
                 let kind = match fault {
                     EmbedFault::Timeout => MemErrorKind::Deadline,
                     EmbedFault::Unreachable => MemErrorKind::Unavailable,
-                    EmbedFault::Rejected => MemErrorKind::Invalid,
+                    EmbedFault::Rejected => MemErrorKind::Rejected,
                     EmbedFault::BadReply => MemErrorKind::Internal,
                 };
                 MemError::of_kind(kind, f.message())
@@ -198,10 +202,12 @@ pub(crate) fn create_options(m: &crate::args::MemoryArgs, name: &str) -> Arc<Cre
         let mut options = pigeonhole_memory::StoreOptions::new();
         let model = match (e, &m.memory_model, m.memory_dim) {
             (Some(e), _, _) => {
-                // The dimension is the endpoint's: one probe embedding tells it.
+                // The dimension is the endpoint's: one probe embedding tells it. Its failure
+                // is the endpoint's (down, slow, or refusing), not the command line's: an
+                // input error, as `phdb mcp` always reported it (ai1249's R1 on #1648).
                 let dim = e
                     .embed("dimension probe", EmbedKind::Passage)
-                    .map_err(|e| Failure::usage(&e.message))?
+                    .map_err(|e| Failure::input(e.message))?
                     .len();
                 Some((e.model().to_owned(), dim as u32))
             }

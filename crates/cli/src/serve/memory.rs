@@ -31,7 +31,7 @@ const EVENTS: usize = 64;
 impl From<MemError> for ApiError {
     fn from(e: MemError) -> Self {
         match e.kind {
-            MemErrorKind::Invalid => Self::invalid(e.message),
+            MemErrorKind::Invalid | MemErrorKind::Rejected => Self::invalid(e.message),
             MemErrorKind::Denied => Self::permission_denied(&e.message),
             MemErrorKind::Engine(code) => Self::from_code(code, &e.message),
             MemErrorKind::Unavailable => Self::unavailable(e.message),

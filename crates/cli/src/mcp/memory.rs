@@ -637,15 +637,18 @@ fn normalization_name(n: pigeonhole_memory::Normalization) -> &'static str {
 /// `phdb mcp` has no namespace limit: every call may touch every namespace.
 const ALL: Scope<'static> = Scope(None);
 
-/// A store operation's failure as `phdb mcp` reports it: the request's, the store's by its
-/// code, or the embedding endpoint's, which `phdb mcp` has always reported as input.
+/// A store operation's failure as `phdb mcp` reports it: the request's arguments as usage,
+/// the store's by its code, and the embedding endpoint's, its refusal of the text included,
+/// as bad input (exit ERROR), as `phdb mcp` always has: scripts may check the exit code (the
+/// coordinator on #1648).
 fn mem_failure(e: MemError) -> Failure {
     match e.kind {
         MemErrorKind::Invalid | MemErrorKind::Denied => Failure::usage(&e.message),
         MemErrorKind::Engine(code) => Failure::coded(code, e.message),
-        MemErrorKind::Unavailable | MemErrorKind::Deadline | MemErrorKind::Internal => {
-            Failure::input(e.message)
-        }
+        MemErrorKind::Rejected
+        | MemErrorKind::Unavailable
+        | MemErrorKind::Deadline
+        | MemErrorKind::Internal => Failure::input(e.message),
     }
 }
 
@@ -870,6 +873,37 @@ fn forget_tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coordinator on #1648 (ai1249's R1): moving onto the shared core changes no code
+    /// `phdb mcp` answers. Every embedding-endpoint failure, its refusal of the text
+    /// included, stays bad input (exit ERROR); the arguments' faults stay usage.
+    #[test]
+    fn the_cores_failures_keep_phdb_mcps_codes() {
+        let code = |kind| {
+            let f = mem_failure(MemError {
+                kind,
+                message: "m".into(),
+            });
+            (f.json()["code"].as_str().unwrap().to_owned(), f.status())
+        };
+        let bad_input = ("BadInput".to_owned(), crate::ExitStatus::ERROR);
+        for kind in [
+            MemErrorKind::Rejected,
+            MemErrorKind::Unavailable,
+            MemErrorKind::Deadline,
+            MemErrorKind::Internal,
+        ] {
+            assert_eq!(code(kind), bad_input, "{kind:?}");
+        }
+        assert_eq!(
+            code(MemErrorKind::Invalid),
+            ("Usage".to_owned(), crate::ExitStatus::USAGE)
+        );
+        assert_eq!(
+            code(MemErrorKind::Engine(pigeonhole::ErrorCode::TableNotFound)).0,
+            "TableNotFound"
+        );
+    }
 
     /// 8b's fix, as ai1249's R1 on 8b asks: `phdb mcp` not writable on a writer database
     /// opens the store without its forgetter. On main it opened the store as the writer does,
