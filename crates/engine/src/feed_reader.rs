@@ -934,6 +934,22 @@ impl FeedReader {
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
     /// commit [`FeedReader::try_next`] returned, never inside one (§2.5).
     pub fn token(&self) -> Vec<u8> {
+        {
+            use std::sync::atomic::AtomicU64 as A;
+            static N: A = A::new(0);
+            let held: usize = self.held.values().map(Vec::len).sum();
+            if self.ready.len() + held > 1000 {
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n % 512 == 0 {
+                    eprintln!(
+                        "DBG token: streams {} ready {} held {} (big call #{n})",
+                        self.streams.len(),
+                        self.ready.len(),
+                        held
+                    );
+                }
+            }
+        }
         let mut t = Vec::with_capacity(1 + 16 + 4 + 8 + 8 + 16 * self.streams.len() + 16);
         t.push(if self.tables.is_empty() {
             TOKEN_VERSION_ALL

@@ -688,7 +688,26 @@ fn open(tables: &[Table], visible: bool, start: &Start) -> Result<pigeonhole::Fe
 
 /// A stream's token right after what it has read, as the bytes events carry.
 fn token_of(stream: &FeedStream) -> Bytes {
-    Bytes::copy_from_slice(stream.token().as_bytes())
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    static SLOW_US: AtomicU64 = AtomicU64::new(0);
+    let t0 = std::time::Instant::now();
+    let b = Bytes::copy_from_slice(stream.token().as_bytes());
+    let us = t0.elapsed().as_micros() as u64;
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if us >= 1000 {
+        let k = SLOW.fetch_add(1, Ordering::Relaxed) + 1;
+        let tot = SLOW_US.fetch_add(us, Ordering::Relaxed) + us;
+        if k.is_power_of_two() || k % 256 == 0 {
+            eprintln!(
+                "DBG {} token_of slow #{k} {us}us (slow total {tot}us, calls {n})",
+                now_us()
+            );
+        }
+    } else if n.is_power_of_two() && n >= 1024 {
+        eprintln!("DBG {} token_of calls {n} last {us}us", now_us());
+    }
+    b
 }
 
 /// A feed stream's next item, as a future.

@@ -318,6 +318,7 @@ pub(crate) fn run(
             let dumping = Arc::clone(&shared);
             tokio::spawn(async move {
                 while usr1.recv().await.is_some() {
+                    eprintln!("DBG usr1 woke at {:?}", std::time::SystemTime::now());
                     eprint!("{}", dumping.router.service.feeds.dump());
                 }
             });
