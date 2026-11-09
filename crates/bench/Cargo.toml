@@ -40,7 +40,7 @@ pigeonhole-io = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 rocksdb = { version = "0.25", default-features = false, optional = true }
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 
 [lints]
 workspace = true
