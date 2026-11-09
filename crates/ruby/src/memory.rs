@@ -17,10 +17,14 @@
 //! released in 100 ms slices, with an interrupt check between them (as `Feed#next`), calls
 //! the block with the GVL held, and sends its memories back. Whatever ends the wait early (an
 //! exception from the block, `break`/`throw`/`return` out of it, an interrupt) stops the
-//! worker and joins it before the method returns (perf2's C1 on #697).
+//! worker and joins it before the method returns (perf2's C1 on #697). Under a fiber
+//! scheduler, `ConsolidateLoop#run_once` waits for the groups through the fiber bridge
+//! instead, so the thread's other fibers run meanwhile (#1574 PR 3, `fiber`).
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::task::Waker;
 use std::time::Duration;
 
 use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value, prelude::*, r_hash::ForEach};
@@ -38,6 +42,10 @@ use crate::fork::ForkSafe;
 use crate::gvl::without_gvl;
 use crate::read::snapshot_arg;
 use crate::vector::{element, element_name, sym_name};
+
+#[cfg(unix)]
+#[path = "memory_fiber.rs"]
+pub(crate) mod fiber;
 
 /// The longest the Ruby thread waits for the consolidation worker with the GVL released
 /// before it checks for an interrupt.
@@ -815,6 +823,15 @@ impl Memory {
 // ---- Results, as Arrays for memory.rb ----------------------------------------------
 
 /// `[id, outcome]`.
+/// `mark_used`'s result: `[marked, [missing id, ...]]`.
+fn marked(ruby: &Ruby, m: mem::Marked) -> Result<RArray, Error> {
+    let missing = ruby.ary_from_iter(m.missing.into_iter().map(id_value));
+    let a = ruby.ary_new_capa(2);
+    a.push(m.marked)?;
+    a.push(frozen_ary(missing))?;
+    Ok(a)
+}
+
 fn remembered(ruby: &Ruby, r: mem::Remembered) -> Result<RArray, Error> {
     let outcome = match &r {
         mem::Remembered::New(_) => "new",
@@ -1094,7 +1111,114 @@ enum Answer {
 }
 
 /// One drive's channels: groups to the Ruby thread, answers back.
-type Channels = (Sender<Vec<mem::StoredMemory>>, Receiver<Answer>);
+type Channels = (GroupTx, Receiver<Answer>);
+
+/// The groups the worker sends the Ruby thread: waited for in slices with the GVL released,
+/// or, under a fiber scheduler, polled by a fiber op ([`fiber`]). Closed once the worker's
+/// sender is dropped, which the worker does as its work ends (or panics).
+#[derive(Default)]
+pub(crate) struct Groups {
+    q: Mutex<GroupQueue>,
+    more: Condvar,
+}
+
+#[derive(Default)]
+struct GroupQueue {
+    items: VecDeque<Vec<mem::StoredMemory>>,
+    closed: bool,
+    /// A fiber op's waker while it waits ([`fiber`]).
+    waker: Option<Waker>,
+}
+
+/// What a wait for a group found.
+enum Recv {
+    Group(Vec<mem::StoredMemory>),
+    /// Nothing yet.
+    Empty,
+    /// The worker's sender is gone and every group taken.
+    Closed,
+}
+
+impl Groups {
+    /// The next group, waiting up to `d` for one.
+    fn recv_timeout(&self, d: Duration) -> Recv {
+        let mut g = lock(&self.q);
+        if g.items.is_empty() && !g.closed && !d.is_zero() {
+            g = self
+                .more
+                .wait_timeout(g, d)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        match g.items.pop_front() {
+            Some(group) => Recv::Group(group),
+            None if g.closed => Recv::Closed,
+            None => Recv::Empty,
+        }
+    }
+
+    /// Waits up to `d` for a group or the close, taking nothing.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn wait_ready(&self, d: Duration) {
+        let g = lock(&self.q);
+        if g.items.is_empty() && !g.closed {
+            let _ = self.more.wait_timeout(g, d);
+        }
+    }
+
+    /// Whether a group or the close is there to take; if not, `cx`'s waker is kept for the
+    /// next send or the close.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> bool {
+        let mut g = lock(&self.q);
+        if g.items.is_empty() && !g.closed {
+            g.waker = Some(cx.waker().clone());
+            return false;
+        }
+        true
+    }
+
+    fn push(&self, item: Option<Vec<mem::StoredMemory>>) {
+        let waker = {
+            let mut g = lock(&self.q);
+            match item {
+                Some(group) => g.items.push_back(group),
+                None => g.closed = true,
+            }
+            g.waker.take()
+        };
+        self.more.notify_all();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+/// The worker's end of [`Groups`]: dropping it closes them.
+pub(crate) struct GroupTx(Arc<Groups>);
+
+impl GroupTx {
+    fn send(&self, group: Vec<mem::StoredMemory>) {
+        self.0.push(Some(group));
+    }
+}
+
+impl Drop for GroupTx {
+    fn drop(&mut self) {
+        self.0.push(None);
+    }
+}
+
+/// Empties a consolidator's slot when dropped: the worker holds one, so its sender goes as
+/// its work returns or panics, and the Ruby side sees the groups closed at once.
+struct EmptySlot(Arc<SlotConsolidator>);
+
+impl Drop for EmptySlot {
+    fn drop(&mut self) {
+        let channels = lock(&self.0.slot).take();
+        drop(channels);
+    }
+}
 
 /// The crate's `Consolidator`, answered by the Ruby thread over the channels `drive`
 /// installs for each call (a `ConsolidateLoop` keeps one across its steps). With none
@@ -1113,9 +1237,7 @@ impl mem::Consolidator for SlotConsolidator {
         let Some((to_ruby, answers)) = slot.as_ref() else {
             return Err(Box::new(Stopped));
         };
-        to_ruby
-            .send(group.to_vec())
-            .map_err(|_| Box::new(Stopped))?;
+        to_ruby.send(group.to_vec());
         match answers.recv() {
             Ok(Answer::Memories(memories)) => Ok(memories),
             Ok(Answer::Failed) => Err(Box::new(Stopped)),
@@ -1144,15 +1266,31 @@ struct Driven<R> {
     jump: Option<Error>,
 }
 
+/// How `drive` waits for the worker's groups.
+#[derive(Clone, Copy)]
+enum Waiter<'a> {
+    /// With the GVL released, in slices with interrupt checks between them.
+    Blocking,
+    /// Through this thread's fiber bridge (the Ruby `FiberBridge` and its native core), so
+    /// the thread's other fibers run meanwhile (#1574 PR 3).
+    #[cfg(unix)]
+    Fiber(Value, &'a crate::fiber::FiberBridge),
+    #[cfg(not(unix))]
+    #[allow(dead_code)]
+    Never(std::marker::PhantomData<&'a ()>),
+}
+
 /// Runs `work` on a thread of its own, answering its consolidator's groups with `block`
 /// on this thread, by the owner's channel pattern (O3): the Ruby thread waits with the GVL
-/// released in 100 ms slices, with interrupt checks between them, and calls the block with
-/// the GVL held. However the wait ends, the worker is joined before this returns (ai1249's
-/// B1 and perf2's S1 on #1425), so no thread outlives the call.
+/// released in 100 ms slices, with interrupt checks between them (or under a fiber
+/// scheduler, through the fiber bridge: `waiter`), and calls the block with the GVL held.
+/// However the wait ends, the worker is joined before this returns (ai1249's B1 and perf2's
+/// S1 on #1425), so no thread outlives the call.
 ///
 /// `interrupter`, for a loop's step, is tripped as soon as a jump or interrupt is recorded,
 /// so the step stops waiting for new memories within about 50 ms instead of at its timeout
 /// (perf2's S1 on #1441, #1447's `LoopInterrupter`).
+#[allow(clippy::too_many_arguments)]
 fn drive<R: Send + 'static>(
     ruby: &Ruby,
     slot: &Arc<SlotConsolidator>,
@@ -1160,6 +1298,7 @@ fn drive<R: Send + 'static>(
     on_raise: OnRaise,
     name: &str,
     interrupter: Option<&mem::LoopInterrupter>,
+    waiter: Waiter<'_>,
     work: impl FnOnce() -> R + Send + 'static,
 ) -> Result<Driven<R>, Error> {
     let trip = || {
@@ -1167,17 +1306,16 @@ fn drive<R: Send + 'static>(
             i.interrupt();
         }
     };
-    let (to_ruby, groups) = mpsc::channel::<Vec<mem::StoredMemory>>();
+    let groups = Arc::new(Groups::default());
     let (answer_tx, answers) = mpsc::channel::<Answer>();
-    *lock(&slot.slot) = Some((to_ruby, answers));
-    // The worker empties the slot as soon as its work returns, dropping the sender, so the
-    // wait below sees `Disconnected` at once rather than at the end of a slice (ai1249's
-    // N1 on #1441).
-    let worker_slot = Arc::clone(slot);
+    *lock(&slot.slot) = Some((GroupTx(Arc::clone(&groups)), answers));
+    // The worker empties the slot as soon as its work returns (or panics), dropping the
+    // sender, so the wait below sees the groups closed at once rather than at the end of a
+    // slice (ai1249's N1 on #1441), and a fiber's wait ends at all.
+    let worker_slot = EmptySlot(Arc::clone(slot));
     let run = move || {
-        let out = work();
-        lock(&worker_slot.slot).take();
-        out
+        let _empty = worker_slot;
+        work()
     };
     let worker = match std::thread::Builder::new().name(name.into()).spawn(run) {
         Ok(w) => w,
@@ -1189,23 +1327,55 @@ fn drive<R: Send + 'static>(
             ));
         }
     };
-    let groups = Arc::new(Mutex::new(groups));
     let mut raised: Vec<(String, Error)> = Vec::new();
     let mut jump: Option<Error> = None;
+    #[cfg(unix)]
+    let mut reraised = false;
     loop {
-        let rx = Arc::clone(&groups);
-        // `without_gvl` raises an interrupt already pending instead of waiting: recorded,
-        // and the loop keeps draining until the worker ends.
-        let msg = match without_gvl(ruby, move || lock(&rx).recv_timeout(SLICE)) {
-            Ok(msg) => msg,
-            Err(e) => {
-                jump.get_or_insert(e);
-                trip();
-                continue;
+        let msg = match waiter {
+            Waiter::Blocking => {
+                let rx = Arc::clone(&groups);
+                // `without_gvl` raises an interrupt already pending instead of waiting:
+                // recorded, and the loop keeps draining until the worker ends.
+                match without_gvl(ruby, move || rx.recv_timeout(SLICE)) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        jump.get_or_insert(e);
+                        trip();
+                        continue;
+                    }
+                }
             }
+            #[cfg(unix)]
+            Waiter::Fiber(bridge, core) => match groups.recv_timeout(Duration::ZERO) {
+                Recv::Empty => {
+                    // Parks this fiber until a group comes or the worker ends. Raised into
+                    // meanwhile (a stop, a timeout), it's recorded as an interrupt is, and
+                    // the loop goes on waiting through the bridge until the worker has
+                    // ended: no thread outlives the call (§4 of the design note on #1574).
+                    // Raised into again after that (a scheduler that re-raises at every
+                    // yield), it waits in slices with the GVL released instead, so it can't
+                    // spin through the scheduler (cli692's N2 on #1614).
+                    let waited = if reraised {
+                        let g = Arc::clone(&groups);
+                        without_gvl(ruby, move || g.wait_ready(SLICE))
+                    } else {
+                        fiber::await_groups(ruby, bridge, core, &groups)
+                    };
+                    if let Err(e) = waited {
+                        reraised = jump.is_some();
+                        jump.get_or_insert(e);
+                        trip();
+                    }
+                    continue;
+                }
+                msg => msg,
+            },
+            #[cfg(not(unix))]
+            Waiter::Never(_) => unreachable!(),
         };
         match msg {
-            Ok(group) => {
+            Recv::Group(group) => {
                 let refuse = jump.is_some() || (on_raise == OnRaise::StopAll && !raised.is_empty());
                 let reply = if refuse {
                     Answer::Refused
@@ -1230,7 +1400,7 @@ fn drive<R: Send + 'static>(
                 // A send fails only once the worker is gone, which `is_finished` then shows.
                 let _ = answer_tx.send(reply);
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Recv::Empty => {
                 if worker.is_finished() {
                     break;
                 }
@@ -1242,7 +1412,7 @@ fn drive<R: Send + 'static>(
                     trip();
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Recv::Closed => break,
         }
     }
     // The worker has ended (or is ending): the join doesn't wait on the engine. If an
@@ -1516,11 +1686,7 @@ impl Store {
         let ids = ids_arg(ruby, ids)?;
         let s = rb_self.handle(ruby)?;
         let m = call(ruby, move || s.mark_used(&ids))?;
-        let missing = ruby.ary_from_iter(m.missing.into_iter().map(id_value));
-        let a = ruby.ary_new_capa(2);
-        a.push(m.marked)?;
-        a.push(frozen_ary(missing))?;
-        Ok(a)
+        marked(ruby, m)
     }
 
     pub(crate) fn get(ruby: &Ruby, rb_self: &Self, id: Value) -> Result<Option<RArray>, Error> {
@@ -1679,6 +1845,7 @@ impl Store {
             OnRaise::StopAll,
             "pigeonhole-consolidate",
             None,
+            Waiter::Blocking,
             move || {
                 let mut run = s.consolidate(&ns, &*consolidator);
                 if let Some(p) = &policy {
@@ -2036,17 +2203,20 @@ impl Store {
         if let Some(off) = clock_offset_us {
             lp = lp.clock(move || now_us().saturating_add_signed(off));
         }
-        Ok(ConsolidateLoop(ForkSafe::new(Mutex::new(LoopSlot::Idle(
-            Box::new(LoopState { lp, slot }),
+        Ok(ConsolidateLoop(ForkSafe::new(Arc::new(Mutex::new(
+            LoopSlot::Idle(Box::new(LoopState { lp, slot })),
         )))))
     }
 }
 
-/// Where a `ConsolidateLoop` is: ready, in a step on another thread, closed, or lost to a
-/// worker panic (perf2's N1 on #1441: each says why a call can't run).
+/// Where a `ConsolidateLoop` is: ready, in a step on another thread, in a fiber's wait for
+/// new memories (with its waker, for `close`), closed, or lost to a worker panic (perf2's
+/// N1 on #1441: each says why a call can't run).
 pub(crate) enum LoopSlot {
     Idle(Box<LoopState>),
     Running,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Waiting(Option<Waker>),
     Closed,
     Lost,
 }
@@ -2067,6 +2237,7 @@ impl LoopSlot {
     fn why(&self) -> &'static str {
         match self {
             LoopSlot::Running => "a step of this consolidation loop is running on another thread",
+            LoopSlot::Waiting(_) => "a fiber's step of this consolidation loop is waiting",
             LoopSlot::Closed => "the consolidation loop is closed",
             LoopSlot::Lost => "the consolidation loop's thread panicked: the loop is gone",
             LoopSlot::Idle(_) => "the consolidation loop is ready",
@@ -2085,6 +2256,19 @@ impl ConsolidateLoop {
         timeout: Secs,
         block: magnus::block::Proc,
     ) -> Result<RArray, Error> {
+        Self::step(ruby, rb_self, timeout.0, 0, block, Waiter::Blocking)
+    }
+
+    /// A step: reads for up to `timeout`, counting `waited` events a fiber's wait read
+    /// before it, then runs the due passes, waiting for their groups as `waiter` says.
+    fn step(
+        ruby: &Ruby,
+        rb_self: &Self,
+        timeout: Duration,
+        waited: usize,
+        block: magnus::block::Proc,
+        waiter: Waiter<'_>,
+    ) -> Result<RArray, Error> {
         let m = rb_self.0.get(ruby)?;
         let LoopState { mut lp, slot } = lock(m).take(ruby)?;
         let interrupter = lp.interrupter();
@@ -2095,8 +2279,12 @@ impl ConsolidateLoop {
             OnRaise::PerGroup,
             "pigeonhole-consolidate-loop",
             Some(&interrupter),
+            waiter,
             move || {
-                let step = lp.run_once(timeout.0);
+                let mut step = lp.run_once(timeout);
+                if let Ok(s) = &mut step {
+                    s.events += waited;
+                }
                 (lp, step)
             },
         );
@@ -2182,6 +2370,12 @@ impl ConsolidateLoop {
                     None
                 }
                 LoopSlot::Idle(s) => Some(s),
+                // A fiber's wait: woken, it finds the loop closed and raises `Closed`
+                // (#1606's lesson), dropping the loop itself.
+                LoopSlot::Waiting(Some(w)) => {
+                    w.wake();
+                    None
+                }
                 _ => None,
             }
         };

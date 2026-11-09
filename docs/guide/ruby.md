@@ -439,9 +439,14 @@ end
   - `Table#put`, `incr`, `incr_returning` and `delete`.
 
   - `Feed#next` and `each`, and memory `Watch#next` and `each` (the writer process's; a reader process's watch raises `Pigeonhole::Unsupported` for a fiber, so wait on a thread there).
+  - The memory store's writes (`remember`, `delete`, `link`, `supersede` and `mark_used`), `recall` and `recall_with_stats`, and `ConsolidateLoop#run_once`.
 
   Each commit submits at the call, as before, then waits without holding the thread.
-- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), memory recall and the consolidation loop's step (coming later), and every call on Windows.
+- **The memory store under a scheduler:**
+  - A write runs as `transact` around its `_in` form (`remember_in`, `delete_in` and the rest), so its commit yields, and it's retried as before.
+  - `recall`, `remember`'s near-dedup lookup, and an IVF store's settle after a write run on a small worker pool of the binding's own (at most 8 threads), and the fiber waits for them.
+  - `ConsolidateLoop#run_once` waits for new memories and for the pass's groups without holding the thread, and calls the block on the calling fiber, so the block may itself yield (an HTTP call to a model, say). Its first step starts the loop without waiting.
+- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), memory `get`, `verify`, `forget` and `consolidate`, and every call on Windows.
 - **Opting out:** `Fiber.blocking { ... }` keeps the calls inside it blocking. `Pigeonhole.fiber_scheduler = false` does it for the whole process, which keeps 1.1's behaviour for an application that can't check its call sites yet.
 - **A commit is now a point where the thread's other fibers run.** So [don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) applies across fibers too. A snapshot or open scan that one fiber keeps while another fiber on the thread commits can make that commit wait for room the snapshot pins, and it ends in `Busy` after the write-stall timeout. Finish or release snapshots and scans before a commit that may yield.
 - **Stopping a waiting fiber** (`Async::Task#stop`, a timeout, `Thread#raise`) ends its wait and raises in it, as for any other wait.
@@ -450,6 +455,8 @@ end
   - For `incr_returning` and `commit_returning`, a landed commit's values are lost: a gap in a sequence, never a repeat.
   - `transact` doesn't retry a stopped attempt.
   - A feed or watch `next` loses nothing: a commit it had already taken is the next one any call returns, and `token` still points before it.
+  - A memory write ends as a stopped `transact` does. `recall` stopped while it runs finishes on its worker, and its result is dropped.
+  - A `ConsolidateLoop#run_once` stopped while it waits for new memories loses nothing: the next step reads them. Stopped during its passes, it raises once the pass has ended, as an interrupt does, and the loop is ready for the next step.
 - **One consumer per feed or watch at a time.** A second fiber's `next` while one waits raises `Pigeonhole::Error`, and so does a thread's `next` while a fiber waits on the same feed, or a fiber's while a thread does. `token`, `try_next` and `close` from anywhere stay fine.
 - **Threads and processes:** each thread's fibers share one small bridge (a pipe and its file descriptors). A forked child makes its own and leaves the parent's open.
 

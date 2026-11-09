@@ -28,6 +28,8 @@ mod fork;
 mod gvl;
 mod index;
 mod memory;
+#[cfg(unix)]
+mod offload;
 mod read;
 mod table;
 mod vector;
@@ -69,6 +71,44 @@ mod entry {
     fn init(ruby: &magnus::Ruby) -> Result<(), magnus::Error> {
         super::init(ruby)
     }
+}
+
+/// The memory store's natives under a fiber scheduler (#1574 PR 3, ICR 0126 amendment 2).
+#[cfg(unix)]
+fn memory_fiber_methods(ruby: &Ruby, native: RModule, mm: RModule) -> Result<(), Error> {
+    use classes::{ConsolidateLoop, ReadStore, Store};
+    class(ruby, native, "PreparedMemory")?;
+    let c = mm.const_get::<_, RClass>("Store")?;
+    c.define_private_method(
+        "native_prepare_remember",
+        method!(Store::prepare_remember, 9),
+    )?;
+    c.define_private_method(
+        "native_prepare_remember_op",
+        method!(Store::prepare_remember_op, 10),
+    )?;
+    c.define_private_method(
+        "native_remember_prepared_in",
+        method!(Store::remember_prepared_in, 2),
+    )?;
+    c.define_private_method("native_link_in", method!(Store::link_in, 5))?;
+    c.define_private_method("native_supersede_in", method!(Store::supersede_in, 3))?;
+    c.define_private_method("native_mark_used_in", method!(Store::mark_used_in, 2))?;
+    c.define_private_method("native_near_dedup_on", method!(Store::near_dedup_on, 0))?;
+    c.define_private_method("native_has_ivf", method!(Store::has_ivf, 0))?;
+    c.define_private_method("native_settle_op", method!(Store::settle_op, 1))?;
+    c.define_private_method("native_recall_op", method!(Store::recall_op, 2))?;
+    let c = mm.const_get::<_, RClass>("ReadStore")?;
+    c.define_private_method("native_recall_op", method!(ReadStore::recall_op, 2))?;
+    let c = mm.const_get::<_, RClass>("ConsolidateLoop")?;
+    c.define_private_method("native_wait_op", method!(ConsolidateLoop::wait_op, 1))?;
+    c.define_private_method(
+        "native_run_once_fiber",
+        method!(ConsolidateLoop::run_once_fiber, 3),
+    )?;
+    #[cfg(feature = "test-hooks")]
+    native.define_singleton_method("offload_hold", function!(offload::hooks::hold, 1))?;
+    Ok(())
 }
 
 /// The fiber bridge's native classes and the ops of each waiting call (#1574, ICR 0126).
@@ -114,6 +154,7 @@ fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> 
     let mem_mod = m.const_get::<_, RModule>("Memory")?;
     let c = mem_mod.const_get::<_, RClass>("Watch")?;
     c.define_private_method("native_next_op", method!(crate::classes::Watch::next_op, 1))?;
+    memory_fiber_methods(ruby, native, mem_mod)?;
     let c = m.const_get::<_, RClass>("WriteBatch")?;
     c.define_private_method("native_commit_op", method!(WriteBatch::commit_op, 2))?;
     let c = m.const_get::<_, RClass>("Transaction")?;
@@ -551,10 +592,10 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_method("ivf", method!(Store::ivf, 0))?;
     c.define_private_method("native_remember", method!(Store::remember, 9))?;
     c.define_private_method("native_remember_in", method!(Store::remember_in, 10))?;
-    c.define_method("delete", method!(Store::delete, 1))?;
+    c.define_private_method("native_delete", method!(Store::delete, 1))?;
     c.define_method("delete_in", method!(Store::delete_in, 2))?;
     c.define_private_method("native_link", method!(Store::link, 4))?;
-    c.define_method("supersede", method!(Store::supersede, 2))?;
+    c.define_private_method("native_supersede", method!(Store::supersede, 2))?;
     c.define_private_method("native_mark_used", method!(Store::mark_used, 1))?;
     c.define_private_method("native_get", method!(Store::get, 1))?;
     c.define_private_method("native_verify", method!(Store::verify, 0))?;
