@@ -81,6 +81,8 @@ pub(crate) struct Writer {
     /// written back (file offsets; contiguous within an extent).
     writeback: Option<std::sync::Arc<crate::Writeback>>,
     behind: std::ops::Range<u64>,
+    /// The pieces an append wrote, kept for reuse (no allocation per value; perf2's N3).
+    pieces: Vec<(u64, u64)>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -104,6 +106,7 @@ impl Writer {
             pos: 0,
             writeback: None,
             behind: 0..0,
+            pieces: Vec::new(),
         }
     }
 
@@ -178,7 +181,8 @@ impl Writer {
         let offset = self.pos;
         let header = encode_record_header(value);
         for (at, bytes) in [(offset, &header[..]), (offset + header.len() as u64, value)] {
-            let mut pieces = Vec::new();
+            let mut pieces = std::mem::take(&mut self.pieces);
+            pieces.clear();
             for_each_piece(&self.extents, self.payload, at, bytes.len(), |_, abs, r| {
                 crate::reader::write_any(&self.file, &bytes[r.clone()], abs)?;
                 if self.writeback.is_some() {
@@ -186,9 +190,10 @@ impl Writer {
                 }
                 Ok(())
             })?;
-            for (abs, len) in pieces {
+            for &(abs, len) in &pieces {
                 self.written(abs, len);
             }
+            self.pieces = pieces;
         }
         self.pos += (BLOB_RECORD_HEADER_LEN + value.len()) as u64;
         Ok(BlobPointer {

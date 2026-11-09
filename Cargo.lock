@@ -1919,6 +1919,7 @@ name = "pigeonhole-sst"
 version = "3.0.0"
 dependencies = [
  "criterion",
+ "loom",
  "pigeonhole-cache",
  "pigeonhole-format",
  "pigeonhole-io",

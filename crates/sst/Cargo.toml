@@ -24,5 +24,10 @@ criterion = { workspace = true }
 name = "sst"
 harness = false
 
+# The write-back budget's loom model (`writeback`, D319): `RUSTFLAGS="--cfg sst_loom" cargo test
+# --release -p pigeonhole-sst --lib loom`.
+[target.'cfg(sst_loom)'.dependencies]
+loom = { workspace = true }
+
 [lints]
 workspace = true

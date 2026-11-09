@@ -22,8 +22,17 @@
 //! [`pigeonhole_io::inline_io`] scope (an application-owned worker's slice) a write-back runs
 //! before [`Writeback::submit`] returns, so a slice still ends with nothing in flight.
 
+// The budget's loom model (`loom_tests` below) checks this type as shipped:
+// `RUSTFLAGS="--cfg sst_loom" cargo test --release -p pigeonhole-sst --lib loom`.
+#[cfg(sst_loom)]
+use loom::sync::atomic::{AtomicU64, Ordering};
+#[cfg(sst_loom)]
+use loom::sync::{Condvar, Mutex};
+use std::sync::PoisonError;
+#[cfg(not(sst_loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError};
+#[cfg(not(sst_loom))]
+use std::sync::{Condvar, Mutex};
 use std::task::Waker;
 
 use pigeonhole_io::File;
@@ -72,7 +81,7 @@ impl Writeback {
 
     /// Writes nothing back on a thread where `skip` is true: the engine's pinned shard
     /// threads, so a job running there never starts io-wq workers on a shard's CPU (D319,
-    /// #1460). Its chunks still count nothing, and its jobs still wait for room.
+    /// #1460). Its chunks count nothing, and it never waits for room.
     #[must_use]
     pub fn skip_on(mut self, skip: fn() -> bool) -> Self {
         self.skip = Some(skip);
@@ -83,7 +92,7 @@ impl Writeback {
     /// completes. It never waits for room: a writer submits each chunk it wrote, and its job
     /// checks [`Writeback::admit`] between chunks. The result is ignored (pacing only).
     pub fn submit(self: &std::sync::Arc<Self>, file: &dyn File, offset: u64, len: u64) {
-        if len == 0 || self.skip.is_some_and(|skip| skip()) {
+        if len == 0 || self.skipped_here() {
             return;
         }
         let now = self.in_flight.fetch_add(len, Ordering::AcqRel) + len;
@@ -115,6 +124,9 @@ impl Writeback {
     /// [`COMPACTION_SHARE`] quarters of it for a compaction. When not, `waker` is woken once
     /// write-backs complete, and the job ends its slice blocked (never waiting on its thread).
     pub fn admit(&self, flush: bool, waker: &Waker) -> bool {
+        if self.skipped_here() {
+            return true;
+        }
         let limit = self.limit(flush);
         if self.in_flight.load(Ordering::Acquire) < limit {
             return true;
@@ -135,7 +147,14 @@ impl Writeback {
     /// Whether the budget is full for a flush (`true`) or a compaction: a cheap check a job
     /// makes between chunks, ending its slice; [`Writeback::admit`] then registers its wait.
     pub fn full(&self, flush: bool) -> bool {
-        self.in_flight.load(Ordering::Relaxed) >= self.limit(flush)
+        self.in_flight.load(Ordering::Relaxed) >= self.limit(flush) && !self.skipped_here()
+    }
+
+    /// Whether this thread writes nothing back ([`Writeback::skip_on`]): its job adds nothing
+    /// to the device's queue, so it never waits for room either (perf2's N1 on #1633; a
+    /// taken-back flush is freeing arena room).
+    fn skipped_here(&self) -> bool {
+        self.skip.is_some_and(|skip| skip())
     }
 
     fn limit(&self, flush: bool) -> u64 {
@@ -189,8 +208,114 @@ impl Writeback {
     }
 }
 
+#[cfg(not(sst_loom))]
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(sst_loom)]
+fn lock<T>(m: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The budget's wait and wake under loom (D319; the coordinator on #1633, after #1502's lost
+/// wake behind a "recheck under the lock" argument). A job that finds the budget full
+/// registers its waker and blocks; a write-back completing elsewhere releases bytes. Whatever
+/// the interleaving, the job is woken and its retry is admitted: a lost wake leaves it
+/// blocked for ever, which loom reports as a deadlock.
+#[cfg(all(test, sst_loom))]
+mod loom_tests {
+    use super::Writeback;
+    use loom::sync::atomic::Ordering;
+    use loom::sync::{Arc, Condvar, Mutex};
+    use loom::thread;
+    use std::task::{Wake, Waker};
+
+    /// The job's task waker, as the scheduler's: a wake before the job blocks ends its wait
+    /// at once.
+    #[derive(Default)]
+    struct Task {
+        woken: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Wake for Task {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            *self.woken.lock().unwrap() = true;
+            self.cv.notify_one();
+        }
+    }
+
+    impl Task {
+        fn block(&self) {
+            let mut w = self.woken.lock().unwrap();
+            while !*w {
+                w = self.cv.wait(w).unwrap();
+            }
+            *w = false;
+        }
+    }
+
+    /// A job polls until admitted, blocking whenever `admit` refuses: as `run_stages` does
+    /// with `TaskPoll::Blocked`.
+    fn job(wb: &Writeback, flush: bool, task: &std::sync::Arc<Task>) {
+        let waker = Waker::from(std::sync::Arc::clone(task));
+        while !wb.admit(flush, &waker) {
+            task.block();
+        }
+    }
+
+    /// One job, the budget full, one completion racing its check and its registration.
+    #[test]
+    fn loom_a_completion_racing_a_full_budget_wakes_the_job() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let wb = Arc::new(Writeback::new(4));
+            wb.in_flight.store(4, Ordering::Release);
+            let done = {
+                let wb = Arc::clone(&wb);
+                thread::spawn(move || wb.release(2))
+            };
+            job(&wb, true, &std::sync::Arc::new(Task::default()));
+            done.join().unwrap();
+            assert_eq!(wb.in_flight(), 2);
+        });
+    }
+
+    /// A flush and a compaction both blocked, two completions: the flush (allowed up to the
+    /// whole budget) and the compaction (up to three quarters) both get through, whichever
+    /// release wakes which, and the last release signals idle for a close.
+    #[test]
+    fn loom_two_jobs_and_two_completions_all_get_through() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let wb = Arc::new(Writeback::new(4));
+            wb.in_flight.store(4, Ordering::Release);
+            let releases: Vec<_> = (0..2)
+                .map(|_| {
+                    let wb = Arc::clone(&wb);
+                    thread::spawn(move || wb.release(2))
+                })
+                .collect();
+            let compaction = {
+                let wb = Arc::clone(&wb);
+                thread::spawn(move || job(&wb, false, &std::sync::Arc::new(Task::default())))
+            };
+            job(&wb, true, &std::sync::Arc::new(Task::default()));
+            for r in releases {
+                r.join().unwrap();
+            }
+            compaction.join().unwrap();
+            wb.wait_idle();
+            assert_eq!(wb.in_flight(), 0);
+        });
+    }
 }
 
 #[cfg(test)]

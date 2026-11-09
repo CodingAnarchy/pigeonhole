@@ -568,6 +568,10 @@ impl FlushTask {
             while gc.step(it)? {
                 gc.drain(|k, v| sink.add(k, v))?;
                 n += 1;
+                // A flush without a deadline (a caller that runs it to the end in one call)
+                // never waits for write-back room: its chunks are still written back and
+                // counted, so the budget can overshoot by what it writes (perf2's N2 on
+                // #1633).
                 if deadline == u64::MAX {
                     continue;
                 }
