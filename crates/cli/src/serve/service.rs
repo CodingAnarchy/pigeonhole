@@ -935,7 +935,7 @@ impl Service {
         let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes()) else {
             return self.answer(op, caller, prepaid).await;
         };
-        if op.writes() && caller.scope >= op.scope() {
+        if op.writes() && caller.scope.allows(op.scope()) {
             return Err(ApiError::replica_read_only(replica.primary()));
         }
         match self.answer(op, caller, prepaid).await {
@@ -951,7 +951,7 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
-        if caller.scope < op.scope() {
+        if !caller.scope.allows(op.scope()) {
             return Err(ApiError::permission_denied(&format!("call {}", op.name())));
         }
         let size = op.size();
@@ -1038,6 +1038,8 @@ impl Service {
             ServiceOp::ListTables(_) => {
                 drop(budget);
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Tables(proto::ListTablesResponse { tables }))
             }
@@ -1057,6 +1059,8 @@ impl Service {
                 let db = self.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Info(proto::InfoResponse {
                     path: self.db.path().display().to_string(),
@@ -1287,6 +1291,7 @@ impl Service {
         if let Some(t) = self.tables.load().get(name) {
             return Ok(t.clone());
         }
+        reserved(name)?;
         let db = self.db.clone();
         let owned = name.to_owned();
         let table = self
@@ -1307,6 +1312,7 @@ impl Service {
         &self,
         r: proto::CreateTableRequest,
     ) -> Result<proto::TableResponse, ApiError> {
+        reserved(&r.name)?;
         if r.name.is_empty() {
             return Err(ApiError::invalid("a table needs a name"));
         }
@@ -1343,6 +1349,7 @@ impl Service {
     /// the name. A table created again under it is a new table, with a new id: its feed hubs
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+        reserved(&name)?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let owned = name.clone();
@@ -2511,7 +2518,7 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
-        if !r.rows.is_empty() && caller.scope < Scope::Write {
+        if !r.rows.is_empty() && !caller.scope.allows(Scope::Write) {
             return Err(ApiError::permission_denied("commit writes"));
         }
         let rows = self.txn_rows(&r.rows).await?;
@@ -2938,4 +2945,16 @@ async fn budget_within(
             "the server's in-flight request bytes stayed full past the deadline",
         )),
     }
+}
+
+/// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
+/// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
+fn reserved(name: &str) -> Result<(), ApiError> {
+    if name.starts_with(super::cluster::map::RESERVED_PREFIX) {
+        return Err(ApiError::invalid(format!(
+            "table {name:?}: the {} prefix is reserved",
+            super::cluster::map::RESERVED_PREFIX
+        )));
+    }
+    Ok(())
 }
