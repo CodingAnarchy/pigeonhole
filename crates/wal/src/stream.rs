@@ -28,6 +28,9 @@ pub(crate) const MAX_SEGMENT_SIZE: u64 = (1 << 32) - FRAME;
 /// Bytes written per call when zero-filling a slot.
 const ZERO_CHUNK: usize = 1 << 20;
 
+/// Appends between checks for an early rollover out of an `Extended` slot (D319).
+const EARLY_CHECK_EVERY: u32 = 64;
+
 /// Epoch recorded in the stream's slot table for a slot the spare pool owns (blank, never
 /// held a segment the stream knows of). Real epochs never reach this value.
 const POOLED: u32 = u32::MAX;
@@ -391,6 +394,7 @@ pub struct WalCounters {
     rollover_blocks: AtomicU64,
     rollover_waits: AtomicU64,
     retained_taken: AtomicU64,
+    early_rollovers: AtomicU64,
 }
 
 impl WalCounters {
@@ -423,6 +427,13 @@ impl WalCounters {
     /// rather than the writer waiting. Expected to stay 0 while spares keep up.
     pub fn retained_taken(&self) -> u64 {
         self.retained_taken.load(Ordering::Relaxed)
+    }
+
+    /// Rollovers out of an `Extended` (unwritten) open-time slot before it filled, once a
+    /// spare was ready (D319): about one per stream per open on a fresh store, so its syncs
+    /// stop converting extents.
+    pub fn early_rollovers(&self) -> u64 {
+        self.early_rollovers.load(Ordering::Relaxed)
     }
 }
 
@@ -1032,6 +1043,7 @@ impl SpareSegments {
             next_offset: 0,
             allocated: false,
             writes: VecDeque::new(),
+            writeback: None,
             buffers: Vec::new(),
             failed: None,
             sync: None,
@@ -1110,8 +1122,11 @@ struct Reserved {
     grown: usize,
 }
 
-/// Zero-fill writes a [`SparePrep`] keeps in flight.
-const PREP_IN_FLIGHT: usize = 4;
+/// Zero-fill writes a [`SparePrep`] keeps in flight: one, written back before the next
+/// (D319), so the stream file never holds more than a chunk of the spare's zeros dirty or
+/// under write-back when a group syncs it (#1621). A slot still fills in about a tenth of a
+/// second on NVMe, against the ~90 s a busy stream takes to use one.
+const PREP_IN_FLIGHT: usize = 1;
 
 /// Zero-fill writes a [`SparePrep`] submits per poll before it yields.
 const PREP_WRITES_PER_POLL: usize = 4;
@@ -1132,7 +1147,13 @@ pub struct SparePrep {
     next_offset: u64,
     /// Whether `next_slot` has been allocated.
     allocated: bool,
-    writes: VecDeque<Completion>,
+    /// Zero-fill writes in flight, with the range each wrote.
+    writes: VecDeque<(Completion, u64, u64)>,
+    /// The write-back of a written chunk, in flight (D319): the next write waits for it, so
+    /// the zeros a group sync of this file finds dirty or under write-back stay about one
+    /// chunk, never most of a slot (#1621: a sync landing mid-fill wrote up to 128 MiB of them
+    /// back, 16-64 ms).
+    writeback: Option<Completion<()>>,
     /// Zero buffers back from completed writes, for the next ones.
     buffers: Vec<IoBuf>,
     /// The first failed allocation or write: no more are submitted, and the slots go back
@@ -1163,16 +1184,28 @@ impl SparePrep {
         }
         let (mut submitted, mut allocated) = (0, false);
         loop {
-            // Collect finished writes, oldest first.
-            while let Some(w) = self.writes.front_mut() {
+            // Collect finished writes, oldest first, and write each one's chunk back.
+            while let Some((w, _, _)) = self.writes.front_mut() {
                 match Pin::new(w).poll(cx) {
-                    Poll::Ready(Ok(buf)) => self.buffers.push(buf),
+                    Poll::Ready(Ok(buf)) => {
+                        self.buffers.push(buf);
+                        let (_, at, len) = self.writes.pop_front().expect("polled above");
+                        self.write_back(at, len);
+                        continue;
+                    }
                     Poll::Ready(Err(e)) => {
                         self.failed.get_or_insert(e.into());
                     }
                     Poll::Pending => break,
                 }
                 self.writes.pop_front();
+            }
+            // Its outcome only paces: a failed write-back leaves the data to the slot's sync.
+            if let Some(wb) = &mut self.writeback {
+                if Pin::new(wb).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.writeback = None;
             }
             if self.writes.len() >= PREP_IN_FLIGHT {
                 return Poll::Pending;
@@ -1194,6 +1227,22 @@ impl SparePrep {
             allocated |= allocates;
             submitted += 1;
         }
+    }
+
+    /// Starts the write-back of a zero chunk just written (D319), counted in the stream's I/O
+    /// for a close to wait for. With the write-back in flight no other write is submitted
+    /// (`write_slots`), so at most one chunk is ever dirty or under write-back.
+    fn write_back(&mut self, at: u64, len: u64) {
+        let Some(token) = self.spares.shared.track() else {
+            // A close waits for the stream's I/O: no more is submitted.
+            self.failed
+                .get_or_insert(Error::Io(Shared::closing_error()));
+            return;
+        };
+        self.writeback = Some(self.spares.file.submit_writeback(at, len).map(move |r| {
+            drop(token);
+            r
+        }));
     }
 
     /// Whether every write has been submitted, or a failure stops them.
@@ -1230,15 +1279,15 @@ impl SparePrep {
             self.failed = Some(Error::Io(Shared::closing_error()));
             return;
         };
-        self.writes.push_back(
-            self.spares
-                .file
-                .submit_write(buf, start + self.next_offset)
-                .map(move |r| {
-                    drop(token);
-                    r
-                }),
-        );
+        let at = start + self.next_offset;
+        self.writes.push_back((
+            self.spares.file.submit_write(buf, at).map(move |r| {
+                drop(token);
+                r
+            }),
+            at,
+            len as u64,
+        ));
         self.next_offset += len as u64;
         if self.next_offset == size {
             self.next_slot += 1;
@@ -1376,6 +1425,9 @@ pub struct WalStream {
     held: Option<HeldHeader>,
     /// The epoch the current segment's slot held before, if it was recycled.
     stale: Option<u32>,
+    /// Appends left before the next check for an early rollover; 0 when the current
+    /// segment's slot isn't `Extended` (D319, `append_parts`).
+    early: u32,
     shared: Arc<Shared>,
 }
 
@@ -1589,6 +1641,7 @@ impl WalStream {
             buf: Vec::new(),
             held: None,
             stale: None,
+            early: 0,
             shared: Arc::new(Shared {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
@@ -1713,6 +1766,11 @@ impl WalStream {
     /// prepared in time this stays 0.
     pub fn inline_rollover_syncs(&self) -> u64 {
         self.shared.counters.inline_rollover_syncs()
+    }
+
+    /// Early rollovers out of an `Extended` open-time slot (D319; [`WalCounters::early_rollovers`]).
+    pub fn early_rollovers(&self) -> u64 {
+        self.shared.counters.early_rollovers()
     }
 
     /// The stream's stall counters, shared: a metrics reader keeps the handle and reads it
@@ -1920,6 +1978,13 @@ impl WalStream {
             .ok_or_else(|| corrupt("wal epochs exhausted"))?;
         let (slot, source) = self.take_slot(at_open)?;
         self.stale = (source == SlotSource::Recycled).then_some(self.slots[slot]);
+        // A segment in an `Extended` slot (unwritten extents) leaves it early, once a spare is
+        // ready (D319, `append_parts`).
+        self.early = if source == SlotSource::Extended {
+            EARLY_CHECK_EVERY
+        } else {
+            0
+        };
         self.slots[slot] = epoch;
         if let Some(at) = self.sealed_at.get_mut(slot) {
             *at = None;
@@ -2009,6 +2074,39 @@ impl WalStream {
         Ok(())
     }
 
+    /// D319 (#1621): the open-time segment's `Extended` slot is unwritten extents, so every
+    /// sync while it fills converts extents, an XFS transaction and a log force each (about
+    /// 3K a second at #1621's load, for the ~90 s a stream takes to fill a segment). Once a
+    /// recyclable or prepared slot is ready the stream rolls over to it at this record
+    /// boundary, through the usual rollover (a submitted sync, the successor's header held
+    /// until it is durable, `prev_end` where this segment ended): no format change. Checked
+    /// every [`EARLY_CHECK_EVERY`] appends, so a stream whose spares never get prepared pays
+    /// a counter decrement per append, and the pool's lock only that often. A retained slot
+    /// doesn't count: taking it costs the change feed's history, a full segment's worth.
+    #[cold]
+    #[inline(never)]
+    fn leave_extended(&mut self) -> Result<()> {
+        self.early -= 1;
+        if self.early != 0 {
+            return Ok(());
+        }
+        self.early = EARLY_CHECK_EVERY;
+        if self.held.is_some() || self.append_pos() <= FRAME {
+            return Ok(());
+        }
+        let ready = (0..self.slots.len()).any(|i| self.is_recyclable(i))
+            || !self.shared.pool().ready.is_empty();
+        if ready {
+            self.shared
+                .counters
+                .early_rollovers
+                .fetch_add(1, Ordering::Relaxed);
+            // The successor is a recyclable or prepared slot: `early` goes to 0 there.
+            self.rollover()?;
+        }
+        Ok(())
+    }
+
     fn append_pos(&self) -> u64 {
         self.written_off + self.buf.len() as u64
     }
@@ -2080,11 +2178,13 @@ impl WalStream {
     }
 
     /// Frames a record of `len` bytes, given as `parts`, into the buffer, rolling over first
-    /// if it does not fit.
+    /// if it does not fit, or early out of an `Extended` slot ([`WalStream::leave_extended`]).
     fn append_parts(&mut self, parts: &[&[u8]], len: usize) -> Result<Lsn> {
         let need = self.enc.encoded_len(len) as u64;
         if self.append_pos() + need > self.segment_size {
             self.rollover()?;
+        } else if self.early != 0 {
+            self.leave_extended()?;
         }
         let end = self.enc.encode_parts(parts, &mut self.buf);
         Ok(Lsn::new(self.epoch, end as u32))
