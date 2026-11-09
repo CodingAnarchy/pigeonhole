@@ -522,9 +522,11 @@ impl MemCore {
                     })
                     .map(|(r, _)| r);
                 // A write through `remember_in` parks an IVF store's records until a settle
-                // (ICR 0123): settle after it commits, as `remember` does itself (ai1249's N2
-                // on #1617).
-                store.settle();
+                // (ICR 0123): settle once it commits, as `remember` does itself (ai1249's N2
+                // on #1617). A transaction that failed parked nothing (their N1 on 8b).
+                if r.is_ok() {
+                    store.settle();
+                }
                 r
             }
             None => store.remember(ns, m),

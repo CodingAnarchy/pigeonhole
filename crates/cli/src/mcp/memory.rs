@@ -871,6 +871,59 @@ fn forget_tool() -> Value {
 mod tests {
     use super::*;
 
+    /// 8b's fix, as ai1249's R1 on 8b asks: `phdb mcp` not writable on a writer database
+    /// opens the store without its forgetter. On main it opened the store as the writer does,
+    /// whose forgetter runs a pass at once and deletes an episodic memory past its TTL from a
+    /// session meant to be read-only.
+    #[test]
+    fn a_read_only_open_on_a_writer_starts_no_forgetter() {
+        use pigeonhole_memory::{Memory as NewMemory, OpenOptions, Store, StoreOptions};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("m.phdb"),
+            pigeonhole::Options::default().shards(1),
+        )
+        .unwrap();
+        let store = Store::create(
+            &db,
+            "m",
+            StoreOptions::new().episodic_ttl(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        // The store's own forgetter is taken, so nothing deletes until the open under test.
+        drop(store.take_forgetter());
+        let id = store
+            .remember("ns", NewMemory::new("an episode").kind(Kind::Episodic))
+            .unwrap()
+            .id()
+            .clone();
+        drop(store);
+        // Past its TTL by the time the open below could start a forgetter.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let args = MemoryArgs {
+            memory: Some("m".into()),
+            ..MemoryArgs::default()
+        };
+        let mut notes = Vec::new();
+        let memory = Memory::open(&Db::Writer(db.clone()), &args, false, 1 << 20, &mut notes)
+            .unwrap()
+            .unwrap();
+        // A forgetter's first pass runs as it starts: give one the time it would need.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let probe = Store::open_with(
+            &db,
+            "m",
+            OpenOptions::new().without_embeddings().own_forgetter(),
+        )
+        .unwrap();
+        assert!(
+            probe.get(&id).unwrap().is_some(),
+            "a read-only open deleted an expired memory"
+        );
+        drop((probe, memory));
+        db.close().unwrap();
+    }
+
     #[test]
     fn link_types_and_weights_parse_and_refuse() {
         let m = |v: Value| match v {
