@@ -698,16 +698,125 @@ fn raw(url: &str, head: &str) -> std::net::TcpStream {
     tcp
 }
 
+/// Takes `s`'s one request slot (`max_concurrent` 1) with a body that never finishes:
+/// larger than the pre-read reads first (#1601), so the request reaches the limit.
+fn hold_a_slot(s: &Server) -> std::net::TcpStream {
+    raw(
+        &s.url,
+        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{",
+    )
+}
+
+/// One HTTP/1.1 answer off `tcp`: its status line, headers and body (by `Content-Length`).
+fn read_answer(tcp: &mut std::net::TcpStream) -> std::io::Result<(String, String)> {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if tcp.read(&mut byte)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    tcp.read_exact(&mut body)?;
+    Ok((head, String::from_utf8_lossy(&body).into_owned()))
+}
+
 #[test]
-fn health_and_metrics_answer_while_requests_are_shed() {
-    // perf287's F4 on #1501: one slot, held by a request whose body never finishes.
+fn an_answer_before_the_body_arrives_keeps_the_connection() {
+    // #1601: health and a shed request are answered without their bodies. hyper closed the
+    // connection when a body wasn't read yet, the late body drew a reset, and on Windows the
+    // client lost the answer (WSAECONNABORTED). Each is sent with its body 50 ms after its
+    // head; the answer must be whole and the connection must take another request.
+    use std::io::Write as _;
     let mut l = limits();
     l.max_concurrent = 1;
     let s = Server::start("", l);
-    let _held = raw(
+    let mut held = None;
+    // Health first, with the slot free; then a `Get` shed while the slot is held.
+    for (path, status) in [("Admin/Health", "200"), ("Data/Get", "503")] {
+        if path == "Data/Get" {
+            held = Some(hold_a_slot(&s));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut tcp = raw(
+            &s.url,
+            &format!(
+                "POST /v1/{path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n"
+            ),
+        );
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        tcp.write_all(b"{}").unwrap();
+        let (head, body) = read_answer(&mut tcp).unwrap();
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status}")),
+            "{path}: {head}{body}"
+        );
+        // The late body went somewhere: the same connection answers again.
+        tcp.write_all(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap_or_else(|e| panic!("{path}: the connection was closed: {e}"));
+        let (head, body) = read_answer(&mut tcp)
+            .unwrap_or_else(|e| panic!("{path}: the connection was closed: {e}"));
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "{path}, then health: {head}{body}"
+        );
+    }
+    drop(held);
+}
+
+#[test]
+fn a_body_that_never_arrives_is_answered_at_the_request_timeout_and_closed() {
+    // perf287's (1) on #1601: the pre-read waits at most --request-timeout-ms, then answers
+    // DeadlineExceeded and closes the connection rather than keep it with a body half read.
+    use std::io::Read as _;
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(300);
+    let s = Server::start("", l);
+    let mut tcp = raw(
         &s.url,
-        "POST /v1/Data/Get HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        "POST /v1/Admin/Health HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
     );
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let started = std::time::Instant::now();
+    let (head, body) = read_answer(&mut tcp).unwrap();
+    assert!(head.starts_with("HTTP/1.1 504"), "{head}{body}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    assert!(body.contains("DeadlineExceeded"), "{body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "answered before its timeout"
+    );
+    let mut rest = Vec::new();
+    assert_eq!(
+        tcp.read_to_end(&mut rest).unwrap_or(0),
+        0,
+        "the connection ends"
+    );
+}
+
+#[test]
+fn health_and_metrics_answer_while_requests_are_shed() {
+    // perf287's F4 on #1501: one slot, held by a request whose body never finishes. Over
+    // the pre-read's 64 KiB (#1601), so it takes the slot before its body is read.
+    let mut l = limits();
+    l.max_concurrent = 1;
+    let s = Server::start("", l);
+    let _held = hold_a_slot(&s);
     std::thread::sleep(Duration::from_millis(200));
     let (status, body) = s.post(
         "Get",
@@ -3745,7 +3854,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
 // ---- Replication (#1436) ----
 
 /// Waits until the replica's `Admin.Info` replica section passes `ok`, and returns it.
-fn wait_replica(r: &Server, what: &str, ok: impl Fn(&Json) -> bool) -> Json {
+fn wait_replica(r: &Server, what: &str, mut ok: impl FnMut(&Json) -> bool) -> Json {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let (status, info) = r.rpc("Admin/Info", &json!({}), None);
@@ -4459,5 +4568,150 @@ fn a_promotion_releases_waiting_reads_and_a_client_deadline_answers_deadline_exc
         started.elapsed() < Duration::from_secs(10),
         "answered at the promotion, not the 20 s deadline: {:?}",
         started.elapsed()
+    );
+}
+
+/// A TCP proxy to `upstream` (`host:port`) that forwards each connection's first `budget`
+/// bytes from the server, then stalls it: it keeps the connection open and forwards nothing
+/// more (#1595: a primary's stream that stops without ending). Connection number `refuse`
+/// (from 0), if any, is closed as soon as it's accepted: a reconnect that fails. Stops when
+/// `stop` is set.
+fn stalling_proxy(
+    upstream: &str,
+    budget: usize,
+    refuse: Option<usize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let upstream = upstream.to_owned();
+    std::thread::spawn(move || {
+        let mut accepted = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let client = match listener.accept() {
+                Ok((c, _)) => c,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
+            accepted += 1;
+            if refuse == Some(accepted - 1) {
+                drop(client);
+                continue;
+            }
+            client.set_nonblocking(false).unwrap();
+            let server = std::net::TcpStream::connect(&upstream).unwrap();
+            let (mut c_read, mut s_write) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 16 << 10];
+                while let Ok(n) = c_read.read(&mut buf) {
+                    if n == 0 || s_write.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let (mut s_read, mut c_write) = (server, client);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut left = budget;
+                let mut buf = [0u8; 16 << 10];
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    match s_read.read(&mut buf[..want]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if c_write.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                            left -= n;
+                        }
+                    }
+                }
+                // Stalled: both ends stay open, and nothing more goes through.
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+    });
+    url
+}
+
+#[test]
+fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
+    // #1595: a primary's stream that stops sending without ending used to hold a replica in
+    // `bootstrapping` for ever, with nothing in Info. Each chunk's wait is now bounded by
+    // `--stream-idle-ms`; a stall is a break, recorded in `last_error`, and the download
+    // resumes from its offset on a new connection.
+    let p = Server::start("", limits());
+    // Data that doesn't compress, so the copy spans many 1 MiB chunks.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..48 {
+        let value: Vec<u8> = (0..64 << 10)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let (status, body) = p.post(
+            "Mutate",
+            &put(&format!("r{i:02}"), "f", "q", json!({"bytes": b64(&value)})),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let upstream = p.url.trim_start_matches("http://").to_owned();
+    // The copy is the primary's whole file (tens of MiB with its preallocation): each
+    // connection takes a few chunks of it, then stalls.
+    // The second connection, the first reconnect after a stall, is closed at once: one more
+    // break, never a restart from zero (cli692's R2 on #1609).
+    let proxy = stalling_proxy(&upstream, 16 << 20, Some(1), Arc::clone(&stop));
+    let mut short = limits();
+    short.stream_idle = Duration::from_millis(500);
+    let r = Server::start_replica_with(test_dir(), &proxy, None, short);
+    let mut stalled = false;
+    let mut refused = false;
+    let mut downloading = false;
+    let (mut most, mut restarted) = (0u64, false);
+    let info = wait_replica(&r, "caught up", |info| {
+        let error = info["last_error"].as_str().unwrap_or("");
+        stalled |= error.contains("no chunk of the bootstrap copy");
+        // tonic's `connect` doesn't wait for the handshake, so a connection closed at once
+        // fails the request on it ("transport error"); a refused TCP connect would fail
+        // the connect ("connecting to …"). Either is a break.
+        refused |= error.contains("transport error") || error.contains("connecting to");
+        downloading |= info["bootstrap_phase"] == "downloading";
+        if let Some(bytes) = info["bootstrap_bytes"].as_str() {
+            let bytes: u64 = bytes.parse().unwrap();
+            restarted |= bytes < most;
+            most = most.max(bytes);
+        }
+        caught_up(&p, None)(info)
+    });
+    stop.store(true, Ordering::Relaxed);
+    assert!(stalled, "the stall was recorded as a break: {info}");
+    assert!(
+        refused,
+        "the failed reconnect was recorded as a break: {info}"
+    );
+    assert!(
+        !restarted,
+        "the download resumed, never restarted from zero"
+    );
+    assert!(downloading, "Info showed the download's step");
+    assert!(
+        info.get("bootstrap_phase").is_none(),
+        "no bootstrap step once it's done: {info}"
+    );
+    assert_eq!(
+        get_value(&r, "t", "r47", None),
+        get_value(&p, "t", "r47", None)
     );
 }

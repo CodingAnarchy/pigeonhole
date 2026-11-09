@@ -13,6 +13,7 @@ use std::time::Instant;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_core::Stream;
@@ -150,8 +151,61 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     axum::Router::new()
         .route("/v1/health", get(health))
         .route("/metrics", get(metrics))
-        .with_state(shared)
+        .with_state(Arc::clone(&shared))
         .merge(limited)
+        // Outermost, so a body is read before any early answer: health, shedding, auth.
+        .layer(axum::middleware::from_fn_with_state(shared, preread))
+}
+
+/// The largest HTTP/1.1 request body [`preread`] reads before routing (#1601). Above it, the
+/// in-flight budget is reserved from `Content-Length` before the body is read (perf287's F2
+/// on #1501), and a client that may be refused early should send `Expect: 100-continue`.
+const PREREAD_BYTES: usize = 64 << 10;
+
+/// Reads a small HTTP/1.1 request body before routing, so no answer goes out with its
+/// body unread (#1601).
+///
+/// hyper closes an HTTP/1.1 connection whose request body wasn't read, unless the body is
+/// already buffered when the answer completes. A body that arrives after that close draws a
+/// TCP reset. On Windows, a reset can reach the client before it reads the answer and
+/// discard it, so the client fails with WSAECONNABORTED. The answers sent before reading
+/// are health, a shed `Overloaded`, `Unauthenticated`, `RequestTooLarge` and a chunked
+/// body. HTTP/2 refuses a stream without touching the connection, so it passes through, as
+/// do bodies without a `Content-Length` and bodies over [`PREREAD_BYTES`].
+///
+/// The body is read within `--request-timeout-ms`. Past that, or if the body breaks off,
+/// the answer closes the connection. The bytes read become the request's body as they are,
+/// so the handler's own read takes them without another copy.
+async fn preread(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
+    if req.version() > axum::http::Version::HTTP_11 {
+        return next.run(req).await;
+    }
+    let length = match content_length(req.headers()) {
+        Ok(n) if n > 0 && n <= PREREAD_BYTES => n,
+        _ => return next.run(req).await,
+    };
+    let (parts, body) = req.into_parts();
+    let read = tokio::time::timeout(
+        shared.limits.request_timeout,
+        axum::body::to_bytes(body, length),
+    )
+    .await;
+    let e = match read {
+        Ok(Ok(bytes)) => {
+            return next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await;
+        }
+        Ok(Err(_)) => ApiError::invalid("the request body broke off before its Content-Length"),
+        Err(_) => ApiError::deadline(
+            "the request body didn't arrive within the request timeout (--request-timeout-ms)",
+        ),
+    };
+    let mut response = error_response(&parts.headers, e);
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 /// An error in the protocol the request spoke: a gRPC status for gRPC, JSON otherwise.
