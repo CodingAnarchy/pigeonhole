@@ -17,9 +17,10 @@ use super::service::{Metrics, Service, ServiceOp};
 use super::{Shared, http, listener};
 
 // The serve modules the area files reach as `super::<module>`.
-use super::{bulk, errors, feed, replica, service, tls};
+use super::{bulk, cluster, errors, feed, replica, service, tls};
 
 mod admin_tests;
+mod cluster_tests;
 mod data_tests;
 mod feed_tests;
 mod http1_tests;

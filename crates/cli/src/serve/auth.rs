@@ -1,16 +1,38 @@
 //! Bearer tokens with scopes (D313 §6; owner, Q2 and Q6): `read`, `write` and `admin`, each
-//! optionally limited to memory namespaces. Tokens come from a file or the environment,
+//! optionally limited to memory namespaces, and `cluster` for node-to-node calls (D317, ICR
+//! 0117). Tokens come from a file or the environment,
 //! never a flag, and are compared by their SHA-256 digests in constant time, so a file may
 //! hold digests instead of tokens.
 
 use sha2::{Digest, Sha256};
 
-/// What a caller may do. Each scope includes the ones below it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// What a caller may do. `read`, `write` and `admin` each include the ones before them;
+/// `cluster` (a node of a D317 cluster calling another) stands apart: it includes none of
+/// them, and none of them includes it, so an admin token can't push a map and a node's
+/// token can't read data. Not ordered: [`Scope::allows`] is the only comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
     Read,
     Write,
     Admin,
+    Cluster,
+}
+
+impl Scope {
+    /// Whether a caller with this scope may make a call that needs `need`.
+    pub(crate) fn allows(self, need: Scope) -> bool {
+        let rank = |s: Scope| match s {
+            Scope::Read => Some(0),
+            Scope::Write => Some(1),
+            Scope::Admin => Some(2),
+            Scope::Cluster => None,
+        };
+        match (rank(self), rank(need)) {
+            (Some(have), Some(need)) => have >= need,
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Who is calling: the token that matched (its line, `token`), its scope, and its namespace
@@ -52,7 +74,7 @@ impl std::fmt::Debug for Tokens {
 }
 
 impl Tokens {
-    /// Parses `text`: one token per line, `read|write|admin [ns=a,b] <token>` or with
+    /// Parses `text`: one token per line, `read|write|admin|cluster [ns=a,b] <token>` or with
     /// `sha256:<hex>` in place of the token. Blank lines and `#` comments are skipped. An
     /// error names the line, never its token.
     pub(crate) fn parse(text: &str, source: &str) -> Result<Self, String> {
@@ -68,7 +90,8 @@ impl Tokens {
                 Some("read") => Scope::Read,
                 Some("write") => Scope::Write,
                 Some("admin") => Scope::Admin,
-                _ => return Err(bad("a line starts with read, write or admin")),
+                Some("cluster") => Scope::Cluster,
+                _ => return Err(bad("a line starts with read, write, admin or cluster")),
             };
             let mut namespaces = None;
             let mut secret = None;
@@ -199,7 +222,15 @@ mod tests {
     }
 
     #[test]
-    fn scopes_include_the_ones_below() {
-        assert!(Scope::Admin >= Scope::Write && Scope::Write >= Scope::Read);
+    fn scopes_include_the_ones_below_and_cluster_stands_apart() {
+        use Scope::{Admin, Cluster, Read, Write};
+        assert!(Admin.allows(Write) && Admin.allows(Read) && Write.allows(Read));
+        assert!(!Read.allows(Write) && !Write.allows(Admin));
+        for s in [Read, Write, Admin] {
+            assert!(!s.allows(Cluster) && !Cluster.allows(s), "{s:?}");
+        }
+        assert!(Cluster.allows(Cluster));
+        let t = Tokens::parse("cluster n0de\n", "t").unwrap();
+        assert_eq!(t.caller("n0de").unwrap().scope, Cluster);
     }
 }
