@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
@@ -52,6 +52,10 @@ struct State<S: Source> {
     closed: bool,
     slot: Option<(S::Item, Vec<u8>)>,
     wait: Option<Wait>,
+    /// The `next_async` wait's waker while its future is pending: `close` wakes it, so the
+    /// wait finds the source gone and fails with `Closed` (the source's own wakers go with it,
+    /// unwoken; cli692's R1 on the Ruby port, #1605).
+    waker: Option<Waker>,
     generation: u64,
 }
 
@@ -106,6 +110,7 @@ impl<S: Source> Waits<S> {
                 closed: false,
                 slot: None,
                 wait: None,
+                waker: None,
                 generation: 0,
             })),
             Arc::new(Condvar::new()),
@@ -292,11 +297,18 @@ impl<S: Source> Waits<S> {
 
     pub(crate) fn close(&self, py: Python<'_>) {
         py.detach(|| {
-            let mut g = self.0.lock().expect("not poisoned");
-            // A sync read that has the source out drops it when it comes back.
-            g.closed = true;
-            g.source = None;
-            g.slot = None;
+            let (source, slot, waker) = {
+                let mut g = self.0.lock().expect("not poisoned");
+                // A sync read that has the source out drops it when it comes back.
+                g.closed = true;
+                (g.source.take(), g.slot.take(), g.waker.take())
+            };
+            drop((source, slot));
+            // A pending `next_async` is polled again, finds the source gone and fails with
+            // `Closed`, rather than waiting for an item that can't come.
+            if let Some(w) = waker {
+                w.wake();
+            }
         });
     }
 }
@@ -373,10 +385,12 @@ impl<S: Source> Future for NextWait<S> {
         let state = Arc::clone(&this.state);
         let mut g = state.lock().expect("not poisoned");
         if g.generation != this.generation {
-            // Superseded: the future was cancelled and a newer wait owns the source.
+            // Superseded: the future was cancelled and a newer wait owns the source. The
+            // stored waker is that wait's, so it stays (perf2's R1 on #1610).
             this.finished = true;
             return Poll::Ready(Box::new(|py| crate::aio::Entry::Value(py.None())));
         }
+        g.waker = None;
         if g.slot.is_some() {
             // Left by a superseded wait that took it after its cancel.
             this.finished = true;
@@ -395,7 +409,10 @@ impl<S: Source> Future for NextWait<S> {
             }));
         };
         match source.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                g.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
             Poll::Ready(Ok(item)) => {
                 let token = this.token.take().unwrap_or_default();
                 g.slot = Some((item, token));
@@ -420,6 +437,7 @@ impl<S: Source> Drop for NextWait<S> {
         let mut g = self.state.lock().expect("not poisoned");
         if g.generation == self.generation {
             g.wait = None;
+            g.waker = None;
         }
     }
 }

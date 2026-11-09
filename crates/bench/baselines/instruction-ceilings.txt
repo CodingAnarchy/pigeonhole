@@ -312,7 +312,12 @@ short-scans 13068 0.3
 # commit: 8581 -> 8591 (+10, +0.12%) on run 42088494045 (571a5bf3), after #1566 removed the
 # rest (wait_visible kept inline). The highest times 1.003, as commit-async's.
 commit-one 8617 0.3
-commit-sixteen 36382 0.3
+# Raised by D195 (#1581, #1559 A): commit-sixteen 36382 -> 36521 (+0.38%). It measured
+# 36352 -> 36412 (+60 per commit, +0.17%; run 42133196250), all in ShardState::apply's inlined
+# code (B-tree map, Vec, the futex mutex, shard.rs; integer and tuple code down), and nothing
+# from pigeonhole_cache: inlining and layout moved when the engine binary changed (x86 scratch
+# run 42145473960, perf287 on #1581). The head count times 1.003.
+commit-sixteen 36521 0.3
 flush 2087 0.3
 compact 2615 0.5
 ycsb-c 41605 1.0

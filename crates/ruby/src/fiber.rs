@@ -241,20 +241,17 @@ impl FiberOp {
         out(ruby)
     }
 
-    /// `native_cancel`: drops the future now (a commit still waiting for room writes
-    /// nothing; one submitted may still land, D210), without the GVL, and forgets the op.
-    /// Nothing if it's already done or taken.
+    /// `native_cancel`: drops the op now, without the GVL, and forgets it: a pending future
+    /// (a commit still waiting for room writes nothing; one submitted may still land, D210),
+    /// or a done result its fiber won't take (a stream's item then stays in its slot for the
+    /// next caller). Nothing once taken.
     pub(crate) fn cancel(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         let (shared, op) = rb_self.0.get(ruby)?;
         let (shared, op) = (Arc::clone(shared), Arc::clone(op));
         without_gvl(ruby, move || {
             lock(&shared.ops).remove(&op.id);
-            let mut st = lock(&op.state);
-            if matches!(*st, OpState::Pending(_)) {
-                let fut = std::mem::replace(&mut *st, OpState::Gone);
-                drop(st);
-                drop(fut);
-            }
+            let gone = std::mem::replace(&mut *lock(&op.state), OpState::Gone);
+            drop(gone);
         })
     }
 }

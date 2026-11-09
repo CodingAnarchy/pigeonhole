@@ -26,6 +26,15 @@ This is the design note on #1574, §3:
 - **The drainer:** one parked fiber holds the drainer role. It waits on the pipe through the scheduler, polls every woken op in one call without the GVL, and resumes the fibers whose ops are done. The role passes on in its holder's `ensure`.
 - **Resumes:** `block` gets no timeout, and every return from it is re-checked.
 
+## Amendment 1: the feed and the memory watch (#1574 PR 2)
+- **Behaviour (Changed):** under a scheduler, `Feed#next` and `each`, and memory `Watch#next` and `each`, let the thread's other fibers run while they wait. `next(timeout:)` returns nil once the timeout passes, as before.
+- **Fiber-wait rules:**
+  - **Readers:** a reader process's watch raises `Unsupported` for a fiber wait, because the engine's poll is the writer's only. A thread can still wait on it.
+  - **One consumer at a time:** a second fiber's `next` raises `Pigeonhole::Error` while one waits, and so does a thread's `next` while a fiber waits, or the reverse.
+  - **Stops lose nothing:** a stopped fiber's commit stays in a hand-back slot, and `token` gives the position from before it.
+- **The core:** `crates/ruby/src/waits.rs`, a port of the Python bindings' `waits` core (#1479), now holds both streams' state. A sync read takes the source out, other sync callers take turns (#1411's fairness kept), and a generation counter retires a dropped wait.
+- **Deadlines** live on the bridge (cli692's R2): the drainer waits on the pipe up to the nearest deadline and resumes expired waiters itself. A stopped or timed-out fiber's op is dropped at once, a pending future or an unclaimed result alike.
+
 ## Cancellation
 A fiber raised into while it waits drops its op's future, as D210 defines:
 - a commit still waiting for room writes nothing;
@@ -37,4 +46,4 @@ So it's the same outcome as Python's asyncio forms (ICR 0121).
 
 ## Known effects
 - **After a fork,** the child leaves the parent's bridge open (two file descriptors for each thread that had waited) and makes its own (S1).
-- **The change feed's, memory's and recall's waits** follow in #1574's later PRs, and they're named here when they land.
+- **Memory recall and the consolidation loop's step** follow in #1574's later PRs, and they're named here when they land.

@@ -221,6 +221,21 @@ def test_feed_next_async_waits_and_times_out_without_losing_a_commit(fdb, ft):
     run(main())
 
 
+def test_closing_a_feed_ends_a_pending_next_async(fdb, ft):
+    """#1606: the close wakes the pending wait, which fails with Closed, rather than waiting
+    for a commit that can't come (the bug cli692 found in the Ruby port, #1605)."""
+
+    async def main():
+        feed = ft.feed()
+        waiting = asyncio.ensure_future(feed.next_async())
+        await asyncio.sleep(0.05)
+        feed.close()
+        with pytest.raises(ph.Closed):
+            await asyncio.wait_for(waiting, 1)
+
+    run(main())
+
+
 def test_one_feed_wait_at_a_time(fdb, ft):
     async def main():
         feed = ft.feed()

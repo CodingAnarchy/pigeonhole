@@ -1,0 +1,2 @@
+### Fixed
+- **`phdb serve` no longer loses an HTTP/1.1 answer to a connection reset.** An answer sent before the request body arrived (health over `POST`, a shed `Overloaded`, `Unauthenticated`) made the server drop the connection, and the late body then reset it. On Windows that can discard the answer before the client reads it. The server now reads an HTTP/1.1 body of up to 64 KiB before answering, within `--request-timeout-ms`. For larger bodies, a client should send `Expect: 100-continue` (#1601).
