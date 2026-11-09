@@ -367,7 +367,7 @@ static SPECS: &[Spec] = &[
         false,
         "{sync}",
         [],
-        "Group syncs finished: each is one WAL sync covering the group_sync commits batched behind it.",
+        "Group syncs finished: each is one WAL sync covering the group_sync commits batched behind it, or a buffered group whose record waits for a WAL rollover's sync (at most one per rollover).",
         |s, out| one(out, s.e.group_syncs)
     ),
     spec!(
@@ -376,7 +376,7 @@ static SPECS: &[Spec] = &[
         true,
         "s",
         [],
-        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits): not a sync commit's own sync, flush or checkpoint barrier syncs, or buffered commits.",
+        "Time group syncs were in flight, summed over shards: over pigeonhole.group_syncs, the mean group sync time. Group syncs only (group_sync commits, or buffered ones held behind a WAL rollover's sync): not a sync commit's own sync, or flush or checkpoint barrier syncs.",
         |s, out| out.push((seconds(s.e.group_sync_nanos), Vec::new()))
     ),
     spec!(
