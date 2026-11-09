@@ -4520,14 +4520,16 @@ PR 3 adds an in-process two-database replication test with process and power-los
     - **Later in PR 1** (perf287's x86 profile, the AX102): two more costs, both candle's, reported upstream with the owner's approval.
       - **Repacking (huggingface/candle#4103):** `Linear` multiplies by `weight.t()`, and gemm repacked every weight matrix on every call: a fixed 20–50 ms per call. The crate now loads each linear weight transposed, which fixes it here, with identical outputs. On the laptop at 16 tokens: 33 → 12 ms on 1 thread, 8.4 → 7.1 ms on 4.
       - **The thread count (huggingface/candle#4070):** without `RAYON_NUM_THREADS` or `CANDLE_CPU_MASK`, candle 0.11 re-reads `/proc/cpuinfo` on every matrix product, about 47 ms per call on the AX102.
-    - **The x86 numbers after the weight fix** (ms at 16 / 64 / 256 tokens):
+    - **The x86 numbers after the weight fix** (ms at 16 / 64 / 256 tokens; perf287's final run on 7684b0c7 for 0.11.1):
 
-      | | 1 thread | 4 threads |
-      |---|---|---|
-      | 0.11.1, an env var set | 11 / 37 / 163 | 6.5 / 24 / 99 |
-      | 0.10.2, no env | 17.3 / 44.5 / 207.6 | 9.7 / 26.2 / 138.2 |
+      | | 1 thread | 4 threads | 32 threads |
+      |---|---|---|---|
+      | 0.11.1, an env var set | 11 / 37 / 164 | 6.4 / 24 / 98 | 9.4 / 27–29 / 135–143 |
+      | 0.10.2, no env | 17.3 / 44.5 / 207.6 | 9.7 / 26.2 / 138.2 | |
 
-      0.11.1 with no env var stays at 52–59 ms per short text.
+      - **Either variable alone** (`CANDLE_CPU_MASK` or `RAYON_NUM_THREADS`) is enough; the two are within noise of each other at every thread count. 0.11.1 with neither stays at 52–61 ms per short text, whatever the thread count.
+      - **More threads isn't faster for one text:** 32 (every hardware thread, SMT siblings included) is slower than 4 for single texts, and only batched long texts gain a little (10.5 against 7.8 texts/s at 256 tokens). So the default stays `min(cores, 4)`, and the guide recommends about 4 for interactive use, not all cores.
+      - **Page faults** are about 13–15M per run with the variable set: the per-op tensor allocation, the next lever (#1558, the allocator).
     - **The choice (owner, 2026-11-09): stay on 0.11.1.** No candle release has either fix. Our weight loading covers the repacking, and the documented environment covers the thread count. Revisit once candle releases #4070's fix.
     - **So:** 0.11 is kept, and the variables are documented. Operators set them in the environment before starting the process. `phdb serve` can't set them itself: `set_var` is `unsafe` in Rust 2024, and the shard CPUs are known only after its threads start. With local embedding and pinned shards, it warns at startup and prints the values from its placement (cli692, D313 ticket 8).
 - **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
@@ -4539,4 +4541,4 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **4 threads:** 8.4, 18 and 65 ms;
   - **Batched:** 375 texts/s in batches of 32 at 4 threads.
 
-  The AX102 rows come in the PR. The owner judges Q2's fallback on them.
+  The AX102 rows are above, under candle's own pool. The owner judges Q2's fallback on them.
