@@ -122,15 +122,21 @@ struct HubKey {
     visible: bool,
 }
 
-/// One commit in a hub's ring.
+/// One commit in a hub's ring: its encoded event and little else, so a ring's share of
+/// `--feed-ring-bytes` holds as many commits as it can (#1397's 16 hubs × 16, where each
+/// hub's share is a sixteenth). The decoded commit isn't kept: a client with a row prefix
+/// filters the encoded event's changes instead ([`Entry::for_prefix`]).
 pub(crate) struct Entry {
-    commit: Commit,
-    /// The hub feed's token right after this commit.
+    /// The commit's seqno.
+    seqno: u64,
+    /// The hub feed's token right after this commit: a slice of `encoded` when there is
+    /// one (its first field), so it's held once.
     token: Bytes,
     /// The hub feed's position just before it (`Feed::position`): every commit of the spec
     /// at or below it came before this one.
     prev: u64,
-    /// Its share of `--feed-ring-bytes`: the commit, its token and `encoded`.
+    /// Its share of `--feed-ring-bytes`: `encoded` (the token included) or the token, and a
+    /// fixed overhead.
     bytes: usize,
     /// The commit as a client with no prefix gets it, encoded once for every such client on
     /// the ring: `None` if it has no change to send. Encoded by the hub, before the entry is
@@ -138,20 +144,50 @@ pub(crate) struct Entry {
     encoded: Option<Bytes>,
 }
 
+/// An entry's size beside its bytes: the `Arc`, the struct and the ring's slot.
+const ENTRY_OVERHEAD: usize = 96;
+
 impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
     /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
-    fn new(commit: Commit, token: Bytes) -> Self {
-        let encoded = filtered(&commit, b"")
+    fn new(commit: &Commit, token: Bytes) -> Self {
+        let encoded: Option<Bytes> = filtered(commit, b"")
             .map(|c| prost::Message::encode_to_vec(&commit_event(token.clone(), c)).into());
-        let bytes = entry_bytes(&commit, &token) + encoded.as_ref().map_or(0, Bytes::len);
+        // The token is the event's field 1, which prost writes first: its tag, its length,
+        // then its bytes. Kept as that slice, it isn't held twice.
+        let token = match &encoded {
+            Some(e) => {
+                let at = 1 + prost::encoding::encoded_len_varint(token.len() as u64);
+                match e.get(at..at + token.len()) {
+                    Some(b) if !token.is_empty() && b == &token[..] => {
+                        e.slice(at..at + token.len())
+                    }
+                    _ => token,
+                }
+            }
+            None => token,
+        };
+        let bytes = ENTRY_OVERHEAD + encoded.as_ref().map_or(token.len(), Bytes::len);
         Entry {
-            commit,
+            seqno: commit.seqno(),
             token,
             prev: 0,
             bytes,
             encoded,
         }
+    }
+
+    /// The event a client with `prefix` sends for this entry: the commit's changes to rows
+    /// starting with it, or `None` if there are none. Decoded from `encoded`, in the order a
+    /// filter of the commit gives them.
+    fn for_prefix(&self, prefix: &[u8]) -> Option<proto::FeedEvent> {
+        let bytes = self.encoded.as_ref()?;
+        let mut event = <proto::FeedEvent as prost::Message>::decode(&bytes[..]).ok()?;
+        let Some(proto::feed_event::Event::Commit(c)) = &mut event.event else {
+            return None;
+        };
+        c.changes.retain(|ch| ch.row.starts_with(prefix));
+        (!c.changes.is_empty()).then_some(event)
     }
 
     /// The `FeedEvent` a client with no prefix sends for this commit, encoded.
@@ -205,7 +241,7 @@ impl Ring {
         let i = self
             .entries
             .iter()
-            .position(|e| e.commit.seqno() > seqno)
+            .position(|e| e.seqno > seqno)
             .unwrap_or(self.entries.len());
         Some(self.base + i as u64)
     }
@@ -239,7 +275,7 @@ impl Hub {
         let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
-        let mut entry = Entry::new(commit, token.clone());
+        let mut entry = Entry::new(&commit, token.clone());
         let bytes = entry.bytes;
         let mut r = self.ring();
         entry.prev = r.passed;
@@ -290,31 +326,6 @@ impl Drop for Hub {
         // The last client left: the engine subscription (and its shard wakers) goes.
         self.task.abort();
         self.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// A commit's size in the ring: its changes, its token (about 45 + 16 × shards bytes,
-/// feed1248's (1)), and a fixed overhead.
-fn entry_bytes(c: &Commit, token: &[u8]) -> usize {
-    let changes: usize = c
-        .changes()
-        .iter()
-        .map(|ch| {
-            48 + ch.table().len()
-                + ch.family().len()
-                + ch.row().len()
-                + ch.qualifier().len()
-                + ch.value().map_or(0, |v| value_len(&v))
-        })
-        .sum();
-    96 + changes + token.len()
-}
-
-fn value_len(v: &pigeonhole::Value<'_>) -> usize {
-    match v {
-        pigeonhole::Value::Bytes(b) => b.len(),
-        pigeonhole::Value::Vector(v) => v.as_bytes().len(),
-        _ => 8,
     }
 }
 
@@ -981,15 +992,20 @@ impl Client {
     /// event is encoded once, for every such client (perf287's profile on #1536: building
     /// and encoding the same event per subscriber was two thirds of the feed's CPU).
     async fn cover_entry(&self, e: &Arc<Entry>, pos: &mut Position) -> Result<(), ApiError> {
-        if !self.prefix.is_empty() {
-            return self.cover(&e.commit, &e.token, pos).await;
-        }
-        pos.seqno = Some(e.commit.seqno());
+        pos.seqno = Some(e.seqno);
         pos.token = e.token.clone();
-        if e.commit.seqno() <= self.after || e.encoded().is_none() {
+        if e.seqno <= self.after || e.encoded().is_none() {
             return Ok(());
         }
-        self.send(Out::Shared(Arc::clone(e)), pos).await
+        if self.prefix.is_empty() {
+            return self.send(Out::Shared(Arc::clone(e)), pos).await;
+        }
+        // A prefix: the entry's changes to matching rows, if any (a later progress event
+        // carries the position past one with none).
+        match e.for_prefix(&self.prefix) {
+            Some(event) => self.send(Out::Event(event), pos).await,
+            None => Ok(()),
+        }
     }
 
     /// A progress event, if the position moved since the last event and the stream was quiet.
@@ -1154,10 +1170,10 @@ impl Out {
     pub(crate) fn into_proto(self) -> proto::FeedEvent {
         match self {
             Out::Event(e) => e,
-            Out::Shared(e) => {
-                let c = filtered(&e.commit, b"").unwrap_or_default();
-                commit_event(e.token.clone(), c)
-            }
+            Out::Shared(e) => e
+                .encoded()
+                .and_then(|b| <proto::FeedEvent as prost::Message>::decode(&b[..]).ok())
+                .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
         }
     }
 
@@ -1263,7 +1279,7 @@ mod tests {
         for c in commits {
             r.entries.push_back(Arc::new(Entry {
                 prev,
-                ..Entry::new(c.clone(), Bytes::new())
+                ..Entry::new(c, Bytes::new())
             }));
             prev = c.seqno();
         }
@@ -1659,7 +1675,7 @@ mod tests {
         let (commits, db, dir) = commits("encoded", 3);
         for c in &commits {
             let token = Bytes::from_static(b"the token right after it");
-            let e = Arc::new(Entry::new(c.clone(), token.clone()));
+            let e = Arc::new(Entry::new(c, token.clone()));
             let want = prost::Message::encode_to_vec(&proto::FeedEvent {
                 token: token.clone(),
                 event: Some(proto::feed_event::Event::Commit(proto::FeedCommit {
@@ -1685,8 +1701,24 @@ mod tests {
             Out::Shared(Arc::clone(&e)).encode(&mut wire).unwrap();
             assert_eq!(wire, want, "the gRPC codec writes those bytes");
             assert_eq!(Out::Shared(Arc::clone(&e)).encoded_len(), want.len());
-            // Counted in the ring's budget (R1, P1).
-            assert_eq!(e.bytes, entry_bytes(c, &token) + want.len());
+            // Counted in the ring's budget (R1, P1): the encoding, which holds the token,
+            // and the fixed overhead. The token is a slice of the encoding, not a copy.
+            assert_eq!(e.bytes, ENTRY_OVERHEAD + want.len());
+            assert_eq!(e.token, token);
+            let enc = e.encoded().unwrap();
+            assert!(
+                enc.as_ptr() <= e.token.as_ptr()
+                    && e.token.as_ptr() as usize + e.token.len()
+                        <= enc.as_ptr() as usize + enc.len(),
+                "the token is held once, inside the encoding"
+            );
+            // A prefix client gets the changes to its rows, as a filter of the commit
+            // would give them.
+            for prefix in [&b""[..], b"r", b"zz"] {
+                let got = e.for_prefix(prefix);
+                let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f));
+                assert_eq!(got, want, "prefix {prefix:?}");
+            }
             let decoded = <proto::FeedEvent as prost::Message>::decode(&want[..]).unwrap();
             assert_eq!(
                 Out::Shared(e).into_proto(),
