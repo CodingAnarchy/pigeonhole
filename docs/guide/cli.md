@@ -446,7 +446,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
     - Otherwise it opens the store when it arrives from the primary. Until then, `Recall` and `Watch` answer `ReplicaBehind` while the replica is still starting or bootstrapping, and `Unavailable` once it follows the primary, since the primary may not have created the store yet.
     - A store that arrives pinned to another model answers `FailedPrecondition`.
   - **No background writers:** the store's forgetter and IVF rebalancer don't run on a replica; the primary's work arrives as its commits.
-  - **A re-bootstrap:** the server opens the store again on the new copy. An open `Watch` ends with `FeedExpired` (its token is the old copy's), as feed streams end with an error, so recall and watch again without the token.
+  - **A re-bootstrap:** the server opens the store again on the new copy. An open `Watch` ends with an error (`FeedExpired` or `InvalidArgument`: its token is the old copy's), as feed streams do, so recall and watch again without the token.
   - **A promote:** the store is opened as the writer at once, created if missing, with the `--memory-*` creation flags (they're used only then). If that fails, the promote still succeeds, and `Admin.Info`'s `last_error` says why.
   - **`--embed-url` on a replica** embeds recall's query text.
 - **The consistency model:**

@@ -733,9 +733,13 @@ fn a_swap_reopens_the_memory_store_from_the_new_copy_and_ends_its_watches() {
     assert_eq!(status, 200, "{hits}");
     assert_eq!(hit_texts(&hits), ["theirs"], "the new copy's store");
     assert_eq!(remember(&s, "a", "after the swap", None).0, 200);
-    // The old copy's watch ends, with FeedExpired (its token is of the old copy).
+    // The old copy's watch ends with an error: the server's FeedExpired, or the store's
+    // InvalidArgument if its feed sees the new copy first (as feed streams end).
     match next_memory(&s, &mut stream, Duration::from_secs(10)) {
-        Err(e) => assert_eq!(e.code(), tonic::Code::OutOfRange, "{e:?}"),
+        Err(e) => assert!(
+            [tonic::Code::OutOfRange, tonic::Code::InvalidArgument].contains(&e.code()),
+            "{e:?}"
+        ),
         other => panic!("the old copy's watch went on: {other:?}"),
     }
     // A new watch is of the new copy.

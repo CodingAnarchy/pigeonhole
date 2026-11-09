@@ -27,10 +27,6 @@ use super::errors::ApiError;
 use crate::exit::Failure;
 use crate::memcore::{Create, Embedder, MemCore, OpenError};
 
-/// The hold seam's hook: run once after an open, before its result is installed.
-#[cfg(test)]
-type AfterOpen = Box<dyn FnOnce(&MemSlot) + Send>;
-
 /// What a slot holds once an open has finished.
 #[derive(Clone)]
 pub(crate) enum Entry {
@@ -65,10 +61,12 @@ pub(crate) struct MemSlot {
     /// How many times the database was swapped under the slot: a watch of the store ends
     /// when it changes.
     swaps: tokio::sync::watch::Sender<u64>,
-    /// Runs once after an open, before its result is installed: a hold seam, where a test
-    /// lands a catalog change and a clear during an open (D1).
+    /// A hold seam (AGENTS.md), and nothing else: run once after an open, before its result
+    /// is installed, where `tests::an_open_overtaken_by_a_clear_opens_again` lands a create
+    /// and a clear during an open (D1). Unset, it does nothing.
     #[cfg(test)]
-    after_open: Mutex<Option<AfterOpen>>,
+    #[allow(clippy::type_complexity)]
+    after_open: Mutex<Option<Box<dyn FnOnce(&MemSlot) + Send>>>,
 }
 
 impl MemSlot {
