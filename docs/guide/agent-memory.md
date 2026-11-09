@@ -69,10 +69,12 @@ let hits = store
 
 | Threads | 16 tokens | 64 tokens | 256 tokens | Batches of 32 (16 tokens) |
 |---|---|---|---|---|
-| 1 | 33 ms | 41 ms | 138 ms | 62 texts/s |
-| 4 | 8.4 ms | 18 ms | 65 ms | 375 texts/s |
+| 1 | 12 ms | 33 ms | 130 ms | 148 texts/s |
+| 4 | 7.1 ms | 17 ms | 68 ms | 353 texts/s |
 
   Pass many texts to `embed_passages` when you can: a batch costs far less per text. A query is one text.
+- **On Linux, set `CANDLE_CPU_MASK` (or `RAYON_NUM_THREADS`) in the environment.** Without either, candle 0.11 re-reads `/proc/cpuinfo` on every matrix product, which costs about 47 ms per call on a 16-core x86 server, five times the work itself ([huggingface/candle#4070](https://github.com/huggingface/candle/issues/4070)). Either variable avoids it. `RAYON_NUM_THREADS` also sizes your application's global rayon pool, so prefer `CANDLE_CPU_MASK` if that matters. With one set, the same server takes 11 / 37 / 163 ms at 16 / 64 / 256 tokens on 1 thread, and 6.5 / 24 / 99 ms on 4.
+- **Allocator:** each forward pass allocates and frees its tensors. On Linux, glibc's allocator gives large freed blocks back to the system, so the next pass faults them in again (about a fifth of the CPU at 1 thread). A server embedding steadily may prefer jemalloc or mimalloc as its global allocator.
 
 ## Recall
 ```rust

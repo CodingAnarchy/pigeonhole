@@ -181,7 +181,8 @@ impl LocalEmbedder {
     /// The weights, with each linear layer's matrix stored transposed: `Linear` multiplies by
     /// `weight.t()`, which is then contiguous, so gemm reads it in place. Loaded as is, every
     /// forward pass repacked every weight matrix (all 133 MB, in gemm's scalar packing loop),
-    /// a fixed ~20–50 ms per call whatever the text's length (perf287's profile on #1591).
+    /// a fixed ~20–50 ms per call whatever the text's length (perf287's profile on #1591;
+    /// reported as huggingface/candle#4103).
     /// The values are the same, so the vectors are too (the reference test).
     fn weights(bytes: &[u8]) -> candle_core::Result<VarBuilder<'static>> {
         let mut ts = candle_core::safetensors::load_buffer(bytes, &Device::Cpu)?;

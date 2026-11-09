@@ -58,6 +58,17 @@
 //!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set both in the process's
 //!   environment before it starts (they're read once, and a library can't set them safely):
 //!   `phdb serve` prints the values for its placement.
+//!
+//! **On Linux, set `RAYON_NUM_THREADS` or `CANDLE_CPU_MASK`.** With neither set, candle
+//! 0.11 re-reads `/proc/cpuinfo` on every matrix product to count the physical cores
+//! (huggingface/candle#4070): about 47 ms of every call on a 16-core x86 server, five times
+//! the work itself. Either variable takes a cached path. `RAYON_NUM_THREADS` also sizes the
+//! application's global rayon pool, so `CANDLE_CPU_MASK` is the one to prefer when that
+//! matters. macOS and Windows count cores without it.
+//!
+//! The weights of each linear layer are loaded transposed, so a forward pass multiplies by
+//! them in place; loaded as stored, candle repacked every weight matrix on every call
+//! (huggingface/candle#4103).
 
 #![forbid(unsafe_code)]
 
