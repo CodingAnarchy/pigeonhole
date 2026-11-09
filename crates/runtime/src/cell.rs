@@ -52,11 +52,12 @@ struct RunWord {
     /// The driver has work a caller's turn may not run (#1176 rev 3.1, C2): callers leave
     /// the token alone while it is set. Set by a caller's turn that stopped at a message it
     /// may not run, and by a driver turn that left work; cleared when the driver takes the
-    /// token.
+    /// token to look at the shard (`ShardCell::driver_look`).
     driver_wants: AtomicBool,
     /// The driver found the token held by a caller and went on without the shard (#1176's
     /// skip-then-notify pair): the caller's release, which loads it after its fence, wakes
-    /// the driver. Cleared when the driver takes the token.
+    /// the driver. Cleared only when the driver takes the token to look at the shard
+    /// (`ShardCell::driver_look`): a take that doesn't look must leave it.
     skipped: AtomicBool,
     /// Time callers' turns spent on the shard since the hosting driver last collected it
     /// (rev 3.1: charged to that driver's busy time, so the controller sizes it for the
@@ -134,10 +135,6 @@ impl<H: ShardHandler> ShardCell<H> {
         };
         guard.as_ref()?;
         self.run.state.store(holder, Ordering::Relaxed);
-        if holder == DRIVER {
-            self.run.skipped.store(false, Ordering::Relaxed);
-            self.run.driver_wants.store(false, Ordering::Relaxed);
-        }
         Some(Turn { cell: self, guard })
     }
 
@@ -152,6 +149,20 @@ impl<H: ShardHandler> ShardCell<H> {
         self.run.skipped.store(true, Ordering::Relaxed);
         fence(Ordering::SeqCst);
         self.try_take(DRIVER)
+    }
+
+    /// [`ShardCell::driver`] for a take that looks at the shard's work (a turn, the spin's
+    /// looks, its last check before sleeping): clears `skipped` and `driver_wants`, which
+    /// that look answers. Only such a take may: one that doesn't look (`next_deadline`, the
+    /// spin's bookkeeping, a move) leaves them, or a caller's release that loads `skipped`
+    /// after it finds it clear and doesn't notify, while a message queued during its turn
+    /// waits unread with the driver parked (#1502's box run; the loom model
+    /// `loom_a_take_that_does_not_look_keeps_the_skip_handshake`).
+    pub(crate) fn driver_look(&self) -> Option<Turn<'_, H>> {
+        let t = self.driver()?;
+        self.run.skipped.store(false, Ordering::Relaxed);
+        self.run.driver_wants.store(false, Ordering::Relaxed);
+        Some(t)
     }
 
     /// The driver's take where it must have the shard (start, a move, close): waits out a
@@ -435,6 +446,82 @@ mod loom_tests {
                 );
             }
             let _ = m.handled.load(Ordering::Relaxed);
+        });
+    }
+
+    /// A driver take that doesn't look at the shard (`next_deadline`, the spin's `due` and
+    /// `record`, the gap window's setup) after the sleep handshake found the token held: the
+    /// handshake's `skipped` must survive it, or the caller's release, loading `skipped` after
+    /// that take cleared it, doesn't notify, and a message submitted while the driver polled
+    /// awake (its notify a no-op) waits with the driver parked.
+    #[test]
+    fn loom_a_take_that_does_not_look_keeps_the_skip_handshake() {
+        loom::model(|| {
+            let woken = Arc::new(AtomicBool::new(false));
+            let m = Arc::new(Model {
+                token: AtomicBool::new(true),
+                skipped: AtomicBool::new(false),
+                queued: AtomicBool::new(false),
+                handled: AtomicBool::new(false),
+                woken: Arc::clone(&woken),
+                signal: Signal::new(),
+            });
+            {
+                let woken = Arc::clone(&woken);
+                m.signal
+                    .set_target(WakeTarget::Callback(std::sync::Arc::new(move || {
+                        woken.store(true, Ordering::SeqCst);
+                    })));
+            }
+            // Polling (`spin_poll`): announced awake.
+            m.signal.awake();
+            let submitter = {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.queued.store(true, Ordering::Release);
+                    m.signal.notify();
+                })
+            };
+            let caller = {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.release();
+                    fence(Ordering::SeqCst);
+                    if m.skipped.load(Ordering::Relaxed) {
+                        m.signal.notify();
+                    }
+                })
+            };
+            // The poll's last check, as `spin_poll`: the token held, announce sleep, then the
+            // driver's take (skipped, fence, retry).
+            let mut hit = false;
+            m.signal.prepare_sleep();
+            if m.try_take() {
+                m.drain();
+                hit = m.handled.load(Ordering::Relaxed);
+                m.release();
+            } else {
+                m.skipped.store(true, Ordering::Relaxed);
+                fence(Ordering::SeqCst);
+                if m.try_take() {
+                    m.drain();
+                    hit = m.handled.load(Ordering::Relaxed);
+                    m.release();
+                }
+            }
+            // A take that doesn't look (`record`, `next_deadline`): as `ShardCell::driver`,
+            // leaving `skipped` (clearing it here fails this model: the lost wake).
+            if !hit && m.try_take() {
+                m.release();
+            }
+            submitter.join().unwrap();
+            caller.join().unwrap();
+            if m.queued.load(Ordering::Relaxed) {
+                assert!(
+                    hit || m.woken.load(Ordering::SeqCst),
+                    "a message waits with the driver parked and unwoken"
+                );
+            }
         });
     }
 

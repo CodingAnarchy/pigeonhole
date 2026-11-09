@@ -644,7 +644,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
             stats
                 .busy
                 .fetch_add(cell.take_caller_busy(), Ordering::Relaxed);
-            let Some(mut core) = cell.driver() else {
+            let Some(mut core) = cell.driver_look() else {
                 // A caller runs it now. Announce sleep for the shard, as the turn's end would
                 // have, then try once more (`driver`: skipped, fence, retry). Either this
                 // thread gets the token after the caller released it, or the caller's release
@@ -999,7 +999,7 @@ fn spin_poll<H: ShardHandler>(cores: &[Arc<ShardCell<H>>], window: Duration, rea
     let mut polls = 0u32;
     let mut hit = 'poll: loop {
         for cell in cores {
-            let Some(mut core) = cell.driver() else {
+            let Some(mut core) = cell.driver_look() else {
                 // A caller runs it now: it takes what is queued.
                 continue;
             };
@@ -1035,12 +1035,13 @@ fn spin_poll<H: ShardHandler>(cores: &[Arc<ShardCell<H>>], window: Duration, rea
         for cell in cores {
             // A caller holding the token sees `skipped` at its release and wakes the thread:
             // announce sleep for the shard all the same, so that wake reaches it.
-            hit |= match cell.driver() {
+            hit |= match cell.driver_look() {
                 Some(mut t) => t.check_before_sleep(),
                 // Announce sleep first, then retry (as in the turns above).
                 None => {
                     cell.signal().prepare_sleep();
-                    cell.driver().is_some_and(|mut t| t.check_before_sleep())
+                    cell.driver_look()
+                        .is_some_and(|mut t| t.check_before_sleep())
                 }
             };
         }
