@@ -835,11 +835,7 @@ impl Replica {
             .map_err(|e| format!("creating {}: {e}", side.display()))?;
         let mut hash = sha2::Sha256::new();
         let (mut backup_id, mut offset, mut token) = (String::new(), 0u64, Vec::new());
-        let mut tries = 0;
-        let mut at_last_break = 0u64;
-        // The first break's reason that isn't the copy being gone: the error a bootstrap that
-        // gives up reports, so a copy that failed on the primary says why (cli692's R2 on #1628).
-        let mut cause: Option<String> = None;
+        let mut breaks = Breaks::default();
         loop {
             let req = self.request(proto::BackupDownloadRequest {
                 durable: true,
@@ -946,18 +942,13 @@ impl Replica {
                         Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
                             backup_id.clear();
                             offset = 0;
-                            at_last_break = 0;
                             token.clear();
                             hash = sha2::Sha256::new();
                             file = tokio::fs::File::create(side)
                                 .await
                                 .map_err(|e| format!("creating {}: {e}", side.display()))?;
-                            tries += 1;
-                            if tries > 3 {
-                                return Err(format!(
-                                    "downloading the bootstrap copy: {}",
-                                    cause.unwrap_or_else(|| status.message().to_owned())
-                                ));
+                            if let Some(why) = breaks.gone(status.message()) {
+                                return Err(format!("downloading the bootstrap copy: {why}"));
                             }
                             self.status().last_error = format!(
                                 "downloading the bootstrap copy: {}; starting a fresh copy",
@@ -971,27 +962,60 @@ impl Replica {
                     }
                 }
             };
-            // Three breaks in a row without progress give up; progress starts the count again
-            // (cli692's N1 on #1583), so a long copy over a flaky link isn't restarted. It
-            // starts the kept cause again too: an old blip isn't a later failure's reason
-            // (cli692's N5 on #1628).
-            if offset > at_last_break {
-                tries = 0;
-                at_last_break = offset;
-                cause = None;
-            }
-            cause.get_or_insert_with(|| broke.clone());
-            tries += 1;
-            if backup_id.is_empty() || tries > 3 {
-                let why = cause.unwrap_or(broke);
+            let give_up = breaks.note(offset, &broke);
+            // A fresh request that broke before its answer named a copy: nothing to resume.
+            if let Some(why) = give_up.or_else(|| backup_id.is_empty().then(|| breaks.cause())) {
                 return Err(format!("downloading the bootstrap copy: {why}"));
             }
             // Info says why it's resuming (#1595), while the state stays `bootstrapping`.
             self.status().last_error = format!("downloading the bootstrap copy: {broke}");
-            tokio::time::sleep(Duration::from_millis(200 * tries)).await;
+            tokio::time::sleep(Duration::from_millis(200 * breaks.tries)).await;
             // On a new connection: a stalled one stays stalled for every later request on it.
             client = None;
         }
+    }
+}
+
+/// A bootstrap download's breaks: three in a row without progress give up, and progress
+/// starts the count again (cli692's N1 on #1583), so a long copy over a flaky link isn't
+/// restarted. The error a download that gives up reports is the first break since its last
+/// progress (cli692's R2 and N5 on #1628): a copy that failed on the primary says why, through
+/// the NotFound of the resumes after it, and an old blip isn't a later failure's reason.
+#[derive(Debug, Default)]
+struct Breaks {
+    tries: u64,
+    /// The offset reached at the last break.
+    at_last_break: u64,
+    /// The first break's reason since the last progress.
+    cause: Option<String>,
+}
+
+impl Breaks {
+    /// A break at `offset` for `why`. Returns the error to give up with, after the third in a
+    /// row without progress.
+    fn note(&mut self, offset: u64, why: &str) -> Option<String> {
+        if offset > self.at_last_break {
+            self.tries = 0;
+            self.at_last_break = offset;
+            self.cause = None;
+        }
+        self.cause.get_or_insert_with(|| why.to_owned());
+        self.tries += 1;
+        (self.tries > 3).then(|| self.cause())
+    }
+
+    /// The copy is gone (`why`, a resume's NotFound): a fresh copy starts at offset 0, within
+    /// the same tries, and the cause stays the break before it. Returns the error to give up
+    /// with, as for [`note`](Self::note).
+    fn gone(&mut self, why: &str) -> Option<String> {
+        self.at_last_break = 0;
+        self.tries += 1;
+        (self.tries > 3).then(|| self.cause.clone().unwrap_or_else(|| why.to_owned()))
+    }
+
+    /// The reason to report now: the first break since the last progress.
+    fn cause(&self) -> String {
+        self.cause.clone().unwrap_or_default()
     }
 }
 
@@ -1032,4 +1056,46 @@ fn side_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".bootstrap");
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Breaks;
+
+    #[test]
+    fn a_bootstrap_gives_up_with_the_first_break_since_its_last_progress() {
+        // Three breaks in a row without progress give up, with the first one's reason.
+        let mut b = Breaks::default();
+        assert_eq!(b.note(0, "stalled"), None);
+        assert_eq!(b.note(0, "refused"), None);
+        assert_eq!(b.note(0, "refused").as_deref(), None);
+        assert_eq!(b.note(0, "refused").as_deref(), Some("stalled"));
+        // Progress starts the count and the cause again (cli692's N5 on #1628): an early blip
+        // isn't the reason a later failure reports.
+        let mut b = Breaks::default();
+        assert_eq!(b.note(0, "an early blip"), None);
+        assert_eq!(b.note(1 << 20, "stalled"), None);
+        assert_eq!(b.note(1 << 20, "refused"), None);
+        assert_eq!(b.note(1 << 20, "refused"), None);
+        assert_eq!(b.note(1 << 20, "refused").as_deref(), Some("stalled"));
+        // A copy that failed on the primary (R2): its error, then the resumes' NotFound, each
+        // a fresh copy within the same tries; giving up reports the copy's error.
+        let mut b = Breaks::default();
+        assert_eq!(b.note(0, "disk full"), None);
+        assert_eq!(b.gone("no such backup download"), None);
+        assert_eq!(b.note(0, "disk full"), None);
+        assert_eq!(
+            b.gone("no such backup download").as_deref(),
+            Some("disk full")
+        );
+        // Gone with no break before it: the NotFound itself.
+        let mut b = Breaks {
+            tries: 3,
+            ..Breaks::default()
+        };
+        assert_eq!(
+            b.gone("no such backup download").as_deref(),
+            Some("no such backup download")
+        );
+    }
 }
