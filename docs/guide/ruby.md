@@ -438,8 +438,10 @@ end
   - `Mutation#commit`, `commit_if`, `commit_returning` and `commit_if_returning`;
   - `Table#put`, `incr`, `incr_returning` and `delete`.
 
-  Each submits at the call, as before, then waits without holding the thread.
-- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), the change feed's and memory's waits (coming in later releases), and every call on Windows.
+  - `Feed#next` and `each`, and memory `Watch#next` and `each` (the writer process's; a reader process's watch raises `Pigeonhole::Unsupported` for a fiber, so wait on a thread there).
+
+  Each commit submits at the call, as before, then waits without holding the thread.
+- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), memory recall and the consolidation loop's step (coming later), and every call on Windows.
 - **Opting out:** `Fiber.blocking { ... }` keeps the calls inside it blocking. `Pigeonhole.fiber_scheduler = false` does it for the whole process, which keeps 1.1's behaviour for an application that can't check its call sites yet.
 - **A commit is now a point where the thread's other fibers run.** So [don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) applies across fibers too. A snapshot or open scan that one fiber keeps while another fiber on the thread commits can make that commit wait for room the snapshot pins, and it ends in `Busy` after the write-stall timeout. Finish or release snapshots and scans before a commit that may yield.
 - **Stopping a waiting fiber** (`Async::Task#stop`, a timeout, `Thread#raise`) ends its wait and raises in it, as for any other wait.
@@ -447,6 +449,8 @@ end
   - One already submitted may still land, and its result is lost (D210), so the outcome is unknown, as after `OutcomeUnknown`.
   - For `incr_returning` and `commit_returning`, a landed commit's values are lost: a gap in a sequence, never a repeat.
   - `transact` doesn't retry a stopped attempt.
+  - A feed or watch `next` loses nothing: a commit it had already taken is the next one any call returns, and `token` still points before it.
+- **One consumer per feed or watch at a time.** A second fiber's `next` while one waits raises `Pigeonhole::Error`, and so does a thread's `next` while a fiber waits on the same feed, or a fiber's while a thread does. `token`, `try_next` and `close` from anywhere stay fine.
 - **Threads and processes:** each thread's fibers share one small bridge (a pipe and its file descriptors). A forked child makes its own and leaves the parent's open.
 
 ## Readers, threads and processes

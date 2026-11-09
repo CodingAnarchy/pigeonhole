@@ -655,9 +655,16 @@ module Pigeonhole
 
     # The next `Commit`, waiting up to `timeout` seconds (nil waits until one comes); nil if
     # none came in time. Raises `FeedExpired` once the history the feed needs is gone, and
-    # from then on.
+    # from then on. Under a fiber scheduler, the thread's other fibers run while it waits; a
+    # fiber stopped while it waits loses no commit (the next call returns it), and one
+    # consumer at a time may wait (ICR 0126).
     def next(timeout: nil)
-      to_commit(native_next(timeout))
+      b = Native::FiberBridge.current
+      return to_commit(native_next(timeout)) unless b
+
+      deadline = timeout && Native::FiberBridge.deadline(timeout)
+      r = b.await(native_next_op(b.native), deadline: deadline)
+      r.equal?(Native::FiberBridge::TIMED_OUT) ? nil : to_commit(r)
     end
 
     # The next `Commit` if one is ready, else nil. Never waits.

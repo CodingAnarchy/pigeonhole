@@ -31,6 +31,7 @@ mod memory;
 mod read;
 mod table;
 mod vector;
+mod waits;
 mod walk;
 
 use classes::{
@@ -108,6 +109,11 @@ fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> 
         "native_commit_if_returning_op",
         method!(Mutation::commit_if_returning_op, 2),
     )?;
+    let c = m.const_get::<_, RClass>("Feed")?;
+    c.define_private_method("native_next_op", method!(crate::classes::Feed::next_op, 1))?;
+    let mem_mod = m.const_get::<_, RModule>("Memory")?;
+    let c = mem_mod.const_get::<_, RClass>("Watch")?;
+    c.define_private_method("native_next_op", method!(crate::classes::Watch::next_op, 1))?;
     let c = m.const_get::<_, RClass>("WriteBatch")?;
     c.define_private_method("native_commit_op", method!(WriteBatch::commit_op, 2))?;
     let c = m.const_get::<_, RClass>("Transaction")?;
