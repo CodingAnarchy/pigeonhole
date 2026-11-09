@@ -15,7 +15,9 @@
 //! - **A generation counter** supersedes a wait that was dropped, so it never touches the
 //!   source or the slot again.
 
+#[cfg(unix)]
 use std::future::Future;
+#[cfg(unix)]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -40,10 +42,13 @@ pub(crate) trait Source: Send + 'static {
     const NAME: &'static str;
     fn next(&mut self, d: Duration) -> Result<Option<Self::Item>, Self::Error>;
     fn try_next(&mut self) -> Result<Option<Self::Item>, Self::Error>;
+    // The fiber wait's poll and conversion: Unix only (no fiber waits on Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Item, Self::Error>>;
     fn token(&self) -> Vec<u8>;
     fn oldest_retained(&self) -> Option<u64>;
     /// An item as its Ruby value.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn to_rb(ruby: &Ruby, item: Self::Item) -> Result<Value, Error>;
     fn error(ruby: &Ruby, e: Self::Error) -> Error;
 }
@@ -54,12 +59,14 @@ struct State<S: Source> {
     out: bool,
     closed: bool,
     slot: Option<(S::Item, Vec<u8>)>,
-    /// The generation of the fiber wait in progress, if one is.
+    /// The generation of the fiber wait in progress, if one is (never set on Windows, where
+    /// no fiber waits).
     waiting: Option<u64>,
     /// That wait's waker while it's pending: `close` wakes it, so a parked fiber finds the
     /// source gone and raises `Closed` (the source's own wakers go with it, unwoken; cli692's
     /// R1 on #1605).
     waker: Option<Waker>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     generation: u64,
 }
 
@@ -321,6 +328,7 @@ impl<S: Source> Drop for Out<'_, S> {
     }
 }
 
+#[cfg(unix)]
 /// A fiber wait's future, polled by the bridge's drain without the GVL. An item it takes
 /// goes to the slot; the fiber claims it when it resumes, or leaves it for the next caller if
 /// it was stopped (its op dropped).
@@ -331,6 +339,7 @@ struct NextWait<S: Source> {
     finished: bool,
 }
 
+#[cfg(unix)]
 /// The fiber's claim on the slot's item: run, it takes the item; dropped unrun (the fiber
 /// was stopped after the item came), it ends the wait and leaves the item in the slot.
 struct Claim<S: Source> {
@@ -339,6 +348,7 @@ struct Claim<S: Source> {
     used: bool,
 }
 
+#[cfg(unix)]
 impl<S: Source> Claim<S> {
     fn take(mut self, ruby: &Ruby) -> Result<Value, Error> {
         self.used = true;
@@ -358,6 +368,7 @@ impl<S: Source> Claim<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: Source> Drop for Claim<S> {
     fn drop(&mut self) {
         if self.used {
@@ -371,6 +382,7 @@ impl<S: Source> Drop for Claim<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: Source> NextWait<S> {
     fn claim(&self) -> crate::fiber::Out {
         let claim = Claim {
@@ -382,6 +394,7 @@ impl<S: Source> NextWait<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: Source> Future for NextWait<S> {
     type Output = crate::fiber::Out;
 
@@ -429,6 +442,7 @@ impl<S: Source> Future for NextWait<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: Source> Drop for NextWait<S> {
     fn drop(&mut self) {
         if self.finished {
