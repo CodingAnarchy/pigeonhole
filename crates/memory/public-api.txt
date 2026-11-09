@@ -332,6 +332,7 @@ pub fn pigeonhole_memory::Store::set_forget_policy(&self, core::option::Option<p
 pub fn pigeonhole_memory::Store::settle(&self)
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::supersede_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::Store::table_names(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn pigeonhole_memory::Store::take_forgetter(&self) -> core::option::Option<pigeonhole_memory::Forgetter>
 pub fn pigeonhole_memory::Store::take_rebalancer(&self) -> core::option::Option<pigeonhole_vector::rebalancer::Rebalancer>
 pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
