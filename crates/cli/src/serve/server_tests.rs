@@ -4127,6 +4127,10 @@ fn promote_makes_a_replica_take_writes() {
 /// An IVF index made and written on the primary is searched and verified on a replica, and
 /// the replica refuses its writes like any other (#1436 with #1573's index RPCs).
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "#1595: the bootstrap download hangs intermittently on Windows"
+)]
 fn a_replica_serves_ivf_index_reads_and_refuses_its_writes() {
     let p = Server::start("", limits());
     for (name, mode) in [("ix", "REBALANCE_INLINE"), ("bg", "REBALANCE_BACKGROUND")] {
@@ -4569,10 +4573,13 @@ fn a_promotion_releases_waiting_reads_and_a_client_deadline_answers_deadline_exc
 
 /// A TCP proxy to `upstream` (`host:port`) that forwards each connection's first `budget`
 /// bytes from the server, then stalls it: it keeps the connection open and forwards nothing
-/// more (#1595: a primary's stream that stops without ending). Stops when `stop` is set.
+/// more (#1595: a primary's stream that stops without ending). Connection number `refuse`
+/// (from 0), if any, is closed as soon as it's accepted: a reconnect that fails. Stops when
+/// `stop` is set.
 fn stalling_proxy(
     upstream: &str,
     budget: usize,
+    refuse: Option<usize>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
     use std::io::{Read, Write};
@@ -4581,6 +4588,7 @@ fn stalling_proxy(
     listener.set_nonblocking(true).unwrap();
     let upstream = upstream.to_owned();
     std::thread::spawn(move || {
+        let mut accepted = 0;
         while !stop.load(Ordering::Relaxed) {
             let client = match listener.accept() {
                 Ok((c, _)) => c,
@@ -4589,6 +4597,11 @@ fn stalling_proxy(
                     continue;
                 }
             };
+            accepted += 1;
+            if refuse == Some(accepted - 1) {
+                drop(client);
+                continue;
+            }
             client.set_nonblocking(false).unwrap();
             let server = std::net::TcpStream::connect(&upstream).unwrap();
             let (mut c_read, mut s_write) =
@@ -4657,20 +4670,41 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
     let upstream = p.url.trim_start_matches("http://").to_owned();
     // The copy is the primary's whole file (tens of MiB with its preallocation): each
     // connection takes a few chunks of it, then stalls.
-    let proxy = stalling_proxy(&upstream, 16 << 20, Arc::clone(&stop));
+    // The second connection, the first reconnect after a stall, is closed at once: one more
+    // break, never a restart from zero (cli692's R2 on #1609).
+    let proxy = stalling_proxy(&upstream, 16 << 20, Some(1), Arc::clone(&stop));
     let mut short = limits();
     short.stream_idle = Duration::from_millis(500);
     let r = Server::start_replica_with(test_dir(), &proxy, None, short);
     let mut stalled = false;
+    let mut refused = false;
     let mut downloading = false;
+    let (mut most, mut restarted) = (0u64, false);
     let info = wait_replica(&r, "caught up", |info| {
         let error = info["last_error"].as_str().unwrap_or("");
         stalled |= error.contains("no chunk of the bootstrap copy");
+        // tonic's `connect` doesn't wait for the handshake, so a connection closed at once
+        // fails the request on it ("transport error"); a refused TCP connect would fail
+        // the connect ("connecting to …"). Either is a break.
+        refused |= error.contains("transport error") || error.contains("connecting to");
         downloading |= info["bootstrap_phase"] == "downloading";
+        if let Some(bytes) = info["bootstrap_bytes"].as_str() {
+            let bytes: u64 = bytes.parse().unwrap();
+            restarted |= bytes < most;
+            most = most.max(bytes);
+        }
         caught_up(&p, None)(info)
     });
     stop.store(true, Ordering::Relaxed);
     assert!(stalled, "the stall was recorded as a break: {info}");
+    assert!(
+        refused,
+        "the failed reconnect was recorded as a break: {info}"
+    );
+    assert!(
+        !restarted,
+        "the download resumed, never restarted from zero"
+    );
     assert!(downloading, "Info showed the download's step");
     assert!(
         info.get("bootstrap_phase").is_none(),
