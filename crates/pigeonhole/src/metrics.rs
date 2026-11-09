@@ -164,7 +164,9 @@ pub struct EngineMetrics {
     pub cross_shard: CrossShardMetrics,
     /// Group syncs finished, a failed one included: each is one WAL sync covering the
     /// [`Durability::GroupSync`](crate::Durability::GroupSync) commits batched behind it,
-    /// however many there were. Counted with the change feed on or off, so it isn't a feed
+    /// however many there were. A group of `Buffered` commits takes one too when its record
+    /// lands in a WAL segment whose header still waits for the previous rollover's sync, so
+    /// a few appear without `GroupSync` commits (at most one per rollover). Counted with the change feed on or off, so it isn't a feed
     /// cost on its own: set the `feed_*` syncs beside it. Its rise over an interval, against
     /// the `GroupSync` commits', is the commits each sync carried.
     pub group_syncs: u64,
@@ -172,8 +174,8 @@ pub struct EngineMetrics {
     /// sync adds its own duration, so its rise over an interval, divided by
     /// [`group_syncs`](Self::group_syncs)', is the mean group sync time, even with several
     /// syncs in flight at once. It covers group syncs only, the ones `group_syncs` counts
-    /// (those of groups with a `GroupSync` commit): a `Sync` commit's own sync, flushes' and
-    /// checkpoints' barrier syncs, and `Buffered` and `None` commits aren't in it. It's
+    /// (those of groups with a `GroupSync` commit, or held behind a rollover's sync): a
+    /// `Sync` commit's own sync and flushes' and checkpoints' barrier syncs aren't in it. It's
     /// current as of the last time a group sync started or finished on its shard, so a
     /// sync still in flight counts from then (perf287 and cli692 on #1521).
     pub group_sync_nanos: u64,
