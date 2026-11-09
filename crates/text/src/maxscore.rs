@@ -74,7 +74,6 @@ impl Bm25 {
     }
 }
 
-
 // ---- Where the reads come from (#1560) ----
 
 /// MaxScore's reads: one core, run by the sync search over [`Blocking`] and by the async one
@@ -341,6 +340,35 @@ impl<'t> Walk<'t, Blocking> {
     }
 }
 
+/// [`Walk::new`] as a future (#1560): the bound's aggregates read with point-read futures,
+/// and the walk stepped onto its first posting without blocking.
+#[cfg(feature = "async")]
+pub(crate) async fn walk_async<'t>(
+    t: &'t Rows,
+    s: &Snapshot,
+    bm: &Bm25,
+    term: &str,
+    weight: f64,
+    postings: u64,
+    prefix: Option<&[u8]>,
+) -> Result<Walk<'t, Nonblocking>> {
+    let row = post_row(term);
+    let maxtf = t.get_at_async(s, &row, MAXTF, BOUND).await?;
+    let minlen = t.get_at_async(s, &row, MINLEN, BOUND).await?;
+    let factor = bound_factor(
+        bm,
+        maxtf.and_then(|c| c.as_i64()),
+        minlen.and_then(|c| c.as_i64()),
+    );
+    let mut read = t.row(&row).family(POST).snapshot(s);
+    if let Some(p) = prefix {
+        read = read.qualifier_prefix(p);
+    }
+    let mut w = Walk::opened(row, weight, factor, read.cells()?, postings);
+    std::future::poll_fn(|cx| w.step(bm, &mut Polling::new(cx))).await?;
+    Ok(w)
+}
+
 impl<'t, R: Reads> Walk<'t, R> {
     /// A walk over `row`'s postings in `cells`, not yet on its first (call `step`).
     pub(crate) fn opened(
@@ -364,21 +392,21 @@ impl<'t, R: Reads> Walk<'t, R> {
         }
     }
 
-    /// The walk's bound.
-    pub(crate) fn bound(&self) -> f64 {
-        self.bound
-    }
-
     fn doc(&self) -> Option<&[u8]> {
         self.cur.as_ref().map(|(d, _)| d.as_slice())
     }
 
+    /// Out of line, as the sync walk's step was before #1560 (the compiler's choice then):
+    /// inlined into `TopK::run`, it doubled the loop's own cost on the text shapes.
+    #[inline(never)]
     pub(crate) fn step(&mut self, bm: &Bm25, cx: &mut R::Cx<'_, '_>) -> Poll<Result<()>> {
         self.skip_while(bm, cx, |_| false)
     }
 
     /// Stands `cur` on `e`, the posting stepped to (`None`: the row is done). On the walk's
-    /// fields, not `self`: `e` borrows its cells.
+    /// fields, not `self`: `e` borrows its cells. Always inline: out of line, `e` was copied
+    /// in on every posting (`memcpy`, about 12 instructions a posting on #1560's profile).
+    #[inline(always)]
     fn hold(
         cur: &mut Option<(Vec<u8>, f64)>,
         weight: f64,
@@ -850,7 +878,11 @@ enum At {
     Doc,
     /// Re-cutting: the essential fuzzy clauses' walked expansions, from `by_bound[i]`, with
     /// the budget left and whether one is unwalked so far.
-    Cut { i: usize, budget: f64, unwalked: bool },
+    Cut {
+        i: usize,
+        budget: f64,
+        unwalked: bool,
+    },
     /// Stepping the essential clauses on the candidate, from `by_bound[i]`.
     Step { i: usize, partial: f64 },
     /// The essential fuzzy clauses' unwalked expansions, from `by_bound[i]`; `looking` once
@@ -1140,14 +1172,7 @@ impl<'t, R: Reads> TopK<'t, R> {
                         continue 'docs;
                     }
                     let c = self.by_bound[i - 1];
-                    let v = poll!(self.clauses[c].lookup(
-                        t,
-                        s,
-                        bm,
-                        cx,
-                        &self.last,
-                        &mut lookup
-                    ));
+                    let v = poll!(self.clauses[c].lookup(t, s, bm, cx, &self.last, &mut lookup));
                     if v != 0.0 {
                         self.contrib[c] = Some(v);
                         partial += v;

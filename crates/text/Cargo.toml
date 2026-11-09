@@ -18,12 +18,19 @@ pigeonhole = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-segmentation = { workspace = true }
 levenshtein_automata = { workspace = true }
+futures-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The async search's tests run on the simulated device with deferred I/O (#1560), which
+# `Options::vfs` (a test hook, ICR 0085) puts the store on.
+pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
+pigeonhole-io = { workspace = true }
 
 [features]
 # `Search::run_async` and `run_with_stats_async` (#1560, ICR 0124), on `pigeonhole`'s async
 # front door; default-on, as there.
 default = ["async"]
-async = ["pigeonhole/async"]
+async = ["pigeonhole/async", "dep:futures-core"]
 
 [lints]
 workspace = true
