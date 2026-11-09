@@ -4333,3 +4333,127 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let (status, body) = r.rpc_with("Admin/Info", &json!({}), None, &ahead);
     assert_eq!(status, 200, "Info answers at once: {body}");
 }
+
+#[test]
+fn a_read_waits_for_none_and_cross_shard_commits_without_a_later_commit() {
+    // cli692's Q1 on #1594: a client's `CommitInfo.seqno` is always one the primary's feed
+    // delivers, so a read naming it is answered once the replica applies that commit, with
+    // no later commit needed to move the replica past it. A `None` commit and a
+    // cross-shard transaction are the cases that could have had no event of their own.
+    let p = Server::start_with("", limits(), 4);
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let read = |seqno: &str| {
+        let get = json!({"table": "t", "row": b64(b"row0"), "family": "f", "qualifier": b64(b"q")});
+        let header = [(super::replica::MIN_PRIMARY_SEQNO, seqno)];
+        let (status, body) = r.rpc_with("Data/Get", &get, None, &header);
+        assert_eq!(status, 200, "seqno {seqno}: {body}");
+    };
+    let mut w = put("a", "f", "q", json!({"bytes": b64(b"a")}));
+    w["durability"] = json!("DURABILITY_NONE");
+    let (status, body) = p.post("Mutate", &w, None);
+    assert_eq!(status, 200, "{body}");
+    read(body["commit"]["seqno"].as_str().unwrap());
+
+    let id = begin(&p, None);
+    let rows: Vec<Json> = (0..16)
+        .flat_map(|i| {
+            txn_rows(&format!("row{i}"), b"v")
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let (status, body) = p.rpc(
+        "Transactions/Commit",
+        &json!({"txn_id": id, "rows": rows}),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    read(body["commit"]["seqno"].as_str().unwrap());
+}
+
+#[test]
+fn a_promotion_releases_waiting_reads_and_a_client_deadline_answers_deadline_exceeded() {
+    let p = Server::start("", limits());
+    let mut long = limits();
+    long.request_timeout = Duration::from_secs(20);
+    let r = Server::start_replica_with(test_dir(), &p.url, None, long);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let ahead = || {
+        let mut req = tonic::Request::new(proto::GetRequest {
+            table: "t".into(),
+            row: b"x".to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        });
+        req.metadata_mut().insert(
+            super::replica::MIN_PRIMARY_SEQNO,
+            "999999999".parse().unwrap(),
+        );
+        req
+    };
+
+    // The client's deadline is shorter than the server's: it bounds the wait, which ends
+    // as the budget wait does, DeadlineExceeded (cli692's R1 on #1594). Called on the
+    // service itself: tonic's client ends the call at its own deadline first.
+    let service = &r.shared.router.service;
+    let get = || {
+        ServiceOp::Get(proto::GetRequest {
+            table: "t".into(),
+            row: b"x".to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        })
+    };
+    let arrived = std::time::Instant::now();
+    let deadline = |client: bool| {
+        super::replica::ReadDeadline::new(
+            arrived,
+            Duration::from_secs(20),
+            client.then_some(Duration::from_millis(300)),
+        )
+    };
+    let err = r
+        .block_on(service.await_primary(&get(), Some(999_999_999), deadline(true)))
+        .unwrap_err();
+    assert_eq!(
+        err.to_status().code(),
+        tonic::Code::DeadlineExceeded,
+        "{err:?}"
+    );
+    // One deadline from the request's arrival: time already spent (the budget wait) counts.
+    let spent = super::replica::ReadDeadline::new(
+        arrived - Duration::from_secs(20),
+        Duration::from_secs(20),
+        None,
+    );
+    let err = r
+        .block_on(service.await_primary(&get(), Some(999_999_999), spent))
+        .unwrap_err();
+    assert_eq!(err.to_status().code(), tonic::Code::Unavailable, "{err:?}");
+    assert!(arrived.elapsed() < Duration::from_secs(5));
+
+    // A read already waiting when the replica is promoted is answered then, not at its
+    // deadline (cli692's R2, simp724's N2).
+    let started = std::time::Instant::now();
+    let reply = std::thread::scope(|scope| {
+        let read = scope.spawn(|| {
+            let mut client = r.grpc();
+            r.block_on(client.get(ahead()))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!read.is_finished(), "the read waits for the replica");
+        let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+        assert_eq!(status, 200, "{body}");
+        read.join().unwrap()
+    });
+    assert!(reply.is_ok(), "{reply:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "answered at the promotion, not the 20 s deadline: {:?}",
+        started.elapsed()
+    );
+}

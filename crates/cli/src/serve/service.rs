@@ -754,7 +754,7 @@ impl Service {
     }
 
     /// Read-your-writes on a replica (#1577): with the client's `min_primary_seqno` (the
-    /// `x-pigeonhole-min-primary-seqno` header), a read waits at most `wait` until the replica
+    /// `x-pigeonhole-min-primary-seqno` header), a read waits, until `deadline` at most, for the replica
     /// has applied the primary's commits through it. Reads only: a write is refused on a
     /// replica anyway, and `Info` and `Metrics` answer at once (a monitor must see a lagging
     /// replica). A server that isn't a replica, or was promoted, ignores it. The wait holds the
@@ -763,7 +763,7 @@ impl Service {
         &self,
         op: &ServiceOp,
         min_primary_seqno: Option<u64>,
-        wait: Duration,
+        deadline: super::replica::ReadDeadline,
     ) -> Result<(), ApiError> {
         let (Some(seqno), Some(replica)) = (min_primary_seqno, &self.replica) else {
             return Ok(());
@@ -771,7 +771,7 @@ impl Service {
         if op.scope() != Scope::Read || matches!(op, ServiceOp::Info(_) | ServiceOp::Metrics(_)) {
             return Ok(());
         }
-        replica.wait_applied(seqno, wait).await
+        replica.wait_applied(seqno, deadline).await
     }
 
     /// `Admin.Info`'s replica section.

@@ -55,6 +55,33 @@ pub(crate) const RUN_EVENTS: usize = 256;
 /// server that isn't a replica ignores it.
 pub(crate) const MIN_PRIMARY_SEQNO: &str = "x-pigeonhole-min-primary-seqno";
 
+/// When a read's wait for its primary seqno ends: one instant for the whole request, from
+/// its arrival, so the budget wait and this one share a bound (cli692's R1 on #1594).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadDeadline {
+    pub(crate) at: Instant,
+    /// The client's own deadline set it (gRPC's `grpc-timeout`, shorter than the server's
+    /// request timeout): its end answers `DeadlineExceeded`, as the budget wait does.
+    pub(crate) client: bool,
+}
+
+impl ReadDeadline {
+    /// From a request that arrived at `arrived`, with the server's `limit` and the client's
+    /// own deadline, if it set one.
+    pub(crate) fn new(arrived: Instant, limit: Duration, client: Option<Duration>) -> Self {
+        match client {
+            Some(d) if d <= limit => Self {
+                at: arrived + d,
+                client: true,
+            },
+            _ => Self {
+                at: arrived + limit,
+                client: false,
+            },
+        }
+    }
+}
+
 /// [`MIN_PRIMARY_SEQNO`]'s value: none without the header, `InvalidArgument` unless it's a
 /// decimal `u64`.
 pub(crate) fn min_primary_seqno(value: Option<&[u8]>) -> Result<Option<u64>, ApiError> {
@@ -321,16 +348,28 @@ impl Replica {
         s.last_error = error;
     }
 
+    /// The primary seqno the served engine has applied through: a run's last event's, or a
+    /// catalog change's. A read's `x-pigeonhole-min-primary-seqno` is a `CommitInfo.seqno`,
+    /// and every one of those names a commit the primary's feed of every table delivers,
+    /// a `None` commit's and a cross-shard transaction's included (cli692's Q1 on #1594;
+    /// the server tests check both), so the value reaches it without a later commit.
     fn set_applied(&self, applied: u64) {
         self.status().applied = applied;
         self.applied.send_replace(applied);
     }
 
     /// Waits until the replica has applied the primary's commits through `seqno`, at most
-    /// `wait` (#1577: read-your-writes on a replica). `ReplicaBehind` (retry-safe) if it
-    /// hasn't by then, or at once while a bootstrap runs: a copy being swapped in has
-    /// nothing to wait on. Immediate once promoted: the database is a primary then.
-    pub(crate) async fn wait_applied(&self, seqno: u64, wait: Duration) -> Result<(), ApiError> {
+    /// until `deadline` (#1577: read-your-writes on a replica). At the deadline,
+    /// `ReplicaBehind` (retry-safe), or `DeadlineExceeded` when the client's own deadline
+    /// was the bound, as the budget wait answers (cli692's R1 on #1594); `ReplicaBehind` at
+    /// once while a bootstrap runs: a copy being swapped in has nothing to wait on.
+    /// Immediate once promoted, a wait already running included: the promotion sends
+    /// `u64::MAX` (cli692's R2 and simp724's N2 on #1594).
+    pub(crate) async fn wait_applied(
+        &self,
+        seqno: u64,
+        deadline: ReadDeadline,
+    ) -> Result<(), ApiError> {
         if !self.refuses_writes() {
             return Ok(());
         }
@@ -344,11 +383,14 @@ impl Replica {
                 "this replica is {state}: it can't wait for the primary's seqno {seqno}"
             )));
         }
-        match tokio::time::timeout(wait, rx.wait_for(|&a| a >= seqno)).await {
+        let wait = tokio::time::timeout_at(deadline.at.into(), rx.wait_for(|&a| a >= seqno));
+        match wait.await {
             Ok(Ok(_)) => Ok(()),
+            _ if deadline.client => Err(ApiError::deadline_exceeded()),
             _ => Err(ApiError::replica_behind(format!(
-                "this replica hadn't applied the primary's seqno {seqno} within the request's \
-                 deadline (it's at {}): retry, or read from the primary",
+                "this replica has applied the primary's commits through seqno {}, and was \
+                 waiting for {seqno} when the request timed out: retry, or read from the \
+                 primary",
                 *self.applied.borrow()
             ))),
         }
@@ -459,6 +501,9 @@ impl Replica {
             ));
         };
         self.promoted.store(true, Ordering::Release);
+        // A primary now: every read waiting for a seqno passes (the loop is stopped, so
+        // nothing sets the value again).
+        self.applied.send_replace(u64::MAX);
         self.set_state("promoted");
         Ok(token.map(|t| t.as_bytes().to_vec()).unwrap_or_default())
     }
@@ -711,6 +756,11 @@ impl Replica {
             r = self.download(&side) => r.map_err(Halt::Failed)?,
             _ = stop.changed() => return Err(Halt::Stopped),
         };
+        // From here the served engine may be the new copy, whose applied seqno can be below
+        // the old copy's (a primary that itself replaced its file from an older backup), so
+        // the value never exceeds what the served engine applied (simp724's N1 on #1594).
+        // The follow after the swap reads the copy's own from its stored state.
+        self.set_applied(0);
         let swap_side = side.clone();
         let swapped = tokio::task::spawn_blocking(move || {
             let copy = Pigeonhole::open(&swap_side, pigeonhole::Options::default())?;
@@ -726,7 +776,6 @@ impl Replica {
         // nothing cached of the old one may serve again.
         service.engine_replaced();
         swapped.map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
-        self.set_applied(0);
         let mut s = self.status();
         s.caught_up = false;
         s.behind_since = Instant::now();

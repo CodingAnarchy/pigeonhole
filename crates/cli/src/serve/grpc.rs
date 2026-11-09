@@ -25,12 +25,18 @@ use super::Shared;
 use super::errors::ApiError;
 use super::feed::Out;
 use super::proto::{self, data_server::Data};
+use super::replica::ReadDeadline;
 use super::service::{ScanPages, ServiceOp, ServiceReply};
 
 /// The budget `prepay` reserved for a request, for its handler to take. Extensions must be
 /// `Clone`; the permit is taken once.
 #[derive(Clone, Default)]
 struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
+
+/// When `prepay` saw the request arrive: the start of its one deadline, which the budget wait
+/// and a replica's wait for the client's primary seqno share (cli692's R1 on #1594).
+#[derive(Clone, Copy)]
+struct Arrived(Instant);
 
 impl Prepaid {
     fn take(&self) -> Option<OwnedSemaphorePermit> {
@@ -55,6 +61,7 @@ pub(crate) async fn prepay(
     req: HttpRequest,
     next: Next,
 ) -> HttpResponse {
+    let arrived = Instant::now();
     let (parts, body) = req.into_parts();
     let mut data = body.into_data_stream();
     let mut head = Vec::new();
@@ -105,6 +112,7 @@ pub(crate) async fn prepay(
     let mut req = HttpRequest::from_parts(parts, body);
     req.extensions_mut()
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
+    req.extensions_mut().insert(Arrived(arrived));
     req.extensions_mut().insert(meter);
     next.run(req).await
 }
@@ -302,24 +310,19 @@ async fn call<T>(
             .get(super::replica::MIN_PRIMARY_SEQNO)
             .map(|v| v.as_bytes()),
     );
-    // Bounded by the client's deadline when it set a shorter one (#1577).
-    let wait = req
-        .metadata()
-        .get("grpc-timeout")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_grpc_timeout)
-        .map_or(shared.limits.request_timeout, |d| {
-            d.min(shared.limits.request_timeout)
-        });
+    // The request's one deadline, from its arrival (#1577).
+    let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
+    let deadline = ReadDeadline::new(
+        arrived,
+        shared.limits.request_timeout,
+        grpc_timeout(req.metadata().as_ref()),
+    );
     let op = op(req.into_inner());
     let rpc = op.index();
-    let reply = match min_primary_seqno {
-        Ok(seqno) => match shared.router.service.await_primary(&op, seqno, wait).await {
-            Ok(()) => shared.router.dispatch(op, &caller, prepaid).await,
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(e),
-    };
+    let reply = shared
+        .router
+        .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+        .await;
     shared.count(rpc, started, &reply);
     Ok(reply?)
 }

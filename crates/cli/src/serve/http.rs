@@ -24,6 +24,7 @@ use super::auth::Scope;
 use super::errors::ApiError;
 use super::grpc::DataGrpc;
 use super::proto;
+use super::replica::ReadDeadline;
 use super::service::{ServiceOp, ServiceReply};
 
 /// The whole router: gRPC and HTTP/JSON behind the concurrency limit and load shedding,
@@ -248,6 +249,8 @@ async fn call(
     if length > limit {
         return ApiError::request_too_large(limit).into_response();
     }
+    // The request's one deadline starts here, before the budget wait (cli692's R1 on #1594).
+    let arrived = Instant::now();
     let budget = match shared.router.service.reserve(length).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -298,23 +301,17 @@ async fn call(
         }
     }
     let rpc = op.index();
-    // Read-your-writes on a replica (#1577), within the request timeout.
-    let reply = match super::replica::min_primary_seqno(
+    // Read-your-writes on a replica (#1577), within the request timeout from its arrival.
+    let min_primary_seqno = super::replica::min_primary_seqno(
         headers
             .get(super::replica::MIN_PRIMARY_SEQNO)
             .map(|v| v.as_bytes()),
-    ) {
-        Ok(seqno) => match shared
-            .router
-            .service
-            .await_primary(&op, seqno, shared.limits.request_timeout)
-            .await
-        {
-            Ok(()) => shared.router.dispatch(op, &caller, Some(budget)).await,
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(e),
-    };
+    );
+    let deadline = ReadDeadline::new(arrived, shared.limits.request_timeout, None);
+    let reply = shared
+        .router
+        .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
+        .await;
     shared.count(rpc, started, &reply);
     match reply {
         Ok(ServiceReply::Get(r)) => json(&r),
