@@ -102,6 +102,8 @@ fn replica_of_refuses_a_database_of_its_own() {
         primary.to_str().unwrap(),
         "--listen",
         "127.0.0.1:0",
+        // Each test's server needn't size its logs at start-up (ICR 0130).
+        "--no-wal-preallocate",
         "--replica-of",
         "http://127.0.0.1:1",
     ]);
@@ -134,6 +136,8 @@ fn a_replica_s_memory_store_pinned_to_another_model_fails_the_start() {
         copy.to_str().unwrap(),
         "--listen",
         "127.0.0.1:0",
+        // Each test's server needn't size its logs at start-up (ICR 0130).
+        "--no-wal-preallocate",
         "--replica-of",
         "http://127.0.0.1:1",
         "--memory",
