@@ -625,6 +625,7 @@ pub fn pigeonhole::Options::change_feed_off(self) -> Self
 pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self
 pub fn pigeonhole::Options::cpu_profile(self, pigeonhole::CpuProfile) -> Self
 pub fn pigeonhole::Options::create_if_missing(self, bool) -> Self
+pub fn pigeonhole::Options::default_shards(self, usize) -> Self
 pub fn pigeonhole::Options::direct_io(self, bool) -> Self
 pub fn pigeonhole::Options::durability(self, pigeonhole::Durability) -> Self
 pub fn pigeonhole::Options::feed_tables<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
