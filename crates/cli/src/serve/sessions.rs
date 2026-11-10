@@ -19,6 +19,7 @@
 //!   (any number at once, unlike a transaction; the session caps its own), and counted in
 //!   the caps.
 
+use super::auth::Principal;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -62,7 +63,7 @@ enum State {
 }
 
 struct Entry {
-    token: u32,
+    token: Principal,
     state: State,
     /// Calls in flight: at most one on a transaction.
     busy: usize,
@@ -87,7 +88,7 @@ impl Entry {
 #[derive(Default)]
 struct Table {
     map: HashMap<Id, Entry>,
-    per_token: HashMap<u32, usize>,
+    per_token: HashMap<Principal, usize>,
 }
 
 impl Table {
@@ -177,7 +178,7 @@ impl Sessions {
     /// Adds a session for `token`, within the caps.
     fn insert(
         self: &Arc<Self>,
-        token: u32,
+        token: Principal,
         state: State,
         durability: Option<Durability>,
         idle: Duration,
@@ -218,7 +219,7 @@ impl Sessions {
     /// Holds `txn` for `token` and returns its id.
     pub(crate) fn begin(
         self: &Arc<Self>,
-        token: u32,
+        token: Principal,
         txn: Transaction,
         durability: Option<Durability>,
     ) -> Result<String, ApiError> {
@@ -234,7 +235,7 @@ impl Sessions {
     /// Pins `snapshot` for `token` and returns its id.
     pub(crate) fn open_snapshot(
         self: &Arc<Self>,
-        token: u32,
+        token: Principal,
         snapshot: Snapshot,
     ) -> Result<String, ApiError> {
         self.insert(
@@ -247,7 +248,7 @@ impl Sessions {
     }
 
     /// Takes transaction `id` out for one call by `token`.
-    pub(crate) fn take(self: &Arc<Self>, id: &str, token: u32) -> Result<Taken, ApiError> {
+    pub(crate) fn take(self: &Arc<Self>, id: &str, token: Principal) -> Result<Taken, ApiError> {
         let gone = || ApiError::not_found("no such transaction");
         let key = parse_id(id).ok_or_else(gone)?;
         let now = Instant::now();
@@ -287,7 +288,7 @@ impl Sessions {
     /// Holds a remote MCP session for `token` and returns its id.
     pub(crate) fn open_mcp(
         self: &Arc<Self>,
-        token: u32,
+        token: Principal,
         session: Arc<super::mcp::McpSession>,
     ) -> Result<String, ApiError> {
         self.insert(
@@ -303,7 +304,7 @@ impl Sessions {
     /// expire under the request) until the guard drops. Another token's id, a malformed one
     /// and an expired one are all `NotFound`, which `/mcp` answers 404: the client starts a
     /// new session.
-    pub(crate) fn mcp(self: &Arc<Self>, id: &str, token: u32) -> Result<McpGuard, ApiError> {
+    pub(crate) fn mcp(self: &Arc<Self>, id: &str, token: Principal) -> Result<McpGuard, ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let now = Instant::now();
@@ -328,7 +329,7 @@ impl Sessions {
     }
 
     /// Ends MCP session `id` (`DELETE /mcp`). Requests already running finish.
-    pub(crate) fn end_mcp(&self, id: &str, token: u32) -> Result<(), ApiError> {
+    pub(crate) fn end_mcp(&self, id: &str, token: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let mut t = self.lock();
@@ -346,7 +347,7 @@ impl Sessions {
     pub(crate) fn snapshot(
         self: &Arc<Self>,
         id: &str,
-        token: u32,
+        token: Principal,
     ) -> Result<SnapshotGuard, ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
@@ -373,7 +374,7 @@ impl Sessions {
 
     /// Releases snapshot `id` now. Reads already running finish on their own handle; later
     /// ones get `NotFound`.
-    pub(crate) fn release(&self, id: &str, token: u32) -> Result<(), ApiError> {
+    pub(crate) fn release(&self, id: &str, token: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let mut t = self.lock();
@@ -689,6 +690,11 @@ fn parse_id(s: &str) -> Option<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test's principal: token `n`'s digest, as far as the session table can tell.
+    fn p(n: u8) -> Principal {
+        [n; 32]
+    }
     use pigeonhole::{Family, Options, Pigeonhole};
 
     fn leases() -> Leases {
@@ -733,21 +739,21 @@ mod tests {
     fn a_second_call_on_a_transaction_is_busy_until_the_first_ends() {
         let (db, dir) = db("busy");
         let s = Sessions::new(leases());
-        let id = s.begin(1, db.transaction().unwrap(), None).unwrap();
-        let first = open(s.take(&id, 1));
-        let Err(e) = s.take(&id, 1) else {
+        let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        let first = open(s.take(&id, p(1)));
+        let Err(e) = s.take(&id, p(1)) else {
             panic!("a second call got the transaction")
         };
         assert_eq!(e.code, "SessionBusy");
         // Dropping the call's guard (its future dropped) puts the transaction back.
         drop(first);
-        let again = open(s.take(&id, 1));
+        let again = open(s.take(&id, p(1)));
         // And a commit makes every call busy until its outcome is recorded.
         let (txn, _, ticket) = again.commit();
-        assert_eq!(s.take(&id, 1).err().unwrap().code, "SessionBusy");
+        assert_eq!(s.take(&id, p(1)).err().unwrap().code, "SessionBusy");
         drop(txn);
         drop(ticket);
-        let Ok(Taken::Done(Err(e))) = s.take(&id, 1) else {
+        let Ok(Taken::Done(Err(e))) = s.take(&id, p(1)) else {
             panic!("the tombstone")
         };
         assert_eq!(
@@ -762,19 +768,19 @@ mod tests {
     fn ids_are_bound_to_their_token() {
         let (db, dir) = db("token");
         let s = Sessions::new(leases());
-        let id = s.begin(1, db.transaction().unwrap(), None).unwrap();
+        let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         assert_eq!(id.len(), 32);
-        assert_eq!(s.take(&id, 2).err().unwrap().code, "NotFound");
-        assert_eq!(s.take("not an id", 1).err().unwrap().code, "NotFound");
-        let snap = s.open_snapshot(1, db.snapshot().unwrap()).unwrap();
-        assert_eq!(s.snapshot(&snap, 2).err().unwrap().code, "NotFound");
+        assert_eq!(s.take(&id, p(2)).err().unwrap().code, "NotFound");
+        assert_eq!(s.take("not an id", p(1)).err().unwrap().code, "NotFound");
+        let snap = s.open_snapshot(p(1), db.snapshot().unwrap()).unwrap();
+        assert_eq!(s.snapshot(&snap, p(2)).err().unwrap().code, "NotFound");
         assert_eq!(
-            s.take(&snap, 1).err().unwrap().code,
+            s.take(&snap, p(1)).err().unwrap().code,
             "NotFound",
             "not a txn"
         );
-        assert_eq!(s.release(&snap, 2).err().unwrap().code, "NotFound");
-        drop(open(s.take(&id, 1)));
+        assert_eq!(s.release(&snap, p(2)).err().unwrap().code, "NotFound");
+        drop(open(s.take(&id, p(1))));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -784,12 +790,12 @@ mod tests {
         let (db, dir) = db("caps");
         let s = Sessions::new(leases());
         for _ in 0..3 {
-            s.begin(1, db.transaction().unwrap(), None).unwrap();
+            s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         }
-        let e = s.begin(1, db.transaction().unwrap(), None).unwrap_err();
+        let e = s.begin(p(1), db.transaction().unwrap(), None).unwrap_err();
         assert!(e.message.contains("per-token"), "{e:?}");
-        s.open_snapshot(2, db.snapshot().unwrap()).unwrap();
-        let e = s.open_snapshot(3, db.snapshot().unwrap()).unwrap_err();
+        s.open_snapshot(p(2), db.snapshot().unwrap()).unwrap();
+        let e = s.open_snapshot(p(3), db.snapshot().unwrap()).unwrap_err();
         assert!(e.message.contains("--max-sessions)"), "{e:?}");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
@@ -799,8 +805,8 @@ mod tests {
     fn the_reaper_skips_a_session_with_a_call_in_flight() {
         let (db, dir) = db("reaper");
         let s = Sessions::new(leases());
-        let id = s.begin(1, db.transaction().unwrap(), None).unwrap();
-        let call = open(s.take(&id, 1));
+        let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        let call = open(s.take(&id, p(1)));
         // The call outlasts the idle lease and the hard lifetime: the reaper leaves it.
         let late = Instant::now() + Duration::from_secs(400);
         assert_eq!(s.sweep(late), 0);
@@ -809,18 +815,18 @@ mod tests {
         // that answers TransactionExpired (no Commit was received).
         assert_eq!(s.sweep(Instant::now()), 0, "just renewed");
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(31)), 1);
-        assert_eq!(s.take(&id, 1).err().unwrap().code, "TransactionExpired");
+        assert_eq!(s.take(&id, p(1)).err().unwrap().code, "TransactionExpired");
         // The marker expires after one more idle lease: then the id is unknown.
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(62)), 1);
-        assert_eq!(s.take(&id, 1).err().unwrap().code, "NotFound");
+        assert_eq!(s.take(&id, p(1)).err().unwrap().code, "NotFound");
 
         // A read at a snapshot holds it the same way.
-        let snap = s.open_snapshot(1, db.snapshot().unwrap()).unwrap();
-        let read = s.snapshot(&snap, 1).unwrap();
+        let snap = s.open_snapshot(p(1), db.snapshot().unwrap()).unwrap();
+        let read = s.snapshot(&snap, p(1)).unwrap();
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(700)), 0);
         drop(read);
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(61)), 1);
-        assert_eq!(s.snapshot(&snap, 1).err().unwrap().code, "NotFound");
+        assert_eq!(s.snapshot(&snap, p(1)).err().unwrap().code, "NotFound");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -829,15 +835,15 @@ mod tests {
     fn a_tombstone_never_answers_transaction_expired() {
         let (db, dir) = db("tomb");
         let s = Sessions::new(leases());
-        let id = s.begin(1, db.transaction().unwrap(), None).unwrap();
-        let (txn, _, ticket) = open(s.take(&id, 1)).commit();
+        let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        let (txn, _, ticket) = open(s.take(&id, p(1))).commit();
         let info = txn.commit().unwrap();
         ticket.finish(Ok(info));
         // Past its idle lease the tombstone goes, straight to NotFound: never
         // TransactionExpired, which would read as "not committed".
-        assert!(matches!(s.take(&id, 1), Ok(Taken::Done(Ok(c))) if c.seqno == info.seqno));
+        assert!(matches!(s.take(&id, p(1)), Ok(Taken::Done(Ok(c))) if c.seqno == info.seqno));
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(31)), 1);
-        assert_eq!(s.take(&id, 1).err().unwrap().code, "NotFound");
+        assert_eq!(s.take(&id, p(1)).err().unwrap().code, "NotFound");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -846,9 +852,9 @@ mod tests {
     fn a_released_snapshot_finishes_its_running_reads_only() {
         let (db, dir) = db("release");
         let s = Sessions::new(leases());
-        let snap = s.open_snapshot(1, db.snapshot().unwrap()).unwrap();
-        let read = s.snapshot(&snap, 1).unwrap();
-        s.release(&snap, 1).unwrap();
+        let snap = s.open_snapshot(p(1), db.snapshot().unwrap()).unwrap();
+        let read = s.snapshot(&snap, p(1)).unwrap();
+        s.release(&snap, p(1)).unwrap();
         assert_eq!(
             read.check().unwrap_err().code,
             "NotFound",
@@ -856,7 +862,7 @@ mod tests {
         );
         let _ = read.snapshot().seqno();
         drop(read);
-        assert_eq!(s.snapshot(&snap, 1).err().unwrap().code, "NotFound");
+        assert_eq!(s.snapshot(&snap, p(1)).err().unwrap().code, "NotFound");
         assert!(parse_id(&hex(&[0xab; 16])).is_some_and(|id| id == [0xab; 16]));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

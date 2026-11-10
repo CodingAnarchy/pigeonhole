@@ -183,8 +183,8 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> 
         }
     };
     Ok(Caller {
-        // Not a token of this node's: forwarded calls hold no sessions.
-        token: u32::MAX,
+        // Forwarded calls hold no sessions yet (ticket 3 binds them by the token's digest).
+        principal: crate::serve::auth::ANONYMOUS,
         scope,
         namespaces: (!f.all_namespaces).then_some(f.namespaces),
         // The reply goes back to the forwarding node as protobuf; that node charges and

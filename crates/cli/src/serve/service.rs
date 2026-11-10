@@ -1548,7 +1548,7 @@ impl Service {
             ServiceOp::ReleaseSnapshot(r) => {
                 drop(budget);
                 self.sessions
-                    .release(&r.snapshot_id, caller.token)
+                    .release(&r.snapshot_id, caller.principal)
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
         }
@@ -2782,7 +2782,7 @@ impl Service {
         if id.is_empty() {
             return Ok(None);
         }
-        self.sessions.snapshot(id, caller.token).map(Some)
+        self.sessions.snapshot(id, caller.principal).map(Some)
     }
 
     fn pinned_selection(
@@ -3017,7 +3017,7 @@ impl Service {
             Some(S::FromOldest(true)) => Start::Oldest,
             Some(S::FromSnapshot(id)) => Start::Snapshot(
                 self.sessions
-                    .snapshot(&id, caller.token)?
+                    .snapshot(&id, caller.principal)?
                     .snapshot()
                     .clone(),
             ),
@@ -3048,9 +3048,9 @@ impl Service {
     ) -> Result<proto::BeginResponse, ApiError> {
         let txn = self.part()?.db.transaction()?;
         let snapshot_seqno = txn.snapshot_seqno();
-        let txn_id = self
-            .sessions
-            .begin(caller.token, txn, convert::durability(r.durability))?;
+        let txn_id =
+            self.sessions
+                .begin(caller.principal, txn, convert::durability(r.durability))?;
         Ok(proto::BeginResponse {
             txn_id,
             snapshot_seqno,
@@ -3059,7 +3059,7 @@ impl Service {
 
     /// Takes transaction `id` for a call that only an open transaction answers.
     fn open_txn(&self, id: &str, caller: &Caller) -> Result<super::sessions::TxnGuard, ApiError> {
-        match self.sessions.take(id, caller.token)? {
+        match self.sessions.take(id, caller.principal)? {
             Taken::Open(g) => Ok(g),
             Taken::Done(outcome) => Err(ApiError::transaction_finished(&outcome)),
         }
@@ -3160,7 +3160,7 @@ impl Service {
             return Err(ApiError::permission_denied("commit writes"));
         }
         let rows = self.txn_rows(&r.rows).await?;
-        let mut g = match self.sessions.take(&r.txn_id, caller.token)? {
+        let mut g = match self.sessions.take(&r.txn_id, caller.principal)? {
             Taken::Open(g) => g,
             Taken::Done(outcome) => {
                 return outcome.map(|c| proto::TxnCommitResponse {
@@ -3219,7 +3219,7 @@ impl Service {
             self.part()?.db.snapshot()?
         };
         let seqno = snapshot.seqno();
-        let snapshot_id = self.sessions.open_snapshot(caller.token, snapshot)?;
+        let snapshot_id = self.sessions.open_snapshot(caller.principal, snapshot)?;
         Ok(proto::OpenSnapshotResponse { snapshot_id, seqno })
     }
 

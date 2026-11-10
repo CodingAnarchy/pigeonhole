@@ -35,11 +35,20 @@ impl Scope {
     }
 }
 
-/// Who is calling: the token that matched (its line, `token`), its scope, and its namespace
-/// limit. Sessions are bound to `token` (D313 §3).
+/// Who a session belongs to (D317 ticket 3): its token's SHA-256 digest, the same on every
+/// node that lists the token and stable when a token file is reordered or reloaded;
+/// [`ANONYMOUS`] without tokens. Never logged or put in an error (cli692's S1).
+pub(crate) type Principal = [u8; 32];
+
+/// The principal of a server without tokens.
+pub(crate) const ANONYMOUS: Principal = [0; 32];
+
+/// Who is calling: the token that matched (its `principal`), its scope, and its namespace
+/// limit. Sessions are bound to `principal` (D313 §3, D317 ticket 3).
 #[derive(Debug, Clone)]
 pub(crate) struct Caller {
-    pub token: u32,
+    /// Whose sessions it may use, and whose per-token cap it counts against.
+    pub principal: Principal,
     pub scope: Scope,
     /// `None`: every namespace. Used by the memory calls (ticket 8).
     #[allow(dead_code)]
@@ -53,7 +62,7 @@ impl Caller {
     /// The caller when no tokens are configured (a loopback server): everything.
     pub(crate) fn anonymous() -> Self {
         Self {
-            token: u32::MAX,
+            principal: ANONYMOUS,
             scope: Scope::Admin,
             namespaces: None,
             json: false,
@@ -142,10 +151,10 @@ impl Tokens {
     pub(crate) fn caller(&self, token: &str) -> Option<Caller> {
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let mut found = None;
-        for (i, e) in self.0.iter().enumerate() {
+        for e in &self.0 {
             if constant_time_eq(&e.digest, &digest) && found.is_none() {
                 found = Some(Caller {
-                    token: u32::try_from(i).unwrap_or(u32::MAX - 1),
+                    principal: e.digest,
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,
