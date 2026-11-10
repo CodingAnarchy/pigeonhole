@@ -43,6 +43,7 @@ pub struct Options {
     shards: usize,
     compaction_cores: Option<usize>,
     pin_threads: bool,
+    wal_preallocate: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
@@ -276,6 +277,7 @@ impl Default for Options {
             shards: 0,
             compaction_cores: None,
             pin_threads: true,
+            wal_preallocate: false,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -410,6 +412,46 @@ impl Options {
         self
     }
 
+    /// Sizes each shard's write-ahead log for a busy store when the database opens, rather
+    /// than while it serves (default off; D157 amendment, #1621, ICR 0130).
+    ///
+    /// Each shard's log is a ring of 64 MiB slots in its own file beside the database. Every
+    /// slot after the first is zero-filled and synced before the log uses it, so the log's
+    /// syncs don't pay for allocating space.
+    ///
+    /// - **Off (the default):** the ring grows on demand, a slot at a time, in the background
+    ///   while the store serves. A small database stays small: an open writes almost
+    ///   nothing, and the logs are removed at the last clean close. But on a busy store the
+    ///   zero-fill shares the device with the log's own syncs, which lengthens commits'
+    ///   tail latency while the rings grow. That's the first minutes of every session
+    ///   without the change feed, whose logs are removed at the close (#1621).
+    /// - **On:** before the open returns, every shard's ring gets the slots it holds once
+    ///   busy: twice [`memtable_budget`](Self::memtable_budget) of unflushed log, two
+    ///   spares, the change feed's retention and the slot in use. The rings are filled in
+    ///   parallel. A ring that later needs more still grows on demand.
+    ///
+    /// **The cost of turning it on:** disk and open time. At the defaults (a 64 MiB memtable
+    /// budget, no change feed) each shard's ring is 5 slots, 320 MiB, so a 16-shard
+    /// database holds about 5 GiB of logs from the open. The open writes and syncs all of
+    /// it, which takes a few seconds on NVMe. A database reopened after a clean close with
+    /// the change feed on keeps its logs: the open adds no slot, and zero-fills again only
+    /// the slots the last session never used (a reopen can't trust their zeros).
+    ///
+    /// `phdb serve` turns this on (`--no-wal-preallocate` turns it off). A reader process
+    /// has no log, so this does nothing there.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A long-running server: pay the log's growth at the open, not in commit latency.
+    /// let options = Options::default().wal_preallocate(true);
+    /// # let _ = options;
+    /// ```
+    pub fn wal_preallocate(mut self, yes: bool) -> Self {
+        self.wal_preallocate = yes;
+        self
+    }
+
     /// How long a write, `flush` or `compact` may wait before it fails with
     /// [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s). Two waits count:
     /// - **Memtable room.** A commit that finds its shard's arena full, or a `flush` or
@@ -519,19 +561,32 @@ impl Options {
         self
     }
 
-    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
-    /// the API: the default suits applications.
-    ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 200 µs, sized up to 1 ms from the shard's recent gaps; a fixed
-    /// 1 ms with [`CpuProfile::Server`]; a window set here is fixed; D198 as amended
-    /// on 2026-10-19 and 2026-10-30), so a steady stream
-    /// of commits is taken without waking the thread each time, and a store whose clients
-    /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
-    /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
-    /// by application-owned shards, whose loop the application runs.
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
+    /// before it sleeps (D198, ICR 0129). Engine-owned mode only: application-owned shards
+    /// run the application's loop.
+    ///
+    /// - **Default:** 200 µs, sized up to 1 ms from the shard's recent gaps between commits
+    ///   ([`CpuProfile::Embedded`]), or a fixed 1 ms ([`CpuProfile::Server`]). A window set
+    ///   here is fixed.
+    /// - **What it buys:** a steady stream of commits is taken without waking the thread for
+    ///   each one, which saves a wakeup's latency (microseconds, or tens of them on a busy
+    ///   or virtualized host) per commit. An idle database never polls, and polls that keep
+    ///   finding nothing poll less often.
+    /// - **What it costs:** CPU. A shard thread polls through every gap up to the window,
+    ///   so under a steady load it stays busy whether or not work arrives.
+    /// - **`Duration::ZERO`** sleeps at once. Use it for battery-powered or CPU-constrained
+    ///   hosts, and where a commit's latency is dominated by something else, such as a
+    ///   network round trip: `phdb serve` runs without the poll by default, because there
+    ///   it was a quarter to half of the server's CPU per put, and the wakeup it saves is
+    ///   small next to the round trip (D198 amendment 4, #1644).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().shard_spin(Duration::ZERO);
+    /// # let _ = options;
+    /// ```
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
         self
@@ -1765,6 +1820,7 @@ impl Options {
             None => budget.compaction,
         };
         o.pin_threads = self.pin_threads;
+        o.wal_preallocate = self.wal_preallocate;
         o.shard_threads = budget.drivers;
         // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
         // 2026-10-28), never with a fixed count; application-owned shards run on the

@@ -638,9 +638,11 @@ pub fn pigeonhole::Options::reader_slots(self, u32) -> Self
 pub fn pigeonhole::Options::row_cache(self, usize) -> Self
 pub fn pigeonhole::Options::row_cache_family(self, &str, &str) -> Self
 pub fn pigeonhole::Options::row_cache_max_row(self, usize) -> Self
+pub fn pigeonhole::Options::shard_spin(self, core::time::Duration) -> Self
 pub fn pigeonhole::Options::shard_threads(self, usize) -> Self
 pub fn pigeonhole::Options::shards(self, usize) -> Self
 pub fn pigeonhole::Options::shm_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn pigeonhole::Options::wal_preallocate(self, bool) -> Self
 pub fn pigeonhole::Options::write_stall_timeout(self, core::time::Duration) -> Self
 impl core::default::Default for pigeonhole::Options
 pub fn pigeonhole::Options::default() -> Self

@@ -172,7 +172,17 @@ RocksDB's sparse-wide `Buffered` put p99 is 17 µs: about 2.9× under `Embedded`
 
 At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. So a window past about 256 µs would cost more poll per gap than 200 µs, and the windows stay at 200–256 µs. That's what keeps the CPU near `Embedded`'s.
 
-*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above).*
+- **Fourth amendment (coordinator, 2026-11-09; #1644, ICR 0129): `phdb serve` runs its shards with no poll, and `Options::shard_spin` is public.** The library's defaults (`Embedded`'s adaptive window, `Server`'s fixed 1 ms) are unchanged.
+  - **Why:** on `phdb serve` at full load (perf287's g51, 16 hubs × 16 subscribers and 0 subscribers, AX102, split CPUs), the drivers are pinned to their own CPUs, so their poll starved no other thread. But it was a quarter to half of the server's CPU per put: 191 → 138 µs at 16 × 16, and 111 → 57 µs at 0 subscribers, with driver CPU 354% → 60% and put p50 level. A network round trip dwarfs the wakeup it saves.
+  - **`phdb serve`:** `shard_spin(Duration::ZERO)` by default. `--shard-spin US` sets a fixed window, and `--shard-spin adaptive` restores the library's.
+  - **Confirmed by perf287's g57** (×3, arms rotated, serve's put path on split CPUs):
+    - **At a paced 5,000 puts/s,** with the poll off, put p50 was 99 µs and p99 161–166 µs, against adaptive's 90–94 and 149–156 µs (+7 / +10 µs). CPU per put fell from 237–242 to 65–67 µs (−72%).
+    - **At full load,** latency was level and CPU per put fell from 110 to 57 µs.
+    - **A fixed 200 µs** matched adaptive exactly: at 5,000 puts/s each shard's gap is about 800 µs, so it still polls through every gap. It's no middle ground, so the default is 0.
+  - **`Options::shard_spin`** becomes public (ICR 0129), as decision 3 promised: "both windows are documented options that can be set to 0". `shard_spin_cap` and `commit_spin` stay hooks.
+  - **Not done:** a back-off when the poll's CPU is contended, for embedders whose shard threads aren't pinned, is #1678 (#1644's option 1). `sched_yield` yields only within a CPU's own runqueue, so pinned drivers would never see the signal.
+
+*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above). Amended by the coordinator, 2026-11-09 (`phdb serve` doesn't poll, and `Options::shard_spin` is public; the fourth amendment above).*
 
 - **Amended by D321 (owner, 2026-11-09): decision 2's C2 is built, as an opt-in commit mode (caller-runs), off by default.** The evidence went to the owner as decision 2 required. The defaults stay C1's.
 
@@ -4570,13 +4580,40 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
 - **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
 - **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.
-- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before.
+- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before. PR 2 gives the same flag to `phdb serve --memory`, with its embedder's threads placed off the shards' CPUs and the startup line for candle's environment (ICR 0119).
 - **The cost, PR 1's first numbers** (a 10-core Apple laptop):
   - **1 thread:** 33, 41 and 138 ms (p50) at 16, 64 and 256 tokens;
   - **4 threads:** 8.4, 18 and 65 ms;
   - **Batched:** 375 texts/s in batches of 32 at 4 threads.
 
   The AX102 rows are above, under candle's own pool. On them, the owner kept bge-small alone (2026-11-09).
+
+<a id="d319"></a>
+## D319 — #1621's GroupSync commit tail: the WAL record write off the driver, and a cap on background write-back (perf2, design; coordinator, 2026-11-09; reviewed by perf287; wal, engine, #1621)
+
+**Problem (#1621).** At GroupSync, puts stalled 10–90 ms on every shard at once, every few seconds, under steady load (`serve_feed_load`, 0 subscribers, 57K puts/s on the AX102). Each durable commit rewrote its shard's WAL tail page with a buffered `pwrite` on the driver thread. While the previous group's `fdatasync` had that page under write-back, the `pwrite` waited, and flush and compaction bursts (+130–260 MB/s, queue depth 15–40) stretched that wait.
+
+**Decided (design c6737884974, revision 1; perf287 approved).**
+- **Part A:** a GroupSync record write is submitted through the I/O backend, chained before its sync, with one in flight per stream. Later commits coalesce behind it, and Buffered keeps the blocking `pwrite`. No format change.
+- **Part B:** flush and compaction output is written back behind its job under a 4 MiB in-flight budget (#1633, ICR 0127).
+
+**Amendment 1 (perf287, #1646): the spare slots' zero-fill.** perf287's probes found every WAL fsync over 16 ms was the spare slots' zero-fill. It wrote 4–128 MiB of zeros itself, or waited on another sync that did. The amendment wrote a spare back a chunk at a time (C), and left the open-time slot early (B, the early rollover).
+
+**Amendment 2 (perf2; coordinator, 2026-11-10): Part B and B are dropped, and the growth half is D157's open-time pre-size.**
+- **Measured:**
+  - g42: the WAL-only arm met #1621 but doubled group-commit's pinned p99.9 (0.87 → 1.9 ms).
+  - g47: every in-run zero-fill shape (256 KiB to 64 MiB chunks, buffered or O_DIRECT) traded #1621's Mutate tail against group-commit's p99.9. Only a ring with no prep during the run met both.
+  - g52:
+    - B was ycsb-a's cost (p99.9: pre with B 151 µs, pre without B 125, main 131).
+    - 64 MiB O_DIRECT kept main's tail.
+    - All of fsync's blocked time was `folio_wait_writeback`, with no inode lock and no log force.
+- **Decided:**
+  - #1646 (C and B) is closed as superseded.
+  - #1621's growth half is fixed by D157's amendment instead: `wal_preallocate`, on in `phdb serve` (ICR 0130).
+  - Part B (#1633) stays a draft until g58 and isn't part of this fix.
+  - The idea worth keeping is C's write-back per chunk (`File::submit_writeback`), in case in-run prep ever comes back.
+- **Still open:** g52 also found the rest of #1621's tail. With no prep in the window, Mutates over 10 ms persist, and at long retention put p99 grows with run time. g58 is tracing it. If flush and compaction bursts in the device queue are the cause, a background write cap (issue option 3; Part B's mechanism, tuned first: g40 measured ycsb-a and ycsb-f p99.9 +50–80%) comes back as its own PR.
+- **Part A** isn't built. Whether #1621 still needs it waits on g58 too.
 
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
@@ -4668,6 +4705,7 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **`GroupSync`:** extending caller-runs to it was refused in v1.
 - **#1460** closes as "use caller-runs for this workload".
 
+<a id="d322"></a>
 ## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
 
 **Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
@@ -4688,3 +4726,19 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 
 **Note for the serve benches:** `serve_feed_load` and `serve_read_load` run the `phdb` binary, so from this change on their server side runs on jemalloc. Compare their results only with runs from builds on the same side of it.
 
+
+## D323 — `phdb serve`'s `/metrics` carries the engine's metrics under D316's names, through a backend-neutral `pigeonhole-otel` collector (cli692, design; coordinator, 2026-11-10; cli, otel, D313 ticket 9, ICR 0131)
+
+**Problem.** `phdb serve`'s `/metrics` had the server's own metrics: requests, durations, sessions, connections, shedding, feed hubs, bulk loads and the replica. Of the engine's, it had only `async_sync_reads`. An operator couldn't see a write stall, compaction debt, the caches, the file or a recovery. Those are D316's metrics, which `pigeonhole-otel` maps and carries, but only onto an application's OpenTelemetry `Meter`.
+
+**Decided (option B of ticket 9's plan).**
+- **`pigeonhole-otel` gains a `Collector` (ICR 0131):** the same metric table and the same reading as `register`, as plain points or as Prometheus text under `MetricInfo::prometheus_name`'s names. One table and one reading serve both outputs, so the names can't drift. A test checks the text against `opentelemetry-prometheus`'s for the same database.
+- **`phdb serve`** holds a collector for its database, and `/metrics` and `Admin.Metrics` append its text after the server's own. Its counters stay monotonic across an automatic recovery and a replica's re-bootstrap: the engine's generation moves, and the collector carries.
+- **`pigeonhole_async_sync_reads_total`** now comes from the table, under the same name, with the `pigeonhole_db_name` label.
+- **The cost:** the `opentelemetry` API crate (no SDK) enters the `serve` build through `pigeonhole-otel`.
+
+**Rejected.**
+- **(A) `opentelemetry_sdk` and `opentelemetry-prometheus` in serve:** the names would match by construction, but it brings an SDK and the `prometheus` crate into every serve build, with a second registry beside serve's own metrics.
+- **(C) hand-rendering the engine's metrics in serve:** a second copy of D316's mapping and carry logic, which would drift.
+
+**Also under ICR 0131 (ticket 9b):** `phdb serve --affinity on|off`, documented, default `on`. It's for operators on shared hosts, and for R1's acceptance run (the serve bench's p99 and p99.9 with and without the mask).

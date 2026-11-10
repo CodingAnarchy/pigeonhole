@@ -112,6 +112,17 @@ pub struct EngineOptions {
     /// which the 2026-10-12 gate measured against four times: as fast, with a smaller WAL and
     /// a shorter replay after a crash (decision D229).
     pub wal_pin_bytes: u64,
+    /// Pre-size each WAL stream's ring of slots at a writable open (D157 amendment, #1621,
+    /// ICR 0130): before the shards take writes, every stream's file gets the slots it holds
+    /// in steady state, zero-filled and synced, so a busy stream never prepares a slot while
+    /// it serves. The ring is the slot in use, ⌈`wal_pin_bytes` / slot⌉ for the checkpoint's
+    /// lag, `wal.spare_segments` and the change feed's retention. Slots a reopened stream
+    /// already has count. The streams are filled in parallel, one thread each. Off (the
+    /// default), a stream grows its ring on demand while it runs, and a small database stays
+    /// small (D157). On costs disk and open time: the ring × the slot size per stream,
+    /// written and synced at the open. A stream that outgrows the estimate still prepares
+    /// more on demand.
+    pub wal_preallocate: bool,
     /// Tablet split threshold in bytes of live data (default 256 MiB). A tablet whose SSTs
     /// hold at least this much splits in two; two adjacent cold tablets on one shard holding
     /// less than a quarter of it together merge. Only read when `tablet_changes` is on.
@@ -283,6 +294,7 @@ impl EngineOptions {
             feed: None,
             feed_inherit: false,
             wal_pin_bytes: 0,
+            wal_preallocate: false,
             tablet_split_bytes: 256 << 20,
             tablet_changes: true,
             balance_interval_nanos: 100_000_000,

@@ -124,6 +124,12 @@ pub(crate) struct ServeArgs {
     /// stream's queued delivery.
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(16_384..))]
     pub http2_send_buffer: Option<u64>,
+    /// How long a shard thread polls its queue before it sleeps, in microseconds, or
+    /// `adaptive` for the library's default (D198). The server's default is 0, no poll: a
+    /// network round trip dwarfs the wakeup a poll saves, and on a busy server the poll was
+    /// about a quarter to half of the CPU per put (D198 amendment 4, #1644).
+    #[arg(long, value_name = "US|adaptive", default_value = "0")]
+    pub shard_spin: ShardSpin,
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
@@ -158,6 +164,14 @@ pub(crate) struct ServeArgs {
     /// bootstraps again.
     #[arg(long, value_name = "BYTES")]
     pub change_feed: Option<u64>,
+    /// Don't size each shard's write-ahead log at start-up. By default `serve` gives every
+    /// shard's log the slots it holds when busy before it accepts connections (about 320 MiB
+    /// a shard at the defaults, plus the change feed's retention), written and synced at the
+    /// open, so the logs never grow while commits wait on them (#1621, ICR 0130). With this
+    /// flag they grow on demand instead: less disk and a faster start, but a slower commit
+    /// tail while they grow.
+    #[arg(long)]
+    pub no_wal_preallocate: bool,
     /// Serve this database as a replica of the primary server at this URL (`http://` or
     /// `https://`): it bootstraps from the primary's backup, then follows its durable
     /// commits, and refuses writes until `Admin.Promote`. Reads see a consistent prefix of
@@ -322,9 +336,52 @@ pub(crate) fn check_bind(
     ))
 }
 
+/// `--shard-spin`'s largest window: 10 ms.
+const MAX_SHARD_SPIN_US: u64 = 10_000;
+
+/// `--shard-spin`: the shard threads' poll before they sleep (D198 amendment 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardSpin {
+    /// The library's default for the CPU profile (D198: adaptive under `Embedded`).
+    Adaptive,
+    /// A fixed window, in microseconds; 0 doesn't poll.
+    Micros(u64),
+}
+
+impl std::str::FromStr for ShardSpin {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        if s == "adaptive" {
+            return Ok(Self::Adaptive);
+        }
+        let us: u64 = s
+            .parse()
+            .map_err(|_| format!("{s:?}: microseconds, or `adaptive`"))?;
+        // A poll past this is a typo, not a setting: it would hold a CPU per shard through
+        // every gap of up to that long (cli692's N1 on #1680).
+        if us > MAX_SHARD_SPIN_US {
+            return Err(format!(
+                "{us} µs: at most {MAX_SHARD_SPIN_US} µs (the library's own cap is 1 ms)"
+            ));
+        }
+        Ok(Self::Micros(us))
+    }
+}
+
+impl ShardSpin {
+    /// Applies it to the engine's options.
+    pub(crate) fn apply(self, options: pigeonhole::Options) -> pigeonhole::Options {
+        match self {
+            Self::Adaptive => options,
+            Self::Micros(us) => options.shard_spin(Duration::from_micros(us)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check_bind;
+    use super::{ShardSpin, check_bind};
 
     #[test]
     fn a_reachable_address_needs_tls_and_tokens() {
@@ -344,5 +401,16 @@ mod tests {
             "{e}"
         );
         assert!(check_bind("[::1]:7448".parse().unwrap(), false, false, false).is_ok());
+    }
+
+    #[test]
+    fn shard_spin_takes_microseconds_or_adaptive() {
+        assert_eq!("0".parse::<ShardSpin>(), Ok(ShardSpin::Micros(0)));
+        assert_eq!("200".parse::<ShardSpin>(), Ok(ShardSpin::Micros(200)));
+        assert_eq!("adaptive".parse::<ShardSpin>(), Ok(ShardSpin::Adaptive));
+        assert!("1ms".parse::<ShardSpin>().is_err());
+        assert!("-1".parse::<ShardSpin>().is_err());
+        assert_eq!("10000".parse::<ShardSpin>(), Ok(ShardSpin::Micros(10_000)));
+        assert!("1000000".parse::<ShardSpin>().is_err());
     }
 }

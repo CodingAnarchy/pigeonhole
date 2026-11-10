@@ -279,7 +279,34 @@ fn tokens_and_scopes_decide_who_may_do_what() {
         text.contains("pigeonhole_serve_requests_total{rpc=\"Data.Mutate\",outcome=\"ok\"} 1"),
         "{text}"
     );
-    assert!(text.contains("pigeonhole_async_sync_reads_total"), "{text}");
+    // The engine's metrics, under D316's names (D323), `async_sync_reads` among them as
+    // before, now with the database's name.
+    for family in [
+        "pigeonhole_async_sync_reads_total",
+        "pigeonhole_commits_total",
+        "pigeonhole_write_stall_time_seconds_total",
+        "pigeonhole_failed_ratio",
+    ] {
+        assert!(
+            text.contains(&format!("{family}{{pigeonhole_db_name=\"")),
+            "{family}:\n{text}"
+        );
+    }
+    // The engine's names stay out of the server's own namespaces, so they can't clash as
+    // either side grows (perf287's nit 1 on #1687).
+    for m in pigeonhole_otel::metrics() {
+        let name = m.prometheus_name();
+        assert!(
+            !name.starts_with("pigeonhole_serve_") && !name.starts_with("pigeonhole_replica_"),
+            "{name}"
+        );
+    }
+    // Each family is declared once: Prometheus refuses a scrape that repeats one.
+    let mut types: Vec<&str> = text.lines().filter(|l| l.starts_with("# TYPE ")).collect();
+    let n = types.len();
+    types.sort_unstable();
+    types.dedup();
+    assert_eq!(types.len(), n, "{text}");
 }
 
 #[test]
@@ -349,7 +376,8 @@ fn a_write_whose_client_went_away_still_commits() {
     let landed = (0..100).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
         let r = s.block_on(service.call(get(), &Caller::anonymous(), None)).unwrap();
-        matches!(r, super::service::ServiceReply::Get(g) if g.cell.as_ref().is_some_and(|c| &c.value[..] == b"landed"))
+        // A read's reply comes with its charge (#1567).
+        matches!(r.uncharge().0, super::service::ServiceReply::Get(g) if g.cell.as_ref().is_some_and(|c| &c.value[..] == b"landed"))
     });
     assert!(landed, "the detached commit landed");
     // The task counts the lost reply once its commit returns, which can be just after the
@@ -591,7 +619,7 @@ fn a_client_that_stops_reading_loses_its_scan_after_the_idle_timeout() {
         scan_request(1000, 0, first.next.to_vec()),
     ));
     assert_eq!(join(&pages), whole_rows(30));
-    let text = s.shared.metrics.render(&service.db);
+    let text = s.shared.metrics.render();
     assert!(
         text.contains(
             r#"pigeonhole_serve_requests_total{rpc="Data.Scan",outcome="DeadlineExceeded"} 1"#

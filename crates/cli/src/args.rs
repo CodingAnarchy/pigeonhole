@@ -155,9 +155,9 @@ pub(crate) enum Command {
         /// `feed_poll` serves too: phdb's open inherits it.
         #[arg(long, value_name = "BYTES", conflicts_with = "read_only")]
         change_feed: Option<u64>,
-        /// The agent memory tools (D311 T7).
+        /// The agent memory tools (D311 T7). Boxed: the variant would be the enum's size.
         #[command(flatten)]
-        memory: MemoryArgs,
+        memory: Box<MemoryArgs>,
     },
     /// Serve the database over the network (D313): gRPC and HTTP/JSON on one port (ICR
     /// 0112). Holds the database until stopped with Ctrl-C or SIGTERM, then closes it.
@@ -191,7 +191,7 @@ pub(crate) struct MemoryArgs {
     /// A new store's embedding model id, when the client supplies the embeddings: the store
     /// is pinned to it, and refuses embeddings that name another model. With
     /// `--memory-dim`.
-    #[arg(long, value_name = "ID", requires_all = ["memory", "memory_dim"], conflicts_with = "embed_url")]
+    #[arg(long, value_name = "ID", requires_all = ["memory", "memory_dim"], conflicts_with_all = ["embed_url", "embed_local"])]
     pub memory_model: Option<String>,
     /// A new store's embedding dimension, with `--memory-model`.
     #[arg(long, value_name = "N", requires = "memory_model")]
@@ -211,7 +211,7 @@ pub(crate) struct MemoryArgs {
     /// Compute the embeddings in the server through this OpenAI-compatible `/embeddings`
     /// endpoint (the full URL). The memory tools then take text only. Memory text and recall
     /// queries are sent to it.
-    #[arg(long, value_name = "URL", requires_all = ["memory", "embed_model"])]
+    #[arg(long, value_name = "URL", requires_all = ["memory", "embed_model"], conflicts_with = "embed_local")]
     pub embed_url: Option<String>,
     /// The endpoint's model name, sent with each request; a new store is pinned to it.
     #[arg(long, value_name = "NAME", requires = "embed_url")]
@@ -220,6 +220,21 @@ pub(crate) struct MemoryArgs {
     /// key itself is never a flag, and never logged.
     #[arg(long, value_name = "VAR", requires = "embed_url")]
     pub embed_key_env: Option<String>,
+    /// Compute the embeddings in this process, on the CPU, with `BAAI/bge-small-en-v1.5`
+    /// (`pigeonhole-embed`, D318): no service and no network after the model's first
+    /// download. The memory tools then take text only, and a new store is pinned to
+    /// `BAAI/bge-small-en-v1.5@5c38ec7c`. Needs a phdb built with the `embed-local` feature.
+    #[arg(long, requires = "memory")]
+    pub embed_local: bool,
+    /// Load `--embed-local`'s model files from DIR (filled by hand, for an air-gapped
+    /// install) instead of the cache; nothing is downloaded. The files are still checked
+    /// against their pinned SHA-256s.
+    #[arg(long, value_name = "DIR", requires = "embed_local")]
+    pub embed_model_dir: Option<std::path::PathBuf>,
+    /// Never download `--embed-local`'s model: a file missing from the cache fails the
+    /// start, naming the URL to fetch and where to put it (as `PIGEONHOLE_EMBED_OFFLINE=1`).
+    #[arg(long, requires = "embed_local")]
+    pub embed_offline: bool,
 }
 
 impl Cli {

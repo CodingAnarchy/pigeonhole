@@ -188,6 +188,47 @@ fn recovery_starts_a_fresh_chained_segment() {
     assert_eq!(got.end, Lsn::new(7, FRAME_SIZE as u32));
 }
 
+/// `prepare_ring` (the D157 amendment, #1621, ICR 0130) tops a stream's file up to a whole
+/// ring: the slot in use and every slot the stream already has count, so asking again, or
+/// for a smaller ring, fills nothing, and a reopened stream's slots are kept.
+#[test]
+fn prepare_ring_tops_a_stream_up_to_a_ring_counting_what_it_has() {
+    let vfs = sim(7);
+    let opts = opts(4, 2);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    assert_eq!(file_len(&vfs), opts.segment_size);
+    // A ring of 5: the slot in use plus 4 new ones, all ready.
+    assert_eq!(wal.spares().prepare_ring(5).unwrap(), 4);
+    assert_eq!(wal.spares().ready(), 4);
+    assert_eq!(file_len(&vfs), 5 * opts.segment_size);
+    assert_eq!(
+        wal.spares().prepare_ring(5).unwrap(),
+        0,
+        "already a ring of 5"
+    );
+    assert_eq!(wal.spares().prepare_ring(3).unwrap(), 0, "never shrinks");
+    // Rollovers take the ring's slots; checkpointed ones recycle, so it never grows.
+    for i in 1..=40u64 {
+        let t = wal
+            .append(&batch(i, 20_000).record(), Durability::GroupSync)
+            .unwrap();
+        wal.sync().unwrap();
+        wal.checkpoint(t.end).unwrap();
+    }
+    assert_eq!(file_len(&vfs), 5 * opts.segment_size);
+    assert_eq!(wal.inline_grows(), 0);
+    // Reopened, the stream's slots count toward the ring, so it adds none. Slots recovery
+    // finds blank (prepared but never used: it can't trust their zeros, D157) are
+    // zero-filled again, and a second call fills nothing.
+    drop(wal);
+    let (_, r) = replay(&vfs, Lsn::default()).unwrap();
+    let wal = r.into_stream(opts).unwrap();
+    let refilled = wal.spares().prepare_ring(5).unwrap();
+    assert!(refilled <= 4, "only the ring's other slots: {refilled}");
+    assert_eq!(file_len(&vfs), 5 * opts.segment_size, "no slot added");
+    assert_eq!(wal.spares().prepare_ring(5).unwrap(), 0);
+}
+
 #[test]
 fn segments_are_preallocated_and_recycled_after_checkpoint() {
     let vfs = sim(5);

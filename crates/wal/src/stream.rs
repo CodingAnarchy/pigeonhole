@@ -977,7 +977,29 @@ impl SpareSegments {
     /// thread of its own, never on a shard thread; a background task on a shard runs
     /// [`SpareSegments::start`] instead.
     pub fn prepare(&self, n: u32) -> Result<u32> {
-        let Some(slots) = self.reserve(n) else {
+        self.fill(self.reserve(n))
+    }
+
+    /// Makes sure the stream's file holds at least `slots` slots, every one of them usable:
+    /// it grows the file by whole slots up to `slots` and zero-fills every blank slot, then
+    /// syncs once, as [`SpareSegments::prepare`] does. Returns how many slots it zero-filled.
+    /// For sizing a stream's whole ring at once, whatever it holds already: the slot in use,
+    /// retained segments (D310) and recyclable ones count toward `slots`. An engine's open
+    /// calls it before the stream takes writes, when asked to (the D157 amendment, #1621,
+    /// ICR 0130). Blocking file I/O: run it on a thread of its own.
+    pub fn prepare_ring(&self, slots: u32) -> Result<u32> {
+        let reserved = {
+            let mut pool = self.shared.pool();
+            let free = pool.recyclable + pool.ready.len();
+            let n = free + pool.blank.len() + (slots as usize).saturating_sub(pool.total);
+            Self::reserve_in(&mut pool, u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        self.fill(reserved)
+    }
+
+    /// Zero-fills and syncs `slots`, a [`SpareSegments::reserve`], then settles it.
+    fn fill(&self, slots: Option<Reserved>) -> Result<u32> {
+        let Some(slots) = slots else {
             return Ok(0);
         };
         let zeros = vec![0u8; ZERO_CHUNK.min(self.segment_size as usize)];
@@ -1043,7 +1065,11 @@ impl SpareSegments {
     /// past the file's end (counted in the pool's total now, so no other preparation or
     /// inline growth claims them). `None` if the stream has enough free slots.
     fn reserve(&self, n: u32) -> Option<Reserved> {
-        let mut pool = self.shared.pool();
+        Self::reserve_in(&mut self.shared.pool(), n)
+    }
+
+    /// [`SpareSegments::reserve`] under the pool's lock.
+    fn reserve_in(pool: &mut Pool, n: u32) -> Option<Reserved> {
         // Blank slots are not ready (a segment there needs its zero-fill first), so they
         // count as needing preparation, not as spares.
         let have = pool.recyclable + pool.ready.len();

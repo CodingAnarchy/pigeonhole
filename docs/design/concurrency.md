@@ -27,6 +27,7 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 | Caller thread | A client thread running a shard's turn itself while it waits (caller-runs, D321's opt-in `EngineOptions::caller_runs`, off by default). It holds the shard's run token, so it is the one thread touching that shard's state for the turn; see appendix D's caller-runs table. |
 | Manifest pump | Whoever holds the manifest exclusion (`Shared::manifest_busy`) and runs `manifest::begin` / `end`: a shard thread's `ManifestPump` task, or a client thread in `commit_req_from_thread` / `drain_sync`. |
 | Background task | A cooperative task (flush, compaction, WAL spares, `ClockTimer`) on a shard's scheduler or the runtime's pool. |
+| Open-time pre-size | With `wal_preallocate` (D157 amendment, ICR 0130), one scoped thread per WAL stream (`pigeonhole-wal-presize`) inside `Engine::open`, before the runtime starts. Each runs `SpareSegments::prepare_ring` on its own stream, under the WAL crate's spare-pool lock (uncontended: nothing else runs yet), and all are joined before any shard takes a turn. No primitive is added. |
 | Completion | The thread that resolves an I/O completion or a `Notifier`, and so runs the continuations chained to it. |
 | Reader process | Another process attached read-only through shared memory (`Role::Reader`). |
 
@@ -608,6 +609,7 @@ All are per-thread; none is shared across threads. Listed because they carry cro
 - `StdWaker` (waker.rs:26; fields in `ManifestPump`, `FlushTask`, `CompactionWork`): a
   per-task cached `std::task::Waker`, `&mut` only, no sync.
 - Outside the engine and runtime, beside D290 and D292: `pigeonhole-cache`'s `RowEntry::read` (`AtomicU8`, D290's `stale_unused` flag, with the cache's other internals), and `pigeonhole-io`'s nowait state (D292): a per-handle off flag set once, the per-file breaker `FileState::{streak, skip}` (Relaxed; `skip` saturates at 0 under a `compare_exchange_weak` loop) and per-backend hit and miss counters (Relaxed statistics).
+- Outside the engine and runtime, the public crate's point-read buffers (#1558, #1677): `pigeonhole`'s `RowShape` (cell.rs, one per `TableCore`, so shared by a table's handles): two `AtomicU32` high-water marks of a point read's qualifier bytes and cell count, read Relaxed to size the next read's buffers and raised by a Relaxed `fetch_max` only when a read exceeds them (capped), so they stop being written once the table's rows have been seen; a stale value only sizes a buffer smaller or larger. And `thread_local POOL` (cell.rs): `RefCell<Vec<(Vec<u8>, Vec<RowCell>)>>`, up to 4 emptied buffer pairs, each within `RowShape`'s caps (about 60 KiB a thread at most), that a thread's dropped `RowBuf`s left for its next point reads; per-thread, `try_borrow_mut` and `try_with` so re-entrance or thread exit just skips reuse, and a row dropped on another thread feeds that thread's pool.
 - Locals: `sst_ids`/`blob_ids` in maintenance.rs:89-90 (one thread, `Arc` only to fit `SstSink`);
   `guards` vec in flush.rs:644 (moved into the closure).
 

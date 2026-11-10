@@ -2,8 +2,22 @@ pub mod pigeonhole_otel
 #[non_exhaustive] pub enum pigeonhole_otel::InstrumentKind
 pub pigeonhole_otel::InstrumentKind::Counter
 pub pigeonhole_otel::InstrumentKind::Gauge
+#[non_exhaustive] pub enum pigeonhole_otel::PointValue
+pub pigeonhole_otel::PointValue::F64(f64)
+pub pigeonhole_otel::PointValue::U64(u64)
+pub struct pigeonhole_otel::Collector
+impl pigeonhole_otel::Collector
+pub fn pigeonhole_otel::Collector::collect(&self) -> alloc::vec::Vec<pigeonhole_otel::Point>
+pub fn pigeonhole_otel::Collector::rebind(&self, &pigeonhole::db::Pigeonhole)
+pub fn pigeonhole_otel::Collector::render_prometheus(&self, &mut alloc::string::String)
+pub fn pigeonhole_otel::Collector::watch_feed(&self, impl core::convert::Into<alloc::string::String>, pigeonhole::feed::FeedProgress)
+impl core::fmt::Debug for pigeonhole_otel::Collector
+pub fn pigeonhole_otel::Collector::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for pigeonhole_otel::Collector
+pub fn pigeonhole_otel::Collector::drop(&mut self)
 pub struct pigeonhole_otel::Config
 impl pigeonhole_otel::Config
+pub fn pigeonhole_otel::Config::collector(self, &pigeonhole::db::Pigeonhole) -> pigeonhole_otel::Collector
 pub fn pigeonhole_otel::Config::db_name(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_otel::Config::latency_window(self, core::time::Duration) -> Self
 pub fn pigeonhole_otel::Config::new() -> Self
@@ -19,6 +33,10 @@ pub pigeonhole_otel::MetricInfo::name: &'static str
 pub pigeonhole_otel::MetricInfo::unit: &'static str
 impl pigeonhole_otel::MetricInfo
 pub fn pigeonhole_otel::MetricInfo::prometheus_name(&self) -> alloc::string::String
+#[non_exhaustive] pub struct pigeonhole_otel::Point
+pub pigeonhole_otel::Point::attributes: alloc::vec::Vec<(&'static str, alloc::string::String)>
+pub pigeonhole_otel::Point::metric: pigeonhole_otel::MetricInfo
+pub pigeonhole_otel::Point::value: pigeonhole_otel::PointValue
 pub struct pigeonhole_otel::Registration
 impl pigeonhole_otel::Registration
 pub fn pigeonhole_otel::Registration::rebind(&self, &pigeonhole::db::Pigeonhole)
@@ -27,5 +45,6 @@ impl core::fmt::Debug for pigeonhole_otel::Registration
 pub fn pigeonhole_otel::Registration::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for pigeonhole_otel::Registration
 pub fn pigeonhole_otel::Registration::drop(&mut self)
+pub fn pigeonhole_otel::collector(&pigeonhole::db::Pigeonhole) -> pigeonhole_otel::Collector
 pub fn pigeonhole_otel::metrics() -> impl core::iter::traits::exact_size::ExactSizeIterator<Item = pigeonhole_otel::MetricInfo>
 pub fn pigeonhole_otel::register(&pigeonhole::db::Pigeonhole, &opentelemetry::metrics::meter::Meter) -> pigeonhole_otel::Registration
