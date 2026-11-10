@@ -221,13 +221,16 @@ fn row_read_allocations(t: &Table, cells: usize) -> u64 {
 
 /// #287 item 1: a row read builds the row it returns directly (no intermediate row, no
 /// second copy of each cell). Its allocations are a constant per read plus the row
-/// buffers' growth, which is logarithmic in the cells.
+/// buffers' growth, which is logarithmic in the cells, and no more as the row grows once the
+/// table's rows have been seen (#1558 item 1: the buffers are sized from the largest row read, so the wide
+/// read after its warm-up can allocate no more than the 1-cell one), and item 2 hands a dropped
+/// row's buffers to the thread's next read.
 #[test]
 fn row_read_allocations_per_cell() {
     let (db, t) = open("row_read");
     let one = row_read_allocations(&t, 1);
     let wide = row_read_allocations(&t, 33);
-    let per_cell = (wide - one) as f64 / 32.0;
+    let per_cell = wide.saturating_sub(one) as f64 / 32.0;
     eprintln!(
         "row read: {one} allocator calls for 1 cell, {wide} for 33 ({per_cell:.2} per extra cell)"
     );
