@@ -87,7 +87,7 @@ If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.car
 }
 ```
 
-- **The token's scope decides the tools.** A read token gets the read tools only, and a write tool called anyway is refused (`PermissionDenied`). A write token gets `write` and `create_table` too. A replica offers the read tools whatever the token.
+- **The token's scope decides the tools.** A read token gets the read tools only, and a write tool called anyway is refused (`PermissionDenied`). A write token gets `write` and `create_table` too. A replica offers the read tools whatever the token. Whether a session is offered the write tools is settled when it starts: after a replica's promote, start a new session to write.
 - **The server's rules apply to every call:** its in-flight and concurrency limits, the reserved `__phdb_` table prefix, and on a replica, read-your-writes with `x-pigeonhole-min-primary-seqno`.
 - **Sessions** last until the client ends them, or until idle for `--mcp-session-idle-ms` (30 min) or older than `--mcp-session-lifetime-ms` (24 h). After that the client gets 404 and starts a new one, as MCP clients do. A session answers up to `--mcp-session-requests` (8) requests at once; past that, the extra request gets `Overloaded` and is retried.
 - **`nearest` appears for every session** once any session, or the application, creates the first vector family: each session's next request carries `notifications/tools/list_changed`.

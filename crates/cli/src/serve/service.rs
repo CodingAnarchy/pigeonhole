@@ -1041,6 +1041,16 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.check(call, caller)?;
+        match prepaid {
+            Some(p) => Ok(p),
+            None => self.budget(call.size).await,
+        }
+    }
+
+    /// [`admit`](Self::admit)'s checks without its reservation: a `/mcp` tool call, whose
+    /// request's bytes are its POST's, already reserved (ai1249's S1 on #1666).
+    pub(crate) fn check(&self, call: &Admit, caller: &Caller) -> Result<(), ApiError> {
         if let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes())
             && call.writes
             && caller.scope.allows(call.scope)
@@ -1053,10 +1063,7 @@ impl Service {
         if call.size > self.limits.max_request_bytes {
             return Err(ApiError::request_too_large(self.limits.max_request_bytes));
         }
-        match prepaid {
-            Some(p) => Ok(p),
-            None => self.budget(call.size).await,
-        }
+        Ok(())
     }
 
     async fn answer(
@@ -1150,10 +1157,7 @@ impl Service {
                 drop(budget);
                 let db = self.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
-                let mut tables = self.db.tables();
-                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
-                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
-                tables.sort();
+                let tables = self.user_tables();
                 Ok(ServiceReply::Info(proto::InfoResponse {
                     path: self.db.path().display().to_string(),
                     file_bytes: info.file_bytes,
@@ -1412,12 +1416,9 @@ impl Service {
     /// since it may have resolved the name before a drop and create (#1632).
     pub(crate) async fn table(&self, name: &str) -> Result<Table, ApiError> {
         loop {
-            let generation = {
-                let cache = self.tables.load();
-                if let Some(t) = cache.map.get(name) {
-                    return Ok(t.clone());
-                }
-                cache.generation
+            let generation = match self.cached(name) {
+                Ok(t) => return Ok(t),
+                Err(generation) => generation,
             };
             reserved(name)?;
             let db = self.db.clone();
@@ -1429,6 +1430,29 @@ impl Service {
                 return Ok(t);
             }
         }
+    }
+
+    /// [`table`](Self::table) on a blocking thread the caller already holds (a `/mcp`
+    /// request's): a miss opens the table here, never on a second pool thread, which a full
+    /// pool would never give (ai1249's B1 on #1666).
+    pub(crate) fn table_blocking(&self, name: &str) -> Result<Table, ApiError> {
+        loop {
+            let generation = match self.cached(name) {
+                Ok(t) => return Ok(t),
+                Err(generation) => generation,
+            };
+            reserved(name)?;
+            let table = self.db.table(name)?.open()?;
+            if let Some(t) = self.keep_table(name, &table, generation) {
+                return Ok(t);
+            }
+        }
+    }
+
+    /// The cached handle for `name`, or the cache's generation to open it at.
+    fn cached(&self, name: &str) -> Result<Table, u64> {
+        let cache = self.tables.load();
+        cache.map.get(name).cloned().ok_or(cache.generation)
     }
 
     /// Keeps `table` under `name` unless a handle is there already (then that one is
@@ -1488,25 +1512,35 @@ impl Service {
         let db = self.db.clone();
         let owned = name.clone();
         let table = self
-            .blocking(move || {
-                let mut b = db.table(&owned)?;
-                for (n, f) in families {
-                    b = b.family(&n, f);
-                }
-                Ok(if if_missing {
-                    b.create_if_missing()?
-                } else {
-                    b.create()?
-                })
-            })
+            .blocking(move || create_in(&db, &owned, families, if_missing))
             .await?;
+        self.created(name, &table);
+        Ok(table)
+    }
+
+    /// [`create_with`](Self::create_with) on a blocking thread the caller already holds (a
+    /// `/mcp` request's), for the reason [`table_blocking`](Self::table_blocking) gives.
+    pub(crate) fn create_blocking(
+        &self,
+        name: &str,
+        families: Vec<(String, pigeonhole::Family)>,
+        if_missing: bool,
+    ) -> Result<Table, ApiError> {
+        reserved(name)?;
+        let _schema = self.schema.blocking_lock();
+        let table = create_in(&self.db, name, families, if_missing)?;
+        self.created(name.to_owned(), &table);
+        Ok(table)
+    }
+
+    /// A created table's handle replaces the name's, and the catalog moves.
+    fn created(&self, name: String, table: &Table) {
         self.tables.rcu(|c| {
             let mut c = TableCache::clone(c);
             c.map.insert(name.clone(), table.clone());
             c
         });
         self.catalog.fetch_add(1, Ordering::Release);
-        Ok(table)
     }
 
     /// The user's tables, sorted: the cluster's own (`__phdb_cluster`, ICR 0117) aren't.
@@ -3187,6 +3221,25 @@ async fn budget_within(
             "the server's in-flight request bytes stayed full past the deadline",
         )),
     }
+}
+
+/// Creates table `name` with `families` (with `if_missing`, opens it with the families it
+/// lacks added): a sync call, on a blocking thread.
+fn create_in(
+    db: &Pigeonhole,
+    name: &str,
+    families: Vec<(String, pigeonhole::Family)>,
+    if_missing: bool,
+) -> Result<Table, ApiError> {
+    let mut b = db.table(name)?;
+    for (n, f) in families {
+        b = b.family(&n, f);
+    }
+    Ok(if if_missing {
+        b.create_if_missing()?
+    } else {
+        b.create()?
+    })
 }
 
 /// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables

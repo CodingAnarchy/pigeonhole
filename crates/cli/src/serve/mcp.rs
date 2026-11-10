@@ -32,7 +32,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use pigeonhole::{Family, FamilyInfo, Pigeonhole, Table};
 use serde_json::{Map, Value};
-use tokio::runtime::Handle as Runtime;
 use tokio::sync::Semaphore;
 
 use super::Shared;
@@ -72,7 +71,6 @@ impl McpSession {
             db: service.db.clone(),
             writable,
             replica: service.replica.is_some(),
-            rt: Runtime::current(),
         };
         Self {
             tools: Tools::new(Box::new(backend), writable, shared.limits.mcp, None),
@@ -93,8 +91,9 @@ fn refuses_writes(shared: &Shared) -> bool {
 }
 
 /// The tools' database surface on the service layer (D313 §7 as amended in 8c-2). Its
-/// calls run on the blocking pool, inside a `/mcp` request, so they wait on the service's
-/// async functions with the runtime's `block_on`.
+/// calls run on the blocking thread a `/mcp` request already holds, so they use the
+/// service's sync paths (`table_blocking`, `create_blocking`): taking a second pool thread
+/// from inside one could wait forever on a full pool (ai1249's B1 on #1666).
 struct ServeBackend {
     /// Weak: the session table, inside the service, holds the session that holds this.
     shared: Weak<Shared>,
@@ -103,7 +102,6 @@ struct ServeBackend {
     db: Pigeonhole,
     writable: bool,
     replica: bool,
-    rt: Runtime,
 }
 
 impl ServeBackend {
@@ -116,8 +114,10 @@ impl ServeBackend {
     /// `table`, through the service's own table cache and its rules.
     fn table(&self, table: &str) -> Result<Table, Failure> {
         let shared = self.shared()?;
-        self.rt
-            .block_on(shared.router.service.table(table))
+        shared
+            .router
+            .service
+            .table_blocking(table)
             .map_err(|e| failure(e).within(&format!("table {table}")))
     }
 }
@@ -168,13 +168,10 @@ impl Backend for ServeBackend {
             return None;
         }
         Some(self.shared().and_then(|shared| {
-            self.rt
-                .block_on(
-                    shared
-                        .router
-                        .service
-                        .create_with(table.to_owned(), families, true),
-                )
+            shared
+                .router
+                .service
+                .create_blocking(table, families, true)
                 .map_err(|e| failure(e).within(&format!("create_table {table}")))
         }))
     }
@@ -194,7 +191,6 @@ struct Gate<'a> {
     session: &'a McpSession,
     shared: &'a Shared,
     caller: &'a Caller,
-    rt: &'a Runtime,
 }
 
 impl Host for Gate<'_> {
@@ -232,10 +228,10 @@ impl Host for Gate<'_> {
             // The request's bytes are the POST's, reserved before its body was read.
             size: 0,
         };
-        let _admitted = match self.rt.block_on(service.admit(&admit, self.caller, None)) {
-            Ok(p) => p,
-            Err(e) => return Some(Err(failure(e))),
-        };
+        // The checks only: the request's bytes are its POST's, already reserved (ai1249's S1).
+        if let Err(e) = service.check(&admit, self.caller) {
+            return Some(Err(failure(e)));
+        }
         // A poll can wait up to 30 s: it holds a `--max-streams` place for that long, as a
         // feed stream does (ai1249's note on 8c), though it needs no hub.
         let _stream = if name == "feed_poll" {
@@ -282,6 +278,10 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
             return ApiError::invalid("the body is longer than its Content-Length").into_response();
         }
     };
+    // A session this request starts, ended again unless its `initialize` succeeds: a
+    // refused one mustn't hold a place against the token's cap for its idle lease
+    // (ai1249's nit on #1666).
+    let mut started = None;
     let id = match headers.get(SESSION).map(HeaderValue::to_str) {
         Some(Ok(id)) => id.to_owned(),
         Some(Err(_)) => return ApiError::not_found("no such MCP session").into_response(),
@@ -289,7 +289,15 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         None if is_initialize(&text) => {
             let session = Arc::new(McpSession::new(&shared, &caller));
             match service.sessions.open_mcp(caller.token, session) {
-                Ok(id) => id,
+                Ok(id) => {
+                    started = Some(Started {
+                        sessions: Arc::clone(&service.sessions),
+                        id: id.clone(),
+                        token: caller.token,
+                        keep: false,
+                    });
+                    id
+                }
                 Err(e) => return e.into_response(),
             }
         }
@@ -350,7 +358,6 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     if session.catalog.swap(now, Ordering::AcqRel) != now {
         session.protocol.catalog_moved();
     }
-    let rt = Runtime::current();
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
     let answered = service
@@ -359,7 +366,6 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
                 session: &session,
                 shared: &shared_owned,
                 caller: &caller_owned,
-                rt: &rt,
             };
             let core = Core::new(Transport::Http);
             let reply = core.message(&gate, &session.protocol, &text);
@@ -373,6 +379,17 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
+    if let Some(s) = &mut started {
+        // Initialized: the session stays.
+        s.keep = reply.as_ref().is_some_and(|r| r.get("result").is_some());
+    }
+    if started.as_ref().is_some_and(|s| !s.keep) {
+        // Its `initialize` was refused: the session goes, and its id isn't given out.
+        return match reply {
+            Some(reply) => body(&reply.to_string(), "application/json"),
+            None => StatusCode::ACCEPTED.into_response(),
+        };
+    }
     // TODO(#1567): charge the reply to the in-flight budget until it's written, through
     // #1661's charge layer once it lands (before 1.2.0 ships; noted on #1567).
     let mut resp = match (reply, note) {
@@ -392,6 +409,23 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         resp.headers_mut().insert(SESSION, v);
     }
     resp
+}
+
+/// A session a request started, ended when dropped unless `keep` (its `initialize`
+/// succeeded), so every early answer ends it too.
+struct Started {
+    sessions: Arc<super::sessions::Sessions>,
+    id: String,
+    token: u32,
+    keep: bool,
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = self.sessions.end_mcp(&self.id, self.token);
+        }
+    }
 }
 
 /// `GET /mcp`: this server opens no stream of its own (its only notification rides on a

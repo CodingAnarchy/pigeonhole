@@ -214,7 +214,7 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
 - **Protocol versions:** `/mcp` offers 2025-03-26 and later (2024-11-05 defined the older HTTP+SSE transport). A request whose `MCP-Protocol-Version` names a version other than the session's gets 400. A request without the header is answered as the session's.
 - **The service's rules apply to every tool call:**
   - Each call passes the same `admit` as every RPC: the caller's scope, read or write (`write`, `create_table`), and a replica's write refusal. A refusal is the tool's result, with `isError` and the server's code (`PermissionDenied`, `ReadOnly`).
-  - A token with read scope, or a replica, isn't offered the write tools.
+  - A token with read scope, or a replica, isn't offered the write tools. That's settled when the session starts: a replica's sessions stay read-only after a promote.
   - The tools reach tables through the service's own table cache and checks: the reserved `__phdb_` prefix is refused. A table `create_table` makes is the service's at once.
   - `feed_poll` holds a `--max-streams` place while it waits.
   - On a replica, `x-pigeonhole-min-primary-seqno` makes a request wait for the primary's seqno, as an RPC does.

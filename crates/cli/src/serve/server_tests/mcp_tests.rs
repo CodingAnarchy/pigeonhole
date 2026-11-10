@@ -28,6 +28,8 @@ impl Answer {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // A request that hangs fails the test rather than hanging it.
+        .timeout_global(Some(Duration::from_secs(20)))
         .build()
         .into()
 }
@@ -374,9 +376,16 @@ fn a_session_past_its_request_limit_gets_a_retryable_refusal() {
         .stats(std::time::Instant::now());
     assert_eq!(busy.mcp, 1);
     std::thread::sleep(Duration::from_millis(500));
-    let refused = mcp(&s, None, Some(&id), None, &request("ping", json!({})));
-    assert_eq!(refused.status, 503, "{:?}", refused.messages);
-    assert_eq!(refused.messages[0]["code"], "Overloaded");
+    let mut resp = agent()
+        .post(format!("{}/mcp", s.url))
+        .header("content-type", "application/json")
+        .header("mcp-session-id", id.as_str())
+        .send(request("ping", json!({})).to_string())
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert!(resp.headers().get("retry-after").is_some(), "{resp:?}");
+    let refused: Json = resp.body_mut().read_json().unwrap();
+    assert_eq!(refused["code"], "Overloaded");
     let polled = poll.join().unwrap();
     assert!(polled.contains("\"isError\":false"), "{polled}");
     // The place is back.
@@ -384,4 +393,97 @@ fn a_session_past_its_request_limit_gets_a_retryable_refusal() {
         mcp(&s, None, Some(&id), None, &request("ping", json!({}))).status,
         200
     );
+}
+
+#[test]
+fn an_initialize_without_an_answer_leaves_no_session() {
+    let s = Server::start("", limits());
+    // As a notification (no id), nothing answers it: the session it opened goes again.
+    let a = mcp(
+        &s,
+        None,
+        None,
+        None,
+        &json!({"jsonrpc": "2.0", "method": "initialize", "params": {}}),
+    );
+    assert_eq!(a.status, 202);
+    assert!(a.session.is_none());
+    let stats = s
+        .shared
+        .router
+        .service
+        .sessions
+        .stats(std::time::Instant::now());
+    assert_eq!(stats.mcp, 0);
+}
+
+#[test]
+fn a_tool_opens_and_creates_tables_on_the_requests_own_pool_thread() {
+    // ai1249's B1 on #1666: a `/mcp` request holds a blocking-pool thread for its message,
+    // so a table it opens or creates must not wait for a second one. With a pool of one,
+    // that would wait forever.
+    blocking_threads(1);
+    let s = Server::start("", limits());
+    let id = session(&s, None);
+    let (out, err) = call(
+        &s,
+        None,
+        &id,
+        "create_table",
+        json!({"table": "made", "families": ["f"]}),
+    );
+    assert!(!err, "{out}");
+    // A drop empties the table cache: the next use of each name opens it again.
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "made"}), None);
+    assert_eq!(status, 200, "{e}");
+    let (out, err) = call(&s, None, &id, "read_row", json!({"table": "t", "row": "r"}));
+    assert!(!err, "{out}");
+    let (out, err) = call(&s, None, &id, "list_tables", json!({}));
+    assert!(!err, "{out}");
+}
+
+#[test]
+fn sessions_opening_tables_at_once_never_wait_on_each_other() {
+    // As many first reads of uncached tables at once as the pool has threads (2): each
+    // request holds one thread, and opens its table on it.
+    let s = Server::start("", limits());
+    for name in ["a", "b", "c", "d"] {
+        let (status, e) = s.rpc(
+            "Schema/CreateTable",
+            &json!({"name": name, "families": [{"name": "f"}]}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+    }
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "d"}), None);
+    assert_eq!(status, 200, "{e}");
+    let ids: Vec<String> = (0..3).map(|_| session(&s, None)).collect();
+    let url = s.url.clone();
+    let readers: Vec<_> = ids
+        .into_iter()
+        .zip(["a", "b", "c"])
+        .map(|(id, table)| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                let mut resp = agent()
+                    .post(format!("{url}/mcp"))
+                    .header("content-type", "application/json")
+                    .header("mcp-session-id", id.as_str())
+                    .send(
+                        request(
+                            "tools/call",
+                            json!({"name": "read_row", "arguments": {"table": table, "row": "r"}}),
+                        )
+                        .to_string(),
+                    )
+                    .unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                resp.body_mut().read_to_string().unwrap()
+            })
+        })
+        .collect();
+    for r in readers {
+        let body = r.join().unwrap();
+        assert!(body.contains("\"isError\":false"), "{body}");
+    }
 }
