@@ -25,12 +25,19 @@ use super::Shared;
 use super::errors::ApiError;
 use super::feed::Out;
 use super::proto::{self, data_server::Data};
+use super::replica::ReadDeadline;
 use super::service::{ScanPages, ServiceOp, ServiceReply};
 
 /// The budget `prepay` reserved for a request, for its handler to take. Extensions must be
 /// `Clone`; the permit is taken once.
 #[derive(Clone, Default)]
 struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
+
+/// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
+/// deadline, which the budget wait and a replica's wait for the client's primary seqno share
+/// (cli692's R1 on #1594), and an HTTP/1.1 body's pre-read too (perf287 on #1613).
+#[derive(Clone, Copy)]
+pub(crate) struct Arrived(pub(crate) Instant);
 
 impl Prepaid {
     fn take(&self) -> Option<OwnedSemaphorePermit> {
@@ -55,6 +62,7 @@ pub(crate) async fn prepay(
     req: HttpRequest,
     next: Next,
 ) -> HttpResponse {
+    let arrived = Instant::now();
     let (parts, body) = req.into_parts();
     let mut data = body.into_data_stream();
     let mut head = Vec::new();
@@ -105,6 +113,7 @@ pub(crate) async fn prepay(
     let mut req = HttpRequest::from_parts(parts, body);
     req.extensions_mut()
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
+    req.extensions_mut().insert(Arrived(arrived));
     req.extensions_mut().insert(meter);
     next.run(req).await
 }
@@ -239,7 +248,11 @@ impl Stream for Rest {
 
 /// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
 fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
-    let v = headers.get("grpc-timeout")?.to_str().ok()?;
+    parse_grpc_timeout(headers.get("grpc-timeout")?.to_str().ok()?)
+}
+
+/// A `grpc-timeout` value: digits and a unit.
+fn parse_grpc_timeout(v: &str) -> Option<Duration> {
     let (n, unit) = v.split_at(v.len().checked_sub(1)?);
     let n: u64 = n.parse().ok()?;
     Some(match unit {
@@ -293,9 +306,24 @@ async fn call<T>(
     let caller = shared.caller(header)?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
+    let min_primary_seqno = super::replica::min_primary_seqno(
+        req.metadata()
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    // The request's one deadline, from its arrival (#1577).
+    let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
+    let deadline = ReadDeadline::new(
+        arrived,
+        shared.limits.request_timeout,
+        grpc_timeout(req.metadata().as_ref()),
+    );
     let op = op(req.into_inner());
     let rpc = op.index();
-    let reply = shared.router.dispatch(op, &caller, prepaid).await;
+    let reply = shared
+        .router
+        .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+        .await;
     shared.count(rpc, started, &reply);
     Ok(reply?)
 }
@@ -754,6 +782,80 @@ impl proto::text_server::Text for TextGrpc {
         req: Request<proto::TextIndexRequest>,
     ) -> Result<Response<proto::TextVerifyResponse>, Status> {
         unary!(&self.0, req, TextVerify, TextVerify)
+    }
+}
+
+/// `Memory` over gRPC (D313 ticket 8a): the server's one memory store.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryGrpc(pub(crate) Arc<Shared>);
+
+/// A memory watch's events as gRPC messages.
+struct GrpcMemoryEvents(super::memory::MemoryEvents);
+
+impl Stream for GrpcMemoryEvents {
+    type Item = Result<proto::MemoryEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::memory_server::Memory for MemoryGrpc {
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<proto::MemoryEvent, Status>> + Send>>;
+
+    async fn remember(
+        &self,
+        req: Request<proto::RememberRequest>,
+    ) -> Result<Response<proto::RememberResponse>, Status> {
+        unary!(&self.0, req, Remember, Remember)
+    }
+
+    async fn recall(
+        &self,
+        req: Request<proto::RecallRequest>,
+    ) -> Result<Response<proto::RecallResponse>, Status> {
+        unary!(&self.0, req, Recall, Recall)
+    }
+
+    async fn mark_used(
+        &self,
+        req: Request<proto::MarkUsedRequest>,
+    ) -> Result<Response<proto::MarkUsedResponse>, Status> {
+        unary!(&self.0, req, MarkUsed, MarkUsed)
+    }
+
+    async fn supersede(
+        &self,
+        req: Request<proto::SupersedeRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Supersede, Empty)
+    }
+
+    async fn link(
+        &self,
+        req: Request<proto::LinkRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        unary!(&self.0, req, Link, Empty)
+    }
+
+    async fn forget(
+        &self,
+        req: Request<proto::ForgetRequest>,
+    ) -> Result<Response<proto::ForgetResponse>, Status> {
+        unary!(&self.0, req, Forget, Forget)
+    }
+
+    async fn watch(
+        &self,
+        req: Request<proto::MemoryWatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        match call(&self.0, req, ServiceOp::MemoryWatch).await? {
+            ServiceReply::MemoryWatch(e) => Ok(Response::new(Box::pin(GrpcMemoryEvents(e)))),
+            _ => Err(unexpected()),
+        }
     }
 }
 

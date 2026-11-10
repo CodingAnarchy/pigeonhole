@@ -10,16 +10,16 @@
 
 use crate::exit::Failure;
 
-/// The longest the server waits for one embedding.
-#[cfg(feature = "embed")]
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest `phdb mcp` waits for one embedding: one agent waits on its own call.
+/// `phdb serve` passes a shorter one (`--embed-timeout-ms`, 10 s by default).
+pub(crate) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The largest response body read.
 #[cfg(feature = "embed")]
 const MAX_RESPONSE_BYTES: u64 = 16 << 20;
 
 /// An embedding endpoint.
-pub(super) struct Endpoint {
+pub(crate) struct Endpoint {
     #[cfg(feature = "embed")]
     agent: ureq::Agent,
     #[cfg(feature = "embed")]
@@ -32,7 +32,13 @@ pub(super) struct Endpoint {
 impl Endpoint {
     /// The endpoint at `url` for `model`, with the key from the environment variable
     /// `key_env` if given (a variable that's unset or empty is a usage failure, at startup).
-    pub(super) fn new(url: &str, model: &str, key_env: Option<&str>) -> Result<Self, Failure> {
+    /// One embedding waits at most `timeout`.
+    pub(crate) fn new(
+        url: &str,
+        model: &str,
+        key_env: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<Self, Failure> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(Failure::usage(&format!(
                 "--embed-url {url}: an http:// or https:// URL"
@@ -81,7 +87,13 @@ impl Endpoint {
             }
             let tls = tls.build();
             let agent = ureq::Agent::config_builder()
-                .timeout_global(Some(TIMEOUT))
+                .timeout_global(Some(timeout))
+                // A connection that isn't up within this is an endpoint that can't be
+                // reached, not a slow one: shorter than the call's own bound, so it ends as
+                // a connect timeout (`EmbedFault::Unreachable`). Windows retries a SYN to a
+                // closed port for about 2 s rather than failing at once (#1617).
+                .timeout_resolve(Some(connect_timeout(timeout)))
+                .timeout_connect(Some(connect_timeout(timeout)))
                 // No redirects: the bearer key goes only to the URL given.
                 .max_redirects(0)
                 .http_status_as_error(false)
@@ -97,7 +109,7 @@ impl Endpoint {
         }
         #[cfg(not(feature = "embed"))]
         {
-            let _ = (model, key_env);
+            let _ = (model, key_env, timeout);
             Err(Failure::unsupported(
                 "--embed-url: this phdb was built without the `embed` feature".into(),
             ))
@@ -105,16 +117,31 @@ impl Endpoint {
     }
 
     /// The model name the endpoint is asked for.
-    pub(super) fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
-    /// `text`'s embedding. A failure's message names the endpoint and what went wrong, never
-    /// the key.
-    pub(super) fn embed(&self, text: &str) -> Result<Vec<f32>, Failure> {
+    /// `text`'s embedding, or the kind of failure with its message, which names the endpoint
+    /// and what went wrong, never the key (ai1249's R2 on #1617). Both front-ends call it
+    /// through [`crate::memcore::Embedder`].
+    pub(crate) fn embed_classified(&self, text: &str) -> Result<Vec<f32>, (EmbedFault, Failure)> {
         #[cfg(feature = "embed")]
         {
-            let fail = |m: String| Failure::input(format!("embedding endpoint {}: {m}", self.url));
+            let fail = |kind: EmbedFault, m: String| {
+                (
+                    kind,
+                    Failure::input(format!("embedding endpoint {}: {m}", self.url)),
+                )
+            };
+            // A transport error: the call's own timeout, or the endpoint unreachable.
+            let transport = |e: ureq::Error| match e {
+                // No connection within its bound: unreachable, like a refused one.
+                ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => {
+                    fail(EmbedFault::Unreachable, e.to_string())
+                }
+                ureq::Error::Timeout(_) => fail(EmbedFault::Timeout, e.to_string()),
+                e => fail(EmbedFault::Unreachable, e.to_string()),
+            };
             let body = serde_json::json!({"model": self.model, "input": text}).to_string();
             let mut req = self
                 .agent
@@ -123,27 +150,73 @@ impl Endpoint {
             if let Some(k) = &self.key {
                 req = req.header("Authorization", &format!("Bearer {k}"));
             }
-            let mut resp = req.send(body).map_err(|e| fail(e.to_string()))?;
+            let mut resp = req.send(body).map_err(transport)?;
             let status = resp.status().as_u16();
             let text = resp
                 .body_mut()
                 .with_config()
                 .limit(MAX_RESPONSE_BYTES)
                 .read_to_string()
-                .map_err(|e| fail(format!("reading the response: {e}")))?;
+                .map_err(|e| match e {
+                    ureq::Error::BodyExceedsLimit(_) => {
+                        fail(EmbedFault::BadReply, format!("reading the response: {e}"))
+                    }
+                    e => transport(e),
+                })?;
             if status != 200 {
                 let mut brief: String = text.chars().take(300).collect();
                 if brief.len() < text.len() {
                     brief.push('…');
                 }
-                return Err(fail(format!("HTTP {status}: {brief}")));
+                return Err(fail(
+                    EmbedFault::of_status(status),
+                    format!("HTTP {status}: {brief}"),
+                ));
             }
-            parse(&text).map_err(fail)
+            parse(&text).map_err(|m| fail(EmbedFault::BadReply, m))
         }
         #[cfg(not(feature = "embed"))]
         {
             let _ = text;
             unreachable!("an Endpoint is only made with the embed feature")
+        }
+    }
+}
+
+/// How long an embedding call waits for its connection (name resolution, then connect and
+/// TLS, each): half the call's bound, at most 3 s.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+fn connect_timeout(call: std::time::Duration) -> std::time::Duration {
+    (call / 2).min(std::time::Duration::from_secs(3))
+}
+
+/// What kind of failure an embedding call met (ai1249's R2 on #1617). `phdb serve` answers
+/// each with its own code; `phdb mcp` reports them all alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+pub(crate) enum EmbedFault {
+    /// The call took longer than the endpoint's timeout.
+    Timeout,
+    /// The endpoint couldn't be reached (refused, or no connection within half the call's
+    /// bound, at most 3 s), or answered that it's failing or busy (5xx, 408, 429): worth
+    /// retrying.
+    Unreachable,
+    /// The endpoint refused the input (400, 413, 422): the caller's text, say too long for
+    /// the model.
+    Rejected,
+    /// Any other answer (a bad key, a wrong path), or a reply that isn't an embedding: the
+    /// server's configuration.
+    BadReply,
+}
+
+impl EmbedFault {
+    /// The kind of a non-200 answer.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    fn of_status(status: u16) -> Self {
+        match status {
+            400 | 413 | 422 => Self::Rejected,
+            408 | 429 | 500..=599 => Self::Unreachable,
+            _ => Self::BadReply,
         }
     }
 }
@@ -197,13 +270,14 @@ mod tests {
     #[cfg(feature = "embed")]
     #[test]
     fn endpoints_load_the_system_roots_and_refuse_bad_flags() {
-        let e = Endpoint::new("https://example.invalid/v1/embeddings", "m", None).unwrap();
+        let e = Endpoint::new("https://example.invalid/v1/embeddings", "m", None, TIMEOUT).unwrap();
         assert_eq!(e.model(), "m");
-        assert!(Endpoint::new("ftp://example.invalid/", "m", None).is_err());
+        assert!(Endpoint::new("ftp://example.invalid/", "m", None, TIMEOUT).is_err());
         let unset = Endpoint::new(
             "http://127.0.0.1:1/v1/embeddings",
             "m",
             Some("PHDB_EMBED_TEST_KEY_NEVER_SET"),
+            TIMEOUT,
         );
         assert!(unset.is_err());
     }
@@ -227,10 +301,15 @@ mod tests {
             assert_eq!(loopback(url), ok, "{url}");
         }
         // The variable is set (PATH), so only the URL decides.
-        let refused = Endpoint::new("http://example.com/v1/embeddings", "m", Some("PATH"));
+        let refused = Endpoint::new(
+            "http://example.com/v1/embeddings",
+            "m",
+            Some("PATH"),
+            TIMEOUT,
+        );
         assert!(refused.is_err());
         assert!(
-            Endpoint::new("http://example.com/v1/embeddings", "m", None).is_ok()
+            Endpoint::new("http://example.com/v1/embeddings", "m", None, TIMEOUT).is_ok()
                 == cfg!(feature = "embed")
         );
     }

@@ -82,6 +82,13 @@ pub(crate) enum ServiceOp {
     TextSearch(proto::TextSearchRequest),
     TextRebuild(proto::TextIndexRequest),
     TextVerify(proto::TextIndexRequest),
+    Remember(proto::RememberRequest),
+    Recall(proto::RecallRequest),
+    MarkUsed(proto::MarkUsedRequest),
+    Supersede(proto::SupersedeRequest),
+    Link(proto::LinkRequest),
+    Forget(proto::ForgetRequest),
+    MemoryWatch(proto::MemoryWatchRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -117,6 +124,11 @@ pub(crate) enum ServiceReply {
     TextSearch(proto::TextSearchResponse),
     TextRebuild(proto::TextRebuildResponse),
     TextVerify(proto::TextVerifyResponse),
+    Remember(proto::RememberResponse),
+    Recall(proto::RecallResponse),
+    MarkUsed(proto::MarkUsedResponse),
+    Forget(proto::ForgetResponse),
+    MemoryWatch(super::memory::MemoryEvents),
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -213,6 +225,13 @@ impl ServiceOp {
             Self::TextSearch(_) => 40,
             Self::TextRebuild(_) => 41,
             Self::TextVerify(_) => 42,
+            Self::Remember(_) => 43,
+            Self::Recall(_) => 44,
+            Self::MarkUsed(_) => 45,
+            Self::Supersede(_) => 46,
+            Self::Link(_) => 47,
+            Self::Forget(_) => 48,
+            Self::MemoryWatch(_) => MEMORY_WATCH,
         }
     }
 
@@ -246,7 +265,9 @@ impl ServiceOp {
             | Self::VectorSearch(_)
             | Self::VectorVerify(_)
             | Self::TextSearch(_)
-            | Self::TextVerify(_) => Scope::Read,
+            | Self::TextVerify(_)
+            | Self::Recall(_)
+            | Self::MemoryWatch(_) => Scope::Read,
             // An index is a table: creating one is a write, as `Schema.CreateTable` is.
             Self::CreateIndex(_)
             | Self::VectorInsert(_)
@@ -256,7 +277,14 @@ impl ServiceOp {
             | Self::TextCreateIndex(_)
             | Self::TextPut(_)
             | Self::TextDelete(_)
-            | Self::TextRebuild(_) => Scope::Write,
+            | Self::TextRebuild(_)
+            // Memory writes, `Forget` included: forgetting is ordinary agent behaviour, and
+            // a token's namespaces bound its reach (ai1249 on D313 §7).
+            | Self::Remember(_)
+            | Self::MarkUsed(_)
+            | Self::Supersede(_)
+            | Self::Link(_)
+            | Self::Forget(_) => Scope::Write,
             // Maintenance and backups: admin (ICR 0112's Admin).
             // A replica's bootstrap and follow read everything, ids and all (#1436).
             Self::Flush(_)
@@ -321,6 +349,13 @@ impl ServiceOp {
             Self::TextDelete(r) => r.encoded_len(),
             Self::TextSearch(r) => r.encoded_len(),
             Self::TextRebuild(r) | Self::TextVerify(r) => r.encoded_len(),
+            Self::Remember(r) => r.encoded_len(),
+            Self::Recall(r) => r.encoded_len(),
+            Self::MarkUsed(r) => r.encoded_len(),
+            Self::Supersede(r) => r.encoded_len(),
+            Self::Link(r) => r.encoded_len(),
+            Self::Forget(r) => r.encoded_len(),
+            Self::MemoryWatch(r) => r.encoded_len(),
         }
     }
 
@@ -344,10 +379,24 @@ pub(crate) const FEED: usize = 16;
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
+/// How often a download sends a heartbeat chunk while its copy is written (#1611): well
+/// inside any client's idle limit.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// A download's offset past its copy's end.
+fn past_the_copy(offset: u64, total: u64) -> ApiError {
+    ApiError::invalid(format!(
+        "offset {offset} is past the backup's {total} bytes"
+    ))
+}
+
 /// `Replication.Follow`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const FOLLOW: usize = 36;
 
-pub(crate) const RPCS: [&str; 43] = [
+/// `Memory.Watch`'s index in `RPCS`.
+pub(crate) const MEMORY_WATCH: usize = 49;
+
+pub(crate) const RPCS: [&str; 50] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -391,11 +440,18 @@ pub(crate) const RPCS: [&str; 43] = [
     "Text.Search",
     "Text.Rebuild",
     "Text.Verify",
+    "Memory.Remember",
+    "Memory.Recall",
+    "Memory.MarkUsed",
+    "Memory.Supersede",
+    "Memory.Link",
+    "Memory.Forget",
+    "Memory.Watch",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 44] = [
+pub(crate) const OUTCOMES: [&str; 46] = [
     "ok",
     "Io",
     "Corruption",
@@ -438,6 +494,8 @@ pub(crate) const OUTCOMES: [&str; 44] = [
     "TransactionExpired",
     "TransactionFinished",
     "FailedPrecondition",
+    "ReplicaBehind",
+    "Unavailable",
     "Internal",
     "other",
 ];
@@ -648,12 +706,20 @@ pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
     }
 }
 
+/// The service's open tables by name, and the generation
+/// [`tables_changed`](Service::tables_changed) bumps (#1632).
+#[derive(Clone, Default)]
+struct TableCache {
+    generation: u64,
+    map: HashMap<String, Table>,
+}
+
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
     pub(crate) db: Pigeonhole,
     /// Read on every call, changed only when a table is first used: a snapshot swapped
     /// whole, never a lock (perf287's note 3 on D313).
-    tables: ArcSwap<HashMap<String, Table>>,
+    tables: ArcSwap<TableCache>,
     /// The in-flight bytes budget (R3), in bytes.
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
@@ -677,6 +743,12 @@ pub(crate) struct Service {
     pub(crate) texts: Arc<super::texts::Texts>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
     text_rebuilds: Arc<Semaphore>,
+    /// The memory store (`--memory`), if the server serves one: opened when a call needs
+    /// it, and again after the catalog or the engine changes (#1618).
+    memory: Option<Arc<super::memslot::MemSlot>>,
+    /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
+    /// can't take every blocking thread (ai1249's M6 on D313 §7).
+    memory_calls: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     schema: tokio::sync::Mutex<()>,
@@ -685,6 +757,9 @@ pub(crate) struct Service {
     scan_reads: Arc<Semaphore>,
     limits: Limits,
     pub(crate) metrics: Arc<Metrics>,
+    /// The open connections against `--max-connections` (#1604): the listener counts them,
+    /// the metrics show them.
+    pub(crate) connections: Arc<super::listener::Connections>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
@@ -707,8 +782,9 @@ impl Service {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            connections: super::listener::Connections::new(limits.max_connections),
             db: db.clone(),
-            tables: ArcSwap::from_pointee(HashMap::new()),
+            tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
@@ -721,6 +797,8 @@ impl Service {
             bulk: super::bulk::BulkLoads::default(),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
             text_rebuilds: Arc::new(Semaphore::new(1)),
+            memory: None,
+            memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             schema: tokio::sync::Mutex::new(()),
             feeds: super::feed::Feeds::new(
                 db.clone(),
@@ -752,6 +830,27 @@ impl Service {
         self
     }
 
+    /// Read-your-writes on a replica (#1577): with the client's `min_primary_seqno` (the
+    /// `x-pigeonhole-min-primary-seqno` header), a read waits, until `deadline` at most, for
+    /// the replica to apply the primary's commits through it. Reads only: a write is refused
+    /// on a replica anyway, and `Info` and `Metrics` answer at once (a monitor must see a
+    /// lagging replica). A server that isn't a replica, or was promoted, ignores it. The wait
+    /// holds the request's slot and budget, as any read in progress does.
+    pub(crate) async fn await_primary(
+        &self,
+        op: &ServiceOp,
+        min_primary_seqno: Option<u64>,
+        deadline: super::replica::ReadDeadline,
+    ) -> Result<(), ApiError> {
+        let (Some(seqno), Some(replica)) = (min_primary_seqno, &self.replica) else {
+            return Ok(());
+        };
+        if op.scope() != Scope::Read || matches!(op, ServiceOp::Info(_) | ServiceOp::Metrics(_)) {
+            return Ok(());
+        }
+        replica.wait_applied(seqno, deadline).await
+    }
+
     /// `Admin.Info`'s replica section.
     fn replica_info(&self) -> Option<proto::ReplicaInfo> {
         self.replica.as_ref().and_then(|r| r.info())
@@ -761,16 +860,38 @@ impl Service {
     /// cached table, vector index and text index handles go, and the next call on each name
     /// opens it
     /// again.
+    ///
+    /// The memory store is opened again too (#1618). Its clear is synchronous: the replica
+    /// publishes the seqno it applied only after this returns, so a read waiting for that
+    /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
-        self.tables.store(Arc::new(HashMap::new()));
+        self.handles_changed();
+        if let Some(memory) = &self.memory {
+            memory.clear();
+        }
+    }
+
+    /// The cached table, vector index and text index handles go: a replica's catalog change,
+    /// or a `DropTable` here (#1588), whose name may have been an index's. The next call on
+    /// each name opens it again. A forgotten background index's rebalancer sees its index
+    /// close and ends. An open running across this keeps nothing (#1632).
+    fn handles_changed(&self) {
+        self.tables.rcu(|c| TableCache {
+            generation: c.generation + 1,
+            map: HashMap::new(),
+        });
         self.indexes.forget();
         self.texts.forget();
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
-    /// cache, the feed hubs and the sessions are of the old engine, and go.
+    /// cache, the feed hubs, the memory store's watches and the sessions are of the old
+    /// engine, and go.
     pub(crate) fn engine_replaced(&self) {
         self.tables_changed();
+        if let Some(memory) = &self.memory {
+            memory.replaced();
+        }
         self.feeds.fail_all();
         self.sessions.drop_idle();
     }
@@ -799,6 +920,40 @@ impl Service {
         self.bulk.placement = Some(Arc::clone(placement));
         self.placement = Some(Arc::clone(placement));
         self
+    }
+
+    /// Serves the store `slot` holds, if any, as the `Memory` service, with at most `calls`
+    /// memory calls on the blocking pool at once (0: half the pool, at least 1).
+    pub(crate) fn memory_opt(
+        mut self,
+        slot: Option<super::memslot::MemSlot>,
+        calls: usize,
+    ) -> Self {
+        let Some(slot) = slot else { return self };
+        self.memory = Some(Arc::new(slot));
+        if calls > 0 {
+            self.memory_calls = Arc::new(Semaphore::new(calls));
+        }
+        self
+    }
+
+    /// The table cache's generation, for a test to run [`table`](Self::table)'s steps with a
+    /// catalog change between them (#1632).
+    #[cfg(test)]
+    pub(crate) fn table_generation(&self) -> u64 {
+        self.tables.load().generation
+    }
+
+    /// Whether the table cache holds a handle for `name`.
+    #[cfg(test)]
+    pub(crate) fn table_cached(&self, name: &str) -> bool {
+        self.tables.load().map.contains_key(name)
+    }
+
+    /// The memory store's slot, for a test to inspect the store it holds (#1640).
+    #[cfg(test)]
+    pub(crate) fn memory_slot(&self) -> Option<&Arc<super::memslot::MemSlot>> {
+        self.memory.as_ref()
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -834,7 +989,7 @@ impl Service {
         let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes()) else {
             return self.answer(op, caller, prepaid).await;
         };
-        if op.writes() && caller.scope >= op.scope() {
+        if op.writes() && caller.scope.allows(op.scope()) {
             return Err(ApiError::replica_read_only(replica.primary()));
         }
         match self.answer(op, caller, prepaid).await {
@@ -850,7 +1005,7 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
-        if caller.scope < op.scope() {
+        if !caller.scope.allows(op.scope()) {
             return Err(ApiError::permission_denied(&format!("call {}", op.name())));
         }
         let size = op.size();
@@ -937,6 +1092,8 @@ impl Service {
             ServiceOp::ListTables(_) => {
                 drop(budget);
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Tables(proto::ListTablesResponse { tables }))
             }
@@ -956,6 +1113,8 @@ impl Service {
                 let db = self.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
                 let mut tables = self.db.tables();
+                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
+                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Info(proto::InfoResponse {
                     path: self.db.path().display().to_string(),
@@ -1011,6 +1170,26 @@ impl Service {
                 // afresh (cli692's F3 on #1583).
                 self.indexes.forget();
                 self.indexes.pause_rebalancing(false);
+                // The memory store opens as the writer now, at once, created if missing
+                // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
+                // is what's promoted): it's the replica's last error, and memory calls answer
+                // it until the next clear.
+                if let Some(memory) = &self.memory {
+                    memory.promote();
+                    let slot = Arc::clone(memory);
+                    let opened = self.blocking(move || slot.get()).await;
+                    let failed = match opened {
+                        Ok(super::memslot::Entry::Failed(e)) | Err(e) => Some(e.message),
+                        Ok(_) => None,
+                    };
+                    if let Some(e) = failed {
+                        eprintln!(
+                            "phdb serve: after the promote, memory store {}: {e}",
+                            memory.name()
+                        );
+                        replica.note_error(format!("memory store {}: {e}", memory.name()));
+                    }
+                }
                 Ok(ServiceReply::Promote(proto::PromoteResponse {
                     primary_token: primary_token.into(),
                 }))
@@ -1092,6 +1271,70 @@ impl Service {
                     .map(ServiceReply::TextVerify)
                     .map_err(ApiError::for_read)
             }
+            ServiceOp::Remember(r) => self
+                .remember(r, caller, budget)
+                .await
+                .map(ServiceReply::Remember),
+            ServiceOp::Recall(r) => {
+                drop(budget);
+                self.recall(r, caller)
+                    .await
+                    .map(ServiceReply::Recall)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::MarkUsed(r) => {
+                let ids = super::memory::ids(&r.ids)?;
+                self.memory_write("Memory.MarkUsed", caller, budget, move |core, scope| {
+                    let m = core.mark_used(scope, &ids)?;
+                    Ok(proto::MarkUsedResponse {
+                        marked: m.marked as u64,
+                    })
+                })
+                .await
+                .map(ServiceReply::MarkUsed)
+            }
+            ServiceOp::Supersede(r) => {
+                let (old, new) = (super::memory::id(&r.old)?, super::memory::id(&r.new)?);
+                self.memory_write("Memory.Supersede", caller, budget, move |core, scope| {
+                    core.supersede(scope, &old, &new)?;
+                    Ok(proto::Empty {})
+                })
+                .await
+                .map(ServiceReply::Empty)
+            }
+            ServiceOp::Link(r) => {
+                let (from, to) = (super::memory::id(&r.from)?, super::memory::id(&r.to)?);
+                let ty = super::memory::link_type(r.link_type.as_ref())?;
+                let weight = r.weight;
+                self.memory_write("Memory.Link", caller, budget, move |core, scope| {
+                    core.link(scope, &from, &to, ty, weight)?;
+                    Ok(proto::Empty {})
+                })
+                .await
+                .map(ServiceReply::Empty)
+            }
+            ServiceOp::Forget(r) => {
+                let ids = super::memory::ids(&r.ids)?;
+                self.memory_write("Memory.Forget", caller, budget, move |core, scope| {
+                    // Serve answers the failure; the deletes before it stand.
+                    let done = core.forget(scope, &ids)?;
+                    if let Some((e, _left)) = done.failed {
+                        return Err(e.into());
+                    }
+                    Ok(proto::ForgetResponse {
+                        forgotten: done.deleted,
+                    })
+                })
+                .await
+                .map(ServiceReply::Forget)
+            }
+            ServiceOp::MemoryWatch(r) => {
+                drop(budget);
+                self.memory_watch(r, caller)
+                    .await
+                    .map(ServiceReply::MemoryWatch)
+                    .map_err(ApiError::for_read)
+            }
             ServiceOp::VectorBulkLoad(op) => {
                 drop(budget);
                 let index = self.index(&op.index).await?;
@@ -1125,21 +1368,51 @@ impl Service {
     /// serialized with their cache updates (`schema`), so the only stale entry it can leave
     /// is a handle resolved just before a drop, for a name with no table: its errors match
     /// the catalog, and the next create replaces it.
+    ///
+    /// A replica's applied catalog changes don't take `schema`: there, an open that
+    /// [`tables_changed`](Self::tables_changed) overtook keeps nothing and opens again,
+    /// since it may have resolved the name before a drop and create (#1632).
     async fn table(&self, name: &str) -> Result<Table, ApiError> {
-        if let Some(t) = self.tables.load().get(name) {
-            return Ok(t.clone());
+        loop {
+            let generation = {
+                let cache = self.tables.load();
+                if let Some(t) = cache.map.get(name) {
+                    return Ok(t.clone());
+                }
+                cache.generation
+            };
+            reserved(name)?;
+            let db = self.db.clone();
+            let owned = name.to_owned();
+            let table = self
+                .blocking(move || db.table(&owned)?.open().map_err(ApiError::from))
+                .await?;
+            if let Some(t) = self.keep_table(name, &table, generation) {
+                return Ok(t);
+            }
         }
-        let db = self.db.clone();
-        let owned = name.to_owned();
-        let table = self
-            .blocking(move || db.table(&owned)?.open().map_err(ApiError::from))
-            .await?;
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.entry(name.to_owned()).or_insert_with(|| table.clone());
-            m
+    }
+
+    /// Keeps `table` under `name` unless a handle is there already (then that one is
+    /// returned). `None`, keeping nothing, if [`tables_changed`](Self::tables_changed) came
+    /// after `generation`, the one the open started at (#1632).
+    pub(crate) fn keep_table(&self, name: &str, table: &Table, generation: u64) -> Option<Table> {
+        let mut kept = None;
+        self.tables.rcu(|c| {
+            if c.generation != generation {
+                kept = None;
+                return Arc::clone(c);
+            }
+            let mut c = TableCache::clone(c);
+            kept = Some(
+                c.map
+                    .entry(name.to_owned())
+                    .or_insert_with(|| table.clone())
+                    .clone(),
+            );
+            Arc::new(c)
         });
-        Ok(table)
+        kept
     }
 
     /// `Schema.CreateTable`: the table with its families, created, or with `if_missing`
@@ -1149,6 +1422,7 @@ impl Service {
         &self,
         r: proto::CreateTableRequest,
     ) -> Result<proto::TableResponse, ApiError> {
+        reserved(&r.name)?;
         if r.name.is_empty() {
             return Err(ApiError::invalid("a table needs a name"));
         }
@@ -1173,10 +1447,10 @@ impl Service {
                 })
             })
             .await?;
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.insert(r.name.clone(), table.clone());
-            m
+        self.tables.rcu(|c| {
+            let mut c = TableCache::clone(c);
+            c.map.insert(r.name.clone(), table.clone());
+            c
         });
         Ok(describe(&table))
     }
@@ -1185,22 +1459,34 @@ impl Service {
     /// the name. A table created again under it is a new table, with a new id: its feed hubs
     /// are new too, and those on the old one end with their engine feeds.
     async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+        reserved(&name)?;
+        // The memory store this server serves keeps its data in its own tables: dropping one
+        // would leave the slot over a dropped table, and a restart would re-create the store
+        // empty (cli692's N1 on #1650, #1651). The crate names them.
+        if let Some(memory) = &self.memory {
+            let store = memory.name();
+            if pigeonhole_memory::Store::table_names(store).contains(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} belongs to the memory store {store} this server serves \
+                     (--memory {store}): stop the server to drop it"
+                )));
+            }
+        }
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let owned = name.clone();
-        let dropped = self.blocking(move || Ok(db.drop_table(&owned)?)).await;
-        // Whatever the outcome, the next use resolves the name again.
-        self.tables.rcu(|m| {
-            let mut m = HashMap::clone(m);
-            m.remove(&name);
-            m
-        });
+        let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
+        // Whatever the outcome, the next use resolves every name again: the table's handle,
+        // and a vector or text index's if it was one, with its rebalancer (#1588). Every
+        // cached handle goes, not only the name's: drops are rare, and an open of the name
+        // already running keeps nothing (#1632).
+        self.handles_changed();
         dropped
     }
 
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
     pub(crate) fn metrics_text(&self) -> String {
         let mut text = self.metrics.render(&self.db);
+        self.connections.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);
@@ -1236,11 +1522,18 @@ impl Service {
     /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
     /// from an offset, streamed in chunks of up to 1 MiB on its own task. It holds a
     /// `--max-streams` slot until it ends, and each send waits at most `--stream-idle-ms`.
+    ///
+    /// It answers at once (#1611): while the copy is written, the task sends a heartbeat (a
+    /// chunk with no data, at the requested offset, with the id and, for a replica, the feed
+    /// token; `total` 0 and no `sha256`, so a client's last-chunk check never fires on one)
+    /// at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
+    /// limit and resumes a break during the copy with the id. HTTP waits for the copy
+    /// instead: it sends the size and hash as headers.
     async fn backup_download(
         &self,
         r: proto::BackupDownloadRequest,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup;
+        use super::backup::{self, Copy};
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -1253,37 +1546,39 @@ impl Service {
                 "a replica can't be a bootstrap source: bootstrap from its primary",
             ));
         }
-        let (id, kept) = if r.backup_id.is_empty() {
+        let (id, copy) = if r.backup_id.is_empty() {
             let (db, durable, replica) = (self.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
-            self.backups
-                .fresh_download(move |p| {
-                    if replica {
-                        // A replica's bootstrap (#1436): a durable snapshot's copy, and the
-                        // token of a feed of every table from that same snapshot.
-                        let snap = db.durable_snapshot()?;
-                        let token = db.feed().from_snapshot(&snap).open()?.token();
-                        db.backup_at(&snap, p)?;
-                        return Ok(token.as_bytes().to_vec());
-                    }
-                    if durable {
-                        db.backup_durable(p)?;
-                    } else {
-                        db.backup(p)?;
-                    }
-                    Ok(Vec::new())
-                })
-                .await?
+            self.backups.fresh_download(move |p, started| {
+                if replica {
+                    // A replica's bootstrap (#1436): a durable snapshot's copy, and the
+                    // token of a feed of every table from that same snapshot, sent with the
+                    // heartbeats once it's known.
+                    let snap = db.durable_snapshot()?;
+                    let token = db.feed().from_snapshot(&snap).open()?.token();
+                    let token = token.as_bytes().to_vec();
+                    started(token.clone());
+                    db.backup_at(&snap, p)?;
+                    return Ok(token);
+                }
+                if durable {
+                    db.backup_durable(p)?;
+                } else {
+                    db.backup(p)?;
+                }
+                Ok(Vec::new())
+            })?
         } else {
             (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
         };
-        if r.offset > kept.total {
+        // A kept copy: an offset past it is refused now. One still being written is checked
+        // once it's ready.
+        if let Copy::Ready(kept) = &*copy.borrow()
+            && r.offset > kept.total
+        {
             self.backups.release(&id);
-            return Err(ApiError::invalid(format!(
-                "offset {} is past the backup's {} bytes",
-                r.offset, kept.total
-            )));
+            return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
         let (backups, pool, idle) = (
@@ -1293,38 +1588,78 @@ impl Service {
         );
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
-        let (task_id, task_kept, start) = (id.clone(), kept.clone(), r.offset);
+        let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
         tokio::spawn(async move {
-            let mut at = start;
+            // Sends `chunk` within the idle limit; `false` once the client went away (it
+            // resumes with the id).
+            let send = |chunk: proto::BackupChunk| {
+                let tx = tx.clone();
+                async move {
+                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
+                        Ok(Ok(())) => Ok(true),
+                        Ok(Err(_)) => Ok(false),
+                        Err(_) => Err(ApiError::deadline(
+                            "the client took no backup chunk for --stream-idle-ms; resume \
+                             with backup_id and the offset it reached",
+                        )),
+                    }
+                }
+            };
             let outcome: Result<(), ApiError> = async {
+                // The copy, with heartbeats while it's written (#1611).
+                let kept = loop {
+                    let state = task_copy.borrow_and_update().clone();
+                    let feed_token = match state {
+                        Copy::Ready(kept) => break kept,
+                        Copy::Failed(e) => return Err(e),
+                        Copy::Writing { feed_token } => feed_token,
+                    };
+                    let beat = proto::BackupChunk {
+                        data: Default::default(),
+                        total: 0,
+                        backup_id: task_id.clone(),
+                        offset: start,
+                        sha256: Default::default(),
+                        feed_token: feed_token.into(),
+                    };
+                    if !send(beat).await? {
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        changed = task_copy.changed() => {
+                            // The table dropped the copy without a last state: never expected
+                            // (it says why it failed first).
+                            if changed.is_err()
+                                && matches!(*task_copy.borrow(), Copy::Writing { .. })
+                            {
+                                return Err(ApiError::internal("the backup's copy vanished"));
+                            }
+                        }
+                        () = tokio::time::sleep(HEARTBEAT) => {}
+                    }
+                };
+                if start > kept.total {
+                    return Err(past_the_copy(start, kept.total));
+                }
+                let mut at = start;
                 loop {
-                    let path = task_kept.path.clone();
+                    let path = kept.path.clone();
                     let data = blocking(&pool, move || backup::read_chunk(&path, at)).await?;
                     let next = at + data.len() as u64;
-                    let last = next >= task_kept.total;
+                    let last = next >= kept.total;
                     let chunk = proto::BackupChunk {
                         data: data.into(),
-                        total: if last { task_kept.total } else { 0 },
+                        total: if last { kept.total } else { 0 },
                         backup_id: task_id.clone(),
                         offset: at,
                         sha256: if last {
-                            task_kept.sha256.to_vec().into()
+                            kept.sha256.to_vec().into()
                         } else {
                             Default::default()
                         },
-                        feed_token: task_kept.feed_token.clone().into(),
+                        feed_token: kept.feed_token.clone().into(),
                     };
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => {}
-                        // The client went away; it resumes with the id.
-                        Ok(Err(_)) => return Ok(()),
-                        Err(_) => {
-                            return Err(ApiError::deadline(
-                                "the client took no backup chunk for --stream-idle-ms; resume                                  with backup_id and the offset it reached",
-                            ));
-                        }
-                    }
-                    if last {
+                    if !send(chunk).await? || last {
                         return Ok(());
                     }
                     at = next;
@@ -1336,17 +1671,18 @@ impl Service {
                 outcome.as_ref().err().map(|e| e.code.as_str()),
                 started.elapsed(),
             );
+            // Within the idle limit, as a chunk: a heartbeat may still sit in the channel, and
+            // a dropped error would end the stream as if it were whole (cli692's R1 on #1628).
             if let Err(e) = outcome {
-                let _ = tx.try_send(Err(e));
+                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
             }
             backups.release(&task_id);
             drop(slot);
         });
         Ok(super::backup::Download {
             id,
-            total: kept.total,
-            sha256: kept.sha256,
             offset: r.offset,
+            copy,
             chunks: rx,
         })
     }
@@ -2025,6 +2361,151 @@ impl Service {
         self.pinned(s.map_or("", |s| s.snapshot_id.as_str()), caller)
     }
 
+    /// The memory store, opened on the blocking pool if the slot holds none (#1618), or
+    /// `Unsupported` without `--memory`. On a replica without the store: `ReplicaBehind`
+    /// while its copy is still arriving, else `Unavailable` (the primary hasn't created it,
+    /// or the replica hasn't applied that yet; ICR 0112).
+    async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
+        use super::memslot::Entry;
+        let slot = self.memory.clone().ok_or_else(|| {
+            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
+        })?;
+        let entry = match slot.cached() {
+            Some(entry) => entry,
+            None => {
+                // Under the memory sub-limit (M6): a call waiting for another's open waits on
+                // the semaphore, not in a blocking-pool thread (cli692's R2 on #1639).
+                let slot = Arc::clone(&slot);
+                self.memory_blocking(move || slot.get()).await?
+            }
+        };
+        match entry {
+            Entry::Core(core) => Ok(core),
+            Entry::Failed(e) => Err(e),
+            Entry::Missing => {
+                let name = slot.name();
+                match self.replica.as_ref().and_then(|r| r.settling()) {
+                    Some(state) => Err(ApiError::replica_behind(format!(
+                        "this replica is {state}: memory store {name} isn't on it yet"
+                    ))),
+                    None => Err(ApiError::unavailable(format!(
+                        "memory store {name} isn't on this replica yet: the primary hasn't \
+                         created it, or the replica hasn't applied that yet"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// `f` on the blocking pool under the memory sub-limit (M6). The wait for a memory slot
+    /// counts against the request timeout.
+    async fn memory_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let slot = budget_within(&self.memory_calls, 1, self.limits.request_timeout)
+            .await
+            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))?;
+        let r = self.blocking(f).await;
+        drop(slot);
+        r
+    }
+
+    /// A memory write: detached (its real outcome even if the client goes away), on the
+    /// blocking pool under the memory sub-limit, with the caller's namespaces.
+    async fn memory_write<T: Send + std::fmt::Debug + 'static>(
+        &self,
+        rpc: &'static str,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+        f: impl FnOnce(&crate::memcore::MemCore, crate::memcore::Scope<'_>) -> Result<T, ApiError>
+        + Send
+        + 'static,
+    ) -> Result<T, ApiError> {
+        let core = self.memory_core().await?;
+        let namespaces = caller.namespaces.clone();
+        let (calls, pool, wait) = (
+            Arc::clone(&self.memory_calls),
+            Arc::clone(&self.blocking),
+            self.limits.request_timeout,
+        );
+        self.detached(rpc, budget, async move {
+            let _slot = budget_within(&calls, 1, wait)
+                .await
+                .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))?;
+            blocking(&pool, move || {
+                f(&core, crate::memcore::Scope(namespaces.as_deref()))
+            })
+            .await
+        })
+        .await
+    }
+
+    /// `Memory.Remember`: a memory in its namespace, embedded by the server if it has an
+    /// embedder. Detached, as every write.
+    async fn remember(
+        &self,
+        r: proto::RememberRequest,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+    ) -> Result<proto::RememberResponse, ApiError> {
+        let m = super::memory::remember(r)?;
+        self.memory_write("Memory.Remember", caller, budget, move |core, scope| {
+            let (done, _) = core.remember(scope, m, None)?;
+            Ok(super::memory::remembered(&done))
+        })
+        .await
+    }
+
+    /// `Memory.Recall`: the best memories for a query, within a byte budget (the server's
+    /// default when the request sets none, so the reply is bounded).
+    async fn recall(
+        &self,
+        r: proto::RecallRequest,
+        caller: &Caller,
+    ) -> Result<proto::RecallResponse, ApiError> {
+        let core = self.memory_core().await?;
+        let a = super::memory::recall(r)?;
+        let namespaces = caller.namespaces.clone();
+        self.memory_blocking(move || {
+            let (hits, _stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+            Ok(proto::RecallResponse {
+                hits: hits.into_iter().map(super::memory::hit).collect(),
+            })
+        })
+        .await
+    }
+
+    /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
+    async fn memory_watch(
+        &self,
+        r: proto::MemoryWatchRequest,
+        caller: &Caller,
+    ) -> Result<super::memory::MemoryEvents, ApiError> {
+        // Before the store: a swap from here on ends the watch.
+        let swaps = self.memory.as_ref().map(|m| m.swaps());
+        let core = self.memory_core().await?;
+        let Some(swaps) = swaps else {
+            return Err(ApiError::unsupported(
+                "this server has no memory store (phdb serve --memory NAME)",
+            ));
+        };
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        super::memory::watch(
+            core,
+            crate::memcore::Scope(caller.namespaces.as_deref()),
+            r,
+            slot,
+            Arc::clone(&self.blocking),
+            self.limits.stream_idle,
+            swaps,
+        )
+    }
+
     /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
     /// catch-up stream follow the same table ids), its start checked, and its stream handed to
     /// the fan-out. It holds a `--max-streams` slot until it ends.
@@ -2195,7 +2676,7 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
-        if !r.rows.is_empty() && caller.scope < Scope::Write {
+        if !r.rows.is_empty() && !caller.scope.allows(Scope::Write) {
             return Err(ApiError::permission_denied("commit writes"));
         }
         let rows = self.txn_rows(&r.rows).await?;
@@ -2408,7 +2889,7 @@ fn page_bytes(asked: u64) -> u64 {
 }
 
 /// Runs a sync-only call on the blocking pool, holding one of `pool`'s permits.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     pool: &Arc<Semaphore>,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -2622,4 +3103,16 @@ async fn budget_within(
             "the server's in-flight request bytes stayed full past the deadline",
         )),
     }
+}
+
+/// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
+/// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
+fn reserved(name: &str) -> Result<(), ApiError> {
+    if name.starts_with(super::cluster::map::RESERVED_PREFIX) {
+        return Err(ApiError::invalid(format!(
+            "table {name:?}: the {} prefix is reserved",
+            super::cluster::map::RESERVED_PREFIX
+        )));
+    }
+    Ok(())
 }

@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 use pigeonhole_io::IoBuf;
 
 use crate::hash::hash_of;
-use crate::s3fifo::Sharded;
+use crate::s3fifo::{Sharded, Taken};
 use crate::sync::{Arc, AtomicU8, AtomicU64, lock, read};
 
 /// Identifies a cached block: a namespace (an SST id or a blob file id, tagged by the caller
@@ -136,10 +136,19 @@ impl BlockCache {
     /// Smallest shard the default shard count will create.
     const MIN_SHARD_BYTES: usize = 256 << 10;
 
+    /// The block size each shard's index is sized for up front (#1559): an SST's data
+    /// blocks are 4 KiB by default.
+    const ENTRY_HINT: usize = 4 << 10;
+
     /// A cache holding up to `capacity` bytes across `shards` shards (0 picks a default:
     /// up to 64, at least 256 KiB each).
     pub fn new(capacity: usize, shards: usize) -> Self {
-        Self::with_shards(Sharded::new(capacity, shards, Self::MIN_SHARD_BYTES))
+        Self::with_shards(Sharded::new(
+            capacity,
+            shards,
+            Self::MIN_SHARD_BYTES,
+            Self::ENTRY_HINT,
+        ))
     }
 
     /// A cache that stores nothing: every insert returns an unshared handle.
@@ -193,7 +202,10 @@ impl BlockCache {
         let charge = data.charge();
         let block = Arc::new(data);
         if let Some(shard) = self.shards.shard(hash_of(&key)) {
-            lock(shard).insert(key, Arc::clone(&block), charge, priority);
+            // Declared before the guard, so what the insert evicts or replaces is dropped
+            // (and freed) after the lock is released (#1559).
+            let mut taken = Taken::new();
+            lock(shard).insert(key, Arc::clone(&block), charge, priority, &mut taken);
         }
         BlockHandle::new(block)
     }
@@ -220,12 +232,13 @@ impl BlockCache {
     pub fn erase_files(&self, files: &[u64]) {
         if files.len() <= 8 {
             self.shards
-                .for_each(|s| s.remove_unpinned_where(|k| files.contains(&k.file)));
+                .for_each(|s, out| s.remove_unpinned_where(|k| files.contains(&k.file), out));
         } else {
             let mut sorted = files.to_vec();
             sorted.sort_unstable();
-            self.shards
-                .for_each(|s| s.remove_unpinned_where(|k| sorted.binary_search(&k.file).is_ok()));
+            self.shards.for_each(|s, out| {
+                s.remove_unpinned_where(|k| sorted.binary_search(&k.file).is_ok(), out)
+            });
         }
     }
 
@@ -248,7 +261,15 @@ impl BlockCache {
     /// assert_eq!(cache.usage(), 0);
     /// ```
     pub fn clear(&self) {
-        self.shards.for_each(|s| s.clear());
+        self.shards.for_each(|s, out| s.clear(out));
+    }
+
+    /// Eviction passes that stopped early, leaving a shard over capacity until its next
+    /// insert, because one insert would have taken out more than a stack buffer holds (#1559,
+    /// perf287's R1). Not part of the stable API: for the bench and tests.
+    #[doc(hidden)]
+    pub fn deferred_evictions(&self) -> u64 {
+        self.shards.deferred_evictions()
     }
 
     /// Counts `bytes` of blocks a reader keeps pinned while it is open (an SST's top index
@@ -543,7 +564,7 @@ impl RowCache {
     /// A row cache of up to `capacity` bytes.
     pub fn new(capacity: usize) -> Self {
         Self {
-            shards: Sharded::new(capacity, 0, Self::MIN_SHARD_BYTES),
+            shards: Sharded::new(capacity, 0, Self::MIN_SHARD_BYTES, 0),
         }
     }
 
@@ -578,7 +599,9 @@ impl RowCache {
         });
         let h = Self::hash(family, row);
         if let Some(shard) = self.shards.shard(h) {
-            lock(shard).insert(h, Arc::clone(&entry), charge, Priority::Normal);
+            // Declared before the guard: what it takes out is dropped after the lock (#1559).
+            let mut taken = Taken::new();
+            lock(shard).insert(h, Arc::clone(&entry), charge, Priority::Normal, &mut taken);
         }
         RowHandle { entry }
     }
@@ -616,6 +639,8 @@ impl RowCache {
         let Some(shard) = self.shards.shard(h) else {
             return false;
         };
+        // Declared before the guard, so it's dropped after it (#1559).
+        let mut taken = Taken::new();
         let mut shard = lock(shard);
         if !shard
             .peek(&h)
@@ -623,18 +648,22 @@ impl RowCache {
         {
             return false;
         }
-        shard.update(&h, |entry| {
-            // Copied first while a handle holds it (`Arc::make_mut`, written out: loom's
-            // `Arc` has no `make_mut`).
-            if Arc::get_mut(entry).is_none() {
-                *entry = Arc::new(RowEntry::clone(entry));
-            }
-            let e = Arc::get_mut(entry)?;
-            edit(&mut e.encoded);
-            e.epoch = to;
-            e.read = AtomicU8::new(0);
-            Some(e.row.len() + e.encoded.len() + Self::ENTRY_OVERHEAD)
-        })
+        shard.update(
+            &h,
+            |entry| {
+                // Copied first while a handle holds it (`Arc::make_mut`, written out: loom's
+                // `Arc` has no `make_mut`).
+                if Arc::get_mut(entry).is_none() {
+                    *entry = Arc::new(RowEntry::clone(entry));
+                }
+                let e = Arc::get_mut(entry)?;
+                edit(&mut e.encoded);
+                e.epoch = to;
+                e.read = AtomicU8::new(0);
+                Some(e.row.len() + e.encoded.len() + Self::ENTRY_OVERHEAD)
+            },
+            &mut taken,
+        )
     }
 
     /// Whether the row is cached at an epoch other than `epoch` and was not read since it
@@ -670,9 +699,11 @@ impl RowCache {
         let Some(shard) = self.shards.shard(h) else {
             return;
         };
+        // Declared before the guard, so the row is freed after the lock (#1559).
+        let mut taken = Taken::new();
         let mut shard = lock(shard);
         if shard.peek(&h).is_some_and(|e| e.is(family, row)) {
-            shard.remove(&h);
+            shard.remove(&h, &mut taken);
         }
     }
 
@@ -691,7 +722,13 @@ impl RowCache {
     /// assert_eq!(rows.usage(), 0);
     /// ```
     pub fn clear(&self) {
-        self.shards.for_each(|s| s.clear());
+        self.shards.for_each(|s, out| s.clear(out));
+    }
+
+    /// As [`BlockCache::deferred_evictions`]. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn deferred_evictions(&self) -> u64 {
+        self.shards.deferred_evictions()
     }
 
     /// Bytes currently cached (rows, encodings and a fixed per-entry overhead).

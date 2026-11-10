@@ -94,6 +94,7 @@ pub fn counting_file_reads<T>(f: impl FnOnce() -> T) -> (T, u64) {
 /// Counts a block read from the file, if `counting_file_reads` is running.
 #[cold]
 pub(crate) fn note_file_read() {
+    pigeonhole_io::note_thread_file_read();
     FILE_READS.with(|c| {
         if let Some(n) = c.get() {
             c.set(Some(n + 1));

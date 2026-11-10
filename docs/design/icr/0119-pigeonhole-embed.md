@@ -34,4 +34,4 @@ None. Everything is new, and `pigeonhole-memory` is unchanged and doesn't depend
 ## Follow-ups
 - PR 2: `phdb mcp --embed-local`.
 - PR 3: memrecall's `--embed-local` rerun on the AX102.
-- Later, separately: MiniLM as a second `Model` variant (D318 Q2's fallback), and the Python and Ruby bindings.
+- Later, separately: the Python and Ruby bindings. No second model: the owner kept bge-small alone (D318, 2026-11-09).

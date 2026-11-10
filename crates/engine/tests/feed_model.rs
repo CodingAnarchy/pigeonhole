@@ -153,6 +153,9 @@ struct Sub {
     /// The current reader's last `position()` (ICR 0114 amendment): it never goes back, and
     /// never passes a commit not yet delivered.
     position: Seqno,
+    /// A read-ahead budget of a few records in place of the 64 MiB default (D320), so the
+    /// cap passes records over, rewinds and doubles its budget in the run.
+    cap: Option<u64>,
 }
 
 struct Run {
@@ -246,7 +249,10 @@ impl Run {
             None => FeedStart::Now,
         };
         let spec = self.spec(self.subs[i].durable, start);
-        let r = self.feed_for(i, spec);
+        let mut r = self.feed_for(i, spec);
+        if let Some(cap) = self.subs[i].cap {
+            r.set_read_ahead(cap);
+        }
         let sub = &mut self.subs[i];
         if sub.token.is_none() {
             sub.last = r.delivered();
@@ -381,6 +387,10 @@ impl Run {
                     sub.position
                 );
                 sub.position = before;
+                if sub.cap.is_some() {
+                    // Its tracked bytes match a scan of what it keeps (D320).
+                    r.read_ahead_bytes();
+                }
                 let next = r.try_next();
                 self.vfs.enter_process(WRITER);
                 let next = match next {
@@ -682,18 +692,21 @@ fn run(seed: u64) {
         shards: Vec::new(),
         made: BTreeMap::new(),
         // A durable and a visible subscriber in the writer, and the same in a reader process;
-        // and two that subscribe from the oldest each time (#1465): a durable one in the
-        // writer and a visible one in the reader process.
+        // two that subscribe from the oldest each time (#1465): a durable one in the writer
+        // and a visible one in the reader process; and two with a read-ahead of a few
+        // records (D320): a durable one in the writer and a visible one in the reader process.
         subs: [
-            (true, false, false),
-            (false, false, false),
-            (true, true, false),
-            (false, true, false),
-            (true, false, true),
-            (false, true, true),
+            (true, false, false, false),
+            (false, false, false, false),
+            (true, true, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (false, true, true, false),
+            (true, false, false, true),
+            (false, true, false, true),
         ]
         .into_iter()
-        .map(|(durable, process, oldest)| Sub {
+        .map(|(durable, process, oldest, capped)| Sub {
             durable,
             process,
             oldest,
@@ -702,6 +715,7 @@ fn run(seed: u64) {
             delivered: Vec::new(),
             last: 0,
             position: 0,
+            cap: capped.then(|| 200 + rng.below(1000)),
         })
         .collect(),
         window_expiries: 0,

@@ -172,6 +172,11 @@ pub(crate) enum Command {
         /// The replica's database file (`*.phdb`).
         file: PathBuf,
     },
+    /// A partitioned cluster's operator commands (D317): stamp a partition file, and set,
+    /// show or check the partition map on running nodes (`phdb serve --cluster`).
+    #[cfg(feature = "serve")]
+    #[command(subcommand)]
+    Cluster(crate::serve::ClusterCommand),
 }
 
 /// `phdb mcp`'s agent memory options (D311 T7): a `pigeonhole-memory` store and the tools

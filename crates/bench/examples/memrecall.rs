@@ -544,7 +544,12 @@ fn size(fix_dir: &Path, db_dir: &Path, n: usize) {
 /// into `big` for `MEMRECALL_WRITER_SECS` each (8 by default), with throughput, remember
 /// latency, `Busy` sleeps, transaction retries and conflicts, room and pacing stall time, and
 /// flushes.
-fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
+///
+/// With `index` false (the `flat` mode), the same build and writer phases run on a store
+/// without the index, as the IVF-off baseline for the writer rows (#1477); the recall passes
+/// are skipped, and the rows are `flat-build`, `flat-writers` and `flat-verify`.
+fn indexed_store(fix_dir: &Path, db_dir: &Path, n: usize, index: bool) {
+    let mode = if index { "ivf" } else { "flat" };
     let f = fixture(fix_dir, "lme_m");
     let mut seen = BTreeSet::new();
     let picked: Vec<usize> = (0..f.mems.len())
@@ -553,16 +558,15 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
         .collect();
     let (held, rest) = picked.split_at(5_000.min(picked.len() / 4));
     let sparse_n = 10_000.min(rest.len() / 4);
-    let dir = db_dir.join("ivf");
+    let dir = db_dir.join(mode);
     std::fs::create_dir_all(&dir).unwrap();
     let db = open(&dir);
     let model = EmbeddingModel::new(f.model.clone(), f.dim, Element::F32).unwrap();
-    let store = Store::create(
-        &db,
-        STORE,
-        StoreOptions::new().embedding(model).ivf(IvfOptions::new()),
-    )
-    .unwrap();
+    let mut options = StoreOptions::new().embedding(model);
+    if index {
+        options = options.ivf(IvfOptions::new());
+    }
+    let store = Store::create(&db, STORE, options).unwrap();
     let mut busy = 0u64;
     let every = rest.len() / sparse_n.max(1);
     let t = Instant::now();
@@ -589,10 +593,11 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
     }
     println!(
         "{}",
-        json!({"mode": "ivf-build", "memories": rest.len(), "sparse": sparse_n,
+        json!({"mode": format!("{mode}-build"), "memories": rest.len(), "sparse": sparse_n,
                "seconds": t.elapsed().as_secs_f64(), "busy_retries": busy})
     );
-    for ns in ["big", "sparse"] {
+    let recall_namespaces: &[&str] = if index { &["big", "sparse"] } else { &[] };
+    for &ns in recall_namespaces {
         for (name, only) in [("fused", None), ("vector", Some(0))] {
             let mut lat = [Vec::new(), Vec::new()];
             let (mut found, mut total, mut ivf_ns, mut fallbacks) = (0usize, 0usize, 0, 0);
@@ -698,7 +703,7 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
         println!(
             "{}",
             json!({
-                "mode": "ivf-writers", "threads": threads, "memories": n, "seconds": elapsed,
+                "mode": format!("{mode}-writers"), "threads": threads, "memories": n, "seconds": elapsed,
                 "per_second": n as f64 / elapsed,
                 "p50_us": p50, "p99_us": p99, "max_us": max,
                 "busy_sleeps": busy_all.load(std::sync::atomic::Ordering::Relaxed),
@@ -715,7 +720,7 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
     let st = store.verify().unwrap();
     println!(
         "{}",
-        json!({"mode": "ivf-verify", "consistent": st.is_consistent(),
+        json!({"mode": format!("{mode}-verify"), "consistent": st.is_consistent(),
                "ivf_mismatched": st.ivf_mismatched, "ivf_counter_drift": st.ivf_counter_drift})
     );
     drop(store);
@@ -724,7 +729,8 @@ fn ivf(fix_dir: &Path, db_dir: &Path, n: usize) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "memrecall FIXTURE_DIR DB_DIR (recall DATASET [ELEMENT] | size [N] | ivf [N])";
+    let usage =
+        "memrecall FIXTURE_DIR DB_DIR (recall DATASET [ELEMENT] | size [N] | ivf [N] | flat [N])";
     let fix = PathBuf::from(args.get(1).expect(usage));
     let db = PathBuf::from(args.get(2).expect(usage));
     std::fs::create_dir_all(&db).unwrap();
@@ -740,10 +746,11 @@ fn main() {
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),
         ),
-        Some("ivf") => ivf(
+        Some(mode @ ("ivf" | "flat")) => indexed_store(
             &fix,
             &db,
             args.get(4).map_or(100_000, |n| n.parse().expect("N")),
+            mode == "ivf",
         ),
         _ => panic!("{usage}"),
     }

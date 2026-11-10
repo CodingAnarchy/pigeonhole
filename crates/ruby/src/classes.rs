@@ -199,9 +199,9 @@ pub(crate) struct PagesState {
 #[magnus::wrap(class = "Pigeonhole::Pages", free_immediately, size)]
 pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);
 
-/// `Pigeonhole::Feed`: a change feed subscription (its state is `crate::feed::FeedState`).
+/// `Pigeonhole::Feed`: a change feed subscription, a `crate::waits` stream.
 #[magnus::wrap(class = "Pigeonhole::Feed", free_immediately, size)]
-pub(crate) struct Feed(pub(crate) ForkSafe<crate::feed::FeedState>);
+pub(crate) struct Feed(pub(crate) ForkSafe<crate::waits::Waits<crate::feed::FeedSource>>);
 
 // ---- Pigeonhole::Memory (PR 3a; methods in memory.rs) ------------------------------
 
@@ -307,8 +307,10 @@ pub(crate) struct VectorBulkLoad(pub(crate) ForkSafe<Mutex<Option<crate::index::
 
 /// `Pigeonhole::Memory::Watch`: a store's memory events (T9); `None` once closed.
 #[magnus::wrap(class = "Pigeonhole::Memory::Watch", free_immediately, size)]
-pub(crate) struct Watch(pub(crate) ForkSafe<crate::index::Fair<Option<pigeonhole_memory::Watch>>>);
+pub(crate) struct Watch(pub(crate) ForkSafe<crate::waits::Waits<crate::memory::WatchSource>>);
 
 /// `Pigeonhole::Memory::ConsolidateLoop`: feed-driven consolidation (T9).
 #[magnus::wrap(class = "Pigeonhole::Memory::ConsolidateLoop", free_immediately, size)]
-pub(crate) struct ConsolidateLoop(pub(crate) ForkSafe<Mutex<crate::memory::LoopSlot>>);
+pub(crate) struct ConsolidateLoop(
+    pub(crate) ForkSafe<std::sync::Arc<Mutex<crate::memory::LoopSlot>>>,
+);

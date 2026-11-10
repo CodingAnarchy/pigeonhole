@@ -3,6 +3,9 @@ writes mirror test_memory.py's cases, `Watch` and `ConsolidateLoop` mirror the R
 bindings', and the waits are cancel-safe (cli692's C1, perf287's W6)."""
 
 import asyncio
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -161,6 +164,20 @@ def test_a_cancelled_watch_wait_loses_nothing_and_one_waits_at_a_time(fdb):
         run(main(s, w))
 
 
+def test_closing_a_watch_ends_a_pending_next_async(fdb):
+    """#1606: as for the feed, the close wakes a pending wait, which fails with Closed."""
+
+    async def main(w):
+        waiting = asyncio.ensure_future(w.next_async())
+        await asyncio.sleep(0.05)
+        w.close()
+        with pytest.raises(ph.Closed):
+            await asyncio.wait_for(waiting, 1)
+
+    with mem.Store.create(fdb, "agents") as s:
+        run(main(s.watch("n")))
+
+
 # --- the consolidation loop ---
 
 
@@ -292,3 +309,185 @@ def test_a_reader_process_watch_cant_await(fdb, path):
                 run(main())
         finally:
             reader.close()
+
+
+# --- recall (#1560 PR 4, ICR 0124) ---
+
+
+def _hit(h):
+    sig = h.signals
+    signals = None if sig is None else tuple(
+        None if x is None else (x.rank, x.value)
+        for x in (sig.vector, sig.keyword, sig.recency, sig.importance, sig.uses, sig.graph)
+    )
+    return (h.id, h.text, h.kind, h.importance, h.created_us, h.superseded_by, h.score,
+            signals, h.embedding)
+
+
+def _stats(st):
+    return (st.candidates, st.truncated, st.expanded, st.expansion_truncated)
+
+
+def _fill(s, n=60):
+    words = ["deploy", "postgres", "cache", "memory", "agent", "index", "budget", "window"]
+    ids = []
+    for i in range(n):
+        text = f"{words[i % 8]} {words[(i * 3) % 8]} {words[(i * 5) % 8]} note {i}"
+        emb = [((i * 7) % 11) / 10 - 0.5, ((i * 3) % 5) / 4 - 0.5, (i % 4) / 3, 1.0]
+        r = s.remember("ns" if i % 3 else "other", text, embedding=emb,
+                       session="s1" if i % 2 else "s2", importance=(i % 10) / 10)
+        ids.append(r.id)
+    # A hub in "ns" (links stay within a namespace).
+    in_ns = [ids[i] for i in range(n) if i % 3]
+    for j, to in enumerate(in_ns[1::2]):
+        s.link(in_ns[0], to, 16, (j % 9 + 1) / 10)
+    for i in range(0, n, 7):
+        s.mark_used([ids[i]])
+    return ids
+
+
+_CASES = [
+    dict(text="deploy cache"),
+    dict(embedding=[0.2, -0.1, 0.5, 1.0]),
+    dict(text="memory agent", embedding=[0.1, 0.3, -0.2, 1.0], k=5, with_signals=True),
+    dict(text="postgres", session="s1", include_superseded=True, candidates=3),
+    dict(text="index budget", fusion="linear", with_embeddings=True),
+    dict(text="deploy", expand=mem.Expand(2, max=10), with_signals=True),
+    dict(embedding=[0.0, 0.0, 1.0, 1.0], expand=mem.Expand(3), byte_budget=300),
+    dict(text="window note", byte_budget=120, k=20),
+]
+
+
+def test_recall_async_returns_what_recall_returns(db):
+    """Every case's hits (signals and embeddings included) and stats, async against sync,
+    over one namespace and two, at a snapshot and at the latest."""
+
+    async def main(s, snap):
+        for case in _CASES:
+            for ns in ("ns", ["ns", "other"]):
+                for at in (None, snap):
+                    q = dict(case, now_us=1_900_000_000_000_000, snapshot=at)
+                    want, wst = s.recall_with_stats(ns, **q)
+                    got, gst = await s.recall_with_stats_async(ns, **q)
+                    ctx = (case, ns, at is not None)
+                    assert [_hit(h) for h in got] == [_hit(h) for h in want], ctx
+                    assert _stats(gst) == _stats(wst), ctx
+                    hits = await s.recall_async(ns, **q)
+                    assert [_hit(h) for h in hits] == [_hit(h) for h in want], ctx
+
+    with mem.Store.create(db, "agents", embedding=model()) as s:
+        _fill(s)
+        snap = db.snapshot()
+        run(main(s, snap))
+        snap.release()
+
+
+def test_recall_async_starts_on_the_bridge_not_at_the_call(db):
+    """ai1249's B1: a recall isn't polled inline, so even a warm recall's future is pending
+    when the call returns, and the loop runs meanwhile."""
+
+    async def main(s):
+        s.recall("ns", text="deploy")  # warm
+        f = s.recall_async("ns", text="deploy")
+        assert isinstance(f, asyncio.Future) and not f.done()
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while not f.done():
+                ticks += 1
+                await asyncio.sleep(0)
+
+        await asyncio.gather(f, tick())
+        assert ticks >= 1
+        assert [h.id for h in f.result()] == [h.id for h in s.recall("ns", text="deploy")]
+
+    with mem.Store.create(db, "agents", embedding=model()) as s:
+        _fill(s)
+        run(main(s))
+
+
+def test_concurrent_recall_async_each_return_what_recall_does(db):
+    async def main(s):
+        qs = [dict(c, now_us=1_900_000_000_000_000) for c in _CASES] * 4
+        got = await asyncio.gather(*[s.recall_async("ns", **q) for q in qs])
+        for q, hits in zip(qs, got):
+            assert [_hit(h) for h in hits] == [_hit(h) for h in s.recall("ns", **q)], q
+
+    with mem.Store.create(db, "agents", embedding=model()) as s:
+        _fill(s)
+        run(main(s))
+
+
+def test_recall_async_raises_what_recall_raises_and_survives_a_cancel(db):
+    async def main(s):
+        # Refused at the call, as the sync form refuses: a bad keyword.
+        with pytest.raises(ph.InvalidArgument):
+            s.recall_async("ns", text="x", fusion="nope")
+        # Refused by the recall itself: neither text nor an embedding.
+        with pytest.raises(ph.InvalidArgument):
+            await s.recall_async("ns")
+        with pytest.raises(ph.InvalidArgument):
+            await s.recall_async("ns", expand=mem.Expand(9), text="x")
+        # A cancelled recall leaves the bridge serving the next one.
+        f = s.recall_async("ns", text="deploy", expand=mem.Expand(3))
+        f.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await f
+        assert len(await s.recall_async("ns", text="deploy")) > 0
+
+    with mem.Store.create(db, "agents", embedding=model()) as s:
+        _fill(s)
+        run(main(s))
+    with pytest.raises(ph.Closed):
+        s.recall_async("ns", text="x")
+
+
+def test_a_reader_store_recalls_async(db, path):
+    async def main(rs):
+        for case in _CASES:
+            q = dict(case, now_us=1_900_000_000_000_000)
+            want, wst = rs.recall_with_stats("ns", **q)
+            got, gst = await rs.recall_with_stats_async("ns", **q)
+            assert [_hit(h) for h in got] == [_hit(h) for h in want], case
+            assert _stats(gst) == _stats(wst), case
+
+    with mem.Store.create(db, "agents", embedding=model()) as s:
+        _fill(s)
+        with ph.open_reader(path) as reader:
+            with mem.Store.open_reader(reader, "agents", model="m") as rs:
+                run(main(rs))
+
+
+_POOL_CHILD = r"""
+import asyncio, glob, sys
+import pigeonhole as ph
+from pigeonhole import memory as mem
+
+db = ph.open(sys.argv[1], create=True, shards=1)
+with mem.Store.create(db, "agents") as s:
+    for i in range(20):
+        s.remember("ns", f"deploy note {i}")
+
+    async def main():
+        return await asyncio.gather(*[s.recall_async("ns", text="deploy") for _ in range(16)])
+
+    assert all(len(h) > 0 for h in asyncio.run(main()))
+# Linux truncates a thread's name to 15 bytes: the pool's are "pigeonhole-asyn" (the
+# bridge thread would be too, but nothing here parks a commit, so it never starts).
+names = [open(p).read().strip() for p in glob.glob("/proc/self/task/*/comm")]
+print(sum(n == "pigeonhole-asyn" for n in names))
+db.close()
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="counts threads through /proc")
+@pytest.mark.parametrize("threads", [1, 3])
+def test_the_pool_has_the_threads_its_variable_asks_for(tmp_path, threads):
+    """PIGEONHOLE_ASYNCIO_POOL_THREADS sizes the pool recalls run on (g45, ICR 0124)."""
+    env = dict(os.environ, PIGEONHOLE_ASYNCIO_POOL_THREADS=str(threads))
+    out = subprocess.run(
+        [sys.executable, "-c", _POOL_CHILD, str(tmp_path / "p.phdb")],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert int(out.stdout.split()[-1]) == threads, out

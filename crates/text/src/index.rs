@@ -126,6 +126,22 @@ impl Rows {
         }
     }
 
+    /// [`Rows::get_at`] as a future (#1560): a cache or memtable hit resolves at its first
+    /// poll.
+    #[cfg(feature = "async")]
+    pub(crate) fn get_at_async(
+        &self,
+        s: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::nonblocking::GetFuture {
+        match self {
+            Rows::W(t) => t.get_at_async(s, row, family, qualifier),
+            Rows::R(t) => t.get_at_async(s, row, family, qualifier),
+        }
+    }
+
     pub(crate) fn row(&self, row: &[u8]) -> RowRead<'_> {
         match self {
             Rows::W(t) => t.row(row),

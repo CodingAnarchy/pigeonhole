@@ -15,6 +15,9 @@ mod args;
 mod cmd;
 mod exit;
 mod mcp;
+// The memory core: `phdb serve`'s `Memory` service and `phdb mcp`'s memory tools (D313
+// ticket 8b), synchronous and free of Tokio.
+mod memcore;
 mod open;
 mod output;
 #[cfg(feature = "serve")]

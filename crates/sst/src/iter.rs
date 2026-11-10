@@ -329,6 +329,20 @@ impl SstIter {
         self.upcoming_with(max, true, false, |_, fetch| out.push(fetch));
     }
 
+    /// A value that changes when the cursor moves to another data block (and stays while it
+    /// steps within one): its SST, index partition and index entry. What [`SstIter::upcoming`]
+    /// returns depends only on that, so an async walk asks it again only when this changes
+    /// (perf287 on #1625). Not a key: a value may in principle repeat across SSTs.
+    #[inline]
+    pub fn block_stamp(&self) -> u64 {
+        let top = self.top.as_ref().map_or(0, |t| t.entry_offset() as u64);
+        let index = self
+            .index
+            .as_ref()
+            .map_or(u64::MAX, |i| i.entry_offset() as u64);
+        (Arc::as_ptr(&self.reader) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (top << 32) ^ index
+    }
+
     /// Where this cursor's readahead ramp stands (#712), for [`SstIter::resume_readahead`].
     pub fn readahead_ramp(&self) -> ReadaheadRamp {
         ReadaheadRamp {

@@ -435,36 +435,65 @@ impl<'a> Recall<'a> {
     }
 
     /// [`run`](Self::run), with what the recall met.
+    ///
+    /// [`run_with_stats_async`](Self::run_with_stats_async) is its async twin: the same
+    /// steps in the same order, sharing every decision (`Pass`, `Hop`, `Walk`), with each
+    /// read's async form. A change to one goes into the other.
     pub fn run_with_stats(self) -> Result<(Vec<RecallHit>, RecallStats)> {
         let (text, spec) = self.check()?;
-        let owned;
-        let s = match self.snapshot {
-            Some(s) => s,
-            None => {
-                owned = match self.db {
-                    Snap::W(db) => db.snapshot()?,
-                    Snap::R(r) => r.snapshot()?,
-                };
-                &owned
-            }
-        };
-        let plan = Plan {
+        let owned = self.own_snapshot()?;
+        let s = self.snapshot.or(owned.as_ref()).expect("a snapshot");
+        let plan = self.plan(s, text, spec);
+        if self.k == 0 {
+            return Ok((Vec::new(), RecallStats::default()));
+        }
+        let mut stats = RecallStats::default();
+        // 1. Candidates.
+        let ivf_counts = self.ivf_counts(s)?;
+        let (mut cands, fell_back) = self.gather(&plan, &ivf_counts)?;
+        // 2. The graph expansion, seeded by the fused order without it.
+        if let Some(x) = self.expand {
+            let seeds = self.seeds(&mut cands);
+            self.expand_graph(&plan, &mut cands, seeds, x, &mut stats)?;
+            unscore(&mut cands);
+        }
+        // 3 and 4.
+        Ok(self.finish(cands, &ivf_counts, &fell_back, stats))
+    }
+
+    /// The snapshot the recall takes when none is given; `None` with one.
+    fn own_snapshot(&self) -> Result<Option<Snapshot>> {
+        if self.snapshot.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(match self.db {
+            Snap::W(db) => db.snapshot()?,
+            Snap::R(r) => r.snapshot()?,
+        }))
+    }
+
+    fn plan<'p>(
+        &self,
+        s: &'p Snapshot,
+        text: Option<&'p str>,
+        spec: Option<VectorSpec>,
+    ) -> Plan<'p> {
+        Plan {
             s,
             text,
             spec,
             now: self.at_us.unwrap_or_else(now_us),
-        };
-        let mut stats = RecallStats::default();
-        if self.k == 0 {
-            return Ok((Vec::new(), stats));
         }
-        // 1. Candidates.
-        let ivf_counts = self.ivf_counts(s)?;
-        let (mut cands, fell_back) = self.gather(&plan, &ivf_counts)?;
-        // 2. The graph expansion.
-        if let Some(x) = self.expand {
-            self.expand_from_fused(&plan, &mut cands, x, &mut stats)?;
-        }
+    }
+
+    /// Steps 3 and 4: the stats, the fusion and the hits.
+    fn finish(
+        &self,
+        mut cands: Vec<Cand>,
+        ivf_counts: &BTreeMap<&str, u64>,
+        fell_back: &BTreeSet<&str>,
+        mut stats: RecallStats,
+    ) -> (Vec<RecallHit>, RecallStats) {
         stats.candidates = cands.len();
         stats.ivf_fallbacks = fell_back.len();
         stats.ivf_namespaces = ivf_counts.len() - fell_back.len();
@@ -472,7 +501,7 @@ impl<'a> Recall<'a> {
         fuse(&mut cands, &self.signal_weights(), self.fusion);
         // 4. The hits.
         let out = self.take_hits(cands, &mut stats);
-        Ok((out, stats))
+        (out, stats)
     }
 
     /// The arguments' checks: the text to search for, if any, and the query embedding's
@@ -525,8 +554,7 @@ impl<'a> Recall<'a> {
     /// `min_namespace_len`. Not in the map: exact.
     fn ivf_counts(&self, s: &Snapshot) -> Result<BTreeMap<&str, u64>> {
         let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
-        if let (Some(ivf), Some(_), false) = (self.ivf, &self.embedding, self.exact) {
-            let min = ivf.options().get_min_namespace_len();
+        if let Some(min) = self.ivf_min() {
             for ns in &self.namespaces {
                 let c = crate::ivf::count(&self.rows, s, ns)?;
                 if c >= min {
@@ -535,6 +563,42 @@ impl<'a> Recall<'a> {
             }
         }
         Ok(ivf_counts)
+    }
+
+    /// The namespace length from which the IVF index serves this recall, if it can.
+    fn ivf_min(&self) -> Option<u64> {
+        match (self.ivf, &self.embedding, self.exact) {
+            (Some(ivf), Some(_), false) => Some(ivf.options().get_min_namespace_len()),
+            _ => None,
+        }
+    }
+
+    /// The IVF index and `ns`'s count, if its vector list comes from the index this pass:
+    /// it's large enough, and hasn't fallen back to exact.
+    fn ivf_for(
+        &self,
+        ns: &str,
+        ivf_counts: &BTreeMap<&str, u64>,
+        fell_back: &BTreeSet<&str>,
+    ) -> Option<(&'a crate::ivf::Ivf, u64)> {
+        match (self.ivf, ivf_counts.get(ns)) {
+            (Some(ivf), Some(&c)) if !fell_back.contains(ns) => Some((ivf, c)),
+            _ => None,
+        }
+    }
+
+    /// Adds the candidate in `row`, if it passes the filters, to `into`.
+    fn admit(
+        &self,
+        into: &mut BTreeMap<Vec<u8>, Cand>,
+        key: &[u8],
+        row: &pigeonhole::RowRef<'_>,
+        plan: &Plan<'_>,
+    ) -> Result<()> {
+        if let Some(c) = self.candidate(key, row, plan.spec.as_ref(), plan.now)? {
+            into.insert(key.to_vec(), c);
+        }
+        Ok(())
     }
 
     /// Step 1, the candidates: per namespace and signal, its best `n`, read in one
@@ -547,124 +611,58 @@ impl<'a> Recall<'a> {
         plan: &Plan<'_>,
         ivf_counts: &BTreeMap<&str, u64>,
     ) -> Result<(Vec<Cand>, BTreeSet<&str>)> {
-        let (s, text, spec, now) = (plan.s, plan.text, plan.spec.as_ref(), plan.now);
+        let s = plan.s;
         let mut n = self.per_signal.max(1);
         let mut fell_back: BTreeSet<&str> = BTreeSet::new();
-        let (lists, eligible) = loop {
-            let mut lists: Vec<(usize, Vec<Vec<u8>>, bool)> = Vec::new();
-            let mut scores: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
+        loop {
+            let mut pass = Pass::new(n);
             for ns in &self.namespaces {
                 let prefix = [ns.as_bytes(), MEMORY_TAG].concat();
                 if let Some(e) = &self.embedding {
-                    let via_ivf = match (self.ivf, ivf_counts.get(ns.as_str())) {
-                        (Some(ivf), Some(&c)) if !fell_back.contains(ns.as_str()) => {
+                    let via_ivf = match self.ivf_for(ns, ivf_counts, &fell_back) {
+                        Some((ivf, c)) => {
                             let found = ivf.nearest(s, &prefix, e, n, c, self.nprobe)?;
                             if found.is_none() {
                                 fell_back.insert(ns.as_str());
                             }
                             found
                         }
-                        _ => None,
+                        None => None,
                     };
                     let l = match via_ivf {
                         Some(l) => l,
                         None => self.rows.nearest(s, &prefix, e, n)?,
                     };
-                    let full = l.len() == n;
-                    lists.push((0, l, full));
+                    pass.list(0, l);
                 }
-                if let Some(t) = text {
-                    let hits = self.index.search(s, t, &prefix, n)?;
-                    let full = hits.len() == n;
-                    let mut l = Vec::with_capacity(hits.len());
-                    for (id, score) in hits {
-                        scores.insert(id.clone(), score);
-                        l.push(id);
-                    }
-                    lists.push((1, l, full));
+                if let Some(t) = plan.text {
+                    pass.keyword(self.index.search(s, t, &prefix, n)?);
                 }
-                let l = self.rows.newest(s, &prefix, n)?;
-                let full = l.len() == n;
-                lists.push((2, l, full));
+                pass.list(2, self.rows.newest(s, &prefix, n)?);
             }
-            let keys: BTreeSet<&Vec<u8>> = lists.iter().flat_map(|(_, l, _)| l.iter()).collect();
-            let set = KeySet::from_unsorted(keys.into_iter().collect::<Vec<_>>());
             let mut eligible: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
-            self.rows.read_each(s, &set, |key, row| {
-                if let Some(c) = self.candidate(key, row, spec, now)? {
-                    eligible.insert(key.to_vec(), c);
-                }
-                Ok(())
+            self.rows.read_each(s, &pass.keys(), |key, row| {
+                self.admit(&mut eligible, key, row, plan)
             })?;
-            let done = lists.iter().all(|(_, l, full)| {
-                !full || l.iter().filter(|k| eligible.contains_key(*k)).count() >= self.per_signal
-            });
-            if done {
-                // BM25 counts for the keyword lists' kept keys only (below).
-                for c in eligible.values_mut() {
-                    c.vals[1] = None;
-                }
-                for (sig, l, _) in &lists {
-                    if *sig == 1 {
-                        let top: Vec<&Vec<u8>> = l
-                            .iter()
-                            .filter(|k| eligible.contains_key(*k))
-                            .take(self.per_signal)
-                            .collect();
-                        for k in top {
-                            if let Some(c) = eligible.get_mut(k) {
-                                c.vals[1] = scores.get(k).copied();
-                            }
-                        }
-                    }
-                }
-                break (lists, eligible);
+            if let Some(cands) = pass.settle(eligible, self.per_signal) {
+                return Ok((cands, fell_back));
             }
             n = n.saturating_mul(2);
-        };
-        // Each list's best `per_signal` eligible memories, together.
-        let mut kept: BTreeSet<&Vec<u8>> = BTreeSet::new();
-        for (_, l, _) in &lists {
-            for k in l
-                .iter()
-                .filter(|k| eligible.contains_key(*k))
-                .take(self.per_signal)
-            {
-                kept.insert(k);
-            }
         }
-        let kept: BTreeSet<Vec<u8>> = kept.into_iter().cloned().collect();
-        let cands: Vec<Cand> = eligible
-            .into_iter()
-            .filter(|(k, _)| kept.contains(k))
-            .map(|(_, c)| c)
-            .collect();
-        Ok((cands, fell_back))
     }
 
-    /// Step 2, the graph expansion: seeded by the fused order without it.
-    fn expand_from_fused(
-        &self,
-        plan: &Plan<'_>,
-        cands: &mut Vec<Cand>,
-        x: Expand,
-        stats: &mut RecallStats,
-    ) -> Result<()> {
+    /// Step 2's seeds: the candidates in fused order without the graph signal, the best
+    /// [`GRAPH_SEEDS`] each valued by its rank.
+    fn seeds(&self, cands: &mut [Cand]) -> Vec<(Vec<u8>, f64)> {
         let mut w = self.signal_weights();
         w[5] = 0.0;
         fuse(cands, &w, self.fusion);
-        let seeds = cands
+        cands
             .iter()
             .take(GRAPH_SEEDS)
             .enumerate()
             .map(|(i, c)| (c.key.clone(), 1.0 / (i + 1) as f64))
-            .collect();
-        self.expand_graph(plan, cands, seeds, x, stats)?;
-        for c in cands.iter_mut() {
-            c.score = 0.0;
-            c.ranks = [None; 6];
-        }
-        Ok(())
+            .collect()
     }
 
     /// Step 4: the candidates in fused order, within `k` and the byte budget.
@@ -732,105 +730,36 @@ impl<'a> Recall<'a> {
         x: Expand,
         stats: &mut RecallStats,
     ) -> Result<()> {
-        let (s, spec, now) = (plan.s, plan.spec.as_ref(), plan.now);
-        let mut at: BTreeMap<Vec<u8>, usize> = cands
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.key.clone(), i))
-            .collect();
-        // Seeds and earlier hops' memories: not reached again.
-        let mut visited: BTreeSet<Vec<u8>> = seeds.iter().map(|(k, _)| k.clone()).collect();
-        // Rows the recall couldn't return: neither scored nor walked through.
-        let mut ineligible: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut budget = self.byte_budget;
-        let mut graphed = 0usize;
-        let mut level = seeds;
+        let s = plan.s;
+        let mut walk = Walk::new(cands, seeds, x, self.byte_budget);
         for _ in 0..x.hops {
-            if graphed == x.max {
+            if walk.full() {
                 break;
             }
-            // Every link of this hop, each memory valued by its best one. A hop the budget
-            // can't hold whole is dropped, so the hops kept are exact.
-            let mut reached: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-            let mut read = 0u64;
-            for (q, vq) in &level {
+            let mut hop = Hop::default();
+            for (q, vq) in &walk.level {
                 for fam in [LINKS, BACKLINKS] {
-                    // With nothing left, a budget of 1 still cuts at the first node (and
-                    // only if there is one); 0 would mean no budget.
-                    let left = budget.map_or(0, |b| b.saturating_sub(read).max(1));
-                    let (edges, cut) = self.rows.edges(s, q, fam, left)?;
+                    let (edges, cut) = self.rows.edges(s, q, fam, hop.left(walk.budget))?;
                     if cut {
-                        stats.expansion_truncated = true;
-                        stats.expanded = graphed;
+                        walk.cut(stats);
                         return Ok(());
                     }
-                    read += edges
-                        .iter()
-                        .map(|(k, _)| k.len() as u64 + ITEM_OVERHEAD)
-                        .sum::<u64>();
-                    for (n, w) in edges {
-                        if visited.contains(&n) || ineligible.contains(&n) {
-                            continue;
-                        }
-                        let v = vq * f64::from(w);
-                        let e = reached.entry(n).or_insert(v);
-                        if v > *e {
-                            *e = v;
-                        }
-                    }
+                    hop.add(*vq, edges, &walk.visited, &walk.ineligible);
                 }
             }
-            if let Some(b) = budget.as_mut() {
-                *b = b.saturating_sub(read);
-            }
-            // The recall's own filters: what it couldn't return is neither scored nor walked
-            // through.
-            let unknown: Vec<&Vec<u8>> = reached.keys().filter(|k| !at.contains_key(*k)).collect();
+            let unknown = walk.unknown(&hop);
             let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
             if !unknown.is_empty() {
                 let set = KeySet::from_unsorted(unknown.iter().copied());
-                self.rows.read_each(s, &set, |key, row| {
-                    if let Some(c) = self.candidate(key, row, spec, now)? {
-                        fresh.insert(key.to_vec(), c);
-                    }
-                    Ok(())
-                })?;
-                for k in unknown {
-                    if !fresh.contains_key(k) {
-                        ineligible.insert(k.clone());
-                    }
-                }
+                self.rows
+                    .read_each(s, &set, |key, row| self.admit(&mut fresh, key, row, plan))?;
+                walk.filtered_out(&unknown, &fresh);
             }
-            let mut l: Vec<(Vec<u8>, f64)> = reached
-                .into_iter()
-                .filter(|(k, _)| !ineligible.contains(k))
-                .collect();
-            l.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            // The best-valued ones, up to `max` in all.
-            if l.len() > x.max - graphed {
-                l.truncate(x.max - graphed);
-                stats.expansion_truncated = true;
-            }
-            for (n, v) in &l {
-                let i = match at.get(n) {
-                    Some(&i) => i,
-                    None => {
-                        let c = fresh.remove(n).expect("an eligible row was read");
-                        at.insert(n.clone(), cands.len());
-                        cands.push(c);
-                        cands.len() - 1
-                    }
-                };
-                cands[i].vals[5] = Some(*v);
-                visited.insert(n.clone());
-            }
-            graphed += l.len();
-            if l.is_empty() {
+            if !walk.settle(hop, fresh, cands, stats) {
                 break;
             }
-            level = l;
         }
-        stats.expanded = graphed;
+        stats.expanded = walk.graphed;
         Ok(())
     }
 
@@ -946,6 +875,250 @@ struct Cand {
     hit: RecallHit,
 }
 
+/// Clears the scores and ranks the seeding fusion left, so the final one starts afresh.
+fn unscore(cands: &mut [Cand]) {
+    for c in cands.iter_mut() {
+        c.score = 0.0;
+        c.ranks = [None; 6];
+    }
+}
+
+/// One pass of the gather at `n` per list: each namespace's lists in order (vector,
+/// keyword, recency), each with whether it came back full, and the keyword scores. Both
+/// forms of the recall fill it in the same order and settle it here.
+struct Pass {
+    n: usize,
+    lists: Vec<(usize, Vec<Vec<u8>>, bool)>,
+    scores: BTreeMap<Vec<u8>, f64>,
+}
+
+impl Pass {
+    fn new(n: usize) -> Self {
+        Pass {
+            n,
+            lists: Vec::new(),
+            scores: BTreeMap::new(),
+        }
+    }
+
+    /// Signal `sig`'s list.
+    fn list(&mut self, sig: usize, l: Vec<Vec<u8>>) {
+        let full = l.len() == self.n;
+        self.lists.push((sig, l, full));
+    }
+
+    /// The keyword list, with its BM25 scores.
+    fn keyword(&mut self, hits: Vec<(Vec<u8>, f64)>) {
+        let mut l = Vec::with_capacity(hits.len());
+        for (id, score) in hits {
+            self.scores.insert(id.clone(), score);
+            l.push(id);
+        }
+        self.list(1, l);
+    }
+
+    /// Every list's rows, for one multi-get.
+    fn keys(&self) -> KeySet {
+        let keys: BTreeSet<&Vec<u8>> = self.lists.iter().flat_map(|(_, l, _)| l.iter()).collect();
+        KeySet::from_unsorted(keys.into_iter().collect::<Vec<_>>())
+    }
+
+    /// The candidates, once every list holds `per_signal` that pass the filters or came back
+    /// short (its namespace is exhausted): each list's best `per_signal` eligible memories,
+    /// together. `None`: a list is full with fewer, so `n` doubles.
+    fn settle(self, mut eligible: BTreeMap<Vec<u8>, Cand>, per_signal: usize) -> Option<Vec<Cand>> {
+        let done = self.lists.iter().all(|(_, l, full)| {
+            !full || l.iter().filter(|k| eligible.contains_key(*k)).count() >= per_signal
+        });
+        if !done {
+            return None;
+        }
+        // BM25 counts for the keyword lists' kept keys only (below).
+        for c in eligible.values_mut() {
+            c.vals[1] = None;
+        }
+        for (sig, l, _) in &self.lists {
+            if *sig == 1 {
+                let top: Vec<&Vec<u8>> = l
+                    .iter()
+                    .filter(|k| eligible.contains_key(*k))
+                    .take(per_signal)
+                    .collect();
+                for k in top {
+                    if let Some(c) = eligible.get_mut(k) {
+                        c.vals[1] = self.scores.get(k).copied();
+                    }
+                }
+            }
+        }
+        let mut kept: BTreeSet<&Vec<u8>> = BTreeSet::new();
+        for (_, l, _) in &self.lists {
+            for k in l
+                .iter()
+                .filter(|k| eligible.contains_key(*k))
+                .take(per_signal)
+            {
+                kept.insert(k);
+            }
+        }
+        let kept: BTreeSet<Vec<u8>> = kept.into_iter().cloned().collect();
+        Some(
+            eligible
+                .into_iter()
+                .filter(|(k, _)| kept.contains(k))
+                .map(|(_, c)| c)
+                .collect(),
+        )
+    }
+}
+
+/// A graph expansion's state between hops ([`Recall::expand_graph`]), shared by both forms.
+struct Walk {
+    /// Each candidate's index in `cands`.
+    at: BTreeMap<Vec<u8>, usize>,
+    /// Seeds and earlier hops' memories: not reached again.
+    visited: BTreeSet<Vec<u8>>,
+    /// Rows the recall couldn't return: neither scored nor walked through.
+    ineligible: BTreeSet<Vec<u8>>,
+    budget: Option<u64>,
+    graphed: usize,
+    max: usize,
+    /// The memories the next hop walks from, each with its value, best first.
+    level: Vec<(Vec<u8>, f64)>,
+}
+
+/// One hop's links: every memory it reaches, valued by its best link, and the bytes read.
+#[derive(Default)]
+struct Hop {
+    reached: BTreeMap<Vec<u8>, f64>,
+    read: u64,
+}
+
+impl Hop {
+    /// The budget for the hop's next `edges`: what's left of `budget` after this hop's
+    /// reads. With nothing left, a budget of 1 still cuts at the first node (and only if
+    /// there is one); 0 would mean no budget.
+    fn left(&self, budget: Option<u64>) -> u64 {
+        budget.map_or(0, |b| b.saturating_sub(self.read).max(1))
+    }
+
+    /// The links from a memory valued `vq`.
+    fn add(
+        &mut self,
+        vq: f64,
+        edges: Vec<Edge>,
+        visited: &BTreeSet<Vec<u8>>,
+        ineligible: &BTreeSet<Vec<u8>>,
+    ) {
+        self.read += edges
+            .iter()
+            .map(|(k, _)| k.len() as u64 + ITEM_OVERHEAD)
+            .sum::<u64>();
+        for (n, w) in edges {
+            if visited.contains(&n) || ineligible.contains(&n) {
+                continue;
+            }
+            let v = vq * f64::from(w);
+            let e = self.reached.entry(n).or_insert(v);
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
+}
+
+impl Walk {
+    fn new(cands: &[Cand], seeds: Vec<(Vec<u8>, f64)>, x: Expand, budget: Option<u64>) -> Self {
+        Walk {
+            at: cands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.key.clone(), i))
+                .collect(),
+            visited: seeds.iter().map(|(k, _)| k.clone()).collect(),
+            ineligible: BTreeSet::new(),
+            budget,
+            graphed: 0,
+            max: x.max,
+            level: seeds,
+        }
+    }
+
+    /// Whether `max` memories have their graph signal.
+    fn full(&self) -> bool {
+        self.graphed == self.max
+    }
+
+    /// A hop the budget can't hold whole is dropped, so the hops kept are exact.
+    fn cut(&self, stats: &mut RecallStats) {
+        stats.expansion_truncated = true;
+        stats.expanded = self.graphed;
+    }
+
+    /// What `hop` reached that isn't a candidate yet: its rows are read to apply the
+    /// recall's own filters.
+    fn unknown<'h>(&self, hop: &'h Hop) -> Vec<&'h Vec<u8>> {
+        hop.reached
+            .keys()
+            .filter(|k| !self.at.contains_key(*k))
+            .collect()
+    }
+
+    /// Of `unknown`, what the filters left out of `fresh` is neither scored nor walked
+    /// through.
+    fn filtered_out(&mut self, unknown: &[&Vec<u8>], fresh: &BTreeMap<Vec<u8>, Cand>) {
+        for k in unknown {
+            if !fresh.contains_key(*k) {
+                self.ineligible.insert((*k).clone());
+            }
+        }
+    }
+
+    /// Ends a hop: its best-valued memories, up to `max` in all, get their graph values
+    /// (`fresh` holds the new candidates' rows) and are the next hop's level. `false`: it
+    /// reached none, so the walk ends.
+    fn settle(
+        &mut self,
+        hop: Hop,
+        mut fresh: BTreeMap<Vec<u8>, Cand>,
+        cands: &mut Vec<Cand>,
+        stats: &mut RecallStats,
+    ) -> bool {
+        if let Some(b) = self.budget.as_mut() {
+            *b = b.saturating_sub(hop.read);
+        }
+        let mut l: Vec<(Vec<u8>, f64)> = hop
+            .reached
+            .into_iter()
+            .filter(|(k, _)| !self.ineligible.contains(k))
+            .collect();
+        l.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if l.len() > self.max - self.graphed {
+            l.truncate(self.max - self.graphed);
+            stats.expansion_truncated = true;
+        }
+        for (n, v) in &l {
+            let i = match self.at.get(n) {
+                Some(&i) => i,
+                None => {
+                    let c = fresh.remove(n).expect("an eligible row was read");
+                    self.at.insert(n.clone(), cands.len());
+                    cands.push(c);
+                    cands.len() - 1
+                }
+            };
+            cands[i].vals[5] = Some(*v);
+            self.visited.insert(n.clone());
+        }
+        self.graphed += l.len();
+        if l.is_empty() {
+            return false;
+        }
+        self.level = l;
+        true
+    }
+}
+
 /// Ranks every signal among `cands` and adds each one's weighted term to their scores, then
 /// sorts them best first (ties by id).
 fn fuse(cands: &mut [Cand], w: &[f64; 6], fusion: Fusion) {
@@ -1013,6 +1186,40 @@ pub(crate) fn hit_size(hit: &RecallHit, with_signals: bool) -> u64 {
 /// The cosine distance the store's family ranks by.
 fn similarity_distance(spec: &VectorSpec, q: &[f32], v: pigeonhole::VectorRef<'_>) -> Result<f64> {
     Ok(spec.distance_f32(q, v)?)
+}
+
+/// A one-hop traversal's nodes, and whether its budget cut them.
+fn linked(t: &pigeonhole::Traversal) -> (Vec<Vec<u8>>, bool) {
+    let nodes = t
+        .hops()
+        .first()
+        .map(|h| h.nodes().iter().map(<[u8]>::to_vec).collect())
+        .unwrap_or_default();
+    (nodes, t.stats().cut_by_budget)
+}
+
+/// Each of `nodes` with its link's weight, from the linking memory's `row` over the range
+/// the traversal returned.
+fn weighted(nodes: Vec<Vec<u8>>, row: Option<&pigeonhole::RowRef<'_>>) -> Result<Vec<Edge>> {
+    let mut weights: BTreeMap<Vec<u8>, f32> = BTreeMap::new();
+    if let Some(row) = row {
+        for e in row.iter() {
+            let v = e.cell.value();
+            if v.len() != 5 {
+                return Err(corrupt("a link's value"));
+            }
+            let w = f32::from_le_bytes(v[1..].try_into().expect("4"));
+            weights.insert(e.qualifier.to_vec(), w);
+        }
+    }
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let w = *weights
+            .get(&n)
+            .ok_or_else(|| corrupt("a link the traversal read"))?;
+        out.push((n, w));
+    }
+    Ok(out)
 }
 
 impl Rows<'_> {
@@ -1143,40 +1350,17 @@ impl Rows<'_> {
                     .snapshot(s)
                     .byte_budget(budget)
                     .run()?;
-                let cut = t.stats().cut_by_budget;
-                let nodes: Vec<Vec<u8>> = t
-                    .hops()
-                    .first()
-                    .map(|h| h.nodes().iter().map(<[u8]>::to_vec).collect())
-                    .unwrap_or_default();
+                let (nodes, cut) = linked(&t);
                 let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
                     return Ok((Vec::new(), cut));
                 };
-                let mut weights: BTreeMap<Vec<u8>, f32> = BTreeMap::new();
-                if let Some(row) = $t
+                let row = $t
                     .row(from)
                     .family(fam)
                     .qualifier_bounds(Bound::Included(first), Bound::Included(last))
                     .snapshot(s)
-                    .read()?
-                {
-                    for e in row.iter() {
-                        let v = e.cell.value();
-                        if v.len() != 5 {
-                            return Err(corrupt("a link's value"));
-                        }
-                        let w = f32::from_le_bytes(v[1..].try_into().expect("4"));
-                        weights.insert(e.qualifier.to_vec(), w);
-                    }
-                }
-                let mut out = Vec::with_capacity(nodes.len());
-                for n in nodes {
-                    let w = *weights
-                        .get(&n)
-                        .ok_or_else(|| corrupt("a link the traversal read"))?;
-                    out.push((n, w));
-                }
-                Ok((out, cut))
+                    .read()?;
+                Ok((weighted(nodes, row.as_ref())?, cut))
             }};
         }
         match self {
@@ -1231,6 +1415,407 @@ impl Idx<'_> {
             Idx::W(i) => i.search(q, n).snapshot(s).id_prefix(prefix).run()?,
             Idx::R(i) => i.search(q, n).snapshot(s).id_prefix(prefix).run()?,
         };
+        Ok(hits.into_iter().map(|h| (h.id, h.score)).collect())
+    }
+}
+
+/// The async recall (#1560, ICR 0124): [`Recall::run_with_stats`]'s steps in the same order,
+/// with each read's async form and the same shared decisions (`Pass`, `Hop`, `Walk`).
+#[cfg(feature = "async")]
+impl<'a> Recall<'a> {
+    /// [`run`](Self::run) as a future: the same hits, with the recall's reads asynchronous,
+    /// so it doesn't block an executor thread on the cache's misses. Each namespace's
+    /// vector, keyword and recency lists are read together. A poll yields after 256 rows
+    /// of its own (its recency lists' and candidates' rows), so a warm recall over a large
+    /// namespace doesn't hold the thread either. The future is `Send`.
+    ///
+    /// One gap remains (#1652): a row longer than a block in the engine's key-set reads (the
+    /// candidates' multi-get, a graph expansion's traversal, an IVF list) has its later
+    /// blocks read synchronously, counted in `EngineMetrics::async_sync_reads`: at most a
+    /// block or two per recall.
+    ///
+    /// The same refusals as `run`. It works in a reader process
+    /// ([`ReadStore::recall`](crate::ReadStore::recall)) too: every read a recall makes has
+    /// an async form there, so none is refused.
+    pub async fn run_async(self) -> Result<Vec<RecallHit>> {
+        Ok(self.run_with_stats_async().await?.0)
+    }
+
+    /// [`run_with_stats`](Self::run_with_stats) as a future: [`run_async`](Self::run_async),
+    /// with what the recall met. The same stats as the sync form.
+    ///
+    /// The async twin of `run_with_stats`: a change to one goes into the other.
+    pub async fn run_with_stats_async(self) -> Result<(Vec<RecallHit>, RecallStats)> {
+        let (text, spec) = self.check()?;
+        let owned = self.own_snapshot()?;
+        let s = self.snapshot.or(owned.as_ref()).expect("a snapshot");
+        let plan = self.plan(s, text, spec);
+        if self.k == 0 {
+            return Ok((Vec::new(), RecallStats::default()));
+        }
+        let mut stats = RecallStats::default();
+        // The row loops' yield budget, shared by every list and multi-get (ai1249's R1).
+        let rows = Yields::new();
+        // 1. Candidates.
+        let ivf_counts = self.ivf_counts_async(s).await?;
+        let (mut cands, fell_back) = self.gather_async(&plan, &ivf_counts, &rows).await?;
+        // 2. The graph expansion, seeded by the fused order without it.
+        if let Some(x) = self.expand {
+            let seeds = self.seeds(&mut cands);
+            self.expand_graph_async(&plan, &mut cands, seeds, x, &mut stats, &rows)
+                .await?;
+            unscore(&mut cands);
+        }
+        // 3 and 4.
+        Ok(self.finish(cands, &ivf_counts, &fell_back, stats))
+    }
+
+    /// [`ivf_counts`](Self::ivf_counts)' async twin.
+    async fn ivf_counts_async(&self, s: &Snapshot) -> Result<BTreeMap<&str, u64>> {
+        let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
+        if let Some(min) = self.ivf_min() {
+            for ns in &self.namespaces {
+                let c = crate::ivf::count_async(&self.rows, s, ns).await?;
+                if c >= min {
+                    ivf_counts.insert(ns.as_str(), c);
+                }
+            }
+        }
+        Ok(ivf_counts)
+    }
+
+    /// [`gather`](Self::gather)'s async twin: per namespace, its vector, keyword and
+    /// recency lists are read together, and added to the pass in the sync form's order.
+    async fn gather_async(
+        &self,
+        plan: &Plan<'_>,
+        ivf_counts: &BTreeMap<&str, u64>,
+        rows: &Yields,
+    ) -> Result<(Vec<Cand>, BTreeSet<&str>)> {
+        let s = plan.s;
+        let mut n = self.per_signal.max(1);
+        let mut fell_back: BTreeSet<&str> = BTreeSet::new();
+        loop {
+            let mut pass = Pass::new(n);
+            for ns in &self.namespaces {
+                let prefix = [ns.as_bytes(), MEMORY_TAG].concat();
+                let ivf = self.ivf_for(ns, ivf_counts, &fell_back);
+                let vector = async {
+                    let Some(e) = &self.embedding else {
+                        return Ok(None);
+                    };
+                    let via_ivf = match ivf {
+                        Some((ivf, c)) => {
+                            ivf.nearest_async(s, &prefix, e, n, c, self.nprobe).await?
+                        }
+                        None => None,
+                    };
+                    let fell = ivf.is_some() && via_ivf.is_none();
+                    let l = match via_ivf {
+                        Some(l) => l,
+                        None => self.rows.nearest_async(s, &prefix, e, n).await?,
+                    };
+                    Ok::<_, Error>(Some((l, fell)))
+                };
+                let keyword = async {
+                    match plan.text {
+                        Some(t) => self.index.search_async(s, t, &prefix, n).await.map(Some),
+                        None => Ok(None),
+                    }
+                };
+                let newest = self.rows.newest_async(s, &prefix, n, rows);
+                let (vector, keyword, newest) = join3(vector, keyword, newest).await;
+                if let Some((l, fell)) = vector? {
+                    if fell {
+                        fell_back.insert(ns.as_str());
+                    }
+                    pass.list(0, l);
+                }
+                if let Some(hits) = keyword? {
+                    pass.keyword(hits);
+                }
+                pass.list(2, newest?);
+            }
+            let mut eligible: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+            self.rows
+                .read_each_async(s, &pass.keys(), rows, |key, row| {
+                    self.admit(&mut eligible, key, row, plan)
+                })
+                .await?;
+            if let Some(cands) = pass.settle(eligible, self.per_signal) {
+                return Ok((cands, fell_back));
+            }
+            n = n.saturating_mul(2);
+        }
+    }
+
+    /// [`expand_graph`](Self::expand_graph)'s async twin: the same budget arithmetic
+    /// ([`Hop`]), hop by hop, link by link.
+    async fn expand_graph_async(
+        &self,
+        plan: &Plan<'_>,
+        cands: &mut Vec<Cand>,
+        seeds: Vec<(Vec<u8>, f64)>,
+        x: Expand,
+        stats: &mut RecallStats,
+        rows: &Yields,
+    ) -> Result<()> {
+        let s = plan.s;
+        let mut walk = Walk::new(cands, seeds, x, self.byte_budget);
+        for _ in 0..x.hops {
+            if walk.full() {
+                break;
+            }
+            let mut hop = Hop::default();
+            for (q, vq) in &walk.level {
+                for fam in [LINKS, BACKLINKS] {
+                    let left = hop.left(walk.budget);
+                    let (edges, cut) = self.rows.edges_async(s, q, fam, left).await?;
+                    if cut {
+                        walk.cut(stats);
+                        return Ok(());
+                    }
+                    hop.add(*vq, edges, &walk.visited, &walk.ineligible);
+                }
+            }
+            let unknown = walk.unknown(&hop);
+            let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+            if !unknown.is_empty() {
+                let set = KeySet::from_unsorted(unknown.iter().copied());
+                self.rows
+                    .read_each_async(s, &set, rows, |key, row| {
+                        self.admit(&mut fresh, key, row, plan)
+                    })
+                    .await?;
+                walk.filtered_out(&unknown, &fresh);
+            }
+            if !walk.settle(hop, fresh, cands, stats) {
+                break;
+            }
+        }
+        stats.expanded = walk.graphed;
+        Ok(())
+    }
+}
+
+/// Rows an async recall reads and handles in one poll before it yields: its recency
+/// lists' and multi-gets' rows together (ai1249's R1 on #1654). A filtered recall's
+/// doubling can grow a list to its namespace's size, so without it a warm recall over a
+/// large namespace would read three lists' worth of rows in one poll. The reads it calls
+/// (the vector, text and traversal searches) yield on their own budgets.
+#[cfg(feature = "async")]
+const RECALL_POLL_ROWS: u32 = 256;
+
+/// An async recall's shared row budget ([`RECALL_POLL_ROWS`]): an atomic, so the joined
+/// lists share it and the future stays `Send`.
+#[cfg(feature = "async")]
+struct Yields(std::sync::atomic::AtomicU32);
+
+#[cfg(feature = "async")]
+impl Yields {
+    fn new() -> Self {
+        Yields(std::sync::atomic::AtomicU32::new(RECALL_POLL_ROWS))
+    }
+
+    /// Counts a row; after [`RECALL_POLL_ROWS`] of them, wakes the task and returns
+    /// `Pending` once, with the budget renewed.
+    async fn row(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.0.fetch_sub(1, Relaxed) > 1 {
+            return;
+        }
+        self.0.store(RECALL_POLL_ROWS, Relaxed);
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// Polls three futures together until each is done, each in turn on every wake, and
+/// returns their outputs in order: the recall's "awaited together" without a dependency
+/// for it (ai1249 on #1560).
+#[cfg(feature = "async")]
+async fn join3<A: Future, B: Future, C: Future>(
+    a: A,
+    b: B,
+    c: C,
+) -> (A::Output, B::Output, C::Output) {
+    let (mut a, mut b, mut c) = (std::pin::pin!(a), std::pin::pin!(b), std::pin::pin!(c));
+    let (mut ra, mut rb, mut rc) = (None, None, None);
+    std::future::poll_fn(move |cx| {
+        if ra.is_none()
+            && let std::task::Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
+        }
+        if rb.is_none()
+            && let std::task::Poll::Ready(v) = b.as_mut().poll(cx)
+        {
+            rb = Some(v);
+        }
+        if rc.is_none()
+            && let std::task::Poll::Ready(v) = c.as_mut().poll(cx)
+        {
+            rc = Some(v);
+        }
+        if ra.is_some() && rb.is_some() && rc.is_some() {
+            std::task::Poll::Ready((ra.take().unwrap(), rb.take().unwrap(), rc.take().unwrap()))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+#[cfg(feature = "async")]
+impl Rows<'_> {
+    /// [`counter_at`](Self::counter_at), async.
+    pub(crate) async fn counter_at_async(
+        &self,
+        s: &Snapshot,
+        row: &[u8],
+        family: &str,
+        q: &[u8],
+    ) -> Result<Option<i64>> {
+        let get = match self {
+            Rows::W(t) => t.get_at_async(s, row, family, q),
+            Rows::R(t) => t.get_at_async(s, row, family, q),
+        };
+        Ok(get.await?.and_then(|c| c.as_i64()))
+    }
+
+    /// [`nearest`](Self::nearest), async.
+    async fn nearest_async(
+        &self,
+        s: &Snapshot,
+        prefix: &[u8],
+        q: &[f32],
+        n: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let scan = match self {
+            Rows::W(t) => t.scan_prefix(prefix),
+            Rows::R(t) => t.scan_prefix(prefix),
+        };
+        let found = scan
+            .family(EMB)
+            .snapshot(s)
+            .nearest_f32(q, n)
+            .run_async()
+            .await?;
+        Ok(found.into_iter().map(|n| n.row).collect())
+    }
+
+    /// [`newest`](Self::newest), async: the scan as a stream.
+    async fn newest_async(
+        &self,
+        s: &Snapshot,
+        prefix: &[u8],
+        n: usize,
+        yields: &Yields,
+    ) -> Result<Vec<Vec<u8>>> {
+        use futures_core::Stream;
+        let scan = match self {
+            Rows::W(t) => t.scan_prefix(prefix),
+            Rows::R(t) => t.scan_prefix(prefix),
+        };
+        let mut rows = std::pin::pin!(scan.family(CONTENT).snapshot(s).limit(n as u64).stream());
+        let mut out = Vec::new();
+        while let Some(r) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+            out.push(r?.key().to_vec());
+            yields.row().await;
+        }
+        Ok(out)
+    }
+
+    /// [`edges`](Self::edges), async: the traversal and the linking row's read.
+    async fn edges_async(
+        &self,
+        s: &Snapshot,
+        from: &[u8],
+        fam: &str,
+        budget: u64,
+    ) -> Result<(Vec<Edge>, bool)> {
+        let seeds = KeySet::from_unsorted([from]);
+        let traverse = match self {
+            Rows::W(t) => t.traverse(&seeds),
+            Rows::R(t) => t.traverse(&seeds),
+        };
+        let t = traverse
+            .family(fam)
+            .snapshot(s)
+            .byte_budget(budget)
+            .run_async()
+            .await?;
+        let (nodes, cut) = linked(&t);
+        let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
+            return Ok((Vec::new(), cut));
+        };
+        let read = match self {
+            Rows::W(t) => t.row(from),
+            Rows::R(t) => t.row(from),
+        };
+        let row = read
+            .family(fam)
+            .qualifier_bounds(Bound::Included(first), Bound::Included(last))
+            .snapshot(s)
+            .read_async()
+            .await?;
+        let view = row.as_ref().map(pigeonhole::Row::view);
+        Ok((weighted(nodes, view.as_ref())?, cut))
+    }
+
+    /// [`read_each`](Self::read_each), async: the multi-get's rows as they're read.
+    async fn read_each_async(
+        &self,
+        s: &Snapshot,
+        keys: &KeySet,
+        yields: &Yields,
+        mut f: impl FnMut(&[u8], &pigeonhole::RowRef<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let read = match self {
+            Rows::W(t) => t.keys(keys),
+            Rows::R(t) => t.keys(keys),
+        };
+        let mut rows = read
+            .families(
+                [CONTENT, META, STATS, PEAK, EMB]
+                    .into_iter()
+                    .filter(|f| self.has_family(f)),
+            )
+            .snapshot(s)
+            .read()?;
+        while let Some((_, row)) = rows.next_async().await? {
+            let key = row.key().to_vec();
+            f(&key, &row)?;
+            yields.row().await;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+impl Idx<'_> {
+    /// [`search`](Self::search), async.
+    async fn search_async(
+        &self,
+        s: &Snapshot,
+        text: &str,
+        prefix: &[u8],
+        n: usize,
+    ) -> Result<Vec<(Vec<u8>, f64)>> {
+        let q = Query::new().text(text);
+        let search = match self {
+            Idx::W(i) => i.search(q, n),
+            Idx::R(i) => i.search(q, n),
+        };
+        let hits = search.snapshot(s).id_prefix(prefix).run_async().await?;
         Ok(hits.into_iter().map(|h| (h.id, h.score)).collect())
     }
 }

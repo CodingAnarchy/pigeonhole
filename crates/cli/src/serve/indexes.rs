@@ -9,7 +9,6 @@
 //!   then knows the thread, and its shutdown waits for it ([`Indexes::close`]) before it
 //!   closes the database. An index that rebalances inline needs no thread.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -28,7 +27,7 @@ const IDLE: Duration = Duration::from_secs(1);
 
 pub(crate) struct Indexes {
     db: Pigeonhole,
-    open: Mutex<HashMap<String, Arc<Index>>>,
+    open: Mutex<super::handles::Handles<Index>>,
     rebalancers: Mutex<Vec<JoinHandle<()>>>,
     /// Rebalancer threads running, for tests to read.
     running: Arc<AtomicUsize>,
@@ -56,7 +55,7 @@ impl Indexes {
         Self {
             placement,
             db,
-            open: Mutex::new(HashMap::new()),
+            open: Mutex::new(super::handles::Handles::default()),
             rebalancers: Mutex::new(Vec::new()),
             running: Arc::default(),
             closed: AtomicBool::new(false),
@@ -64,7 +63,7 @@ impl Indexes {
         }
     }
 
-    fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Index>>> {
+    fn handles(&self) -> std::sync::MutexGuard<'_, super::handles::Handles<Index>> {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -76,14 +75,23 @@ impl Indexes {
     /// The index `name`, opened if this server hasn't yet. Sync: call it on the blocking pool.
     /// The open runs outside the cache's lock, so a cached lookup never waits behind another
     /// request's I/O (ai1249's M1 on #1573); two first calls racing for one name both open
-    /// it, and the first to finish is kept.
+    /// it, and the first to finish is kept. An open that a [`forget`](Self::forget)
+    /// overtook opens again, since it may have read the catalog from before it (#1632).
     pub(crate) fn get(&self, name: &str) -> Result<Arc<Index>, ApiError> {
-        if let Some(i) = self.cached(name) {
-            return Ok(i);
+        loop {
+            let generation = {
+                let open = self.handles();
+                if let Some(i) = open.get(name) {
+                    return Ok(Arc::clone(i));
+                }
+                open.generation()
+            };
+            self.refuse_if_closed()?;
+            let (index, rebalancer) = Index::open_with_rebalancer(&self.db, name)?;
+            if let Some(kept) = self.keep(name, index, rebalancer, generation)? {
+                return Ok(kept);
+            }
         }
-        self.refuse_if_closed()?;
-        let (index, rebalancer) = Index::open_with_rebalancer(&self.db, name)?;
-        self.keep(name, index, rebalancer)
     }
 
     /// Creates the index `name`, or with `if_missing` opens an existing one, whatever its
@@ -100,6 +108,7 @@ impl Indexes {
             return Ok(());
         }
         self.refuse_if_closed()?;
+        let generation = self.handles().generation();
         let created = Index::create_with_rebalancer(&self.db, name, spec, options);
         let (index, rebalancer) = match created {
             Ok(r) => r,
@@ -108,7 +117,8 @@ impl Indexes {
             }
             Err(e) => return Err(e.into()),
         };
-        self.keep(name, index, rebalancer)?;
+        // Overtaken by a forget: the next call opens it afresh.
+        self.keep(name, index, rebalancer, generation)?;
         Ok(())
     }
 
@@ -123,18 +133,25 @@ impl Indexes {
     /// returned, and this one is dropped with its rebalancer), and runs the rebalancer of a
     /// background index it keeps on a thread of its own. Under the cache's lock, which
     /// `close` takes to set `closed`: after `close`, nothing is kept or started.
+    ///
+    /// `None`, keeping nothing, if a [`forget`](Self::forget) came after `generation` (the
+    /// one the open started at): the handle may be of the catalog from before it (#1632).
     fn keep(
         &self,
         name: &str,
         index: Index,
         rebalancer: Rebalancer,
-    ) -> Result<Arc<Index>, ApiError> {
+        generation: u64,
+    ) -> Result<Option<Arc<Index>>, ApiError> {
         let mut open = self.handles();
         if self.closed.load(Ordering::Acquire) {
             return Err(closed());
         }
+        if !open.current(generation) {
+            return Ok(None);
+        }
         if let Some(kept) = open.get(name) {
-            return Ok(Arc::clone(kept));
+            return Ok(Some(Arc::clone(kept)));
         }
         if matches!(index.options().rebalance_mode(), Rebalance::Background)
             && !self.paused.load(Ordering::Acquire)
@@ -165,9 +182,8 @@ impl Indexes {
                 }
             }
         }
-        let index = Arc::new(index);
-        open.insert(name.to_owned(), Arc::clone(&index));
-        Ok(index)
+        // Current, checked above under this same lock.
+        Ok(open.keep(generation, name, Arc::new(index)))
     }
 
     /// Drops every handle, so the next call opens its index again: the catalog changed under
@@ -178,8 +194,10 @@ impl Indexes {
     /// It doesn't wait for those rebalancers (a call holding a handle would hold this
     /// caller, the replica's loop, too): it reaps the threads that have ended, so their
     /// handles don't pile up over many changes (cli692's F3 on #1583).
+    ///
+    /// An open running across it keeps nothing, and opens again (#1632).
     pub(crate) fn forget(&self) {
-        self.handles().clear();
+        self.handles().forget();
         let mut threads = self
             .rebalancers
             .lock()
@@ -208,7 +226,7 @@ impl Indexes {
         {
             let mut open = self.handles();
             self.closed.store(true, Ordering::Release);
-            open.clear();
+            open.forget();
         }
         let threads = std::mem::take(
             &mut *self
@@ -247,5 +265,41 @@ fn rebalance(mut r: Rebalancer, name: &str) {
                 r.wait(IDLE);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Indexes;
+    use pigeonhole::{Element, Metric, Options, Pigeonhole, VectorSpec};
+    use pigeonhole_vector::{Index, IndexOptions};
+
+    /// #1632: an open that a `forget` overtook (a replica's catalog change, or a swap)
+    /// keeps nothing, and the next call opens the index afresh.
+    #[test]
+    fn an_open_overtaken_by_a_forget_keeps_nothing() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("i.phdb"), Options::default().shards(1)).unwrap();
+        let spec = VectorSpec::new(2, Element::F32, Metric::L2).unwrap();
+        drop(Index::create(&db, "v", spec, IndexOptions::new()).unwrap());
+        let indexes = Indexes::new(db.clone(), None);
+        // The steps of `get`, with a forget between the open and the keep.
+        let started = indexes.handles().generation();
+        let (index, rebalancer) = Index::open_with_rebalancer(&db, "v").unwrap();
+        indexes.forget();
+        assert!(
+            indexes
+                .keep("v", index, rebalancer, started)
+                .unwrap()
+                .is_none(),
+            "a stale open is not kept"
+        );
+        assert!(indexes.cached("v").is_none());
+        // Opened afresh, it is kept.
+        let kept = indexes.get("v").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&kept, &indexes.cached("v").unwrap()));
+        drop(kept);
+        indexes.close();
+        db.close().unwrap();
     }
 }

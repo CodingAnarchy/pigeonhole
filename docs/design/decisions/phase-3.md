@@ -4328,6 +4328,8 @@ The same rules hold for all three protocols, and every call path enforces scopes
 
 **The limits, stated in the guide:** one writer node, so no replication or HA, only backup and restore; the file on local disk; one machine's throughput. Read replicas (#1436) and partitions (D317, #1482) build on this service layer.
 
+**Amendment, 2026-11-09: how the MCP tools reach the service layer (cli692, ticket 8c-2; coordinator's option B, refined; ai1249 for §7).** §7's "each tool calls the service layer, and stdio drives it with `block_on`" can't hold as written: the service layer is built on `serve`'s own dependencies (prost and tonic types, Tokio), which the default `phdb` build that `phdb mcp` ships in doesn't have. Instead, the tools reach the database through a `Backend` trait at their own database surface (tables, families, table handles, a write batch, table creation). `phdb mcp` implements it with the database it opened, as before and Tokio-free. `phdb serve`'s `/mcp` implements it through `Service`'s own `table()`, `create_table` and `drop_table`, after one `Service::admit` that holds every per-call rule (the scope, a replica's write refusal, the request size, the in-flight budget) and that `answer()` itself calls too. So no rule exists twice, and MCP keeps its own paging, cursors and answers. The MCP tests run against both backends. Rejected: ungating `serve`'s dependencies into every build, and a serve-side gate that mirrors the service's rules (it would drift, and would already miss the `__phdb_` prefix and #1651's refusal).
+
 <a id="d314"></a>
 ## D314 — A row mutation's counters can return their values after its commit: `commit_returning`, folded on the row's shard right after the commit applies (perf2, design; owner decision, 2026-11-03; reviewed by simp724 and perf287; engine, pigeonhole, #1440, ICR 0113)
 
@@ -4499,6 +4501,37 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
 - **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
 
+<a id="d317"></a>
+## D317 — one database split across `phdb serve` nodes by static key-range partitions (simp724, design; owner sign-off, 2026-11-04; reviewed by perf287 and cli692; cli, #1482, ICR 0117)
+
+**Decided** (the design note on #1482, revision 2, is the full record; the owner set the scope on #1437):
+- **Partitions are whole database files.** A versioned partition map assigns tables, or key ranges of a table (sorted split keys, half-open ranges), to partitions, and partitions to nodes.
+- **The map has two layers.** Which partition holds a key range is fixed once the range holds data. Moving ranges is #1499, in 1.3.0. Which node serves a partition changes by relocation, with a higher epoch.
+- **Every node routes.** Any node takes any call, serves what it owns and forwards the rest over node-to-node gRPC. There are no engine changes: a `Router` in front of D313's service functions, behind the seam D313's ticket 3 landed.
+- **Single-partition operations keep their guarantees.** Writes and transactions that span partitions are refused (`CrossPartition`) before anything is written; transactions and snapshots bind to one partition by a routing key.
+- **Reads fan out.** Scans, multi-gets, KNN and traversal fan out and merge in key order (or to the exact top K). A missing partition fails the read unless the caller opts in to partial results, which name what's missing.
+- **Fencing is manual.** A partition file records its identity and epoch (`__phdb_cluster`). A node writes P only while its newest map names it at that epoch and P isn't fenced. Restarted nodes start fenced.
+- **Later:** cross-node transactions (#1483), failover (#1484), the balancer (#1485) and fencing leases (#1486), all in 1.3.0.
+
+**Tickets:**
+1. the map: proto, validation, distribution and the identity row;
+2. routing and forwarding;
+3. transactions and snapshots bound to one partition;
+4. fan-out reads;
+5. schema in the map;
+6. fencing and relocation;
+7. cluster feeds;
+8. backup and restore, several partitions per node, and the serving guide's cluster chapter, with perf287's partitions-per-node box run.
+
+**Ticket 1** (ICR 0117's first section):
+- **`phdb serve --cluster DIR --node-id ID`** keeps the map in `DIR/cluster-map.json`, written atomically, and holds `DIR/.lock`.
+- **The `Cluster` service:** `GetMap`; `SetMap`, a compare-and-set on the version (a miss is `Conflict`, the coordinator's call); `PushMap`, node to node; and `Status`.
+- **The `cluster` token scope** stands outside read < write < admin.
+- **Pull:** a node pulls a newer map from a peer whose call says it has one.
+- **Divergence:** an equal version with different content is refused and reported as divergent (cli692's M3).
+- **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
+- **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
+
 <a id="d318"></a>
 ## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
 
@@ -4507,7 +4540,7 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **The model (owner, Q2):** `BAAI/bge-small-en-v1.5` (MIT) at revision `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. It's a 12-layer BERT, 384 dimensions, 512 tokens, CLS pooling, L2-normalised.
   - It's the model D311 T5 measured, so the guide's recall numbers describe what this crate produces.
   - **Its store id is `BAAI/bge-small-en-v1.5@5c38ec7c`,** naming the revision. A store refuses vectors from any other runtime of the same model. A later model or revision is a new id.
-  - **The fallback:** MiniLM-L6 becomes a second `Model` if bge-small is too slow for interactive use. That's the owner's call on the measured numbers, never a silent switch.
+  - **No fallback model (owner, 2026-11-09):** bge-small is the only model; MiniLM-L6 isn't added. The owner made the call on the measured numbers below. A different model later would be a new `Model` and a new store id, never a silent switch.
 - **Passages and queries are separate calls:** `embed_query` prepends bge's retrieval instruction, as the fixture did.
 - **The files:** the weights aren't bundled. The three files come from a directory (`LoadOptions::dir`), or from the cache, downloaded once from the pinned revision.
   - **Checksums:** every file is checked against a SHA-256 pinned in the crate, wherever it came from. A download is written to a temporary file and renamed into place only once it verifies.
@@ -4541,4 +4574,39 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **4 threads:** 8.4, 18 and 65 ms;
   - **Batched:** 375 texts/s in batches of 32 at 4 threads.
 
-  The AX102 rows are above, under candle's own pool. The owner judges Q2's fallback on them.
+  The AX102 rows are above, under candle's own pool. On them, the owner kept bge-small alone (2026-11-09).
+
+<a id="d320"></a>
+## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
+
+**Problem.** A `FeedReader` read every stream to its end on each pass and kept every record it hadn't delivered. A consumer that fell behind kept its whole backlog decoded in memory (278,287 entries in one `phdb serve` hub, #1397 ticket 5).
+
+**A stream isn't in key order,** so a reader can't stop a stream early. A Single is keyed by its seqno and a cross-shard commit by its Decision's apply seqno. The coordinator reserves the apply seqno when it decides and queues the DECISION. The next group's Singles get their seqnos when the group forms, so they are larger, but the Singles queued before the DECISION are logged ahead of it. The inversion stays within one group, and group boundaries aren't visible in the WAL. So "every record after this point has a key above k" can't be known from a stream alone.
+
+**Decided (PR 1).** Each pass still reads every stream to its readable end (M1 and rule C are unchanged), but keeps only records with keys at or below a cutoff **C**:
+- **The budget:** 64 MiB of decoded changes (an engine constant, no public knob), counted over `ready` and `held`.
+- **Eviction:** past the budget, the largest keys go first, and C falls below each one.
+  - A held share counts at its id + 1, a lower bound for its round's apply seqno (the allocator reserves the id first). It goes with every share of its round.
+  - A decided round goes with its shares.
+- **Passing over:** a record past C is passed over after its header, with its mutations never filtered or copied. A Prepare with id ≥ C is passed over too.
+  - A Decision past C passes its round over: its shares are dropped and any read later in the pass are passed over. Leaving them held would let rule C drop them as aborted, and the Decision read after the rewind would then expire the feed.
+- **Delivery and position** go up to min(F, C), and so does a feed of every table's catalog event.
+- **The rewind:** once the frontier is past C and nothing is kept below it, the reader reads every stream again from its hint. That's the earliest record not delivered, kept or passed over, the same hint a token carries, so the rewind is a resume from the reader's own token.
+- **Liveness:** a pass that leaves nothing to deliver below a cutoff under the frontier rewinds at once with twice the budget, and a delivery restores the budget. (Only the shares of rounds in flight around the next commit can fill the budget that way.) `Pending` still means every commit up to the frontier was delivered.
+- **The bound:** the reader keeps at most its budget, plus about twice the in-flight cross-shard shares, plus one commit.
+- **The cost:** a reader that stays a backlog B behind re-reads B (frames and headers only) once per budget delivered.
+- **Reader processes** (`ReadTable::feed`) run the same passes, so the cap applies there too.
+- **Retention (simp724's N2 on #1622):** retention follows bytes and age, not subscribers. A capped reader's margin is its hint, as for a token resume: a record it evicted has to be read again from the log. So a rewind can expire a feed that, uncapped, would still hold that record in memory. The guide says so under "When a feed expires".
+- **What the reader remembers between rewinds (simp724's S1 on #1622):** only the passed-over rounds with ids below C, the rounds in flight across C. A share with a larger id is passed over by its id, and C only falls.
+- **`read_through`** is still set after every pass, capped or not. `position()` and the idle fast path take the min with C, and a rewind clears it.
+- **Shares of delivered rounds** that a rewind re-reads without their Decision are never evicted (simp724's N1). Evicting one would put C at or below `delivered` for nothing; rule C drops it.
+
+**Deferred (PR 2): not needed (coordinator, 2026-11-09, on perf287's ticket 5 re-run, #1598).** The option: the writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it would need a per-session marker (a FORMAT and ICR line). The AX102 run (#1397 ticket 5; main 6aca49f1 against d3378ff8, the full table ×2) showed it isn't worth that:
+- **16 hubs × 16 subscribers,** the scenario that falls behind:
+  - `phdb` peak RSS fell from 8.9–15.9 GB to 4.7–5.1 GB, and no longer depends on how far the run falls behind;
+  - each subscriber got 1.3–2.6× more events;
+  - server CPU per put rose 5–6% (180 → 186–191 µs). That's the re-read cost, and all PR 2 could save.
+- **Every other scenario** (0, 1, 16 and 256 subscribers, and tiny) was level between the arms.
+- **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
+
+Revisit PR 2 only if a profile shows the re-reads costing more than that.

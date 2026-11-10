@@ -10,8 +10,10 @@ pub(crate) use super::sessions::Leases;
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
-    /// The database file (`*.phdb`).
-    pub file: PathBuf,
+    /// The database file (`*.phdb`). Not with `--cluster`, whose directory holds the
+    /// partitions' files.
+    #[arg(required_unless_present = "cluster", conflicts_with = "cluster")]
+    pub file: Option<PathBuf>,
     /// Create the database file if it does not exist.
     #[arg(long)]
     pub create: bool,
@@ -47,6 +49,10 @@ pub(crate) struct ServeArgs {
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
     #[arg(long, value_name = "N", default_value_t = 1024)]
     pub max_concurrent: usize,
+    /// Open connections at once, HTTP/1.1 and HTTP/2 alike; one past this is closed as soon
+    /// as it's accepted. Default: half the open-file limit (`ulimit -n`), at most 4096.
+    #[arg(long, value_name = "N")]
+    pub max_connections: Option<usize>,
     /// Scans streaming at once; more are refused at once (`Overloaded`). A scan's stream
     /// outlives its request's slot in `--max-concurrent`, so it has its own cap.
     #[arg(long, value_name = "N", default_value_t = 64)]
@@ -63,8 +69,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N", default_value_t = 16)]
     pub max_catch_up: usize,
     /// Bytes of recent commits the shared feeds keep for their streams, in all: each table
-    /// set's share is this over the sets subscribed. Each commit counts its changes and its
-    /// resume token (about 45 + 16 × shards bytes). Outside `--inflight-bytes`.
+    /// set's share is this over the sets subscribed. Each commit counts its encoded event, which
+    /// holds its resume token (about 45 + 16 × shards bytes), and about 110 bytes more.
+    /// Outside `--inflight-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 256 << 20)]
     pub feed_ring_bytes: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
@@ -118,6 +125,21 @@ pub(crate) struct ServeArgs {
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
+    /// The memory store to serve as `Memory` (D313 ticket 8a), with `phdb mcp`'s flags.
+    #[command(flatten)]
+    pub memory: crate::args::MemoryArgs,
+    /// The longest one embedding call to `--embed-url` may take, in milliseconds: shorter
+    /// than `phdb mcp`'s 30 s, since a server's blocking threads wait on it.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 10_000,
+        requires = "embed_url"
+    )]
+    pub embed_timeout_ms: u64,
+    /// Memory calls at once (default: half the blocking threads, at least 1).
+    #[arg(long, value_name = "N", requires = "memory")]
+    pub memory_calls: Option<usize>,
     /// Where `Admin.Backup` writes, and (in `.phdb-serve-downloads`, the server's own, mode
     /// 0700) where `Admin.BackupDownload` keeps its copies for resumes. It must exist.
     /// Without it the server takes no backups. Put it on a disk with room for a copy or two
@@ -149,6 +171,36 @@ pub(crate) struct ServeArgs {
     /// (or 8 MiB). A caught-up replica applies what arrived at once, whatever the count.
     #[arg(long, value_name = "N", default_value_t = super::replica::RUN_EVENTS, requires = "replica_of")]
     pub replica_run: usize,
+    /// Serve as a node of a partitioned cluster (D317, ICR 0117): DIR holds the node's
+    /// partition map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`). One
+    /// server per DIR. So far the node keeps and distributes the map (`phdb cluster`); serving
+    /// the partitions' data comes with D317's next ticket.
+    #[arg(long, value_name = "DIR", requires = "node_id")]
+    pub cluster: Option<PathBuf>,
+    /// This node's id in the cluster's map (`[a-z0-9_-]`, up to 64).
+    #[arg(long, value_name = "ID", requires = "cluster")]
+    pub node_id: Option<String>,
+    /// The bearer token this node presents to the other nodes (`cluster` scope there), alone
+    /// in the file. Also from `PHDB_CLUSTER_TOKEN`. Never a flag's value.
+    #[arg(long, value_name = "FILE", requires = "cluster")]
+    pub cluster_token_file: Option<PathBuf>,
+    /// A PEM file of the CA certificates this node trusts for its peers' TLS, beside the
+    /// system's roots.
+    #[arg(long, value_name = "PEM", requires = "cluster")]
+    pub cluster_ca: Option<PathBuf>,
+    /// How long `SetMap` waits for each other node to take the map, in milliseconds. A node
+    /// that doesn't pulls it later.
+    #[arg(long, value_name = "MS", default_value_t = 2_000, requires = "cluster")]
+    pub cluster_push_timeout_ms: u64,
+}
+
+impl ServeArgs {
+    /// The database file: present unless `--cluster` (clap requires one of the two).
+    pub(crate) fn db_file(&self) -> &std::path::Path {
+        self.file
+            .as_deref()
+            .expect("clap requires FILE unless --cluster is given")
+    }
 }
 
 /// What the flags leave the server to do.
@@ -157,6 +209,8 @@ pub(crate) struct Limits {
     pub max_request_bytes: usize,
     pub inflight_bytes: usize,
     pub max_concurrent: usize,
+    /// Open connections at once (`--max-connections`, #1604).
+    pub max_connections: usize,
     pub max_scans: usize,
     pub max_streams: usize,
     pub max_feed_hubs: usize,
@@ -178,6 +232,12 @@ impl ServeArgs {
             max_request_bytes: self.max_request_bytes,
             inflight_bytes: self.inflight_bytes.max(self.max_request_bytes),
             max_concurrent: self.max_concurrent.max(1),
+            max_connections: self
+                .max_connections
+                .unwrap_or_else(|| {
+                    super::listener::default_max_connections(super::listener::open_file_limit())
+                })
+                .max(1),
             max_scans: self.max_scans.max(1),
             max_streams: self.max_streams.max(1),
             max_feed_hubs: self.max_feed_hubs.max(1),

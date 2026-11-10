@@ -203,6 +203,20 @@ impl ApiError {
         )
     }
 
+    /// A read with `x-pigeonhole-min-primary-seqno` that the replica couldn't serve in time
+    /// (#1577): nothing was read, so it may be sent again (to this replica, or the primary).
+    pub(crate) fn replica_behind(message: impl Into<String>) -> Self {
+        Self::new(
+            "ReplicaBehind",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
     /// A write to a replica server (#1436): the engine's `ReadOnly`, naming the primary
     /// that takes the writes.
     pub(crate) fn replica_read_only(primary: &str) -> Self {
@@ -218,6 +232,21 @@ impl ApiError {
     pub(crate) fn overloaded(message: impl Into<String>) -> Self {
         Self::new(
             "Overloaded",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
+    /// A service the server depends on failed or can't be reached (today the embedding
+    /// endpoint, `--embed-url`): nothing was applied, and the request may be sent again
+    /// (ICR 0112's `Unavailable`, #1617).
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            "Unavailable",
             0,
             message,
             tonic::Code::Unavailable,

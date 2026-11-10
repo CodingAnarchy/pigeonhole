@@ -285,7 +285,14 @@ module Pigeonhole
       # `timeout: nil` waits until a commit comes or the thread is interrupted (perf2's N2 on
       # #1441). `FeedExpired` once the history it needs is gone.
       def next(timeout: nil)
-        c = native_next(timeout)
+        b = Native::FiberBridge.current
+        c = if b
+              r = b.await(native_next_op(b.native),
+                          deadline: timeout && Native::FiberBridge.deadline(timeout))
+              r.equal?(Native::FiberBridge::TIMED_OUT) ? nil : r
+            else
+              native_next(timeout)
+            end
         c && Build.commit(c)
       end
 
@@ -324,11 +331,48 @@ module Pigeonhole
       # whose block the interrupt lands in is refused as well; a commit already under way
       # finishes first. (`break` in the block raises `LocalJumpError`, a
       # `StandardError`: the block outlives the `consolidate_loop` call that took it.)
+      #
+      # Under a fiber scheduler (ICR 0126), the step's wait for new memories and its wait for
+      # the block's groups let the thread's other fibers run, and the block runs on the
+      # calling fiber, so it may itself yield (an HTTP call under Async, say). A stop or
+      # timeout raised into the step's wait loses nothing (the next step reads what it
+      # would have); raised into its passes, the pass still ends first, as an interrupt
+      # does, and then it takes effect. A loop's first step starts it without waiting.
       def run_once(timeout = 1.0)
-        events, passes, failed, stopped, interrupted, next_due, token = native_run_once(timeout, @consolidator)
+        b = Native::FiberBridge.current
+        raw = b ? fiber_step(b, timeout) : native_run_once(timeout, @consolidator)
+        events, passes, failed, stopped, interrupted, next_due, token = raw
         pairs = ->(list) { list.map { |ns, p| [ns, ConsolidatePass.new(*p)].freeze }.freeze }
         LoopStep.new(events, pairs.(passes), failed.map { |ns, e| [ns, e].freeze }.freeze, pairs.(stopped),
                      interrupted, next_due, token)
+      end
+
+      private
+
+      # `run_once` under a scheduler: waits through the bridge, one commit at a time, until
+      # `timeout` or the next pass falls due, then runs the step's passes, whose groups it
+      # also waits for through the bridge.
+      def fiber_step(bridge, timeout)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        events = 0
+        while true # rubocop:disable Style/InfiniteLoop -- `loop` would swallow StopIteration
+          wait = timeout - (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+          due = next_due
+          wait = [wait, (due - loop_now_us) / 1e6].min if due
+          break if wait <= 0
+
+          n = bridge.await(native_wait_op(bridge.native), deadline: Native::FiberBridge.deadline(wait))
+          # 0: the loop hasn't stepped yet (its step starts it), or its history was recycled.
+          break if n.equal?(Native::FiberBridge::TIMED_OUT) || n.zero?
+
+          events += n
+        end
+        native_run_once_fiber(bridge, events, @consolidator)
+      end
+
+      # The loop's clock now (µs since the Unix epoch), with its `clock_offset:`.
+      def loop_now_us
+        Process.clock_gettime(Process::CLOCK_REALTIME, :microsecond) + @clock_offset_us.to_i
       end
     end
 
@@ -356,7 +400,8 @@ module Pigeonhole
                                              now_us:, half_life:, fusion:, weights:, include_superseded:,
                                              session:, with_signals:, with_embeddings:, expand:, exact:,
                                              nprobe:)
-        Build.hits(native_recall(args))
+        b = Native::FiberBridge.current
+        Build.hits(b ? b.await(native_recall_op(b.native, args)) : native_recall(args))
       end
 
       # One memory, or nil.
@@ -387,6 +432,7 @@ module Pigeonhole
         def create(db, name, embedding: nil, forget: nil, episodic_ttl: nil, near_dedup: nil,
                    normalization: nil, ivf: nil, &)
           s = native_create(db, name, embedding, forget, episodic_ttl, near_dedup, normalization, ivf)
+          s.instance_variable_set(:@db, db)
           block_given? ? scoped(s, &) : s
         end
 
@@ -396,6 +442,7 @@ module Pigeonhole
         # `remember` or `supersede`).
         def open(db, name, model:, &)
           s = native_open(db, name, model)
+          s.instance_variable_set(:@db, db)
           block_given? ? scoped(s, &) : s
         end
 
@@ -418,10 +465,41 @@ module Pigeonhole
       # Remembers one memory in namespace `ns`, in one transaction (a `Remembered`). An exact
       # duplicate (after trimming and collapsing whitespace) of a live memory merges into it;
       # with near dedup set, a near duplicate is handled by its policy.
+      #
+      # The writes (`remember`, `delete`, `link`, `supersede`, `mark_used`) and `recall` let
+      # the thread's other fibers run while they wait under a fiber scheduler (ICR 0126): a
+      # write's commit yields as `Database#transact`'s does, and its other waits (the
+      # near-dedup lookup, an IVF store's settle) and `recall` run on a worker thread. A write
+      # stopped while it waits ends as a stopped `transact` does (D210).
       def remember(ns, text, embedding: nil, kind: nil, importance: nil, source: nil, session: nil,
                    links: nil, pinned: false)
-        Remembered.new(*native_remember(ns, text, embedding, kind, importance, source, session, links,
-                                        pinned))
+        args = [ns, text, embedding, kind, importance, source, session, links, pinned]
+        b = Native::FiberBridge.current
+        return Remembered.new(*native_remember(*args)) unless b
+
+        # The near-dedup lookup reads outside the transaction (a vector search): off the thread.
+        prepared = if native_near_dedup_on
+                     b.await(native_prepare_remember_op(b.native, *args))
+                   else
+                     native_prepare_remember(*args)
+                   end
+        Remembered.new(*fiber_write(b, settle: true) { |t| native_remember_prepared_in(t, prepared) })
+      end
+
+      # Deletes the memory `id` and its links; whether it existed.
+      def delete(id)
+        b = Native::FiberBridge.current
+        return native_delete(id) unless b
+
+        fiber_write(b, settle: true) { |t| delete_in(t, id) }
+      end
+
+      # Marks `old` superseded by `new` (one namespace), linking them.
+      def supersede(old, new)
+        b = Native::FiberBridge.current
+        return native_supersede(old, new) unless b
+
+        fiber_write(b) { |t| native_supersede_in(t, old, new) }
       end
 
       # `remember` inside `txn`, committed with it. It skips near dedup (call
@@ -435,10 +513,18 @@ module Pigeonhole
 
       # Links `from` to `to` (one namespace) with a link type (`LinkType`, or an
       # application's from 16) and a weight from 0 to 1.
-      def link(from, to, link_type, weight = 1.0) = native_link(from, to, link_type, weight)
+      def link(from, to, link_type, weight = 1.0)
+        b = Native::FiberBridge.current
+        return native_link(from, to, link_type, weight) unless b
+
+        fiber_write(b) { |t| native_link_in(t, from, to, link_type, weight) }
+      end
 
       # Counts a use of each memory of `ids` (a `Marked`).
-      def mark_used(ids) = Marked.new(*native_mark_used(ids))
+      def mark_used(ids)
+        b = Native::FiberBridge.current
+        Marked.new(*(b ? fiber_write(b) { |t| native_mark_used_in(t, ids) } : native_mark_used(ids)))
+      end
 
       # One forget pass (T2) under `policy`, else the store's persisted one
       # (`InvalidArgument` with neither); `after` resumes where an earlier pass stopped.
@@ -480,6 +566,19 @@ module Pigeonhole
                                    "MergeFailed", MERGE_FAILED_CODE_NUM, consolidated: pass),
               cause: failure
       end
+
+      private
+
+      # A write under a fiber scheduler, as the crate's own runs it (ICR 0123): the store's
+      # `*_in` form in a `transact` (retried as the crate retries, its commit yielding), then
+      # with `settle:` an IVF store's parked writes handed on, on a worker thread. Unlike the
+      # crate's, a write whose transaction raises doesn't settle: anything parked goes with
+      # the next write's settle, which is harmless for recall (cli692's N3 on #1614).
+      def fiber_write(bridge, settle: false)
+        out = @db.transact { |t| yield t }
+        bridge.await(native_settle_op(bridge.native)) if settle && native_has_ivf
+        out
+      end
     end
 
     class Store
@@ -491,9 +590,11 @@ module Pigeonhole
       def consolidate_loop(name, policy: nil, namespaces: nil, clock_offset: nil, &block)
         raise ArgumentError, "consolidate_loop needs a block: the consolidator" unless block
 
-        lp = native_consolidate_loop(name, policy, namespaces, clock_offset && (clock_offset * 1_000_000).to_i)
+        offset_us = clock_offset && (clock_offset * 1_000_000).to_i
+        lp = native_consolidate_loop(name, policy, namespaces, offset_us)
         consolidator = proc { |group| block.call(Build.group(group)) }
         lp.instance_variable_set(:@consolidator, consolidator)
+        lp.instance_variable_set(:@clock_offset_us, offset_us)
         lp
       end
     end

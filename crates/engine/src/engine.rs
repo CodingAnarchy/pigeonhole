@@ -171,6 +171,11 @@ pub struct Metrics {
     /// warning that the cache is too small for the open SSTs' metadata (D215). Counted at
     /// most once until the pinned bytes fall below 40% of the capacity again.
     pub block_cache_pinned_warnings: u64,
+    /// Eviction passes in the block cache and the row cache that stopped early, leaving a
+    /// shard over capacity until its next insert, because one insert would have freed more
+    /// than a stack buffer holds (#1559 A: what an insert takes out is freed after the shard's
+    /// lock). A statistic for benchmarks.
+    pub cache_deferred_evictions: (u64, u64),
     /// Passes that flushed slots pinning a WAL checkpoint (a shard's own, past
     /// `EngineOptions::wal_pin_bytes`, or at another shard's request), and the memtables
     /// they froze below the size threshold (#137). Flushes per pass is the cost of the
@@ -3310,6 +3315,18 @@ impl Engine {
             .into_async(Arc::clone(&self.inner.shared)))
     }
 
+    /// `cursor` as an async scan ([`Engine::scan_async`]) from where it stands: a sync scan
+    /// already on a row can read that row's cells with [`ScanCursor::poll_next_cell`] (a
+    /// lending walk that starts sync and goes on async, #1560). An async cursor is returned
+    /// as it is.
+    pub fn async_scan_from(&self, cursor: ScanCursor) -> ScanCursor {
+        if cursor.is_async() {
+            cursor
+        } else {
+            cursor.into_async(Arc::clone(&self.inner.shared))
+        }
+    }
+
     // ---- maintenance ----
 
     /// Freezes and flushes every memtable; returns when the SSTs are in the manifest. A
@@ -3815,6 +3832,13 @@ impl Engine {
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
         m.block_cache_pinned_warnings = shared.cache.pinned_warnings();
+        m.cache_deferred_evictions = (
+            shared.cache.deferred_evictions(),
+            shared
+                .row_cache
+                .as_ref()
+                .map_or(0, crate::row_cache::RowCaches::deferred_evictions),
+        );
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
         if self.inner.reader.is_none() {
             let (active, total) = shared.shm.reader_slot_usage();
