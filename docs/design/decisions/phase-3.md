@@ -4668,6 +4668,7 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **`GroupSync`:** extending caller-runs to it was refused in v1.
 - **#1460** closes as "use caller-runs for this workload".
 
+<a id="d322"></a>
 ## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
 
 **Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
