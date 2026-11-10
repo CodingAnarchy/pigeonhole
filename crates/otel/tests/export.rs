@@ -608,3 +608,129 @@ fn the_dashboard_and_the_alerts_query_only_documented_metrics() {
     let guide = doc_file("guide/observability.md");
     assert!(known_names_only("the guide", &guide) >= 10);
 }
+
+/// A Prometheus text's families: each name's `# HELP` and `# TYPE`, and its samples' labels
+/// as written (values left out, since gauges move between two readings).
+type Families = BTreeMap<String, (Option<String>, Option<String>, BTreeSet<String>)>;
+
+fn families(text: &str) -> Families {
+    let mut out = Families::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, help) = rest.split_once(' ').unwrap();
+            out.entry(name.to_owned()).or_default().0 = Some(help.to_owned());
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let (name, kind) = rest.split_once(' ').unwrap();
+            out.entry(name.to_owned()).or_default().1 = Some(kind.to_owned());
+        } else if !line.is_empty() {
+            let (series, value) = line.rsplit_once(' ').unwrap();
+            assert!(value.parse::<f64>().is_ok(), "{line}");
+            let (name, labels) = match series.split_once('{') {
+                Some((n, l)) => (n, l.strip_suffix('}').unwrap()),
+                None => (series, ""),
+            };
+            // As written, label for label: ours must match the exporter's order too.
+            out.entry(name.to_owned())
+                .or_default()
+                .2
+                .insert(labels.to_owned());
+        }
+    }
+    out
+}
+
+/// D323: `Collector::render_prometheus` writes what OpenTelemetry's Prometheus exporter
+/// writes for the same database (without its scope labels and `target_info`): the same
+/// families, with the same `# HELP` and `# TYPE`, and the same label sets.
+#[test]
+fn render_prometheus_matches_the_exporter() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("prom.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    let registry = prometheus::Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_target_info()
+        .scope_info_enabled(false)
+        .build()
+        .unwrap();
+    let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    let registration = pigeonhole_otel::register(&db, &provider.meter("prom"));
+    let collector = pigeonhole_otel::collector(&db);
+    workload(&db, &t);
+    let theirs = {
+        use prometheus::Encoder as _;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    };
+    let mut ours = String::new();
+    collector.render_prometheus(&mut ours);
+    let (theirs_f, ours_f) = (families(&theirs), families(&ours));
+    for (name, f) in &theirs_f {
+        assert_eq!(
+            ours_f.get(name),
+            Some(f),
+            "{name}:\nours:\n{ours}\ntheirs:\n{theirs}"
+        );
+    }
+    assert_eq!(
+        ours_f.keys().collect::<Vec<_>>(),
+        theirs_f.keys().collect::<Vec<_>>(),
+        "ours:\n{ours}\ntheirs:\n{theirs}"
+    );
+    drop(registration);
+    drop(collector);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D323: `Collector::collect` gives each metric's points with `pigeonhole.db.name` first and
+/// only the metric's own attributes after; seconds as floats, counts as integers; nothing
+/// once the database is closed.
+#[test]
+fn a_collector_gives_plain_points_until_the_database_closes() {
+    use pigeonhole_otel::PointValue;
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("c.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    let collector = Config::new().db_name("main").collector(&db);
+    workload(&db, &t);
+    let points = collector.collect();
+    let sync_commits = points
+        .iter()
+        .find(|p| {
+            p.metric.name == "pigeonhole.commits"
+                && p.attributes[1] == ("pigeonhole.durability", "sync".to_owned())
+        })
+        .unwrap();
+    assert!(matches!(sync_commits.value, PointValue::U64(n) if n >= 20));
+    for p in &points {
+        assert_eq!(p.attributes[0], ("pigeonhole.db.name", "main".to_owned()));
+        for (k, _) in &p.attributes[1..] {
+            assert!(p.metric.attributes.contains(k), "{}: {k}", p.metric.name);
+        }
+        if p.metric.unit == "s" {
+            assert!(matches!(p.value, PointValue::F64(_)), "{}", p.metric.name);
+        }
+        if p.metric.unit.starts_with('{') {
+            assert!(matches!(p.value, PointValue::U64(_)), "{}", p.metric.name);
+        }
+    }
+    let levels: Vec<_> = points
+        .iter()
+        .filter(|p| p.metric.name == "pigeonhole.sst.count")
+        .map(|p| p.attributes[1].clone())
+        .collect();
+    assert!(!levels.is_empty());
+    assert!(
+        levels
+            .iter()
+            .all(|(k, v)| *k == "pigeonhole.level" && v.parse::<u8>().is_ok())
+    );
+    drop(t);
+    db.close().unwrap();
+    assert!(collector.collect().is_empty());
+}

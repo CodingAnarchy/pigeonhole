@@ -2236,6 +2236,7 @@ dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
  "pigeonhole-memory",
+ "pigeonhole-otel",
  "pigeonhole-text",
  "pigeonhole-vector",
  "prost",
