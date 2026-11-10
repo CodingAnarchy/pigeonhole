@@ -4611,6 +4611,13 @@ PR 3 adds an in-process two-database replication test with process and power-los
 
 Revisit PR 2 only if a profile shows the re-reads costing more than that.
 
+**Amendment, 2026-11-09: the budget counts what's allocated (#1637).** perf287's heap profile of the 16 × 16 run found the readers holding about 2.5–3× what the cap counted. A single-mutation commit was counted at about 270 B but held about 700–800 B: a `Vec` of mutations grown to four, three allocations per mutation (row, qualifier, value), and its `ready` node.
+- **Packed:** a record's followed mutations are now packed into two allocations of exactly their size. One holds the fixed fields; the other holds the rows, qualifiers and values back to back. A first pass over the batch sizes them and a second fills them, so no scratch buffer outlives a read (one would keep the largest record's size, uncounted: simp724's S1 on #1667).
+- **One entry per share:** a held PREPARE is one entry keyed by (round id, stream), with no per-round `Vec`. A round's shares therefore come out in stream order, not read order; two shares never hold the same cell, so a subscriber sees no difference.
+- **The count:** each record's map entry (with its `starts` entry, twice over for a half-full B-tree node) plus its allocations, each rounded to a 16-byte size class.
+- **Measured:** a counting-allocator test holds what's kept to within 1.25× of the count (`tests/feed_memory.rs`: 0.93×, where main was 2.6×). The same backlog takes about half the memory it did. "Allocated" here is requested bytes: the allocator's own chunk overhead (glibc adds 8 B per chunk, with a 32 B minimum) is on top, a little for a record's two small allocations.
+- **The cost:** delivery copies each change's bytes out of the pack, where it used to move the vectors. That's one copy of what's delivered; a record read is copied once, from the log into its pack. CPU per put on the 16 × 16 run isn't measured yet; perf287's re-run after this lands gives it.
+
 ## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
 
 **Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
