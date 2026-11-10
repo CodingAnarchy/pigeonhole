@@ -1613,6 +1613,15 @@ impl WalStream {
     ) -> Result<WalStream> {
         let mut s = Self::create_unsynced(vfs, db_path, stream, db_id, opts)?;
         s.open_segment(0, 0)?;
+        // g47's up-front arm (perf2): `PIGEONHOLE_PREFILL=N` grows and zero-fills N slots,
+        // synced, before the stream goes live, so a run that never needs more never preps.
+        if let Some(n) = std::env::var("PIGEONHOLE_PREFILL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+        {
+            s.spares().prepare(n)?;
+        }
         Ok(s)
     }
 
