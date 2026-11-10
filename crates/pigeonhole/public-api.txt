@@ -619,6 +619,7 @@ pub fn pigeonhole::Options::allow_fuse(self, bool) -> Self
 pub fn pigeonhole::Options::auto_recover(self, pigeonhole::Recovery) -> Self
 pub fn pigeonhole::Options::background_workers(self, usize) -> Self
 pub fn pigeonhole::Options::block_cache(self, usize) -> Self
+pub fn pigeonhole::Options::caller_runs(self, bool) -> Self
 pub fn pigeonhole::Options::change_feed(self, pigeonhole::FeedRetention) -> Self
 pub fn pigeonhole::Options::change_feed_off(self) -> Self
 pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self

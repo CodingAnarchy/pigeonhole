@@ -598,6 +598,10 @@ pub(crate) struct Shared {
     pub feed: Option<Arc<crate::feed::Feed>>,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
+    /// Each shard's caller-run entry, in shard order: set at an engine-owned open with
+    /// `EngineOptions::caller_runs` (D321), never otherwise. A waiting committer may run its
+    /// shard's turn through it.
+    pub callers: std::sync::OnceLock<Box<[pigeonhole_runtime::CallerEntry]>>,
     /// Per shard, a handle on its WAL stream's count of submitted, unfinished I/O
     /// (`IoTracker`), set when the stream is attached at open (`ShardState::set_wal`); the
     /// close waits on them after the runtime's threads are joined (#824), so a reopen in
@@ -12214,6 +12218,34 @@ impl ShardHandler for ShardState {
 
     fn handle(&mut self, ctx: &mut ShardContext<'_, Self::Msg>, msg: Self::Msg) {
         self.handle_msg(msg, ctx);
+    }
+
+    /// Caller-runs (#1176): a client's turn takes a single-shard commit that waits for no
+    /// sync and reads nothing at apply (no `check_and_mutate` predicate, no transaction's
+    /// validation, no `commit_returning`), and kicks. Everything else (cross-shard rounds,
+    /// flushes, maintenance, durable commits) stays the driver's.
+    fn caller_may_take(&self, msg: &ShardMsg) -> bool {
+        match msg {
+            ShardMsg::Commit(req) => {
+                matches!(req.durability, Durability::None | Durability::Buffered)
+                    && req.predicate.is_none()
+                    && req.validate.is_none()
+                    && req.retry.is_none()
+                    && matches!(req.reply, Reply::Commit(_))
+            }
+            ShardMsg::Kick => true,
+            _ => false,
+        }
+    }
+
+    /// Caller-runs: a batch runs on a client's thread only while nothing in it can wait
+    /// there: no close, no room wait or stall (their timers are the driver's), and a WAL
+    /// stream that can take the append without waiting for a rollover sync.
+    fn caller_may_run(&self) -> bool {
+        !self.closing
+            && !self.wait_room
+            && !self.stall_open()
+            && !self.wal.as_ref().is_some_and(|w| w.blocked())
     }
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {

@@ -859,7 +859,9 @@ pub(crate) fn worker_main(mut driver: PoolDriver, vfs: VfsRef) {
                 );
                 thread::park()
             }
-            Some(deadline) => idle_park.park(&*vfs, deadline),
+            Some(deadline) => {
+                idle_park.park(&*vfs, deadline);
+            }
         }
         signal.awake();
     }
