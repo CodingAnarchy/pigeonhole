@@ -1,0 +1,38 @@
+[package]
+name = "pigeonhole-embed"
+description = "Local text embeddings for pigeonhole-memory: a pinned open model, run on the CPU in-process."
+# Its own 0.N line (owner, 2026-11-05: D318 Q1), as pigeonhole-otel has, until the API has
+# been used for a while.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["embeddings", "bert", "memory", "database", "embedded"]
+categories = ["text-processing", "science"]
+readme = "README.md"
+
+[features]
+default = ["download"]
+# Fetches the model's files from huggingface.co on first use. Without it the crate has no
+# network code: the files come from `LoadOptions::dir` or the cache.
+download = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
+
+[dependencies]
+pigeonhole = { workspace = true }
+pigeonhole-memory = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+# `download`: the same client stack as phdb's `embed` feature (rustls on ring, the OS's roots).
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+
+[lints]
+workspace = true

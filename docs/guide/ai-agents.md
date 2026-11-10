@@ -70,6 +70,29 @@ or, for a project, a `.mcp.json` at its root:
 
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
+## Remote MCP (`phdb serve`)
+> **Status:** on `main` for 1.2.0 (#1397). The data tools are served; the memory tools follow.
+
+[`phdb serve`](cli.md#phdb-serve) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
+
+```json
+{
+  "mcpServers": {
+    "pigeonhole": {
+      "type": "http",
+      "url": "https://db.internal:7448/mcp",
+      "headers": {"Authorization": "Bearer ${PIGEONHOLE_TOKEN}"}
+    }
+  }
+}
+```
+
+- **The token's scope decides the tools.** A read token gets the read tools only, and a write tool called anyway is refused (`PermissionDenied`). A write token gets `write` and `create_table` too. A replica offers the read tools whatever the token. Whether a session is offered the write tools is settled when it starts: after a replica's promote, start a new session to write.
+- **The server's rules apply to every call:** its in-flight and concurrency limits, the reserved `__phdb_` table prefix, and on a replica, read-your-writes with `x-pigeonhole-min-primary-seqno`.
+- **Sessions** last until the client ends them, or until idle for `--mcp-session-idle-ms` (30 min) or older than `--mcp-session-lifetime-ms` (24 h). After that the client gets 404 and starts a new one, as MCP clients do. A session answers up to `--mcp-session-requests` (8) requests at once; past that, the extra request gets `Overloaded` and is retried.
+- **`nearest` appears for every session** once any session, or the application, creates the first vector family: each session's next request carries `notifications/tools/list_changed`.
+- **Results** are cut as with `phdb mcp`, at `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB). A session keeps up to `--mcp-session-cache-bytes` (8 MiB) of traversal results for its cursors.
+
 ## The tools
 Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md) (the server advertises `listChanged`, and after any tool call that finds the list changed, such as the first vector family appearing, whether this session or the writer added it, it sends `notifications/tools/list_changed`), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
 
@@ -89,7 +112,7 @@ Eight tools, each with a JSON schema and a description written for the agent. `t
 **Errors.** A tool that fails returns a result with `isError` and `{"error": {"code", "code_num", "message"}}`, with the [`ErrorCode`](errors.md) name when the database refused the call (`TableNotFound`, `FamilyNotFound`, `ReadOnly`, ...) and `Usage` for a bad argument. The agent sees it and can correct the call. An unknown argument is an error, not ignored, so a misspelt `limt` doesn't silently scan 100 rows.
 
 ## The memory tools
-`phdb mcp --memory NAME` adds six tools over a [`pigeonhole-memory`](agent-memory.md) store named `NAME` (its tables are `mem_NAME` and `mem_NAME_text`). The store keeps memories with ranked recall, deduplication, superseding and forgetting, so an agent doesn't have to model them in tables itself. When the database is writable and the store is missing, the server creates it.
+`phdb mcp --memory NAME` adds six tools over a [`pigeonhole-memory`](agent-memory.md) store named `NAME` (its tables are `mem_NAME`, `mem_NAME_text` and, with an IVF index, `mem_NAME_ivf`: `Store::table_names`). The store keeps memories with ranked recall, deduplication, superseding and forgetting, so an agent doesn't have to model them in tables itself. When the database is writable and the store is missing, the server creates it.
 
 ```sh
 phdb mcp --create --memory agent memory.phdb                          # keyword and recency recall
@@ -121,7 +144,7 @@ Reopening a store with a model flag that names another model than the store's fa
 
 **Keyword matching.** `--memory-normalization nfkc` makes a new store's keyword recall match ligatures and full-width forms against plain text, for memories from PDFs, OCR or East Asian sources (`nfc` is the default; `none` compares code points as written). It's fixed when the store is created: for an existing store, a value other than the store's stops the server at startup.
 
-**Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs. A store whose application set a policy forgets under it too.
+**Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs, and only when the server can write: a server whose database is read-only (it fell back to a read-only open) or a reader process (`--read-only`, or when another process is the writer) deletes nothing (#1648). A store whose application set a policy forgets under it too.
 
 ## Long results and cursors
 A result that would pass `--max-result-bytes` stops early and carries a `cursor`. Calling the same tool again with the same arguments plus that `cursor` returns the next part. An agent pages through anything this way, a million-edge hub included, without flooding its context.

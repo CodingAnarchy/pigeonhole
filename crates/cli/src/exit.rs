@@ -200,6 +200,18 @@ impl Failure {
         }
     }
 
+    /// A failure with a server's code (`phdb serve`'s `/mcp`: a refusal from the service
+    /// layer, as its tools' result).
+    #[cfg(feature = "serve")]
+    pub(crate) fn served(code: &str, code_num: u32, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            code_num: Some(code_num),
+            message: message.into(),
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// The message alone.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn message(&self) -> &str {

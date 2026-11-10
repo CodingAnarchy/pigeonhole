@@ -349,9 +349,13 @@ impl PendingNearest {
                 columns: &mut self.columns,
             };
             let end = match &mut self.source {
-                Source::Scan(c) => c.counted(|c| r.read(c)),
-                Source::Keys { cursor, .. } => cursor.counted(|c| r.read(c)),
+                Source::Scan(c) => c.counted(|c| r.read(c, cx)),
+                Source::Keys { cursor, .. } => cursor.counted(|c| r.read(c, cx)),
             }?;
+            if end == RowEnd::Fetch {
+                // The row's place is kept; the fetch's completion wakes the task.
+                return Poll::Pending;
+            }
             if end == RowEnd::Limit
                 && let Source::Keys { cursor, .. } = &mut self.source
             {
@@ -372,17 +376,36 @@ impl PendingNearest {
 /// A cursor that lends the current row's cells one at a time.
 trait RowCells {
     fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>>;
+    /// Fetches the block the next step reads first (#1652): `Pending` while it's in flight.
+    fn poll_cell_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<crate::Result<()>>;
 }
 
 impl RowCells for super::ScanCursor {
     fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>> {
         super::ScanCursor::next_cell(self)
     }
+
+    fn poll_cell_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<crate::Result<()>> {
+        super::ScanCursor::poll_cell_ready(self, cx)
+    }
 }
 
 impl RowCells for super::keys::KeyCursor {
     fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>> {
         super::keys::KeyCursor::next_cell(self)
+    }
+
+    fn poll_cell_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<crate::Result<()>> {
+        super::keys::KeyCursor::poll_cell_ready(self, cx)
     }
 }
 
@@ -391,6 +414,8 @@ impl RowCells for super::keys::KeyCursor {
 enum RowEnd {
     /// The poll's cell budget ran out: the row goes on next poll.
     Budget,
+    /// The next cell is in a block being fetched (#1652): the row goes on once it lands.
+    Fetch,
     /// The row's cells ran out.
     Ended,
     /// The column limit is reached: the rest of the row is skipped.
@@ -412,12 +437,19 @@ impl RowRead<'_> {
     /// Scores the current row's cells. Cells `filter` drops count toward the budget too,
     /// and never reach the visitor; with a column limit, only the cells it keeps count
     /// toward the limit (one version per column).
-    fn read(&mut self, cells: &mut impl RowCells) -> crate::Result<RowEnd> {
+    fn read(
+        &mut self,
+        cells: &mut impl RowCells,
+        cx: &mut std::task::Context<'_>,
+    ) -> crate::Result<RowEnd> {
         use super::reduce::{CellRef, Reducer};
         let row = self.row;
         loop {
             if *self.budget == 0 {
                 return Ok(RowEnd::Budget);
+            }
+            if cells.poll_cell_ready(cx)?.is_pending() {
+                return Ok(RowEnd::Fetch);
             }
             let Some(c) = cells.next_cell()? else {
                 return Ok(RowEnd::Ended);

@@ -29,6 +29,7 @@ use pigeonhole::{
 use serde_json::{Map, Value, json};
 
 use super::Limits;
+use super::backend::Backend;
 use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
@@ -36,7 +37,7 @@ use crate::cmd::schema::{
     family_from_json, family_json, value_from_json, vector_spec_json,
 };
 use crate::exit::Failure;
-use crate::open::{Db, Handle};
+use crate::open::Handle;
 
 /// The aggregation kinds `create_table` takes (`family_from_json`'s names).
 const AGGREGATIONS: &[&str] = &[
@@ -71,14 +72,31 @@ const MAX_K: u64 = 1_000;
 /// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
 const MAX_COMMITS: u64 = 1_000;
 const MAX_WAIT_MS: u64 = 30_000;
-/// The largest traversal result the server keeps for its cursors (#1254), about: counted in
-/// node-key bytes, plus 4 a node for parents. Past it, a cursor runs the traversal again.
-const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
-pub(super) type Outcome = Result<Map<String, Value>, Failure>;
+pub(crate) type Outcome = Result<Map<String, Value>, Failure>;
 
-pub(super) struct Tools {
-    db: Db,
+impl super::protocol::Host for Tools {
+    fn memory(&self) -> Option<&super::memory::Memory> {
+        Tools::memory(self)
+    }
+
+    fn list(&self) -> Vec<Value> {
+        Tools::list(self)
+    }
+
+    fn names(&self) -> Vec<String> {
+        Tools::names(self)
+    }
+
+    fn call(&self, name: &str, args: &Map<String, Value>) -> Option<Outcome> {
+        Tools::call(self, name, args)
+    }
+}
+
+pub(crate) struct Tools {
+    /// The database, through the tools' surface on it (8c-2): the one `phdb mcp` opened,
+    /// or `phdb serve`'s service layer.
+    db: Box<dyn Backend>,
     writable: bool,
     limits: Limits,
     /// The last cut traversal (#1254): its cursors page from it, in O(page), all from one
@@ -101,8 +119,8 @@ struct CachedTraversal {
 }
 
 impl Tools {
-    pub(super) fn new(
-        db: Db,
+    pub(crate) fn new(
+        db: Box<dyn Backend>,
         writable: bool,
         limits: Limits,
         memory: Option<super::memory::Memory>,
@@ -145,7 +163,7 @@ impl Tools {
         // reader process (#1361): always, since the running writer's feed isn't in a reader's
         // `info` and can change across the writer's restarts; a call without one fails with
         // a hint.
-        if matches!(self.db, Db::Reader(_)) || self.db.info().is_ok_and(|i| i.feed.is_some()) {
+        if self.db.lists_feed() {
             tools.push(feed_poll());
         }
         if self.writable {
@@ -202,10 +220,7 @@ impl Tools {
         };
         let mut tables = Vec::new();
         for t in names {
-            let families = self
-                .db
-                .families(&t)
-                .map_err(|e| Failure::db(&format!("table {t}"), &e))?;
+            let families = self.db.families(&t)?;
             let families: Vec<Value> = families.iter().map(family_brief).collect();
             tables.push(json!({"name": t, "families": families}));
         }
@@ -533,7 +548,7 @@ impl Tools {
                         .sum::<usize>()
                 })
                 .sum();
-            if bytes <= MAX_CACHED_TRAVERSAL_BYTES {
+            if bytes <= self.limits.cache_bytes {
                 *self.traversal.lock().expect("not poisoned") = Some(CachedTraversal {
                     fingerprint,
                     run,
@@ -768,12 +783,9 @@ impl Tools {
                 "ops: between 1 and {MAX_ITEMS} operations"
             )));
         }
-        let Db::Writer(db) = &self.db else {
+        let Some(db) = self.db.writer().filter(|_| self.writable) else {
             return Err(Failure::read_only(self.db.mode()));
         };
-        if !self.writable {
-            return Err(Failure::read_only(self.db.mode()));
-        }
         // Every table first: the batch borrows them.
         let mut tables: HashMap<String, Table> = HashMap::new();
         for (i, op) in ops.iter().enumerate() {
@@ -781,10 +793,11 @@ impl Tools {
                 .as_str()
                 .ok_or_else(|| Failure::usage(&format!("ops[{i}]: table: a table name")))?;
             if !tables.contains_key(name) {
-                let t = db
-                    .table(name)
-                    .and_then(|b| b.open())
-                    .map_err(|e| Failure::db(&format!("ops[{i}]: table {name}"), &e))?;
+                let t = self
+                    .db
+                    .open_for_write(name)
+                    .ok_or_else(|| Failure::read_only(self.db.mode()))?
+                    .map_err(|f| f.within(&format!("ops[{i}]")))?;
                 tables.insert(name.to_owned(), t);
             }
         }
@@ -811,10 +824,7 @@ impl Tools {
     fn create_table(&self, a: Args<'_>) -> Outcome {
         a.only(&["table", "families"])?;
         let table = a.str("table")?;
-        let Db::Writer(db) = &self.db else {
-            return Err(Failure::read_only(self.db.mode()));
-        };
-        if !self.writable {
+        if self.db.writer().is_none() || !self.writable {
             return Err(Failure::read_only(self.db.mode()));
         }
         let Some(Value::Array(families)) = a.0.get("families") else {
@@ -823,18 +833,21 @@ impl Tools {
         if families.is_empty() {
             return Err(Failure::usage("families: at least one"));
         }
-        let fail = |e: pigeonhole::Error| Failure::db(&format!("create_table {table}"), &e);
-        let mut b = db.table(table).map_err(fail)?;
+        let mut specs = Vec::with_capacity(families.len());
         for (i, f) in families.iter().enumerate() {
             let spec = match f {
                 Value::String(name) => json!({ "name": name }),
                 other => other.clone(),
             };
-            let (name, family) = family_from_json(&spec)
-                .map_err(|m| Failure::usage(&format!("families[{i}]: {m}")))?;
-            b = b.family(&name, family);
+            specs.push(
+                family_from_json(&spec)
+                    .map_err(|m| Failure::usage(&format!("families[{i}]: {m}")))?,
+            );
         }
-        let t = b.create_if_missing().map_err(fail)?;
+        let t = self
+            .db
+            .create_table(table, specs)
+            .ok_or_else(|| Failure::read_only(self.db.mode()))??;
         let families: Vec<Value> = t
             .families()
             .into_iter()

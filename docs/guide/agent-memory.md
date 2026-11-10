@@ -35,6 +35,48 @@ assert_eq!(again, Remembered::Merged(r.id().clone()));
 - **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
 - **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. Python's `Store.create(..., normalization="nfkc")` and `phdb mcp --memory-normalization nfkc` set it too. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
 
+## Local embeddings
+`pigeonhole-embed` (0.1, on its own version line) computes embeddings in your process, on the CPU, with no service and no network after the first load. It runs [`BAAI/bge-small-en-v1.5`](https://huggingface.co/BAAI/bge-small-en-v1.5) (MIT licence), the model this guide's [recall numbers](#how-well-it-recalls) were measured with, and gives the reference implementation's (sentence-transformers') vectors to within 1e-4 per component.
+
+```toml
+[dependencies]
+pigeonhole-embed = "0.1"
+```
+
+```rust,ignore
+use pigeonhole_embed::{Element, LoadOptions, LocalEmbedder, Model};
+
+let embedder = LocalEmbedder::open(Model::BgeSmallEnV15, &LoadOptions::new())?;
+let store = Store::create(&db, "agents", StoreOptions::new().embedding(embedder.embedding_model(Element::F32)?))?;
+
+let text = "The March meeting chose Postgres.";
+store.remember("agent:alice", Memory::new(text).embedding(embedder.embed_passages(&[text])?.remove(0)))?;
+let hits = store
+    .recall(&["agent:alice"])
+    .embedding(embedder.embed_query("which database did we pick?")?)
+    .k(5)
+    .run()?;
+```
+
+- **Passages and queries are embedded differently.** `embed_passages` is for what you remember. `embed_query` adds the model's retrieval instruction, which recall's measured quality depends on. Don't embed a query as a passage.
+- **The pinned id** is `BAAI/bge-small-en-v1.5@5c38ec7c`: the model and its revision. A store created with it refuses vectors from anything else, including the same model served by Ollama or another runtime, whose vectors can differ.
+- **The files:** the weights (133 MB) aren't in the crate. The first `open` downloads the model's three files from the pinned revision on huggingface.co into the cache: `$PIGEONHOLE_EMBED_CACHE`, else `~/.cache/pigeonhole/models` on Linux, `~/Library/Caches/pigeonhole/models` on macOS, and `%LOCALAPPDATA%\pigeonhole\models` on Windows. Every file is checked against a SHA-256 pinned in the crate, however it arrived.
+- **Offline and air-gapped:** `LoadOptions::offline()` (or `PIGEONHOLE_EMBED_OFFLINE=1`) never downloads, and a missing file fails with the URL to fetch and where to put it. `LoadOptions::dir(path)` loads from a directory you filled yourself. Build with `default-features = false` to leave out the download code entirely.
+- **Text past 512 tokens is truncated** (about 350 English words), so split long documents before remembering them.
+- **One embedder, shared:** each `LocalEmbedder` holds the weights (about 133 MB), and it's `Send` and `Sync`. Calls from many threads queue for its pool.
+- **The store's element:** `embedding_model(Element::F16)` (or `BF16`) pins a half-size store. The embeddings stay `f32`, and the store rounds them as it writes.
+- **CPU cost:** the matrix products run on the embedder's own thread pool (`LoadOptions::threads`, by default up to 4), never your application's rayon pool. `LoadOptions::on_thread_start` can place its threads. candle runs large element-wise steps on a process-wide pool of its own, one thread per physical core less one, sized by `CANDLE_NUM_THREADS` and on Linux pinned by `CANDLE_CPU_MASK` (a CPU list). Export both before starting the process (they're read once) to keep embedding work off cores your latency-sensitive threads use. `phdb serve` prints the values to use for its placement. On a 10-core Apple laptop:
+
+| Threads | 16 tokens | 64 tokens | 256 tokens | Batches of 32 (16 tokens) |
+|---|---|---|---|---|
+| 1 | 12 ms | 33 ms | 130 ms | 148 texts/s |
+| 4 | 7.1 ms | 17 ms | 68 ms | 353 texts/s |
+
+  Pass many texts to `embed_passages` when you can: a batch costs far less per text. A query is one text.
+- **On Linux, set `CANDLE_CPU_MASK` (or `RAYON_NUM_THREADS`) in the environment.** Without either, candle 0.11 re-reads `/proc/cpuinfo` on every matrix product, which costs about 47 ms per call on a 16-core x86 server, five times the work itself ([huggingface/candle#4070](https://github.com/huggingface/candle/issues/4070)). Either variable avoids it. `RAYON_NUM_THREADS` also sizes your application's global rayon pool, so prefer `CANDLE_CPU_MASK` if that matters. With one set, the same server takes 11 / 37 / 164 ms at 16 / 64 / 256 tokens on 1 thread, and 6.4 / 24 / 98 ms on 4.
+- **About 4 threads for interactive use, not all cores.** One text doesn't split well across many threads: on the same 16-core (32-thread) server, 32 threads took 9.4 ms at 16 tokens against 6.4 ms on 4, and 135 against 98 ms at 256 tokens. Only large batches of long texts gain a little. The default, `min(cores, 4)`, is the right choice for `remember` and `recall`; give a dedicated batch embedder more only if you've measured that it helps.
+- **Allocator:** each forward pass allocates and frees its tensors. On Linux, glibc's allocator gives large freed blocks back to the system, so the next pass faults them in again (about a fifth of the CPU at 1 thread). A server embedding steadily may prefer jemalloc or mimalloc as its global allocator.
+
 ## Recall
 ```rust
 # use pigeonhole::*;
@@ -72,6 +114,7 @@ store.mark_used(&[hits[0].id.clone()])?;
 - **Filters:** superseded memories are left out unless `include_superseded(true)`, and then each such hit's `superseded_by` names its successor. `session(s)` keeps one session.
 - **Determinism:** with an explicit `snapshot` and `now_us(time)`, the same call always returns the same result.
 - **Either signal alone works:** text alone recalls by keyword and recency, and an embedding alone by similarity and recency.
+- **Async:** `run_async().await` and `run_with_stats_async().await` return exactly what `run` and `run_with_stats` do, with every read asynchronous, so a recall doesn't block an executor thread on the cache's misses. Each namespace's vector, keyword and recency lists are read together. The futures are `Send`, and they work in reader processes too. They're behind the `async` feature, on by default as in `pigeonhole`.
 
 ## Lifecycle
 - **`get(&id)`** returns a memory with all its metadata.

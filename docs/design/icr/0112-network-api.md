@@ -120,8 +120,8 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
 | `DeadlineExceeded` (only before a write was submitted, B3; or a server stream (`Data.Scan`, `Feed.Subscribe`) whose client took no message for `--stream-idle-ms`, resumable from its last page's `next` or its last event's `token`; or an HTTP/1.1 request body that didn't arrive within `--request-timeout-ms`, answered with `Connection: close`, #1601: the same code as every other deadline, not an HTTP-only 408) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
 | `ReplicaBehind` (a read with `x-pigeonhole-min-primary-seqno` that the replica hadn't applied within its deadline, or while it bootstraps, #1577) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied (a read) | `REQUEST`, after the pause |
-| `Unavailable` (a service the server depends on failed or can't be reached: the embedding endpoint, `--embed-url`, refused the connection, didn't connect within half of `--embed-timeout-ms` (at most 3 s), or answered 5xx, 408 or 429; #1617) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
-| `FailedPrecondition` (the server's role refuses the call, #1436: `Admin.Promote` on a server that isn't a replica, a replica asked for a bootstrap copy or to be followed) | `FAILED_PRECONDITION` | 409 | not applied | no |
+| `Unavailable` (a service the server depends on failed or can't be reached: the embedding endpoint, `--embed-url`, refused the connection, didn't connect within half of `--embed-timeout-ms` (at most 3 s), or answered 5xx, 408 or 429; #1617. Or, on a replica, a memory store the replica doesn't have yet; #1618) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
+| `FailedPrecondition` (the server's role refuses the call, #1436: `Admin.Promote` on a server that isn't a replica, a replica asked for a bootstrap copy or to be followed. Or the server's configuration does, #1618: a replica's memory store that arrived pinned to another model than `--embed-url`'s or `--memory-model`; and #1651: `Schema.DropTable` of a table of the memory store the server serves) | `FAILED_PRECONDITION` | 409 | not applied | no |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
 A code an older client doesn't know follows its `retry_safe` and `retry_from`.
@@ -180,5 +180,43 @@ None: the contract is new. `phdb serve` (D313's tickets 3 and later) implements 
 - **Read-your-writes on a replica (#1577, a later amendment; cli692's call: a header, not a proto field).** A read may carry the request header `x-pigeonhole-min-primary-seqno: <seqno>`, gRPC metadata or an HTTP header: the seqno of the client's commit on the primary, in decimal. On a replica, the read waits until the replica has applied the primary's commits through that seqno, then answers. The wait shares one deadline with the in-flight budget wait, from the request's arrival: the request timeout, or a shorter `grpc-timeout`. Past it, or while the replica bootstraps, the read fails with the new server code `ReplicaBehind` (the table above), or `DeadlineExceeded` when the client's `grpc-timeout` was the bound, as the budget wait answers (cli692's R1 on #1594). A promotion answers every waiting read at once. Every `CommitInfo.seqno` names a commit the primary's feed of every table delivers, so the wait needs no later commit to end. A value that isn't a decimal `u64` is `InvalidArgument`. It applies to read-scope RPCs except `Admin.Info` and `Admin.Metrics`. A server that isn't a replica, or a promoted one, ignores the header. A header rather than a field keeps it out of every read message, and works the same for RPCs added later.
 - **A download answers at once (#1611, a later amendment; wire-compatible, no new field).** Over gRPC, a fresh `Admin.BackupDownload` answers as soon as its copy is registered. While the copy is written and hashed, the server sends a **heartbeat**: a `BackupChunk` with no `data`, the requested `offset`, the `backup_id`, and, for a replica's copy, the `feed_token` once its snapshot is taken. The first goes at once, the rest every second. A client can therefore bound every wait independently of the copy's size (a replica allows 3 s between heartbeats), and a break during the copy resumes the same copy with `backup_id`: a resume of a copy still being written waits for it, with heartbeats. A client already accepted empty chunks at its current offset. HTTP keeps waiting for the whole copy, because its size and SHA-256 go out as headers. A replica no longer needs a separate, longer wait for the first answer.
 
+## Amendment: `Memory` on a replica (#1618)
+The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6).
+- **`--memory NAME` with `--replica-of`** serves the store's `Recall` and `Watch` from what the replica has applied. `x-pigeonhole-min-primary-seqno` applies to them, as to any read-scope RPC. The five memory writes are write-scope, so they fail with the replica's `ReadOnly`, naming the primary (the replication amendment's rule).
+- **The store is opened, never created, on a replica.**
+  - At startup it's opened if the replica's copy has it, so a pin mismatch fails the start; otherwise it's opened when a call first needs it.
+  - It's opened again after every applied catalog change and every re-bootstrap swap. The server drops it before the replica publishes the seqno it applied, so a read waiting for the primary's create sees the store.
+  - The store's forgetter and IVF rebalancer don't run there (ICR 0107's `own_rebalancer` amendment).
+- **A store the replica doesn't have:**
+  - `ReplicaBehind` while the replica is `starting`, `bootstrapping` or `re-bootstrapping`;
+  - otherwise `Unavailable`, widened in the table above: the primary may not have created the store yet, or the replica hasn't applied that yet;
+  - a store pinned to another model than the server's: `FailedPrecondition`.
+- **An open `Memory.Watch` across a re-bootstrap** ends with an error, as `Feed.Subscribe` streams do: `FeedExpired`, or `InvalidArgument` if the store's feed sees the new copy first. Its token is the old copy's, so the client watches again without it. An applied catalog change doesn't end it.
+- **A promote** opens the store as the writer at once, creating it if missing with the server's `--memory-*` options. A failure there doesn't fail the promote: it's `ReplicaInfo.last_error` and the log, and memory calls answer it until the next catalog change.
+
 ## Amendment: `Unavailable` (#1617)
 - **A new server code, `Unavailable`,** in the table above (the coordinator approved it on #1617, ai1249's R2): a service the server depends on failed or can't be reached, so nothing was applied and the request may be sent again. Today that's `Memory`'s embedding endpoint (`--embed-url`) refusing the connection, not connecting within half of `--embed-timeout-ms` (at most 3 s; a connect that hangs is an unreachable endpoint, not a slow one), or answering 5xx, 408 or 429. The endpoint's other failures map to existing codes: its timeout (`--embed-timeout-ms`) is `DeadlineExceeded`; a 400, 413 or 422 (the caller's text) is `InvalidArgument`; any other answer, or a reply that isn't an embedding of the store's dimension, is `Internal` (the server's configuration). Clients that don't know the code see it as an unknown server code with its HTTP status and `retry_from`.
+
+## Amendment: remote MCP at `/mcp` (#1397, D313 ticket 8c-3a)
+`phdb serve` serves `phdb mcp`'s data tools over MCP's Streamable HTTP transport at `/mcp`, on the same port. The tools, their arguments, their paging and cursors, and their answers are `phdb mcp`'s. The memory tools follow in 8c-3b.
+- **Requests:**
+  - `POST /mcp` carries one JSON-RPC message, or a batch (2025-03-26). The reply is `application/json`. It's `text/event-stream` when `notifications/tools/list_changed` rides along: the reply's event, then the notification's. A message with nothing to answer (a notification) gets 202.
+  - `GET /mcp` gets 405: the server opens no stream of its own.
+  - `DELETE /mcp` ends the session (204).
+  - The body's share of the in-flight budget is reserved from `Content-Length` before the body is read, as for `/v1`. `/mcp` is under the global concurrency shed, the deadlines and `--max-connections` as `/v1` is.
+- **Sessions:**
+  - An `initialize` without `Mcp-Session-Id` starts a session, and its answer carries the id. Any other request without one gets 400.
+  - A session is bound to the token that started it. Another token's request on it, an ended one or an expired one gets 404, which tells the client to start a new session.
+  - A session lives in the session table beside transactions and snapshots, counted in `--max-sessions` and `--max-sessions-per-token`, with leases of its own: `--mcp-session-idle-ms` (30 min) and `--mcp-session-lifetime-ms` (24 h). A session with a request in flight never expires.
+  - It answers up to `--mcp-session-requests` (8) requests at once. One more waits up to 1 s for a place, then gets `Overloaded` (503, retryable).
+  - It keeps at most `--mcp-session-cache-bytes` (8 MiB) for its cursors: a cut traversal's result. A larger one isn't kept, and its cursor runs the traversal again.
+  - `/metrics` counts sessions as `pigeonhole_serve_sessions{kind="mcp"}`.
+- **Protocol versions:** `/mcp` offers 2025-03-26 and later (2024-11-05 defined the older HTTP+SSE transport). A request whose `MCP-Protocol-Version` names a version other than the session's gets 400. A request without the header is answered as the session's.
+- **The service's rules apply to every tool call:**
+  - Each call passes the same `admit` as every RPC: the caller's scope, read or write (`write`, `create_table`), and a replica's write refusal. A refusal is the tool's result, with `isError` and the server's code (`PermissionDenied`, `ReadOnly`).
+  - A token with read scope, or a replica, isn't offered the write tools. That's settled when the session starts: a replica's sessions stay read-only after a promote.
+  - The tools reach tables through the service's own table cache and checks: the reserved `__phdb_` prefix is refused. A table `create_table` makes is the service's at once.
+  - `feed_poll` holds a `--max-streams` place while it waits.
+  - On a replica, `x-pigeonhole-min-primary-seqno` makes a request wait for the primary's seqno, as an RPC does.
+- **`list_changed` across sessions:** the service keeps a catalog generation, which a create or drop (or a replica's catalog change) moves. A session that saw an older one checks its tool list on its next request, and announces a change there, as after its own calls.
+- **Result limits:** `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB), `phdb mcp`'s `--max-result-bytes` and `--max-value-bytes`.
