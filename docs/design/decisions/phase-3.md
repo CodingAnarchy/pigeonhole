@@ -4568,7 +4568,7 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
 - **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
 - **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.
-- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before.
+- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before. PR 2 gives the same flag to `phdb serve --memory`, with its embedder's threads placed off the shards' CPUs and the startup line for candle's environment (ICR 0119).
 - **The cost, PR 1's first numbers** (a 10-core Apple laptop):
   - **1 thread:** 33, 41 and 138 ms (p50) at 16, 64 and 256 tokens;
   - **4 threads:** 8.4, 18 and 65 ms;

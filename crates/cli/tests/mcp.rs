@@ -1792,6 +1792,130 @@ fn embed_url_needs_the_embed_feature() {
     assert!(err.contains("embed"), "{err}");
 }
 
+/// `--embed-local`'s flags (#1345 PR 2): it's one way to embed, so it conflicts with
+/// `--embed-url` and `--memory-model`, and its options need it. All usage errors, with or
+/// without the feature.
+#[test]
+fn embed_local_conflicts_are_usage_errors() {
+    let dir = TempDir::new("mcp-memory-local-flags");
+    let path = db_path(&dir);
+    for flags in [
+        &[
+            "--memory",
+            "a",
+            "--embed-local",
+            "--embed-url",
+            "http://127.0.0.1:9/v1/embeddings",
+            "--embed-model",
+            "m",
+        ][..],
+        &[
+            "--memory",
+            "a",
+            "--embed-local",
+            "--memory-model",
+            "m",
+            "--memory-dim",
+            "4",
+        ],
+        &["--embed-local"],
+        &["--memory", "a", "--embed-offline"],
+        &["--memory", "a", "--embed-model-dir", "/nonexistent"],
+    ] {
+        let mut all = vec!["--create"];
+        all.extend_from_slice(flags);
+        let (status, err) = Server::spawn(&path, &all).finish();
+        assert_eq!(status, 2, "{flags:?}: {err}");
+    }
+}
+
+/// Without the `embed-local` feature, `--embed-local` is refused as unsupported.
+#[cfg(not(feature = "embed-local"))]
+#[test]
+fn embed_local_needs_the_embed_local_feature() {
+    let dir = TempDir::new("mcp-memory-no-local");
+    let path = db_path(&dir);
+    let (status, err) =
+        Server::spawn(&path, &["--create", "--memory", "agent", "--embed-local"]).finish();
+    assert_eq!(status, 6, "{err}");
+    assert!(err.contains("embed-local"), "{err}");
+}
+
+/// `--embed-local` (#1345 PR 2): the model runs in the process, a new store is pinned to its
+/// id and dimension with no probe, a memory is embedded as a passage and a recall's text as
+/// a query, and a client's vectors are refused. It needs the model's files: set
+/// `PIGEONHOLE_EMBED_MODEL_DIR` to a directory holding them, as `pigeonhole-embed`'s
+/// reference test does (CI's `embed-reference` job).
+#[cfg(feature = "embed-local")]
+#[test]
+fn embed_local_embeds_text_in_the_process() {
+    let Some(model_dir) = std::env::var("PIGEONHOLE_EMBED_MODEL_DIR").ok() else {
+        eprintln!("PIGEONHOLE_EMBED_MODEL_DIR is unset: skipping the local model");
+        return;
+    };
+    let dir = TempDir::new("mcp-memory-local");
+    let path = db_path(&dir);
+    let flags = [
+        "--create",
+        "--memory",
+        "agent",
+        "--embed-local",
+        "--embed-model-dir",
+        &model_dir,
+    ];
+    let (mut s, init) = Server::start_env(&path, &flags, &[]);
+    assert!(
+        init["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("send text only"),
+        "{init}"
+    );
+    let pg = s.call(
+        "memory_remember",
+        json!({"text": "The March planning meeting chose Postgres for the billing service."}),
+    );
+    s.call(
+        "memory_remember",
+        json!({"text": "Lunch on Friday was tacos from the place on Fifth Street."}),
+    );
+    // A query sharing no keyword with the memory: only the embedding finds it.
+    let hits = s.call(
+        "memory_recall",
+        json!({"text": "which database did we pick?", "k": 1}),
+    );
+    assert_eq!(hits["hits"][0]["id"], pg["id"], "{hits}");
+    let e = s.fail(
+        "memory_remember",
+        json!({"text": "x", "embedding": vec![0.0; 384], "embedding_model": "BAAI/bge-small-en-v1.5@5c38ec7c"}),
+    );
+    assert!(
+        e["message"].as_str().unwrap().contains("--embed-local"),
+        "{e}"
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("embedding model BAAI/bge-small-en-v1.5@5c38ec7c, 384 dimensions"),
+        "{err}"
+    );
+
+    // Offline with an empty cache: the start fails, naming what to fetch.
+    let empty = TempDir::new("mcp-memory-local-cache");
+    let cache = empty.path().display().to_string();
+    let (status, err) = Server::spawn_env(
+        &path,
+        &["--memory", "agent", "--embed-local", "--embed-offline"],
+        &[("PIGEONHOLE_EMBED_CACHE", cache.as_str())],
+    )
+    .finish();
+    assert_ne!(status, 0, "{err}");
+    assert!(
+        err.contains("--embed-local") && err.contains("huggingface.co"),
+        "{err}"
+    );
+}
+
 /// With `supersedes`, a store's near dedup doesn't stop the write (simp724's S1 on #1389): a
 /// correction is near what it corrects, and `Skip` would otherwise store nothing and
 /// supersede with the match.

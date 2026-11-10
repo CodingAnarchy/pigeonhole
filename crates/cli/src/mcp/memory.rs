@@ -22,7 +22,6 @@ use std::sync::Arc;
 use pigeonhole_memory::{EmbeddingModel, Kind, LinkType, MemoryId, Remembered};
 use serde_json::{Map, Value, json};
 
-use super::embed::Endpoint;
 use super::tools::{Args, Outcome, tool};
 use crate::args::MemoryArgs;
 use crate::exit::Failure;
@@ -71,15 +70,13 @@ impl Memory {
         let Some(name) = args.memory.clone() else {
             return Ok(None);
         };
-        let embedder = match &args.embed_url {
-            Some(url) => Some(Arc::new(Embedder::Remote(Endpoint::new(
-                url,
-                args.embed_model.as_deref().unwrap_or_default(),
-                args.embed_key_env.as_deref(),
-                super::embed::TIMEOUT,
-            )?))),
-            None => None,
-        };
+        // `phdb mcp` has no placement: a local model's threads go where the OS puts them.
+        let embedder = Embedder::from_args(
+            args,
+            super::embed::TIMEOUT,
+            crate::memcore::LocalPlace::default(),
+        )?
+        .map(Arc::new);
         let embeds = embedder.is_some();
         // A recall's budget: `--max-result-bytes` when it asks for none, any larger it asks.
         let budget = (result_bytes as u64, u64::MAX);
@@ -258,7 +255,7 @@ impl Memory {
         if self.embeds {
             if given.is_some() || named.is_some() {
                 return Err(Failure::usage(
-                    "this server computes the embeddings (--embed-url): send text only",
+                    "this server computes the embeddings (--embed-url or --embed-local): send text only",
                 ));
             }
             return Ok(None);

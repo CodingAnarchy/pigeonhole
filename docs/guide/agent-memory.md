@@ -35,6 +35,21 @@ assert_eq!(again, Remembered::Merged(r.id().clone()));
 - **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
 - **The keyword index's normalisation:** `StoreOptions::normalization(Normalization::Nfkc)` makes keyword recall match ligatures and full-width forms (`ﬁle`, `ｆｉｌｅ`) against plain text, for memories gathered from PDFs, OCR or East Asian sources. The default, `Nfc`, only unifies different encodings of the same character. It's fixed at create, and `Store::normalization()` reads it back. To change it, create a new store and remember the old one's memories into it. Python's `Store.create(..., normalization="nfkc")` and `phdb mcp --memory-normalization nfkc` set it too. The full-text guide's [which normalisation to pick](text-search.md#options) has the trade-offs.
 
+## Which embeddings
+A store is pinned to its embedding model when it's created, so choose first. There are three ways to get embeddings, plus no model at all (keyword recall):
+
+| | Local (`pigeonhole-embed`) | An endpoint | Your own vectors |
+|---|---|---|---|
+| **Runs** | in your process, on the CPU | in a service: Ollama, llama.cpp, or a hosted API | wherever you embed today |
+| **Memory text leaves the machine** | never | to the endpoint (local or hosted) | your choice |
+| **Model** | `bge-small-en-v1.5`, pinned to a revision | any the endpoint serves | any |
+| **Cost per short text** | about 7–12 ms of CPU | a network round trip plus the endpoint's time | yours |
+| **`phdb mcp` / `phdb serve`** | `--embed-local` (the `embed-local` feature) | `--embed-url` | `--memory-model` with `--memory-dim` |
+
+- **Choose local** for an agent on one machine, offline or air-gapped work, or memory text that mustn't leave the host. It's English-first and truncates at 512 tokens.
+- **Choose an endpoint** for a larger or multilingual model, a GPU, or one embedding service shared by many processes.
+- **Supply your own** when your application already embeds with some model and you want memory recall in the same space.
+
 ## Local embeddings
 `pigeonhole-embed` (0.1, on its own version line) computes embeddings in your process, on the CPU, with no service and no network after the first load. It runs [`BAAI/bge-small-en-v1.5`](https://huggingface.co/BAAI/bge-small-en-v1.5) (MIT licence), the model this guide's [recall numbers](#how-well-it-recalls) were measured with, and gives the reference implementation's (sentence-transformers') vectors to within 1e-4 per component.
 

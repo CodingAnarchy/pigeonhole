@@ -19,9 +19,10 @@
   `release-check` checks each on its own.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
-- **Publish order:** `list` prints `INTERNAL`, then `PUBLIC`, then `OWN`, and `check` fails unless each
-  crate comes after every pigeonhole crate it depends on (normal and build dependencies, which
-  must be on crates.io when it publishes).
+- **Publish order:** `list` prints `PUBLISH_ORDER`: `INTERNAL`, then `PUBLIC` and `OWN`, with
+  `pigeonhole-cli` last since it depends on `pigeonhole-embed` (#1345 PR 2). `check` fails
+  unless each crate comes after every pigeonhole crate it depends on (normal and build
+  dependencies, which must be on crates.io when it publishes).
 - **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
   itself: `check` fails unless its `version`, its pins, the gem's `Pigeonhole::VERSION`
   (`lib/pigeonhole/version.rb`) and the gem's own entries in `Gemfile.lock` are the
@@ -55,6 +56,10 @@ PUBLIC = ["pigeonhole", "arrow", "vector", "text", "memory", "cli"]
 # Published crates on a version line of their own (D316), after the public line's.
 OWN = ["otel", "embed"]
 UNPUBLISHED = ["capi", "bench"]
+# The order `list` prints and `publish.sh` publishes in: every published crate once, each after
+# the pigeonhole crates it depends on. `cli` takes `embed` (an own line) for `--embed-local`,
+# so it goes last.
+PUBLISH_ORDER = INTERNAL + [d for d in PUBLIC if d != "cli"] + OWN + ["cli"]
 
 
 def name(directory):
@@ -95,9 +100,11 @@ def pigeonhole_deps(m):
 def order_errors():
     """A published crate listed before a pigeonhole crate it depends on would fail to publish:
     its dependency isn't on crates.io yet."""
-    order = [name(d) for d in INTERNAL + PUBLIC + OWN]
+    order = [name(d) for d in PUBLISH_ORDER]
     errors = []
-    for i, d in enumerate(INTERNAL + PUBLIC + OWN):
+    if sorted(PUBLISH_ORDER) != sorted(INTERNAL + PUBLIC + OWN):
+        errors.append("PUBLISH_ORDER isn't every published crate once")
+    for i, d in enumerate(PUBLISH_ORDER):
         for dep in sorted(pigeonhole_deps(manifest(d))):
             if dep not in order:
                 errors.append(f"{name(d)} depends on {dep}, which isn't published")
@@ -181,7 +188,7 @@ def check():
 def listing():
     root, crates = versions()
     workspace = root["workspace"]["package"]["version"]
-    for d in INTERNAL + PUBLIC + OWN:
+    for d in PUBLISH_ORDER:
         print(name(d), crates[d] or workspace)
     return 0
 

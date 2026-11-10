@@ -154,26 +154,30 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
 /// already has it (so a pin mismatch fails the start too, cli692's D3), and otherwise when a
 /// call first needs it. The `--memory-*` creation options are then used only if it's
 /// promoted without the store.
+///
+/// `--embed-local`'s threads run where the network side's do (`placement`), off the shards'
+/// CPUs, at most as many as those CPUs (cli692's A2 on #1591).
 fn memory(
     args: &ServeArgs,
     db: &pigeonhole::Pigeonhole,
     writer: bool,
+    placement: &Arc<placement::Placement>,
     stderr: &mut dyn std::io::Write,
 ) -> Result<Option<memslot::MemSlot>, Failure> {
-    use crate::memcore::Embedder;
+    use crate::memcore::{Embedder, LocalPlace};
     let m = &args.memory;
     let Some(name) = &m.memory else {
         return Ok(None);
     };
-    let embedder = match &m.embed_url {
-        Some(url) => Some(Embedder::Remote(crate::mcp::Endpoint::new(
-            url,
-            m.embed_model.as_deref().unwrap_or_default(),
-            m.embed_key_env.as_deref(),
-            Duration::from_millis(args.embed_timeout_ms),
-        )?)),
-        None => None,
-    };
+    let enter = Arc::clone(placement);
+    let embedder = Embedder::from_args(
+        m,
+        Duration::from_millis(args.embed_timeout_ms),
+        LocalPlace {
+            threads: Some(placement.free_cpus.clamp(1, 4)),
+            on_thread_start: Some(Arc::new(move || enter.enter())),
+        },
+    )?;
     let create = crate::memcore::create_options(m, name);
     let name = args.memory.memory.as_deref().unwrap_or_default();
     // A recall's byte budget: 1 MiB when it sets none, 8 MiB at most, as pages are.
@@ -190,6 +194,30 @@ fn memory(
         let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
     }
     Ok(Some(slot))
+}
+
+/// With `--embed-local` and the shards pinned (`cpus`, the CPUs left to the network side as a
+/// list, and their count), a
+/// line telling the operator what to export, or `None` when `CANDLE_CPU_MASK` is set. candle
+/// runs large element-wise steps on a process-wide pool of its own, which
+/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_CPU_MASK` places it (Linux) and
+/// `CANDLE_NUM_THREADS` sizes it. Without the mask, or `RAYON_NUM_THREADS`, candle 0.11 also
+/// re-reads `/proc/cpuinfo` on every matrix product (huggingface/candle#4070). They're read
+/// once, from the environment, and setting them here would need `unsafe` (D318), so the
+/// operator sets them before the start.
+fn candle_advice(
+    cpus: Option<(String, usize)>,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    let (cpus, n) = cpus?;
+    if env("CANDLE_CPU_MASK").is_some() {
+        return None;
+    }
+    Some(format!(
+        "phdb serve: --embed-local: candle's own thread pool isn't kept off the shards' CPUs. \
+         Start the server with these in its environment (they're read once, at start):\n  \
+         export CANDLE_CPU_MASK={cpus} CANDLE_NUM_THREADS={n}"
+    ))
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
@@ -322,7 +350,7 @@ pub(crate) fn run(
     // Before `replica`: it rebuilds the indexes, whose rebalancing a replica pauses.
     .placement(&placement)
     .memory_opt(
-        memory(args, &db, replica.is_none(), stderr)?,
+        memory(args, &db, replica.is_none(), &placement, stderr)?,
         args.memory_calls.unwrap_or(0),
     );
     if let Some(r) = &replica {
@@ -398,6 +426,14 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
+        if args.memory.embed_local
+            && let Some(line) = candle_advice(
+                placement.cpu_list().map(|l| (l, placement.free_cpus)),
+                &|k| std::env::var_os(k),
+            )
+        {
+            let _ = writeln!(stderr, "{line}");
+        }
         if let Some(r) = &replica {
             let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());
             r.spawn(Arc::clone(&shared));

@@ -170,3 +170,28 @@ fn a_quiet_stream_still_moves_its_token() {
     let back: proto::FeedEvent = serde_json::from_value(json).unwrap();
     assert_eq!(back, event);
 }
+
+// ---- `--embed-local`'s startup advice (#1345 PR 2) ----
+
+/// The line comes only when the shards are pinned and `CANDLE_CPU_MASK` is unset, and it
+/// gives the placement's CPU list and count. `RAYON_NUM_THREADS` alone doesn't place
+/// candle's pool, so it doesn't silence it.
+#[test]
+fn embed_local_advice_names_the_placements_cpus_until_the_mask_is_set() {
+    use std::ffi::OsString;
+    let none = |_: &str| None::<OsString>;
+    let masked = |k: &str| (k == "CANDLE_CPU_MASK").then(|| OsString::from("2-7"));
+    let rayon = |k: &str| (k == "RAYON_NUM_THREADS").then(|| OsString::from("4"));
+    let pinned = || Some(("2-7,10".to_owned(), 7));
+
+    let line = super::candle_advice(pinned(), &none).expect("pinned, no mask: advice");
+    assert!(
+        line.contains("export CANDLE_CPU_MASK=2-7,10 CANDLE_NUM_THREADS=7"),
+        "{line}"
+    );
+    assert!(line.starts_with("phdb serve: --embed-local:"), "{line}");
+    assert!(super::candle_advice(pinned(), &rayon).is_some());
+    assert_eq!(super::candle_advice(pinned(), &masked), None);
+    // No placement (`--unpin`, or nothing pinned): nothing to say.
+    assert_eq!(super::candle_advice(None, &none), None);
+}
