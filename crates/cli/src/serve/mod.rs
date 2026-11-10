@@ -200,7 +200,10 @@ fn memory(
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
-    let mut options = Options::default().create_if_missing(args.create);
+    // The logs are sized at start-up, not while commits wait on them (#1621, ICR 0130).
+    let mut options = Options::default()
+        .create_if_missing(args.create)
+        .wal_preallocate(!args.no_wal_preallocate);
     // A database this command creates gets the server's default shard count. An existing
     // one keeps its own unless `--shards` says otherwise: an explicit count that differs
     // from the one a change feed recorded would reshard, ending the feed's history.
