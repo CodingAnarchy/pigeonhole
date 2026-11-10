@@ -81,6 +81,11 @@ A commit returns only once it is durable at its level **and** visible to readers
 
 **Other readers can see a commit sooner than that.** A shard makes a commit visible once its WAL record is handed to the operating system and the commit is applied in memory. It doesn't wait for the fsync (D227, which amends D19). That keeps one shard's sync from delaying every other shard's commits. The cost is that **visible no longer means durable**, at any level, for anyone but the committing thread after its call returns.
 
+**On Linux, a database whose default level syncs writes its WAL directly to the device (D324).** With `Options::durability` at `GroupSync` (the default) or `Sync`, each shard writes its WAL records with direct I/O instead of through the page cache. A buffered rewrite of the log's last page could wait while the previous group's sync wrote that page back, and that wait held up every commit on the shard (#1621). For you, three things change:
+- **"Handed to the operating system" means "written to the device".** A commit is visible to other readers once its write has completed, typically some tens of microseconds after it is applied.
+- **A `Buffered` commit on such a database is acknowledged once its record reaches the device.** That's later than a page-cache write, and survives more. A database whose default is `Buffered` keeps writing through the page cache, so its `Buffered` commits are as fast as before.
+- **Fallback:** a file system that refuses direct I/O (tmpfs, for example) keeps the page cache. Other platforms always do.
+
 What that means in practice:
 
 - **A reader can see data that a power loss then removes.** Thread A commits `user:42 → "paid"` with `GroupSync`. Before the fsync finishes, thread B (or a reader process) reads `"paid"`. The power fails before the fsync completes. After the restart, `user:42` has its old value. A was never told the commit succeeded, but B acted on it. A process crash alone doesn't do this: the write has already reached the operating system. It takes an OS crash or a power loss.

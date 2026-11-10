@@ -4615,6 +4615,8 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Still open:** g52 also found the rest of #1621's tail. With no prep in the window, Mutates over 10 ms persist, and at long retention put p99 grows with run time. g58 is tracing it. If flush and compaction bursts in the device queue are the cause, a background write cap (issue option 3; Part B's mechanism, tuned first: g40 measured ycsb-a and ycsb-f p99.9 +50–80%) comes back as its own PR.
 - **Part A** isn't built. Whether #1621 still needs it waits on g58 too.
 
+**Amendment 3 (coordinator, 2026-11-10): Part A is built as [D324](#d324),** with the record writes direct (`O_DIRECT`), not buffered. g62 and g66 found #1621's remaining tail in the tail page's folio lock, which a buffered write submitted from another thread would still wait on.
+
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
 
@@ -4742,3 +4744,24 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 - **(C) hand-rendering the engine's metrics in serve:** a second copy of D316's mapping and carry logic, which would drift.
 
 **Also under ICR 0131 (ticket 9b):** `phdb serve --affinity on|off`, documented, default `on`. It's for operators on shared hosts, and for R1's acceptance run (the serve bench's p99 and p99.9 with and without the mask).
+
+<a id="d324"></a>
+## D324 — GroupSync WAL record writes bypass the page cache: direct I/O, one write in flight per stream (perf2, design; coordinator, 2026-11-10; reviewed by perf287; wal, engine, pigeonhole, #1621) · amends D319 Part A
+
+**Problem (#1621's second cause, g66).** A durable commit's record write was a buffered `pwrite` on the shard's driver. The previous group's sync writes the stream's tail page back, and the flusher (an io_uring worker running that `fdatasync`) holds the page's folio lock while it submits the bio, which blocks when the device queue is deep (aqu-sz 30–40). The next group's `pwrite` rewrites the same page, so it waited in `iomap_write_begin → __filemap_get_folio`. That was 350–390 ms a minute of driver time. About 200 driver `pwrite`s a session took ≥ 5 ms (max 33 ms), and their count per 5 s correlated with slow puts at r = +0.71/+0.65. While a driver waits, its whole shard waits. With #1681's open-time ring (g69) the count halved but stayed (104/94).
+
+**Decided (design note on #1621, revision 1; perf287 approved).**
+1. **A direct stream** (`WalOptions::direct`) writes its records through a second handle opened for direct I/O (`O_DIRECT` on Linux). It writes whole aligned blocks: the tail block's earlier bytes come from the stream's in-memory image, and zeros pad past the last byte. That's what a prepared slot holds there (D157), and what recovery reads as the end. There's no folio, so there's no lock to wait on.
+2. **One write in flight per stream** (D319 Part A's rule). Two direct writes of the same block may not overlap, because the device may reorder them. The driver hands its bytes over and returns. Bytes that come while a write is in flight go out together as the next write, which that write's completion submits. `Wal::written` moves when a write completes, never at its submission, so D310's M1 order holds.
+3. **Syncs follow the writes.** A submitted sync, a rollover's sync, a blocking sync and the open's sync each wait until every byte before their position is written.
+4. **The segment header stays a buffered write of its own.** It's the segment's first frame (32 KiB, frame-aligned), and records start at the second, so no direct write shares its pages. A spare slot's zero-fill is synced before a segment uses the slot. So no direct write meets a dirty buffered page, whose write-back (`filemap_write_and_wait_range`) would bring the wait back.
+5. **The engine.** On a direct stream a group stays unwritten until its write lands. `ShardMsg::WriteDone` then makes it visible (D227's rule: visible once written and applied) and resolves a group that needs no sync. A Buffered commit on a direct stream is acknowledged once its write completed, never while its record is only in process memory. A Buffered PREPARE votes then too, not at its append (D279's early vote): a vote at the append could acknowledge a commit whose write later failed.
+6. **When a stream is direct.** On Linux, when the database's writer default (`Options::durability`) is `GroupSync` or `Sync`. A `Buffered` default keeps buffered writes, since there a commit returns at its write, and direct I/O would make that a device write. The choice is made once, when the stream opens: a file system that refuses direct I/O (`EINVAL`, e.g. tmpfs) keeps buffered writes. A later failed direct write is an I/O error like any other and poisons the stream. `WalCounters::direct` reports it. There's no public option (no ICR).
+7. **No format change.** Older builds read the files unchanged.
+
+**Measured.** The box run reuses g66 and g69's session, with the count of driver `pwrite`s over 5 ms as the functional check (≈ 0). It also covers group-commit p99.9, ycsb-a/f p99.9 at GroupSync and Buffered, a Buffered-only row, CPU per commit, WAL bytes per commit, and the feed rows at 1 and 16 subscribers. The results go on #1621.
+
+**Not done.**
+- `RWF_DSYNC` on the direct write, which would drop the separate sync: PR 2, measured on its own.
+- An in-memory last chunk for feed readers tailing a direct stream: only if the feed rows show the page cache's loss.
+- Rows 11–12's p50 rise in g69 isn't D324's. There were no device reads, so it isn't a read-before-write; perf287 is looking at the feed's retention trim.
