@@ -19,10 +19,15 @@ fn connect(s: &Server) -> TcpStream {
     TcpStream::connect(s.url.trim_start_matches("http://")).unwrap()
 }
 
-/// The server's connection counts, for a failure's message.
+/// The server's connection counts, and how its connections ended, for a failure's message.
 fn counts(s: &Server) -> String {
     let conns = &s.shared.router.service.connections;
-    format!("open {}, refused {}", conns.open(), conns.refused())
+    format!(
+        "open {}, refused {}, ended {:?}",
+        conns.open(),
+        conns.refused(),
+        conns.ended()
+    )
 }
 
 /// `GET /v1/health` on `c`, kept alive: the connection stays open, holding its slot.
@@ -31,7 +36,13 @@ fn health(c: &mut TcpStream) {
         .unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 4096];
-    let n = c.read(&mut buf).unwrap();
+    let n = loop {
+        match c.read(&mut buf) {
+            // See `how_closed`: an interrupted read is read again (#1668).
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            r => break r.unwrap(),
+        }
+    };
     assert!(
         buf[..n].starts_with(b"HTTP/1.1 200"),
         "{}",
@@ -42,21 +53,34 @@ fn health(c: &mut TcpStream) {
 /// Whether the server closes `c` within `within`: an EOF or a reset. Bytes it sends (an
 /// HTTP/2 server's settings) don't count.
 fn closed_within(c: &mut TcpStream, within: Duration) -> bool {
+    how_closed(c, within).is_some()
+}
+
+/// How the server closed `c` within `within` (an EOF, or the read's error), or `None` if
+/// it didn't. An interrupted read is read again, since it isn't a close (#1668): on Linux a
+/// blocking socket read with a timeout fails with `EINTR` when the thread gets task work,
+/// with no signal handler involved. The test thread opens the database, so it submits to
+/// the engine's shared io_uring ring (no `DEFER_TASKRUN`), and the kernel queues task work
+/// to a submitting thread. On Linux the serve tests' reads saw `EINTR` in 5 of 20 runs with
+/// io_uring and 0 of 20 with `PIGEONHOLE_IO=pread`. A bare `read` doesn't retry it;
+/// `read_exact` does.
+fn how_closed(c: &mut TcpStream, within: Duration) -> Option<String> {
     let deadline = std::time::Instant::now() + within;
     let mut buf = [0u8; 1024];
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return false;
+            return None;
         }
         c.set_read_timeout(Some(left)).unwrap();
         match c.read(&mut buf) {
-            Ok(0) => return true,
+            Ok(0) => return Some("EOF".to_owned()),
             Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return false;
+                return None;
             }
-            Err(_) => return true,
+            Err(e) => return Some(format!("{e} ({:?})", e.kind())),
         }
     }
 }
@@ -124,17 +148,24 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
 
     let mut silent = connect(&s);
     let started = std::time::Instant::now();
-    assert!(
-        closed_within(&mut silent, Duration::from_secs(5)),
-        "a silent connection was kept"
-    );
-    // Closed early, it was refused at the cap: something else held the slot.
-    assert!(
-        started.elapsed() >= timeout / 2,
-        "{:?}, {}",
-        started.elapsed(),
-        counts(&s)
-    );
+    let how = how_closed(&mut silent, Duration::from_secs(5));
+    let took = started.elapsed();
+    let Some(how) = how else {
+        panic!("a silent connection was kept: {}", counts(&s));
+    };
+    // Closed early: the message says how the client saw it close, and how the server ended
+    // the connection, if it did (#1668: "6 ms, open 1, refused 0"). Its task records that
+    // just after the socket closes, so it gets a moment to.
+    if took < timeout / 2 {
+        let t = std::time::Instant::now();
+        while conns.ended().is_empty() && t.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "closed after {took:?}: the client saw {how}; {}",
+            counts(&s)
+        );
+    }
     assert_eq!(conns.refused(), 0, "{}", counts(&s));
     wait_open(&s, 0);
     let mut next = connect(&s);
