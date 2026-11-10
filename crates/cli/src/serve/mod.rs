@@ -187,6 +187,12 @@ fn memory(
         (1 << 20, 8 << 20),
         writer,
     )?;
+    // An existing store against `--memory-dim` and `--memory-normalization`, as `phdb mcp`
+    // checks it: another value fails the start (#1405). A replica that opens the store later
+    // checks only its pin, as before.
+    if let Some(memslot::Entry::Core(core)) = slot.cached() {
+        crate::memcore::check_reopened(m, name, &core)?;
+    }
     if created {
         let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
     }

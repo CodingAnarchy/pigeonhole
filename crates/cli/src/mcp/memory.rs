@@ -44,12 +44,39 @@ const DEFAULT_NAMESPACE: &str = "default";
 /// The guide served as `memory://guide`, and the MCP guide's memory section.
 pub(super) const GUIDE: &str = include_str!("memory_guide.md");
 
+/// Where a [`Memory`]'s store core comes from.
+pub(crate) trait Store: Send + Sync {
+    /// The core, opening the store if need be (it can block: a blocking thread's call).
+    fn core(&self) -> Result<Arc<MemCore>, Failure>;
+    /// The core if it's open now, without opening it: for what the tools' descriptions say
+    /// about the store's model.
+    fn cached(&self) -> Option<Arc<MemCore>>;
+}
+
+/// `phdb mcp`'s store: the core it opened at start.
+struct Opened(Arc<MemCore>);
+
+impl Store for Opened {
+    fn core(&self) -> Result<Arc<MemCore>, Failure> {
+        Ok(Arc::clone(&self.0))
+    }
+
+    fn cached(&self) -> Option<Arc<MemCore>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
 /// The memory tools over one store: `phdb mcp`'s arguments and answers around the store's
 /// operations in [`MemCore`], the one implementation `phdb serve`'s `Memory` service shares
 /// (D313 ticket 8b).
 pub(crate) struct Memory {
     name: String,
-    core: MemCore,
+    /// Where the store's core comes from: the one `phdb mcp` opened, or `phdb serve`'s
+    /// served store (8c-3b), which can be opened again under a session.
+    store: Box<dyn Store>,
+    /// The namespaces calls may touch: `None`, every one (`phdb mcp`); on `phdb serve`, the
+    /// caller's token's (M4).
+    scope: Option<Vec<String>>,
     /// Whether writes can succeed.
     writable: bool,
     /// `--embed-url`: the server embeds text itself.
@@ -128,26 +155,9 @@ impl Memory {
                 }
             );
         }
-        // An existing store's dimension against `--memory-dim`.
-        if let (Some(m), Some(dim)) = (core.model(), args.memory_dim)
-            && m.dim() != dim
-        {
-            return Err(Failure::usage(&format!(
-                "memory store {name} is pinned to {} dimensions, not {dim}",
-                m.dim()
-            )));
-        }
-        // The normalisation is fixed at create: a flag naming another one for an existing
-        // store fails at startup, as a model that doesn't match does (#1405).
-        if let Some(want) = &args.memory_normalization
-            && core.normalization() != normalization(want)
-        {
-            return Err(Failure::usage(&format!(
-                "--memory-normalization {want}: memory store {name}'s text index is {}, fixed \
-                 when it was created",
-                normalization_name(core.normalization())
-            )));
-        }
+        // An existing store's dimension and normalisation against the flags: fixed at create,
+        // so another value fails the start (#1405), as on `phdb serve`.
+        memcore::check_reopened(args, &name, &core)?;
         if exists && (args.memory_episodic_ttl.is_some() || args.memory_dim.is_some()) {
             let _ = writeln!(
                 stderr,
@@ -158,16 +168,53 @@ impl Memory {
         let writable = writable && core.writable();
         Ok(Some(Self {
             name,
-            core,
+            store: Box::new(Opened(Arc::new(core))),
+            scope: None,
             writable,
             embeds,
             result_bytes,
         }))
     }
 
-    /// The store's pinned model.
-    fn model(&self) -> Option<&EmbeddingModel> {
-        self.core.model()
+    /// The memory tools over a store a server serves (`phdb serve`'s `/mcp`, 8c-3b), for a
+    /// caller limited to `scope`'s namespaces (`None`: every one).
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn served(
+        name: &str,
+        store: Box<dyn Store>,
+        scope: Option<Vec<String>>,
+        writable: bool,
+        embeds: bool,
+        result_bytes: usize,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            store,
+            scope,
+            writable,
+            embeds,
+            result_bytes,
+        }
+    }
+
+    /// The store's pinned model, if the store is open now.
+    fn model(&self) -> Option<EmbeddingModel> {
+        self.store.cached().and_then(|c| c.model().cloned())
+    }
+
+    /// The store's pinned model, for a call: the store opened if need be.
+    fn call_model(&self) -> Result<Option<EmbeddingModel>, Failure> {
+        Ok(self.core()?.model().cloned())
+    }
+
+    /// The store's core, for a call.
+    fn core(&self) -> Result<Arc<MemCore>, Failure> {
+        self.store.core()
+    }
+
+    /// The namespaces a call may touch.
+    fn scope(&self) -> Scope<'_> {
+        Scope(self.scope.as_deref())
     }
 
     fn writer(&self) -> Result<(), Failure> {
@@ -246,7 +293,7 @@ impl Memory {
 
     /// Drops the store (and its forgetter) before the database closes.
     pub(super) fn close(self) {
-        drop(self.core);
+        drop(self.store);
     }
 
     /// A client's embedding, checked as `phdb mcp` documents it: with `--embed-url` there's
@@ -269,7 +316,7 @@ impl Memory {
             }
             return Ok(None);
         };
-        let Some(model) = self.model() else {
+        let Some(model) = self.call_model()? else {
             return Err(Failure::usage(
                 "this store has no embedding model: send text only",
             ));
@@ -323,7 +370,7 @@ impl Memory {
         let embedding = self.client_embedding(&a)?;
         if embedding.is_none()
             && !self.embeds
-            && let Some(model) = self.model()
+            && let Some(model) = self.call_model()?
         {
             return Err(Failure::usage(&format!(
                 "this store is pinned to the embedding model {:?}: a memory needs its \
@@ -364,8 +411,8 @@ impl Memory {
         // dedup (simp724's S1 on #1389), keeping exact dedup; the supersede is a second
         // transaction whose failure comes back with the stored id (simp724's S2).
         let (done, supersede_error) = self
-            .core
-            .remember(ALL, r, supersedes.clone())
+            .core()?
+            .remember(self.scope(), r, supersedes.clone())
             .map_err(mem_failure)?;
         let (outcome, id) = match &done {
             Remembered::New(id) => ("new", id),
@@ -417,9 +464,9 @@ impl Memory {
             u64::MAX,
         )?;
         let (hits, stats) = self
-            .core
+            .core()?
             .recall(
-                ALL,
+                self.scope(),
                 RecallArgs {
                     namespaces,
                     text: text.map(str::to_owned),
@@ -461,7 +508,10 @@ impl Memory {
         a.only(&["ids"])?;
         self.writer()?;
         let ids = ids(&a, "ids")?;
-        let m = self.core.mark_used(ALL, &ids).map_err(mem_failure)?;
+        let m = self
+            .core()?
+            .mark_used(self.scope(), &ids)
+            .map_err(mem_failure)?;
         let missing: Vec<String> = m.missing.iter().map(ToString::to_string).collect();
         Ok(super::tools::object(
             json!({"marked": m.marked, "missing": missing}),
@@ -473,7 +523,9 @@ impl Memory {
         self.writer()?;
         let old = memory_id(a.str("old")?)?;
         let new = memory_id(a.str("new")?)?;
-        self.core.supersede(ALL, &old, &new).map_err(mem_failure)?;
+        self.core()?
+            .supersede(self.scope(), &old, &new)
+            .map_err(mem_failure)?;
         Ok(Map::new())
     }
 
@@ -482,8 +534,8 @@ impl Memory {
         self.writer()?;
         let from = memory_id(a.str("from")?)?;
         let to = memory_id(a.str("to")?)?;
-        self.core
-            .link(ALL, &from, &to, link_type(&a)?, weight(&a)?)
+        self.core()?
+            .link(self.scope(), &from, &to, link_type(&a)?, weight(&a)?)
             .map_err(mem_failure)?;
         Ok(Map::new())
     }
@@ -492,7 +544,10 @@ impl Memory {
         a.only(&["ids"])?;
         self.writer()?;
         let ids = ids(&a, "ids")?;
-        let done = self.core.forget(ALL, &ids).map_err(mem_failure)?;
+        let done = self
+            .core()?
+            .forget(self.scope(), &ids)
+            .map_err(mem_failure)?;
         let missing: Vec<String> = done.missing.iter().map(ToString::to_string).collect();
         if let Some((e, left)) = done.failed {
             // The deletes before it stand: report them, the error, and what's left
@@ -613,37 +668,16 @@ impl Memory {
     }
 }
 
-/// `--memory-normalization`'s value (clap admits only these three).
-fn normalization(flag: &str) -> pigeonhole_memory::Normalization {
-    match flag {
-        "nfkc" => pigeonhole_memory::Normalization::Nfkc,
-        "none" => pigeonhole_memory::Normalization::None,
-        _ => pigeonhole_memory::Normalization::Nfc,
-    }
-}
-
-/// A normalisation as `--memory-normalization` names it.
-fn normalization_name(n: pigeonhole_memory::Normalization) -> &'static str {
-    match n {
-        pigeonhole_memory::Normalization::Nfc => "nfc",
-        pigeonhole_memory::Normalization::Nfkc => "nfkc",
-        pigeonhole_memory::Normalization::None => "none",
-        _ => "another normalisation",
-    }
-}
-
-/// The store's pin against the flags: `--embed-model`/`--memory-model` must name the pinned
-/// model, and `--memory-dim` its dimension.
-/// `phdb mcp` has no namespace limit: every call may touch every namespace.
-const ALL: Scope<'static> = Scope(None);
-
 /// A store operation's failure as `phdb mcp` reports it: the request's arguments as usage,
 /// the store's by its code, and the embedding endpoint's, its refusal of the text included,
 /// as bad input (exit ERROR), as `phdb mcp` always has: scripts may check the exit code (the
 /// coordinator on #1648).
 fn mem_failure(e: MemError) -> Failure {
     match e.kind {
-        MemErrorKind::Invalid | MemErrorKind::Denied => Failure::usage(&e.message),
+        MemErrorKind::Invalid => Failure::usage(&e.message),
+        // A namespace outside the caller's token (`/mcp` only: `phdb mcp` has no limit),
+        // as the `Memory` RPCs answer it.
+        MemErrorKind::Denied => Failure::permission_denied(&e.message),
         MemErrorKind::Engine(code) => Failure::coded(code, e.message),
         MemErrorKind::Rejected
         | MemErrorKind::Unavailable

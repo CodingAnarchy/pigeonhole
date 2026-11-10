@@ -116,6 +116,11 @@ impl MemSlot {
         }
     }
 
+    /// Whether the server computes the embeddings (`--embed-url`, `--embed-local`).
+    pub(crate) fn embeds(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     /// The store's name.
     pub(crate) fn name(&self) -> &str {
         &self.name
