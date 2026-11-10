@@ -35,11 +35,29 @@ impl Drop for TempDir {
 
 #[test]
 fn real_files_roundtrip_and_are_removed() {
-    let dir = TempDir::new("roundtrip");
+    roundtrip("roundtrip", false);
+}
+
+/// The same on a direct stream (D324): the temp directory's file system takes direct I/O
+/// (`O_DIRECT`, `F_NOCACHE`, `FILE_FLAG_NO_BUFFERING`), records go out as aligned blocks, and
+/// recovery reads them back through the buffered handle.
+#[test]
+fn real_files_roundtrip_on_a_direct_stream() {
+    roundtrip("direct", true);
+}
+
+fn roundtrip(tag: &str, direct: bool) {
+    let dir = TempDir::new(tag);
     let db = dir.0.join("data.phdb");
     let vfs: VfsRef = real_vfs();
-    let opts = opts(4, 1);
+    let mut opts = opts(4, 1);
+    opts.direct = direct;
     let mut wal = WalStream::create(&vfs, &db, StreamId(0), DB_ID, opts).unwrap();
+    assert_eq!(
+        wal.counters().direct(),
+        direct,
+        "the file system took direct I/O"
+    );
     let path = pigeonhole_wal::stream_path(&db, StreamId(0));
     assert_eq!(std::fs::metadata(&path).unwrap().len(), opts.segment_size);
     assert_eq!(wal.spares().prepare(1).unwrap(), 1);
