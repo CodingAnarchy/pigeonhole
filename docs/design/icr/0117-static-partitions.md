@@ -115,6 +115,39 @@
 | `CrossPartition` | `FAILED_PRECONDITION` | 409 | no: split the batch. |
 | `PartitionUnavailable` | `UNAVAILABLE` + detail | 503 | yes: nothing was sent to the partition's node (B3). A forwarded write that fails after it was sent answers `OutcomeUnknown`. |
 
+## Ticket 4a: fan-out scans and multi-gets
+**`Data.Scan` and `Data.MultiGet` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. They're no longer refused on a cluster node. A read with a `snapshot_id` is still refused until ticket 3, and `Nearest` and `Traverse` until ticket 4b.
+- **A scan** reads the partitions its range meets, one at a time, in key order. It passes each partition's pages through: their rows and `bytes`, with `next` rewritten. There's no next-partition prefetch (§7). `limit` counts rows, as on a single node, and what's left of it goes on to the next partition. Each partition's part reads at its own snapshot, as each page does on a single node.
+- **A multi-get** sorts and dedupes its keys, splits them by partition, and merges the partitions' pages in key order under the one `page_bytes`. Its pages are exactly a single node's:
+  - a partition reads with what's left of the budget;
+  - the next one is read ahead with the whole budget, and read again with what's left if its page doesn't fit;
+  - so at most about twice `page_bytes` is in flight.
+
+**Positions** (`next`, `after`):
+- **The format:** on a cluster they're a cluster position: `0xC1`, the kind (`S` or `K`), the partition's id, then that partition's own position, or nothing for its start.
+  - A page cut inside a partition points into it.
+  - A page that ends at a partition's end, with more to read, points at the next partition's start.
+  - An empty `next` still means only the read's end.
+- **Why a new format:** a single node's positions name the table by its id in one file, and a table's partitions are separate files. So a position is only valid on the partition that issued it, and the cluster's names that partition.
+- **Kept apart:** a single node's positions start with their version byte, 1, so the two are never taken for each other. A cluster position sent to a single node, or a single node's sent to a cluster read, is `InvalidArgument`, saying which it is.
+
+**`allow_partial`** (new on `ScanRequest` and `MultiGetRequest`): a partition that can't be reached is skipped, not an error.
+- **Without it,** the read fails with `PartitionUnavailable`. A scan that already sent pages ends with that error, and its last page's `next` resumes it.
+- **With it,** a skipped partition's `[start, end)` is a `MissingRange` in the new `missing` field (`partition`, `table`, `start`, `end`):
+  - a scan reports it on the next page it sends, or on a final empty page when nothing follows;
+  - a multi-get reports it on its reply.
+- **A scan's partition that fails partway** still ends the stream with the error.
+- **A single node** ignores `allow_partial`, and its `missing` is always empty.
+
+**`Cluster.ForwardScan`** (node to node, `cluster` scope, gRPC only): one partition's part of a scan, a server stream of that partition's pages.
+- **The request** carries the sender's `map_version`, the `ForwardedCaller`, the partition, and the scan, with that partition's own `after` and what's left of `limit`.
+- **The owner** serves it only if its map gives it the partition and it has the partition open. Otherwise it answers `WrongPartition`, and the entry node pulls the map and opens the stream once more.
+- **Connections:** each forwarded stream has a connection of its own to its peer while it runs, apart from the unary forwards' (simp724's S1 on #1698). HTTP/2 counts a stream's unread data against its connection's window as well, so streams sharing a connection would stall one another once a few of their clients stopped reading. A connection whose stream ended cleanly is kept for the next one (at most 4 idle per peer); ticket 7's feed streams open through the same helper.
+
+**`Cluster.Forward`** gains a `multi_get` arm: one partition's keys of a fanned-out multi-get.
+
+**Budgets:** a fanned-out scan holds one `--max-scans` slot on its entry node for its life, and counts as one `Data.Scan`. Each page it hasn't handed to the client counts against `--inflight-bytes`, as a single node's scan pages do.
+
 ## Ticket 7: cluster feeds
 **`Feed.Subscribe` on a cluster node** follows every partition the subscription covers, through any node. Covered means the partitions of its tables' placements, narrowed by its prefix to the ranges that can hold such rows. Each partition is followed by a single-node subscription on the node serving it, and the entry node merges them:
 - **Order:** a partition's commits keep its order, so each row's do. There's no order across partitions.
@@ -155,7 +188,7 @@
 **`Cluster.ForwardSubscribe`** (node to node, `cluster` scope, gRPC only): `ForwardSubscribeRequest { map_version, caller, partition, request, skip_through }`, answered with a single node's events. Every event carries a token, and the first is a progress event with the start's position.
 - The owner serves it only if its map gives it the partition, every table of the request is placed on it, and it has it open. Otherwise it answers `WrongPartition`, and it never forwards it on.
 - Each part holds a `--max-streams` place on its partition's node. The subscription holds one more on the node it entered. The `Cluster` calls' small concurrency limit doesn't apply to it.
-- **Connections (simp724's S1):** parts run on connections apart from forwarded unary calls. A subscriber that stops reading holds those connections' HTTP/2 windows, never a forwarded call's. One stalled stream can't fill a connection (hyper's 2 MiB stream window against 5 MiB a connection), but three or four on one connection did in a test.
+- **Connections (simp724's S1):** a subscription's parts on one peer share a connection of the subscription's own: a lease from the stream connections (ticket 4a's `stream_channel`), never given back, so it closes with the subscription. A subscriber that stops reading holds only its own connections' HTTP/2 windows, never a forwarded call's or another stream's. One stalled stream can't fill a connection (hyper's 2 MiB stream window against 5 MiB a connection), but three or four on one connection did in a test.
 
 **Memory:** a subscription buffers up to the feed's client limits (64 events, 256 KiB) at its entry node, plus as much on each part's node. That's `(partitions + 1) × 256 KiB` at most, outside `--inflight-bytes`, as a single node's feed buffers are.
 

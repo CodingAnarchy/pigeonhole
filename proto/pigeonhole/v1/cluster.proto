@@ -34,6 +34,11 @@ service Cluster {
   // once more). Every other answer is the call's own, as a single node gives it. Cluster
   // scope, gRPC only.
   rpc Forward(ForwardRequest) returns (ForwardResponse);
+  // Node to node (D317 ticket 4): one partition's part of a scan the sending node fans out,
+  // for the caller it names, as this node's own `Data.Scan` stream of it. This node serves
+  // it only if its map gives it `partition` and it has the partition open; otherwise
+  // `WrongPartition` with its `map_version`. Cluster scope, gRPC only.
+  rpc ForwardScan(ForwardScanRequest) returns (stream ScanPage);
   // Node to node (D317 ticket 7): one partition's part of a cluster subscription, which the
   // sending node merges with the others. Served only if this node's map gives it the
   // partition, and only on connections of their own (never the `Forward` pool), so a
@@ -162,7 +167,20 @@ message ForwardRequest {
     MutateRequest mutate_returning = 7;
     // Every row in one partition: a batch across partitions is refused before it's sent.
     BatchRequest batch = 8;
+    // One partition's keys of a multi-get the sending node fans out (D317 ticket 4).
+    MultiGetRequest multi_get = 9;
   }
+}
+
+// One partition's part of a fanned-out scan (D317 ticket 4).
+message ForwardScanRequest {
+  // The sending node's map version, as in `ForwardRequest`.
+  uint64 map_version = 1;
+  ForwardedCaller caller = 2;
+  // The partition to scan: it must be this node's.
+  string partition = 3;
+  // The scan, with `after` (if any) this partition's own position and `limit` what's left.
+  ScanRequest scan = 4;
 }
 
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
@@ -185,6 +203,7 @@ message ForwardResponse {
     MutateResponse mutate = 3;
     CheckAndMutateResponse check_and_mutate = 4;
     MutateReturningResponse mutate_returning = 5;
+    MultiGetResponse multi_get = 6;
   }
 }
 

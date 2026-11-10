@@ -18,7 +18,7 @@ cargo install pigeonhole-cli --features serve
 cargo install pigeonhole-cli --features serve,embed-local
 ```
 
-**Start** it on a database file. `--create` makes the file if it's missing. For a quick try, add `--no-wal-preallocate`, so the start doesn't write each shard's log in full first ([below](#running-it)):
+**Start** it on a database file. `--create` makes the file if it's missing. For a quick try, add `--no-wal-preallocate`, so the start doesn't write each shard's log in full first (see "Start-up writes the logs in full" below):
 
 ```sh
 phdb serve app.phdb --create
@@ -246,7 +246,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 - A write the server has submitted always answers its real outcome.
 
 ## Threads and placement
-- **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. Each stream's framing still runs on its connection's network thread.
+- **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. The shared subscriptions (hubs) that read the engine's feed run on threads of their own (`phdb-serve-feed-hub`), a quarter as many as `--feed-threads`, at least 1, on the same CPUs, so a hub never waits behind its streams' delivery and falls behind the database (#1397). Each stream's framing still runs on its connection's network thread.
 - **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the network, feed and blocking threads get an affinity mask of the other CPUs. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206), and one on a shard's SMT sibling doubled p99 (#1244). The startup line's last part says which mask the server built:
   - **`off the shards' cores`:** every CPU but the shards' and their SMT siblings;
   - **`off the shards' CPUs`:** too few CPUs to leave the siblings out as well, so only the shards' own CPUs are left out;
@@ -343,7 +343,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, and serves single-row reads and writes for the whole cluster, forwarding each to the node that owns its row. It also serves change feeds across partitions. Transactions, reads across partitions, schema changes and backups come in the next steps, and this section grows with them.
+**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, serves single-row reads and writes for the whole cluster (forwarding each to the node that owns its row), fans scans and multi-gets out across the partitions, and serves change feeds across them. Transactions, graph and vector reads across partitions, schema changes and backups come in the next steps, and this section grows with them.
 
 - **`phdb serve --cluster DIR --node-id ID`** runs a node.
   - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
@@ -361,7 +361,13 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Serving data:** any node takes any call. It serves the call if its partition holds the row, and otherwise forwards it to the node that does. A client needs no map; one that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
   - **What's served:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters, by their row. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
   - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
-  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, scans and other reads across partitions, schema calls (`ListTables` included), backups, `Info` and `/mcp`.
+  - **Scans and multi-gets** read across the partitions, in key order, and return what one database holding all of them would (D317 ticket 4a):
+    - **Scans:** each page holds one partition's rows, and each partition reads at its own snapshot, so rows in different partitions aren't from one point in time. A row is never torn.
+    - **Multi-gets:** a page is exactly what a single node would return for the same keys and `page_bytes`.
+    - **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
+    - **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
+    - **Not yet:** a scan or multi-get with a `snapshot_id`.
+  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), backups, `Info` and `/mcp`.
   - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
   - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir` and `--change-feed` as a single node does, for its partition. `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
   - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.

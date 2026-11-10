@@ -24,8 +24,8 @@ use super::Node;
 use crate::serve::auth::{Caller, Scope};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
-    ForwardRequest, ForwardResponse, ForwardedCaller, cluster_client::ClusterClient,
-    forward_request, forward_response,
+    ForwardRequest, ForwardResponse, ForwardScanRequest, ForwardedCaller, ScanPage,
+    cluster_client::ClusterClient, forward_request, forward_response,
 };
 use crate::serve::service::{ServiceOp, ServiceReply};
 
@@ -43,6 +43,59 @@ struct Peer {
 pub(crate) struct Forwarder {
     node: Arc<Node>,
     peers: Mutex<HashMap<String, Arc<Peer>>>,
+    /// Connections for forwarded streams (`ForwardScan`): one per stream while it runs,
+    /// reused once it has ended (see [`StreamLease`]).
+    stream_peers: Mutex<HashMap<String, Arc<StreamPeer>>>,
+}
+
+/// The most idle stream connections kept per peer for reuse.
+const IDLE_STREAM_CHANNELS: usize = 4;
+
+/// One peer's stream connections: none shared by two streams at once.
+struct StreamPeer {
+    endpoint: Endpoint,
+    idle: Mutex<Vec<Channel>>,
+}
+
+/// A forwarded stream's connection, its own while the stream runs (simp724's S1 on #1698).
+/// HTTP/2 counts a stream's unread data against its connection's window too, so a client that
+/// stops reading one stream would, on a shared connection, stall every other stream there. A
+/// stream that ended cleanly gives its connection back for the next one; a connection whose
+/// stream failed or was dropped partway is closed.
+pub(crate) struct StreamLease {
+    channel: Option<Channel>,
+    peer: Arc<StreamPeer>,
+    clean: bool,
+}
+
+impl StreamLease {
+    /// The connection, for a client of the stream.
+    pub(crate) fn channel(&self) -> Channel {
+        self.channel.clone().expect("held until the lease drops")
+    }
+
+    /// The stream ended cleanly: its connection may serve another.
+    pub(crate) fn ended(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        if !self.clean {
+            return;
+        }
+        if let Some(channel) = self.channel.take() {
+            let mut idle = self
+                .peer
+                .idle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if idle.len() < IDLE_STREAM_CHANNELS {
+                idle.push(channel);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Forwarder {
@@ -56,6 +109,7 @@ impl Forwarder {
         Self {
             node,
             peers: Mutex::new(HashMap::new()),
+            stream_peers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -109,6 +163,89 @@ impl Forwarder {
             Err(status) => Err(classify(&status, address, writes)),
         }
     }
+
+    /// Opens one partition's part of a fanned-out scan on the node at `address` (D317
+    /// ticket 4), on the stream connections. The stream has no deadline of its own: its
+    /// pages are paced by the client, and each side's `--stream-idle-ms` ends a stalled one.
+    /// A failure is the owner's answer, or `PartitionUnavailable` (a read).
+    pub(crate) async fn scan(
+        &self,
+        address: &str,
+        req: ForwardScanRequest,
+        open_within: Duration,
+    ) -> Result<(tonic::Streaming<ScanPage>, StreamLease), ApiError> {
+        let lease = self.stream_channel(address, open_within).await?;
+        let request = self.node.request(req).map_err(ApiError::internal)?;
+        let mut client = ClusterClient::new(lease.channel());
+        match tokio::time::timeout(open_within, client.forward_scan(request)).await {
+            Ok(Ok(reply)) => Ok((reply.into_inner(), lease)),
+            Ok(Err(status)) => Err(classify(&status, address, false)),
+            Err(_) => Err(ApiError::deadline_exceeded()),
+        }
+    }
+
+    /// A connection to the node at `address` for one forwarded stream, its own while the
+    /// stream runs: an idle one a finished stream gave back, or a new one (within
+    /// `open_within`). Every node-to-node stream opens through here (`ForwardScan`, and
+    /// ticket 7's feeds), never on the unary forwards' connections. A stream that ends
+    /// cleanly calls [`StreamLease::ended`] to give the connection back; one that never does
+    /// (a feed, which lives for hours) keeps a connection to itself, closed when it ends.
+    pub(crate) async fn stream_channel(
+        &self,
+        address: &str,
+        open_within: Duration,
+    ) -> Result<StreamLease, ApiError> {
+        let peer = self.stream_peer(address)?;
+        let idle = peer
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let channel = match idle {
+            Some(c) => c,
+            None => tokio::time::timeout(open_within, peer.endpoint.connect())
+                .await
+                .map_err(|_| ApiError::deadline_exceeded())?
+                .map_err(|e| {
+                    ApiError::partition_unavailable(format!(
+                        "the partition's node at {address} can't be reached: {e}"
+                    ))
+                })?,
+        };
+        Ok(StreamLease {
+            channel: Some(channel),
+            peer,
+            clean: false,
+        })
+    }
+
+    fn stream_peer(&self, address: &str) -> Result<Arc<StreamPeer>, ApiError> {
+        let mut peers = self
+            .stream_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = peers.get(address) {
+            return Ok(Arc::clone(p));
+        }
+        if let Some(routes) = self.node.routes().as_ref() {
+            peers.retain(|a, _| routes.has_address(a));
+        }
+        let endpoint = self
+            .node
+            .endpoint(address)
+            .map_err(|e| ApiError::partition_unavailable(format!("node at {address}: {e}")))?;
+        let peer = Arc::new(StreamPeer {
+            endpoint,
+            idle: Mutex::new(Vec::new()),
+        });
+        peers.insert(address.to_owned(), Arc::clone(&peer));
+        Ok(peer)
+    }
+}
+
+/// A forwarded scan's failure partway (a page that didn't arrive) as the client's error.
+pub(crate) fn stream_error(status: &tonic::Status, address: &str) -> ApiError {
+    classify(status, address, false)
 }
 
 /// What a failed forward answers the client (B3).
@@ -203,6 +340,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::CheckAndMutate(r) => Op::CheckAndMutate(r),
         ServiceOp::MutateReturning(r) => Op::MutateReturning(r),
         ServiceOp::Batch(r) => Op::Batch(r),
+        ServiceOp::MultiGet(r) => Op::MultiGet(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -223,6 +361,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::CheckAndMutate(r) => ServiceOp::CheckAndMutate(r),
             Op::MutateReturning(r) => ServiceOp::MutateReturning(r),
             Op::Batch(r) => ServiceOp::Batch(r),
+            Op::MultiGet(r) => ServiceOp::MultiGet(r),
         },
     )
 }
@@ -240,6 +379,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Mutate(r) => Reply::Mutate(r),
         ServiceReply::CheckAndMutate(r) => Reply::CheckAndMutate(r),
         ServiceReply::MutateReturning(r) => Reply::MutateReturning(r),
+        ServiceReply::MultiGet(r) => Reply::MultiGet(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -262,6 +402,7 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Mutate(r) => ServiceReply::Mutate(r),
             Reply::CheckAndMutate(r) => ServiceReply::CheckAndMutate(r),
             Reply::MutateReturning(r) => ServiceReply::MutateReturning(r),
+            Reply::MultiGet(r) => ServiceReply::MultiGet(r),
         },
     )
 }

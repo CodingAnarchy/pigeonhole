@@ -162,7 +162,7 @@ impl ServiceReply {
 /// #1510). The scan task keeps a handle on it, so a client that stops reading loses the page
 /// and the budget comes back (G2): the page is taken out of the slot by whichever comes first,
 /// the client or the task's idle timeout.
-type PageSlot = Arc<std::sync::Mutex<Option<(proto::ScanPage, OwnedSemaphorePermit)>>>;
+pub(crate) type PageSlot = Arc<std::sync::Mutex<Option<(proto::ScanPage, OwnedSemaphorePermit)>>>;
 
 /// A scan's pages as the scan task reads them, then its error if it failed. The task reads a
 /// page ahead at most, so a slow client holds back the reading, not the memory. A page's
@@ -172,6 +172,17 @@ pub(crate) struct ScanPages {
     pages: mpsc::Receiver<PageSlot>,
     /// The error the stream ends with, sent before `pages` closes.
     end: Option<oneshot::Receiver<ApiError>>,
+}
+
+impl ScanPages {
+    /// A stream of the pages `pages` sends, then the error `end` sends, if any: for a
+    /// stream built elsewhere, a cluster's fanned-out scan (D317 ticket 4).
+    pub(crate) fn new(pages: mpsc::Receiver<PageSlot>, end: oneshot::Receiver<ApiError>) -> Self {
+        Self {
+            pages,
+            end: Some(end),
+        }
+    }
 }
 
 impl futures_core::Stream for ScanPages {
@@ -891,6 +902,16 @@ impl Service {
     }
 
     /// `--request-timeout-ms`: the bound a forwarded call gets (D317 ticket 2).
+    /// The in-flight bytes budget (R3), which a cluster's fanned-out scan pages count
+    /// against (D317 ticket 4).
+    pub(crate) fn inflight(&self) -> &Arc<Semaphore> {
+        &self.inflight
+    }
+
+    pub(crate) fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     pub(crate) fn request_timeout(&self) -> std::time::Duration {
         self.limits.request_timeout
     }
@@ -2193,12 +2214,14 @@ impl Service {
                 let mut read = select.keys(table.keys(&keys))?;
                 let after;
                 if !r.after.is_empty() {
+                    super::cluster::position::refuse_on_a_single_node(&r.after)?;
                     after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
                     read = read.resume_after(&after);
                 }
                 let page = read.read_within(budget)?;
                 let q = select.aggregate();
                 Ok(proto::MultiGetResponse {
+                    missing: Vec::new(),
                     rows: page
                         .rows()
                         .iter()
@@ -2724,58 +2747,34 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<ScanPages, ApiError> {
-        let Ok(slot) = Arc::clone(&self.scans).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent scan limit",
-            ));
-        };
+        let slot = self.scan_slot()?;
         convert::Select::new(r.selection.as_ref())?;
         // A pinned snapshot is held for the stream's life, and checked before each page: a
         // page that starts after its `Release` gets NotFound.
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
-        let after = if r.after.is_empty() {
-            None
-        } else {
-            Some(ScanPosition::from_bytes(&r.after).map_err(ApiError::from)?)
-        };
-        let table = self.table(&r.table).await?;
+        let opener = self.scan_opener(&r.table).await?;
         // The request's bytes are decoded and checked: the stream holds pages, not them.
         drop(budget);
-        let (tx, rx) = mpsc::channel(1);
-        let (end_tx, end_rx) = oneshot::channel();
-        let task = ScanTask {
-            table,
-            r,
-            after,
-            pinned,
+        opener.open(r, Some(slot), pinned, Some(Arc::clone(&self.metrics)))
+    }
+
+    /// A `--max-scans` slot, or `Overloaded`.
+    pub(crate) fn scan_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        Arc::clone(&self.scans)
+            .try_acquire_owned()
+            .map_err(|_| ApiError::overloaded("the server is at its concurrent scan limit"))
+    }
+
+    /// What a scan of `table` needs, owned, so the scan can start later on a task of its own:
+    /// a cluster's fanned-out scan resolves its local partition's table at the request, and
+    /// starts reading it when the scan reaches that partition (D317 ticket 4a).
+    pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
+        Ok(ScanOpener {
+            table: self.table(table).await?,
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
             inflight: Arc::clone(&self.inflight),
             limits: self.limits,
-            pages: tx,
-        };
-        let metrics = Arc::clone(&self.metrics);
-        let started = Instant::now();
-        tokio::spawn(async move {
-            // Its own task, so a panic is a `JoinError` here, and the stream ends with
-            // `Internal` rather than looking like a clean end (simp724's B1 on #1510).
-            let outcome = match tokio::spawn(task.run()).await {
-                Ok(outcome) => outcome.map_err(ApiError::for_read),
-                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
-            };
-            metrics.count(
-                SCAN,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            drop(slot);
-            if let Err(e) = outcome {
-                let _ = end_tx.send(e);
-            }
-        });
-        Ok(ScanPages {
-            pages: rx,
-            end: Some(end_rx),
         })
     }
 
@@ -3396,7 +3395,7 @@ fn cap(asked: u64) -> usize {
     usize::try_from(page_bytes(asked)).unwrap_or(usize::MAX)
 }
 
-fn page_bytes(asked: u64) -> u64 {
+pub(crate) fn page_bytes(asked: u64) -> u64 {
     if asked == 0 {
         DEFAULT_PAGE_BYTES
     } else {
@@ -3428,6 +3427,74 @@ async fn held<T: Send + 'static>(
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
+}
+
+/// A table's scan, ready to start: see [`Service::scan_opener`].
+pub(crate) struct ScanOpener {
+    table: Table,
+    pool: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
+    inflight: Arc<Semaphore>,
+    limits: Limits,
+}
+
+impl ScanOpener {
+    /// Starts `r`'s scan: its pages, read one ahead at most by a task of its own, then its
+    /// error if it fails. A failure before the first page (a bad position) is returned here.
+    /// The scan holds `slot` (a `--max-scans` slot) until its stream ends; one partition's
+    /// part of a cluster scan holds none, since the fanned-out stream holds it. With
+    /// `metrics`, its outcome is counted as a `Data.Scan` when it ends.
+    pub(crate) fn open(
+        &self,
+        r: proto::ScanRequest,
+        slot: Option<OwnedSemaphorePermit>,
+        pinned: Option<SnapshotGuard>,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Result<ScanPages, ApiError> {
+        let after = if r.after.is_empty() {
+            None
+        } else {
+            super::cluster::position::refuse_on_a_single_node(&r.after)?;
+            Some(ScanPosition::from_bytes(&r.after).map_err(ApiError::from)?)
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let (end_tx, end_rx) = oneshot::channel();
+        let task = ScanTask {
+            table: self.table.clone(),
+            r,
+            after,
+            pinned,
+            pool: Arc::clone(&self.pool),
+            reads: Arc::clone(&self.reads),
+            inflight: Arc::clone(&self.inflight),
+            limits: self.limits,
+            pages: tx,
+        };
+        let started = Instant::now();
+        tokio::spawn(async move {
+            // Its own task, so a panic is a `JoinError` here, and the stream ends with
+            // `Internal` rather than looking like a clean end (simp724's B1 on #1510).
+            let outcome = match tokio::spawn(task.run()).await {
+                Ok(outcome) => outcome.map_err(ApiError::for_read),
+                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
+            };
+            if let Some(metrics) = metrics {
+                metrics.count(
+                    SCAN,
+                    outcome.as_ref().err().map(|e| e.code.as_str()),
+                    started.elapsed(),
+                );
+            }
+            drop(slot);
+            if let Err(e) = outcome {
+                let _ = end_tx.send(e);
+            }
+        });
+        Ok(ScanPages {
+            pages: rx,
+            end: Some(end_rx),
+        })
+    }
 }
 
 /// A scan's reading side, run as its own task.
@@ -3547,6 +3614,7 @@ impl ScanTask {
             // an empty `next` says the scan finished (simp724's D2 on #1510).
             let end = next.is_none() || rows.is_empty();
             let page = proto::ScanPage {
+                missing: Vec::new(),
                 rows,
                 next: next
                     .as_ref()
@@ -3578,7 +3646,7 @@ impl ScanTask {
 /// client went away. A client that stays connected without reading for `idle` loses its
 /// unread page (`queued`), whose budget comes back, and the stream ends with
 /// `DeadlineExceeded`: the last page it did take has the position to resume from.
-async fn room<'a>(
+pub(crate) async fn room<'a>(
     pages: &'a mpsc::Sender<PageSlot>,
     queued: &mut Option<PageSlot>,
     idle: Duration,
@@ -3618,7 +3686,7 @@ fn row_bytes(row: &proto::Row) -> u64 {
 }
 
 /// Takes `size` bytes of `inflight`, waiting at most `wait`.
-async fn budget_within(
+pub(crate) async fn budget_within(
     inflight: &Arc<Semaphore>,
     size: usize,
     wait: Duration,

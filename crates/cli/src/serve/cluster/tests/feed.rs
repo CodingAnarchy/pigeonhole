@@ -105,6 +105,7 @@ impl Three {
             IDS[i],
             PARTS[i],
             listener,
+            crate::serve::server_tests::limits(),
             self.dbs[i].clone(),
         );
         self.stops[i] = Some(stop);

@@ -71,8 +71,11 @@ struct Ctx {
     caller: Caller,
     prefix: Bytes,
     visible: bool,
-    /// The subscription's connection to each peer, made on first use (S1).
-    channels: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Channel>>>>,
+    /// Opens the node-to-node streams' connections, apart from forwarded unary calls'.
+    forwarder: Arc<super::forward::Forwarder>,
+    /// The subscription's connection to each peer (S1): a stream lease of its own, taken on
+    /// first use and held until the subscription ends, never given back (`ended`).
+    channels: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<super::forward::StreamLease>>>>,
 }
 
 /// A component's stream of encoded events.
@@ -100,6 +103,7 @@ struct Part {
 /// its own. A component that can't be opened fails the call, unless `allow_partial`.
 pub(crate) async fn subscribe(
     node: Arc<Node>,
+    forwarder: Arc<super::forward::Forwarder>,
     local: Option<String>,
     service: Arc<Service>,
     r: proto::SubscribeRequest,
@@ -187,6 +191,7 @@ pub(crate) async fn subscribe(
     let slot = service.stream_slot()?;
     let ctx = Arc::new(Ctx {
         node,
+        forwarder,
         local,
         service: Arc::clone(&service),
         caller: caller.clone(),
@@ -371,6 +376,11 @@ impl Merge {
         self.parts[i].opening = false;
         match result {
             Ok(events) => {
+                // A reopen may have taken a newer map: later checkpoints carry it (simp724's
+                // nit on round 2).
+                if let Some(r) = self.ctx.node.routes().as_ref() {
+                    self.map_version = self.map_version.max(r.map_version());
+                }
                 let p = &mut self.parts[i];
                 p.events = Some(events);
                 p.retry = None;
@@ -800,9 +810,11 @@ impl Ctx {
         }))
     }
 
-    /// The subscription's connection to the peer at `address` (S1): its own, made once on
-    /// first use (concurrent opens wait for the one connect, simp724's N1) and shared by its
-    /// components there, never by forwarded calls.
+    /// The subscription's connection to the peer at `address` (S1): a stream lease of its
+    /// own from [`super::forward::Forwarder::stream_channel`], taken once on first use
+    /// (concurrent opens wait for it, simp724's N1) and shared by the subscription's
+    /// components there, never by forwarded calls or other streams. Never `ended`: it closes
+    /// with the subscription.
     async fn channel(&self, address: &str) -> Result<Channel, ApiError> {
         let cell = Arc::clone(
             self.channels
@@ -811,19 +823,25 @@ impl Ctx {
                 .entry(address.to_owned())
                 .or_default(),
         );
-        let channel = cell
+        let within = self.service.request_timeout();
+        let lease = cell
             .get_or_try_init(|| async {
-                let endpoint = self.node.endpoint(address).map_err(|e| {
-                    ApiError::partition_unavailable(format!("node at {address}: {e}"))
-                })?;
-                endpoint.connect().await.map_err(|e| {
-                    ApiError::partition_unavailable(format!(
-                        "the partition's node at {address} can't be reached: {e}"
-                    ))
-                })
+                self.forwarder
+                    .stream_channel(address, within)
+                    .await
+                    .map_err(|e| match e.code.as_str() {
+                        // A connect that timed out is the node being unreachable, which
+                        // `allow_partial` retries, not the client's deadline.
+                        "DeadlineExceeded" => ApiError::partition_unavailable(format!(
+                            "the partition's node at {address} didn't accept a connection \
+                             within {} ms",
+                            within.as_millis()
+                        )),
+                        _ => e,
+                    })
             })
             .await?;
-        Ok(channel.clone())
+        Ok(lease.channel())
     }
 }
 
