@@ -174,6 +174,8 @@ At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. S
 
 *History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above).*
 
+- **Amended by D321 (owner, 2026-11-09): decision 2's C2 is built, as an opt-in commit mode (caller-runs), off by default.** The evidence went to the owner as decision 2 required. The defaults stay C1's.
+
 <a id="d199"></a>
 ## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)
 D194 built the index off by default. It was to be enabled only if no shape, the write shapes included, regressed beyond noise, and only if a gate run moved the wide-row p99. Measured on Linux callgrind, same binary, index off against on (run 38008347250, on main with the insert fix that reuses the level-0 successor):
@@ -4617,6 +4619,54 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **The count:** each record's map entry (with its `starts` entry, twice over for a half-full B-tree node) plus its allocations, each rounded to a 16-byte size class.
 - **Measured:** a counting-allocator test holds what's kept to within 1.25× of the count (`tests/feed_memory.rs`: 0.93×, where main was 2.6×). The same backlog takes about half the memory it did. "Allocated" here is requested bytes: the allocator's own chunk overhead (glibc adds 8 B per chunk, with a 32 B minimum) is on top, a little for a record's two small allocations.
 - **The cost:** delivery copies each change's bytes out of the pack, where it used to move the vectors. That's one copy of what's delivered; a record read is copied once, from the log into its pack. CPU per put on the 16 × 16 run isn't measured yet; perf287's re-run after this lands gives it.
+
+<a id="d321"></a>
+## D321 — Caller-runs: an opt-in commit mode in which a committing thread runs its idle shard's turn (owner decision, 2026-11-09; simp724; runtime, engine, pigeonhole, #1176, #1502, ICR 0128) · amends D198 decision 2 and spec.md's thread-per-core rule
+
+**Why.** D198 decision 2 kept C2 (combining: the committing thread runs its idle shard) back until C1, the adaptive spin, was shown not to be enough. #1460's sparse-wide put p99.9 stayed about 25× RocksDB's under C1. The cause was clients' messages waiting in the inbox behind pinned drivers that couldn't get their CPU: 52–71% of the tail, with the hand-back another 21–38% (#1176 note rev 3, c6640816278). #1502 built C2 behind an option that is off by default. perf287 measured it at full scale on the AX102 (Phase A, Phase B, and the re-run on 151c6b25, c6737536849), and the evaluation (#1176 c6737559314) went to the owner.
+
+**What it measured (Buffered, contended 16 threads, main → caller-runs):**
+- **Wins:**
+  - put p99.9 falls where the pinned driver's scheduling was the tail: sparse-wide 473 → 94 µs, ycsb-e 1835 → 241 µs;
+  - ycsb-a-16k +13% and sparse-wide-deletes +11% throughput;
+  - Phase A cut #1460's gap to RocksDB from about 25× to about 4×.
+- **Losses:**
+  - counters −18%, ycsb-a and its variants −9 to −11%, short-op put p99 +20–40%;
+  - skewed-multi-shard fails the 1.5×-of-RocksDB target in all four all-uring runs (1.28–1.39× throughput, 1.56–1.76× p99). A client holding a hot shard's run token makes every other client of that shard queue behind its turn.
+- **Default durability (`GroupSync`)** never engages it: 0 caller turns on every row.
+
+**Owner decision: caller-runs ships as an opt-in, off by default.** `Options::caller_runs(true)` (`EngineOptions::caller_runs`, ICR 0128) turns it on. It's for applications with `Buffered` or `None` writes and large values or wide rows, that care about put p99.9 more than throughput. It is not a default on any profile.
+
+**The mode:**
+- **What a caller may run:** only a single-shard `Buffered`/`None` commit with no predicate, validation, retry or `Returning`. While such a commit's wait spins (D198 C1), every 32 polls it tries the shard's **run token**. If no thread holds the token and the driver hasn't asked for it, it runs one turn of the shard on its own thread.
+- **A caller's turn:**
+  - up to 8 queued messages the handler allows, foreground only (no background slices, timers or I/O ring: its I/O completes inline);
+  - it ends once its own commit is answered;
+  - it stops at the first message it may not run, which the driver then runs first, so order holds.
+  - Everything else stays the driver's: cross-shard rounds, durable commits, flushes and maintenance.
+- **The run token:**
+  - a per-shard mutex taken only with `try_lock`, with an advisory run word on its own cache line. It's the outermost entry in the lock order and is never held across a wait on another shard (concurrency.md, item 17).
+  - A driver that finds the token held marks the shard skipped and fences. The caller's release fences and reads that mark, then wakes the driver: a Dekker pair, modelled under loom, so a message queued during a caller's turn always reaches a driver.
+  - Only a driver take that looks at the shard clears the mark (#1502's box lost wake, cee63c6e).
+  - With caller-runs on, a driver's untimed park has a 100 ms backstop. `Metrics::caller_backstop_wakes` counts the lost wakes it recovers. It's 0 on every box row since cee63c6e, and the tests fail on any.
+- **Engine-owned mode only.** An application-owned shard's loop is the application's.
+- **Removed with the decision:** the evaluation's scaffolding, the `caller_spin_extend` arm (C1) and the `caller-stats` features.
+- **The guide** (`docs/guide/performance.md`) says when to turn it on and what it costs.
+
+**Zero off-cost by type (the evaluation's condition (b)).** With caller-runs off, nothing of it runs and almost nothing of it is compiled into the default paths:
+- **The drivers:** they hold their shards as plain `ShardCore`s, chosen when the runtime starts by a type parameter on the driver loop (`DriverShard`). The loop is main's: no token, skip mark, backstop or branch on the option.
+- **A blocking commit's wait:** it tests the option once, on its spinning path only. The caller path is a separate, `#[cold]` function.
+- **Submit and the turn's drain:** they're main's. The work hint, the turn count and the caller entries live in the run token's cell and the engine's `Shared::callers`, not on the inbox or the wakeup signal.
+- **x86 callgrind** on the PR confirms the instruction ceilings (D193, D195) hold.
+
+**What it amends:**
+- **D198 decision 2:** C2 is built, as this opt-in. The evidence went to the owner as decision 2 required, and the default stays C1.
+- **spec.md's "every write executes on exactly one pinned shard thread":** with caller-runs on, a shard's turn may run on a committing client's thread. It's still one thread at a time per shard (the run token), and the shard's state is still touched by no other thread. The spec says so where it states the rule.
+
+**Not done, for a later decision:**
+- **A hot-shard caller cap:** a caller doesn't take the token while other clients are queued on that shard. That's the fix skewed-multi-shard would need before any default-on.
+- **`GroupSync`:** extending caller-runs to it was refused in v1.
+- **#1460** closes as "use caller-runs for this workload".
 
 ## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
 
