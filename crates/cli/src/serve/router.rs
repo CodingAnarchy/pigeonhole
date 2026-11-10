@@ -87,7 +87,13 @@ impl Router {
             // A read across a table's partitions fans out (D317 ticket 4a).
             match op {
                 ServiceOp::MultiGet(_) => {
-                    return self.fan_multi_get(cluster, op, caller, prepaid).await;
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    return self
+                        .fan_multi_get(cluster, op, caller, prepaid, deadline)
+                        .await;
                 }
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
                 _ => {}

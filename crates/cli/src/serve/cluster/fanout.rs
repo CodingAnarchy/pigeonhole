@@ -51,8 +51,11 @@ struct Reach {
     node: Arc<super::Node>,
     local: Option<String>,
     forwarder: Arc<forward::Forwarder>,
-    /// A forward's (and a stream's opening's) deadline: the request timeout.
+    /// A scan stream's opening's bound: the request timeout, for each partition in turn.
     timeout: std::time::Duration,
+    /// A multi-get's: the request's deadline from its arrival, which every forward and map
+    /// pull of it shares (simp724's N1 on #1698, as #1686's forwards do).
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Reach {
@@ -62,6 +65,19 @@ impl Reach {
             local: cluster.local.clone(),
             forwarder: Arc::clone(&cluster.forwarder),
             timeout: router.service.request_timeout(),
+            deadline: None,
+        }
+    }
+
+    /// How long the next forward or pull may take: what's left of the deadline, or the
+    /// timeout.
+    fn within(&self) -> Result<std::time::Duration, ApiError> {
+        match self.deadline {
+            None => Ok(self.timeout),
+            Some(d) => d
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(ApiError::deadline_exceeded),
         }
     }
 
@@ -101,7 +117,7 @@ impl Reach {
             .map(|o| o.node.clone())
             .unwrap_or_default();
         tokio::time::timeout(
-            self.timeout,
+            self.within()?,
             self.node.pull_now(&node, address, routes.map_version()),
         )
         .await
@@ -240,7 +256,7 @@ impl Router {
                     };
                     let sent = reach
                         .forwarder
-                        .send(&address, req, reach.timeout, false)
+                        .send(&address, req, reach.within()?, false)
                         .await;
                     match sent {
                         Err(e) if e.code == "WrongPartition" && !pulled => {
@@ -268,6 +284,7 @@ impl Router {
         op: ServiceOp,
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
         // The caller's scope and the request's size, as for any call (its bytes are held to
         // the end).
@@ -281,7 +298,10 @@ impl Router {
         {
             return Err(later("a snapshot", 3));
         }
-        let reach = Reach::of(self, cluster);
+        let reach = Reach {
+            deadline: Some(deadline),
+            ..Reach::of(self, cluster)
+        };
         let routes = reach.routes()?;
         let ranges = ranges_of(&routes, &r.table)?;
         let after = Position::from_bytes(&r.after, Kind::Keys)?;
@@ -527,7 +547,12 @@ impl Router {
 /// One partition's pages: its own scan's here, or its node's stream.
 enum PartPages {
     Here(ScanPages),
-    There(Box<tonic::Streaming<ScanPage>>, String),
+    /// The stream, its node's address, and its connection's lease (dropped after the stream).
+    There(
+        Box<tonic::Streaming<ScanPage>>,
+        String,
+        forward::StreamLease,
+    ),
 }
 
 impl PartPages {
@@ -539,9 +564,12 @@ impl PartPages {
                 })
                 .await
             }
-            Self::There(stream, address) => match stream.message().await {
+            Self::There(stream, address, lease) => match stream.message().await {
                 Ok(Some(page)) => Some(Ok(page)),
-                Ok(None) => None,
+                Ok(None) => {
+                    lease.ended();
+                    None
+                }
                 Err(status) => Some(Err(forward::stream_error(&status, address))),
             },
         }
@@ -589,7 +617,7 @@ impl ScanJob {
                         .scan(&address, req, self.reach.timeout)
                         .await
                     {
-                        Ok(s) => return Ok(PartPages::There(Box::new(s), address)),
+                        Ok((s, lease)) => return Ok(PartPages::There(Box::new(s), address, lease)),
                         Err(e) if e.code == "WrongPartition" && !pulled => {
                             pulled = true;
                             self.reach.catch_up(&routes, partition, &address).await?;

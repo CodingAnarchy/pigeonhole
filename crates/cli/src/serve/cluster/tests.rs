@@ -437,9 +437,30 @@ fn data_node(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    data_node_with(
+        rt,
+        dir,
+        id,
+        local,
+        listener,
+        crate::serve::server_tests::limits(),
+    )
+}
+
+/// [`data_node`] with its own limits.
+fn data_node_with(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    limits: crate::serve::config::Limits,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node(dir, id);
-    let limits = crate::serve::server_tests::limits();
     let metrics = Arc::new(Metrics::default());
     let db = local.map(|p| {
         let db = pigeonhole::Pigeonhole::open(
@@ -995,7 +1016,17 @@ fn three_nodes(
     {
         let dir = test_dir();
         super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node(rt, &dir, id, Some(p), l);
+        // Room for the stalled-stream test's scans: each holds a slot on its entry node and
+        // one on the partition's.
+        let limits = crate::serve::config::Limits {
+            max_scans: 64,
+            inflight_bytes: 256 << 20,
+            // Longer than the stalled-stream test's bound, so a stall can't clear itself by
+            // idling out.
+            stream_idle: Duration::from_secs(30),
+            ..crate::serve::server_tests::limits()
+        };
+        let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
         stops.push(stop);
         dbs.push(db.unwrap());
     }
@@ -1480,6 +1511,66 @@ fn a_partition_that_cant_be_reached_fails_a_fan_out_read_unless_it_may_be_skippe
         assert_eq!(got.missing.len(), 1);
         assert_eq!(got.missing[0].partition, "p2");
         assert!(got.next.is_empty());
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node() {
+    // simp724's S1 on #1698: a forwarded scan's unread pages count against its HTTP/2
+    // connection's window too, so streams sharing a connection stall one another once a
+    // few stop reading. Each forwarded stream has a connection of its own: sixteen scans
+    // from node a over p2 (on node b) whose clients read nothing, and another scan from a
+    // over p2 still reads to its end.
+    use super::proto::{KeyRange, ScanRequest, key_range::Range};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, dbs) = three_nodes(&rt);
+    rt.block_on(async {
+        // About 12 MiB in p2 (["g", "m")): more than a connection's window, many times over.
+        let mut c = data(ports[1]).await;
+        for i in 0..192 {
+            c.mutate(super::proto::MutateRequest {
+                writes: Some(cells_row(format!("h{i:03}").as_bytes(), &[64 << 10], i)),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        }
+        let scan = || ScanRequest {
+            table: "users".into(),
+            range: Some(KeyRange {
+                range: Some(Range::Prefix(b"h".to_vec().into())),
+            }),
+            page_bytes: 1 << 20,
+            ..Default::default()
+        };
+        // The stalled clients (each opens its scan, takes its first page, and stops), then
+        // another scan to its end, all well within --stream-idle-ms (30 s here): on a shared
+        // connection the stalled streams would hold up the others until they idled out.
+        let stalled = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stalled = Vec::new();
+            for _ in 0..16 {
+                let mut s = data(ports[0])
+                    .await
+                    .scan(scan())
+                    .await
+                    .unwrap()
+                    .into_inner();
+                s.message().await.unwrap().unwrap();
+                stalled.push(s);
+            }
+            // Their streams fill what windows they can.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let pages = scan_pages(ports[0], scan()).await.unwrap();
+            let rows: usize = pages.iter().map(|p| p.rows.len()).sum();
+            assert!(rows >= 192, "{rows}");
+            stalled
+        })
+        .await
+        .expect("a scan stalled behind scans whose clients stopped reading");
+        drop(stalled);
     });
     for db in dbs {
         let _ = db.close();
