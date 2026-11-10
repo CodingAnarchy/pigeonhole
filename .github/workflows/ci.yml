@@ -312,3 +312,9 @@ jobs:
         run: cargo test --release -p pigeonhole-cli --features embed-local --test mcp -- embed_local
         env:
           PIGEONHOLE_EMBED_MODEL_DIR: ${{ github.workspace }}/.embed-cache/bge-small-en-v1.5@5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+      # `phdb serve --memory --embed-local` end to end: the Memory service's text, the store's
+      # pin, and the embedder's threads under the server's placement (#1673).
+      - name: phdb serve --embed-local
+        run: cargo test --release -p pigeonhole-cli --features serve,embed-local --test serve_embed_local
+        env:
+          PIGEONHOLE_EMBED_MODEL_DIR: ${{ github.workspace }}/.embed-cache/bge-small-en-v1.5@5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
