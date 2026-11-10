@@ -174,7 +174,7 @@ fn memory(
         m,
         Duration::from_millis(args.embed_timeout_ms),
         LocalPlace {
-            threads: Some(placement.free_cpus.clamp(1, 4)),
+            threads: Some(embed_threads(placement.free_cpus)),
             on_thread_start: Some(Arc::new(move || enter.enter())),
         },
     )?;
@@ -196,27 +196,45 @@ fn memory(
     Ok(Some(slot))
 }
 
+/// `--embed-local`'s threads on `free` CPUs: `pigeonhole-embed`'s default bound, 4, since one
+/// text doesn't split well across more (D318: 32 threads were slower than 4).
+fn embed_threads(free: usize) -> usize {
+    free.clamp(1, 4)
+}
+
 /// With `--embed-local` and the shards pinned (`cpus`, the CPUs left to the network side as a
-/// list, and their count), a
-/// line telling the operator what to export, or `None` when `CANDLE_CPU_MASK` is set. candle
-/// runs large element-wise steps on a process-wide pool of its own, which
+/// list), a line telling the operator what to export, or `None` once both are set. candle runs
+/// large element-wise steps on a process-wide pool of its own, which
 /// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_CPU_MASK` places it (Linux) and
-/// `CANDLE_NUM_THREADS` sizes it. Without the mask, or `RAYON_NUM_THREADS`, candle 0.11 also
-/// re-reads `/proc/cpuinfo` on every matrix product (huggingface/candle#4070). They're read
-/// once, from the environment, and setting them here would need `unsafe` (D318), so the
-/// operator sets them before the start.
+/// `CANDLE_NUM_THREADS` sizes it. The mask alone isn't enough: unsized, the pool takes a
+/// thread per core (from `RAYON_NUM_THREADS` or the core count) and crowds them onto the
+/// masked CPUs (cli692's N2 on #1671). Its size is the embedder's own, `threads`, so
+/// embedding takes about that many CPUs in all (N1). Without the mask or `RAYON_NUM_THREADS`,
+/// candle 0.11 also re-reads `/proc/cpuinfo` on every matrix product (huggingface/candle#4070).
+/// They're read once, from the environment, and setting them here would need `unsafe` (D318),
+/// so the operator sets them before the start. Only the unset ones are named.
 fn candle_advice(
-    cpus: Option<(String, usize)>,
+    cpus: Option<String>,
+    threads: usize,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<String> {
-    let (cpus, n) = cpus?;
-    if env("CANDLE_CPU_MASK").is_some() {
+    let cpus = cpus?;
+    let missing: Vec<String> = [
+        ("CANDLE_CPU_MASK", cpus),
+        ("CANDLE_NUM_THREADS", threads.to_string()),
+    ]
+    .into_iter()
+    .filter(|(k, _)| env(k).is_none())
+    .map(|(k, v)| format!("{k}={v}"))
+    .collect();
+    if missing.is_empty() {
         return None;
     }
     Some(format!(
-        "phdb serve: --embed-local: candle's own thread pool isn't kept off the shards' CPUs. \
-         Start the server with these in its environment (they're read once, at start):\n  \
-         export CANDLE_CPU_MASK={cpus} CANDLE_NUM_THREADS={n}"
+        "phdb serve: --embed-local: candle's own thread pool isn't placed and sized off the \
+         shards' CPUs. Start the server with these in its environment (they're read once, at \
+         start):\n  export {}",
+        missing.join(" ")
     ))
 }
 
@@ -428,7 +446,8 @@ pub(crate) fn run(
         );
         if args.memory.embed_local
             && let Some(line) = candle_advice(
-                placement.cpu_list().map(|l| (l, placement.free_cpus)),
+                placement.cpu_list(),
+                embed_threads(placement.free_cpus),
                 &|k| std::env::var_os(k),
             )
         {
