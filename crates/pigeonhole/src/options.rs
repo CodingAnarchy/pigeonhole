@@ -43,6 +43,7 @@ pub struct Options {
     shards: usize,
     compaction_cores: Option<usize>,
     pin_threads: bool,
+    wal_preallocate: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
@@ -276,6 +277,7 @@ impl Default for Options {
             shards: 0,
             compaction_cores: None,
             pin_threads: true,
+            wal_preallocate: false,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -407,6 +409,46 @@ impl Options {
     /// [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable) if it does not.
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
+        self
+    }
+
+    /// Sizes each shard's write-ahead log for a busy store when the database opens, rather
+    /// than while it serves (default off; D157 amendment, #1621, ICR 0130).
+    ///
+    /// Each shard's log is a ring of 64 MiB slots in its own file beside the database. Every
+    /// slot after the first is zero-filled and synced before the log uses it, so the log's
+    /// syncs don't pay for allocating space.
+    ///
+    /// - **Off (the default):** the ring grows on demand, a slot at a time, in the background
+    ///   while the store serves. A small database stays small: an open writes almost
+    ///   nothing, and the logs are removed at the last clean close. But on a busy store the
+    ///   zero-fill shares the device with the log's own syncs, which lengthens commits'
+    ///   tail latency while the rings grow. That's the first minutes of every session
+    ///   without the change feed, whose logs are removed at the close (#1621).
+    /// - **On:** before the open returns, every shard's ring gets the slots it holds once
+    ///   busy: twice [`memtable_budget`](Self::memtable_budget) of unflushed log, two
+    ///   spares, the change feed's retention and the slot in use. The rings are filled in
+    ///   parallel. A ring that later needs more still grows on demand.
+    ///
+    /// **The cost of turning it on:** disk and open time. At the defaults (a 64 MiB memtable
+    /// budget, no change feed) each shard's ring is 5 slots, 320 MiB, so a 16-shard
+    /// database holds about 5 GiB of logs from the open. The open writes and syncs all of
+    /// it, which takes a few seconds on NVMe. A database reopened after a clean close with
+    /// the change feed on keeps its logs: the open adds no slot, and zero-fills again only
+    /// the slots the last session never used (a reopen can't trust their zeros).
+    ///
+    /// `phdb serve` turns this on (`--no-wal-preallocate` turns it off). A reader process
+    /// has no log, so this does nothing there.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A long-running server: pay the log's growth at the open, not in commit latency.
+    /// let options = Options::default().wal_preallocate(true);
+    /// # let _ = options;
+    /// ```
+    pub fn wal_preallocate(mut self, yes: bool) -> Self {
+        self.wal_preallocate = yes;
         self
     }
 
@@ -1778,6 +1820,7 @@ impl Options {
             None => budget.compaction,
         };
         o.pin_threads = self.pin_threads;
+        o.wal_preallocate = self.wal_preallocate;
         o.shard_threads = budget.drivers;
         // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
         // 2026-10-28), never with a fixed count; application-owned shards run on the
