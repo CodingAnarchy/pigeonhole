@@ -237,10 +237,6 @@ pub struct Metrics {
     /// over shards: a shard had work when its driver's park ran out and no notify had
     /// signalled it (#1502). Should stay 0; 0 with caller-runs off.
     pub caller_backstop_wakes: u64,
-    /// Caller-runs' evaluation split (the `caller-stats` feature; zeros without it):
-    /// caller-run commits resolved in the client's own turn, another client's, and the
-    /// driver's.
-    pub caller_resolved: [u64; 3],
     /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
     /// commits every shard completed (D257), plus each cross-shard commit's time from
     /// submit to the decision at every participant (D262). Its rise over an interval,
@@ -1898,7 +1894,7 @@ impl Engine {
     // ---- catalog ----
 
     /// Turns committing threads ran on the shards themselves, summed over shards (the
-    /// caller-runs prototype, #1176; 0 with it off). Relaxed.
+    /// caller-runs, D321; 0 with it off). Relaxed.
     #[doc(hidden)]
     pub fn caller_turns(&self) -> u64 {
         self.inner
@@ -1906,22 +1902,6 @@ impl Engine {
             .submitters
             .get()
             .map_or(0, |subs| subs.iter().map(|s| s.caller_turns()).sum())
-    }
-
-    /// Caller-run commits by who resolved them, `[own client's turn, another client's, the
-    /// driver's]` (the caller-runs evaluation's split, #1176 rev 3.1 C1; `caller-stats`).
-    #[cfg(feature = "caller-stats")]
-    #[doc(hidden)]
-    pub fn caller_resolutions(&self) -> [u64; 3] {
-        self.inner.shared.caller_stats.counts()
-    }
-
-    /// The calling thread's last caller-run commit: 0 resolved in its own turn, 1 in another
-    /// client's, 2 by the driver; 3 none yet (`caller-stats`, #1176).
-    #[cfg(feature = "caller-stats")]
-    #[doc(hidden)]
-    pub fn last_caller_class() -> u8 {
-        crate::write::last_caller_class()
     }
 
     /// Creates a table with its families (a manifest commit).
@@ -3897,10 +3877,6 @@ impl Engine {
                 m.reader_pin_lag = (views, seqnos);
             }
         }
-        #[cfg(feature = "caller-stats")]
-        {
-            m.caller_resolved = shared.caller_stats.counts();
-        }
         m.shard_commit_inflight_nanos = shared
             .metrics
             .iter()
@@ -5452,21 +5428,15 @@ impl Inner {
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
         match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+            // Caller-runs (D321): the commit's shard, which this thread may run itself while
+            // its spinning wait goes on. A cross-shard commit's coordinator refuses it (only
+            // single-shard commits are a caller's to run).
             Routed::Sent {
                 mut waiter,
                 spins,
                 target,
                 ..
-            } => {
-                // Caller-runs (#1176): the commit's shard, which this thread may run itself
-                // while it waits. A cross-shard commit's coordinator refuses it (only
-                // single-shard commits are a caller's to run).
-                if spins && self.shared.caller_runs {
-                    crate::write::wait_blocking_as_caller(&self.shared, &mut waiter, target)
-                } else {
-                    crate::write::wait_blocking(&self.shared, &mut waiter, spins)
-                }
-            }
+            } => crate::write::wait_blocking_on(&self.shared, &mut waiter, spins, target),
             Routed::Held(p) => self.send(p)?.wait(),
         }
     }
@@ -7058,9 +7028,6 @@ impl Shared {
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
             caller_runs: options.caller_runs,
-            caller_spin_extend_nanos: options.caller_spin_extend_nanos,
-            #[cfg(feature = "caller-stats")]
-            caller_stats: Default::default(),
             tail_index: false,
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),

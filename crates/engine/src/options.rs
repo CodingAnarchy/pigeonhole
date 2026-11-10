@@ -238,16 +238,13 @@ pub struct EngineOptions {
     /// `shard_spin_nanos`'s could. Zero (the default), or at most `shard_spin_nanos`: the
     /// poll is `shard_spin_nanos`, fixed.
     pub shard_spin_cap_nanos: u64,
-    /// A prototype, off by default and not for general use (#1176, D198's C2): a thread
-    /// waiting on its non-durable single-shard commit runs the shard's turn itself when no
-    /// thread is running it, instead of waiting for the shard's driver. Engine-owned mode.
-    #[doc(hidden)]
+    /// Caller-runs (D321, ICR 0128), off by default: a thread waiting on its single-shard
+    /// `Buffered` or `None` commit (no predicate, validation, retry or `Returning`) runs its
+    /// shard's turn itself when no thread is running it, instead of waiting for the shard's
+    /// thread. It cuts put tails where the shard's thread can't get its CPU (large values,
+    /// wide rows), and costs throughput and p99 on hot, short commits. Engine-owned mode
+    /// only; ignored for application-owned shards and other durabilities.
     pub caller_runs: bool,
-    /// With `caller_runs`, how long past its spin window a waiting committer keeps polling
-    /// while its shard's run token is free, in nanoseconds (#1176 rev 3.1, C1: an
-    /// evaluation arm; 0, the default, parks at the window's end as without it).
-    #[doc(hidden)]
-    pub caller_spin_extend_nanos: u64,
     /// The writer keeps a process-local stale-tail index beside each memtable, and row reads
     /// and scans pass a finished column's superseded memtable versions in one jump (D194,
     /// on by default per D199). Same results either way. It costs a write that overwrites a
@@ -308,7 +305,6 @@ impl EngineOptions {
             shard_spin_nanos: 200_000,
             shard_spin_cap_nanos: 0,
             caller_runs: false,
-            caller_spin_extend_nanos: 0,
             memtable_tail_index: true,
             async_commit_bound: 0,
         }

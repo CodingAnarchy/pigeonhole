@@ -180,7 +180,7 @@ pub struct RuntimeConfig {
     /// a sparse one polls no longer per message than under `idle_spin`. Zero (the default),
     /// or at most `idle_spin`: the window is `idle_spin`, fixed.
     pub idle_spin_cap: Duration,
-    /// Engine-owned mode, a prototype behind a hidden option (#1176, D198's C2): a client
+    /// Engine-owned mode, opt-in (D321, D198's C2): a client
     /// waiting on a message it queued may run the shard's turn itself when no thread is
     /// running it ([`Submitter::try_caller_turn`]), taking only what
     /// [`ShardHandler::caller_may_take`] allows. Off by default.
@@ -474,15 +474,6 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.signal.caller_turns()
     }
 
-    /// Caller-runs (#1176): if no thread is running the target shard and caller-runs is on,
-    /// runs a turn of it on this thread: up to [`CALLER_BATCH`] queued messages the
-    /// handler allows, foreground only, ending early once `own_done` says the caller's own
-    /// message was answered. Never waits for the shard. Returns whether a turn ran.
-    #[doc(hidden)]
-    pub fn caller_token_free(&self) -> bool {
-        self.inbox.caller.get().is_some_and(|c| c.is_free())
-    }
-
     /// Lost wakes the caller-runs park backstop recovered on the target shard: work it had
     /// when its driver's park ran out that no notify had signalled (#1176, #1502; should
     /// stay 0). 0 with caller-runs off. Relaxed.
@@ -491,6 +482,10 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.caller.get().map_or(0, |c| c.backstop_wakes())
     }
 
+    /// Caller-runs (D321): if no thread is running the target shard and caller-runs is on,
+    /// runs a turn of it on this thread: up to [`CALLER_BATCH`] queued messages the
+    /// handler allows, foreground only, ending early once `own_done` says the caller's own
+    /// message was answered. Never waits for the shard. Returns whether a turn ran.
     #[doc(hidden)]
     pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         match self.inbox.caller.get() {
@@ -506,31 +501,6 @@ pub const CALLER_BATCH: usize = 8;
 
 thread_local! {
     static CURRENT_SHARD: Cell<Option<ShardId>> = const { Cell::new(None) };
-    /// The calling thread is in a committing client's turn (caller-runs, #1176).
-    static IN_CALLER_TURN: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether the calling thread is running a committing client's turn of a shard
-/// (caller-runs, #1176): for the evaluation's count of who resolved a commit.
-#[doc(hidden)]
-pub fn in_caller_turn() -> bool {
-    IN_CALLER_TURN.with(Cell::get)
-}
-
-/// Marks the calling thread as in a caller's turn until dropped.
-struct InCallerTurn;
-
-impl InCallerTurn {
-    fn new() -> Self {
-        IN_CALLER_TURN.with(|c| c.set(true));
-        Self
-    }
-}
-
-impl Drop for InCallerTurn {
-    fn drop(&mut self) {
-        IN_CALLER_TURN.with(|c| c.set(false));
-    }
 }
 
 /// Marks the calling thread as running `shard` until dropped.
@@ -736,7 +706,6 @@ impl<H: ShardHandler> ShardCore<H> {
         wants: &std::sync::atomic::AtomicBool,
     ) -> (bool, usize) {
         let _shard = EnterShard::new(self.id);
-        let _caller = InCallerTurn::new();
         let deadline_before = self.next_deadline();
         let ShardCore {
             id,
@@ -1096,6 +1065,39 @@ pub struct Pinning {
     pub failed: usize,
 }
 
+/// A started driver: its handle (its shards' handlers come back at shutdown) and start ack.
+type Spawned<H> = (JoinHandle<Vec<(ShardId, H)>>, Receiver<bool>);
+
+/// Starts `k` engine-owned drivers on `shards`, each holding its shards as `S` (D321), and
+/// returns their handles and start acks in driver order.
+fn spawn_drivers<H: ShardHandler, S: cell::DriverShard<H>>(
+    config: &RuntimeConfig,
+    shared: &Arc<drivers::Drivers<H>>,
+    k: usize,
+    cpu: &dyn Fn(usize) -> Option<usize>,
+    shards: impl Iterator<Item = S>,
+) -> Result<Vec<Spawned<H>>> {
+    let mut held: Vec<Vec<S>> = (0..k).map(|_| Vec::new()).collect();
+    for shard in shards {
+        held[drivers::Drivers::<H>::owner(shard.id(), k)].push(shard);
+    }
+    let mut spawned = Vec::with_capacity(k);
+    for (d, cores) in held.into_iter().enumerate() {
+        // A fixed thread per shard keeps the shard's name, as before D289; drivers whose
+        // shards may move are named for themselves.
+        let name = if k == config.shards && !config.adaptive_drivers {
+            format!("pigeonhole-shard-{d}")
+        } else {
+            format!("pigeonhole-driver-{d}")
+        };
+        let shared = Arc::clone(shared);
+        spawned.push(spawn_pinned(name, cpu(d), move || {
+            drivers::driver_main(shared, d, cores)
+        })?);
+    }
+    Ok(spawned)
+}
+
 /// Spawns a named thread that pins itself to CPU id `cpu` if given, reports whether it is
 /// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`.
 fn spawn_pinned<T: Send + 'static>(
@@ -1183,7 +1185,6 @@ impl<H: ShardHandler> Runtime<H> {
         let shared = Arc::new(drivers::Drivers::new(
             k,
             config.adaptive_drivers,
-            config.caller_runs,
             Arc::clone(&config.vfs),
             Arc::clone(&submitters),
         ));
@@ -1228,28 +1229,22 @@ impl<H: ShardHandler> Runtime<H> {
             rt.workers.push(handle);
             acks.push(ack);
         }
-        let mut held: Vec<Vec<Arc<cell::ShardCell<H>>>> = (0..k).map(|_| Vec::new()).collect();
-        for core in cores {
-            let cell = Arc::new(cell::ShardCell::new(core));
-            if config.caller_runs {
+        // How the drivers hold their shards, chosen once (D321): behind the run token with
+        // caller-runs on, plainly (the driver loop as before caller-runs) with it off.
+        let spawned = if config.caller_runs {
+            let cells = cores.into_iter().map(|core| {
+                let cell = Arc::new(cell::ShardCell::new(core));
                 let entry: Arc<dyn cell::CallerTurn> = Arc::clone(&cell) as _;
                 cell.with_inbox(|inbox| {
                     let _ = inbox.caller.set(entry);
                 });
-            }
-            held[drivers::Drivers::<H>::owner(cell.id(), k)].push(cell);
-        }
-        for (d, cores) in held.into_iter().enumerate() {
-            // A fixed thread per shard keeps the shard's name, as before D289; drivers whose
-            // shards may move are named for themselves.
-            let name = if k == config.shards && !config.adaptive_drivers {
-                format!("pigeonhole-shard-{d}")
-            } else {
-                format!("pigeonhole-driver-{d}")
-            };
-            let shared = Arc::clone(&shared);
-            let (handle, ack) =
-                spawn_pinned(name, cpu(d), move || drivers::driver_main(shared, d, cores))?;
+                cell
+            });
+            spawn_drivers(&config, &shared, k, &cpu, cells)?
+        } else {
+            spawn_drivers(&config, &shared, k, &cpu, cores.into_iter())?
+        };
+        for (handle, ack) in spawned {
             rt.shards.push(handle);
             acks.push(ack);
         }

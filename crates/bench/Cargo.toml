@@ -26,10 +26,6 @@ sqlite = ["dep:rusqlite"]
 # instructions.yml (which passes no features) gets it; a base from before #1273, built with
 # the head's example sources, has no such feature and keeps random seeds.
 fixed-seed = []
-# Caller-runs' evaluation split (#1176): the box runs' builds count who resolved each
-# caller-run commit (`pigeonhole/caller-stats`). Off by default, so the instruction counts
-# never include it.
-caller-stats = ["pigeonhole/caller-stats"]
 
 [dependencies]
 # Default features (async included): the instruction counts measure what users get.

@@ -731,16 +731,6 @@ pub struct Stalls {
     /// park ran out and no notify had signalled it (#1502; should be 0).
     #[serde(default)]
     pub caller_backstop_wakes: u64,
-    /// Caller-runs' evaluation split (the bench's `caller-stats` feature; 0 without it):
-    /// caller-run commits resolved in the client's own turn, another client's, the driver's.
-    #[serde(default)]
-    pub caller_resolved_own: u64,
-    /// See [`Stalls::caller_resolved_own`].
-    #[serde(default)]
-    pub caller_resolved_other: u64,
-    /// See [`Stalls::caller_resolved_own`].
-    #[serde(default)]
-    pub caller_resolved_driver: u64,
     /// File growths, and the time they held the page allocator (#28, #182).
     pub file_growths: u64,
     /// See [`Stalls::file_growths`].
@@ -874,9 +864,6 @@ impl Stalls {
             wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
             caller_turns: d(before.caller_turns, after.caller_turns),
             caller_backstop_wakes: d(before.caller_backstop_wakes, after.caller_backstop_wakes),
-            caller_resolved_own: d(before.caller_resolved_own, after.caller_resolved_own),
-            caller_resolved_other: d(before.caller_resolved_other, after.caller_resolved_other),
-            caller_resolved_driver: d(before.caller_resolved_driver, after.caller_resolved_driver),
             file_growths: d(before.file_growths, after.file_growths),
             file_growth_nanos: d(before.file_growth_nanos, after.file_growth_nanos),
             file_growths_ahead: d(before.file_growths_ahead, after.file_growths_ahead),

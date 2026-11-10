@@ -70,7 +70,6 @@ pub struct Options {
     shard_spin: Option<Duration>,
     shard_spin_cap: Option<Duration>,
     caller_runs: bool,
-    caller_spin_extend: Option<Duration>,
     shard_threads: Option<usize>,
     adaptive_shard_threads: bool,
     background_workers: usize,
@@ -304,7 +303,6 @@ impl Default for Options {
             shard_spin: None,
             shard_spin_cap: None,
             caller_runs: false,
-            caller_spin_extend: None,
             shard_threads: None,
             adaptive_shard_threads: true,
             background_workers: 0,
@@ -553,22 +551,32 @@ impl Options {
         self
     }
 
-    /// A prototype under evaluation, off by default (#1176, D198's C2): a thread waiting
-    /// on its non-durable single-shard commit runs the shard's turn itself when no thread
-    /// is running it, rather than waiting for the shard's driver. Engine-owned mode.
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
+    /// Caller-runs (D321, ICR 0128), off by default: a thread waiting on its own commit
+    /// runs the shard's work itself when no other thread is running that shard, instead of
+    /// waiting for the shard's thread to be scheduled.
+    ///
+    /// - **Applies to:** single-shard commits at [`Durability::Buffered`] or
+    ///   [`Durability::None`] with no condition, transaction or returned columns. Everything
+    ///   else (cross-shard commits, [`Durability::GroupSync`], flushes and compactions) stays
+    ///   on the shard's thread. A shard is still run by one thread at a time.
+    /// - **Turn it on for:** buffered writers of large values or wide rows that care about
+    ///   put tail latency more than throughput. On a contended 16-thread load it cut
+    ///   sparse-wide put p99.9 from 473 to 94 µs and raised large-value throughput 13%.
+    /// - **Leave it off for:** hot, short commits. On the same machine it cost counters
+    ///   18% and ycsb-a 10% throughput, raised short-op put p99 20–40%, and put a skewed
+    ///   multi-shard load outside 1.5× of RocksDB: a client running a hot shard makes the
+    ///   shard's other clients queue behind it.
+    /// - **Engine-owned mode only:** ignored with application-owned shards
+    ///   ([`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)).
+    ///
+    /// See `docs/guide/performance.md` (caller-runs) for the measurements.
+    ///
+    /// ```
+    /// let opts = pigeonhole::Options::default().caller_runs(true);
+    /// # let _ = opts;
+    /// ```
     pub fn caller_runs(mut self, on: bool) -> Self {
         self.caller_runs = on;
-        self
-    }
-
-    /// With [`caller_runs`](Self::caller_runs): how long past its spin a waiting committer
-    /// keeps polling while its shard's run token is free (#1176's C1 arm; default none).
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
-    pub fn caller_spin_extend(mut self, extend: Duration) -> Self {
-        self.caller_spin_extend = Some(extend);
         self
     }
 
@@ -1832,9 +1840,6 @@ impl Options {
             o.shard_spin_cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
         }
         o.caller_runs = self.caller_runs;
-        if let Some(d) = self.caller_spin_extend {
-            o.caller_spin_extend_nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        }
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         }

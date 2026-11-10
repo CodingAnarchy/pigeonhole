@@ -1,4 +1,4 @@
-//! Caller-runs (#1176, the prototype behind `EngineOptions::caller_runs`): with real client
+//! Caller-runs (D321, `EngineOptions::caller_runs`): with real client
 //! threads on engine-owned shards, a committing thread runs its idle shard's turn itself.
 //! Sixteen clients mix what a caller may run (`Buffered` and `None` single-shard commits)
 //! with what it must leave to the driver (`GroupSync` commits, cross-shard commits,
@@ -25,7 +25,7 @@ const CLIENTS: usize = 16;
 const ROWS_PER_CLIENT: u64 = 16;
 const STALL: Duration = Duration::from_secs(60);
 
-fn options(spin_extend_nanos: u64) -> EngineOptions {
+fn options() -> EngineOptions {
     let vfs: pigeonhole_io::VfsRef = match std::env::var("PIGEONHOLE_IO").as_deref() {
         #[cfg(target_os = "linux")]
         Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring"),
@@ -38,7 +38,6 @@ fn options(spin_extend_nanos: u64) -> EngineOptions {
     // Table `t` lands on shard `t % SHARDS`: the two-table commits below cross shards.
     o.tablet_changes = false;
     o.caller_runs = true;
-    o.caller_spin_extend_nanos = spin_extend_nanos;
     o
 }
 
@@ -125,27 +124,13 @@ fn client(
 
 #[test]
 fn callers_running_their_shards_lose_no_write_and_hang_nothing() {
-    run(0);
-}
-
-/// The same with rev 3.1's C1 arm: a waiting committer keeps polling past its spin while
-/// its shard's token is free.
-#[test]
-fn callers_that_keep_polling_while_the_token_is_free_lose_and_hang_nothing() {
-    run(500_000);
-}
-
-fn run(spin_extend_nanos: u64) {
     let ops: u64 = std::env::var("PIGEONHOLE_STRESS_OPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
-    let dir = std::env::temp_dir().join(format!(
-        "phdb-caller-runs-{}-{spin_extend_nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("phdb-caller-runs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let db = Engine::open(&dir.join("callers.phdb"), options(spin_extend_nanos)).unwrap();
+    let db = Engine::open(&dir.join("callers.phdb"), options()).unwrap();
     let tables: Vec<(TableId, FamilyId)> = (0..TABLES)
         .map(|t| {
             let info = db
@@ -203,12 +188,6 @@ fn run(spin_extend_nanos: u64) {
         0,
         "a shard had work no notify signalled when its driver's park backstop ran out: a lost wake"
     );
-    #[cfg(feature = "caller-stats")]
-    {
-        let [own, other, driver] = db.caller_resolutions();
-        eprintln!("caller-run commits resolved: own {own}, other {other}, driver {driver}");
-        assert!(own + other + driver > 0, "no caller-run commit was counted");
-    }
     let snap = db.snapshot().unwrap();
     for ((t, r), want) in &writes {
         let got = db
@@ -249,7 +228,7 @@ fn callers_amid_contended_cross_shard_commits_lose_no_wake() {
         * 10;
     let dir = std::env::temp_dir().join(format!("phdb-caller-runs-xshard-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut o = options(0);
+    let mut o = options();
     o.shards = XSHARDS;
     o.adaptive_drivers = true;
     o.tablet_changes = true;

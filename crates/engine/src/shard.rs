@@ -526,11 +526,6 @@ pub(crate) struct Shared {
     pub commit_spin_nanos: u64,
     /// `EngineOptions::caller_runs` (#1176): a waiting committer may run its shard's turn.
     pub caller_runs: bool,
-    /// `EngineOptions::caller_spin_extend_nanos` (#1176 rev 3.1, C1).
-    pub caller_spin_extend_nanos: u64,
-    /// Caller-runs' evaluation counts (`caller-stats`, #1176).
-    #[cfg(feature = "caller-stats")]
-    pub caller_stats: crate::write::CallerStats,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
     pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,
@@ -1381,10 +1376,10 @@ impl Reply {
     /// freed here, it would be freed on another thread than the one that allocated it.
     fn resolve_returning(self, outcome: Result<CommitInfo>, batch: Option<BatchBuilder>) {
         match self {
-            Reply::Commit(n) => n.notify(outcome.map(|info| Settled::new(info, batch))),
+            Reply::Commit(n) => n.notify(outcome.map(|info| Settled { info, batch })),
             Reply::Returning(r) => r
                 .notifier
-                .notify(outcome.map(|info| Settled::new(info, batch))),
+                .notify(outcome.map(|info| Settled { info, batch })),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
             Reply::CheckReturning(r) => r.notifier.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}

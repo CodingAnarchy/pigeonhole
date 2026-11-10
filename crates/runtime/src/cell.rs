@@ -20,7 +20,10 @@
 //! share stay free of their traffic.
 //!
 //! Application-owned shards keep their plain `ShardCore`: their loop is the application's,
-//! and caller-runs is engine-owned only.
+//! and caller-runs is engine-owned only. So do engine-owned shards with caller-runs off
+//! (D321): a driver holds its shards as a [`DriverShard`], chosen by type when the runtime
+//! starts, and the plain `ShardCore` one is the driver loop as it was before caller-runs,
+//! with no token, no backstop and no branch on the option (zero off-cost by type).
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
@@ -76,11 +79,6 @@ pub(crate) trait CallerTurn: Send + Sync {
     /// Runs a caller's turn if the token is free and the driver doesn't want it. Returns
     /// whether a turn ran.
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool;
-
-    /// Whether a caller could take the token now: no thread holds it and the driver
-    /// doesn't want it (a relaxed look, for a waiting client deciding whether to keep
-    /// polling: rev 3.1, C1).
-    fn is_free(&self) -> bool;
 
     /// Lost wakes the park backstop recovered on the shard (see `RunWord::backstop_wakes`).
     /// Relaxed.
@@ -246,11 +244,6 @@ impl<H: ShardHandler> ShardCell<H> {
 }
 
 impl<H: ShardHandler> CallerTurn for ShardCell<H> {
-    fn is_free(&self) -> bool {
-        self.run.state.load(Ordering::Relaxed) == FREE
-            && !self.run.driver_wants.load(Ordering::Relaxed)
-    }
-
     fn backstop_wakes(&self) -> u64 {
         self.run.backstop_wakes.load(Ordering::Relaxed)
     }
@@ -293,6 +286,170 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
             self.signal.notify();
         }
         true
+    }
+}
+
+/// How a driver holds a shard (D321): plainly, when caller-runs is off and nothing but the
+/// driver may run it, or in a [`ShardCell`] behind the run token. The runtime picks one at
+/// start for every driver, so the driver loop is compiled once per kind, and the plain kind
+/// is main's loop exactly: its takes are a borrow, and the caller-runs steps, on
+/// [`CALLER_RUNS`](Self::CALLER_RUNS), are compiled out.
+pub(crate) trait DriverShard<H: ShardHandler>: Send + Sized + 'static {
+    /// Clients may run the shard's turns: the token, the skip handshake and the backstop.
+    const CALLER_RUNS: bool;
+
+    /// A driver's hold on the shard's core.
+    type Turn<'a>: DriverTurn<H>
+    where
+        Self: 'a;
+
+    fn id(&self) -> ShardId;
+
+    /// The shard's wakeup signal, without a turn.
+    fn signal(&self) -> &Signal;
+
+    /// A take that looks at the shard's work ([`ShardCell::driver_look`]).
+    fn look(&mut self) -> Option<Self::Turn<'_>>;
+
+    /// A take that doesn't look ([`ShardCell::driver`]).
+    fn take(&mut self) -> Option<Self::Turn<'_>>;
+
+    /// A take that must have the shard: start, a move, close ([`ShardCell::driver_wait`]).
+    fn wait(&mut self) -> Option<Self::Turn<'_>>;
+
+    /// Callers' turn time since the last call ([`ShardCell::take_caller_busy`]).
+    fn take_caller_busy(&self) -> u64;
+
+    /// After a park that timed out ([`ShardCell::check_backstop`]).
+    fn check_backstop(&self, wakes_before: u64);
+
+    /// Shutdown: the core, out for good ([`ShardCell::close`]).
+    fn close(self) -> Option<ShardCore<H>>;
+
+    /// For a move to another driver, through its handoff.
+    fn into_handed(self) -> Handed<H>;
+
+    /// A shard handed to this driver: always of this runtime's kind.
+    fn from_handed(h: Handed<H>) -> Self;
+}
+
+/// A driver's turn on a shard: the core, and the token's flags.
+pub(crate) trait DriverTurn<H: ShardHandler>: DerefMut<Target = ShardCore<H>> {
+    /// The driver has work a caller may not take ([`ShardCell::want`]).
+    fn want(&self);
+}
+
+/// A shard on its way to another driver (a move is rare: boxed, it keeps the handoff small).
+pub(crate) enum Handed<H: ShardHandler> {
+    Plain(Box<ShardCore<H>>),
+    Cell(Arc<ShardCell<H>>),
+}
+
+impl<H: ShardHandler> DriverShard<H> for ShardCore<H> {
+    const CALLER_RUNS: bool = false;
+    type Turn<'a> = &'a mut ShardCore<H>;
+
+    fn id(&self) -> ShardId {
+        self.id
+    }
+
+    fn signal(&self) -> &Signal {
+        ShardCore::signal(self)
+    }
+
+    #[inline(always)]
+    fn look(&mut self) -> Option<&mut ShardCore<H>> {
+        Some(self)
+    }
+
+    #[inline(always)]
+    fn take(&mut self) -> Option<&mut ShardCore<H>> {
+        Some(self)
+    }
+
+    #[inline(always)]
+    fn wait(&mut self) -> Option<&mut ShardCore<H>> {
+        Some(self)
+    }
+
+    fn take_caller_busy(&self) -> u64 {
+        0
+    }
+
+    fn check_backstop(&self, _wakes_before: u64) {}
+
+    fn close(self) -> Option<ShardCore<H>> {
+        Some(self)
+    }
+
+    fn into_handed(self) -> Handed<H> {
+        Handed::Plain(Box::new(self))
+    }
+
+    fn from_handed(h: Handed<H>) -> Self {
+        match h {
+            Handed::Plain(core) => *core,
+            Handed::Cell(_) => unreachable!("a runtime's drivers all hold one kind of shard"),
+        }
+    }
+}
+
+impl<H: ShardHandler> DriverTurn<H> for &mut ShardCore<H> {
+    #[inline(always)]
+    fn want(&self) {}
+}
+
+impl<H: ShardHandler> DriverShard<H> for Arc<ShardCell<H>> {
+    const CALLER_RUNS: bool = true;
+    type Turn<'a> = Turn<'a, H>;
+
+    fn id(&self) -> ShardId {
+        ShardCell::id(self)
+    }
+
+    fn signal(&self) -> &Signal {
+        ShardCell::signal(self)
+    }
+
+    fn look(&mut self) -> Option<Turn<'_, H>> {
+        self.driver_look()
+    }
+
+    fn take(&mut self) -> Option<Turn<'_, H>> {
+        self.driver()
+    }
+
+    fn wait(&mut self) -> Option<Turn<'_, H>> {
+        self.driver_wait()
+    }
+
+    fn take_caller_busy(&self) -> u64 {
+        ShardCell::take_caller_busy(self)
+    }
+
+    fn check_backstop(&self, wakes_before: u64) {
+        ShardCell::check_backstop(self, wakes_before);
+    }
+
+    fn close(self) -> Option<ShardCore<H>> {
+        ShardCell::close(&self)
+    }
+
+    fn into_handed(self) -> Handed<H> {
+        Handed::Cell(self)
+    }
+
+    fn from_handed(h: Handed<H>) -> Self {
+        match h {
+            Handed::Cell(cell) => cell,
+            Handed::Plain(_) => unreachable!("a runtime's drivers all hold one kind of shard"),
+        }
+    }
+}
+
+impl<H: ShardHandler> DriverTurn<H> for Turn<'_, H> {
+    fn want(&self) {
+        self.cell.want();
     }
 }
 
