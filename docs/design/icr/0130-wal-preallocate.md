@@ -22,7 +22,7 @@
 - **What g52 found:**
   - Off-CPU, all of fsync's blocked time is in `folio_wait_writeback`: the zero writes delay the log's own write-back in the device queue.
   - Only "no prep during the run" met both bars: g47's pre arm, group-commit 0.80 ms against main's 0.88, and no Mutate over 25 ms.
-- **The estimate against g52** (perf287, #1681): at 64 MiB retention the ring is 6 slots and g52 measured 6. At 1 GiB it's 9 and g52 measured 8.
+- **The estimate against g52** (perf287, #1681; g52 ran 4 shards): with 64 MiB of retention the open sizes 7 slots a stream (the feed keeps at least 2), and g52's run used 6. With 1 GiB it sizes 9, and g52 used 8. The estimate covers both, with one to spare.
 - **Why not the library default:** at the defaults that's 5 slots × 64 MiB per shard. Without the change feed the logs are removed at the last clean close, so every session would write them again. That reverses D157's "a tiny database writes almost nothing at open". So it's opt-in in the library and on in `phdb serve`, a long-running server on a dedicated disk.
 
 ## Callers changed
