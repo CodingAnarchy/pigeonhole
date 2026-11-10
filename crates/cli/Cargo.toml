@@ -96,7 +96,9 @@ insta = { version = "1.49", features = ["filters"] }
 pigeonhole-format = { workspace = true }
 # `serve`'s tests: a filesystem that makes a backup download's copy slow (#1611).
 pigeonhole-io = { workspace = true }
-# The memory core's tests read an IVF store's unsettled records (`hooks::ivf_pending`).
+# The memory store's inspection hooks: the memory core's tests read an IVF store's
+# unsettled records (`hooks::ivf_pending`), and `serve`'s its IVF lists and whether its
+# rebalancer started (#1640).
 pigeonhole-memory = { workspace = true, features = ["__unstable-hooks"] }
 # `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }

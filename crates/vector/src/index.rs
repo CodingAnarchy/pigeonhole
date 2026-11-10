@@ -349,6 +349,13 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
+    /// Whether the crate's rebalancing thread was started for this index (an inspection
+    /// helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn thread_started(&self) -> bool {
+        self.thread.load(Ordering::Acquire)
+    }
+
     pub(crate) fn db(&self) -> &Pigeonhole {
         &self.db
     }

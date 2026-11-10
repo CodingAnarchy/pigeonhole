@@ -950,6 +950,12 @@ impl Service {
         self.tables.load().map.contains_key(name)
     }
 
+    /// The memory store's slot, for a test to inspect the store it holds (#1640).
+    #[cfg(test)]
+    pub(crate) fn memory_slot(&self) -> Option<&Arc<super::memslot::MemSlot>> {
+        self.memory.as_ref()
+    }
+
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
     #[cfg(test)]
     pub(crate) fn inflight_available(&self) -> usize {
