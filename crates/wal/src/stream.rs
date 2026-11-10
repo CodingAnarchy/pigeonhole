@@ -1111,6 +1111,23 @@ impl SpareSegments {
     }
 }
 
+/// SCRATCH (g59, not for merge): `PIGEONHOLE_PREFILL=N` grows and zero-fills N slots of a
+/// stream just created, synced, before it goes live (perf2's O1 stand-in).
+fn prefill(w: &WalStream) -> Result<()> {
+    if let Some(n) = std::env::var("PIGEONHOLE_PREFILL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+    {
+        let got = w.spares().prepare(n)?;
+        eprintln!(
+            "PIGEONHOLE_PREFILL: zero-filled {got} slots, {} ready",
+            w.spares().ready()
+        );
+    }
+    Ok(())
+}
+
 /// Slots a preparation claimed ([`SpareSegments::reserve`]).
 #[derive(Debug)]
 struct Reserved {
@@ -1524,6 +1541,9 @@ impl WalStream {
             lock(&w.shared.open_io).extend([file_drive, dir_drive]);
             out.push(w);
         }
+        for w in &out {
+            prefill(w)?;
+        }
         Ok(out)
     }
 
@@ -1537,6 +1557,7 @@ impl WalStream {
     ) -> Result<WalStream> {
         let mut s = Self::create_unsynced(vfs, db_path, stream, db_id, opts)?;
         s.open_segment(0, 0)?;
+        prefill(&s)?;
         Ok(s)
     }
 
