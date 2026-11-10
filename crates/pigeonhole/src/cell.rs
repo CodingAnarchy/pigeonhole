@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use pigeonhole_engine::{CellData, FamilyId, TableInfo, ValueRef};
 
@@ -469,6 +470,49 @@ pub(crate) struct RowCell {
     family: usize,
     qualifier: Range<usize>,
     cell: Cell,
+}
+
+/// A table's row sizes, for sizing a point read's buffers up front (#1558 item 1): without
+/// it each read grew its qualifiers and cells from empty, a `realloc` per doubling,
+/// which was the top allocation site on ycsb-c (g50). Each is the largest seen, capped, so
+/// it stops changing once the table's rows have been seen: after that the shared handle's
+/// counters are only read, never written.
+#[derive(Debug, Default)]
+pub(crate) struct RowShape {
+    qualifiers: AtomicU32,
+    cells: AtomicU32,
+}
+
+impl RowShape {
+    /// The caps: a row larger than this still reads correctly, it just grows past them.
+    const QUALIFIERS_MAX: u32 = 4 << 10;
+    const CELLS_MAX: u32 = 64;
+
+    /// An empty row for `info`'s families, with room for the largest row seen (capped). Not
+    /// the key: a point read moves the caller's key in.
+    #[inline]
+    pub(crate) fn buf(&self, info: Arc<TableInfo>) -> RowBuf {
+        RowBuf {
+            info: Some(info),
+            key: Vec::new(),
+            qualifiers: Vec::with_capacity(self.qualifiers.load(Relaxed) as usize),
+            cells: Vec::with_capacity(self.cells.load(Relaxed) as usize),
+            last_family: None,
+        }
+    }
+
+    /// Records `buf`'s sizes if one is larger than seen so far (and under its cap).
+    #[inline]
+    pub(crate) fn observe(&self, buf: &RowBuf) {
+        fn grow(at: &AtomicU32, len: usize, max: u32) {
+            let len = (len as u32).min(max);
+            if len > at.load(Relaxed) {
+                at.fetch_max(len, Relaxed);
+            }
+        }
+        grow(&self.qualifiers, buf.qualifiers.len(), Self::QUALIFIERS_MAX);
+        grow(&self.cells, buf.cells.len(), Self::CELLS_MAX);
+    }
 }
 
 /// The storage behind [`Row`] and [`RowRef`]: a few buffers per row, none per cell.
