@@ -741,3 +741,170 @@ fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sende
     let _ = db_b.close();
     let _ = db_a.map(pigeonhole::Pigeonhole::close);
 }
+
+/// The cluster model test's random source: splitmix64, seeded and reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[test]
+fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
+    // D317 §12's model test, single-partition half: every single-key call and every
+    // one-partition batch answers as a single database would, whichever node it enters;
+    // every cross-partition batch is refused with nothing written. The oracle is a map.
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("cluster model seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    let mut rng = Rng(seed);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut map = the_map(1, &[ports[0], ports[1], ports[2]]);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    // Rows on both sides of the split at "m".
+    let rows: Vec<String> = ["a", "f", "k", "lz", "m", "n", "s", "z"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}")))
+        .collect();
+    let part = |row: &str| {
+        if row.as_bytes() < b"m".as_slice() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut model: std::collections::HashMap<String, String> = Default::default();
+    let ops = std::env::var("PIGEONHOLE_STRESS_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300u64);
+    rt.block_on(async {
+        let mut clients = Vec::new();
+        for &port in &ports {
+            clients.push(data(port).await);
+        }
+        for i in 0..ops {
+            let entry = rng.below(3) as usize;
+            let c = &mut clients[entry];
+            let at = format!("seed {seed}, op {i}, entry node {entry}");
+            match rng.below(4) {
+                0 | 1 => {
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let value = format!("v{i}");
+                    c.mutate(super::proto::MutateRequest {
+                        writes: Some(put_row(row, &value)),
+                        durability: 0,
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                    model.insert(row.clone(), value);
+                }
+                2 => {
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let got = c
+                        .get(super::proto::GetRequest {
+                            table: "users".into(),
+                            row: row.as_bytes().to_vec().into(),
+                            family: "f".into(),
+                            qualifier: b"q".to_vec().into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: get {row}: {e}"))
+                        .into_inner()
+                        .cell
+                        .map(|c| String::from_utf8(c.value.to_vec()).unwrap());
+                    assert_eq!(got.as_ref(), model.get(row), "{at}: get {row}");
+                }
+                _ => {
+                    // A batch of two to four rows: one partition commits whole, two refuse.
+                    let n = 2 + rng.below(3) as usize;
+                    let picked: Vec<String> = (0..n)
+                        .map(|_| rows[rng.below(rows.len() as u64) as usize].clone())
+                        .collect();
+                    let value = format!("b{i}");
+                    let reply = c
+                        .batch(super::proto::BatchRequest {
+                            rows: picked.iter().map(|r| put_row(r, &value)).collect(),
+                            durability: 0,
+                        })
+                        .await;
+                    let one = picked.iter().all(|r| part(r) == part(&picked[0]));
+                    match reply {
+                        Ok(_) if one => {
+                            for r in &picked {
+                                model.insert(r.clone(), value.clone());
+                            }
+                        }
+                        Err(e) if !one => {
+                            assert_eq!(code(&e), "CrossPartition", "{at}: {e}");
+                        }
+                        other => panic!("{at}: batch {picked:?}: {other:?}"),
+                    }
+                }
+            }
+        }
+    });
+    // Every row is in its own partition's file only, holding the model's value.
+    let read = |db: &pigeonhole::Pigeonhole, row: &str| {
+        db.table("users")
+            .unwrap()
+            .open()
+            .unwrap()
+            .get(row.as_bytes(), "f", b"q")
+            .unwrap()
+            .map(|c| String::from_utf8(c.value().to_vec()).unwrap())
+    };
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    for row in &rows {
+        let (home, other) = if part(row) == 1 {
+            (&db_a, &db_b)
+        } else {
+            (&db_b, &db_a)
+        };
+        assert_eq!(
+            read(home, row).as_ref(),
+            model.get(row),
+            "seed {seed}: {row}"
+        );
+        assert_eq!(
+            read(other, row),
+            None,
+            "seed {seed}: {row} in the wrong file"
+        );
+    }
+    let _ = db_a.close();
+    let _ = db_b.close();
+}
