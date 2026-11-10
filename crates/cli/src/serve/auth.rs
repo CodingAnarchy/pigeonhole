@@ -44,6 +44,9 @@ pub(crate) struct Caller {
     /// `None`: every namespace. Used by the memory calls (ticket 8).
     #[allow(dead_code)]
     pub namespaces: Option<Vec<String>>,
+    /// The reply goes back as HTTP/JSON, larger than its protobuf: a read reserves twice its
+    /// cap for it (#1567, cli692's D2). Set by the HTTP front-end.
+    pub json: bool,
 }
 
 impl Caller {
@@ -53,6 +56,7 @@ impl Caller {
             token: u32::MAX,
             scope: Scope::Admin,
             namespaces: None,
+            json: false,
         }
     }
 }
@@ -144,6 +148,7 @@ impl Tokens {
                     token: u32::try_from(i).unwrap_or(u32::MAX - 1),
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
+                    json: false,
                 });
             }
         }
