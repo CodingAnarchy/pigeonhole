@@ -341,6 +341,8 @@ macro_rules! unary {
 
 /// A unary reply as its response, a read's charge (#1567) in its extensions, which the
 /// gRPC routes' middleware moves into the body on the way out ([`super::charge::hold`]).
+/// Only valid for a route behind [`prepay`]: anywhere else nothing moves the charge into
+/// the body, so it is released when the extensions drop, before the reply is sent.
 fn respond<T>(
     reply: ServiceReply,
     pick: impl FnOnce(ServiceReply) -> Option<T>,
