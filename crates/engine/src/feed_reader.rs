@@ -257,32 +257,39 @@ fn alloc_size(n: usize) -> u64 {
 }
 
 /// Packs `batch`'s mutations of `tables` (every table but a replica's state table, if
-/// empty) and rows starting with `prefix`. `heads` and `bytes` are scratch space, so the
-/// result's two allocations are made once, at their exact size.
-fn pack(
-    batch: BatchRef<'_>,
-    tables: &[TableId],
-    prefix: &[u8],
-    heads: &mut Vec<RawHead>,
-    bytes: &mut Vec<u8>,
-) -> Result<Raws> {
-    heads.clear();
-    bytes.clear();
+/// empty) and rows starting with `prefix`. Two passes over the batch: the first sizes the
+/// result's two allocations, the second fills them, so each is made once at its exact size
+/// and nothing outlives the call (a scratch buffer would keep the largest batch's size,
+/// outside the read-ahead's count: simp724's S1 on #1667).
+fn pack(batch: BatchRef<'_>, tables: &[TableId], prefix: &[u8]) -> Result<Raws> {
     let len = |b: &[u8]| {
         u32::try_from(b.len())
             .map_err(|_| Error::Corruption("a logged mutation's field is over 4 GiB".into()))
     };
-    for m in batch.iter() {
-        let m = m?;
-        // The table first, then the row: a mutation outside is skipped by its lengths,
-        // never copied (§2.7). An empty list is every table (D315), but a replica's state
-        // table: a commit only to it is passed over (D315 PR 3).
-        let followed = if tables.is_empty() {
+    // The table first, then the row: a mutation outside is skipped by its lengths, never
+    // copied (§2.7). An empty list is every table (D315), but a replica's state table: a
+    // commit only to it is passed over (D315 PR 3).
+    let followed = |m: &pigeonhole_format::wal::Mutation<'_>| {
+        let table = if tables.is_empty() {
             m.table != pigeonhole_format::manifest::REPLICA_TABLE
         } else {
             tables.binary_search(&m.table).is_ok()
         };
-        if !followed || !m.row.starts_with(prefix) {
+        table && m.row.starts_with(prefix)
+    };
+    let (mut n, mut size) = (0usize, 0usize);
+    for m in batch.iter() {
+        let m = m?;
+        if followed(&m) {
+            n += 1;
+            size += m.row.len() + m.qualifier.len() + m.value.len();
+        }
+    }
+    let mut heads = Vec::with_capacity(n);
+    let mut bytes = Vec::with_capacity(size);
+    for m in batch.iter() {
+        let m = m?;
+        if !followed(&m) {
             continue;
         }
         heads.push(RawHead {
@@ -298,9 +305,11 @@ fn pack(
         bytes.extend_from_slice(m.qualifier);
         bytes.extend_from_slice(m.value);
     }
+    // Full to capacity, so neither conversion reallocates.
+    debug_assert!(heads.len() == n && bytes.len() == size);
     Ok(Raws {
-        heads: heads.as_slice().into(),
-        bytes: bytes.as_slice().into(),
+        heads: heads.into_boxed_slice(),
+        bytes: bytes.into_boxed_slice(),
     })
 }
 
@@ -491,9 +500,6 @@ pub struct FeedReader {
     /// The PREPAREs read and waiting for their Decision, by round id and stream: one entry
     /// per share, so a share costs its entry and no spine (#1637).
     held: BTreeMap<(Seqno, usize), Held>,
-    /// Scratch for [`pack`].
-    pack_heads: Vec<RawHead>,
-    pack_bytes: Vec<u8>,
     /// The starts of `ready`'s and `held`'s records, per stream.
     starts: Starts,
     /// The read-ahead cap (D320).
@@ -807,8 +813,6 @@ impl FeedReader {
             session: 0,
             ready: BTreeMap::new(),
             held: BTreeMap::new(),
-            pack_heads: Vec::new(),
-            pack_bytes: Vec::new(),
             starts: Starts::default(),
             ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
@@ -1791,8 +1795,7 @@ impl FeedReader {
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let (heads, bytes) = (&mut self.pack_heads, &mut self.pack_bytes);
-        let mut filter = |batch: BatchRef<'_>| pack(batch, tables, prefix, heads, bytes);
+        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix);
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -1882,14 +1885,11 @@ impl FeedReader {
 
     /// Takes round `id`'s held shares, uncounting their starts and bytes.
     fn remove_held(&mut self, id: Seqno) -> Vec<Held> {
-        let streams: Vec<usize> = self
+        let mut shares = Vec::new();
+        for (_, h) in self
             .held
-            .range((id, 0)..=(id, usize::MAX))
-            .map(|(&(_, s), _)| s)
-            .collect();
-        let mut shares = Vec::with_capacity(streams.len());
-        for s in streams {
-            let h = self.held.remove(&(id, s)).expect("listed");
+            .extract_if((id, 0)..=(id, usize::MAX), |_, _| true)
+        {
             self.starts.remove(h.stream, h.start);
             self.ahead.bytes -= held_bytes(&h);
             shares.push(h);
