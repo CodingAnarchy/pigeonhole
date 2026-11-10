@@ -90,7 +90,7 @@ What that means in practice:
 - **Durable snapshots (opt-in, ICR 0037).** A reader that needs every value it sees to be durable takes a durable snapshot instead: `db.durable_snapshot()` (also on a reader process's handle). It sees a commit only once its level is met on its shard, which is how every snapshot behaved before D227. Durable means durable at the commit's own level: `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a process crash, `None` ones nothing. To read only data that survives a power loss, write it with `GroupSync` or `Sync`. A failed fsync never counts as durable. It lags `snapshot()` by the fsyncs in flight, typically well under a millisecond. Use it when what you read must never be undone:
   - before writing something derived from it, on another shard;
   - for a cursor or version you persist;
-  - for a backup that must hold only durable data: `db.backup_durable(path)`.
+  - for a backup that must hold only durable data: `db.backup_durable(path)`, or `db.backup_at(&durable_snapshot, path)` to back up a durable snapshot you also read or follow a feed from.
 
   ```rust
   # use pigeonhole::{Family, Options, Pigeonhole};

@@ -41,6 +41,8 @@ pub(crate) struct Db {
     supervision: Option<crate::recovery::Supervision>,
     /// What a reopen needs: the options and the path (writers with the option on).
     reopen: Option<(Options, PathBuf)>,
+    /// The path the database was opened with, as given ([`Pigeonhole::path`]).
+    path: PathBuf,
     /// `Options::write_stall_timeout`: how long an operation waits for a recovery's swap.
     stall_timeout: Duration,
     /// Transaction outcomes since open (ICR 0061).
@@ -137,6 +139,7 @@ pub(crate) struct Watch {
 impl Watch {
     /// For a transaction's commit: `SnapshotExpired` once the swap is in, as its sync
     /// commit gets.
+    #[cfg(feature = "async")]
     pub(crate) fn transaction(mut self) -> Self {
         self.transaction = true;
         self
@@ -264,8 +267,8 @@ impl Cached {
 const CLOSED: u64 = 1 << 63;
 
 impl Db {
-    fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
-        Self::with_recovery(engine, vfs, max_value, None, Duration::from_secs(30))
+    fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize, path: PathBuf) -> Arc<Self> {
+        Self::with_recovery(engine, vfs, max_value, None, path, Duration::from_secs(30))
     }
 
     /// `new`, supervised when `reopen` names the options and path to recover with and the
@@ -275,6 +278,7 @@ impl Db {
         vfs: VfsRef,
         max_value: usize,
         reopen: Option<(Options, PathBuf)>,
+        path: PathBuf,
         stall_timeout: Duration,
     ) -> Arc<Self> {
         let supervision = reopen
@@ -294,6 +298,7 @@ impl Db {
             max_value,
             supervision,
             reopen,
+            path,
             stall_timeout,
             txn_counts: Default::default(),
             watch_id,
@@ -317,6 +322,7 @@ impl Db {
     /// after, a swap in between records the new generation, and a refusal by the failed
     /// engine then looks as if nothing swapped (`Closed` instead of `Busy`).
     #[inline]
+    #[cfg(feature = "async")]
     pub(crate) fn watch(&self) -> Watch {
         self.watch_at(self.generation())
     }
@@ -742,6 +748,7 @@ impl Pigeonhole {
             vfs,
             max_value,
             Some((options, path.as_ref().to_path_buf())),
+            path.as_ref().to_path_buf(),
             stall_timeout,
         );
         if supervised {
@@ -763,7 +770,7 @@ impl Pigeonhole {
         let engine_options = options.to_engine()?;
         let vfs = Arc::clone(&engine_options.vfs);
         let engine = Engine::open_reader(path.as_ref(), engine_options)?;
-        let db = Db::new(engine, vfs, 0);
+        let db = Db::new(engine, vfs, 0, path.as_ref().to_path_buf());
         let cached = Cached::new(&db);
         Ok(PigeonholeReader { db, cached })
     }
@@ -956,7 +963,7 @@ impl Pigeonhole {
                 io_fd_used: std::sync::atomic::AtomicBool::new(false),
             })
             .collect();
-        let db = Db::new(engine, Arc::clone(&vfs), max_value);
+        let db = Db::new(engine, Arc::clone(&vfs), max_value, path.to_path_buf());
         let cached = Cached::new(&db);
         Ok(AppOwned {
             db: Pigeonhole { db, cached },
@@ -1031,6 +1038,33 @@ impl Pigeonhole {
         Arc::ptr_eq(&self.db, &other.db)
     }
 
+    /// The highest seqno a new snapshot may include now: every commit at or below it is
+    /// visible (D316 A4, ICR 0116). Cheap: a few atomic loads, no snapshot taken. Against a
+    /// feed's [`FeedProgress::covered_seqno`](crate::FeedProgress::covered_seqno), it is
+    /// the feed's lag in commits.
+    pub fn visible_seqno(&self) -> u64 {
+        self.engine().visible_seqno()
+    }
+
+    /// Whether the database was closed ([`close`](Self::close), through this handle or any
+    /// clone of it): every operation then fails with
+    /// [`ErrorCode::Closed`](crate::ErrorCode::Closed). Cheap (one atomic load): a library
+    /// that holds a handle, such as a metrics exporter, can check it before reading
+    /// (ICR 0115).
+    pub fn is_closed(&self) -> bool {
+        self.db.check_open().is_err()
+    }
+
+    /// The path this database was opened with, exactly as given to
+    /// [`open`](Self::open) (or [`open_application_owned`](Self::open_application_owned)):
+    /// not canonicalised, so a relative path stays relative (ICR 0115). Every clone of the
+    /// handle reports the same path, and an automatic recovery keeps it. A label for logs
+    /// and metrics (`pigeonhole-otel` names a database by its file name); to tell two
+    /// handles' databases apart, use [`same_database`](Self::same_database).
+    pub fn path(&self) -> &Path {
+        &self.db.path
+    }
+
     /// Whether this instance has failed (ICR 0040): a shard's thread panicked, an
     /// application-owned shard's driver was dropped before the close finished, a shard
     /// stopped after a WAL write or sync failed (or its in-memory state could not be
@@ -1075,6 +1109,12 @@ impl Pigeonhole {
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
     /// is applied, possibly before its fsync (D227): a power loss can remove what it read.
+    ///
+    /// While it lives, it keeps the memtables it saw in memory, flushed ones included. Don't
+    /// hold one across a commit on the same thread: a commit that waits for memtable room
+    /// would wait on room only this snapshot keeps, and fail with `Busy` after the write-stall
+    /// timeout. Copy out what you read, drop the snapshot, then commit (the user guide's
+    /// transactions page, #1497).
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.db.snapshot(&self.cached)
     }
@@ -1192,6 +1232,20 @@ impl Pigeonhole {
     /// ```
     pub fn pinned_shard_cpus(&self) -> Vec<usize> {
         self.engine().pinned_shard_cpus()
+    }
+
+    /// Counts one retried transaction attempt in
+    /// [`EngineMetrics::transaction_retries`](crate::EngineMetrics::transaction_retries), as
+    /// [`transact`](Self::transact) counts its own: for a binding that runs its own retry
+    /// loop over [`RetryPolicy::next_pause`](crate::RetryPolicy::next_pause) (the Python
+    /// bindings' `transact` and `transact_async`, ICR 0121's amendment). Hidden: a binding
+    /// hook, not a stable API.
+    #[doc(hidden)]
+    pub fn note_transaction_retry(&self) {
+        self.db
+            .txn_counts
+            .retries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The writer's counters since this instance opened: commits and their latency,
@@ -1451,6 +1505,61 @@ impl Pigeonhole {
         })
     }
 
+    /// As [`backup`](Self::backup), of `snapshot` (#1436, ICR 0125): the copy holds exactly
+    /// the commits `snapshot` sees, no more and no fewer, whenever this is called. Take one
+    /// snapshot, back it up, and open a change feed
+    /// [`from_snapshot`](crate::FeedBuilder::from_snapshot) of the same snapshot: the feed
+    /// starts at the first commit the copy doesn't hold, so the copy plus the feed misses
+    /// nothing and repeats nothing (a downstream copy seeded from the backup, then kept
+    /// current from the feed). With a [`durable_snapshot`](Self::durable_snapshot), the copy
+    /// holds only durable commits, as [`backup_durable`](Self::backup_durable)'s does.
+    ///
+    /// The snapshot is held for the copy's length, which holds back version and blob GC as
+    /// any held snapshot does. `dest` must not exist. `InvalidArgument` for another
+    /// database's snapshot, and `SnapshotExpired` for one taken before an automatic recovery
+    /// (D265) replaced the engine: take a new one.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let options = Options::default().shards(1).change_feed(FeedRetention::bytes(64 << 20));
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), options)?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"a").put("f", b"q", b"1").commit()?;
+    ///
+    /// // One snapshot for both: the copy holds `a`, the feed starts after it.
+    /// let snapshot = db.durable_snapshot()?;
+    /// let copy_path = dir.join("seed.phdb");
+    /// db.backup_at(&snapshot, &copy_path)?;
+    /// let mut feed = db.feed().from_snapshot(&snapshot).open()?;
+    /// drop(snapshot);
+    ///
+    /// t.mutate(b"b").put("f", b"q", b"2").commit()?;
+    /// let commit = feed.next(Duration::from_secs(5))?.expect("b's commit");
+    /// assert_eq!(commit.changes()[0].row(), b"b");
+    ///
+    /// let copy = Pigeonhole::open(&copy_path, Options::default().shards(1))?;
+    /// let ct = copy.table("t")?.open()?;
+    /// assert!(ct.get(b"a", "f", b"q")?.is_some());
+    /// assert!(ct.get(b"b", "f", b"q")?.is_none()); // the feed brings it
+    /// # drop(ct);
+    /// # copy.close()?;
+    /// # drop(feed);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn backup_at(&self, snapshot: &Snapshot, dest: impl AsRef<Path>) -> Result<()> {
+        self.db.check_snapshot(snapshot)?;
+        self.engine()
+            .backup_at(&snapshot.inner, dest.as_ref())
+            .map_err(Error::from)
+    }
+
     /// Returns free space at the end of the file to the filesystem and reports the bytes
     /// released. The file never shrinks by itself: space freed by compaction or by deleting
     /// rows is reused by later writes, but the file keeps its length. Call this after a
@@ -1599,6 +1708,12 @@ impl PigeonholeReader {
     /// does not track allocations.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
         Ok(crate::DatabaseInfo::from_engine(self.engine().info()?))
+    }
+
+    /// The path this reader was opened with, exactly as given to
+    /// [`open_reader`](Pigeonhole::open_reader), not canonicalised (ICR 0115).
+    pub fn path(&self) -> &Path {
+        &self.db.path
     }
 
     /// What this reader's row cache did since it last attached to a writer: hits, misses

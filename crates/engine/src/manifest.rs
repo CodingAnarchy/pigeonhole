@@ -12,7 +12,7 @@
 //! loop, decision D30); an application thread making a catalog change does the same inline
 //! with the blocking `Pager::commit_root`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
@@ -363,7 +363,7 @@ impl ManifestWriter {
         }
     }
 
-    /// Sets the `incompat` feature bits `edits` need in both superblock pages, before the
+    /// Sets the `incompat` (and `ro_compat`) feature bits `edits` need in both superblock pages, before the
     /// commit that writes them (D294; FORMAT §8.2): a family of a kind added after 1.0 needs
     /// its kind's bit, so a build that does not know the kind refuses the file at open
     /// instead of meeting the family. Called under the writer's exclusion with no root commit
@@ -377,20 +377,38 @@ impl ManifestWriter {
     /// thread (a creation that found the exclusion held may be drained there), whose turn
     /// then waits on four syncs, against D30's rule for that loop: accepted for a one-time step
     /// (perf287's S2 on #1194; `a_creation_queued_behind_a_background_commit_flags_the_file`).
-    pub(crate) fn flag_features(&mut self, edits: &[Edit]) -> Result<()> {
+    pub(crate) fn flag_features(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<()> {
         if self.poisoned {
             return Err(Self::poisoned_error());
+        }
+        // A promoted replica's bit, once its state table's drop is durable (an earlier commit,
+        // never this batch's): cleared before this commit (#1436, ICR 0125).
+        let dropping = edits.iter().any(|e| {
+            matches!(e, Edit::DropTable { table } if *table == pigeonhole_format::manifest::REPLICA_TABLE)
+        });
+        if !dropping {
+            self.clear_stale_replica_bit(catalog, false)?;
         }
         let needed = edits.iter().fold(0, |bits, e| match e {
             Edit::PutFamily { options, .. } => bits | options.kind.required_incompat(),
             _ => bits,
         });
+        // A replica's state table (D315 PR 3): builds that don't know it open the file
+        // read-only.
+        let needed_ro = if edits.iter().any(|e| {
+            matches!(e, Edit::CreateTable { table, .. } if *table == pigeonhole_format::manifest::REPLICA_TABLE)
+        }) {
+            pigeonhole_format::manifest::RO_COMPAT_REPLICA
+        } else {
+            0
+        };
         let features = self.pager.features();
-        if needed & !features.incompat == 0 {
+        if needed & !features.incompat == 0 && needed_ro & !features.ro_compat == 0 {
             return Ok(());
         }
         let flagged = Features {
             incompat: features.incompat | needed,
+            ro_compat: features.ro_compat | needed_ro,
             ..features
         };
         self.pager.set_features(flagged).map_err(|e| {
@@ -399,9 +417,36 @@ impl ManifestWriter {
         })
     }
 
+    /// Clears `ro_compat` bit 0 when the file carries it but has no replica state table (#1436,
+    /// ICR 0125): a promoted replica's last step, and the open-time repair when a crash came
+    /// between its state table's drop and this. Under the writer's exclusion, as
+    /// [`flag_features`](Self::flag_features); a no-op when the bit isn't set or the table is
+    /// there. `repair` (the open-time repair, simp724's note on #1436): a failure is returned
+    /// without poisoning the writer, so it never fails the open; the next writable open tries
+    /// again.
+    pub(crate) fn clear_stale_replica_bit(
+        &mut self,
+        catalog: &Catalog,
+        repair: bool,
+    ) -> Result<()> {
+        use pigeonhole_format::manifest::{REPLICA_TABLE, RO_COMPAT_REPLICA};
+        let features = self.pager.features();
+        if features.ro_compat & RO_COMPAT_REPLICA == 0 || catalog.table(REPLICA_TABLE).is_some() {
+            return Ok(());
+        }
+        let cleared = Features {
+            ro_compat: features.ro_compat & !RO_COMPAT_REPLICA,
+            ..features
+        };
+        self.pager.set_features(cleared).map_err(|e| {
+            self.poisoned |= !repair;
+            e.into()
+        })
+    }
+
     /// Commits synchronously (open-time flushes, before the shards run).
     pub(crate) fn commit(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<ManifestVersion> {
-        self.flag_features(edits)?;
+        self.flag_features(catalog, edits)?;
         let p = self.prepare(catalog, edits, Rewrite::AsNeeded)?;
         let r = self.pager.commit_root(p.root).map_err(pager_io);
         self.complete(p, r)
@@ -973,17 +1018,27 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // A catalog change with the change feed on (D315): its ceiling is held from the feed's
     // frontier, under the allocator's lock, until its `Catalog` sidecar entry is appended
     // (in the root-commit observer, before the Root entry), and its edits are staged for it.
+    // A replica's state table (D315 PR 3) is no feed's: its creation is never an event.
     let catalog_edits: Vec<Edit> = edits
         .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                Edit::CreateTable { .. } | Edit::PutFamily { .. } | Edit::DropTable { .. }
-            )
+        .filter(|e| match e {
+            Edit::CreateTable { table, .. }
+            | Edit::PutFamily { table, .. }
+            | Edit::DropTable { table } => *table != pigeonhole_format::manifest::REPLICA_TABLE,
+            _ => false,
         })
         .cloned()
         .collect();
-    let catalog_held = shared.feed.is_some() && !catalog_edits.is_empty();
+    // Once the session's sidecar appends stopped (D315; simp724 on #1493), no catalog change
+    // can get an entry: the first change after takes its hold as usual, and
+    // `release_catalog` freezes it there for the rest of the session, so no feed passes a
+    // change it can't deliver. Later changes take none of their own: a larger ceiling would
+    // let the frontier pass the frozen one.
+    let catalog_held = shared
+        .feed
+        .as_ref()
+        .is_some_and(|f| !f.catalog_hold_frozen())
+        && !catalog_edits.is_empty();
     catalog.counters.seqno_ceiling = if catalog_held {
         shared.clock.hold_catalog(&shared.shm)
     } else {
@@ -991,11 +1046,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     };
     // D271: every default timestamp comes from the one allocator, at or below its `H`.
     catalog.counters.ts_floor = shared.clock.last_ts().max(catalog.counters.ts_floor);
-    let staged = catalog_held.then_some((
-        catalog.counters.seqno_ceiling,
-        catalog.counters.ts_floor,
-        catalog_edits,
-    ));
+    let staged = catalog_held.then(|| crate::feed::StagedCatalog {
+        ceiling: catalog.counters.seqno_ceiling,
+        timestamp: catalog.counters.ts_floor,
+        names: catalog_names(&old, &catalog_edits),
+        edits: catalog_edits,
+    });
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
@@ -1023,7 +1079,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         Err(Error::NoSpace)
     } else {
         writer
-            .flag_features(&edits)
+            .flag_features(&catalog, &edits)
             .and_then(|()| writer.prepare(&catalog, &edits, rewrite))
     };
     match prepared {
@@ -1033,8 +1089,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             // on #1493): `flag_features` may have made root commits of its own above (a new
             // incompat bit), and their observer calls must not take the entry, nor may a
             // failed prepare leave one for a change that never committed.
-            if let (Some(feed), Some((ceiling, ts, edits))) = (&shared.feed, staged) {
-                feed.stage_catalog(ceiling, ts, edits);
+            if let (Some(feed), Some(change)) = (&shared.feed, staged) {
+                feed.stage_catalog(change);
             }
             #[cfg(feature = "test-hooks")]
             shared
@@ -1082,13 +1138,55 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     }
 }
 
+/// The name of each table a `PutFamily` or `DropTable` in `edits` names without its
+/// `CreateTable` in `edits`, once per table, from `old`, the catalog before the batch applied
+/// (a dropped table is gone after): the `Catalog` sidecar entry carries them (D315), so a feed
+/// resumed after a table older than the feed was dropped still names it (simp724).
+fn catalog_names(old: &Catalog, edits: &[Edit]) -> Vec<(TableId, String)> {
+    let created: HashSet<TableId> = edits
+        .iter()
+        .filter_map(|e| match e {
+            Edit::CreateTable { table, .. } => Some(*table),
+            _ => None,
+        })
+        .collect();
+    let mut names: Vec<(TableId, String)> = Vec::new();
+    for e in edits {
+        let (Edit::PutFamily { table, .. } | Edit::DropTable { table }) = e else {
+            continue;
+        };
+        if created.contains(table) || names.iter().any(|(t, _)| t == table) {
+            continue;
+        }
+        if let Some(info) = old.table(*table) {
+            names.push((*table, info.name.clone()));
+        }
+    }
+    names
+}
+
 /// Drops a catalog change's staged edits, if its root-commit observer didn't append them (a
 /// failed or refused commit), and releases its hold on the change feed (D315).
 fn release_catalog(shared: &Shared) {
-    if let Some(feed) = &shared.feed {
-        feed.unstage_catalog();
+    let Some(feed) = &shared.feed else {
+        shared.shm.publish_catalog_hold(u64::MAX);
+        return;
+    };
+    feed.unstage_catalog();
+    // This commit's own append failed (or an earlier one did): the hold, at this change's
+    // ceiling, stays up for the rest of the session, so no feed passes it (simp724).
+    if feed.appends_stopped() {
+        feed.freeze_catalog_hold();
+    } else {
+        shared.shm.publish_catalog_hold(u64::MAX);
     }
-    shared.shm.publish_catalog_hold(u64::MAX);
+    // A feed of every table the hold kept back waits on the feed's hold list, as for the
+    // shard's WRITTEN/SYNCED holds: woken after the release is stored (its fence pairs with
+    // `wait_for_hold`'s), so the release is never missed (#1417). And when the hold froze:
+    // that feed re-polls and expires, as the stopped appends say (simp724's W1 on #1533).
+    feed.wake_hold_waiters();
+    // And the idle feeds of every table waiting for a catalog change (simp724's P1 on #1539).
+    feed.wake_catalog_waiters();
 }
 
 /// Finishes a commit whose root commit returned `result`: publishes the view, retires what

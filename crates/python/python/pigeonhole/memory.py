@@ -32,6 +32,12 @@ RecallHit = _native.RecallHit
 RecallStats = _native.RecallStats
 ForgetPass = _native.ForgetPass
 ConsolidatePass = _native.ConsolidatePass
+Watch = _native.Watch
+WatchIter = _native.WatchIter
+MemoryCommit = _native.MemoryCommit
+MemoryEvent = _native.MemoryEvent
+ConsolidateLoop = _native.ConsolidateLoop
+LoopStep = _native.LoopStep
 ModelMismatch = _native.ModelMismatch
 ConsolidateError = _native.ConsolidateError
 

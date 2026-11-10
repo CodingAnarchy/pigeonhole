@@ -583,3 +583,27 @@ fn real_vfs() -> pigeonhole_io::VfsRef {
         _ => pigeonhole_io::pread::PreadVfs::new(2),
     }
 }
+
+/// D315 amendment (#1504): the root-intent hook runs before each root commit writes, with
+/// the new superblock's sequence and checksum, which a later open reads back from the
+/// superblock that commit wrote; a commit that fails after the hook leaves the old
+/// superblock, one sequence behind.
+#[test]
+fn the_root_intent_hook_names_the_superblock_its_commit_writes() {
+    use std::sync::{Arc, Mutex};
+    let vfs: pigeonhole_io::VfsRef = pigeonhole_io::sim::SimVfs::new(77);
+    let path = std::path::Path::new("/db/intent.phdb");
+    let pager = Pager::create(&vfs, path).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = Arc::clone(&seen);
+    assert!(pager.on_root_intent(Box::new(move |seq, sum| s.lock().unwrap().push((seq, sum)))));
+    assert!(!pager.on_root_intent(Box::new(|_, _| {})), "set once");
+    pager.commit_root(pager.root()).unwrap();
+    pager.commit_root(pager.root()).unwrap();
+    let last = *seen.lock().unwrap().last().unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(last.0, pager.sequence());
+    drop(pager);
+    let opened = Pager::open(&vfs, path, false).unwrap();
+    assert_eq!((opened.sequence(), opened.checksum()), last);
+}

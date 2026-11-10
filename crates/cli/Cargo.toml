@@ -16,6 +16,11 @@ readme = "README.md"
 name = "phdb"
 path = "src/main.rs"
 
+# D313 ticket 5's acceptance run: idle feed subscribers against `phdb serve`'s writes.
+[[example]]
+name = "serve_feed_load"
+required-features = ["serve"]
+
 [features]
 default = ["embed"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,
@@ -27,6 +32,9 @@ serve = [
     "dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde",
     "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",
     "dep:sha2", "dep:arc-swap", "dep:num_cpus", "dep:nix", "dep:futures-core",
+    "dep:pigeonhole-vector", "dep:pigeonhole-text", "dep:half",
+    # `--replica-of` (#1436): the replica side of replication, hidden in the library.
+    "pigeonhole/__unstable-replication",
 ]
 
 [dependencies]
@@ -34,6 +42,12 @@ serve = [
 pigeonhole = { workspace = true }
 # `phdb mcp --memory` (D311 T7).
 pigeonhole-memory = { workspace = true }
+# `phdb serve`'s `Vectors` index RPCs (D313 ticket 7).
+pigeonhole-vector = { workspace = true, optional = true }
+# `phdb serve`'s `Text` RPCs (D313 ticket 7c).
+pigeonhole-text = { workspace = true, optional = true }
+# `phdb serve`'s `Memory`: a memory embedding sent as `f16` or `bf16` is widened (ticket 8a).
+half = { workspace = true, optional = true }
 # `--embed-url`: a synchronous HTTP client, rustls on the ring provider, and the operating
 # system's trust store (no bundled roots: webpki-roots' licence isn't in deny.toml).
 ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider"], optional = true }
@@ -47,14 +61,16 @@ arrow-ipc = { workspace = true }
 # `serve`: the network API's messages (prost), services (tonic, codegen only) and proto3 JSON
 # mapping (pbjson), generated into src/serve/proto/ by tools/protogen.
 prost = { version = "0.14", optional = true }
-tonic = { version = "0.14", default-features = false, features = ["codegen"], optional = true }
+# `channel` and TLS for a replica's client of its primary (`--replica-of`, #1436; ICR 0112's
+# amendment): rustls with the system's roots, as `embed` already uses.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring", "tls-native-roots"], optional = true }
 tonic-prost = { version = "0.14", optional = true }
 pbjson = { version = "0.9", optional = true }
 serde = { version = "1", optional = true }
 # `serve`'s server: the runtime, one router for gRPC and HTTP/JSON, the limits, one accept
 # loop for plain and TLS connections, token digests, the table cache, and core counts for
 # placing threads off the shards' CPUs (perf287's R1 on D313).
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "time", "macros", "fs", "io-util"], optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"], optional = true }
 tower = { version = "0.5", features = ["limit", "load-shed", "util"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio", "service"], optional = true }
@@ -68,15 +84,27 @@ futures-core = { workspace = true, optional = true }
 # `serve`: the Tokio threads' affinity mask (R1), through nix's safe `sched_setaffinity`.
 nix = { version = "0.29", default-features = false, features = ["sched", "process"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# `serve`: the open-file limit `--max-connections` defaults from, and accept's errno (#1604).
+nix = { version = "0.29", default-features = false, features = ["resource"], optional = true }
+
 [dev-dependencies]
 # The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).
 pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 insta = { version = "1.49", features = ["filters"] }
 # `tests/check_fixtures.rs` rewrites structures with valid checksums.
 pigeonhole-format = { workspace = true }
+# `serve`'s tests: a filesystem that makes a backup download's copy slow (#1611).
+pigeonhole-io = { workspace = true }
+# The memory store's inspection hooks: the memory core's tests read an IVF store's
+# unsettled records (`hooks::ivf_pending`), and `serve`'s its IVF lists and whether its
+# rebalancer started (#1640).
+pigeonhole-memory = { workspace = true, features = ["__unstable-hooks"] }
 # `serve`'s tests: a gRPC client and an HTTP client against a server on a loopback port.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
 ureq = { version = "3.5", default-features = false, features = ["json"] }
+# `serve`'s idle-limit tests on a paused clock, so a slow runner can't fire a deadline (#1531).
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

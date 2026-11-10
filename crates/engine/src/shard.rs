@@ -223,6 +223,12 @@ pub(crate) struct ShardMetrics {
     /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
     /// time, in nanoseconds, as of the last change in their number.
     pub sync_busy_nanos: AtomicU64,
+    /// The shard's memtable arena's free bytes, which the arena stores itself whenever a
+    /// memtable takes chunks or a retired one gives them back (`ShardArena::set_free_sink`,
+    /// D316 A2, ICR 0116): never per commit. `Engine::metrics` reads it.
+    pub memtable_free: Arc<AtomicU64>,
+    /// The arena's size, stored once when the shard starts (D316 A2).
+    pub memtable_limit: AtomicU64,
     /// Client commits' in-flight time (D257, D262): the sum over the commits this shard
     /// completed (singles and the cross-shard commits it coordinated, committed or failed)
     /// of the nanoseconds from the client's submit to the reply, plus, over the cross-shard
@@ -271,6 +277,8 @@ impl Default for ShardMetrics {
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
             sync_busy_nanos: AtomicU64::new(0),
+            memtable_free: Arc::new(AtomicU64::new(0)),
+            memtable_limit: AtomicU64::new(0),
             commit_inflight_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
             cross: CrossShardCounters::default(),
@@ -384,8 +392,13 @@ pub(crate) fn bucket_floor(b: usize) -> u64 {
 /// handle they live on.
 #[derive(Debug)]
 pub(crate) struct Locks {
+    /// Exclusive, or shared for a true read-only open (#1348).
     pub _writer: WriterLock,
-    pub presence: Presence,
+    /// `None` for a true read-only open, which takes no presence (#1348).
+    pub presence: Option<Presence>,
+    /// Whether `_writer` is the writer byte taken shared (a true read-only open, #1348): a
+    /// handover's reopen must ask for the same open (simp724's G1 on #1570).
+    pub shared: bool,
     /// The handle the locks were taken on; a reopen takes its shm region and presence on it.
     pub file: pigeonhole_io::FileRef,
 }
@@ -400,11 +413,15 @@ pub(crate) type CloseState = crate::close_gate::CloseGate<Result<()>, Notifier<R
 #[repr(align(64))]
 pub(crate) struct Padded(pub AtomicU64);
 
-/// What a watermark waiter is: an async commit waiting for its seqno to become visible, or
-/// a shard whose freeze is deferred until the watermark passes its memtable (kicked).
+/// What a watermark waiter is: a commit waiting for its seqno to become visible (its
+/// future's waker, or a blocking wait's thread), a change feed reader waiting for the
+/// frontier (D310), or a shard whose freeze is deferred until the watermark passes its
+/// memtable (kicked). Only commits count as `VisibilityCounts::woken`, as only they count
+/// as `waits`.
 #[derive(Debug)]
 pub(crate) enum Wake {
     Task(Waker),
+    Feed(Waker),
     Shard(u16),
 }
 
@@ -724,8 +741,16 @@ impl Shared {
         self.visibility
             .scanned
             .fetch_add(scanned as u64, Ordering::Relaxed);
-        // A publish that missed the registration is seen here (`watermark_waiters`).
-        self.shm.visible_seqno() >= seqno
+        // A publish that missed the registration is seen here (`watermark_waiters`). The
+        // entry is taken back then: left listed, a later publish would wake it, and count
+        // it as `woken`, after this commit moved on (#1581's smoke run: a warmup commit's
+        // wake counted in the measured phase, 20 woken over 19 waits).
+        if self.shm.visible_seqno() >= seqno {
+            self.waiters
+                .forget(crate::watermark_waiters::commit_key(seqno), seqno);
+            return true;
+        }
+        false
     }
 
     /// Whether visibility can no longer advance: the close finished, or a shard died (its
@@ -744,13 +769,14 @@ impl Shared {
         // pigeonhole, follows a recovery).
         if let Some(feed) = &self.feed {
             feed.wake_hold_waiters();
+            feed.wake_catalog_waiters();
         }
     }
 
     /// Runs a watermark waiter's wake.
     fn wake(&self, w: Wake) {
         match w {
-            Wake::Task(w) => w.wake(),
+            Wake::Task(w) | Wake::Feed(w) => w.wake(),
             Wake::Shard(s) => {
                 let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
             }
@@ -1044,8 +1070,12 @@ impl Shared {
         } else {
             let locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
             match &*locks {
-                Some(locks) => locks.presence.try_become_last()?,
-                None => false,
+                Some(Locks {
+                    presence: Some(presence),
+                    ..
+                }) => presence.try_become_last()?,
+                // No presence (a true read-only open, #1348): no region to remove.
+                _ => false,
             }
         };
         if self.no_writes {
@@ -1198,6 +1228,17 @@ impl Drop for MaintenanceGuard<'_> {
 }
 
 /// Removes every WAL stream file of `path` (after a clean close checkpointed them all).
+/// Removes the files beside the database at `path` that belong to its current contents: the
+/// WAL streams and the change feed's sidecar (#1436: a replica's re-bootstrap removes the old
+/// copy's before its new file is renamed in, under the locks). The directory is synced.
+pub fn remove_side_files(vfs: &VfsRef, path: &std::path::Path) -> Result<()> {
+    let sidecar = crate::feed::sidecar_path(path);
+    if vfs.exists(&sidecar)? {
+        vfs.remove(&sidecar)?;
+    }
+    remove_wal_files(vfs, path)
+}
+
 pub(crate) fn remove_wal_files(vfs: &VfsRef, path: &std::path::Path) -> Result<()> {
     for stream in pigeonhole_wal::discover_streams(vfs, path)? {
         vfs.remove(&pigeonhole_wal::stream_path(path, stream))?;
@@ -1222,8 +1263,40 @@ pub(crate) enum Reply {
     /// A single-row commit that returns its incremented counters (D314): `Commit`'s reply,
     /// plus the cells to fold after its apply. Boxed: rare, and `Reply` rides every member.
     Returning(Box<Returning>),
+    /// A `check_and_mutate` that returns the row's state either way (D314 amendment 2,
+    /// #1446): `Check`'s reply, plus the slot the shard fills before it, at the check when the
+    /// condition fails or after the apply when it holds. Boxed, as `Returning` is.
+    CheckReturning(Box<CheckReturning>),
     /// Internal (2PC records): nothing to notify directly.
     None,
+}
+
+/// A returning check's reply (D314 amendment 2): `Check`'s notifier and the slot.
+#[derive(Debug)]
+pub(crate) struct CheckReturning {
+    pub notifier: Notifier<Result<(bool, Option<CommitInfo>)>>,
+    pub out: CheckSlot,
+}
+
+/// Where a returning check's values go (D314 amendment 2). Its own type, so a returning
+/// commit's [`ReturnState`] and [`PreviousState`] stay as small as before it (#1566: their
+/// extra fields cost `commit-put-previous` on x86).
+pub(crate) type CheckSlot = Arc<Mutex<CheckState>>;
+
+/// A returning check's request and results (D314 amendment 2).
+#[derive(Debug, Default)]
+pub(crate) struct CheckState {
+    /// Each counter cell an applied check incremented, as [`ReturnState::cells`].
+    pub cells: Option<Vec<crate::engine::Returned>>,
+    /// The columns whose values just before an applied check to read.
+    pub previous_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `previous_of`, in its order, when the check applied.
+    pub previous: Vec<crate::engine::Previous>,
+    /// The columns to report as they are: the condition's own column first. As of the
+    /// commit when the check applies, or as the condition saw them when it fails.
+    pub current_of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `current_of`, in its order.
+    pub current: Vec<crate::engine::Previous>,
 }
 
 /// A returning commit's reply (D314): `Commit`'s notifier, and the slot the shard fills with
@@ -1235,9 +1308,30 @@ pub(crate) struct Returning {
     pub out: ReturnSlot,
 }
 
-/// Where a returning commit's values go: each counter cell it incremented, in the order
-/// the batch first incremented it (D314).
-pub(crate) type ReturnSlot = Arc<Mutex<Option<Vec<crate::engine::Returned>>>>;
+/// Where a returning commit's values go (D314): the committer's request, and what the
+/// shard leaves for it after the commit's apply.
+pub(crate) type ReturnSlot = Arc<Mutex<ReturnState>>;
+
+/// A returning commit's request and results (D314).
+#[derive(Debug, Default)]
+pub(crate) struct ReturnState {
+    /// Each counter cell the commit incremented, in the order the batch first wrote it;
+    /// `None` until the shard folds them.
+    pub cells: Option<Vec<crate::engine::Returned>>,
+    /// The commit's request for previous values (D314 amendment 1), boxed so a commit that
+    /// makes none carries one null pointer (#1517).
+    pub previous: Option<Box<PreviousState>>,
+}
+
+/// A returning commit's request for previous values, and the shard's answer.
+#[derive(Debug)]
+pub(crate) struct PreviousState {
+    /// The columns of the commit's row whose values just before the commit to read: the
+    /// committer's, taken by the shard.
+    pub of: Vec<(FamilyId, Vec<u8>)>,
+    /// Each column of `of`, in its order, as it was just before the commit.
+    pub values: Vec<crate::engine::Previous>,
+}
 
 /// One counter cell a returning commit incremented, as the shard reads it from the batch.
 #[derive(Debug)]
@@ -1292,6 +1386,7 @@ impl Reply {
                 .notifier
                 .notify(outcome.map(|info| Settled::new(info, batch))),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
+            Reply::CheckReturning(r) => r.notifier.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
     }
@@ -1856,6 +1951,17 @@ impl Member {
     /// Whether the member needs a conditional check against the applied state.
     fn conditional(&self) -> bool {
         self.predicate.is_some() || self.validate.is_some()
+    }
+}
+
+/// The column a predicate tests.
+fn predicate_column(predicate: &Predicate) -> (FamilyId, &[u8]) {
+    match predicate {
+        Predicate::Exists { family, qualifier }
+        | Predicate::Absent { family, qualifier }
+        | Predicate::Value {
+            family, qualifier, ..
+        } => (*family, qualifier.as_slice()),
     }
 }
 
@@ -3577,6 +3683,14 @@ impl ShardState {
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
         let shards = shared.shards;
         let cross = shards > 1;
+        // The arena keeps the shard's metrics' free bytes current itself, only as chunks
+        // are taken and given back (D316 A2): nothing per commit or per batch.
+        let mut arena = ShardArena::new(region, chunk_size);
+        let metrics = &shared.metrics[usize::from(id.0)];
+        metrics
+            .memtable_limit
+            .store(arena.region().len() as u64, Ordering::Relaxed);
+        arena.set_free_sink(Arc::clone(&metrics.memtable_free));
         let shard = Self {
             cross,
             id,
@@ -3588,7 +3702,7 @@ impl ShardState {
             cross_durable_at_close: false,
             stream_end: Lsn::default(),
             stream_durable_at_close: false,
-            arena: ShardArena::new(region, chunk_size),
+            arena,
             chunk_size,
             memtables: BTreeMap::new(),
             retired: Vec::new(),
@@ -5787,6 +5901,96 @@ impl ShardState {
         })
     }
 
+    /// A returning check that applied (D314 amendment 2): its counters folded, its previous
+    /// values at the seqno below it, and its reported columns as of the commit (at its seqno,
+    /// with TTL at its timestamp), all under one lock of the slot. The row is the check's,
+    /// so a check that writes nothing still reads it.
+    #[cold]
+    #[inline(never)]
+    fn fill_applied_check(
+        &mut self,
+        slot: &CheckSlot,
+        bytes: &Bytes,
+        table: TableId,
+        row: &[u8],
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) {
+        let mut out = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        out.cells = Some(self.fold_returning(bytes, seqno, commit_ts));
+        let of = std::mem::take(&mut out.previous_of);
+        out.previous = self.column_values(table, row, of, seqno.saturating_sub(1), commit_ts);
+        let of = std::mem::take(&mut out.current_of);
+        out.current = self.column_values(table, row, of, seqno, commit_ts);
+    }
+
+    /// Each of `columns` of `row`, its newest visible version at `seqno` with TTL judged at
+    /// `now`.
+    fn column_values(
+        &self,
+        table: TableId,
+        row: &[u8],
+        columns: Vec<(FamilyId, Vec<u8>)>,
+        seqno: Seqno,
+        now: Timestamp,
+    ) -> Vec<crate::engine::Previous> {
+        columns
+            .into_iter()
+            .map(|(family, qualifier)| crate::engine::Previous {
+                value: self.read_before::<true>(table, family, row, &qualifier, seqno, now),
+                family,
+                qualifier,
+            })
+            .collect()
+    }
+
+    /// [`evaluate`](Self::evaluate) for a returning check (D314 amendment 2): the condition's
+    /// column read once, as a cell, both matched and reported (simp724's S2 on #1446), so a
+    /// blob, a counter's fold or a TTL can't make them disagree. When the condition fails,
+    /// the slot gets every reported column as the check saw it, read with the same view and
+    /// the same `now`, before the reply (the second place the slot is filled, S3).
+    #[cold]
+    #[inline(never)]
+    fn check_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        out: &CheckSlot,
+    ) -> Result<bool> {
+        let (family, qualifier) = predicate_column(predicate);
+        let now = self.shared.vfs.now_micros();
+        let cell = self.read_before::<true>(table, family, row, qualifier, u64::MAX, now)?;
+        let holds = match predicate {
+            Predicate::Exists { .. } => cell.is_some(),
+            Predicate::Absent { .. } => cell.is_none(),
+            Predicate::Value { predicate, .. } => cell
+                .as_ref()
+                .is_some_and(|c| crate::read::predicate_matches(predicate, c.stored())),
+        };
+        if holds {
+            return Ok(true);
+        }
+        let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+        let of = std::mem::take(&mut out.current_of);
+        out.current = of
+            .into_iter()
+            .map(|(f, q)| {
+                let value = if f == family && q == qualifier {
+                    Ok(cell.clone())
+                } else {
+                    self.read_before::<true>(table, f, row, &q, u64::MAX, now)
+                };
+                crate::engine::Previous {
+                    family: f,
+                    qualifier: q,
+                    value,
+                }
+            })
+            .collect();
+        Ok(false)
+    }
+
     /// Whether a write above `snapshot` on this shard could change what `read` read
     /// (optimistic validation): for a family read, any entry of `(table, row, family)`; for a
     /// cell read, `cell_conflicts`. Reads of rows other shards own are theirs to check.
@@ -6410,6 +6614,132 @@ impl ShardState {
         decode_i64(&stored)
             .map(Some)
             .ok_or_else(|| Error::Corruption("a counter cell is not an i64".into()))
+    }
+
+    /// D314 amendment 1: each column of `previous_of` (of the commit's one row) as it was
+    /// just before the commit at `seqno`: its newest visible version at `seqno - 1`, with a
+    /// TTL judged at the commit's own timestamp. Every seqno below `seqno` that writes the
+    /// row has been applied here (the returning member waited for undecided shares on its
+    /// row), so concurrent swaps of one cell each see the one before. A point read through
+    /// the view, as [`read_cell`](Self::read_cell): with explicit timestamps an older source
+    /// can hold a newer version than the active memtable, so there is no memtable walk.
+    #[cold]
+    #[inline(never)]
+    fn previous_values(
+        &self,
+        bytes: &Bytes,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        seqno: Seqno,
+        commit_ts: Timestamp,
+    ) -> Vec<crate::engine::Previous> {
+        let row = bytes
+            .batch()
+            .ok()
+            .and_then(|b| b.iter().flatten().next().map(|m| (m.table, m.row.to_vec())));
+        previous_of
+            .into_iter()
+            .map(|(family, qualifier)| {
+                let value = match &row {
+                    Some((table, row)) => self.read_before::<false>(
+                        *table,
+                        family,
+                        row,
+                        &qualifier,
+                        seqno.saturating_sub(1),
+                        commit_ts,
+                    ),
+                    None => Ok(None),
+                };
+                crate::engine::Previous {
+                    family,
+                    qualifier,
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    /// The newest visible version of one column at `seqno`, with the family's TTL judged at
+    /// `now`, as a get at that snapshot returns it (a separated value read out).
+    ///
+    /// `COLD` changes nothing in the read: it makes the returning check's callers
+    /// (`::<true>`) their own instance, closures included, so `previous_values` (`::<false>`)
+    /// stays its only caller, as before #1566. Shared by three callers, LTO outlined it and
+    /// the generic `FlushedRoots::read` it calls, which cost `commit-put-previous` on x86
+    /// (the zero-cost-by-type pattern of #1284).
+    fn read_before<const COLD: bool>(
+        &self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+        seqno: Seqno,
+        now: Timestamp,
+    ) -> Result<Option<crate::read::CellData>> {
+        let (view, mems) = self.shared.flushed_roots.read(|flushed| {
+            let view = self.shared.view.load_full();
+            let mems = view
+                .tablets()
+                .route(table, row)
+                .and_then(|(tablet, _)| self.memtables.get(&(tablet, family)))
+                .map(|slot| slot.readers(self.id, flushed))
+                .unwrap_or_default();
+            (view, mems)
+        });
+        let Some((tablet, _)) = view.tablets().route(table, row) else {
+            return Ok(None);
+        };
+        let Some(meta) = view.catalog.family(family) else {
+            return Ok(None);
+        };
+        let mut resolver = crate::read::take_scan_resolver();
+        let filled = self.point_sources_into(
+            &view,
+            &mems,
+            tablet,
+            family,
+            row,
+            qualifier,
+            resolver.cursor_mut().sources_mut(),
+        );
+        if filled.is_err() || resolver.cursor_mut().sources().is_empty() {
+            crate::read::give_back(resolver);
+            return filled.map(|()| None);
+        }
+        let mut opts = ResolveOptions::new(seqno, now);
+        opts.ttl_micros = meta.options.ttl_micros;
+        opts.versions = 1;
+        opts.merge = meta.merge_op.clone();
+        opts.counter = meta.options.kind.is_aggregate();
+        let mut col = Vec::with_capacity(row.len() + qualifier.len() + 24);
+        encode_row_prefix(&mut col, row)?;
+        encode_key_after_row(&mut col, qualifier, 0, 0, Kind::Put)?;
+        col.truncate(col.len() - SUFFIX_LEN);
+        let blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
+        resolver.cursor_mut().reset();
+        resolver.reset(opts);
+        let found = (|| -> Result<Option<(Timestamp, Vec<u8>)>> {
+            resolver.seek_column(row, qualifier)?;
+            let next = resolver.next_cell();
+            let Some(cell) = next.map_err(|e| crate::read::read_error(e, meta))? else {
+                return Ok(None);
+            };
+            if !cell.key.starts_with(&col) || cell.key.len() != col.len() + SUFFIX_LEN {
+                return Ok(None);
+            }
+            Ok(Some((cell.ts, cell.value.to_vec())))
+        })();
+        crate::read::give_back(resolver);
+        let found = found?;
+        crate::read::ResolverBlobs::check(blobs.as_ref())?;
+        let Some((ts, value)) = found else {
+            return Ok(None);
+        };
+        let stored = match view.ssts.read_blob(&value)? {
+            Some(v) => v.to_vec(),
+            None => value,
+        };
+        Ok(Some(crate::read::CellData::from_stored(ts, stored)))
     }
 
     /// The fold of `c` at `seqno` from the active memtable alone, and the operands it folded:
@@ -7177,15 +7507,23 @@ impl ShardState {
                 continue;
             }
             if let Some((table, row, predicate)) = m.predicate.as_deref() {
-                match self.evaluate(*table, row, predicate) {
+                let evaluated = match &m.reply {
+                    Reply::CheckReturning(r) => {
+                        self.check_returning(*table, row, predicate, &r.out)
+                    }
+                    _ => self.evaluate(*table, row, predicate),
+                };
+                match evaluated {
                     Ok(true) => {}
                     Ok(false) => {
                         if m.share_wait != 0 {
                             // Writes nothing: the shares chained behind it go on (D267).
                             self.end_single_wait(m.share_wait, ctx);
                         }
-                        if let Reply::Check(n) = m.reply {
-                            n.notify(Ok((false, None)));
+                        match m.reply {
+                            Reply::Check(n) => n.notify(Ok((false, None))),
+                            Reply::CheckReturning(r) => r.notifier.notify(Ok((false, None))),
+                            _ => {}
                         }
                         continue;
                     }
@@ -7613,8 +7951,27 @@ impl ShardState {
                     if applied.is_ok()
                         && let Reply::Returning(r) = &m.reply
                     {
-                        let values = self.fold_returning(&m.bytes, m.seqno, m.commit_ts);
-                        *r.out.lock().unwrap_or_else(PoisonError::into_inner) = Some(values);
+                        // One lock scope (simp724's N1 on #1517): the committer locks the
+                        // slot only at its reply, so holding it across the reads contends
+                        // with nothing.
+                        let mut out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
+                        out.cells = Some(self.fold_returning(&m.bytes, m.seqno, m.commit_ts));
+                        if let Some(p) = out.previous.as_deref_mut() {
+                            let of = std::mem::take(&mut p.of);
+                            p.values = self.previous_values(&m.bytes, of, m.seqno, m.commit_ts);
+                        }
+                    } else if applied.is_ok()
+                        && let Reply::CheckReturning(r) = &m.reply
+                        && let Some((table, row, _)) = m.predicate.as_deref()
+                    {
+                        self.fill_applied_check(
+                            &r.out,
+                            &m.bytes,
+                            *table,
+                            row,
+                            m.seqno,
+                            m.commit_ts,
+                        );
                     }
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
@@ -8512,14 +8869,18 @@ impl ShardState {
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
             if !same && self.touched.contains_key(&h) {
-                let (family, qualifier) = match predicate {
-                    Predicate::Exists { family, qualifier }
-                    | Predicate::Absent { family, qualifier }
-                    | Predicate::Value {
-                        family, qualifier, ..
-                    } => (*family, qualifier.as_slice()),
-                };
+                let (family, qualifier) = predicate_column(predicate);
                 same = writes_cell(admitted.iter(), *table, row, family, qualifier);
+                // A returning check reports its columns as the condition saw them, so they
+                // count as read: an earlier member's write to one waits it for the next
+                // group, or it would report a state the row never had (simp724's S1 on #1446).
+                if !same && let Reply::CheckReturning(r) = &m.reply {
+                    let out = r.out.lock().unwrap_or_else(PoisonError::into_inner);
+                    same = out
+                        .current_of
+                        .iter()
+                        .any(|(f, q)| writes_cell(admitted.iter(), *table, row, *f, q));
+                }
             }
         }
         same

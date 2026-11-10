@@ -23,3 +23,40 @@ None: additive. The Python and Ruby bindings expose it (#1440, cli692):
 - **Python:** `Mutation.commit_returning() -> Incremented` (`seqno`; `value(family, qualifier, *, ts=None) -> int | None`; indexing with `(family, qualifier)` or `(family, qualifier, ts)`, `KeyError` for a cell the commit didn't write; iteration over the keys `(family, qualifier, ts)`; `cells()`), and `Table.incr_returning(row, family, qualifier, delta, *, ts=None, durability=None) -> int | None`.
 - **Ruby:** `Mutation#commit_returning -> Incremented`, frozen (`seqno`; `value(family, qualifier, ts: nil) -> Integer?`; `to_h -> {[family, qualifier, ts] => value}`; `size`), and `Table#incr_returning(row, family, qualifier, delta, ts: nil, durability: nil) -> Integer?`, with the GVL released.
 - **Both:** a read that failed after the commit applied raises `ReturnedValueError` (`pigeonhole.ReturnedValueError`, `Pigeonhole::ReturnedValueError`, subclasses of the base error), from `incr_returning` and when that value is read (`value`, indexing, `cells()`, `to_h`). It carries the commit's `seqno`, and the read's error as its `code`, `code_num` and cause: the commit succeeded, so a caller doesn't retry it. A failed commit keeps its usual exception (perf2's S1 on #1473). Neither binding has an async form, as neither has async commits.
+
+## Amendment 1: get-and-set (#1445, D314 amendment 1)
+**Status:** Approved (the coordinator, 2026-11-04: an amendment, no new number; reviewed by simp724 and cli692 on #1445).
+
+- **pigeonhole** (semver, additive):
+  - `RowMutation::return_previous(self, family, qualifier) -> Self` asks `commit_returning` for that column as it was just before the commit. A mutation that writes nothing is refused with `InvalidArgument`, as are `commit`, `commit_if` and their async forms on a mutation with requests. Repeats are one request.
+  - `Returned::previous(&self, family, qualifier) -> Result<Option<Cell>>` returns the column's newest visible version before the commit, as an owned `Cell`. `Err` is a read that failed after the commit applied, and `InvalidArgument` names a column that wasn't asked for.
+  - The result struct is renamed `Returned`, and `pub type Incremented = Returned;` keeps 1.1.0 code compiling, not deprecated. `commit_returning` and `ReturningFuture::Output` name `Returned`.
+  - **Later, if asked for:** `return_previous_at` / `previous_at` for one timestamp (a bucket). Today `previous` is the column's newest version (cli692's N3).
+- **pigeonhole-engine** (internal, additive):
+  - `Engine::commit_returning_previous(batch, durability, previous_of: Vec<(FamilyId, Vec<u8>)>) -> Result<(CommitInfo, Vec<Returned>, Vec<Previous>)>`.
+  - `Engine::submit_returning_previous(..) -> Result<PendingReturning>`, plus `PendingReturning::take_previous(&mut self) -> Vec<Previous>` once it resolves.
+  - `Previous` (`#[non_exhaustive]`: `family`, `qualifier`, `value: Result<Option<CellData>>`).
+- **Bindings** (cli692's PR 2): Python `Returned = Incremented` and Ruby `Pigeonhole::Returned = Pigeonhole::Incremented`, keeping the classes' identity. A failed previous-value read raises `ReturnedValueError`, as a counter's does.
+  - Python: `Mutation.return_previous(family, qualifier) -> Mutation`, and `Incremented.previous(family, qualifier) -> Cell | None` (`InvalidArgument` for a column not asked for). `commit_returning_async()` takes the requests too.
+  - Ruby: `Mutation#return_previous(family, qualifier) -> self`, and `Incremented#previous(family, qualifier) -> Cell?`, with the same errors.
+  - Both refuse `commit` and `commit_if` on a mutation with requests, as the Rust API does.
+
+## Amendment 2: compare-and-set-then-read (#1446, D314 amendment 2)
+
+**Status:** Approved (the owner signed off the design on 2026-11-05).
+
+- **pigeonhole** (semver, additive):
+  - `RowMutation::commit_if_returning(self, &Condition) -> Result<Checked>`, and `commit_if_returning_async` (the `async` feature, `nonblocking::CheckReturningFuture`);
+  - `RowMutation::return_current(self, family, qualifier) -> Self`;
+  - `#[must_use] enum Checked { Applied(Returned), NotApplied(Seen) }` with `is_applied()`;
+  - `#[non_exhaustive] struct Seen` with `current(family, qualifier) -> Result<Option<Cell>>`. It has no seqno: the shard's applied state at the check can miss a cross-shard share whose seqno was allocated earlier but hadn't arrived, so no snapshot seqno is known to read the same columns. Being `#[non_exhaustive]`, it can gain one later with a guarantee that holds;
+  - `Returned::current(family, qualifier) -> Result<Option<Cell>>`.
+  
+  `return_current` is refused (`InvalidArgument`) by every commit except `commit_if_returning`.
+  A mutation that writes nothing is a check-and-read, as with plain `commit_if`: `Applied` (an empty commit) with the columns as they are when the condition holds, `NotApplied` when it fails. `return_previous`'s columns are reported only when it applies; when it doesn't, nothing changed, so their values are read through `return_current` and `Seen::current`.
+- **pigeonhole-engine** (additive):
+  - `Engine::check_and_mutate_returning`, `submit_check_and_mutate_returning` and `submit_check_and_mutate_returning_async`;
+  - `PendingCheckReturning`;
+  - `CheckReturned { applied, info, cells, previous, current }`.
+
+**Callers changed:** none; additive. The Python and Ruby bindings follow in cli692's PR 2.

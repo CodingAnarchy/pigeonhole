@@ -532,7 +532,8 @@ pub(crate) struct CompactionWork {
     shard: ShardId,
     pub task: CompactionTask,
     job: Option<CompactionJob>,
-    /// The view the inputs were taken from: pins their extents while the job reads them.
+    /// The SSTs of the view the inputs were taken from (`View::ssts_only`): pins their
+    /// extents while the job reads them, and no memtable (#1477).
     view: Arc<View>,
     /// A `Drop`'s blob live-byte changes: the pointers its SSTs held (read before submit).
     drop_delta: Vec<(BlobFileId, i64)>,
@@ -624,6 +625,9 @@ impl CompactionWork {
         } else {
             None
         };
+        // Only the inputs' extents need pinning while the job runs: keep an SST view, never
+        // the memtables the full view lists (#1477).
+        let view = view.ssts_only(&shared.live_views);
         Ok(Self {
             shared,
             shard,

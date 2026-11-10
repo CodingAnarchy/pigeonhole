@@ -98,6 +98,9 @@ mod metrics;
 mod options;
 mod read;
 mod recovery;
+#[cfg(feature = "__unstable-replication")]
+#[doc(hidden)]
+pub mod replication;
 mod retry;
 mod set;
 mod table;
@@ -171,12 +174,15 @@ pub use check::{
 pub use db::RootCommitHold;
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
-pub use feed::{Change, ChangeKind, Commit, Feed, FeedBuilder, FeedToken};
+pub use feed::{
+    CatalogChange, CatalogEdit, Change, ChangeKind, Commit, Feed, FeedBuilder, FeedEvent,
+    FeedPosition, FeedProgress, FeedToken,
+};
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
     TableInfo,
 };
-pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
+pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics, LatencyHistogram};
 pub use options::{
     Aggregation, BloomParams, Compaction, CpuProfile, Family, FeedRetention, HistogramParams,
     IoBackend, IoRings, Options, Priority, QuantileParams, ReaderOptions, Recovery, days,
@@ -194,7 +200,8 @@ pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
 pub use write::{
-    CommitInfo, CommitTicket, Durability, Incremented, RowMutation, Transaction, WriteBatch,
+    Checked, CommitInfo, CommitTicket, Durability, Incremented, Returned, RowMutation, Seen,
+    Transaction, WriteBatch,
 };
 
 pub use merge::{MergeError, MergeOperator};

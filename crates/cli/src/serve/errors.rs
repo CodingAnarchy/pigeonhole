@@ -57,8 +57,14 @@ impl ApiError {
     /// is fixed there (simp724's E1): everything else on a write is outcome-unknown, so not
     /// retry-safe.
     pub(crate) fn from_engine(e: &pigeonhole::Error) -> Self {
+        Self::from_code(e.code(), e.message())
+    }
+
+    /// An error with `code` and `message`, mapped as [`from_engine`](Self::from_engine) maps
+    /// an engine error: for the companion crates' errors, which carry a code of the same
+    /// table (`pigeonhole_vector::Error::code`).
+    pub(crate) fn from_code(code: ErrorCode, message: &str) -> Self {
         use tonic::Code as G;
-        let code = e.code();
         let (grpc, http, retry) = match code {
             ErrorCode::Conflict => (G::Aborted, StatusCode::CONFLICT, RetryFrom::Begin),
             ErrorCode::Busy => (
@@ -135,11 +141,22 @@ impl ApiError {
             ),
         };
         let mut err =
-            Self::new(&format!("{code:?}"), code as u32, e.message(), grpc, http).retry(retry);
+            Self::new(&format!("{code:?}"), code as u32, message, grpc, http).retry(retry);
         if code == ErrorCode::Busy {
             err = err.after(RETRY_AFTER_MS);
         }
         err
+    }
+
+    /// The same error for a read: a read that failed with `Io` wrote nothing and may pass
+    /// on a second try, so it may be sent again (simp724 on #1501). Writes keep "maybe
+    /// applied". `MergeFailed` stays no-retry for a read too: a merge operator failing on
+    /// stored data fails the same way again (simp724 on #1510).
+    pub(crate) fn for_read(mut self) -> Self {
+        if self.retry_from == RetryFrom::Unspecified && self.code == "Io" {
+            self.retry_from = RetryFrom::Request;
+        }
+        self
     }
 
     // ---- Server codes (ICR 0112's table, below the engine's) ----
@@ -174,9 +191,62 @@ impl ApiError {
         )
     }
 
+    /// A call this server's state refuses (a replica's write, `Promote` on a primary): as
+    /// the engine's `ReadOnly`, it changed nothing and fails the same way again.
+    pub(crate) fn failed_precondition(message: impl Into<String>) -> Self {
+        Self::new(
+            "FailedPrecondition",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// A read with `x-pigeonhole-min-primary-seqno` that the replica couldn't serve in time
+    /// (#1577): nothing was read, so it may be sent again (to this replica, or the primary).
+    pub(crate) fn replica_behind(message: impl Into<String>) -> Self {
+        Self::new(
+            "ReplicaBehind",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
+    /// A write to a replica server (#1436): the engine's `ReadOnly`, naming the primary
+    /// that takes the writes.
+    pub(crate) fn replica_read_only(primary: &str) -> Self {
+        Self::new(
+            "ReadOnly",
+            ErrorCode::ReadOnly as u32,
+            format!("this server is a replica of {primary}: send writes to the primary"),
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     pub(crate) fn overloaded(message: impl Into<String>) -> Self {
         Self::new(
             "Overloaded",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
+    /// A service the server depends on failed or can't be reached (today the embedding
+    /// endpoint, `--embed-url`): nothing was applied, and the request may be sent again
+    /// (ICR 0112's `Unavailable`, #1617).
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            "Unavailable",
             0,
             message,
             tonic::Code::Unavailable,
@@ -196,19 +266,89 @@ impl ApiError {
         )
     }
 
-    /// The request's deadline passed before anything was submitted. Ticket 3b honours a
-    /// client's own deadline (`grpc-timeout`); 3a bounds waits on the limits with
-    /// `Overloaded` (R3).
-    #[allow(dead_code)]
+    /// The client's own deadline (`grpc-timeout`) passed while the request waited for the
+    /// server's limits, before anything was submitted.
     pub(crate) fn deadline_exceeded() -> Self {
+        Self::deadline("the request waited past its deadline for the server's limits")
+    }
+
+    /// `DeadlineExceeded` with its own message: a scan whose client stopped reading for
+    /// `--stream-idle-ms` (perf287's G2 on #1510), resumable from its last page's `next`.
+    pub(crate) fn deadline(message: impl Into<String>) -> Self {
         Self::new(
             "DeadlineExceeded",
             0,
-            "the request waited past its deadline for the server's limits",
+            message,
             tonic::Code::DeadlineExceeded,
             StatusCode::GATEWAY_TIMEOUT,
         )
         .retry(RetryFrom::Request)
+    }
+
+    /// A second call on a transaction while one is running, or any call while its `Commit`
+    /// runs (D313 B2): this call did nothing, so it may be sent again once the first answers.
+    pub(crate) fn session_busy() -> Self {
+        Self::new(
+            "SessionBusy",
+            0,
+            "another call on this transaction is running; send this one when it answers",
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+        .retry(RetryFrom::Request)
+    }
+
+    /// The transaction's lease ran out before any `Commit` arrived (D313 B1): nothing was
+    /// written, so the client starts again from `Begin`.
+    pub(crate) fn transaction_expired() -> Self {
+        Self::new(
+            "TransactionExpired",
+            0,
+            "the transaction expired before any Commit; begin a new one",
+            tonic::Code::Aborted,
+            StatusCode::CONFLICT,
+        )
+        .retry(RetryFrom::Begin)
+    }
+
+    /// A call other than `Commit` on a transaction that has received `Commit`: the session
+    /// is its tombstone (D313 B1), and `Commit` answers the recorded outcome, which this
+    /// error's message names too. Not retry-safe: whatever the call wanted is past.
+    pub(crate) fn transaction_finished(outcome: &Result<pigeonhole::CommitInfo, Self>) -> Self {
+        let what = match outcome {
+            Ok(c) => format!("committed at seqno {}", c.seqno),
+            Err(e) => format!("its Commit failed with {}", e.code),
+        };
+        Self::new(
+            "TransactionFinished",
+            0,
+            format!("the transaction has received Commit ({what}); Commit answers its outcome"),
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// Something this server doesn't do as configured (a backup to disk without
+    /// `--backup-dir`): the engine's `Unsupported` code, not applied, no retry.
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(
+            "Unsupported",
+            ErrorCode::Unsupported as u32,
+            message,
+            tonic::Code::Unimplemented,
+            StatusCode::NOT_IMPLEMENTED,
+        )
+    }
+
+    /// A commit whose outcome the server couldn't learn (its task ended without one).
+    pub(crate) fn outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new(
+            "OutcomeUnknown",
+            ErrorCode::OutcomeUnknown as u32,
+            message,
+            tonic::Code::Unknown,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
     }
 
     /// A malformed request: missing a required field, or a value out of range.
@@ -219,16 +359,6 @@ impl ApiError {
             message,
             tonic::Code::InvalidArgument,
             StatusCode::BAD_REQUEST,
-        )
-    }
-
-    pub(crate) fn unimplemented(what: &str) -> Self {
-        Self::new(
-            "Unsupported",
-            ErrorCode::Unsupported as u32,
-            format!("{what} isn't served by this build yet"),
-            tonic::Code::Unimplemented,
-            StatusCode::NOT_IMPLEMENTED,
         )
     }
 
@@ -290,6 +420,29 @@ impl ApiError {
 impl From<pigeonhole::Error> for ApiError {
     fn from(e: pigeonhole::Error) -> Self {
         Self::from_engine(&e)
+    }
+}
+
+/// The vector index's errors keep their code: an engine error as the engine's, the crate's
+/// own (`InvalidArgument`, `Conflict`, `Corruption`) under the same table.
+impl From<pigeonhole_vector::Error> for ApiError {
+    fn from(e: pigeonhole_vector::Error) -> Self {
+        match e {
+            pigeonhole_vector::Error::Db(e) => Self::from_engine(&e),
+            e => Self::from_code(e.code(), &e.to_string()),
+        }
+    }
+}
+
+/// The text index's errors keep their code too: an engine error as the engine's, the crate's
+/// own (`InvalidArgument` for a bad query, `Busy` during a repair, `Corruption`) under the
+/// same table.
+impl From<pigeonhole_text::Error> for ApiError {
+    fn from(e: pigeonhole_text::Error) -> Self {
+        match e {
+            pigeonhole_text::Error::Db(e) => Self::from_engine(&e),
+            e => Self::from_code(e.code(), &e.to_string()),
+        }
     }
 }
 
@@ -381,6 +534,36 @@ mod tests {
             ApiError::invalid("x").code_num,
             ErrorCode::InvalidArgument as u32
         );
+    }
+
+    #[test]
+    fn a_read_that_failed_on_io_may_be_sent_again() {
+        let io = || {
+            ApiError::new(
+                "Io",
+                ErrorCode::Io as u32,
+                "x",
+                tonic::Code::Unavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            )
+        };
+        // A write that failed on Io may have applied; the same failure on a read changed
+        // nothing (ICR 0112).
+        assert_eq!(io().retry_from, RetryFrom::Unspecified);
+        assert_eq!(io().for_read().retry_from, RetryFrom::Request);
+        // Other codes keep their rule; MergeFailed fails the same way again, read or write.
+        assert_eq!(
+            ApiError::invalid("x").for_read().retry_from,
+            RetryFrom::Unspecified
+        );
+        let merge = ApiError::new(
+            "MergeFailed",
+            ErrorCode::MergeFailed as u32,
+            "x",
+            tonic::Code::Internal,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(merge.for_read().retry_from, RetryFrom::Unspecified);
     }
 
     #[test]

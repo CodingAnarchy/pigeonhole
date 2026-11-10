@@ -105,6 +105,19 @@ pub struct CommitInfo {
     pub durability: Durability,
 }
 
+/// One durability level's commit latency histogram ([`Metrics::commit_latency_buckets`]):
+/// commits per half-power-of-two bucket, bucket `b` starting at
+/// [`Engine::commit_latency_floor(b)`](Engine::commit_latency_floor) nanoseconds. A newtype
+/// because the standard library has no `Default` for arrays this long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyBuckets(pub [u64; 64]);
+
+impl Default for LatencyBuckets {
+    fn default() -> Self {
+        Self([0; 64])
+    }
+}
+
 /// Counters and latencies.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -113,6 +126,10 @@ pub struct Metrics {
     pub commits: [u64; 4],
     /// Commit latency in nanoseconds (p50, p99, p99.9) per durability level.
     pub commit_latency_nanos: [[u64; 3]; 4],
+    /// The commit latency histograms those percentiles come from, per durability level,
+    /// summed over shards since open: [`Engine::commit_latency_buckets`]'s buckets, read in
+    /// the same pass (ICR 0115).
+    pub commit_latency_buckets: [LatencyBuckets; 4],
     /// Flushes completed.
     pub flushes: u64,
     /// Compactions completed.
@@ -154,6 +171,11 @@ pub struct Metrics {
     /// warning that the cache is too small for the open SSTs' metadata (D215). Counted at
     /// most once until the pinned bytes fall below 40% of the capacity again.
     pub block_cache_pinned_warnings: u64,
+    /// Eviction passes in the block cache and the row cache that stopped early, leaving a
+    /// shard over capacity until its next insert, because one insert would have freed more
+    /// than a stack buffer holds (#1559 A: what an insert takes out is freed after the shard's
+    /// lock). A statistic for benchmarks.
+    pub cache_deferred_evictions: (u64, u64),
     /// Passes that flushed slots pinning a WAL checkpoint (a shard's own, past
     /// `EngineOptions::wal_pin_bytes`, or at another shard's request), and the memtables
     /// they froze below the size threshold (#137). Flushes per pass is the cost of the
@@ -187,6 +209,17 @@ pub struct Metrics {
     /// Its rise over an interval, divided by the interval, is how many shards' worth of
     /// work the store did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
+    /// Bytes of the shards' memtable arenas taken by memtables, in whole chunks, as of the
+    /// arenas' last chunk taken or given back, summed over shards (D316 A2, ICR 0116).
+    pub memtable_bytes: u64,
+    /// The shards' memtable arenas' size, summed over shards (D316 A2).
+    pub memtable_limit: u64,
+    /// Group syncs' in-flight time, summed over shards (D248's `sync_busy_nanos`): each
+    /// sync in flight adds its own time, so over the group syncs finished it's the mean sync
+    /// time even with several in flight. Group syncs only, those of groups with a
+    /// `GroupSync` member: a `Sync` commit's own sync isn't in it. Published at each group
+    /// sync's start and finish (D316 A3, ICR 0116).
+    pub group_sync_nanos: u64,
     /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
     /// compactions, summed over shards (D256). Its rise over an interval, divided by the
     /// interval, is how many threads' worth of pool work the store did; zero with the pool
@@ -460,6 +493,18 @@ pub(crate) struct Inner {
     /// Refuses writes, catalog changes and maintenance with `ReadOnly`: a reader process, or
     /// a writer opened read-only by `read_only_fallback` (ICR 0059), which writes nothing.
     read_only: bool,
+    /// Whether this database is a replica (D315 PR 3; simp724's R6): its state table exists.
+    /// Then only a primary's changes apply (logged batches, `apply_catalog`); local writes
+    /// and catalog changes are refused with `ReadOnly`, since they'd take the ids the
+    /// primary assigns next, or silently diverge the mirror. Set at open, and by the first
+    /// apply; promotion to a primary (a later change) clears it.
+    replica: AtomicBool,
+    /// Set by `promote` (#1436, ICR 0125; simp724's P1), under the manifest exclusion, in the
+    /// catalog change that drops the state table: one way, it refuses every apply, state
+    /// store and `begin_replication` after it, so an apply racing the promote can't bring the
+    /// table, the bit or the gate back. In memory only: after a reopen the missing table
+    /// refuses them ("not a replica").
+    promoted: Arc<AtomicBool>,
     options: EngineOptions,
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
@@ -926,14 +971,35 @@ impl Engine {
         //    comes first (#147): it only reads (`fstatfs`), and on a network filesystem
         //    without lock support taking the lock fails with a bare I/O error instead.
         //    A handover (D265) brings the handle with both locks held: nothing to take.
+        //    A true read-only open (#1348, ICR 0109 amendment) opens the handle read-only
+        //    and takes the writer byte shared: it works on read-only media, read-only opens
+        //    run beside one another, and a writer can't start under one, nor one under a
+        //    running writer.
         let (file, writer_lock) = match held.as_ref() {
+            // The handover's lock must be the one this open takes: a shared one for a
+            // read-only open, an exclusive one otherwise (simp724's G1 on #1570).
+            Some(locks) if locks.shared != options.read_only => {
+                return Err(Error::InvalidArgument(format!(
+                    "a handover holds the writer lock {}, but the open is {}",
+                    if locks.shared { "shared" } else { "exclusive" },
+                    if options.read_only {
+                        "read-only"
+                    } else {
+                        "writable"
+                    },
+                )));
+            }
             Some(locks) => (locks.file.clone(), None),
             None => {
                 let mut open_opts = OpenOptions::read();
-                open_opts.write = true;
+                open_opts.write = !options.read_only;
                 let file = vfs.open(path, open_opts)?;
                 check_local(&file, options.allow_fuse)?;
-                let writer_lock = WriterLock::acquire(&file)?;
+                let writer_lock = if options.read_only {
+                    WriterLock::acquire_shared(&file)?
+                } else {
+                    WriterLock::acquire(&file)?
+                };
                 (file, Some(writer_lock))
             }
         };
@@ -980,6 +1046,12 @@ impl Engine {
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
+        // And its checksum: a trailing RootIntent of the last session is decided by both
+        // (D315 amendment, #1504).
+        let opened_root = crate::feed::OpenedRoot {
+            sequence: opened_at,
+            checksum: opened.checksum(),
+        };
         // The clean flag is informational only: WAL replay is never skipped (decision D57).
         let _clean = opened.clean_shutdown();
         let (mut catalog, manifest_extents) =
@@ -1036,13 +1108,21 @@ impl Engine {
         let feed = if no_writes {
             None
         } else {
-            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_at)?
+            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_root)?
         };
         if let Some(f) = &feed {
             let weak = Arc::downgrade(f);
             pager.on_root_commit(Box::new(move |sequence| {
                 if let Some(f) = weak.upgrade() {
                     f.note_root(sequence);
+                }
+            }));
+            // Before each root commit writes: its intent, so a process crash between the
+            // superblock and its Root entry is told from a gap (D315 amendment, #1504).
+            let weak = Arc::downgrade(f);
+            pager.on_root_intent(Box::new(move |sequence, checksum| {
+                if let Some(f) = weak.upgrade() {
+                    f.note_intent(sequence, checksum);
                 }
             }));
             // Root commits of this open before the observer: only `finish`'s upgrade of an
@@ -1071,15 +1151,28 @@ impl Engine {
         // so: readers cache only then (D281; a raise on every commit cost the cache-off
         // commit shapes 1.5%).
         shm_config.row_epochs_maintained = options.row_cache_bytes > 0;
-        let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
+        // A true read-only open (#1348) serves only its own process: its arenas and words go
+        // in a private region with the same layout, and no region is created for readers.
+        let shm = if options.read_only {
+            ShmRegion::in_memory(db_id, &shm_config)
+        } else {
+            ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?
+        };
         // A new generation, so new zero slots: reader processes re-attach, which clears their
         // caches (D281; every writer open, a recovery's and a handover's too, builds one).
         let row_epochs = Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs()));
         if held.is_none() {
-            let presence = Presence::acquire(&file)?;
+            // No presence for a true read-only open: there's no region to clean up, and it
+            // mustn't count as another process with the database open.
+            let presence = if options.read_only {
+                None
+            } else {
+                Some(Presence::acquire(&file)?)
+            };
             *held = Some(Locks {
                 _writer: writer_lock.expect("taken at step 1 when there is no handover"),
                 presence,
+                shared: options.read_only,
                 file: file.clone(),
             });
         }
@@ -1542,6 +1635,19 @@ impl Engine {
             s.finish_replay();
         }
         if !no_writes {
+            // A promoted replica whose open came between its state table's drop and its bit's
+            // clearing (a crash): clear the bit now. Writer opens only, and never fatal
+            // (simp724 on #1436, ICR 0125).
+            let repaired = shared
+                .manifest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear_stale_replica_bit(&catalog, true);
+            if let Err(e) = repaired {
+                crate::shard::trace!("the stale replica bit's repair failed ({e}); next open");
+            }
+        }
+        if !no_writes {
             // Blob files a horizon held when the last session ended (no live bytes): held
             // again, against this session's heads, which is later than needed but never
             // earlier (D310).
@@ -1635,6 +1741,12 @@ impl Engine {
                 .collect(),
             role: Role::Writer,
             read_only,
+            replica: AtomicBool::new(
+                catalog
+                    .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                    .is_some(),
+            ),
+            promoted: Arc::new(AtomicBool::new(false)),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1766,6 +1878,8 @@ impl Engine {
             shared,
             role: Role::Reader,
             read_only: true,
+            replica: AtomicBool::new(false),
+            promoted: Arc::new(AtomicBool::new(false)),
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1816,6 +1930,7 @@ impl Engine {
         name: &str,
         families: &[(String, FamilyOptions)],
     ) -> Result<Arc<TableInfo>> {
+        self.inner.refuse_on_replica()?;
         self.inner.create_table(name, families)
     }
 
@@ -1826,28 +1941,32 @@ impl Engine {
         name: &str,
         options: FamilyOptions,
     ) -> Result<Arc<TableInfo>> {
+        self.inner.refuse_on_replica()?;
         self.inner.add_family(table, name, options)
     }
 
-    /// Looks up a table by name.
+    /// Looks up a table by name. A replica's state table (D315 PR 3) isn't found.
     pub fn table(&self, name: &str) -> Option<Arc<TableInfo>> {
         if self.inner.forked() {
             return None;
         }
         // In a writer, looked up under the view's guard: a row read checks its table's entry
         // on every call, and cloning the catalog's `Arc` was a reference count every reader
-        // thread wrote (#709).
-        if !self.inner.is_reader() {
-            return self
-                .inner
+        // thread wrote (#709). The state table is told by its id after the lookup, not by
+        // its name's prefix before it: an id compare is all a hit pays (a prefix check cost
+        // `wide-row-pages` 1.3%).
+        let found = if self.inner.is_reader() {
+            self.inner.catalog().table_by_name(name).cloned()
+        } else {
+            self.inner
                 .shared
                 .view
                 .load()
                 .catalog
                 .table_by_name(name)
-                .cloned();
-        }
-        self.inner.catalog().table_by_name(name).cloned()
+                .cloned()
+        };
+        found.filter(|t| !is_reserved_table(t.id))
     }
 
     /// The table with id `id` (ICR 0092): [`Engine::table`] by id, for a handle that knows
@@ -1864,17 +1983,172 @@ impl Engine {
         self.inner.catalog().table(id).cloned()
     }
 
-    /// Every table.
+    /// Every table, but a replica's state table (D315 PR 3).
     pub fn tables(&self) -> Vec<Arc<TableInfo>> {
         if self.inner.forked() {
             return Vec::new();
         }
-        self.inner.catalog().tables().cloned().collect()
+        self.inner
+            .catalog()
+            .tables()
+            .filter(|t| !is_reserved_table(t.id))
+            .cloned()
+            .collect()
     }
 
-    /// Drops a table and all its data.
+    /// Drops a table and all its data. A replica's state table (D315 PR 3) is refused.
     pub fn drop_table(&self, table: TableId) -> Result<()> {
+        if is_reserved_table(table) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be dropped".to_owned(),
+            ));
+        }
+        self.inner.refuse_on_replica()?;
         self.inner.drop_table(table)
+    }
+
+    /// Applies one catalog change a primary's feed delivered (D315 PR 3), **with the
+    /// primary's ids**, so a replica's tables and families keep them: a table created with
+    /// its families, a family added, or a table dropped, as the change's `edits` hold them. A
+    /// created table gets a tablet of this database's own. The counters are raised past
+    /// every id applied, so this database never allocates one of them itself.
+    ///
+    /// Refused (`InvalidArgument`) when an id or name is already in use, a family's table is
+    /// missing, an id is reserved, or the edits mix a drop with anything else (a primary's
+    /// catalog change is one create, one family added, or one drop).
+    pub fn apply_catalog(&self, edits: &[pigeonhole_format::manifest::Edit]) -> Result<()> {
+        self.inner.apply_catalog(edits)
+    }
+
+    /// Commits a run of a primary's changes (D315 PR 3): `batch` holds them as logged
+    /// ([`WriteBatch::push_logged`]), and `state` (the primary's feed token and position after
+    /// them) goes in the replica's state cell in the same commit, so the two are durable
+    /// together or not at all. One atomic `GroupSync` commit, cross-shard if it has to be.
+    ///
+    /// The first apply creates the reserved state table ([`REPLICA_TABLE`]), which flags
+    /// the file `ro_compat` bit 0 (builds that don't know it open it read-only). The
+    /// timestamp floor is raised to `max_ts`, the largest timestamp applied, so a later
+    /// default timestamp here sorts after every replicated one.
+    ///
+    /// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
+    pub fn apply_replicated(
+        &self,
+        mut batch: WriteBatch,
+        state: &[u8],
+        max_ts: Timestamp,
+    ) -> Result<CommitInfo> {
+        if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a replicated run is a non-empty batch of logged mutations".to_owned(),
+            ));
+        }
+        self.push_replication_state(&mut batch, state)?;
+        self.inner.shared.clock.seed_ts(max_ts);
+        self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// The most bytes of logged changes one replicated commit should carry (D315 PR 3;
+    /// simp724's S1): a quarter of one shard's share of the memtable budget, at least 64 KiB,
+    /// so a large catch-up run splits into commits a shard's arena takes without stalling.
+    pub fn max_replicated_part_bytes(&self) -> usize {
+        let share = self.inner.options.memtable_budget / self.inner.shared.shards.max(1) as u64;
+        usize::try_from(share / 4)
+            .unwrap_or(usize::MAX)
+            .max(64 << 10)
+    }
+
+    /// Commits only the replica's state cell (D315 PR 3): after an applied catalog change,
+    /// whose own commit is the manifest's.
+    pub fn store_replication_state(&self, state: &[u8]) -> Result<CommitInfo> {
+        let mut batch = WriteBatch::new();
+        self.push_replication_state(&mut batch, state)?;
+        self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// Makes this database a replica (#1436, ICR 0125): creates the reserved state table
+    /// (flagging the file `ro_compat` bit 0, and refusing local writes from here, R6) and
+    /// stores `state` in it. `own_tables`: whether the database may already hold tables, as a
+    /// bootstrap copy of the primary does; the from-nothing first apply passes `false`, and a
+    /// table of the database's own then refuses it. Refused on a replica, and after `promote`.
+    pub fn begin_replication(&self, state: &[u8], own_tables: bool) -> Result<CommitInfo> {
+        self.inner.refuse_promoted()?;
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_some()
+        {
+            return Err(Error::InvalidArgument(
+                "already a replica: it has replication state".to_owned(),
+            ));
+        }
+        self.inner.ensure_replica_table(own_tables)?;
+        self.store_replication_state(state)
+    }
+
+    /// Turns a replica into a primary (#1436, ICR 0125) at what it applied last: drops the
+    /// state table and sets the one-way promoted state in one catalog change (an apply
+    /// racing it fails), then a second commit clears `ro_compat` bit 0 once the drop is
+    /// durable (FORMAT §8.2), then lifts R6's refusal. If that second commit fails (or a crash
+    /// comes between them), the database is a primary already, its bit stale: reopen to
+    /// finish, since a writable open clears it (`clear_stale_replica_bit`). `InvalidArgument`
+    /// unless it is a replica.
+    pub fn promote(&self) -> Result<()> {
+        self.inner.promote()
+    }
+
+    /// The replica's state cell, as the last apply stored it; `None` before the first.
+    pub fn replication_state(&self) -> Result<Option<Vec<u8>>> {
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let cell = self.get_latest(
+            pigeonhole_format::manifest::REPLICA_TABLE,
+            pigeonhole_format::manifest::REPLICA_FAMILY,
+            REPLICA_STATE_ROW,
+            REPLICA_STATE_QUALIFIER,
+        )?;
+        Ok(cell.map(|c| c.stored().get(1..).unwrap_or_default().to_vec()))
+    }
+
+    /// Appends the state cell to `batch`. Only `begin_replication` creates the state table
+    /// (simp724's P1 on #1436): an apply on a database that isn't a replica, or was promoted,
+    /// is refused.
+    fn push_replication_state(&self, batch: &mut WriteBatch, state: &[u8]) -> Result<()> {
+        self.inner.refuse_promoted()?;
+        if self
+            .inner
+            .catalog()
+            .table(pigeonhole_format::manifest::REPLICA_TABLE)
+            .is_none()
+        {
+            return Err(Error::InvalidArgument(
+                "not a replica: no replication state (begin_replication starts one)".to_owned(),
+            ));
+        }
+        let mut stored = Vec::with_capacity(1 + state.len());
+        stored.push(pigeonhole_format::value::ValueTag::Bytes as u8);
+        stored.extend_from_slice(state);
+        batch.push_logged(
+            pigeonhole_format::manifest::REPLICA_TABLE,
+            pigeonhole_format::manifest::REPLICA_FAMILY,
+            Kind::Put,
+            REPLICA_STATE_ROW,
+            REPLICA_STATE_QUALIFIER,
+            REPLICA_STATE_TS,
+            &stored,
+        )
+    }
+
+    /// The highest seqno a new snapshot may include now: every commit at or below it is
+    /// applied on every shard (D316 A4, ICR 0116). One Acquire load per shard plus two.
+    pub fn visible_seqno(&self) -> Seqno {
+        self.inner.shared.shm.visible_seqno()
     }
 
     // ---- writes ----
@@ -1990,7 +2264,79 @@ impl Engine {
             } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
             Routed::Held(p) => inner.send(p)?.wait(),
         }?;
-        Ok((info, returned(&out)))
+        Ok((info, returned_cells(&out)))
+    }
+
+    /// [`commit_returning`](Self::commit_returning), also returning each column of
+    /// `previous_of` (of `batch`'s one row) as it was just before this commit (D314
+    /// amendment 1): its newest visible version at the seqno below the commit's, with a TTL
+    /// judged at the commit's timestamp, in `previous_of`'s order. Concurrent commits that
+    /// write one cell and ask for its previous value each get the one before (a swap
+    /// chain). Each column costs a point read on the row's shard. `batch` must write its
+    /// row when `previous_of` is not empty, and each family must be in the row's table.
+    pub fn commit_returning_previous(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<(CommitInfo, Vec<Returned>, Vec<Previous>)> {
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        let out = self.previous_slot(&batch, previous_of)?;
+        let inner = &self.inner;
+        let info = match inner.route_and_send_with(
+            batch,
+            durability,
+            None,
+            None,
+            Some(Arc::clone(&out)),
+            NoAdmission,
+        )? {
+            Routed::Sent {
+                mut waiter, spins, ..
+            } => crate::write::wait_blocking(&inner.shared, &mut waiter, spins),
+            Routed::Held(p) => inner.send(p)?.wait(),
+        }?;
+        Ok((info, returned_cells(&out), taken_previous(&out)))
+    }
+
+    /// The slot a returning commit asking for `previous_of` gives its shard, once `batch`
+    /// is checked to touch one row whose table holds each requested family. Without a
+    /// request it is a plain returning commit's slot: the request is boxed, so commits that
+    /// make none pay nothing for it (#1517).
+    fn previous_slot(
+        &self,
+        batch: &WriteBatch,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<crate::shard::ReturnSlot> {
+        one_row(batch)?;
+        if previous_of.is_empty() {
+            return Ok(crate::shard::ReturnSlot::default());
+        }
+        let Some(table) = row_table(batch) else {
+            return Err(Error::InvalidArgument(
+                "a commit returning previous values writes its row".to_owned(),
+            ));
+        };
+        let view = self.inner.shared.view.load();
+        for (family, _) in &previous_of {
+            if view
+                .catalog
+                .family(*family)
+                .is_none_or(|f| f.table != table)
+            {
+                return Err(Error::FamilyNotFound(format!(
+                    "family {} is not in table {}",
+                    family.0, table.0
+                )));
+            }
+        }
+        Ok(Arc::new(Mutex::new(crate::shard::ReturnState {
+            cells: None,
+            previous: Some(Box::new(crate::shard::PreviousState {
+                of: previous_of,
+                values: Vec::new(),
+            })),
+        })))
     }
 
     /// [`commit_returning`](Self::commit_returning) without waiting, as
@@ -2004,7 +2350,30 @@ impl Engine {
         one_row(&batch)?;
         let out = crate::shard::ReturnSlot::default();
         let pending = self.submit_async_with(batch, durability, Some(Arc::clone(&out)))?;
-        Ok(PendingReturning { pending, out })
+        Ok(PendingReturning {
+            pending,
+            out,
+            asked: false,
+        })
+    }
+
+    /// [`commit_returning_previous`](Self::commit_returning_previous) without waiting, as
+    /// [`submit_returning`](Self::submit_returning) submits: once the [`PendingReturning`]
+    /// resolves, [`PendingReturning::take_previous`] hands over the previous values.
+    pub fn submit_returning_previous(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingReturning> {
+        let asked = !previous_of.is_empty();
+        let out = self.previous_slot(&batch, previous_of)?;
+        let pending = self.submit_async_with(batch, durability, Some(Arc::clone(&out)))?;
+        Ok(PendingReturning {
+            pending,
+            out,
+            asked,
+        })
     }
 
     /// Applies `batch` (which must touch only `row`) if `predicate` holds, atomically on the
@@ -2038,6 +2407,134 @@ impl Engine {
     ) -> Result<PendingCheck> {
         self.inner
             .submit_check_and_mutate(table, row, predicate, batch, durability)
+    }
+
+    /// [`check_and_mutate`](Engine::check_and_mutate) that returns the row's state either
+    /// way (D314 amendment 2, #1446): when the condition holds, the batch's incremented
+    /// counters (as [`commit_returning`](Self::commit_returning)), each of `previous_of` as
+    /// it was just before the commit, and each of `current_of` as of the commit; when it
+    /// fails, each of `current_of` as the condition saw it (the applied state). The
+    /// condition's own column is always reported, first.
+    /// Every family must be in `table`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_and_mutate_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<CheckReturned> {
+        self.inner
+            .shared
+            .refuse_blocking_on_driver("check_and_mutate")?;
+        self.submit_check_and_mutate_returning(
+            table,
+            row,
+            predicate,
+            batch,
+            durability,
+            previous_of,
+            current_of,
+        )?
+        .wait()
+    }
+
+    /// [`check_and_mutate_returning`](Self::check_and_mutate_returning) without waiting, as
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) submits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_check_and_mutate_returning(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingCheckReturning> {
+        let out = self.check_slot(table, predicate, previous_of, current_of)?;
+        let reply = check_reply(&out);
+        let pending = self
+            .inner
+            .submit_check_with(table, row, predicate, batch, durability, reply)?;
+        Ok(PendingCheckReturning { pending, out })
+    }
+
+    /// [`submit_check_and_mutate_returning`](Self::submit_check_and_mutate_returning) for an
+    /// async check, admitted as
+    /// [`submit_check_and_mutate_async`](Self::submit_check_and_mutate_async) is (D210).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_check_and_mutate_returning_async(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<PendingCheckReturning> {
+        let out = self.check_slot(table, predicate, previous_of, current_of)?;
+        let mut charge = match self.inner.fast_admit(Some((table, row)), &batch) {
+            FastAdmit::Wait(admit) => {
+                let inner = Arc::clone(&self.inner);
+                let (row, predicate) = (row.to_vec(), predicate.clone());
+                let slot = Arc::clone(&out);
+                let pending = PendingCheck::waiting(
+                    self.inner.shard_ref(ShardId(admit.shard() as u16)),
+                    admit,
+                    Box::new(move || {
+                        let reply = check_reply(&slot);
+                        inner.submit_check_with(table, &row, &predicate, batch, durability, reply)
+                    }),
+                );
+                return Ok(PendingCheckReturning { pending, out });
+            }
+            FastAdmit::Charged(charge) => charge,
+        };
+        let reply = check_reply(&out);
+        let pending = self
+            .inner
+            .submit_check_with(table, row, predicate, batch, durability, reply)?;
+        charge.attach(&pending.waiter);
+        Ok(PendingCheckReturning { pending, out })
+    }
+
+    /// A returning check's slot: its `previous_of` request, and its `current_of` with the
+    /// condition's own column first (deduped), once every family is checked to be `table`'s.
+    fn check_slot(
+        &self,
+        table: TableId,
+        predicate: &Predicate,
+        previous_of: Vec<(FamilyId, Vec<u8>)>,
+        mut current_of: Vec<(FamilyId, Vec<u8>)>,
+    ) -> Result<crate::shard::CheckSlot> {
+        let (family, qualifier) = match predicate {
+            Predicate::Exists { family, qualifier }
+            | Predicate::Absent { family, qualifier }
+            | Predicate::Value {
+                family, qualifier, ..
+            } => (*family, qualifier),
+        };
+        current_of.retain(|(f, q)| (*f, q) != (family, qualifier));
+        current_of.insert(0, (family, qualifier.clone()));
+        let view = self.inner.shared.view.load();
+        for (f, _) in previous_of.iter().chain(&current_of) {
+            if view.catalog.family(*f).is_none_or(|m| m.table != table) {
+                return Err(Error::FamilyNotFound(format!(
+                    "family {} is not in table {}",
+                    f.0, table.0
+                )));
+            }
+        }
+        Ok(Arc::new(Mutex::new(crate::shard::CheckState {
+            previous_of,
+            current_of,
+            ..Default::default()
+        })))
     }
 
     /// [`submit`](Self::submit) for an async commit (D210): submitted at once while the
@@ -2732,6 +3229,15 @@ impl Engine {
             .value
             .take()
             .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
+        // The read's column limit counts only the columns that pass the predicate (the
+        // resolver counts a column when its newest version passes), so it leaves the read
+        // with the predicate, and the search counts the passing columns itself (simp724's A1
+        // on #1286).
+        let column_limit = if filter.is_some() {
+            std::mem::take(&mut read.columns_per_row)
+        } else {
+            0
+        };
         Ok(match &spec.input {
             crate::ReadInput::Ranges(ranges) => {
                 let [(lo, hi)] = ranges.as_slice() else {
@@ -2742,7 +3248,7 @@ impl Engine {
                 let mut scan = ScanSpec::new(lo.clone(), hi.clone());
                 scan.read = read;
                 let cursor = self.scan_async(snapshot, table, scan)?;
-                read::knn::PendingNearest::scan(cursor, query, k, filter)
+                read::knn::PendingNearest::scan(cursor, query, k, filter, column_limit)
             }
             crate::ReadInput::Keys(keys) => {
                 let cursor = crate::KeyCursor::over(
@@ -2754,9 +3260,85 @@ impl Engine {
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
-                read::knn::PendingNearest::keys(cursor, Arc::clone(keys), query, k, filter)
+                read::knn::PendingNearest::keys(
+                    cursor,
+                    Arc::clone(keys),
+                    query,
+                    k,
+                    filter,
+                    column_limit,
+                )
             }
         })
+    }
+
+    /// [`reduce_into`](Self::reduce_into) as a future that never blocks on a block it can
+    /// fetch (#1286, ICR 0122): `visitor` and `reducer` driven over one range or a key set on
+    /// the polling task, as [`nearest_async`](Self::nearest_async) drives its search, in one
+    /// pass in cell order (no fan-out: D296 rev 1.2 makes that the merged result). It
+    /// resolves to the reducer, unfinished (a byte budget's
+    /// [`into_page`](crate::ByteBudget::into_page)). A poll yields after
+    /// [`REDUCE_POLL_CELLS`](crate::REDUCE_POLL_CELLS) cells or
+    /// [`REDUCE_POLL_BYTES`](crate::REDUCE_POLL_BYTES) value bytes; the read's value
+    /// predicate is tested by the read itself, so its misses count, and the column limit with
+    /// it. A row's cells past its first block that miss the cache, and separated values, are
+    /// read synchronously (counted in `async_sync_reads`).
+    pub fn reduce_async<V, R>(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: &crate::ReduceSpec,
+        visitor: V,
+        reducer: R,
+    ) -> Result<crate::PendingReduce<V, R>>
+    where
+        V: CellVisitor<Item = R::Item>,
+        R: Reducer,
+    {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
+        read::reduce::refuse_excluded_resume(spec)?;
+        // The predicate is tested in the driver, so its misses count toward a poll's bound
+        // (#1237's rule), and the column limit leaves the read with it: the resolver counts
+        // only the columns that pass (simp724's A1 on #1286).
+        let mut read = spec.read.clone();
+        let predicate = read
+            .value
+            .take()
+            .map(|p| (p, std::mem::take(&mut read.columns_per_row)));
+        let parts = read::reduce_async::Read {
+            visitor,
+            reducer,
+            families: families.iter().copied().collect(),
+            predicate,
+            table,
+            resume: spec.resume.clone(),
+        };
+        match &spec.input {
+            crate::ReadInput::Ranges(ranges) => {
+                let [(lo, hi)] = ranges.as_slice() else {
+                    return Err(Error::InvalidArgument(
+                        "an async bounded read reads one range".into(),
+                    ));
+                };
+                let mut scan = ScanSpec::new(lo.clone(), hi.clone());
+                scan.read = read;
+                let cursor = self.scan_async(snapshot, table, scan)?;
+                crate::PendingReduce::scan(cursor, parts)
+            }
+            crate::ReadInput::Keys(keys) => {
+                let cursor = crate::KeyCursor::over(
+                    snapshot.clone(),
+                    table,
+                    families.into_vec(),
+                    read,
+                    self.inner.shared.vfs.now_micros(),
+                    Arc::clone(keys),
+                    Arc::clone(&self.inner.shared),
+                )?;
+                crate::PendingReduce::keys(cursor, Arc::clone(keys), parts)
+            }
+        }
     }
 
     /// [`Engine::scan`] for an async scan: its rows are polled with
@@ -2770,6 +3352,18 @@ impl Engine {
         Ok(self
             .scan(snapshot, table, spec)?
             .into_async(Arc::clone(&self.inner.shared)))
+    }
+
+    /// `cursor` as an async scan ([`Engine::scan_async`]) from where it stands: a sync scan
+    /// already on a row can read that row's cells with [`ScanCursor::poll_next_cell`] (a
+    /// lending walk that starts sync and goes on async, #1560). An async cursor is returned
+    /// as it is.
+    pub fn async_scan_from(&self, cursor: ScanCursor) -> ScanCursor {
+        if cursor.is_async() {
+            cursor
+        } else {
+            cursor.into_async(Arc::clone(&self.inner.shared))
+        }
     }
 
     // ---- maintenance ----
@@ -2825,6 +3419,14 @@ impl Engine {
     /// `Sync` one survives a power loss here; a `Buffered` or `None` one may not).
     pub fn backup_durable(&self, dest: &Path) -> Result<()> {
         self.backup_of(dest, true)
+    }
+
+    /// As [`Engine::backup`], of `snapshot` (#1436, ICR 0125): the copy holds exactly what the
+    /// snapshot sees, so a feed opened `from_snapshot` on the same snapshot starts where the
+    /// copy ends (a replica's bootstrap).
+    pub fn backup_at(&self, snapshot: &Snapshot, dest: &Path) -> Result<()> {
+        let _guard = self.inner.enter_maintenance()?;
+        crate::maintenance::backup(&self.inner.shared, snapshot.clone(), dest)
     }
 
     fn backup_of(&self, dest: &Path, durable: bool) -> Result<()> {
@@ -3208,6 +3810,7 @@ impl Engine {
                     *h += s.latency[d][b].load(Ordering::Relaxed);
                 }
             }
+            m.commit_latency_buckets[d] = LatencyBuckets(hist);
             let total: u64 = hist.iter().sum();
             if total > 0 {
                 for (i, q) in [0.5, 0.99, 0.999].into_iter().enumerate() {
@@ -3224,6 +3827,10 @@ impl Engine {
             }
         }
         for s in &shared.metrics {
+            let limit = s.memtable_limit.load(Ordering::Relaxed);
+            m.memtable_limit += limit;
+            m.memtable_bytes += limit.saturating_sub(s.memtable_free.load(Ordering::Relaxed));
+            m.group_sync_nanos += s.sync_busy_nanos.load(Ordering::Relaxed);
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
@@ -3264,6 +3871,13 @@ impl Engine {
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
         m.block_cache_pinned_warnings = shared.cache.pinned_warnings();
+        m.cache_deferred_evictions = (
+            shared.cache.deferred_evictions(),
+            shared
+                .row_cache
+                .as_ref()
+                .map_or(0, crate::row_cache::RowCaches::deferred_evictions),
+        );
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
         if self.inner.reader.is_none() {
             let (active, total) = shared.shm.reader_slot_usage();
@@ -3366,6 +3980,31 @@ impl Engine {
     /// next open replays and rebuilds. Engine-owned writers only: an application-owned
     /// engine's close cannot wait, and a reader holds no writer lock. For `pigeonhole`'s
     /// automatic recovery (#620); not a stable API.
+    /// Releases `held`, a handover this engine's [`close_for_reopen`](Self::close_for_reopen)
+    /// gave, once nothing will reopen its file (#1436: a replica's re-bootstrap renamed a new
+    /// copy over the path, simp724's A3 on #1583). It runs the last-one-out cleanup the
+    /// handover skipped: if no reader process is still attached, the old file's shm region
+    /// goes. A reader that is attached removes it at its own close. The old file's WAL files
+    /// are the caller's (`remove_side_files` before the rename).
+    #[doc(hidden)]
+    pub fn retire(&self, mut held: Handover) -> Result<()> {
+        let Some(locks) = held.locks.take() else {
+            return Ok(());
+        };
+        let last = match &locks.presence {
+            Some(presence) if pigeonhole_io::sys::process_id() == self.inner.opened_in => {
+                presence.try_become_last()?
+            }
+            _ => false,
+        };
+        if last {
+            let shared = &self.inner.shared;
+            ShmRegion::remove(&shared.vfs, shared.identity, shared.shm_dir.as_deref())?;
+        }
+        drop(locks);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
         if let Err(e) = self.inner.check_process() {
@@ -3458,6 +4097,45 @@ pub struct Handover {
     /// `open_with`'s error, which clippy keeps small.
     locks: Option<Box<Locks>>,
     path: PathBuf,
+}
+
+impl Handover {
+    /// The locks of the file at `side`, for an [`Engine::open_with`] of `target` once `side`
+    /// has been renamed over it (#1436: a replica's re-bootstrap, simp724's sequence). Opens
+    /// `side` and takes its writer byte and presence on that handle, so the inode that becomes
+    /// `target` is locked from before the rename until the new engine holds it; a second
+    /// writer is refused throughout. Fails with `WriterLocked` if another holds `side`.
+    ///
+    /// `side` must have been closed cleanly (simp724's A1 on #1583): its WAL streams are named
+    /// after `side`, so once it's renamed nothing would replay them, and a commit only they
+    /// held (a replica's state, written just before) would be lost without a word. A side
+    /// file whose last writer didn't close cleanly is refused (`InvalidArgument`); reopen
+    /// and close it first. A side file that was only ever created clean (a backup) passes.
+    pub fn adopt(vfs: &VfsRef, side: &Path, target: &Path, allow_fuse: bool) -> Result<Handover> {
+        let mut open_opts = OpenOptions::read();
+        open_opts.write = true;
+        let file = vfs.open(side, open_opts)?;
+        check_local(&file, allow_fuse)?;
+        let writer = WriterLock::acquire(&file)?;
+        let presence = Presence::acquire(&file)?;
+        // Under the writer byte: no writer can open `side` and clear the flag after this.
+        if !Pager::open(vfs, side, false)?.clean_shutdown() {
+            return Err(Error::InvalidArgument(format!(
+                "{} wasn't closed cleanly: its WAL would be left behind by the replace; \
+                 open and close it first",
+                side.display()
+            )));
+        }
+        Ok(Handover {
+            locks: Some(Box::new(Locks {
+                _writer: writer,
+                presence: Some(presence),
+                shared: false,
+                file,
+            })),
+            path: target.to_path_buf(),
+        })
+    }
 }
 
 /// Closes as [`Engine::close`] does (an application-owned engine's drop cannot wait). It
@@ -4152,6 +4830,12 @@ impl Inner {
         if name.is_empty() {
             return Err(Error::InvalidArgument("empty table name".to_owned()));
         }
+        if is_reserved_name(name) {
+            return Err(Error::InvalidArgument(format!(
+                "table names starting with {} are reserved",
+                pigeonhole_format::manifest::RESERVED_PREFIX
+            )));
+        }
         let mut seen = HashSet::new();
         for (fname, options) in families {
             if fname.is_empty() {
@@ -4165,6 +4849,14 @@ impl Inner {
         let name_owned = name.to_owned();
         let families = families.to_vec();
         let view = self.catalog_change(move |catalog| {
+            // Again under the manifest's exclusion (simp724's note (a) on #1562): a create
+            // racing a replica's first apply.
+            if catalog
+                .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                .is_some()
+            {
+                return Err(replica_refusal());
+            }
             if catalog.table_by_name(&name_owned).is_some() {
                 return Err(Error::TableExists(name_owned.clone()));
             }
@@ -4197,6 +4889,224 @@ impl Inner {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Creates a replica's reserved state table if it isn't there (D315 PR 3): its one family
+    /// keeps one version, and its one tablet is reserved too. `flag_features` sets
+    /// `ro_compat` bit 0 before the commit that creates it.
+    fn ensure_replica_table(&self, own_tables: bool) -> Result<()> {
+        use pigeonhole_format::manifest::{
+            REPLICA_FAMILY, REPLICA_FAMILY_NAME, REPLICA_TABLE, REPLICA_TABLE_NAME, REPLICA_TABLET,
+        };
+        if self.catalog().table(REPLICA_TABLE).is_some() {
+            return Ok(());
+        }
+        // Before the table exists, so no local write gets in after it.
+        self.replica.store(true, Ordering::Relaxed);
+        let mut options = FamilyOptions::default();
+        options.max_versions = 1;
+        let created = self.catalog_change(move |catalog| {
+            if catalog.table(REPLICA_TABLE).is_some() {
+                return Ok(Vec::new());
+            }
+            // A table of the database's own made since the first apply's check (a local
+            // create racing it): no replica here (simp724's note (a) on #1562). A bootstrap
+            // copy (`own_tables`) holds the primary's tables.
+            if !own_tables && catalog.tables().any(|t| !is_reserved_table(t.id)) {
+                return Err(Error::InvalidArgument(
+                    "a replica's first apply needs a database with no tables of its own".to_owned(),
+                ));
+            }
+            Ok(vec![
+                Edit::CreateTable {
+                    table: REPLICA_TABLE,
+                    name: REPLICA_TABLE_NAME.to_owned(),
+                },
+                Edit::PutFamily {
+                    table: REPLICA_TABLE,
+                    family: REPLICA_FAMILY,
+                    name: REPLICA_FAMILY_NAME.to_owned(),
+                    options: options.clone(),
+                },
+                Edit::PutTablet {
+                    tablet: REPLICA_TABLET,
+                    table: REPLICA_TABLE,
+                    start: Vec::new(),
+                    end: None,
+                },
+            ])
+        });
+        if created.is_err() && self.catalog().table(REPLICA_TABLE).is_none() {
+            // Refused or failed: not a replica after all.
+            self.replica.store(false, Ordering::Relaxed);
+        }
+        created.map(drop)
+    }
+
+    /// `ReadOnly` once promoted (simp724's P1 on #1436).
+    fn refuse_promoted(&self) -> Result<()> {
+        if self.promoted.load(Ordering::Relaxed) {
+            return Err(Error::InvalidArgument(
+                "promoted: this database is no longer a replica".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn promote(&self) -> Result<()> {
+        use pigeonhole_format::manifest::REPLICA_TABLE;
+        let tablets = self.catalog().tablet_ids_of(REPLICA_TABLE);
+        let promoted = Arc::clone(&self.promoted);
+        self.catalog_change(move |catalog| {
+            if catalog.table(REPLICA_TABLE).is_none() {
+                return Err(Error::InvalidArgument(
+                    "not a replica: nothing to promote".to_owned(),
+                ));
+            }
+            // Under the manifest exclusion, with the drop: an apply after this is refused,
+            // and one committed before it is the drop's to remove.
+            promoted.store(true, Ordering::Relaxed);
+            Ok(vec![Edit::DropTable {
+                table: REPLICA_TABLE,
+            }])
+        })?;
+        self.shared.broadcast(|| ShardMsg::DropTablets {
+            tablets: tablets.clone(),
+        });
+        // A commit after the durable drop: its `flag_features` clears the stale bit.
+        self.catalog_change(|catalog| Ok(vec![catalog.counters_edit()]))?;
+        self.replica.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `ReadOnly` on a replica (simp724's R6).
+    fn refuse_on_replica(&self) -> Result<()> {
+        if self.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
+        }
+        Ok(())
+    }
+
+    fn apply_catalog(&self, edits: &[Edit]) -> Result<()> {
+        self.refuse_promoted()?;
+        let bad =
+            |what: String| Error::InvalidArgument(format!("a replicated catalog change: {what}"));
+        // A drop: as `drop_table` does it (its blob files, the shards' tablets).
+        if let [Edit::DropTable { table }] = edits {
+            if is_reserved_table(*table) {
+                return Err(bad(format!("table id {} is reserved", table.0)));
+            }
+            // Already dropped: a replica's retry after a crash between the change and its
+            // token (D315 PR 3).
+            if self.catalog().table(*table).is_none() {
+                return Ok(());
+            }
+            return self.drop_table(*table);
+        }
+        if edits.is_empty()
+            || edits
+                .iter()
+                .any(|e| !matches!(e, Edit::CreateTable { .. } | Edit::PutFamily { .. }))
+        {
+            return Err(bad(format!(
+                "only one create (with its families), one family added, or one drop: {edits:?}"
+            )));
+        }
+        for e in edits {
+            if let Edit::PutFamily { options, .. } = e {
+                check_merge_operator(options, &self.options.merge_operators)?;
+            }
+        }
+        // Already applied as it stands: a replica's retry after a crash between the change
+        // and its token (D315 PR 3).
+        let catalog = self.catalog();
+        let applied = edits.iter().all(|e| match e {
+            Edit::CreateTable { table, name } => {
+                catalog.table(*table).is_some_and(|t| t.name == *name)
+            }
+            Edit::PutFamily {
+                table,
+                family,
+                name,
+                ..
+            } => catalog
+                .table(*table)
+                .and_then(|t| t.family(name))
+                .is_some_and(|f| f.id == *family),
+            _ => false,
+        });
+        drop(catalog);
+        if applied {
+            return Ok(());
+        }
+        let edits = edits.to_vec();
+        self.catalog_change(move |catalog| {
+            let mut out = Vec::with_capacity(edits.len() + 1);
+            let mut created: Vec<TableId> = Vec::new();
+            let mut families: HashSet<FamilyId> = HashSet::new();
+            for e in &edits {
+                match e {
+                    Edit::CreateTable { table, name } => {
+                        if is_reserved_table(*table) || is_reserved_name(name) {
+                            return Err(bad(format!("table {name} (id {}) is reserved", table.0)));
+                        }
+                        if catalog.table(*table).is_some() || created.contains(table) {
+                            return Err(bad(format!("table id {} is in use", table.0)));
+                        }
+                        if catalog.table_by_name(name).is_some() {
+                            return Err(Error::TableExists(name.clone()));
+                        }
+                        created.push(*table);
+                        catalog.counters.next_table = catalog.counters.next_table.max(table.0 + 1);
+                        out.push(e.clone());
+                    }
+                    Edit::PutFamily {
+                        table,
+                        family,
+                        name,
+                        ..
+                    } => {
+                        if is_reserved_family(*family) {
+                            return Err(bad(format!("family id {} is reserved", family.0)));
+                        }
+                        if catalog.table(*table).is_none() && !created.contains(table) {
+                            return Err(Error::TableNotFound(format!("table {}", table.0)));
+                        }
+                        if catalog.family(*family).is_some() || !families.insert(*family) {
+                            return Err(bad(format!("family id {} is in use", family.0)));
+                        }
+                        if catalog
+                            .table(*table)
+                            .is_some_and(|t| t.family(name).is_some())
+                        {
+                            return Err(Error::FamilyExists(name.clone()));
+                        }
+                        catalog.counters.next_family =
+                            catalog.counters.next_family.max(family.0 + 1);
+                        out.push(e.clone());
+                    }
+                    _ => unreachable!("checked above"),
+                }
+            }
+            // Each created table's own tablet, as `create_table` makes one: tablets are this
+            // database's, never replicated.
+            for table in created {
+                let tablet = catalog.alloc_tablet();
+                out.push(Edit::PutTablet {
+                    tablet,
+                    table,
+                    start: Vec::new(),
+                    end: None,
+                });
+            }
+            debug_assert!(
+                !is_reserved_table(TableId(catalog.counters.next_table))
+                    && !is_reserved_family(FamilyId(catalog.counters.next_family)),
+                "a counter reached a reserved id"
+            );
+            Ok(out)
+        })?;
+        Ok(())
+    }
+
     fn add_family(
         &self,
         table: TableId,
@@ -4209,6 +5119,13 @@ impl Inner {
         check_merge_operator(&options, &self.options.merge_operators)?;
         let name_owned = name.to_owned();
         let view = self.catalog_change(move |catalog| {
+            // As `create_table`: again under the manifest's exclusion.
+            if catalog
+                .table(pigeonhole_format::manifest::REPLICA_TABLE)
+                .is_some()
+            {
+                return Err(replica_refusal());
+            }
             let info = catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))?;
@@ -4270,6 +5187,12 @@ impl Inner {
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
+        if batch.logged() {
+            return route_logged(batch, view);
+        }
+        if self.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
+        }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
             let info = catalog
@@ -4591,6 +5514,21 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingCheck> {
+        self.submit_check_with(table, row, predicate, batch, durability, Reply::Check)
+    }
+
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) with the reply `reply`
+    /// makes of the check's notifier: `Check`, or a returning check's (D314 amendment 2).
+    #[inline(always)]
+    fn submit_check_with(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        reply: impl FnOnce(CheckNotifier) -> Reply,
+    ) -> Result<PendingCheck> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -4633,7 +5571,7 @@ impl Inner {
             .submit(ShardMsg::Commit(CommitReq {
                 bytes: builder,
                 durability,
-                reply: Reply::Check(tx),
+                reply: reply(tx),
                 submitted_at,
                 validate: None,
                 predicate: Some(Box::new((table, row.to_vec(), predicate.clone()))),
@@ -4928,11 +5866,31 @@ impl Inner {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
             // which a writer keeps from before it is present until it is.
             if let Ok(lock) = WriterLock::acquire(&r.file) {
+                // The WAL files are found by path, and the path may name another file now: a
+                // replace (#1436's re-bootstrap, `Pigeonhole::replace_with`) renamed a new copy
+                // over it while this reader held the old one, whose writer byte nobody holds
+                // any more. Those are the running engine's live streams, never this reader's
+                // to remove (simp724's B1 on #1583). Only the region, named by this file's
+                // identity, is ours then.
+                //
+                // No replace can land between this check and the removal below: this runs
+                // only while this reader holds the writer byte on its (old) inode, and a
+                // replace holds that byte, through the running engine and then its handover,
+                // until after the rename. So either the rename came first, and the check sees
+                // the new file, or no engine runs on the old file and no replace is in flight.
+                // A new writer of the path meanwhile gets `WriterLocked` (simp724 on #1583).
+                let still_ours = self
+                    .shared
+                    .vfs
+                    .open(&self.path, OpenOptions::read())
+                    .and_then(|f| f.identity())
+                    .is_ok_and(|id| id == self.shared.identity);
                 // The writer closed cleanly (its streams are checkpointed to their ends): the
                 // WAL files are not needed. After a writer crash they are, so they stay.
-                if Pager::open(&self.shared.vfs, &self.path, false)
-                    .map(|o| o.clean_shutdown())
-                    .unwrap_or(false)
+                if still_ours
+                    && Pager::open(&self.shared.vfs, &self.path, false)
+                        .map(|o| o.clean_shutdown())
+                        .unwrap_or(false)
                 {
                     crate::shard::remove_wal_files(&self.shared.vfs, &self.path)?;
                 }
@@ -5583,6 +6541,74 @@ fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> R
         .or_else(|e| refuse(e.to_string()))
 }
 
+/// A replica refuses local writes and catalog changes (D315 PR 3; simp724's R6).
+#[cold]
+fn replica_refusal() -> Error {
+    Error::ReadOnly
+}
+
+/// A replica's state cell (D315 PR 3): its row and qualifier in [`REPLICA_TABLE`], at one
+/// fixed timestamp in a family that keeps one version, so the newest apply's is the one read.
+///
+/// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
+const REPLICA_STATE_ROW: &[u8] = b"replication";
+/// See [`REPLICA_STATE_ROW`].
+const REPLICA_STATE_QUALIFIER: &[u8] = b"state";
+/// See [`REPLICA_STATE_ROW`].
+const REPLICA_STATE_TS: Timestamp = 1;
+
+/// Routes a replica's batch of a primary's logged mutations (D315 PR 3,
+/// [`WriteBatch::push_logged`]): each family must exist in its table here, with its merge
+/// operator registered for a merge; nothing is converted, prepared or checked as a new write
+/// would be, since the primary did that before it logged them. Out of line: `route` calls it
+/// only for such a batch.
+#[inline(never)]
+fn route_logged(batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
+    let catalog = &view.catalog;
+    let mut shards = Shards::new();
+    for m in batch.batch().iter() {
+        let m = m?;
+        let Some(meta) = catalog.family(m.family) else {
+            return Err(Error::FamilyNotFound(format!("family {}", m.family.0)));
+        };
+        if meta.table != m.table {
+            return Err(Error::FamilyNotFound(format!(
+                "family {} is not in table {}",
+                m.family.0, m.table.0
+            )));
+        }
+        if m.kind == Kind::Merge && meta.merge == MergeKind::Unknown {
+            return Err(Error::UnknownMergeOperator(
+                meta.options.merge_operator.clone(),
+            ));
+        }
+        let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
+            return Err(Error::TableNotFound(format!("table {}", m.table.0)));
+        };
+        if !shards.contains(&shard) {
+            shards.push(shard);
+        }
+    }
+    Ok((batch.builder, shards))
+}
+
+/// The ids reserved for a replica's own state (D315 PR 3; simp724's R1): never allocated (the
+/// counters count up from 1 and never reach them), never applied from a primary.
+pub(crate) fn is_reserved_table(table: TableId) -> bool {
+    table == pigeonhole_format::manifest::REPLICA_TABLE
+}
+
+/// See [`is_reserved_table`].
+fn is_reserved_family(family: FamilyId) -> bool {
+    family == pigeonhole_format::manifest::REPLICA_FAMILY
+}
+
+/// A table name the engine keeps for itself (D315 PR 3): refused at creation, not found by
+/// name.
+fn is_reserved_name(name: &str) -> bool {
+    name.starts_with(pigeonhole_format::manifest::RESERVED_PREFIX)
+}
+
 fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {
     let name = options.merge_operator.as_str();
     if let Some(op) = crate::catalog::aggregate_operator(options.kind)
@@ -6119,8 +7145,99 @@ pub struct Returned {
     pub value: Result<Option<i64>>,
 }
 
+/// One column a returning commit asked for, as it was just before the commit (D314
+/// amendment 1).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Previous {
+    /// Its family.
+    pub family: FamilyId,
+    /// Its qualifier.
+    pub qualifier: Vec<u8>,
+    /// Its newest visible version just before the commit (`None`: none, as after a delete
+    /// or past the family's TTL at the commit's timestamp), or the error that kept the shard
+    /// from reading it once the commit had applied.
+    pub value: Result<Option<crate::read::CellData>>,
+}
+
+/// A returning check's outcome (D314 amendment 2): whether its condition held, and the
+/// row's state either way.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CheckReturned {
+    /// Whether the condition held and the batch applied.
+    pub applied: bool,
+    /// The commit, when it applied.
+    pub info: Option<CommitInfo>,
+    /// When it applied: the counters it incremented, as [`Engine::commit_returning`] returns.
+    pub cells: Vec<Returned>,
+    /// When it applied: each `previous_of` column as it was just before the commit.
+    pub previous: Vec<Previous>,
+    /// Each `current_of` column, the condition's own first: as of the commit when it
+    /// applied, as the condition saw it otherwise.
+    pub current: Vec<Previous>,
+}
+
+/// A submitted [`Engine::submit_check_and_mutate_returning`].
+#[derive(Debug)]
+pub struct PendingCheckReturning {
+    pending: PendingCheck,
+    out: crate::shard::CheckSlot,
+}
+
+impl PendingCheckReturning {
+    /// Waits for the check, as [`PendingCheck::wait`] does.
+    pub fn wait(self) -> Result<CheckReturned> {
+        let (applied, info) = self.pending.wait()?;
+        Ok(check_returned(&self.out, applied, info))
+    }
+}
+
+impl std::future::Future for PendingCheckReturning {
+    type Output = Result<CheckReturned>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.pending).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(r) => std::task::Poll::Ready(
+                r.map(|(applied, info)| check_returned(&this.out, applied, info)),
+            ),
+        }
+    }
+}
+
+/// A check's notifier: whether it applied, and its commit when it did.
+type CheckNotifier = pigeonhole_runtime::Notifier<Result<(bool, Option<CommitInfo>)>>;
+
+/// The reply a returning check's shard fills `out` for (D314 amendment 2).
+fn check_reply(out: &crate::shard::CheckSlot) -> impl FnOnce(CheckNotifier) -> Reply + use<> {
+    let out = Arc::clone(out);
+    move |notifier| Reply::CheckReturning(Box::new(crate::shard::CheckReturning { notifier, out }))
+}
+
+/// What the shard left in a returning check's slot (set before its reply).
+fn check_returned(
+    out: &crate::shard::CheckSlot,
+    applied: bool,
+    info: Option<CommitInfo>,
+) -> CheckReturned {
+    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+    CheckReturned {
+        applied,
+        info,
+        cells: out.cells.take().unwrap_or_default(),
+        previous: std::mem::take(&mut out.previous),
+        current: std::mem::take(&mut out.current),
+    }
+}
+
 /// A returning commit's batch touches one row (D314; simp724's B1 on #1453): the shard
 /// returns its cells by family, qualifier and timestamp, which say nothing of the row.
+#[inline(always)]
 fn one_row(batch: &WriteBatch) -> Result<()> {
     let mut first: Option<(TableId, &[u8])> = None;
     let rows = batch
@@ -6149,11 +7266,38 @@ fn one_row(batch: &WriteBatch) -> Result<()> {
     Ok(())
 }
 
-/// The cells the shard left in `out` (set before the commit's reply, which orders it).
-fn returned(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
+/// The table of the one row `batch` touches (`None` for an empty batch). Out of line, and
+/// apart from [`one_row`], so plain returning commits keep `one_row` inlined (#1517).
+#[cold]
+fn row_table(batch: &WriteBatch) -> Option<TableId> {
+    batch
+        .builder
+        .batch()
+        .iter()
+        .flatten()
+        .map(|m| m.table)
+        .next()
+        .or_else(|| batch.row_deletes.first().map(|d| d.table))
+}
+
+/// The counter cells the shard left in `out`, leaving its previous values for
+/// [`PendingReturning::take_previous`].
+fn returned_cells(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
     out.lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .cells
         .take()
+        .unwrap_or_default()
+}
+
+/// The previous values the shard left in `out` (set before the commit's reply, which
+/// orders it); empty for a commit that asked for none.
+fn taken_previous(out: &crate::shard::ReturnSlot) -> Vec<Previous> {
+    out.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .previous
+        .take()
+        .map(|p| p.values)
         .unwrap_or_default()
 }
 
@@ -6162,13 +7306,25 @@ fn returned(out: &crate::shard::ReturnSlot) -> Vec<Returned> {
 pub struct PendingReturning {
     pending: PendingCommit,
     out: crate::shard::ReturnSlot,
+    /// Whether the commit asked for previous values (so `take_previous` without them
+    /// takes no lock).
+    asked: bool,
 }
 
 impl PendingReturning {
     /// Waits for the commit, as [`PendingCommit::wait`] does.
     pub fn wait(self) -> Result<(CommitInfo, Vec<Returned>)> {
         let info = self.pending.wait()?;
-        Ok((info, returned(&self.out)))
+        Ok((info, returned_cells(&self.out)))
+    }
+
+    /// The previous values a [`Engine::submit_returning_previous`] asked for, once it has
+    /// resolved (empty before, and after the first call).
+    pub fn take_previous(&mut self) -> Vec<Previous> {
+        if !self.asked {
+            return Vec::new();
+        }
+        taken_previous(&self.out)
     }
 }
 
@@ -6183,7 +7339,7 @@ impl std::future::Future for PendingReturning {
         match std::pin::Pin::new(&mut this.pending).poll(cx) {
             std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(r) => {
-                std::task::Poll::Ready(r.map(|info| (info, returned(&this.out))))
+                std::task::Poll::Ready(r.map(|info| (info, returned_cells(&this.out))))
             }
         }
     }

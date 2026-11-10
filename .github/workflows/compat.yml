@@ -79,7 +79,8 @@ jobs:
         if: steps.published.outputs.yes == 'true'
         env:
           PIGEONHOLE_CORPUS_OUT: ${{ runner.temp }}/main-corpus
-        run: cargo test -p pigeonhole --test corpus -- --ignored --exact generate_corpus --nocapture
+        # The replication feature adds the replica entry (D315 PR 3).
+        run: cargo test -p pigeonhole --features __unstable-replication --test corpus -- --ignored --exact generate_corpus --nocapture
       - name: Open it with ${{ matrix.release }}
         if: steps.published.outputs.yes == 'true'
         env:

@@ -48,7 +48,30 @@ pub(crate) struct MutationState {
     pub(crate) row: Vec<u8>,
     /// `None` once committed.
     pub(crate) ops: Mutex<Option<Vec<Op>>>,
+    /// The columns `return_previous` and `return_current` asked for (ICR 0113).
+    pub(crate) asked: Mutex<Asked>,
     pub(crate) durability: Mutex<Option<Durability>>,
+}
+
+/// A column: family and qualifier.
+pub(crate) type Column = (String, Vec<u8>);
+
+/// The columns a mutation's `return_previous` and `return_current` asked for (ICR 0113).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Asked {
+    pub(crate) previous: Vec<Column>,
+    pub(crate) current: Vec<Column>,
+}
+
+impl Asked {
+    /// Whether `return_current` asked for the column, or it's `condition`'s (always
+    /// reported).
+    pub(crate) fn has_current(&self, family: &str, q: &[u8], condition: Option<&Column>) -> bool {
+        self.current
+            .iter()
+            .chain(condition)
+            .any(|(f, cq)| f == family && cq == q)
+    }
 }
 
 /// `Pigeonhole::Mutation`.
@@ -82,10 +105,22 @@ pub(crate) struct Snapshot(pub(crate) ForkSafe<Mutex<Option<pigeonhole::Snapshot
 #[magnus::wrap(class = "Pigeonhole::Cell", free_immediately, size)]
 pub(crate) struct Cell(pub(crate) pigeonhole::Cell);
 
-/// `Pigeonhole::Incremented`: the counter cells a `Mutation#commit_returning` wrote, after
-/// its commit (D314). Plain data: no handle, so nothing to guard across a fork.
+/// `Pigeonhole::Incremented` (also `Pigeonhole::Returned`): the counter cells a
+/// `Mutation#commit_returning` (or an applied `commit_if_returning`) wrote, after its commit
+/// (D314), and the columns `return_previous` and `return_current` asked for, with those
+/// requests and the condition's column. Plain data: no handle, so nothing to guard across a
+/// fork.
 #[magnus::wrap(class = "Pigeonhole::Incremented", free_immediately, size)]
-pub(crate) struct Incremented(pub(crate) pigeonhole::Incremented);
+pub(crate) struct Incremented(
+    pub(crate) pigeonhole::Incremented,
+    pub(crate) Asked,
+    pub(crate) Option<Column>,
+);
+
+/// `Pigeonhole::Seen`: the row as a failed `Mutation#commit_if_returning`'s condition saw it
+/// (D314 amendment 2). Plain data.
+#[magnus::wrap(class = "Pigeonhole::Seen", free_immediately, size)]
+pub(crate) struct Seen(pub(crate) pigeonhole::Seen);
 
 /// `Pigeonhole::Row`.
 #[magnus::wrap(class = "Pigeonhole::Row", free_immediately, size)]
@@ -164,9 +199,9 @@ pub(crate) struct PagesState {
 #[magnus::wrap(class = "Pigeonhole::Pages", free_immediately, size)]
 pub(crate) struct Pages(pub(crate) ForkSafe<Mutex<PagesState>>);
 
-/// `Pigeonhole::Feed`: a change feed subscription (its state is `crate::feed::FeedState`).
+/// `Pigeonhole::Feed`: a change feed subscription, a `crate::waits` stream.
 #[magnus::wrap(class = "Pigeonhole::Feed", free_immediately, size)]
-pub(crate) struct Feed(pub(crate) ForkSafe<crate::feed::FeedState>);
+pub(crate) struct Feed(pub(crate) ForkSafe<crate::waits::Waits<crate::feed::FeedSource>>);
 
 // ---- Pigeonhole::Memory (PR 3a; methods in memory.rs) ------------------------------
 
@@ -272,8 +307,10 @@ pub(crate) struct VectorBulkLoad(pub(crate) ForkSafe<Mutex<Option<crate::index::
 
 /// `Pigeonhole::Memory::Watch`: a store's memory events (T9); `None` once closed.
 #[magnus::wrap(class = "Pigeonhole::Memory::Watch", free_immediately, size)]
-pub(crate) struct Watch(pub(crate) ForkSafe<crate::index::Fair<Option<pigeonhole_memory::Watch>>>);
+pub(crate) struct Watch(pub(crate) ForkSafe<crate::waits::Waits<crate::memory::WatchSource>>);
 
 /// `Pigeonhole::Memory::ConsolidateLoop`: feed-driven consolidation (T9).
 #[magnus::wrap(class = "Pigeonhole::Memory::ConsolidateLoop", free_immediately, size)]
-pub(crate) struct ConsolidateLoop(pub(crate) ForkSafe<Mutex<crate::memory::LoopSlot>>);
+pub(crate) struct ConsolidateLoop(
+    pub(crate) ForkSafe<std::sync::Arc<Mutex<crate::memory::LoopSlot>>>,
+);

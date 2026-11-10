@@ -149,6 +149,7 @@ pub struct OpenOptions {
     model: Option<String>,
     without_embeddings: bool,
     own_forgetter: bool,
+    own_rebalancer: bool,
 }
 
 impl OpenOptions {
@@ -174,6 +175,16 @@ impl OpenOptions {
     /// [`Store::take_forgetter`] and runs it itself (an application-owned database, D284).
     pub fn own_forgetter(mut self) -> Self {
         self.own_forgetter = true;
+        self
+    }
+
+    /// No IVF rebalancing thread of the crate's own: for a store with an IVF index
+    /// ([`StoreOptions::ivf`]), the application takes its [`Rebalancer`](pigeonhole_vector::Rebalancer)
+    /// with [`Store::take_rebalancer`] and runs it itself (an application-owned database,
+    /// D284), or drops it where nothing may write in the background (a replica, #1618). The
+    /// index is opened as [`pigeonhole_vector::Index::open_with_rebalancer`] opens it.
+    pub fn own_rebalancer(mut self) -> Self {
+        self.own_rebalancer = true;
         self
     }
 }
@@ -512,6 +523,9 @@ struct Shared {
     /// through `remember_in`/`delete_in` never settles, and a dropped record only delays a
     /// split the same way.
     ivf_pending: Mutex<std::collections::VecDeque<pigeonhole_vector::Placed>>,
+    /// The IVF index's rebalancer, kept for [`Store::take_rebalancer`] when opened with
+    /// [`OpenOptions::own_rebalancer`].
+    rebalancer: Mutex<Option<pigeonhole_vector::Rebalancer>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -536,6 +550,22 @@ fn index_name(name: &str) -> String {
 }
 
 impl Store {
+    /// The tables a store named `name` keeps its data in: its own, its text index's, and its
+    /// IVF index's (a table that exists only with [`StoreOptions::ivf`]). For an application
+    /// that must leave a store's tables alone: `phdb serve --memory` refuses to drop them
+    /// (#1651).
+    ///
+    /// ```
+    /// use pigeonhole_memory::Store;
+    ///
+    /// let names = Store::table_names("notes");
+    /// assert!(names.contains(&"mem_notes".to_owned()));
+    /// assert_eq!(names.len(), 3);
+    /// ```
+    pub fn table_names(name: &str) -> Vec<String> {
+        vec![table_name(name), index_name(name), ivf_name(name)]
+    }
+
     /// Creates the store `name`: the table `mem_{name}` and its text index
     /// `mem_{name}_text`, the index without positions (recall queries are rarely phrases;
     /// owner, 2026-11-02), and opens it with its own model (as [`open`](Self::open) would).
@@ -614,12 +644,23 @@ impl Store {
                 v = v.target_list_len(n);
             }
             // Created before `G` names it, so a store whose `G` has `ivf` has the index.
-            drop(pigeonhole_vector::Index::create(
-                db,
-                &ivf_name(name),
-                m.spec(),
-                v,
-            )?);
+            // With `own_rebalancer`, no crate thread starts here either: the rebalancer the
+            // open below hands out takes from the same queue.
+            if open.own_rebalancer {
+                drop(pigeonhole_vector::Index::create_with_rebalancer(
+                    db,
+                    &ivf_name(name),
+                    m.spec(),
+                    v,
+                )?);
+            } else {
+                drop(pigeonhole_vector::Index::create(
+                    db,
+                    &ivf_name(name),
+                    m.spec(),
+                    v,
+                )?);
+            }
             g = g.put(META, IVF, &o.encode());
         }
         g.commit()?;
@@ -671,14 +712,26 @@ impl Store {
             }
         };
         let index = Index::open(db, &index_name(name))?;
+        let mut rebalancer = None;
         let ivf = match table.get(GLOBAL, META, IVF)? {
-            Some(c) => Some(Ivf::W(
-                pigeonhole_vector::Index::open(db, &ivf_name(name))?,
-                IvfOptions::decode(c.value())?,
-            )),
+            Some(c) => {
+                let index = if options.own_rebalancer {
+                    let (index, r) =
+                        pigeonhole_vector::Index::open_with_rebalancer(db, &ivf_name(name))?;
+                    rebalancer = Some(r);
+                    index
+                } else {
+                    pigeonhole_vector::Index::open(db, &ivf_name(name))?
+                };
+                Some(Ivf::W(index, IvfOptions::decode(c.value())?))
+            }
             None => None,
         };
         let s = Store::assemble(db, table, index, ivf, model, embeds, options.own_forgetter);
+        *s.shared
+            .rebalancer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = rebalancer;
         s.start_forgetter_if_due()?;
         Ok(s)
     }
@@ -707,6 +760,7 @@ impl Store {
                 started: AtomicBool::new(false),
                 own,
                 ivf_pending: Mutex::new(std::collections::VecDeque::new()),
+                rebalancer: Mutex::new(None),
             }),
         }
     }
@@ -743,6 +797,17 @@ impl Store {
     pub fn take_forgetter(&self) -> Option<Forgetter> {
         self.shared
             .forgetter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The IVF index's [`Rebalancer`](pigeonhole_vector::Rebalancer), for an application that
+    /// runs it itself: a store with an IVF index opened with [`OpenOptions::own_rebalancer`].
+    /// `None` otherwise, or once taken.
+    pub fn take_rebalancer(&self) -> Option<pigeonhole_vector::Rebalancer> {
+        self.shared
+            .rebalancer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
@@ -856,22 +921,50 @@ impl Store {
     /// With [near dedup](NearDedup), the nearest live memory is looked up first, outside the
     /// transaction, and a close enough one is skipped, merged into or linked to.
     pub fn remember(&self, ns: &str, memory: Memory) -> Result<Remembered> {
+        let p = self.prepare_remember(ns, memory)?;
+        #[cfg(feature = "__unstable-hooks")]
+        if p.near.is_some() {
+            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
+        }
+        let r = self.db.transact(&RetryPolicy::default(), |txn| {
+            self.remember_prepared_in(txn, &p)
+        });
+        self.settle();
+        Ok(r?.0)
+    }
+
+    /// The part of [`remember`](Self::remember) before its transaction (ICR 0123): checks
+    /// the memory, runs the near-dedup lookup if the store has near dedup (a read outside
+    /// any transaction), and fixes the new memory's id and time. Then commit
+    /// [`remember_prepared_in`](Self::remember_prepared_in) in a transaction of your own,
+    /// retrying it as you like (each attempt writes the same memory), and
+    /// [`settle`](Self::settle) after it commits. That's `remember`, step by step, for a
+    /// caller with its own retry loop (#1479's asyncio forms).
+    pub fn prepare_remember(&self, ns: &str, memory: Memory) -> Result<PreparedMemory> {
         self.check_memory(ns, &memory)?;
         let near = match self.near_dedup()? {
             Some(setting) => self.near(ns, &memory, setting)?,
             None => None,
         };
-        #[cfg(feature = "__unstable-hooks")]
-        if near.is_some() {
-            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
-        }
         let now = now_us();
         let rid = new_rid(now)?;
-        let r = self.db.transact(&RetryPolicy::default(), |txn| {
-            self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
-        });
-        self.ivf_settle();
-        Ok(r?.0)
+        Ok(PreparedMemory {
+            ns: ns.to_owned(),
+            memory,
+            rid,
+            now,
+            near,
+        })
+    }
+
+    /// One attempt of [`remember`](Self::remember)'s transaction, in the caller's
+    /// transaction: exact dedup, and the near-dedup outcome `prepare` found (ICR 0123).
+    pub fn remember_prepared_in(
+        &self,
+        txn: &mut Transaction,
+        p: &PreparedMemory,
+    ) -> Result<Remembered> {
+        self.remember_with(txn, &p.ns, &p.memory, p.rid, p.now, p.near.as_ref())
     }
 
     /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
@@ -1099,7 +1192,7 @@ impl Store {
         let r = self
             .db
             .transact(&RetryPolicy::default(), |txn| self.delete_in(txn, id));
-        self.ivf_settle();
+        self.settle();
         Ok(r?.0)
     }
 
@@ -1213,6 +1306,27 @@ impl Store {
         q.push_back(placed);
     }
 
+    /// Whether the IVF index's own rebalancing thread was started, or `None` without an
+    /// index (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_rebalancer_started(&self) -> Option<bool> {
+        match &self.ivf {
+            Some(Ivf::W(index, _)) => {
+                Some(pigeonhole_vector::hooks::rebalancer_thread_started(index))
+            }
+            _ => None,
+        }
+    }
+
+    /// The IVF index's list lengths, in list order (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_list_lens(&self) -> Result<Option<Vec<u64>>> {
+        match &self.ivf {
+            Some(Ivf::W(index, _)) => Ok(Some(index.verify()?.list_lens)),
+            _ => Ok(None),
+        }
+    }
+
     /// The IVF records waiting to settle (an inspection helper for `hooks`).
     #[cfg(feature = "__unstable-hooks")]
     pub(crate) fn ivf_pending_len(&self) -> usize {
@@ -1223,11 +1337,19 @@ impl Store {
             .len()
     }
 
-    /// Hands the parked IVF writes to `after_commit`, which splits or merges (in background
-    /// mode, marks for the rebalancer) the lists they left out of bounds. Its errors are
-    /// dropped: the memories are committed, and a missed rebalance waits for the next write
-    /// to those lists (simp724 on #1342: an `after_commit` failure mustn't fail a write).
-    pub(crate) fn ivf_settle(&self) {
+    /// Hands the IVF index's parked writes to its `after_commit`, which splits or merges the
+    /// lists they left out of bounds (in background mode, marks them for the rebalancer):
+    /// what [`remember`](Self::remember) and [`delete`](Self::delete) do after their
+    /// transaction. Call it after committing a transaction of your own that ran
+    /// [`remember_in`](Self::remember_in) or [`delete_in`](Self::delete_in) (ICR 0123): with
+    /// inline rebalance it may commit splits itself, so hold no snapshot across it (#1513).
+    ///
+    /// Its errors are dropped: the memories are committed, and a missed rebalance waits for
+    /// the next write to those lists (simp724 on #1342: an `after_commit` failure mustn't
+    /// fail a write). Without settling, nothing is wrong for recall: the vectors are in
+    /// their lists, and a list just stays over its bound until a later write settles it. A
+    /// store without an IVF index does nothing here.
+    pub fn settle(&self) {
         let Some(Ivf::W(index, _)) = &self.ivf else {
             return;
         };
@@ -1254,15 +1376,34 @@ impl Store {
         }
         check_weight(weight)?;
         self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            for end in [from, to] {
-                if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
-                    return Err(Error::NotFound(format!("the memory {end}")));
-                }
-            }
-            write_link(txn, t, &from.row(), &to.row(), ty, weight);
-            Ok(())
+            self.link_in(txn, from, to, ty, weight)
         })?;
+        Ok(())
+    }
+
+    /// [`link`](Self::link) inside the caller's transaction (ICR 0123): it reads both ends'
+    /// `content:text` in `txn`, so a concurrent delete of either conflicts at commit.
+    pub fn link_in(
+        &self,
+        txn: &mut Transaction,
+        from: &MemoryId,
+        to: &MemoryId,
+        ty: LinkType,
+        weight: f32,
+    ) -> Result<()> {
+        if from.namespace() != to.namespace() {
+            return Err(Error::InvalidArgument(
+                "links stay within a namespace".into(),
+            ));
+        }
+        check_weight(weight)?;
+        let t = &self.table;
+        for end in [from, to] {
+            if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
+                return Err(Error::NotFound(format!("the memory {end}")));
+            }
+        }
+        write_link(txn, t, &from.row(), &to.row(), ty, weight);
         Ok(())
     }
 
@@ -1276,6 +1417,27 @@ impl Store {
     /// one (supersede that one instead: facts change along a chain). Deleting `new` clears
     /// `old`'s `superseded_by`, so `old` is recalled again.
     pub fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        self.check_supersede(old, new)?;
+        let now = now_us();
+        self.db.transact(&RetryPolicy::default(), |txn| {
+            self.supersede_at(txn, old, new, now)
+        })?;
+        Ok(())
+    }
+
+    /// [`supersede`](Self::supersede) inside the caller's transaction (ICR 0123), with
+    /// `valid_to` the time of the call.
+    pub fn supersede_in(
+        &self,
+        txn: &mut Transaction,
+        old: &MemoryId,
+        new: &MemoryId,
+    ) -> Result<()> {
+        self.check_supersede(old, new)?;
+        self.supersede_at(txn, old, new, now_us())
+    }
+
+    fn check_supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         if self.model.is_some() && !self.embeds {
             return Err(Error::InvalidArgument(
                 "this handle was opened without the store's embedding model, so it can't \
@@ -1288,29 +1450,36 @@ impl Store {
                 "supersede takes two memories of one namespace".into(),
             ));
         }
-        let now = now_us();
-        self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            for end in [old, new] {
-                if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
-                    return Err(Error::NotFound(format!("the memory {end}")));
-                }
+        Ok(())
+    }
+
+    /// The supersede's reads and writes in `txn`, `valid_to` being `now`.
+    fn supersede_at(
+        &self,
+        txn: &mut Transaction,
+        old: &MemoryId,
+        new: &MemoryId,
+        now: u64,
+    ) -> Result<()> {
+        let t = &self.table;
+        for end in [old, new] {
+            if txn.get(t, &end.row(), CONTENT, TEXT)?.is_none() {
+                return Err(Error::NotFound(format!("the memory {end}")));
             }
-            if let Some(cur) = txn
-                .get(t, &old.row(), META, SUPERSEDED_BY)?
-                .map(|c| c.value().to_vec())
-            {
-                if cur == new.row() {
-                    return Ok(());
-                }
-                let cur = MemoryId::from_row(&cur).ok_or_else(|| corrupt("superseded_by"))?;
-                return Err(Error::InvalidArgument(format!(
-                    "{old} is already superseded by {cur}: supersede that one instead"
-                )));
+        }
+        if let Some(cur) = txn
+            .get(t, &old.row(), META, SUPERSEDED_BY)?
+            .map(|c| c.value().to_vec())
+        {
+            if cur == new.row() {
+                return Ok(());
             }
-            supersede_in(txn, t, &old.row(), &new.row(), now);
-            Ok(())
-        })?;
+            let cur = MemoryId::from_row(&cur).ok_or_else(|| corrupt("superseded_by"))?;
+            return Err(Error::InvalidArgument(format!(
+                "{old} is already superseded by {cur}: supersede that one instead"
+            )));
+        }
+        supersede_in(txn, t, &old.row(), &new.row(), now);
         Ok(())
     }
 
@@ -1320,24 +1489,34 @@ impl Store {
     pub fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked> {
         let now = now_us() as i64;
         let (m, _) = self.db.transact(&RetryPolicy::default(), |txn| {
-            let t = &self.table;
-            let mut m = Marked::default();
-            let mut seen = BTreeSet::new();
-            for id in ids {
-                let row = id.row();
-                if !seen.insert(row.clone()) {
-                    continue;
-                }
-                if txn.get(t, &row, CONTENT, TEXT)?.is_none() {
-                    m.missing.push(id.clone());
-                    continue;
-                }
-                txn.incr(t, &row, STATS, USES, 1)
-                    .aggregate(t, &row, PEAK, LAST_USED, now);
-                m.marked += 1;
-            }
-            Ok::<_, Error>(m)
+            self.mark_used_at(txn, ids, now)
         })?;
+        Ok(m)
+    }
+
+    /// [`mark_used`](Self::mark_used) inside the caller's transaction (ICR 0123), at the
+    /// time of the call.
+    pub fn mark_used_in(&self, txn: &mut Transaction, ids: &[MemoryId]) -> Result<Marked> {
+        self.mark_used_at(txn, ids, now_us() as i64)
+    }
+
+    fn mark_used_at(&self, txn: &mut Transaction, ids: &[MemoryId], now: i64) -> Result<Marked> {
+        let t = &self.table;
+        let mut m = Marked::default();
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            let row = id.row();
+            if !seen.insert(row.clone()) {
+                continue;
+            }
+            if txn.get(t, &row, CONTENT, TEXT)?.is_none() {
+                m.missing.push(id.clone());
+                continue;
+            }
+            txn.incr(t, &row, STATS, USES, 1)
+                .aggregate(t, &row, PEAK, LAST_USED, now);
+            m.marked += 1;
+        }
         Ok(m)
     }
 
@@ -1546,23 +1725,54 @@ fn verify(
     ivf: bool,
     ivf_index: Option<&pigeonhole_vector::Index>,
 ) -> Result<StoreStats> {
-    let mut st = StoreStats::default();
-    // Per namespace: memories with an embedding, and the counter's value (D311 T8).
-    let mut embedded: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    // The rows of memories with an embedding: the ids the IVF index must hold (#1427).
-    let mut embedded_rows: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut counters: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
-    let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-    let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-    let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut superseded_by: Vec<Vec<u8>> = Vec::new();
+    let mut v = Scanned::default();
     rows.scan_all(s, |key, row| {
+        v.row(key, row, model.is_some(), ivf, ivf_index.is_some())
+    })?;
+    v.check_rows();
+    v.st.text_index_inconsistent = !text_ok;
+    if ivf {
+        v.check_ivf(s, ivf_index)?;
+    }
+    Ok(v.st)
+}
+
+/// A link as `(from, to, value)`.
+type LinkKey = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// What [`verify`]'s scan collects, and the stats it's counted so far.
+#[derive(Default)]
+struct Scanned {
+    st: StoreStats,
+    /// Per namespace: memories with an embedding (D311 T8).
+    embedded: BTreeMap<Vec<u8>, i64>,
+    /// The rows of memories with an embedding: the ids the IVF index must hold (#1427).
+    embedded_rows: BTreeSet<Vec<u8>>,
+    /// Per namespace: the embedded counter's value.
+    counters: BTreeMap<Vec<u8>, i64>,
+    texts: BTreeMap<Vec<u8>, String>,
+    links: BTreeSet<LinkKey>,
+    /// Backlinks, keyed the way their link is.
+    backlinks: BTreeSet<LinkKey>,
+    dedups: Vec<(Vec<u8>, Vec<u8>)>,
+    superseded_by: Vec<Vec<u8>>,
+}
+
+impl Scanned {
+    /// One row of the scan.
+    fn row(
+        &mut self,
+        key: &[u8],
+        row: &pigeonhole::RowRef<'_>,
+        has_model: bool,
+        ivf: bool,
+        ivf_ids: bool,
+    ) -> Result<()> {
         if key == GLOBAL {
             return Ok(());
         }
-        if MemoryId::from_row(key).is_some() {
-            st.memories += 1;
+        if let Some(id) = MemoryId::from_row(key) {
+            self.st.memories += 1;
             let mut has_text = false;
             let mut has_emb = false;
             for e in row.iter() {
@@ -1571,17 +1781,21 @@ fn verify(
                         has_text = true;
                         let text = std::str::from_utf8(e.cell.value())
                             .map_err(|_| corrupt("a memory's text"))?;
-                        texts.insert(key.to_vec(), normalize(text));
+                        self.texts.insert(key.to_vec(), normalize(text));
                     }
                     EMB => has_emb = true,
                     META if e.qualifier == SUPERSEDED_BY => {
-                        superseded_by.push(e.cell.value().to_vec());
+                        self.superseded_by.push(e.cell.value().to_vec());
                     }
                     LINKS => {
-                        links.insert((key.to_vec(), e.qualifier.to_vec(), e.cell.value().to_vec()));
+                        self.links.insert((
+                            key.to_vec(),
+                            e.qualifier.to_vec(),
+                            e.cell.value().to_vec(),
+                        ));
                     }
                     BACKLINKS => {
-                        backlinks.insert((
+                        self.backlinks.insert((
                             e.qualifier.to_vec(),
                             key.to_vec(),
                             e.cell.value().to_vec(),
@@ -1591,84 +1805,100 @@ fn verify(
                 }
             }
             if !has_text {
-                st.no_content += 1;
+                self.st.no_content += 1;
             }
-            if model.is_some() && !has_emb {
-                st.missing_embeddings += 1;
+            if has_model && !has_emb {
+                self.st.missing_embeddings += 1;
             }
-            if has_emb && ivf_index.is_some() {
-                embedded_rows.insert(key.to_vec());
-            }
-            if has_emb && let Some(id) = MemoryId::from_row(key) {
-                *embedded
+            if has_emb {
+                if ivf_ids {
+                    self.embedded_rows.insert(key.to_vec());
+                }
+                *self
+                    .embedded
                     .entry(id.namespace().as_bytes().to_vec())
                     .or_default() += 1;
             }
-        } else if ivf && let Some(ns) = key.strip_suffix(COUNT_TAG) {
+            return Ok(());
+        }
+        if ivf && let Some(ns) = key.strip_suffix(COUNT_TAG) {
             let n = row
                 .get(STATS, EMBEDDED)
                 .and_then(|c| c.as_i64())
                 .unwrap_or(0);
-            counters.insert(ns.to_vec(), n);
+            self.counters.insert(ns.to_vec(), n);
         } else if let Some(c) = row.get(META, RID) {
-            dedups.push((key.to_vec(), c.value().to_vec()));
+            self.dedups.push((key.to_vec(), c.value().to_vec()));
         } else {
             return Err(corrupt("a row that is neither a memory nor a dedup row"));
         }
         Ok(())
-    })?;
-    for (key, target) in &dedups {
-        let ok = texts.get(target).is_some_and(|norm| {
-            key.windows(2)
-                .position(|w| w == DEDUP_TAG)
-                .is_some_and(|at| {
-                    std::str::from_utf8(&key[..at])
-                        .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
-                })
-        });
-        if !ok {
-            st.stale_dedup += 1;
-        }
     }
-    // Each link must have its backlink, and the reverse; both ends live.
-    st.broken_links += links.symmetric_difference(&backlinks).count() as u64;
-    for (from, to, _) in &links {
-        if !texts.contains_key(from) || !texts.contains_key(to) {
-            st.broken_links += 1;
+
+    /// The checks across rows: dedup rows, links and supersessions.
+    fn check_rows(&mut self) {
+        let texts = &self.texts;
+        for (key, target) in &self.dedups {
+            let ok = texts.get(target).is_some_and(|norm| {
+                key.windows(2)
+                    .position(|w| w == DEDUP_TAG)
+                    .is_some_and(|at| {
+                        std::str::from_utf8(&key[..at])
+                            .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
+                    })
+            });
+            if !ok {
+                self.st.stale_dedup += 1;
+            }
         }
+        // Each link must have its backlink, and the reverse; both ends live.
+        self.st.broken_links += self.links.symmetric_difference(&self.backlinks).count() as u64;
+        for (from, to, _) in &self.links {
+            if !texts.contains_key(from) || !texts.contains_key(to) {
+                self.st.broken_links += 1;
+            }
+        }
+        self.st.dangling_superseded = self
+            .superseded_by
+            .iter()
+            .filter(|s| !texts.contains_key(*s))
+            .count() as u64;
     }
-    st.dangling_superseded = superseded_by
-        .iter()
-        .filter(|s| !texts.contains_key(*s))
-        .count() as u64;
-    st.text_index_inconsistent = !text_ok;
-    if ivf {
+
+    /// The IVF checks: counters against the embedded memories, and the index's ids.
+    fn check_ivf(
+        &mut self,
+        s: &pigeonhole::Snapshot,
+        ivf_index: Option<&pigeonhole_vector::Index>,
+    ) -> Result<()> {
+        let (embedded, counters) = (&self.embedded, &self.counters);
         let all: BTreeSet<&Vec<u8>> = embedded.keys().chain(counters.keys()).collect();
-        st.ivf_counter_drift = all
+        self.st.ivf_counter_drift = all
             .into_iter()
             .filter(|ns| {
                 embedded.get(*ns).copied().unwrap_or(0) != counters.get(*ns).copied().unwrap_or(0)
             })
             .count() as u64;
-        if let Some(index) = ivf_index {
-            // Both sides in ascending byte order: a merge walk counts each side's ids the
-            // other lacks, streaming the index's ids against the embedded memories' rows.
-            let mut rows = embedded_rows.iter().peekable();
-            let (mut missing, mut stale) = (0u64, 0u64);
-            index.ids_at(s, |id| {
-                while rows.next_if(|r| r.as_slice() < id).is_some() {
-                    missing += 1;
-                }
-                if rows.next_if(|r| r.as_slice() == id).is_none() {
-                    stale += 1;
-                }
-            })?;
-            st.ivf_missing = missing + rows.count() as u64;
-            st.ivf_stale = stale;
-            st.ivf_mismatched = st.ivf_missing + st.ivf_stale;
-        }
+        let Some(index) = ivf_index else {
+            return Ok(());
+        };
+        // Both sides in ascending byte order: a merge walk counts each side's ids the
+        // other lacks, streaming the index's ids against the embedded memories' rows.
+        let mut rows = self.embedded_rows.iter().peekable();
+        let (mut missing, mut stale) = (0u64, 0u64);
+        index.ids_at(s, |id| {
+            while rows.next_if(|r| r.as_slice() < id).is_some() {
+                missing += 1;
+            }
+            if rows.next_if(|r| r.as_slice() == id).is_none() {
+                stale += 1;
+            }
+        })?;
+        self.st.ivf_missing = missing + rows.count() as u64;
+        self.st.ivf_stale = stale;
+        self.st.ivf_mismatched = self.st.ivf_missing + self.st.ivf_stale;
+        Ok(())
     }
-    Ok(st)
 }
 
 /// Marks the memory at `old` superseded by the one at `new` since `valid_to`, with the
@@ -1811,4 +2041,15 @@ fn check_weight(w: f32) -> Result<()> {
             "a link's weight is from 0 to 1, not {w}"
         )))
     }
+}
+
+/// A memory [`Store::prepare_remember`] checked and placed: its near-dedup lookup done and
+/// its id and time fixed, for [`Store::remember_prepared_in`] (ICR 0123).
+#[derive(Debug)]
+pub struct PreparedMemory {
+    ns: String,
+    memory: Memory,
+    rid: [u8; 16],
+    now: u64,
+    near: Option<Near>,
 }

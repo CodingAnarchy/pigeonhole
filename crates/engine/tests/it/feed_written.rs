@@ -743,7 +743,245 @@ fn a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered() {
             caught = true;
             break;
         }
-        assert!(caught, "never logged `b` while a sync was in flight");
+        // Best effort on real files: a fast sync may finish before `b` is logged every time
+        // (#1570's Windows run). The held-sync test below sets the race up every time.
+        if !caught {
+            eprintln!(
+                "real files (group {group}): never logged `b` while a sync was in flight; \
+                 a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered \
+                 covers it"
+            );
+        }
         close_real(&db, &mut shard);
     }
+}
+
+/// [`SimVfs::hold_file_syncs`] while alive.
+struct HeldSyncs<'a>(&'a SimVfs);
+
+impl<'a> HeldSyncs<'a> {
+    fn new(vfs: &'a SimVfs) -> Self {
+        vfs.hold_file_syncs(true);
+        Self(vfs)
+    }
+}
+
+impl Drop for HeldSyncs<'_> {
+    fn drop(&mut self) {
+        self.0.hold_file_syncs(false);
+    }
+}
+
+/// One simulated step for the held-sync test: a shard turn, then one deferred operation
+/// completed on this thread (the seed picks which). With `tick`, a step that finds nothing
+/// in flight moves the simulated clock a millisecond, so a timed sync comes due; without
+/// it the clock stands still. No device thread and no wall clock, so a run replays exactly.
+fn sim_step(vfs: &SimVfs, shard: &mut EngineShard, tick: bool) {
+    shard.run_once(u64::MAX);
+    if !vfs.complete_io() && tick {
+        vfs.advance(1_000_000);
+    }
+}
+
+/// [`drive`] on the simulator, with the clock standing still: a shard turn, then `pending`
+/// polled, then one deferred operation completed. Polling between the turn and the
+/// completion sees the commit resolve at the turn that handled its sync, before anything
+/// that turn submitted (a follow-up sync) can complete. Within `limit` steps.
+fn sim_drive(
+    vfs: &SimVfs,
+    shard: &mut EngineShard,
+    mut pending: PendingCommit,
+    limit: u32,
+) -> CommitInfo {
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..limit {
+        shard.run_once(u64::MAX);
+        if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
+            return r.unwrap();
+        }
+        vfs.complete_io();
+    }
+    panic!("the commit never resolved in {limit} simulated steps");
+}
+
+/// [`a_record_logged_during_a_sync_never_holds_back_what_the_sync_covered`] on the simulator,
+/// with the sync held in flight ([`SimVfs::hold_file_syncs`]), so `b` is always logged while
+/// the sync covering `a` is still out: the race that test can only hope to hit on real files.
+/// Deterministic: the test thread completes every deferred operation itself and moves the
+/// simulated clock, which the background sync's interval runs on, so no step depends on
+/// when another thread runs (#1581's macOS miss, with a device thread completing the I/O).
+#[test]
+fn a_record_logged_during_a_held_sync_never_holds_back_what_the_sync_covered() {
+    for group in [true, false] {
+        let vfs = SimVfs::new(1340 + u64::from(group));
+        vfs.set_deferred_io(true);
+        // The group case keeps the background sync out of it.
+        let t_sync = if group {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_millis(20)
+        };
+        let mut o = sim_options(&vfs, Some(feed_syncing_after(t_sync)));
+        o.shards = 1;
+        let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let mut shard = shards.remove(0);
+        let t = table(&db, "t");
+        for _ in 0..1000 {
+            sim_step(&vfs, &mut shard, false);
+        }
+        vfs.complete_all_io();
+        // Syncs held from before `a`, so the one covering it stays in flight; released on
+        // the way out whatever happens, so a failed check can't leave the close waiting.
+        let syncs = db.feed_background_syncs();
+        let hold = HeldSyncs::new(&vfs);
+        let a = sim_drive(
+            &vfs,
+            &mut shard,
+            db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+                .unwrap(),
+            10_000,
+        )
+        .seqno;
+        // A sync covering `a`, held in flight.
+        let g = if group {
+            Some(log_only(
+                &db,
+                &mut shard,
+                batch(&t, b"g"),
+                Durability::GroupSync,
+            ))
+        } else {
+            // The interval passes on the simulated clock, and the next turn submits it.
+            for _ in 0..1000 {
+                if db.feed_background_syncs() > syncs {
+                    break;
+                }
+                vfs.advance(t_sync.as_nanos() as u64);
+                sim_step(&vfs, &mut shard, false);
+            }
+            assert!(db.feed_background_syncs() > syncs, "no background sync");
+            None
+        };
+        let b = log_only(&db, &mut shard, batch(&t, b"b"), Durability::Buffered);
+        assert!(
+            db.feed_frontier(true) < a,
+            "the held sync can't have covered `a` (group {group})"
+        );
+        let b = sim_drive(&vfs, &mut shard, b, 10_000).seqno;
+        drop(hold);
+        if let Some(g) = g {
+            // Its resolution means its sync's completion was handled. Nothing else is
+            // completed before the check: a later sync may cover `b`, legitimately.
+            let g = sim_drive(&vfs, &mut shard, g, 10_000).seqno;
+            settle(&mut shard);
+            let f = db.feed_frontier(true);
+            assert!(
+                f >= g && f < b,
+                "the group sync covered `a` and `g`, not `b`: frontier {f}, a {a}, g {g}, b {b}"
+            );
+        } else {
+            // The held sync's completion moves the frontier past `a` but not `b`; the next
+            // background sync covers `b`. With the hold one pair, it would jump.
+            // Each step completes one operation (the held sync among them) or moves the clock
+            // a millisecond, so the next background sync comes due within its interval.
+            let mut between = false;
+            for _ in 0..10_000 {
+                let f = db.feed_frontier(true);
+                between |= f >= a && f < b;
+                if f >= b {
+                    break;
+                }
+                sim_step(&vfs, &mut shard, true);
+            }
+            assert!(db.feed_frontier(true) >= b, "never synced `b`");
+            assert!(
+                between,
+                "the frontier passed `a` only with `b`: a {a}, b {b}"
+            );
+        }
+        // Every check is done: a device thread completes what the close waits on.
+        let _device = vfs.complete_io_in_background();
+        close_real(&db, &mut shard);
+    }
+}
+
+/// #1417: the blocking wait, held back by the SYNCED hold, parks on the hold list rather than
+/// polling every millisecond (it polls a few times in 500 ms, not about 500), and the hold's
+/// release wakes it: a `GroupSync` commit's sync covers the held record. On the real VFS, as
+/// the async test above.
+#[test]
+fn a_held_blocking_wait_parks_until_the_hold_lets_go() {
+    use pigeonhole_engine::{FeedSpec, FeedStart, Next};
+    let dir = TempDir::new("blocking-hold");
+    let vfs = real_vfs();
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(Duration::from_secs(600)));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    let mut feed = db
+        .feed(FeedSpec {
+            tables: vec![t.id],
+            prefix: Vec::new(),
+            durable: true,
+            start: FeedStart::Now,
+        })
+        .unwrap();
+    let held = drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(
+        db.feed_frontier(true) < held.seqno,
+        "held until a sync covers it"
+    );
+    let (polls, repolls, parks) = (feed.polls(), feed.unparked_repolls(), feed.parks());
+    assert!(matches!(
+        feed.wait(Duration::from_millis(500)).unwrap(),
+        Next::Pending
+    ));
+    let (polls, repolls, parks) = (
+        feed.polls() - polls,
+        feed.unparked_repolls() - repolls,
+        feed.parks() - parks,
+    );
+    // It parks rather than spins: while held, no re-poll skips the park. A park may still
+    // return early (`park_timeout` may return spuriously, which #1594's Windows run did 22
+    // times in 500 ms), and each such return polls once more and parks again, which is
+    // right; so the polls aren't the measure, the skipped parks are. Each turn of the loop
+    // polls once, then returns, re-polls or parks, so the counts add up exactly.
+    assert_eq!(
+        repolls, 0,
+        "{repolls} re-polls without parking ({polls} polls over {parks} parks) while held"
+    );
+    assert_eq!(
+        polls,
+        parks + repolls + 1,
+        "one poll per turn of the wait's loop"
+    );
+    // A waiter on another thread; the hold's release wakes it.
+    let waiter = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let got = match feed.wait(Duration::from_secs(60)).unwrap() {
+            Next::Commit(c) => c.seqno,
+            other => panic!("{other:?}"),
+        };
+        (got, start.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    drive(
+        &db,
+        &mut shard,
+        db.submit(batch(&t, b"b"), Some(Durability::GroupSync))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    let (got, took) = waiter.join().unwrap();
+    assert_eq!(got, held.seqno);
+    assert!(
+        took < Duration::from_secs(10),
+        "woken by the release, not the 600 s backstop: {took:?}"
+    );
+    close_real(&db, &mut shard);
 }

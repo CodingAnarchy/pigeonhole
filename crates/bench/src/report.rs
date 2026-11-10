@@ -573,6 +573,11 @@ pub struct FeedReport {
     pub expired: u64,
     /// Other errors subscribers saw.
     pub errors: u64,
+    /// Subscribers whose drain after the phase hit its 30 s bound before they covered the
+    /// phase's last commit, every subscriber counted: their rows miss the phase's tail, so
+    /// a latency row with any is biased low.
+    #[serde(default)]
+    pub drain_timeouts: u64,
     /// The feed's own syncs (`EngineMetrics::feed_background_syncs`).
     pub background_syncs: u64,
     /// Group syncs (`EngineMetrics::group_syncs`), feed or not.
@@ -585,6 +590,11 @@ pub struct FeedReport {
     pub retained_wal_peak: u64,
     /// The most blob bytes held for the history, sampled with it.
     pub held_blob_peak: u64,
+    /// Milliseconds from the phase's end until every subscriber had covered its last commit
+    /// (at most 30 s): about one *T_sync* plus a sync for a durable subscriber, so a slow
+    /// sync shows here (#1553's Windows run).
+    #[serde(default)]
+    pub drain_ms: u64,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
@@ -795,6 +805,14 @@ pub struct Stalls {
     /// Cached family rows a commit moved forward (D290's write-through).
     #[serde(default)]
     pub row_cache_write_throughs: u64,
+    /// Eviction passes in the block cache and the row cache that stopped early with a full
+    /// stack buffer, leaving a shard over capacity until its next insert (#1559 A, perf287's
+    /// R1): how often an insert would have freed more than 16 values.
+    #[serde(default)]
+    pub block_cache_deferred_evictions: u64,
+    /// See [`Stalls::block_cache_deferred_evictions`].
+    #[serde(default)]
+    pub row_cache_deferred_evictions: u64,
     /// Cross-shard two-phase rounds decided, and the rounds a participant refused (ICR 0043,
     /// `Metrics::cross_shard`): the refused rounds over the cross-shard commits are D246's
     /// wasted rounds per commit.
@@ -877,6 +895,14 @@ impl Stalls {
             row_cache_hits: d(before.row_cache_hits, after.row_cache_hits),
             row_cache_misses: d(before.row_cache_misses, after.row_cache_misses),
             row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),
+            block_cache_deferred_evictions: d(
+                before.block_cache_deferred_evictions,
+                after.block_cache_deferred_evictions,
+            ),
+            row_cache_deferred_evictions: d(
+                before.row_cache_deferred_evictions,
+                after.row_cache_deferred_evictions,
+            ),
             row_cache_write_throughs: d(
                 before.row_cache_write_throughs,
                 after.row_cache_write_throughs,

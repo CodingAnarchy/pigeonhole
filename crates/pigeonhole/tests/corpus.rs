@@ -147,7 +147,7 @@ fn write_entry(e: &Entry, seed: u64, path: &str, observer_delay: Duration) -> Ar
     (e.write)(&db);
     if let Some(then) = e.then {
         db.close().unwrap();
-        db = Pigeonhole::open(path, sim_options(&vfs, e.shards)).unwrap();
+        db = Pigeonhole::open(path, (e.then_options)(sim_options(&vfs, e.shards))).unwrap();
         db.delay_root_observer(observer_delay);
         then(&db);
     }
@@ -189,7 +189,9 @@ fn crash_entries_survive_a_slow_root_observer() {
 }
 
 /// The marker file of an entry that 1.0.0 must refuse: it holds the `incompat` feature
-/// bits the refusal names (decimal). CI's 1.0.0 arm fails if such an entry opens, or if
+/// bits the entry uses (decimal), which 1.0.0 lacks. The name stays, since the frozen
+/// release corpora have it; what a release must do with the entry depends on which of those
+/// bits it reads. CI's 1.0.0 arm fails if such an entry opens, or if
 /// the refusal names other bits (`tests/corpus/compat-reader`), and its 1.1.0 arm, whose
 /// release reads bit 0, fails if one using only bit 0 doesn't open (`compat-reader-1.1`).
 const REFUSED_BY: &str = "refused-by-1.0.0.txt";
@@ -217,7 +219,27 @@ struct Entry {
     /// reopens it with the simulator's options alone (so it inherits what the first open
     /// set), and runs this before the entry's crash or close.
     then: Option<fn(&Pigeonhole)>,
+    /// What the later session's open adds to the simulator's options ([`same`]: nothing, so
+    /// it inherits what the first open set).
+    then_options: fn(Options) -> Options,
+    /// Whether 1.1.0, the first release with the feed, must resume the entry's stored table
+    /// feed token and deliver what this build listed: `compat-reader-1.1` does it for an entry
+    /// with the marker file [`FEED_RESUMES`] (the D315 amendment: a 1.2 sidecar after clean
+    /// closes holds only entries 1.1.0 reads, when no session changed the catalog).
+    feed_resumes_by_1_1: bool,
+    /// The `ro_compat` feature bits the entry uses that the published releases lack: each
+    /// must open it read-only and only read-only (marker file [`READ_ONLY_BY`]).
+    read_only_by: u64,
 }
+
+/// The marker file of an entry the published releases must open read-only
+/// ([`Entry::read_only_by`]): it holds those `ro_compat` bits (decimal). The compat
+/// readers fail the entry if it opens read-write.
+const READ_ONLY_BY: &str = "read-only-by-releases.txt";
+
+/// The marker file of an entry whose stored feed token 1.1.0 must resume
+/// ([`Entry::feed_resumes_by_1_1`]).
+const FEED_RESUMES: &str = "feed-resumes-by-1.1.0.txt";
 
 /// An entry's open adds nothing.
 fn same(o: Options) -> Options {
@@ -225,7 +247,8 @@ fn same(o: Options) -> Options {
 }
 
 fn entries() -> Vec<Entry> {
-    vec![
+    #[allow(unused_mut)]
+    let mut entries = vec![
         Entry {
             name: "empty",
             shards: 1,
@@ -235,6 +258,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "values",
@@ -245,6 +271,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "counters",
@@ -255,6 +284,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "blobs",
@@ -265,6 +297,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "merge",
@@ -275,6 +310,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "wal_crash",
@@ -285,6 +323,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "families",
@@ -295,6 +336,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "wal_ops",
@@ -305,6 +349,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "checkpoints",
@@ -315,6 +362,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "aggregates",
@@ -325,6 +375,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "vectors",
@@ -335,6 +388,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(vectors_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "text",
@@ -346,6 +402,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(text_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "memory",
@@ -356,6 +415,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
             extra: Some(memory_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed",
@@ -366,6 +428,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_crash",
@@ -376,6 +441,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_extra),
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "feed_sessions",
@@ -386,6 +454,9 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: Some(feed_oldest_extra),
             then: Some(write_feed_session),
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
         Entry {
             name: "returning",
@@ -396,8 +467,105 @@ fn entries() -> Vec<Entry> {
             refused_by_1_0_0: 0,
             extra: None,
             then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
         },
-    ]
+        Entry {
+            name: "feed_catalog",
+            shards: 2,
+            options: feed_options,
+            write: write_feed_catalog,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_catalog_extra),
+            then: None,
+            then_options: same,
+            feed_resumes_by_1_1: false,
+            read_only_by: 0,
+        },
+        Entry {
+            name: "feed_root_intent",
+            shards: 2,
+            options: same,
+            write: create_feed_tables,
+            crash: false,
+            refused_by_1_0_0: 0,
+            extra: Some(feed_extra),
+            then: Some(write_feed_commits),
+            then_options: feed_options,
+            feed_resumes_by_1_1: true,
+            read_only_by: 0,
+        },
+    ];
+    // A replica (D315 PR 3): its state table, and `ro_compat` bit 0, which every published
+    // release lacks, so each opens it read-only.
+    #[cfg(feature = "__unstable-replication")]
+    entries.push(Entry {
+        name: "replica",
+        shards: 2,
+        options: same,
+        write: write_replica,
+        crash: false,
+        refused_by_1_0_0: 0,
+        extra: None,
+        then: None,
+        then_options: same,
+        feed_resumes_by_1_1: false,
+        read_only_by: pigeonhole_format::manifest::RO_COMPAT_REPLICA,
+    });
+    entries
+}
+
+/// A replica of a small primary (D315 PR 3): the primary's feed of every table applied with
+/// the primary's ids, a catalog change and a run at a time, its token stored with each.
+#[cfg(feature = "__unstable-replication")]
+fn write_replica(db: &Pigeonhole) {
+    let vfs = SimVfs::new(77);
+    let primary = Pigeonhole::open(
+        "/primary/data.phdb",
+        sim_options(&vfs, 2).change_feed(pigeonhole::FeedRetention::bytes(4 << 20)),
+    )
+    .unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    let t = primary
+        .table("mirrored")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    for i in 0..20u64 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put_at("f", b"q", T0 + i, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    t.mutate(b"r03")
+        .delete_cell("f", b"q", T0 + 3)
+        .commit()
+        .unwrap();
+    let mut run = Vec::new();
+    while feed
+        .next_event(Duration::from_millis(200))
+        .unwrap()
+        .is_some()
+    {
+        let ev = feed.replicated().unwrap();
+        if ev.is_catalog() {
+            db.apply_catalog(&ev, ev.token()).unwrap();
+        } else {
+            run.push(ev);
+            if run.len() == 4 {
+                db.apply_replicated(&run, run[3].token()).unwrap();
+                run.clear();
+            }
+        }
+    }
+    if let Some(last) = run.last() {
+        db.apply_replicated(&run, last.token()).unwrap();
+    }
+    drop(feed);
+    primary.close().unwrap();
 }
 
 /// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise, `f64`,
@@ -1099,6 +1267,68 @@ fn write_feed(db: &Pigeonhole) {
         .unwrap();
 }
 
+/// `feed_root_intent`'s first session, with the feed off: the tables, and no catalog
+/// change in any feeding session's sidecar, which 1.1.0 couldn't read past.
+fn create_feed_tables(db: &Pigeonhole) {
+    for (name, families) in [
+        ("events", &["e"][..]),
+        ("other", &["e"][..]),
+        (FEED_TOKEN.0, &["t"][..]),
+    ] {
+        let mut b = db.table(name).unwrap();
+        for f in families {
+            b = b.family(f, Family::default());
+        }
+        b.create().unwrap();
+    }
+}
+
+/// `feed_root_intent`'s second session, with the feed on (D315 amendment, #1504): a table
+/// feed's token, stored, then commits to two tables with flushes between, so the session's
+/// root commits record their intents and overwrite them with their Root entries, and a clean
+/// close. Its sidecar then holds Session and Root entries only, as 1.1.0's do.
+fn write_feed_commits(db: &Pigeonhole) {
+    let events = db.table("events").unwrap().open().unwrap();
+    let other = db.table("other").unwrap().open().unwrap();
+    let tokens = db.table(FEED_TOKEN.0).unwrap().open().unwrap();
+    let token = events.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    let mut last = 0;
+    for i in 0..60u64 {
+        let row = format!("r{:02}", i % 7);
+        last = events
+            .mutate(row.as_bytes())
+            .put_at(
+                "e",
+                b"what",
+                T0 + i,
+                format!("event {i:03} ").repeat(40).as_bytes(),
+            )
+            .commit()
+            .unwrap()
+            .seqno;
+        if i % 4 == 0 {
+            other
+                .mutate(row.as_bytes())
+                .put("e", b"x", b"not followed")
+                .commit()
+                .unwrap();
+        }
+        if i % 20 == 19 {
+            db.flush().unwrap();
+        }
+    }
+    tokens
+        .mutate(FEED_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
 /// Every commit after the stored token, as a resumed feed delivers them, up to the stored
 /// last seqno: one line per change, with a value's bytes as their length and xxh3-64 (the
 /// puts are long).
@@ -1149,6 +1379,207 @@ fn feed_extra(db: &Pigeonhole) -> String {
                         other => value_line(other),
                     }
                 )
+            ));
+        }
+        if c.seqno() >= last {
+            break;
+        }
+    }
+    out
+}
+
+/// Where `feed_catalog` keeps a feed of every table's token, stored as `FEED_TOKEN`'s is.
+const FEED_ALL_TOKEN: (&str, &[u8]) = ("feed_tokens", b"all");
+
+/// D315: a feed of every table's token from before the first commit, then commits among
+/// catalog changes: a table created with two families, a family added to it, and two tables
+/// dropped, one from before the token, beside a table from before the token that survives. The check resumes a feed of every table from the
+/// token and lists every event: the commits, and each catalog change with its names.
+fn write_feed_catalog(db: &Pigeonhole) {
+    let tokens = db
+        .table(FEED_ALL_TOKEN.0)
+        .unwrap()
+        .family("t", Family::default())
+        .create()
+        .unwrap();
+    let events = db
+        .table("events")
+        .unwrap()
+        .family("e", Family::default())
+        .create()
+        .unwrap();
+    let kept = db
+        .table("kept")
+        .unwrap()
+        .family("k", Family::default())
+        .create()
+        .unwrap();
+    let token = db.feed().open().unwrap().token();
+    tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put("t", b"token", token.as_bytes())
+        .commit()
+        .unwrap();
+    let mut late = None;
+    for i in 0..120u64 {
+        match i {
+            30 => {
+                late = Some(
+                    db.table("late")
+                        .unwrap()
+                        .family("a", Family::default())
+                        .family("n", Family::counter())
+                        .create()
+                        .unwrap(),
+                )
+            }
+            60 => {
+                late = Some(
+                    db.table("late")
+                        .unwrap()
+                        .family("b", Family::default().max_versions(2))
+                        .open()
+                        .unwrap(),
+                )
+            }
+            90 => db.drop_table("events").unwrap(),
+            110 => {
+                late = None;
+                db.drop_table("late").unwrap();
+            }
+            _ => {}
+        }
+        let row = format!("r{:02}", i % 7);
+        let value = format!("event {i:03} ").repeat(40);
+        if i < 90 {
+            events
+                .mutate(row.as_bytes())
+                .put_at("e", b"what", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if i % 4 == 1 {
+            kept.mutate(row.as_bytes())
+                .put_at("k", b"kept", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if let Some(late) = &late
+            && i % 3 == 0
+        {
+            let family = if i >= 60 { "b" } else { "a" };
+            late.mutate(row.as_bytes())
+                .put_at(family, b"late", T0 + i, value.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        if i % 50 == 49 {
+            db.flush().unwrap();
+        }
+    }
+    drop(events);
+    // A last commit after the final drop, so the check lists it: the token table's, which
+    // the listing leaves out.
+    let last = tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put("t", b"end", b"")
+        .commit()
+        .unwrap()
+        .seqno;
+    tokens
+        .mutate(FEED_ALL_TOKEN.1)
+        .put_i64("t", b"last", last as i64)
+        .commit()
+        .unwrap();
+}
+
+/// Every event after the stored all-tables token, up to the stored last seqno: each commit's
+/// changes, as `feed_extra` lists them, and each catalog change's edits with their names and
+/// a family's kind and version limit. The token table's own commit is left out (the token's
+/// bytes are this database's). A change to a table dropped by the time of the check has its
+/// table and family listed as `(dropped)`: whether a feed names those commits isn't frozen
+/// (ai1249 on #1515), so a later build that names them still passes. The catalog lines name
+/// every table.
+fn feed_catalog_extra(db: &Pigeonhole) -> String {
+    use pigeonhole::{CatalogEdit, FeedEvent};
+    let tokens = db.table(FEED_ALL_TOKEN.0).unwrap().open().unwrap();
+    let stored = tokens
+        .get(FEED_ALL_TOKEN.1, "t", b"token")
+        .unwrap()
+        .expect("the stored token");
+    let token = pigeonhole::FeedToken::from_bytes(stored.value());
+    let last = tokens
+        .get(FEED_ALL_TOKEN.1, "t", b"last")
+        .unwrap()
+        .expect("the stored last seqno")
+        .as_i64()
+        .unwrap() as u64;
+    let family = |f: &pigeonhole::FamilyInfo| {
+        format!(
+            "{}(counter={},max_versions={})",
+            f.name, f.counter, f.max_versions
+        )
+    };
+    let live = db.tables();
+    let mut feed = db.feed().resume(&token).open().unwrap();
+    let mut out = String::new();
+    loop {
+        let event = feed
+            .next_event(FEED_WAIT)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the feed stopped before seqno {last}"));
+        let c = match event {
+            FeedEvent::Catalog(change) => {
+                for e in change.edits() {
+                    let edit = match e {
+                        CatalogEdit::TableCreated {
+                            table, families, ..
+                        } => {
+                            let f: Vec<String> = families.iter().map(family).collect();
+                            format!("created\t{table}\t{}", f.join(","))
+                        }
+                        CatalogEdit::FamilyAdded {
+                            table, family: f, ..
+                        } => {
+                            format!("family\t{table}\t{}", family(f))
+                        }
+                        CatalogEdit::TableDropped { table, .. } => format!("dropped\t{table}"),
+                        other => panic!("an edit this check doesn't know: {other:?}"),
+                    };
+                    out.push_str(&format!("{}\tcatalog\t{edit}\n", change.seqno()));
+                }
+                continue;
+            }
+            FeedEvent::Commit(c) => c,
+            other => panic!("an event this check doesn't know: {other:?}"),
+        };
+        for ch in c.changes() {
+            if ch.table() == FEED_ALL_TOKEN.0 {
+                continue;
+            }
+            let (table, family) = if live.iter().any(|t| t == ch.table()) {
+                (ch.table(), ch.family())
+            } else {
+                ("(dropped)", "(dropped)")
+            };
+            let value = match ch.value() {
+                Some(Value::Bytes(b)) => format!(
+                    "bytes:{}:{:016x}",
+                    b.len(),
+                    pigeonhole_format::checksum::xxh3_64(b)
+                ),
+                Some(other) => value_line(other),
+                None => "-".to_owned(),
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{value}\n",
+                c.seqno(),
+                table,
+                family,
+                ch.kind(),
+                hex(ch.row()),
+                hex(ch.qualifier()),
+                ch.timestamp(),
             ));
         }
         if c.seqno() >= last {
@@ -1397,6 +1828,13 @@ fn generate_corpus() {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
         std::fs::write(dir.join("expected.txt"), &expected).unwrap();
+        if e.feed_resumes_by_1_1 {
+            std::fs::write(
+                dir.join(FEED_RESUMES),
+                "compat-reader-1.1 resumes this entry's stored table feed token (D315 amendment)\n",
+            )
+            .unwrap();
+        }
         if let Some(extra) = &extra {
             std::fs::write(dir.join(EXTRA), extra).unwrap();
             frozen.push(frozen_line(
@@ -1406,6 +1844,14 @@ fn generate_corpus() {
         }
         for (name, bytes) in &files {
             frozen.push(frozen_line(&format!("{}/{name}", e.name), bytes));
+        }
+        if e.read_only_by != 0 {
+            let marker = format!("{}\n", e.read_only_by);
+            std::fs::write(dir.join(READ_ONLY_BY), &marker).unwrap();
+            frozen.push(frozen_line(
+                &format!("{}/{READ_ONLY_BY}", e.name),
+                marker.as_bytes(),
+            ));
         }
         if e.refused_by_1_0_0 != 0 {
             let marker = format!("{}\n", e.refused_by_1_0_0);
@@ -1505,17 +1951,26 @@ fn check_entry(label: &str, src: &Path, extra: Option<fn(&Pigeonhole) -> String>
         (None, Ok(_)) => panic!("{label}: {EXTRA} without a check"),
         (_, Err(_)) => {}
     }
-    // Write on top, through a flush and a compaction.
-    let t = db
+    // Write on top, through a flush and a compaction. A replica (D315 PR 3; the entry with
+    // [`READ_ONLY_BY`]) takes only its primary's changes: a local table is refused, and the
+    // flush, compaction, check and reread still run.
+    let replica = src.join(READ_ONLY_BY).exists();
+    match db
         .table("corpus_writes")
         .unwrap()
         .family("f", Family::default())
         .create_if_missing()
-        .unwrap();
-    t.mutate(b"written")
-        .put("f", b"q", b"by this build")
-        .commit()
-        .unwrap();
+    {
+        Ok(t) => {
+            assert!(!replica, "{label}: a replica took a local table");
+            t.mutate(b"written")
+                .put("f", b"q", b"by this build")
+                .commit()
+                .unwrap();
+        }
+        Err(e) if replica && e.code() == pigeonhole::ErrorCode::ReadOnly => {}
+        Err(e) => panic!("{label}: create: {e}"),
+    }
     db.flush().unwrap();
     db.compact().unwrap();
     db.close().unwrap();
@@ -1530,7 +1985,7 @@ fn check_entry(label: &str, src: &Path, extra: Option<fn(&Pigeonhole) -> String>
         .into_iter()
         .partition(|l| !l.starts_with("corpus_writes\t"));
     assert_eq!(old, expected, "{label}: contents after the write");
-    assert_eq!(new.len(), 1, "{label}: {new:?}");
+    assert_eq!(new.len(), usize::from(!replica), "{label}: {new:?}");
     db.close().unwrap();
 }
 

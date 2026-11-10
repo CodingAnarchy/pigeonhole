@@ -13,6 +13,8 @@ mod compact;
 pub(crate) mod dump;
 pub(crate) mod info;
 mod load;
+#[cfg(feature = "serve")]
+mod promote;
 pub(crate) mod schema;
 
 /// What a command produced: a report to render, or output it wrote itself (`dump`
@@ -90,6 +92,10 @@ pub(crate) fn run(
         } => backup::run(&cli, file, dest, *latest, *check),
         Command::Compact { file, shrink } => compact::run(&cli, file, *shrink, stderr),
         Command::Info { file } => info::run(&cli, file),
+        #[cfg(feature = "serve")]
+        Command::Promote { file } => promote::run(&cli, file),
+        #[cfg(feature = "serve")]
+        Command::Cluster(cmd) => crate::serve::cluster_run(&cli, cmd),
         Command::Check {
             file,
             deep,

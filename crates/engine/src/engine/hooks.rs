@@ -248,6 +248,10 @@ pub(crate) struct Hooks {
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
     pub manifest_parked: Mutex<Option<TaskWaker>>,
+    /// Keeps flush tasks that have reported alive (`flush::FlushTask`'s `run`,
+    /// `Engine::park_finished_flushes`), and their wakers.
+    pub flush_done_park: AtomicBool,
+    pub flush_done_parked: Mutex<Vec<TaskWaker>>,
     /// Holds each compaction job before its first slice (`Engine::hold_compactions`), and
     /// the held jobs' ids and wakers, oldest first (`Engine::release_held_compaction` takes
     /// one to let it run; clearing the hold takes them all).
@@ -1279,14 +1283,6 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
-    /// [`Engine::backup`] at `snapshot`: with [`Snapshot::at_seqno`], below commits its SSTs
-    /// already hold, so the backup rewrites those SSTs instead of copying them (#715).
-    #[doc(hidden)]
-    pub fn backup_at(&self, snapshot: Snapshot, dest: &Path) -> Result<()> {
-        let _guard = self.inner.enter_maintenance()?;
-        crate::maintenance::backup(&self.inner.shared, snapshot, dest)
-    }
-
     /// How many compactions on shard `shard` a write voided before they installed their
     /// purge, so that they compacted again (#316).
     #[doc(hidden)]
@@ -1419,6 +1415,18 @@ impl Engine {
         }
     }
 
+    /// Makes each root commit wait `delay` after its feed intent is appended, before it
+    /// writes anything (zero: no wait), widening the window in which a crash leaves an intent
+    /// whose superblock never landed (D315 amendment, #1504). A hold seam: the commit then
+    /// goes on as always. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn delay_root_intent(&self, delay: std::time::Duration) {
+        if let Some(f) = &self.inner.shared.feed {
+            let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+            f.root_intent_delay_nanos.store(nanos, Ordering::Relaxed);
+        }
+    }
+
     /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
     /// it: shards' manifest requests queue up (their pumps find it held and leave) until
     /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).
@@ -1480,6 +1488,40 @@ impl Engine {
                 w.wake();
             }
         }
+    }
+
+    /// While `park` is set, a flush task that has reported its outcome to its shard stays
+    /// alive, blocked, instead of finishing; clearing it lets them all finish. The window
+    /// in which a finished task used to still hold its memtables' readers (#1597's Windows CI
+    /// run) (test hook).
+    #[doc(hidden)]
+    pub fn park_finished_flushes(&self, park: bool) {
+        let hooks = &self.inner.shared.hooks;
+        hooks.flush_done_park.store(park, Ordering::Release);
+        if !park {
+            let parked = std::mem::take(
+                &mut *hooks
+                    .flush_done_parked
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            for w in parked {
+                w.wake();
+            }
+        }
+    }
+
+    /// How many finished flush tasks [`park_finished_flushes`](Self::park_finished_flushes)
+    /// holds (test hook).
+    #[doc(hidden)]
+    pub fn parked_flushes(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .flush_done_parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// The oldest `(seqno, view version)` any reader slot of the current region generation

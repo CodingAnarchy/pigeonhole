@@ -112,6 +112,7 @@ Every public enum is `#[non_exhaustive]` (ICR 0071, ICR 0073): a `match` outside
 | `shrink(&self) -> Result<u64>` | Truncate free space at the end of the file, relocate live data from the tail into free space and truncate again; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. A snapshot, scan, backup or reader-process snapshot that holds freed space keeps it until dropped; meanwhile `shrink` never grows the file and gives back less, so call it again afterwards for the rest (#1099). Call after deletes + `compact`. Relocates SST and blob extents (D185); after `compact` + `shrink` a file above a few MiB is about 1.05–1.2× its live data (D183), a small one about 1 MiB of metadata. Data with nowhere lower to go stays, not an error. Errors: `Closed`, `ReadOnly`, `NoSpace` (disk full while moving the manifest), `Io`. |
 | `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue; it can hold commits not yet durable here (D227). `dest` must not exist. Holds its snapshot's memtables only while it copies them (at most one arena's worth written to the copy); the long SST copy that follows pins file extents, not memtable space, so writers are not stalled by it. The copy opens with no WAL replay and no sidecars. SST and blob files are copied byte for byte (#715; a blob file only if the snapshot references it), so the copy is about the source's live data and keeps its level shape. |
 | `backup_durable(&self, dest: impl AsRef<Path>) -> Result<()>` | As `backup`, at a durable snapshot: the copy holds only commits durable here at their level. |
+| `backup_at(&self, snapshot: &Snapshot, dest: impl AsRef<Path>) -> Result<()>` | As `backup`, of `snapshot` (1.2.0, ICR 0125): exactly the commits it sees. A feed `from_snapshot(&snapshot)` starts at the first commit the copy lacks, so copy + feed misses and repeats nothing. `InvalidArgument` for another database's snapshot; `SnapshotExpired` after an automatic recovery. |
 | `is_failed(&self) -> bool` | Whether the instance failed: a shard panicked, an application-owned driver was dropped before `close`, a shard stopped after a WAL I/O error or an internal error, or a manifest commit failed (ICR 0040). One atomic load. Recovery: [recovery.md](recovery.md). |
 | `recovery_stats(&self) -> RecoveryStats` | What automatic recovery (`Options::auto_recover`, D265) did: `generation` (1 at open, +1 per recovery; engine metrics restart at each), `recoveries`, `gave_up`, `last_failure`, `last_recovery`. All zero and `false` with the option off. One lock, no I/O. |
 | `failure(&self) -> Option<Failure>` | The first failure: `Failure { shard: u32, cause: FailureCause }` (`shard` is `Failure::MAIN_FILE` for the main file; `FailureCause` `#[repr(u8)]`: `Panic` 1, `DriverDropped` 2, `Io` 3, `Internal` 4). Later failures don't replace it. |
@@ -147,6 +148,7 @@ Every public enum is `#[non_exhaustive]` (ICR 0071, ICR 0073): a `match` outside
 | `reader_slots(u32)` | Reader handles that can attach at once (default 128, 1..=65,536; ICR 0055). One more `open_reader` fails `NoReaderSlot` at once. A killed reader's slot is freed within about 250 ms. |
 | `create_if_missing(bool)` | Default true. |
 | `merge_operator(Arc<dyn MergeOperator>)` | Register a custom operator (families name it). |
+| `read_only(bool)` | ICR 0109 (and its amendment, #1348). Open read-only whatever the file needs, writing nothing to its files (no format upgrade, change-feed session, WAL segment, flush or clean-close mark; the WAL is replayed into memory, `ReadOnly` if it doesn't fit `memtable_budget`). A true read-only open: files opened read-only (read-only media works), the writer lock taken shared (several at once; a writer and a read-only open refuse each other with `WriterLocked`), no shared memory (a reader process can't attach to it; on Windows the whole `memtable_budget` is committed at open). |
 | `read_only_fallback(bool)` | ICR 0059. Open read-only instead of failing when this build can't write the file: an unknown `ro_compat` feature bit (else `UnsupportedFeature`) or a family naming an unregistered merge operator (else `UnknownMergeOperator`). The handle refuses writes, schema changes, `flush`, `compact`, `shrink` (`ReadOnly`) and writes nothing to the files: no format upgrade, flush, compaction or clean-close mark; the WAL is replayed into memory (`ReadOnly` if it doesn't fit `memtable_budget`). `DatabaseInfo::read_only` tells. |
 | `change_feed(FeedRetention)`, `change_feed_off()`, `feed_tables(..)` | D310. Keeps `retention` of committed history for `Table::feed()` subscribers. **Unset, an open inherits the last open's feed** (retention, age, fed tables) and, with `shards` unset, its shard count, so a tool's open (`phdb`) between two app runs keeps the app's tokens valid. `change_feed_off()` turns it off and ends the history; so does an explicit different `shards(n)`. A new database, or one last opened with the feed off, stays off. `DatabaseInfo::feed` tells. |
 | `allow_fuse(bool)` | Accept a database on FUSE (default off; D173). Only for a trusted **local** FUSE mount: its locks may be host-local and its sync may not be durable. Network filesystems stay refused. Also on `ReaderOptions`. |
@@ -440,6 +442,13 @@ let n: i64 = stats.get(b"user:42", "stats", b"logins")?
 // The value this increment produced, atomically (D314): unique per caller.
 let r = stats.mutate(b"user:42").incr("stats", b"logins", 1).commit_returning()?;
 assert_eq!(r.value("stats", b"logins")?, Some(2));
+// Get-and-set (D314 amendment 1): the value a put replaced, atomically.
+let r = stats
+    .mutate(b"user:42")
+    .put_i64("stats", b"logins", 0)
+    .return_previous("stats", b"logins")
+    .commit_returning()?;
+assert_eq!(r.previous("stats", b"logins")?.and_then(|c| c.as_i64()), Some(2));
 # Ok::<(), pigeonhole::Error>(())
 ```
 

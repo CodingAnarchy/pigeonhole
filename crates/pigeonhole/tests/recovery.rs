@@ -778,6 +778,12 @@ fn a_feed_waiting_through_the_swap_follows_it() {
 /// The record the error hits sits in a segment before the checkpoint, so the reopen's replay
 /// never reads it; the feed's read of it is held across the failure and the swap, then
 /// fails once.
+///
+/// Only the feed's thread is held. The poison's value is also in the SST the flush writes,
+/// and a compaction reading that block while every thread's reads were held blocked the old
+/// engine's close, which joins the engine's threads: the recovery couldn't finish until
+/// the release, which comes after it (#1599's macOS run). The test starts such a
+/// compaction itself, so that case is covered every run.
 #[test]
 fn an_io_error_from_the_old_engine_during_the_swap_follows_it() {
     let (vfs, gate) = gate::vfs(2004);
@@ -797,7 +803,7 @@ fn an_io_error_from_the_old_engine_during_the_swap_follows_it() {
     put(&t, "first").unwrap();
     let first = feed.next(Duration::from_secs(10)).unwrap().unwrap().seqno();
     const MARK: &[u8] = b"feed-io-marker-2004";
-    gate.hold_reads_containing(Some(MARK));
+    gate.hold_first_reader_containing(MARK);
     t.mutate(b"poison").put("f", b"q", MARK).commit().unwrap();
     let waiter = std::thread::spawn(move || {
         let mut rows = Vec::new();
@@ -819,12 +825,24 @@ fn an_io_error_from_the_old_engine_during_the_swap_follows_it() {
         put_sized(&t, &format!("fill{i:02}"), 16 << 10).unwrap();
     }
     db.flush().unwrap();
+    // A compaction reads the flushed poison's block on another thread: never held, so the
+    // old engine's close can join it.
+    let compaction = {
+        let db = db.clone();
+        std::thread::spawn(move || db.compact())
+    };
     let _ = fail_shard(&gate, &t, "lost");
     assert!(
         wait_until(20, || !db.is_failed()
             && db.recovery_stats().recoveries == 1),
-        "the supervisor did not recover"
+        "the supervisor did not recover: failed {}, {:?}, {} reads held",
+        db.is_failed(),
+        db.recovery_stats(),
+        gate.held_reads()
     );
+    // On the old engine or the new one; either way it ended, and its outcome isn't this
+    // test's.
+    let _ = compaction.join().unwrap();
     // Now the held read fails, once, on the superseded engine.
     gate.fail_next_read_containing(MARK);
     gate.release_reads();

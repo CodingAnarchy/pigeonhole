@@ -2,12 +2,13 @@
 //! threads following the bench table's feed (durable, or visible), and `phdb-bench reader
 //! --feed` children following it from reader processes. Each delivery's latency is the wall
 //! clock minus its commit's timestamp ([`FeedReport`]). A sampler keeps the retained bytes'
-//! peak, and the feed's sync counters are read around the phase.
+//! peak, and the feed's sync counters are read around the phase. When the phase ends, every
+//! subscriber goes on until it has covered the phase's last commit (bounded by
+//! [`DRAIN_WAIT`]), so each reports every commit of the phase.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pigeonhole::{ErrorCode, Feed, Pigeonhole, Table};
 
@@ -18,6 +19,42 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// How often the retained bytes are sampled.
 const SAMPLE_EVERY: Duration = Duration::from_millis(100);
+
+/// The longest a subscriber goes on after the phase for its last commits: a durable one
+/// waits for the sync that covers them, which a slow runner disk can take over a second
+/// for (#1553's Windows run).
+pub(crate) const DRAIN_WAIT: Duration = Duration::from_secs(30);
+
+/// When subscribers stop: once [`drain`](Self::drain) was called, at the first look that
+/// finds the feed covering its seqno, or past its deadline.
+#[derive(Debug, Default)]
+pub(crate) struct Stop {
+    through: OnceLock<(u64, Instant)>,
+}
+
+impl Stop {
+    /// Stop once `through` is covered, or after [`DRAIN_WAIT`]; 0 stops at once. Only the
+    /// first call counts.
+    pub(crate) fn drain(&self, through: u64) {
+        let _ = self.through.set((through, Instant::now() + DRAIN_WAIT));
+    }
+
+    fn draining(&self) -> bool {
+        self.through.get().is_some()
+    }
+
+    /// `None` to go on; else whether the deadline ended it (with `through` not covered).
+    fn ended(&self, covered: u64) -> Option<bool> {
+        let &(through, deadline) = self.through.get()?;
+        if covered >= through {
+            Some(false)
+        } else if Instant::now() >= deadline {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
 
 /// Wall-clock microseconds, the commit timestamps' clock.
 pub(crate) fn now_micros() -> u64 {
@@ -32,17 +69,23 @@ pub(crate) struct Followed {
     pub(crate) hist: Histogram,
     pub(crate) expired: u64,
     pub(crate) errors: u64,
+    /// 1 if the drain's deadline stopped it before it covered the phase's last commit.
+    pub(crate) drain_timeouts: u64,
 }
 
-/// Follows `feed` until `stop`, recording each commit's delivery latency. An expired feed is
-/// counted and reopened at now (the row is void anyway, [`FeedReport::expired`]).
+/// Follows `feed` until `stop` says so, recording each commit's delivery latency. An expired
+/// feed is counted and reopened at now (the row is void anyway, [`FeedReport::expired`]).
 pub(crate) fn follow(
     mut feed: Feed,
     reopen: impl Fn() -> Result<Feed, pigeonhole::Error>,
-    stop: &AtomicBool,
+    stop: &Stop,
 ) -> Followed {
     let mut out = Followed::default();
-    while !stop.load(Ordering::Acquire) {
+    loop {
+        if let Some(timed_out) = stop.ended(feed.progress().covered_seqno()) {
+            out.drain_timeouts = u64::from(timed_out);
+            return out;
+        }
         match feed.next(POLL) {
             Ok(Some(c)) => {
                 let late = now_micros().saturating_sub(c.timestamp());
@@ -65,7 +108,6 @@ pub(crate) fn follow(
             }
         }
     }
-    out
 }
 
 /// The feed's counters at a point, to subtract.
@@ -93,7 +135,7 @@ impl Counters {
 #[derive(Debug)]
 pub(crate) struct Running {
     db: Pigeonhole,
-    stop: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     durable: Vec<JoinHandle<Followed>>,
     visible: Vec<JoinHandle<Followed>>,
     readers: Option<super::reader_process::FeedChildren>,
@@ -111,7 +153,7 @@ pub(crate) fn start(
     visible: usize,
     readers: usize,
 ) -> Result<Running, String> {
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(Stop::default());
     let spawn = |visible: bool| -> Result<JoinHandle<Followed>, String> {
         let open = {
             let table = table.clone();
@@ -145,7 +187,7 @@ pub(crate) fn start(
                     peak.0 = peak.0.max(f.retained_wal_bytes);
                     peak.1 = peak.1.max(f.held_blob_bytes);
                 }
-                if stop.load(Ordering::Acquire) {
+                if stop.draining() {
                     return peak;
                 }
                 std::thread::sleep(SAMPLE_EVERY);
@@ -164,11 +206,18 @@ pub(crate) fn start(
 }
 
 impl Running {
-    /// Stops every subscriber and reports them with the feed's cost over the phase.
+    /// Stops every subscriber once it has covered the phase's last commit (bounded by
+    /// [`DRAIN_WAIT`]), and reports them with the feed's cost over the phase.
     pub(crate) fn stop(mut self) -> Result<FeedReport, String> {
         let after = Counters::read(&self.db);
-        self.stop.store(true, Ordering::Release);
-        let (mut expired, mut errors) = (0, 0);
+        // The phase's writers are done: every subscriber delivers through the last commit.
+        let through = self.db.visible_seqno();
+        let drained = Instant::now();
+        self.stop.drain(through);
+        if let Some(r) = &mut self.readers {
+            r.drain(through);
+        }
+        let (mut expired, mut errors, mut drain_timeouts) = (0, 0, 0);
         let mut join = |handles: Vec<JoinHandle<Followed>>| -> Result<(u32, Histogram), String> {
             let n = handles.len() as u32;
             let mut hist = Histogram::new();
@@ -177,6 +226,7 @@ impl Running {
                 hist.merge(&f.hist);
                 expired += f.expired;
                 errors += f.errors;
+                drain_timeouts += f.drain_timeouts;
             }
             Ok((n, hist))
         };
@@ -193,6 +243,7 @@ impl Running {
             visible_delivery: LatencyStats::of(&visible),
             expired,
             errors,
+            drain_timeouts,
             background_syncs: after.background.saturating_sub(self.before.background),
             group_syncs: after.group.saturating_sub(self.before.group),
             sidecar_syncs: after.sidecar.saturating_sub(self.before.sidecar),
@@ -209,7 +260,9 @@ impl Running {
             report.reader_wakeups_per_sec = f.wakeups_per_sec;
             report.expired += f.expired;
             report.errors += f.errors;
+            report.drain_timeouts += f.drain_timeouts;
         }
+        report.drain_ms = drained.elapsed().as_millis() as u64;
         Ok(report)
     }
 }
@@ -217,6 +270,6 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         // A run that failed before `stop` leaves no subscriber behind.
-        self.stop.store(true, Ordering::Release);
+        self.stop.drain(0);
     }
 }

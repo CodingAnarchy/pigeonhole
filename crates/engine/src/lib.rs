@@ -66,12 +66,16 @@ pub use check::{
 pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
-    AppOwned, BackgroundWorker, CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard,
-    FamilyInfo, FamilyStorage, FeedStorage, LevelStorage, Metrics, PendingReturning, Returned,
-    Role, ShardStats, TableInfo, TableStorage,
+    AppOwned, BackgroundWorker, CheckReturned, CommitInfo, CrossShardMetrics, DbInfo, Engine,
+    EngineShard, FamilyInfo, FamilyStorage, FeedStorage, LatencyBuckets, LevelStorage, Metrics,
+    PendingCheckReturning, PendingReturning, Previous, Returned, Role, ShardStats, TableInfo,
+    TableStorage,
 };
 pub use error::{Error, Result};
-pub use feed_reader::{Change, Commit, Expiry, FeedReader, FeedSpec, FeedStart, Next};
+pub use feed_reader::all_tables_token_position;
+pub use feed_reader::{
+    CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
+};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};
@@ -83,12 +87,14 @@ pub use read::reduce::{
     NoRowLimit, Overflow, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec, ReduceStats, Reduced,
     Reducer, RowLimit, RowRange, RowsLimit, TopK, Visit,
 };
+pub use read::reduce_async::{PendingReduce, REDUCE_POLL_BYTES, REDUCE_POLL_CELLS};
 pub use read::traverse::{
     DEFAULT_MAX_NODES, Hop, MAX_HOPS, PendingTraversal, TRAVERSE_PARALLEL_FLOOR,
     TRAVERSE_POLL_CELLS, Traversal, TraverseSpec, TraverseStats,
 };
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};
+pub use shard::remove_side_files;
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};

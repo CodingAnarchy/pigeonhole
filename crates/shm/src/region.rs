@@ -150,12 +150,16 @@ impl Inner {
     /// [`durable_seqno`](Self::durable_seqno) with `durable`, and also below every shard's
     /// written watermark (and, with `durable`, its synced one). Per shard, `pending` (and
     /// `durable`) first, then `written` (and `synced`), all Acquire: a shard stores those
-    /// before `pending` lets a seqno go.
-    fn written_seqno(&self, durable: bool) -> Seqno {
+    /// before `pending` lets a seqno go. With `catalog`, also below `CATALOG_HOLD`.
+    fn written_seqno(&self, durable: bool, catalog: bool) -> Seqno {
         let (next, held) = self.next_and_held();
         // After `NEXT_SEQNO`: a catalog change stores its hold under the allocator's lock,
         // before the mirror passes its ceiling (D315), as a decision does `CROSS_HELD`.
-        let catalog = self.h64(header::CATALOG_HOLD).load(Ordering::Acquire);
+        let catalog = if catalog {
+            self.h64(header::CATALOG_HOLD).load(Ordering::Acquire)
+        } else {
+            u64::MAX
+        };
         let mut lowest = next.min(held).min(catalog);
         for shard in 0..self.header.shard_count {
             lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
@@ -467,103 +471,169 @@ fn read_header(
     Ok(h)
 }
 
-/// Attaches to generation `generation` named by the directory (reader open and re-attach).
-fn attach(
-    vfs: &VfsRef,
+/// What an open of either role starts from: the directory region, the database file's
+/// identity and id, and the configuration.
+struct Opening<'a> {
+    vfs: &'a VfsRef,
     directory: SharedRegion,
     identity: FileIdentity,
     db_id: [u8; 16],
-    config: &ShmConfig,
-    generation: Generation,
-) -> Result<Inner> {
-    if generation.0 == 0 {
-        // No writer has built a region (or the last one removed the directory's generation).
-        return Err(Error::NoWriter);
-    }
-    let found = directory
-        .atomic_u32(directory::LAYOUT_VERSION)
-        .load(Ordering::Acquire);
-    if found != ShmLayoutVersion::CURRENT.0 {
-        return Err(Error::VersionMismatch {
-            found,
-            expected: ShmLayoutVersion::CURRENT.0,
-        });
-    }
-    let dir = config.dir.as_deref();
-    let name = region_name(identity.device, identity.inode, generation.0);
-    // The generation the directory names may be gone: its writer closed and no process
-    // maps it (on Windows a mapping disappears with its last handle, #844). Only that is
-    // `NoWriter`; any other failure stays an I/O error.
-    let no_writer = |e: pigeonhole_io::Error| match e.kind {
-        ErrorKind::NotFound => Error::NoWriter,
-        _ => Error::Io(e),
-    };
-    let probe = vfs
-        .open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach)
-        .map_err(no_writer)?;
-    let h = read_header(&probe, db_id, identity, generation)?;
-    let len = usize::try_from(h.region_len).map_err(|_| Error::Corrupt("region length"))?;
-    let region = if probe.len() >= len {
-        probe
-    } else {
-        vfs.open_shared(&name, dir, h.region_len, SharedOpen::Attach)
-            .map_err(no_writer)?
-    };
-    let state = region.atomic_u32(header::STATE);
-    let mut waited = 0;
-    loop {
-        match state.load(Ordering::Acquire) {
-            STATE_READY => break,
-            STATE_ABANDONED => return Err(Error::Stale),
-            STATE_INITIALIZING if waited < READY_WAIT_ATTEMPTS => {
-                waited += 1;
-                std::thread::sleep(READY_WAIT_DELAY);
-            }
-            STATE_INITIALIZING => return Err(Error::Corrupt("region never became ready")),
-            _ => return Err(Error::Corrupt("region state")),
-        }
-    }
-    Ok(Inner {
-        region,
-        directory: Some(directory),
-        header: h,
-        generation,
-        db_id,
-        identity,
-        config: config.clone(),
-        publish_lock: Mutex::new(Vec::new()),
-    })
+    config: &'a ShmConfig,
 }
 
-/// Builds a new generation (writer open): creates and initializes the new region, marks the
-/// old one abandoned, records the new generation in the directory, and removes the old name.
-fn build(
-    vfs: &VfsRef,
-    file: &FileRef,
-    directory: SharedRegion,
-    identity: FileIdentity,
-    db_id: [u8; 16],
-    config: &ShmConfig,
-    current: u64,
-) -> Result<Inner> {
-    let dir = config.dir.as_deref();
-    let mut current = current;
-    let mut old = if current == 0 {
-        None
-    } else {
-        let name = region_name(identity.device, identity.inode, current);
-        unless_missing(vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach))?
-    };
-    if old.as_ref().is_some_and(|old| region_db_id(old) != db_id) {
-        // Left by another database whose file had this file's (device, inode): the inode was
-        // reused after that file was deleted, and an inode is not reused while any process
-        // has the file open, so nothing maps this region for its own database (#1133).
-        // Remove it and start this database at generation 1.
-        vfs.remove_shared(&region_name(identity.device, identity.inode, current), dir)?;
-        current = 0;
-        old = None;
+impl Opening<'_> {
+    fn dir(&self) -> Option<&Path> {
+        self.config.dir.as_deref()
     }
-    if let Some(old) = &old {
+
+    /// The name of this database file's region of generation `generation`.
+    fn region_name(&self, generation: u64) -> String {
+        region_name(self.identity.device, self.identity.inode, generation)
+    }
+
+    /// The open region: `region`, generation `generation`, with header `header`.
+    fn into_inner(self, region: SharedRegion, header: ShmHeader, generation: Generation) -> Inner {
+        Inner {
+            region,
+            directory: Some(self.directory),
+            header,
+            generation,
+            db_id: self.db_id,
+            identity: self.identity,
+            config: self.config.clone(),
+            publish_lock: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Attaches to generation `generation` named by the directory (reader open and
+    /// re-attach).
+    fn attach(self, generation: Generation) -> Result<Inner> {
+        if generation.0 == 0 {
+            // No writer has built a region (or the last one removed the directory's
+            // generation).
+            return Err(Error::NoWriter);
+        }
+        let found = self
+            .directory
+            .atomic_u32(directory::LAYOUT_VERSION)
+            .load(Ordering::Acquire);
+        if found != ShmLayoutVersion::CURRENT.0 {
+            return Err(Error::VersionMismatch {
+                found,
+                expected: ShmLayoutVersion::CURRENT.0,
+            });
+        }
+        let (vfs, dir) = (self.vfs, self.dir());
+        let name = self.region_name(generation.0);
+        // The generation the directory names may be gone: its writer closed and no process
+        // maps it (on Windows a mapping disappears with its last handle, #844). Only that is
+        // `NoWriter`; any other failure stays an I/O error.
+        let no_writer = |e: pigeonhole_io::Error| match e.kind {
+            ErrorKind::NotFound => Error::NoWriter,
+            _ => Error::Io(e),
+        };
+        let probe = vfs
+            .open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach)
+            .map_err(no_writer)?;
+        let h = read_header(&probe, self.db_id, self.identity, generation)?;
+        let len = usize::try_from(h.region_len).map_err(|_| Error::Corrupt("region length"))?;
+        let region = if probe.len() >= len {
+            probe
+        } else {
+            vfs.open_shared(&name, dir, h.region_len, SharedOpen::Attach)
+                .map_err(no_writer)?
+        };
+        let state = region.atomic_u32(header::STATE);
+        let mut waited = 0;
+        loop {
+            match state.load(Ordering::Acquire) {
+                STATE_READY => break,
+                STATE_ABANDONED => return Err(Error::Stale),
+                STATE_INITIALIZING if waited < READY_WAIT_ATTEMPTS => {
+                    waited += 1;
+                    std::thread::sleep(READY_WAIT_DELAY);
+                }
+                STATE_INITIALIZING => return Err(Error::Corrupt("region never became ready")),
+                _ => return Err(Error::Corrupt("region state")),
+            }
+        }
+        Ok(self.into_inner(region, h, generation))
+    }
+
+    /// Builds a new generation (writer open): creates and initializes the new region, marks
+    /// the old one abandoned, records the new generation in the directory, and removes the
+    /// old name.
+    fn build(self, file: &FileRef, current: u64) -> Result<Inner> {
+        let (current, old) = self.previous(file, current)?;
+        // Present before the new generation is published, so a closing process cannot pass
+        // `Presence::try_become_last` and remove it. After the probe above this is a no-op.
+        present(file)?;
+        let generation = Generation(
+            current
+                .checked_add(1)
+                .ok_or(Error::Corrupt("generation counter exhausted"))?,
+        );
+        let (vfs, dir) = (self.vfs, self.dir());
+        let name = self.region_name(generation.0);
+        if name.len() > MAX_REGION_NAME {
+            return Err(io_error(
+                ErrorKind::Other,
+                "shared-memory region name exceeds 30 bytes (31 with the leading `/`)",
+            ));
+        }
+        let writer = vfs.current_process();
+        let h = new_header(self.db_id, self.config, self.identity, generation, writer);
+        let region = match vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew) {
+            Ok(r) => r,
+            Err(e) if e.kind == ErrorKind::AlreadyExists => {
+                // Left by a writer that died after creating it and before recording it in the
+                // directory, so no process can be attached to it: replace it.
+                vfs.remove_shared(&name, dir)?;
+                vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew)
+                    .map_err(unavailable)?
+            }
+            Err(e) => return Err(unavailable(e)),
+        };
+        init_region(&region, &h, generation, writer, self.config.first_seqno);
+        if let Some(old) = &old {
+            old.atomic_u32(header::STATE)
+                .store(STATE_ABANDONED, Ordering::Release);
+        }
+        self.directory
+            .atomic_u32(directory::LAYOUT_VERSION)
+            .store(ShmLayoutVersion::CURRENT.0, Ordering::Release);
+        self.directory
+            .atomic_u64(directory::GENERATION)
+            .store(generation.0, Ordering::Release);
+        if old.is_some() {
+            // Mappings other processes still hold stay valid; only the name goes.
+            let _ = vfs.remove_shared(&self.region_name(current), dir);
+        }
+        Ok(self.into_inner(region, h, generation))
+    }
+
+    /// The generation a writer builds on (the directory's `current`) and its region, if it
+    /// still exists and is this database's. A region another database left is removed and
+    /// the count starts over; a live one with another layout version is refused unless no
+    /// other process has the database open.
+    fn previous(&self, file: &FileRef, current: u64) -> Result<(u64, Option<SharedRegion>)> {
+        if current == 0 {
+            return Ok((0, None));
+        }
+        let (vfs, dir, name) = (self.vfs, self.dir(), self.region_name(current));
+        let Some(old) =
+            unless_missing(vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach))?
+        else {
+            return Ok((current, None));
+        };
+        if region_db_id(&old) != self.db_id {
+            // Left by another database whose file had this file's (device, inode): the inode
+            // was reused after that file was deleted, and an inode is not reused while any
+            // process has the file open, so nothing maps this region for its own database
+            // (#1133). Remove it and start this database at generation 1.
+            vfs.remove_shared(&name, dir)?;
+            return Ok((0, None));
+        }
         // A live region with another layout version is refused unless no other process has
         // the database open (then nobody can be attached to it).
         let found = old
@@ -575,61 +645,8 @@ fn build(
                 expected: ShmLayoutVersion::CURRENT.0,
             });
         }
+        Ok((current, Some(old)))
     }
-    // Present before the new generation is published, so a closing process cannot pass
-    // `Presence::try_become_last` and remove it. After the probe above this is a no-op.
-    present(file)?;
-
-    let generation = Generation(
-        current
-            .checked_add(1)
-            .ok_or(Error::Corrupt("generation counter exhausted"))?,
-    );
-    let name = region_name(identity.device, identity.inode, generation.0);
-    if name.len() > MAX_REGION_NAME {
-        return Err(io_error(
-            ErrorKind::Other,
-            "shared-memory region name exceeds 30 bytes (31 with the leading `/`)",
-        ));
-    }
-    let writer = vfs.current_process();
-    let h = new_header(db_id, config, identity, generation, writer);
-    let region = match vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew) {
-        Ok(r) => r,
-        Err(e) if e.kind == ErrorKind::AlreadyExists => {
-            // Left by a writer that died after creating it and before recording it in the
-            // directory, so no process can be attached to it: replace it.
-            vfs.remove_shared(&name, dir)?;
-            vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew)
-                .map_err(unavailable)?
-        }
-        Err(e) => return Err(unavailable(e)),
-    };
-    init_region(&region, &h, generation, writer, config.first_seqno);
-    if let Some(old) = &old {
-        old.atomic_u32(header::STATE)
-            .store(STATE_ABANDONED, Ordering::Release);
-    }
-    directory
-        .atomic_u32(directory::LAYOUT_VERSION)
-        .store(ShmLayoutVersion::CURRENT.0, Ordering::Release);
-    directory
-        .atomic_u64(directory::GENERATION)
-        .store(generation.0, Ordering::Release);
-    if old.is_some() {
-        // Mappings other processes still hold stay valid; only the name goes.
-        let _ = vfs.remove_shared(&region_name(identity.device, identity.inode, current), dir);
-    }
-    Ok(Inner {
-        region,
-        directory: Some(directory),
-        header: h,
-        generation,
-        db_id,
-        identity,
-        config: config.clone(),
-        publish_lock: Mutex::new(Vec::new()),
-    })
 }
 
 impl ShmRegion {
@@ -670,9 +687,16 @@ impl ShmRegion {
         let current = directory
             .atomic_u64(directory::GENERATION)
             .load(Ordering::Acquire);
+        let opening = Opening {
+            vfs,
+            directory,
+            identity,
+            db_id,
+            config,
+        };
         let inner = match role {
-            Role::Reader => attach(vfs, directory, identity, db_id, config, Generation(current))?,
-            Role::Writer => build(vfs, file, directory, identity, db_id, config, current)?,
+            Role::Reader => opening.attach(Generation(current))?,
+            Role::Writer => opening.build(file, current)?,
         };
         Ok(ShmRegion {
             inner: Arc::new(inner),
@@ -973,8 +997,13 @@ impl ShmRegion {
     /// The change feed's frontier (D310): every commit at or below it is applied on every
     /// shard and its records are in their stream files; with `durable`, it is durable at its
     /// level and the records the feed needs are synced, so no crash undoes it. Never above [`ShmRegion::visible_seqno`].
-    pub fn written_seqno(&self, durable: bool) -> Seqno {
-        self.inner.written_seqno(durable)
+    ///
+    /// With `catalog` (a feed of every table, D315), it is also below `CATALOG_HOLD`, the
+    /// ceiling of a catalog change whose sidecar entry isn't appended yet. A feed of some
+    /// tables delivers no catalog changes, so it doesn't wait for them (simp724's F2 on
+    /// #1515).
+    pub fn written_seqno(&self, durable: bool, catalog: bool) -> Seqno {
+        self.inner.written_seqno(durable, catalog)
     }
 
     /// The highest seqno a durable snapshot may include (D227, ICR 0037): every commit at or
@@ -1451,22 +1480,37 @@ mod tests {
         let shm = ShmRegion::in_memory([3; 16], &small());
         shm.advance_next_seqno(100);
         assert_eq!(shm.visible_seqno(), 99);
-        assert_eq!(shm.written_seqno(false), 99);
+        assert_eq!(shm.written_seqno(false, false), 99);
         shm.publish_written(1, 40);
-        assert_eq!(shm.written_seqno(false), 39);
-        assert_eq!(shm.written_seqno(true), 39);
+        assert_eq!(shm.written_seqno(false, false), 39);
+        assert_eq!(shm.written_seqno(true, false), 39);
         assert_eq!(shm.visible_seqno(), 99, "snapshots ignore it");
         // A durable feed is also below every durable and synced watermark.
         shm.publish_durable(0, 20);
-        assert_eq!(shm.written_seqno(true), 19);
-        assert_eq!(shm.written_seqno(false), 39);
+        assert_eq!(shm.written_seqno(true, false), 19);
+        assert_eq!(shm.written_seqno(false, false), 39);
         shm.publish_synced(0, 10);
-        assert_eq!(shm.written_seqno(true), 9);
-        assert_eq!(shm.written_seqno(false), 39, "a visible feed ignores it");
+        assert_eq!(shm.written_seqno(true, false), 9);
+        assert_eq!(
+            shm.written_seqno(false, false),
+            39,
+            "a visible feed ignores it"
+        );
         shm.publish_written(1, u64::MAX);
         shm.publish_durable(0, u64::MAX);
         shm.publish_synced(0, u64::MAX);
-        assert_eq!(shm.written_seqno(true), 99);
+        assert_eq!(shm.written_seqno(true, false), 99);
+        // D315: the catalog hold bounds only a feed of every table's frontier.
+        shm.publish_catalog_hold(50);
+        assert_eq!(shm.written_seqno(true, true), 49);
+        assert_eq!(shm.written_seqno(false, true), 49);
+        assert_eq!(
+            shm.written_seqno(true, false),
+            99,
+            "a feed of some tables ignores it"
+        );
+        shm.publish_catalog_hold(u64::MAX);
+        assert_eq!(shm.written_seqno(true, true), 99);
     }
 
     #[test]

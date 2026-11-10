@@ -340,18 +340,7 @@ impl KeyCursor {
         keys: KeySet,
         shared: Arc<crate::shard::Shared>,
     ) -> Result<Self> {
-        let groups = key_groups(&snapshot, table, &keys)?;
-        let end = keys.len();
-        Ok(Self::with_groups(
-            snapshot,
-            families,
-            spec,
-            now,
-            Arc::new(keys),
-            groups,
-            (0, end),
-            shared,
-        ))
+        Self::over(snapshot, table, families, spec, now, Arc::new(keys), shared)
     }
 
     /// [`KeyCursor::new`] over a shared key set (D304's async traversal reads each hop's

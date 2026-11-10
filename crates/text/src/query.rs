@@ -138,6 +138,20 @@ impl Query {
         })
     }
 
+    /// Adds a phrase given as text, tokenised as documents are, like the syntax's `"..."~N`
+    /// ([`Clause::QuotedPhrase`]): matched at consecutive positions, or within `slop`
+    /// position moves of them, as [`phrase_with_slop`](Self::phrase_with_slop) is. Its
+    /// stop words keep their places, so their positions must be there in a match. Unlike
+    /// [`phrase`](Self::phrase), whose words are matched exactly as given, `"March meeting"`
+    /// here matches an index that holds `march meeting` (ICR 0105, amended for `phdb
+    /// serve`'s `Text.Search`, D313 ticket 7c).
+    pub fn quoted_phrase(self, text: impl Into<String>, slop: u16) -> Self {
+        self.with(Clause::QuotedPhrase {
+            text: text.into(),
+            slop,
+        })
+    }
+
     /// Adds text, tokenised as documents are: each of its terms is a clause's term.
     pub fn text(self, text: impl Into<String>) -> Self {
         self.with(Clause::Text(text.into()))

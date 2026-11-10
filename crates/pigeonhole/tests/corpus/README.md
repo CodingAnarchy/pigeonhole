@@ -9,6 +9,7 @@ Small database files that every later build must open, read, check and write (D2
 - `expected.txt`, every cell the generating build read back, one per line: table, row (hex), family, qualifier (hex), timestamp, value. A vector value is its element, dimension and stored bytes;
 - `expected-extra.txt`, in the entries built on the public API: what the generating build's text index, vector index or memory store `verify` reported, or the commits a feed resumed from a stored token delivered. The check compares what the checking build reads with it;
 - `refused-by-1.0.0.txt`, in an entry that uses a feature 1.0.0 lacks: the `incompat` bits the refusal names (see below).
+- `feed-resumes-by-1.1.0.txt`, in an entry whose stored table feed token 1.1.0 must resume: `compat-reader-1.1` resumes it and compares the commits with `expected-extra.txt` (all but the values' hashes).
 
 | Entry | What it holds |
 |---|---|
@@ -29,6 +30,8 @@ Small database files that every later build must open, read, check and write (D2
 | `feed_crash` | the same, left by a process crash |
 | `feed_sessions` | the change feed over two sessions: 150 commits, a clean close, a reopen that inherits the feed, 150 more, and a clean close. The check's open is the third session, with the default WAL segment size (the writer's is 256 KiB), and a feed from the oldest history must start at the first session's first commit and deliver both (#1465, #1471) |
 | `returning` | `commit_returning` increments (D314) on a hot counter whose base is an older SST's `Put`, flushed: its SST holds the newest write-time D291 checkpoint as the counter's base, at its commit's seqno, with the later operands above it |
+| `feed_catalog` | the change feed for every table (D315): a feed of every table's token from before the first commit, stored in a table, then 120 rounds of commits among catalog changes: a table created with two families, a family added to it, and two tables dropped, one from before the token, beside a table from before the token that survives. The check resumes a feed of every table from the token and lists every event: the catalog changes with their names, and each commit's changes, with the table and family of a table dropped by the check listed as `(dropped)` |
+| `feed_root_intent` | the D315 amendment (#1504): a first session with the feed off creates the tables, so no feeding session changes the catalog; a second, with the feed on, stores a table feed's token, then writes 60 commits to two tables with flushes, whose root commits record their intents and overwrite them with their Root entries, and closes cleanly. The check resumes the token. `feed-resumes-by-1.1.0.txt` makes `compat-reader-1.1` resume it too: 1.1.0 reads the sidecar 1.2 leaves after clean closes. (1.1.0 can't resume across a session that changed the catalog: it doesn't know type 4, and its feed expires there, fail closed.) |
 
 The check copies each entry to a temporary directory, opens it with the real filesystem, and compares every cell with `expected.txt`. It then writes a row through a flush and a compaction, closes, runs the offline check, reopens, and reads everything again.
 
@@ -55,6 +58,8 @@ Each reader's package version is the release it pins. The release opens each ent
 - **A release that reads every one** must open the entry read-write. 1.1.0 reads bit 0, so it must open `aggregates`, `vectors`, `text` and `memory`, and a refusal fails it.
 
 The `Compatibility` workflow (`.github/workflows/compat.yml`) runs one arm per release on main and PRs. Each arm enables itself once its release is on crates.io.
+
+**Neither reader commits a lockfile.** Each run resolves the pinned release's own dependencies afresh, within their semver ranges, as an application that adds that release today would. So a run's third-party versions can differ from the last one's. That's intended: the promise is about what the release reads, not the build that a lockfile would freeze.
 
 ## Upgrade corpus
 

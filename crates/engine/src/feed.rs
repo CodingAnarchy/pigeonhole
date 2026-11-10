@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_format::BlobFileId;
-use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries};
+use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, FeedTables, decode_entries_at};
 use pigeonhole_format::manifest::Edit;
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
 use pigeonhole_runtime::ShardId;
@@ -68,14 +68,32 @@ pub(crate) struct Sidecar {
     file: FileRef,
     /// Where the next entry goes.
     end: u64,
+    /// The `RootIntent` this session appended for the root commit in progress, and where:
+    /// its Root entry overwrites exactly that one (simp724's R2 on #1504). Root commits
+    /// never overlap, so one.
+    intent: Option<(u64, u64, bool)>,
 }
 
 impl Sidecar {
     fn append(&mut self, entry: &FeedEntry) -> Result<()> {
         let mut bytes = Vec::with_capacity(64);
         entry.encode(&mut bytes);
-        self.file.write_at(&bytes, self.end)?;
+        self.append_bytes(&bytes)
+    }
+
+    /// Appends encoded entries in one write.
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.write_at(bytes, self.end)?;
         self.end += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Overwrites the entry at `at` with `entry`, of the same framed length (a `RootIntent`
+    /// by its `Root`): the sidecar's only write in place.
+    fn overwrite(&mut self, at: u64, entry: &FeedEntry) -> Result<()> {
+        let mut bytes = Vec::with_capacity(32);
+        entry.encode(&mut bytes);
+        self.file.write_at(&bytes, at)?;
         Ok(())
     }
 }
@@ -90,6 +108,7 @@ pub(crate) fn open_sidecar(
     db_id: [u8; 16],
     entry: &FeedEntry,
     create: bool,
+    opened: OpenedRoot,
 ) -> Result<Option<Sidecar>> {
     let path = sidecar_path(db);
     let exists = vfs.exists(&path)?;
@@ -98,18 +117,12 @@ pub(crate) fn open_sidecar(
     }
     let file = vfs.open(&path, OpenOptions::read_write_create())?;
     let len = file.len()?;
-    let mut bytes = vec![0u8; len as usize];
-    if len > 0 {
-        file.read_at(&mut bytes, 0)?;
-    }
-    let valid = match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == db_id => {
-            let (_, end) = decode_entries(&bytes[FeedHeader::LEN..]);
-            Some(FeedHeader::LEN + end)
-        }
-        // Another database's, or a torn or damaged header: its history is not ours. A reader
-        // finds no session for the segments' marks and expires.
-        _ => None,
+    let bytes = read_whole(&file)?;
+    // Another database's, or a torn or damaged header: its history is not ours. A reader
+    // finds no session for the segments' marks and expires.
+    let valid = match entries_of(&bytes, db_id) {
+        Some((entries, end)) => Some(resolve_intent(&file, &entries, end, opened)?),
+        None => None,
     };
     let rewritten = valid.is_none();
     let mut sidecar = match valid {
@@ -120,6 +133,7 @@ pub(crate) fn open_sidecar(
             Sidecar {
                 file,
                 end: end as u64,
+                intent: None,
             }
         }
         None => {
@@ -131,6 +145,7 @@ pub(crate) fn open_sidecar(
             Sidecar {
                 file,
                 end: FeedHeader::LEN as u64,
+                intent: None,
             }
         }
     };
@@ -146,6 +161,79 @@ pub(crate) fn open_sidecar(
         vfs.sync_dir(dir)?;
     }
     Ok(Some(sidecar))
+}
+
+/// The superblock an open read, before any root commit of its own: its `sequence` and
+/// checksum (FORMAT §8.2), which decide a trailing `RootIntent` (D315 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenedRoot {
+    pub(crate) sequence: u64,
+    pub(crate) checksum: u64,
+}
+
+/// Resolves a `RootIntent` the previous session left as the sidecar's last entry (D315
+/// amendment, #1504), before this open appends anything: a process crash came between that
+/// root commit's intent and its Root entry. Returns where the valid entries now end.
+///
+/// - The root landed (the superblock this open read has the intent's sequence and
+///   checksum): the intent becomes that session's `Root`, written over it in place, so the
+///   history reads as if no crash happened, for any build.
+/// - It didn't (its sequence is one past the superblock's): the intent goes, with the
+///   `Catalog` entry of the same root before it, if any, cut off as a torn tail is.
+/// - Anything else (a build that knows no intents opened and committed since): left alone,
+///   and readers fail closed on it (`chain`).
+///
+/// Offsets in `entries` are past the header.
+fn resolve_intent(
+    file: &FileRef,
+    entries: &[(usize, FeedEntry)],
+    end: usize,
+    opened: OpenedRoot,
+) -> Result<usize> {
+    // A lone Catalog entry at the end, for a root one past the superblock's: its intent was
+    // lost (a power loss kept the first part of their one write) or never appended (a failed
+    // append, then a failed commit). Its root never landed: cut it off, as its intent would
+    // be (simp724's F1 on #1526). One for the superblock's own root lost its intent after the
+    // root landed: the chain then misses that Root and fails closed.
+    if let Some((at, FeedEntry::Catalog { sequence, .. })) = entries.last()
+        && *sequence == opened.sequence + 1
+    {
+        let cut = (FeedHeader::LEN + at) as u64;
+        file.set_len(cut)?;
+        return Ok(cut as usize);
+    }
+    let Some((at, FeedEntry::RootIntent { sequence, checksum })) = entries.last() else {
+        return Ok(end);
+    };
+    let at = (FeedHeader::LEN + at) as u64;
+    if *sequence == opened.sequence && *checksum == opened.checksum {
+        // The session that wrote it: the last Session entry before it.
+        let session = entries.iter().rev().find_map(|(_, e)| match e {
+            FeedEntry::Session { session, .. } => Some(*session),
+            _ => None,
+        });
+        if let Some(session) = session {
+            let mut root = Vec::with_capacity(32);
+            FeedEntry::Root {
+                session,
+                sequence: *sequence,
+            }
+            .encode(&mut root);
+            file.write_at(&root, at)?;
+        }
+        return Ok(end);
+    }
+    if *sequence == opened.sequence + 1 {
+        let cut = match entries.iter().rev().nth(1) {
+            Some((before, FeedEntry::Catalog { sequence: s, .. })) if s == sequence => {
+                (FeedHeader::LEN + before) as u64
+            }
+            _ => at,
+        };
+        file.set_len(cut)?;
+        return Ok(cut as usize);
+    }
+    Ok(end)
 }
 
 /// What an open inherits from the sidecar's last session (the D310 amendment, the owner
@@ -171,15 +259,40 @@ pub(crate) fn last_session(
     if !vfs.exists(&path)? {
         return Ok(None);
     }
-    let file = vfs.open(&path, OpenOptions::read())?;
+    Ok(read_sidecar(vfs, db, db_id)?.and_then(|entries| last_of(&entries)))
+}
+
+/// This database's sidecar entries, the file read whole: `None` when its header is another
+/// database's or damaged (its history isn't ours). A missing file is the open's error.
+pub(crate) fn read_sidecar(
+    vfs: &VfsRef,
+    db: &Path,
+    db_id: [u8; 16],
+) -> Result<Option<Vec<FeedEntry>>> {
+    let file = vfs.open(&sidecar_path(db), OpenOptions::read())?;
+    let bytes = read_whole(&file)?;
+    Ok(entries_of(&bytes, db_id).map(|(entries, _)| entries.into_iter().map(|(_, e)| e).collect()))
+}
+
+/// The file's bytes.
+fn read_whole(file: &FileRef) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; file.len()? as usize];
-    file.read_at(&mut bytes, 0)?;
-    match FeedHeader::decode(&bytes) {
-        Ok(h) if h.db_id == db_id => {}
-        _ => return Ok(None),
+    if !bytes.is_empty() {
+        file.read_at(&mut bytes, 0)?;
     }
-    let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..]);
-    Ok(last_of(&entries))
+    Ok(bytes)
+}
+
+/// The valid entries after `bytes`' header, each with its offset past the header, and where
+/// they end in `bytes`: `None` unless the header is this database's.
+fn entries_of(bytes: &[u8], db_id: [u8; 16]) -> Option<(Vec<(usize, FeedEntry)>, usize)> {
+    match FeedHeader::decode(bytes) {
+        Ok(h) if h.db_id == db_id => {
+            let (entries, end) = decode_entries_at(&bytes[FeedHeader::LEN..]);
+            Some((entries, FeedHeader::LEN + end))
+        }
+        _ => None,
+    }
 }
 
 /// [`last_session`]'s rule over decoded entries.
@@ -219,8 +332,9 @@ pub(crate) fn open_session(
     catalog: &Catalog,
     options: &EngineOptions,
     shards: usize,
-    opened_at: u64,
+    opened: OpenedRoot,
 ) -> Result<Option<Arc<Feed>>> {
+    let opened_at = opened.sequence;
     let Some(cfg) = &options.feed else {
         open_sidecar(
             vfs,
@@ -230,6 +344,7 @@ pub(crate) fn open_session(
                 sequence: opened_at,
             },
             false,
+            opened,
         )?;
         return Ok(None);
     };
@@ -265,7 +380,7 @@ pub(crate) fn open_session(
         streams: streams as u32,
         tables: tables.clone(),
     };
-    let sidecar = open_sidecar(vfs, path, db_id, &entry, true)?
+    let sidecar = open_sidecar(vfs, path, db_id, &entry, true, opened)?
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
     feed.retain_bytes_per_stream = cfg.retention_bytes / streams;
@@ -367,7 +482,15 @@ pub(crate) struct Feed {
     /// it, before its root commit, and appended as a `Catalog` sidecar entry just before that
     /// commit's Root entry. Taken by the root-commit observer, or dropped by
     /// `unstage_catalog` if the commit failed. Root commits never overlap, so one slot.
-    staged_catalog: Mutex<Option<(u64, u64, Vec<Edit>)>>,
+    staged_catalog: Mutex<Option<StagedCatalog>>,
+    /// The session's sidecar appends stopped (D315; simp724 on #1493): an append or a sync
+    /// failed, so no later catalog change can get its `Catalog` entry. Terminal. Feeds of
+    /// every table in this process expire on seeing it; the manifest pump freezes the catalog
+    /// hold (`catalog_hold_frozen`) so no feed's frontier passes a change that has no entry.
+    appends_stopped: std::sync::atomic::AtomicBool,
+    /// The catalog hold is frozen for the rest of the session (set once, by the manifest
+    /// pump, after `appends_stopped`): never released.
+    catalog_hold_frozen: std::sync::atomic::AtomicBool,
     /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
@@ -376,11 +499,39 @@ pub(crate) struct Feed {
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,
+    /// Feeds of every table waiting for a catalog change, which moves no seqno, by reader
+    /// key (the idle-catalog fix after #1515): woken by `manifest::release_catalog` and on
+    /// close, never by the shards' settles, so an idle feed of every table costs the shards
+    /// nothing (simp724's P1 on #1539).
+    catalog_waiters: Mutex<FastMap<u64, std::task::Waker>>,
+    /// Whether `catalog_waiters` may be non-empty.
+    has_catalog_waiters: std::sync::atomic::AtomicBool,
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
     /// observer waits before it records the root, widening the window between a durable
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
+    /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
+    catalog_roots: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
+    /// A hold seam (`Engine::delay_root_intent`, D315 amendment): nanoseconds each root
+    /// commit waits after its intent is appended, before it writes anything, widening the
+    /// window between the intent and the superblock. 0 (the default) waits nothing.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) root_intent_delay_nanos: AtomicU64,
+}
+
+/// A catalog change staged for its root commit's `Catalog` sidecar entry (D315).
+#[derive(Debug)]
+pub(crate) struct StagedCatalog {
+    /// The manifest commit's `seqno_ceiling` (its catalog hold).
+    pub(crate) ceiling: u64,
+    /// The manifest commit's `ts_floor`.
+    pub(crate) timestamp: u64,
+    /// Its `CreateTable`, `PutFamily` and `DropTable` edits, in the order they applied.
+    pub(crate) edits: Vec<Edit>,
+    /// The names, from the catalog before the edits, of the tables they name without a
+    /// `CreateTable` of their own.
+    pub(crate) names: Vec<(pigeonhole_format::TableId, String)>,
 }
 
 /// Whether a sidecar sync is in flight, and whether appends since its submission wait for
@@ -425,10 +576,17 @@ impl Feed {
             sidecar_syncs: AtomicU64::new(0),
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
             staged_catalog: Mutex::default(),
+            appends_stopped: std::sync::atomic::AtomicBool::new(false),
+            catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
+            catalog_waiters: Mutex::default(),
+            has_catalog_waiters: std::sync::atomic::AtomicBool::new(false),
+            catalog_roots: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            root_intent_delay_nanos: AtomicU64::new(0),
         }
     }
 
@@ -585,15 +743,53 @@ impl Feed {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Forgets reader `key`'s waker (the reader is dropped).
-    pub(crate) fn forget_hold_waiter(&self, key: u64) {
+    /// Registers `waker` (reader `key`, a feed of every table) to be woken when a catalog
+    /// change's hold is released, as [`wait_for_hold`](Self::wait_for_hold) for the shards'
+    /// holds: the caller re-checks [`catalog_roots`](Self::catalog_roots) afterwards.
+    pub(crate) fn wait_for_catalog(&self, key: u64, waker: &std::task::Waker) {
         let mut w = self
-            .hold_waiters
+            .catalog_waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        w.remove(&key);
-        if w.is_empty() {
-            self.has_hold_waiters.store(false, Ordering::SeqCst);
+        w.insert(key, waker.clone());
+        self.has_catalog_waiters.store(true, Ordering::SeqCst);
+        drop(w);
+        // Pairs with the fence in `wake_catalog_waiters`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Forgets reader `key`'s wakers, on both lists (the reader is dropped, or delivered).
+    pub(crate) fn forget_hold_waiter(&self, key: u64) {
+        for (list, flag) in [
+            (&self.hold_waiters, &self.has_hold_waiters),
+            (&self.catalog_waiters, &self.has_catalog_waiters),
+        ] {
+            let mut w = list.lock().unwrap_or_else(PoisonError::into_inner);
+            if w.remove(&key).is_some() && w.is_empty() {
+                flag.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// After a catalog change's hold is released (`release_catalog`, its Root entry and
+    /// `catalog_roots` stored first): wakes every feed of every table waiting for one, as
+    /// [`wake_hold_waiters`](Self::wake_hold_waiters) does for the shards' holds.
+    #[inline(never)]
+    pub(crate) fn wake_catalog_waiters(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.has_catalog_waiters.load(Ordering::SeqCst) {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut w = self
+                .catalog_waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.has_catalog_waiters.store(false, Ordering::SeqCst);
+            w.drain().map(|(_, waker)| waker).collect()
+        };
+        for waker in woken {
+            waker.wake();
         }
     }
 
@@ -633,11 +829,60 @@ impl Feed {
         *self.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = Some(sidecar);
     }
 
-    /// After a root commit of this session (the pager's observer): appends its sequence and
-    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure ends the
-    /// session's appends, as a failed sync does (fail closed): a partly written entry is
-    /// never followed by more, and the next feeding open sees the sequence ahead of the last
-    /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
+    /// Records the root commit about to happen (D315 amendment, #1504): the pager's intent
+    /// hook calls it before the commit writes anything. Appends the commit's staged
+    /// `Catalog` entry, if any, then a `RootIntent` naming the new superblock, unsynced: a
+    /// process crash keeps the page cache, and the superblock write comes after. A failed
+    /// append ends the session's appends, as any sidecar failure does, but never the commit
+    /// (simp724's R3).
+    pub(crate) fn note_intent(&self, sequence: u64, checksum: u64) {
+        let staged = self
+            .staged_catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(s) = sidecar.as_mut() else {
+            return;
+        };
+        let catalog = staged.map(|c| FeedEntry::Catalog {
+            session: self.session,
+            sequence,
+            seqno_ceiling: c.ceiling,
+            timestamp: c.timestamp,
+            edits: c.edits,
+            names: c.names,
+        });
+        // One write for both (simp724's F1 on #1526): a crash between two would leave the
+        // Catalog entry without its intent, which no open could place.
+        let mut bytes = Vec::with_capacity(128);
+        if let Some(c) = &catalog {
+            c.encode(&mut bytes);
+        }
+        let at = s.end + bytes.len() as u64;
+        FeedEntry::RootIntent { sequence, checksum }.encode(&mut bytes);
+        let appended = s
+            .append_bytes(&bytes)
+            .map(|()| s.intent = Some((sequence, at, catalog.is_some())));
+        if let Err(e) = appended {
+            crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
+            *sidecar = None;
+            self.appends_stopped.store(true, Ordering::Release);
+        }
+        drop(sidecar);
+        #[cfg(feature = "test-hooks")]
+        {
+            let delay = self.root_intent_delay_nanos.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_nanos(delay));
+            }
+        }
+    }
+
+    /// Records a root commit (the pager's root-commit observer, after the commit is
+    /// durable): its `Root` entry, written over the `RootIntent` this session appended for
+    /// it, or appended if there is none (simp724's R2 on #1504: never over another), then
+    /// the coalesced sync.
     pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
         #[cfg(feature = "test-hooks")]
         {
@@ -646,9 +891,8 @@ impl Feed {
                 std::thread::sleep(std::time::Duration::from_nanos(delay));
             }
         }
-        // A catalog change this root commit made (D315): its entry goes first, in the same
-        // append and the same sync as the Root entry, so a torn tail keeps it only without
-        // the Root (the chain breaks), never the Root without it.
+        // A catalog change whose intent didn't append it (no intent hook ran): its entry
+        // goes first, in the same append as the Root entry.
         let staged = self
             .staged_catalog
             .lock()
@@ -659,39 +903,77 @@ impl Feed {
             let Some(s) = sidecar.as_mut() else {
                 return;
             };
-            if let Some((seqno_ceiling, timestamp, edits)) = staged
-                && let Err(e) = s.append(&FeedEntry::Catalog {
-                    session: self.session,
-                    sequence,
-                    seqno_ceiling,
-                    timestamp,
-                    edits,
-                })
-            {
-                crate::shard::trace!("feed: sidecar append of catalog {sequence} failed: {e}");
-                *sidecar = None;
-                return;
-            }
-            if let Err(e) = s.append(&FeedEntry::Root {
+            let root = FeedEntry::Root {
                 session: self.session,
                 sequence,
-            }) {
-                crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+            };
+            // Whether this root carries a catalog change: its Catalog entry is in the file and
+            // now rooted, for a feed of every table to load (`catalog_roots`).
+            let mut catalog = staged.is_some();
+            let written = match s.intent.take() {
+                Some((seq, at, with_catalog)) if seq == sequence && staged.is_none() => {
+                    catalog = with_catalog;
+                    s.overwrite(at, &root)
+                }
+                _ => staged
+                    .map(|c| FeedEntry::Catalog {
+                        session: self.session,
+                        sequence,
+                        seqno_ceiling: c.ceiling,
+                        timestamp: c.timestamp,
+                        edits: c.edits,
+                        names: c.names,
+                    })
+                    .iter()
+                    .try_for_each(|c| s.append(c))
+                    .and_then(|()| s.append(&root)),
+            };
+            if let Err(e) = written {
+                crate::shard::trace!("feed: sidecar write of root {sequence} failed: {e}");
                 *sidecar = None;
+                self.appends_stopped.store(true, Ordering::Release);
                 return;
+            }
+            if catalog {
+                // After the Root entry is written, before `release_catalog` wakes the hold
+                // list: a feed of every table that sees the count move loads the sidecar.
+                self.catalog_roots.fetch_add(1, Ordering::Release);
             }
             Arc::clone(&s.file)
         };
         self.request_sidecar_sync(file);
     }
 
-    /// Stages a catalog change's ceiling, timestamp floor and edits for its root commit's
-    /// `Catalog` entry (D315), before that commit.
-    pub(crate) fn stage_catalog(&self, ceiling: u64, timestamp: u64, edits: Vec<Edit>) {
+    /// How many of this session's catalog changes have their Root entry written (D315): a
+    /// feed of every table in this process loads the sidecar when it moves, though no seqno
+    /// did (a catalog change on an idle database).
+    pub(crate) fn catalog_roots(&self) -> u64 {
+        self.catalog_roots.load(Ordering::Acquire)
+    }
+
+    /// Stages a catalog change for its root commit's `Catalog` entry (D315), before that
+    /// commit.
+    pub(crate) fn stage_catalog(&self, change: StagedCatalog) {
         *self
             .staged_catalog
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((ceiling, timestamp, edits));
+            .unwrap_or_else(PoisonError::into_inner) = Some(change);
+    }
+
+    /// Whether the session's sidecar appends stopped (D315): see `appends_stopped`.
+    pub(crate) fn appends_stopped(&self) -> bool {
+        self.appends_stopped.load(Ordering::Acquire)
+    }
+
+    /// Marks the catalog hold frozen for the rest of the session: the hold `release_catalog`
+    /// would have let go stays up.
+    pub(crate) fn freeze_catalog_hold(&self) {
+        self.catalog_hold_frozen.store(true, Ordering::Release);
+    }
+
+    /// Whether the catalog hold is frozen for the rest of the session.
+    pub(crate) fn catalog_hold_frozen(&self) -> bool {
+        self.catalog_hold_frozen.load(Ordering::Acquire)
     }
 
     /// Drops a staged catalog change whose root commit didn't happen (D315).
@@ -738,6 +1020,7 @@ impl Feed {
                 // sequence ahead of the last entry and expires every token.
                 crate::shard::trace!("feed: sidecar sync failed, no more appends: {e}");
                 *this.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                this.appends_stopped.store(true, Ordering::Release);
                 let mut st = this
                     .sidecar_sync
                     .lock()

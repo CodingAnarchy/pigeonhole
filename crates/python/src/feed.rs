@@ -1,63 +1,61 @@
 //! The change feed (D310, #1322): `Table.feed(...)`, `Feed`, `Commit` and `Change`.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use pigeonhole::ChangeKind;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::error::{OrPy, with_code};
-
-/// The longest stretch `next` waits with the GIL released before it checks for a signal
-/// (Ctrl-C), so a blocked consumer can still be interrupted.
-const SLICE: Duration = Duration::from_millis(100);
+use crate::waits::{Source, Waits};
 
 /// A subscription to some tables' committed changes: whole commits, once each, in commit
-/// order. Get one from `Table.feed(...)`.
+/// order. Get one from `Table.feed(...)`. Its sync reads and its one `next_async` wait
+/// share `crate::waits` with the memory store's `Watch` (#1479).
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Feed(Mutex<Option<pigeonhole::Feed>>);
+pub(crate) struct Feed(Waits<pigeonhole::Feed>);
+
+impl Source for pigeonhole::Feed {
+    type Item = pigeonhole::Commit;
+    type Error = pigeonhole::Error;
+    const NAME: &'static str = "feed";
+
+    fn next(&mut self, d: Duration) -> Result<Option<Self::Item>, Self::Error> {
+        pigeonhole::Feed::next(self, d).map(|c| c.cloned())
+    }
+
+    fn try_next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
+        pigeonhole::Feed::try_next(self).map(|c| c.cloned())
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Item, Self::Error>> {
+        pigeonhole::Feed::poll_next(self, cx).map(|r| r.cloned())
+    }
+
+    fn token(&self) -> Vec<u8> {
+        pigeonhole::Feed::token(self).as_bytes().to_vec()
+    }
+
+    fn oldest_retained(&self) -> Option<u64> {
+        pigeonhole::Feed::oldest_retained(self)
+    }
+
+    fn to_py(py: Python<'_>, item: Self::Item) -> PyResult<Py<PyAny>> {
+        Ok(Py::new(py, Commit(item))?.into_any())
+    }
+
+    fn error(e: Self::Error) -> PyErr {
+        crate::error::OrPy::or_py(Err::<(), _>(e)).unwrap_err()
+    }
+}
 
 impl Feed {
     pub(crate) fn new(feed: pigeonhole::Feed) -> Self {
-        Self(Mutex::new(Some(feed)))
+        Self(Waits::new(feed))
     }
 
-    /// One wait of at most `slice`, with the GIL released.
-    fn poll(&self, py: Python<'_>, slice: Option<Duration>) -> PyResult<Option<Commit>> {
-        // `None` for a closed feed.
-        let polled = py.detach(|| {
-            let mut guard = self.0.lock().expect("not poisoned");
-            let Some(feed) = guard.as_mut() else {
-                return Ok(None);
-            };
-            let next = match slice {
-                Some(d) => feed.next(d)?,
-                None => feed.try_next()?,
-            };
-            Ok::<_, pigeonhole::Error>(Some(next.cloned().map(Commit)))
-        });
-        polled
-            .or_py()?
-            .ok_or_else(|| with_code(pigeonhole::ErrorCode::Closed, "the feed is closed"))
-    }
-
-    /// `next` with an optional timeout: in slices, checking for signals between them.
     fn wait(&self, py: Python<'_>, timeout: Option<Duration>) -> PyResult<Option<Commit>> {
-        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
-        loop {
-            let slice = match deadline {
-                None => SLICE,
-                Some(d) => d.saturating_duration_since(Instant::now()).min(SLICE),
-            };
-            if let Some(c) = self.poll(py, Some(slice))? {
-                return Ok(Some(c));
-            }
-            py.check_signals()?;
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Ok(None);
-            }
-        }
+        Ok(self.0.wait(py, timeout)?.map(Commit))
     }
 }
 
@@ -74,31 +72,29 @@ impl Feed {
 
     /// The next commit if one is ready, else `None`. Never waits.
     fn try_next(&self, py: Python<'_>) -> PyResult<Option<Commit>> {
-        self.poll(py, None)
+        Ok(self.0.poll(py, None)?.map(Commit))
+    }
+
+    /// The next commit, as an `asyncio.Future` of the running loop (#1479): no thread
+    /// waits for it. For a timeout, `asyncio.wait_for(feed.next_async(), t)`. One wait at a
+    /// time: a second `next_async`, or a sync `next`, during one raises `ValueError`.
+    /// Cancelling it loses nothing: the commit it would have returned is the next one any
+    /// call returns.
+    fn next_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.0.next_async(py)
     }
 
     /// Where the feed is, as bytes: `Table.feed(resume=...)` continues after the last
     /// commit delivered, in this open of the database or a later one. Store it with what
     /// the commits fed.
     fn token<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        // The lock may be held by a thread waiting in `next`, for up to a slice: wait for
-        // it without the GIL.
-        let token = py.detach(|| {
-            let guard = self.0.lock().expect("not poisoned");
-            guard.as_ref().map(|f| f.token())
-        });
-        let token =
-            token.ok_or_else(|| with_code(pigeonhole::ErrorCode::Closed, "the feed is closed"))?;
-        Ok(PyBytes::new(py, token.as_bytes()))
+        Ok(PyBytes::new(py, &self.0.token(py)?))
     }
 
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     #[getter]
     fn oldest_retained(&self, py: Python<'_>) -> Option<u64> {
-        py.detach(|| {
-            let guard = self.0.lock().expect("not poisoned");
-            guard.as_ref().and_then(pigeonhole::Feed::oldest_retained)
-        })
+        self.0.oldest_retained(py)
     }
 
     /// The commits as they come: `for commit in feed:` waits for each (`None` never ends
@@ -121,7 +117,7 @@ impl Feed {
     /// Ends the subscription now rather than when the feed is collected. Calls afterwards
     /// raise `Closed`; closing twice does nothing.
     fn close(&self, py: Python<'_>) {
-        py.detach(|| self.0.lock().expect("not poisoned").take());
+        self.0.close(py);
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {

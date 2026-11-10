@@ -17,6 +17,8 @@ pub(crate) fn default_shards() -> usize {
 pub(crate) struct Placement {
     pub io_threads: usize,
     pub blocking_threads: usize,
+    /// The feed delivery runtime's workers (ticket 5's (A)).
+    pub feed_threads: usize,
     /// The CPUs outside the shards' (Linux, when the engine pinned any).
     #[cfg(target_os = "linux")]
     mask: Option<nix::sched::CpuSet>,
@@ -29,7 +31,16 @@ pub(crate) struct Placement {
 }
 
 impl Placement {
-    pub(crate) fn plan(db: &Pigeonhole, io: Option<usize>, blocking: Option<usize>) -> Self {
+    /// The threads' counts: given, or by default from the CPUs the shards don't use. The
+    /// feed threads' default (a quarter, at least 1) is carved out of the network threads'
+    /// default rather than added, so the two runtimes don't oversubscribe the CPUs (perf287's
+    /// D2 on #1397). An explicit `--io-threads` is taken as given.
+    pub(crate) fn plan(
+        db: &Pigeonhole,
+        io: Option<usize>,
+        blocking: Option<usize>,
+        feed: Option<usize>,
+    ) -> Self {
         let pinned = db.pinned_shard_cpus();
         #[cfg(target_os = "linux")]
         let (mask, free, mode) = linux_mask(&pinned);
@@ -41,9 +52,15 @@ impl Placement {
             "unpinned",
         );
         let default = free.max(2);
+        // A quarter. perf287 on #1397: a floor of 4 (8 network + 4 feed on a 12-CPU slice)
+        // left the network side short and every split run fell behind; 9 + 3 kept up.
+        let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
-            io_threads: io.unwrap_or(default).max(1),
+            io_threads: io
+                .unwrap_or(free.saturating_sub(feed_threads).max(2))
+                .max(1),
             blocking_threads: blocking.unwrap_or(default).max(1),
+            feed_threads,
             #[cfg(target_os = "linux")]
             mask,
             free_cpus: free,
@@ -142,12 +159,21 @@ mod tests {
             Options::default().create_if_missing(true).shards(1),
         )
         .unwrap();
-        let plan = Placement::plan(&db, None, None);
+        let plan = Placement::plan(&db, None, None, None);
         assert!(
-            plan.io_threads >= 1 && plan.blocking_threads >= 1,
+            plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
         );
-        assert_eq!(Placement::plan(&db, Some(3), Some(5)).io_threads, 3);
+        // The feed threads come out of the network threads' default, not on top of it.
+        if plan.free_cpus >= 4 {
+            assert_eq!(
+                plan.io_threads + plan.feed_threads,
+                plan.free_cpus,
+                "{plan:?}"
+            );
+        }
+        let given = Placement::plan(&db, Some(3), Some(5), Some(2));
+        assert_eq!((given.io_threads, given.feed_threads), (3, 2));
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();

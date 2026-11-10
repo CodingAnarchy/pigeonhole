@@ -921,3 +921,45 @@ fn an_application_owned_close_on_one_driver_thread_waits_for_a_held_zero_fill() 
     }
     again.close().unwrap();
 }
+
+/// A handover reopens only as the open it came from (simp724's G1 on #1570): an exclusive
+/// writer lock can't become a read-only open's, nor a read-only open's shared lock a
+/// writer's. Either is refused, and the handover comes back with its locks still held.
+#[test]
+fn a_handover_reopens_only_with_its_own_lock_mode() {
+    let (vfs, _gate) = gate::vfs(1603);
+    let db = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    db.commit(put(&t, "row"), Some(Durability::Sync)).unwrap();
+    let (closed, handover) = db.close_for_reopen();
+    closed.unwrap();
+    let mut read_only = options(Arc::clone(&vfs), 2);
+    read_only.read_only = true;
+    let (e, handover) = Engine::open_with(Path::new(DB), read_only.clone(), handover.unwrap())
+        .expect_err("an exclusive lock to a read-only open is refused");
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    // The writable reopen it came from still works on it.
+    let db = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.close().unwrap();
+
+    // The other way: a read-only open's handover to a writable open.
+    let ro = Engine::open(Path::new(DB), read_only.clone()).unwrap();
+    let (closed, handover) = ro.close_for_reopen();
+    closed.unwrap();
+    let (e, handover) = Engine::open_with(
+        Path::new(DB),
+        options(Arc::clone(&vfs), 2),
+        handover.unwrap(),
+    )
+    .expect_err("a shared lock to a writable open is refused");
+    assert!(matches!(e, Error::InvalidArgument(_)), "{e:?}");
+    let ro = Engine::open_with(Path::new(DB), read_only, handover)
+        .map_err(|(e, _)| e)
+        .unwrap();
+    assert!(has(&ro, &ro.table("t").unwrap(), "row"));
+    ro.close().unwrap();
+}

@@ -10,8 +10,8 @@ use magnus::{Error, Float, Integer, RArray, RHash, RString, Ruby, Symbol, Value,
 use pigeonhole::{Aggregation, Compression, ErrorCode};
 
 use crate::classes::{
-    Builder, Cell, Condition, Family, FamilyInfo, Incremented, Mutation, MutationState, Row,
-    ScanArgs, ScanSpec, Snapshot, Table, TableBuilder, VectorSpec,
+    Asked, Builder, Cell, Column, Condition, Family, FamilyInfo, Incremented, Mutation,
+    MutationState, Row, ScanArgs, ScanSpec, Seen, Snapshot, Table, TableBuilder, VectorSpec,
 };
 use crate::convert::{
     self, Bytes, CellValue, Name, Secs, Val, arg_error, class_name, lock, type_error,
@@ -512,10 +512,13 @@ pub(crate) fn commit_row(
     table: &pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    asked: &Asked,
     durability: Option<Durability>,
     condition: Option<&pigeonhole::Condition>,
 ) -> pigeonhole::Result<Option<u64>> {
-    let m = row_mutation(table, row, ops, durability);
+    // A mutation with `return_previous` or `return_current` requests is refused here
+    // (ICR 0113).
+    let m = row_mutation(table, row, ops, asked, durability);
     match condition {
         None => m.commit().map(|i| Some(i.seqno)),
         Some(c) => m.commit_if(c).map(|i| i.map(|i| i.seqno)),
@@ -528,9 +531,26 @@ pub(crate) fn commit_row_returning(
     table: &pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    asked: &Asked,
     durability: Option<Durability>,
 ) -> pigeonhole::Result<pigeonhole::Incremented> {
-    row_mutation(table, row, ops, durability).commit_returning()
+    row_mutation(table, row, ops, asked, durability).commit_returning()
+}
+
+/// The column a condition reads, which `commit_if_returning` always reports.
+fn condition_column(c: &pigeonhole::Condition) -> Option<Column> {
+    use pigeonhole::Condition as C;
+    match c {
+        C::Exists { family, qualifier }
+        | C::Absent { family, qualifier }
+        | C::Value {
+            family, qualifier, ..
+        } => Some((family.clone(), qualifier.clone())),
+        // `Condition` is non-exhaustive. A variant added later that reads a column must be
+        // named here, or `current` treats its column as unasked: `InvalidArgument`, not
+        // `ReturnedValueError` (ai1249's nit on #1579).
+        _ => None,
+    }
 }
 
 /// `ops` buffered on a row mutation of `row`, uncommitted.
@@ -538,6 +558,7 @@ fn row_mutation<'t>(
     table: &'t pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    asked: &Asked,
     durability: Option<Durability>,
 ) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
@@ -580,6 +601,12 @@ fn row_mutation<'t>(
             Op::DeleteColumn(f, q) => m.delete_column(f, q),
             Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
         };
+    }
+    for (f, q) in &asked.previous {
+        m = m.return_previous(f, q);
+    }
+    for (f, q) in &asked.current {
+        m = m.return_current(f, q);
     }
     m
 }
@@ -769,6 +796,7 @@ impl Table {
             table: rb_self.writer(ruby)?.clone(),
             row: row.0,
             ops: Mutex::new(Some(Vec::new())),
+            asked: Mutex::new(Asked::default()),
             durability: Mutex::new(None),
         })))
     }
@@ -782,8 +810,10 @@ impl Table {
         durability: Option<Durability>,
     ) -> Result<u64, Error> {
         let t = rb_self.writer(ruby)?.clone();
-        engine(ruby, move || commit_row(&t, &row, &[op], durability, None))
-            .map(|s| s.expect("unconditional"))
+        engine(ruby, move || {
+            commit_row(&t, &row, &[op], &Asked::default(), durability, None)
+        })
+        .map(|s| s.expect("unconditional"))
     }
 
     /// `put(row, family, qualifier, value, ts, durability)`.
@@ -836,7 +866,7 @@ impl Table {
         // `ReturnedValueError` (perf2's S1 on #1473).
         let (seqno, value) = engine(ruby, move || {
             let op = Op::Incr(family.0.clone(), qualifier.0.clone(), ts, delta);
-            let r = commit_row_returning(&t, &row.0, &[op], durability)?;
+            let r = commit_row_returning(&t, &row.0, &[op], &Asked::default(), durability)?;
             Ok((
                 r.info.seqno,
                 r.value_at(&family.0, &qualifier.0, ts.unwrap_or(0)),
@@ -970,6 +1000,44 @@ impl Mutation {
         Ok(())
     }
 
+    /// `return_previous(family, qualifier)`: asks `commit_returning` for that column as it was
+    /// just before the commit (ICR 0113).
+    pub(crate) fn return_previous(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<(), Error> {
+        let m = rb_self.0.get(ruby)?;
+        // Under the writes' lock, as a commit takes both (ai1249's Q1 on #1552).
+        let ops = lock(&m.ops);
+        if ops.is_none() {
+            return Err(spent(ruby, "the mutation was already committed"));
+        }
+        lock(&m.asked).previous.push((family.0, qualifier.0));
+        drop(ops);
+        Ok(())
+    }
+
+    /// `return_current(family, qualifier)`: asks `commit_if_returning` for that column as
+    /// the commit left it, or as the condition saw it when it didn't hold (D314 amendment 2).
+    pub(crate) fn return_current(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<(), Error> {
+        let m = rb_self.0.get(ruby)?;
+        // Under the writes' lock, as a commit takes both (Q1).
+        let ops = lock(&m.ops);
+        if ops.is_none() {
+            return Err(spent(ruby, "the mutation was already committed"));
+        }
+        lock(&m.asked).current.push((family.0, qualifier.0));
+        drop(ops);
+        Ok(())
+    }
+
     /// Commits the recorded writes as one atomic row mutation; returns its sequence number.
     pub(crate) fn commit(ruby: &Ruby, rb_self: &Self) -> Result<u64, Error> {
         Self::finish(ruby, rb_self, None).map(|s| s.expect("unconditional"))
@@ -991,13 +1059,51 @@ impl Mutation {
         let durability = *lock(&m.durability);
         // As in `finish`: the writes are taken inside the call.
         let r = without_gvl(ruby, move || {
-            let ops = lock(&m.ops).take()?;
-            Some(commit_row_returning(&m.table, &m.row, &ops, durability))
+            let (ops, asked) = {
+                let mut ops = lock(&m.ops);
+                // Under the writes' lock, as `return_previous` pushes (Q1).
+                (ops.take()?, std::mem::take(&mut *lock(&m.asked)))
+            };
+            let r = commit_row_returning(&m.table, &m.row, &ops, &asked, durability);
+            Some(r.map(|r| Incremented(r, asked, None)))
         })?;
         match r {
-            Some(r) => r.map(Incremented).or_rb(ruby),
+            Some(r) => r.or_rb(ruby),
             None => Err(spent(ruby, "the mutation was already committed")),
         }
+    }
+
+    /// Commits only if `condition` holds, and returns the row either way (D314 amendment 2):
+    /// an `Incremented` (as `Returned`) when it applied, a `Seen` when it didn't. `api.rb`
+    /// wraps it in a `Checked`.
+    pub(crate) fn commit_if_returning(
+        ruby: &Ruby,
+        rb_self: &Self,
+        condition: &Condition,
+    ) -> Result<Value, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        let c = condition.0.clone();
+        // As in `finish`: the writes are taken inside the call.
+        let r = without_gvl(ruby, move || {
+            let (ops, asked) = {
+                let mut ops = lock(&m.ops);
+                // Under the writes' lock, as `return_current` pushes (Q1).
+                (ops.take()?, std::mem::take(&mut *lock(&m.asked)))
+            };
+            let r =
+                row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_if_returning(&c);
+            let column = condition_column(&c);
+            Some(r.map(|r| (r, asked, column)))
+        })?;
+        let (r, asked, column) = match r {
+            Some(r) => r.or_rb(ruby)?,
+            None => return Err(spent(ruby, "the mutation was already committed")),
+        };
+        Ok(match r {
+            pigeonhole::Checked::Applied(ret) => ruby.into_value(Incremented(ret, asked, column)),
+            pigeonhole::Checked::NotApplied(seen) => ruby.into_value(Seen(seen)),
+        })
     }
 
     fn finish(
@@ -1010,11 +1116,16 @@ impl Mutation {
         // The writes are taken inside the call: if an interrupt was pending and the call
         // didn't run, the mutation keeps them.
         let r = without_gvl(ruby, move || {
-            let ops = lock(&m.ops).take()?;
+            let (ops, asked) = {
+                let mut ops = lock(&m.ops);
+                // Under the writes' lock, as `return_previous` pushes (Q1).
+                (ops.take()?, std::mem::take(&mut *lock(&m.asked)))
+            };
             Some(commit_row(
                 &m.table,
                 &m.row,
                 &ops,
+                &asked,
                 durability,
                 condition.as_ref(),
             ))
@@ -1055,6 +1166,58 @@ impl Incremented {
         } else {
             // `InvalidArgument`, naming the cell.
             v.or_rb(ruby)
+        }
+    }
+
+    /// `previous(family, qualifier)`: the column `return_previous` asked for, as it was just
+    /// before the commit, or `nil` if it had no visible version. `InvalidArgument` if the
+    /// mutation didn't ask for it; `ReturnedValueError` if it couldn't be read after the
+    /// commit applied.
+    pub(crate) fn previous(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<Option<Cell>, Error> {
+        let asked = rb_self
+            .1
+            .previous
+            .iter()
+            .any(|(f, q)| *f == family.0 && *q == qualifier.0);
+        let c = rb_self
+            .0
+            .previous(&family.0, &qualifier.0)
+            .map(|c| c.map(Cell));
+        if asked {
+            c.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))
+        } else {
+            // `InvalidArgument`, naming the column.
+            c.or_rb(ruby)
+        }
+    }
+
+    /// `current(family, qualifier)`: after an applied `commit_if_returning`, the column as of
+    /// the commit, or `nil` if a read at the commit sees none. `InvalidArgument` if neither
+    /// `return_current` nor the condition named it; `ReturnedValueError` if it couldn't be
+    /// read after the commit applied.
+    pub(crate) fn current(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<Option<Cell>, Error> {
+        let c = rb_self
+            .0
+            .current(&family.0, &qualifier.0)
+            .map(|c| c.map(Cell));
+        if rb_self
+            .1
+            .has_current(&family.0, &qualifier.0, rb_self.2.as_ref())
+        {
+            c.map_err(|e| returned_value(ruby, rb_self.0.info.seqno, &e))
+        } else {
+            // `InvalidArgument`, naming the column.
+            c.or_rb(ruby)
         }
     }
 
@@ -1157,5 +1320,132 @@ impl TableBuilder {
             }
         })
         .map(|t| Table(ForkSafe::new(Handle::Writer(t))))
+    }
+}
+
+// ---- Seen ---------------------------------------------------------------------------------
+
+impl Seen {
+    /// `current(family, qualifier)`: the column as the condition saw it, its newest visible
+    /// version then, or `nil` if it had none. `InvalidArgument` if neither `return_current`
+    /// nor the condition named it. Nothing was written, so a read error is an ordinary one.
+    pub(crate) fn current(
+        ruby: &Ruby,
+        rb_self: &Self,
+        family: Name,
+        qualifier: Bytes,
+    ) -> Result<Option<Cell>, Error> {
+        rb_self
+            .0
+            .current(&family.0, &qualifier.0)
+            .map(|c| c.map(Cell))
+            .or_rb(ruby)
+    }
+}
+
+// ---- Under a fiber scheduler (#1574, ICR 0126) ---------------------------------------------
+
+/// The mutation's four commits as fiber ops: each takes the writes and submits at the call,
+/// as its blocking form does, and the result converts as that form's does.
+#[cfg(unix)]
+impl Mutation {
+    /// The writes and the asked columns, taken; `None` if already committed.
+    fn take_for_op(m: &MutationState) -> Option<(Vec<Op>, Asked)> {
+        let mut ops = lock(&m.ops);
+        // Under the writes' lock, as `return_previous` pushes (Q1).
+        Some((ops.take()?, std::mem::take(&mut *lock(&m.asked))))
+    }
+
+    fn spent_op() -> crate::fiber::Fut {
+        crate::fiber::ready(Box::new(|ruby: &Ruby| {
+            Err(spent(ruby, "the mutation was already committed"))
+        }))
+    }
+
+    /// `native_commit_op(bridge)`: `commit`, as a fiber op.
+    pub(crate) fn commit_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_async();
+            crate::fiber::map(fut, |ruby, r| Ok(ruby.into_value(r.or_rb(ruby)?.seqno)))
+        })
+    }
+
+    /// `native_commit_if_op(bridge, condition)`: `commit_if`, as a fiber op.
+    pub(crate) fn commit_if_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        condition: &Condition,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        let c = condition.0.clone();
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_if_async(&c);
+            crate::fiber::map(fut, |ruby, r| {
+                Ok(ruby.into_value(r.or_rb(ruby)?.map(|i| i.seqno)))
+            })
+        })
+    }
+
+    /// `native_commit_returning_op(bridge)`: `commit_returning`, as a fiber op.
+    pub(crate) fn commit_returning_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let fut =
+                row_mutation(&m.table, &m.row, &ops, &asked, durability).commit_returning_async();
+            crate::fiber::map(fut, move |ruby, r| {
+                Ok(ruby.into_value(Incremented(r.or_rb(ruby)?, asked, None)))
+            })
+        })
+    }
+
+    /// `native_commit_if_returning_op(bridge, condition)`: `commit_if_returning`, as a fiber
+    /// op: an `Incremented` (as `Returned`) or a `Seen`, which `api.rb` wraps in a `Checked`.
+    pub(crate) fn commit_if_returning_op(
+        ruby: &Ruby,
+        rb_self: &Self,
+        bridge: &crate::fiber::FiberBridge,
+        condition: &Condition,
+    ) -> Result<crate::fiber::FiberOp, Error> {
+        let m = rb_self.0.get(ruby)?;
+        let durability = *lock(&m.durability);
+        let c = condition.0.clone();
+        crate::fiber::FiberBridge::start(ruby, bridge, move || {
+            let Some((ops, asked)) = Self::take_for_op(m) else {
+                return Self::spent_op();
+            };
+            let column = condition_column(&c);
+            let fut = row_mutation(&m.table, &m.row, &ops, &asked, durability)
+                .commit_if_returning_async(&c);
+            crate::fiber::map(fut, move |ruby, r| {
+                Ok(match r.or_rb(ruby)? {
+                    pigeonhole::Checked::Applied(ret) => {
+                        ruby.into_value(Incremented(ret, asked, column))
+                    }
+                    pigeonhole::Checked::NotApplied(seen) => ruby.into_value(Seen(seen)),
+                })
+            })
+        })
     }
 }

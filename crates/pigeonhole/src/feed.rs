@@ -3,15 +3,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pigeonhole_engine::{FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
+use pigeonhole_engine::{CatalogEvent, FamilyId, FeedReader, FeedSpec, FeedStart, Next, TableId};
 use pigeonhole_format::key::Kind;
+use pigeonhole_format::manifest::Edit;
 use pigeonhole_format::value::decode_value;
 
 use crate::db::{Db, Snapshot};
 use crate::table::TableCore;
-use crate::{Error, ErrorCode, ReadTable, Result, Table, Value};
+use crate::{Error, ErrorCode, FamilyInfo, ReadTable, Result, Table, Value};
 
 /// Table and family names by id, as the feed's changes carry them.
 type Names = HashMap<(TableId, FamilyId), (Arc<str>, Arc<str>)>;
@@ -39,7 +41,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    fn of(kind: Kind) -> Self {
+    pub(crate) fn of(kind: Kind) -> Self {
         match kind {
             Kind::Put => ChangeKind::Put,
             Kind::Merge => ChangeKind::Merge,
@@ -69,9 +71,23 @@ pub struct Change {
     qualifier: Vec<u8>,
     /// The stored value (its tag byte first); empty for deletes.
     stored: Vec<u8>,
+    /// The engine's ids of its table and family (a replica applies by them, D315).
+    ids: (TableId, FamilyId),
 }
 
 impl Change {
+    /// The engine's ids of its table and family.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn ids(&self) -> (TableId, FamilyId) {
+        self.ids
+    }
+
+    /// The stored value, its tag byte first; empty for deletes.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn stored(&self) -> &[u8] {
+        &self.stored
+    }
+
     /// The table's name. Empty only for a family created after the feed opened whose table
     /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
@@ -140,6 +156,122 @@ impl Commit {
     /// Its changes the feed follows, in the order the commit wrote them.
     pub fn changes(&self) -> &[Change] {
         &self.changes
+    }
+}
+
+impl Commit {
+    /// A commit with nothing in it yet: the buffer the next one is read into.
+    fn empty() -> Self {
+        Commit {
+            seqno: 0,
+            ts: 0,
+            changes: Vec::new(),
+        }
+    }
+}
+
+/// What a feed delivers ([`Feed::next_event`]): a commit, or in a feed of every table
+/// ([`Pigeonhole::feed`](crate::Pigeonhole::feed)) a change to its tables too (D315), each
+/// in its place in commit order.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum FeedEvent {
+    /// One whole commit, as [`Feed::next`] delivers it.
+    Commit(Commit),
+    /// Tables created or dropped, or families added: every commit before it saw the old
+    /// tables, every commit after it the new ones.
+    Catalog(CatalogChange),
+}
+
+/// One change to the database's tables, as a feed of every table delivers it
+/// ([`FeedEvent::Catalog`]): one or more edits that applied together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogChange {
+    seqno: u64,
+    ts: u64,
+    edits: Vec<CatalogEdit>,
+    /// The change as the engine recorded it, with its ids and root sequence (a replica applies
+    /// it, D315).
+    raw: CatalogEvent,
+}
+
+impl CatalogChange {
+    /// The change as the engine recorded it, with its ids.
+    #[cfg(feature = "__unstable-replication")]
+    pub(crate) fn raw(&self) -> &CatalogEvent {
+        &self.raw
+    }
+
+    /// Where it falls in commit order: every commit with a lower [`Commit::seqno`] came
+    /// before it, every commit at or above it comes after.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+
+    /// The timestamp floor when it applied: every commit before it that took the default
+    /// timestamp has one at most this.
+    pub fn timestamp(&self) -> u64 {
+        self.ts
+    }
+
+    /// Its edits, in the order they applied.
+    pub fn edits(&self) -> &[CatalogEdit] {
+        &self.edits
+    }
+}
+
+/// One edit of a [`CatalogChange`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CatalogEdit {
+    /// A table was created, with these families.
+    #[non_exhaustive]
+    TableCreated {
+        /// Its name.
+        table: String,
+        /// Its families, with their options.
+        families: Vec<FamilyInfo>,
+    },
+    /// A family was added to an existing table.
+    #[non_exhaustive]
+    FamilyAdded {
+        /// The table's name.
+        table: String,
+        /// The family, with its options.
+        family: FamilyInfo,
+    },
+    /// A table was dropped, with all its data.
+    #[non_exhaustive]
+    TableDropped {
+        /// Its name.
+        table: String,
+    },
+}
+
+/// How far a feed has covered its history ([`Feed::position`]). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct FeedPosition {
+    seqno: u64,
+    catalog: u64,
+}
+
+impl FeedPosition {
+    /// Every commit of the feed's tables at or below it is covered.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+
+    /// A feed of every table: every catalog change with a root sequence at or below it was
+    /// delivered or passed over (0 for none, and in a feed of some tables).
+    pub fn catalog_sequence(&self) -> u64 {
+        self.catalog
+    }
+
+    /// Whether this position covers everything `other` does, both parts at least as large:
+    /// the parts are independent, so positions aren't totally ordered.
+    pub fn covers(&self, other: &FeedPosition) -> bool {
+        self.seqno >= other.seqno && self.catalog >= other.catalog
     }
 }
 
@@ -260,7 +392,8 @@ impl FeedBuilder {
             self.error.get_or_insert(e);
             return self;
         }
-        self.start = FeedStart::After(snapshot.seqno());
+        // The snapshot itself, so a feed of every table knows which catalog changes it saw.
+        self.start = FeedStart::Snapshot(snapshot.inner.clone());
         self
     }
 
@@ -307,20 +440,30 @@ impl FeedBuilder {
         for t in &self.tables {
             note_names(&mut names, &t.info);
         }
-        let (reader, generation) = subscribe(&self.db, spec.clone())?;
+        let (mut reader, generation) = subscribe(&self.db, spec.clone())?;
+        let reader_progress = Arc::new(AtomicU64::new(0));
+        reader.set_progress(Arc::clone(&reader_progress));
+        let start = stream_position(&reader);
         Ok(Feed {
             db: self.db,
-            spec,
+            // Only ever resubscribed from its own token: the start isn't kept, so a snapshot
+            // start doesn't stay pinned for the feed's life.
+            spec: FeedSpec {
+                start: FeedStart::Now,
+                ..spec
+            },
             reader,
             generation,
-            names,
-            commit: Commit {
-                seqno: 0,
-                ts: 0,
-                changes: Vec::new(),
+            out: Delivery {
+                names,
+                commit: Commit::empty(),
+                event: None,
+                oldest_retained: None,
+                failed: None,
             },
-            oldest_retained: None,
-            failed: None,
+            covered: pigeonhole_engine::FeedPosition::default(),
+            span: (start, start),
+            progress: FeedProgress::attach(reader_progress),
         })
     }
 }
@@ -332,6 +475,23 @@ fn note_names(names: &mut Names, info: &pigeonhole_engine::TableInfo) {
         names
             .entry((info.id, f.id))
             .or_insert_with(|| (Arc::clone(&table), Arc::from(f.name.as_str())));
+    }
+}
+
+/// Where a feed's stream is, as its token records it (D315 PR 3): every commit at or below
+/// `seqno` delivered or passed over, and every catalog change through `catalog`. Two
+/// deliveries of one feed chain when one's end is the next one's start, and a feed resumed
+/// from a token taken after a delivery starts at that delivery's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct StreamPosition {
+    pub(crate) seqno: u64,
+    pub(crate) catalog: u64,
+}
+
+fn stream_position(reader: &FeedReader) -> StreamPosition {
+    StreamPosition {
+        seqno: reader.delivered(),
+        catalog: reader.position().catalog,
     }
 }
 
@@ -391,104 +551,84 @@ pub struct Feed {
     reader: FeedReader,
     /// The engine generation `reader` reads (D265).
     generation: u64,
-    names: Names,
-    commit: Commit,
-    oldest_retained: Option<u64>,
-    /// The error that ended the feed, returned by every later call (simp724 on #1321): the
-    /// reader had already moved past the commit it was delivering, so going on would skip
-    /// it.
-    failed: Option<Error>,
+    /// What the last call delivered, the names that fill it, and how the feed ended.
+    out: Delivery,
+    /// The position covered by the readers before the current one (a recovery's or a writer
+    /// restart's resubscribe starts the new one at the token's delivered seqno, which can
+    /// be below it).
+    covered: pigeonhole_engine::FeedPosition,
+    /// The stream's position before and after the last delivery (D315 PR 3): a replica checks
+    /// that the runs it applies chain, each starting where the last ended.
+    span: (StreamPosition, StreamPosition),
+    /// Its position, published by the reader as it moves ([`Feed::progress`]).
+    progress: FeedProgress,
+}
+
+/// Where a [`Feed`] is, readable from any thread ([`Feed::progress`], D316 A4, ICR 0116): a
+/// cheap handle, cloned from the feed, that a metrics exporter keeps while the feed's own
+/// thread reads it. `pigeonhole-otel`'s `Registration::watch_feed` reports
+/// [`Pigeonhole::visible_seqno`](crate::Pigeonhole::visible_seqno) less
+/// [`covered_seqno`](Self::covered_seqno) as the feed's lag.
+#[derive(Debug, Clone)]
+pub struct FeedProgress {
+    covered: Arc<AtomicU64>,
+    live: Arc<AtomicBool>,
+}
+
+impl FeedProgress {
+    fn attach(covered: Arc<AtomicU64>) -> Self {
+        Self {
+            covered,
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// How far the feed has covered its history, as a seqno: every commit at or below it
+    /// is covered, delivered or passed over (it carried nothing for the feed's tables, or no
+    /// record holds it) or before the feed's start. Catalog changes aren't included. It's
+    /// the seqno part of the feed's position, kept current as the feed reads, even while it
+    /// waits, so a feed that keeps up stays near [`Pigeonhole::visible_seqno`]. It never
+    /// goes back, a resubscribe after a recovery included.
+    ///
+    /// [`Pigeonhole::visible_seqno`]: crate::Pigeonhole::visible_seqno
+    pub fn covered_seqno(&self) -> u64 {
+        self.covered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the feed still exists: `false` once it was dropped. A feed that failed or
+    /// expired but is still held stays live, and its position stops, so a lag measured from
+    /// it grows until the feed is dropped (cli692 on #1523).
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        self.progress.live.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The longest single wait handed to the engine; a longer `next` waits again.
 const WAIT_SLICE: Duration = Duration::from_secs(3600);
 
 impl Feed {
-    /// The next commit, waiting up to `timeout` for one; `None` if none arrived in time.
+    /// The next commit, waiting up to `timeout` for one; `None` if none arrived in time. A
+    /// feed of every table passes its catalog changes over ([`next_event`](Self::next_event)
+    /// delivers them too).
     ///
     /// An error reading the feed ends it: every later call returns the same error, as an
     /// expired feed does, so no commit is ever skipped. A value that doesn't decode is
     /// `Corruption`; the feed's [`token`](Self::token) then points past that commit, so
     /// resuming from it skips the damaged one.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<&Commit>> {
-        self.check_failed()?;
-        let deadline = Instant::now().checked_add(timeout);
-        loop {
-            self.follow_recovery()?;
-            let left = deadline.map_or(WAIT_SLICE, |d| {
-                d.saturating_duration_since(Instant::now()).min(WAIT_SLICE)
-            });
-            let next = match self.reader.wait(left) {
-                Ok(next) => next,
-                // A reader process's writer restarted: follow it from the token.
-                Err(pigeonhole_engine::Error::SnapshotExpired) => {
-                    self.resubscribe()?;
-                    continue;
-                }
-                // The old engine failing under a recovery's swap: follow the recovery.
-                Err(_) if swapped(&self.db, self.generation) => continue,
-                Err(e) => return Err(fail(&mut self.failed, e.into())),
-            };
-            match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Err(fail(&mut self.failed, e));
-                    }
-                    return Ok(Some(&self.commit));
-                }
-                // The old engine's reader, still waiting as a recovery swapped in a new
-                // engine, reads the new session's records as outside its history: the new
-                // engine's reader decides from the token instead (cli692's S2 on #1321).
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    return Err(expired(e));
-                }
-                Next::Pending => {}
-            }
-            // Out of time, unless a recovery's swap ended the old engine's wait early (look
-            // again on the new one) or the wait was one slice of a longer one.
-            let more = deadline.is_none_or(|d| Instant::now() < d);
-            if !more {
-                return Ok(None);
-            }
-        }
+        Ok(self.wait(timeout, false)?.then_some(&self.out.commit))
     }
 
     /// The next commit if one is ready; `None` otherwise. Never waits. Errors end the feed
     /// as [`next`](Self::next)'s do.
     pub fn try_next(&mut self) -> Result<Option<&Commit>> {
-        self.check_failed()?;
-        loop {
-            self.follow_recovery()?;
-            let next = match self.reader.try_next() {
-                Ok(next) => next,
-                // A reader process's writer restarted: follow it from the token.
-                Err(pigeonhole_engine::Error::SnapshotExpired) => {
-                    self.resubscribe()?;
-                    continue;
-                }
-                // The old engine failing under a recovery's swap: follow it and look again
-                // (a swap is rare, so this goes round once or twice).
-                Err(_) if swapped(&self.db, self.generation) => continue,
-                Err(e) => return Err(fail(&mut self.failed, e.into())),
-            };
-            return match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Err(fail(&mut self.failed, e));
-                    }
-                    Ok(Some(&self.commit))
-                }
-                // As in `next`: a superseded reader's expiry is not the feed's.
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    Err(expired(e))
-                }
-                Next::Pending => Ok(None),
-            };
-        }
+        Ok(self.try_step(false)?.then_some(&self.out.commit))
     }
 
     /// The next commit, for an async caller (D310 PR 5a): `Poll::Ready` with it, or with an
@@ -505,6 +645,117 @@ impl Feed {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<&Commit>> {
+        self.poll_step(cx, false).map_ok(|()| &self.out.commit)
+    }
+
+    /// The next event, waiting up to `timeout` for one; `None` if none arrived in time: a
+    /// commit, or in a feed of every table ([`Pigeonhole::feed`](crate::Pigeonhole::feed))
+    /// a catalog change too (D315), each in its place in commit order. Errors end the feed as
+    /// [`next`](Self::next)'s do, and the [`token`](Self::token) after an event resumes just
+    /// past it.
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<&FeedEvent>> {
+        Ok(if self.wait(timeout, true)? {
+            self.out.event.as_ref()
+        } else {
+            None
+        })
+    }
+
+    /// The next event if one is ready; `None` otherwise. Never waits. As
+    /// [`next_event`](Self::next_event) otherwise.
+    pub fn try_next_event(&mut self) -> Result<Option<&FeedEvent>> {
+        Ok(if self.try_step(true)? {
+            self.out.event.as_ref()
+        } else {
+            None
+        })
+    }
+
+    /// The next event, for an async caller: [`poll_next`](Self::poll_next) for
+    /// [`next_event`](Self::next_event). The writer process only, as `poll_next`.
+    /// [`nonblocking::FeedEventStream`](crate::nonblocking::FeedEventStream) wraps it as a
+    /// `Stream` of owned events.
+    pub fn poll_next_event(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<&FeedEvent>> {
+        use std::task::Poll;
+        match self.poll_step(cx, true) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => match &self.out.event {
+                Some(event) => Poll::Ready(Ok(event)),
+                None => unreachable!("a delivered step leaves its event"),
+            },
+        }
+    }
+
+    /// Waits up to `timeout` for the next delivery into `self.out` (catalog changes too, if
+    /// `events`): whether one arrived.
+    fn wait(&mut self, timeout: Duration, events: bool) -> Result<bool> {
+        self.check_failed()?;
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            self.follow_recovery()?;
+            let left = deadline.map_or(WAIT_SLICE, |d| {
+                d.saturating_duration_since(Instant::now()).min(WAIT_SLICE)
+            });
+            let next = match self.reader.wait(left) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.read_error(e)?;
+                    continue;
+                }
+            };
+            match step(&mut self.out, &self.db, self.generation, next, events)? {
+                Step::Ready => {
+                    self.note_delivery();
+                    return Ok(true);
+                }
+                // A catalog change a commits-only call passes over, or a superseded
+                // reader's expiry: look again (the engine returns at once if more is ready).
+                Step::Again => continue,
+                Step::Pending => {}
+            }
+            // Out of time, unless a recovery's swap ended the old engine's wait early (look
+            // again on the new one) or the wait was one slice of a longer one.
+            let more = deadline.is_none_or(|d| Instant::now() < d);
+            if !more {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// The next delivery into `self.out` if one is ready, as [`wait`](Self::wait) without
+    /// waiting.
+    fn try_step(&mut self, events: bool) -> Result<bool> {
+        self.check_failed()?;
+        loop {
+            self.follow_recovery()?;
+            let next = match self.reader.try_next() {
+                Ok(next) => next,
+                Err(e) => {
+                    self.read_error(e)?;
+                    continue;
+                }
+            };
+            return match step(&mut self.out, &self.db, self.generation, next, events)? {
+                Step::Ready => {
+                    self.note_delivery();
+                    Ok(true)
+                }
+                Step::Again => continue,
+                Step::Pending => Ok(false),
+            };
+        }
+    }
+
+    /// The next delivery into `self.out`, for an async caller, as [`wait`](Self::wait).
+    fn poll_step(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        events: bool,
+    ) -> std::task::Poll<Result<()>> {
         use std::task::Poll;
         if let Err(e) = self.check_failed() {
             return Poll::Ready(Err(e));
@@ -522,32 +773,70 @@ impl Feed {
                 Poll::Ready(Err(e @ pigeonhole_engine::Error::Unsupported(_))) => {
                     return Poll::Ready(Err(e.into()));
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(fail(&mut self.failed, e.into()))),
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(fail(&mut self.out.failed, e.into())));
+                }
             };
-            return match next {
-                Next::Commit(c) => {
-                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                        return Poll::Ready(Err(fail(&mut self.failed, e)));
-                    }
-                    Poll::Ready(Ok(&self.commit))
+            return match step(&mut self.out, &self.db, self.generation, next, events) {
+                Ok(Step::Ready) => {
+                    self.note_delivery();
+                    Poll::Ready(Ok(()))
                 }
-                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
-                Next::Expired(e) => {
-                    self.oldest_retained = e.oldest_retained;
-                    Poll::Ready(Err(expired(e)))
-                }
+                Ok(Step::Again) => continue,
                 // The engine's `poll_next` returns `Poll::Pending` instead.
-                Next::Pending => Poll::Pending,
+                Ok(Step::Pending) => Poll::Pending,
+                Err(e) => Poll::Ready(Err(e)),
             };
         }
     }
 
+    /// An error from the engine's reader in a blocking call: `Ok` to look again, after a
+    /// reader process's writer restarted (followed from the token) or under a recovery's swap
+    /// (the old engine failing: follow the recovery); else the feed's failure, kept.
+    fn read_error(&mut self, e: pigeonhole_engine::Error) -> Result<()> {
+        if matches!(e, pigeonhole_engine::Error::SnapshotExpired) {
+            return self.resubscribe();
+        }
+        if swapped(&self.db, self.generation) {
+            return Ok(());
+        }
+        Err(fail(&mut self.out.failed, e.into()))
+    }
+
+    /// The last event [`next_event`](Self::next_event) (or its try and poll forms) delivered,
+    /// as a replica applies it (D315 PR 3): its changes with the primary's ids, its position
+    /// span, and the feed's token right after it. Call it before the feed's next call, which
+    /// moves both. `None` before any event. Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn replicated(&self) -> Option<crate::replication::ReplicatedEvent> {
+        let event = self.out.event.as_ref()?;
+        Some(crate::replication::ReplicatedEvent::new(
+            event,
+            self.span,
+            self.token(),
+        ))
+    }
+
+    /// A delivery happened: the span from the last one's end to the stream's position now.
+    fn note_delivery(&mut self) {
+        let after = stream_position(&self.reader);
+        self.span = (self.span.1, after);
+    }
+
     /// The error that ended the feed, again.
     fn check_failed(&self) -> Result<()> {
-        match &self.failed {
+        match &self.out.failed {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
+    }
+
+    /// A handle to the feed's position, for another thread (D316 A4, ICR 0116): it stays
+    /// current as the feed reads, and reports [`is_live`](FeedProgress::is_live) `false`
+    /// once the feed is dropped. Cheap: two `Arc` clones.
+    pub fn progress(&self) -> FeedProgress {
+        self.progress.clone()
     }
 
     /// Where the feed is: [`FeedBuilder::resume`] continues after the last commit delivered.
@@ -555,9 +844,26 @@ impl Feed {
         FeedToken(self.reader.token())
     }
 
+    /// How far the feed has covered its history (ICR 0114 amendment), for a server that
+    /// fans one feed out to many clients (`phdb serve`'s hubs): every commit of the feed's
+    /// tables at or below [`FeedPosition::seqno`] was delivered or passed over, or precedes
+    /// its start, including the seqnos no commit of its tables holds (it moves while only
+    /// other tables are written). In a feed of every table, a catalog change was delivered
+    /// or passed over iff its sequence is at most [`FeedPosition::catalog_sequence`]; the
+    /// seqno says nothing about catalog changes. Neither part ever goes back. Not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn position(&self) -> FeedPosition {
+        let p = self.covered.join(self.reader.position());
+        FeedPosition {
+            seqno: p.seqno,
+            catalog: p.catalog,
+        }
+    }
+
     /// Once the feed expired: the oldest commit seqno its history still holds, when known.
     pub fn oldest_retained(&self) -> Option<u64> {
-        self.oldest_retained
+        self.out.oldest_retained
     }
 
     /// `Closed` once the database closed. After an automatic recovery onto a new engine
@@ -581,10 +887,149 @@ impl Feed {
     fn resubscribe(&mut self) -> Result<()> {
         let mut spec = self.spec.clone();
         spec.start = FeedStart::Token(self.reader.token());
-        let (reader, generation) = subscribe(&self.db, spec)?;
+        let (mut reader, generation) = subscribe(&self.db, spec)?;
+        // Nothing of the spec lies undelivered between the token and the old reader's
+        // position, so it stays covered.
+        self.covered = self.covered.join(self.reader.position());
+        reader.set_progress(Arc::clone(&self.progress.covered));
         self.reader = reader;
         self.generation = generation;
         Ok(())
+    }
+}
+
+/// What the last call delivered, and the names that fill it.
+#[derive(Debug)]
+struct Delivery {
+    names: Names,
+    /// The last commit [`Feed::next`] delivered, or the buffer the next is read into.
+    commit: Commit,
+    /// The last event [`Feed::next_event`] delivered. A commit's buffer comes back to
+    /// `commit` for the next one.
+    event: Option<FeedEvent>,
+    /// The oldest seqno still held, from the last expiry ([`Feed::oldest_retained`]).
+    oldest_retained: Option<u64>,
+    /// The error that ended the feed, returned by every later call (simp724 on #1321): the
+    /// reader had already moved past the commit it was delivering, so going on would skip
+    /// it.
+    failed: Option<Error>,
+}
+
+/// What one of the engine's answers comes to.
+enum Step {
+    /// Delivered into the [`Delivery`].
+    Ready,
+    /// Nothing for this call; ask the engine again at once.
+    Again,
+    /// Nothing ready.
+    Pending,
+}
+
+/// `next` into `out`: catalog changes only if `events`, though their names are always
+/// noted. An expiry is noted in `out` and returned; any other error is the feed's failure.
+fn step(
+    out: &mut Delivery,
+    db: &Db,
+    generation: u64,
+    next: Next<'_>,
+    events: bool,
+) -> Result<Step> {
+    // The last event's commit buffer, for this one.
+    if let Some(FeedEvent::Commit(c)) = out.event.take() {
+        out.commit = c;
+    }
+    match next {
+        Next::Commit(c) => {
+            if let Err(e) = fill(&mut out.commit, &mut out.names, db, c) {
+                return Err(fail(&mut out.failed, e));
+            }
+            if events {
+                let commit = std::mem::replace(&mut out.commit, Commit::empty());
+                out.event = Some(FeedEvent::Commit(commit));
+            }
+            Ok(Step::Ready)
+        }
+        Next::Catalog(ev) => {
+            let change = catalog_change(&mut out.names, ev);
+            if !events {
+                return Ok(Step::Again);
+            }
+            out.event = Some(FeedEvent::Catalog(change));
+            Ok(Step::Ready)
+        }
+        // The old engine's reader, still waiting as a recovery swapped in a new engine,
+        // reads the new session's records as outside its history: the new engine's reader
+        // decides from the token instead (cli692's S2 on #1321).
+        Next::Expired(_) if swapped(db, generation) => Ok(Step::Again),
+        Next::Expired(e) => {
+            out.oldest_retained = e.oldest_retained;
+            Err(expired(e))
+        }
+        Next::Pending => Ok(Step::Pending),
+    }
+}
+
+/// `ev` as the public [`CatalogChange`], noting the names of the families it adds and
+/// forgetting those of the tables it drops. A `CreateTable` and the `PutFamily` edits of
+/// its table are one [`CatalogEdit::TableCreated`].
+fn catalog_change(names: &mut Names, ev: &CatalogEvent) -> CatalogChange {
+    // Every table the edits name: created among them, or named by the event (the
+    // writer's rule, D315 2b).
+    let mut tables: HashMap<TableId, Arc<str>> = ev
+        .names
+        .iter()
+        .map(|(t, n)| (*t, Arc::from(n.as_str())))
+        .collect();
+    // Where each table created here sits in `edits`.
+    let mut created: HashMap<TableId, usize> = HashMap::new();
+    let mut edits = Vec::with_capacity(ev.edits.len());
+    for e in &ev.edits {
+        match e {
+            Edit::CreateTable { table, name } => {
+                tables.insert(*table, Arc::from(name.as_str()));
+                created.insert(*table, edits.len());
+                edits.push(CatalogEdit::TableCreated {
+                    table: name.clone(),
+                    families: Vec::new(),
+                });
+            }
+            Edit::PutFamily {
+                table,
+                family,
+                name,
+                options,
+            } => {
+                let table_name = tables.get(table).cloned().unwrap_or_else(|| Arc::from(""));
+                names.insert(
+                    (*table, *family),
+                    (Arc::clone(&table_name), Arc::from(name.as_str())),
+                );
+                let info = FamilyInfo::from_parts(name, options);
+                match created.get(table).and_then(|&i| edits.get_mut(i)) {
+                    Some(CatalogEdit::TableCreated { families, .. }) => families.push(info),
+                    _ => edits.push(CatalogEdit::FamilyAdded {
+                        table: table_name.to_string(),
+                        family: info,
+                    }),
+                }
+            }
+            Edit::DropTable { table } => {
+                names.retain(|(t, _), _| t != table);
+                created.remove(table);
+                let name = tables
+                    .get(table)
+                    .map_or_else(String::new, |n| n.to_string());
+                edits.push(CatalogEdit::TableDropped { table: name });
+            }
+            // The writer stages only the three above (D315).
+            _ => {}
+        }
+    }
+    CatalogChange {
+        seqno: ev.seqno_ceiling,
+        ts: ev.timestamp,
+        edits,
+        raw: ev.clone(),
     }
 }
 
@@ -626,6 +1071,7 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
         if let Some(slot) = out.changes.get_mut(i) {
             slot.table = table;
             slot.family = family;
+            slot.ids = key;
             slot.kind = kind;
             slot.ts = ch.ts;
             for (to, from) in [
@@ -645,6 +1091,7 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
                 row: ch.row.clone(),
                 qualifier: ch.qualifier.clone(),
                 stored: ch.value.clone(),
+                ids: key,
             });
         }
     }
@@ -708,11 +1155,11 @@ mod tests {
                 value: vec![0xEE, 1, 2],
             }],
         };
-        let e = fill(&mut feed.commit, &mut feed.names, &feed.db, &bad).unwrap_err();
+        let e = fill(&mut feed.out.commit, &mut feed.out.names, &feed.db, &bad).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Corruption, "{e}");
-        assert!(feed.commit.changes.is_empty());
+        assert!(feed.out.commit.changes.is_empty());
         // What `next` does with it: kept, and returned by every later call.
-        let e = fail(&mut feed.failed, e);
+        let e = fail(&mut feed.out.failed, e);
         t.mutate(b"after").put("f", b"q", b"v").commit().unwrap();
         for _ in 0..2 {
             assert_eq!(feed.next(Duration::from_secs(5)).unwrap_err(), e);

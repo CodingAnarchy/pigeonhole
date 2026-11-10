@@ -44,8 +44,9 @@ index.delete(b"note:2")?;
 | Syntax | Builder | Matches |
 |---|---|---|
 | `postgres meeting` | `Query::new().text("postgres meeting")` | either word, tokenised as documents are |
-| `"march meeting"` | `.phrase(["march", "meeting"])` | the words at consecutive positions |
-| `"march meeting"~2` | `.phrase_with_slop(["march", "meeting"], 2)` | within 2 position moves |
+| `"March meeting"` | `.quoted_phrase("March meeting", 0)` | the words at consecutive positions, tokenised as documents are (stop words keep their places) |
+| `"March meeting"~2` | `.quoted_phrase("March meeting", 2)` | within 2 position moves |
+| | `.phrase(["march", "meeting"])`, `.phrase_with_slop(words, 2)` | the words exactly as given, never tokenised |
 | `postgress~`, `postgress~1` | `.fuzzy("postgress", Fuzziness::Auto)`, `Fuzziness::One` | terms within a few edits |
 
 ```rust
@@ -140,6 +141,14 @@ Options are fixed when the index is created.
 A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which splits on Unicode word boundaries and lowercases. Normalisation applies to its tokens too.
 - **Its name and fingerprint are stored,** and an open with another tokeniser fails with `Mismatch`.
 - **The built-in tokeniser's fingerprint includes its Unicode version,** so a dependency update that changes word boundaries makes `open` refuse until you `repair` into a new index.
+
+## Async
+`search.run_async().await` and `run_with_stats_async().await` return exactly what `run` and `run_with_stats` do, for every query kind (#1560, ICR 0124). They're behind the `async` feature, on by default as in `pigeonhole`.
+- **Reads never block the thread.** The posting walks fetch their next block before each step, and skip by seeking within the row, so a cold hub term reads only the blocks it lands in. The point lookups, the statistics, a fuzzy term's expansion and a phrase's positions are futures too.
+- **Bounded work per poll.** A search yields after a bounded amount of work, so a hub term or a long phrase doesn't hold an executor thread.
+- **The future is `Send`,** and it works on a `ReadIndex` in a reader process too.
+
+See [Async](async.md) for the engine's async API that these build on.
 
 ## Reader processes
 A reader process opens the index with `Index::open_reader(&reader, name)`. That gives a `ReadIndex`: it searches and verifies at the reader's snapshots, and it can't write. It sees what the writer has committed, as every read in a reader process does. During the writer's `repair`, searches fail with `Busy`.

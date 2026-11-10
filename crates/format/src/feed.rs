@@ -176,6 +176,24 @@ pub enum FeedEntry {
         /// The commit's catalog edits, in the order they applied: `CreateTable`,
         /// `PutFamily` and `DropTable`, in the manifest's own encoding (FORMAT §9.3).
         edits: Vec<Edit>,
+        /// The name, as the catalog held it before these edits, of each table a `PutFamily`
+        /// or `DropTable` here names without its `CreateTable` here, once per table: a feed
+        /// resumed after the drop of a table older than the feed still names it.
+        names: Vec<(TableId, String)>,
+    },
+    /// Type 5 (D315 amendment, #1504): a feeding session's root commit about to happen,
+    /// appended (not synced) before the new superblock is written, and overwritten in place
+    /// by that commit's [`FeedEntry::Root`] once it is durable: the same length, so one
+    /// write. A trailing intent the session never overwrote tells the next open whether the
+    /// root landed (its superblock has this `sequence` and `checksum`: adopt it as the Root)
+    /// or not (its `sequence` is one past the superblock's: cut it off), so a process crash
+    /// between the superblock write and the Root entry no longer looks like a gap.
+    RootIntent {
+        /// The new root's sequence.
+        sequence: u64,
+        /// The new superblock's checksum (FORMAT §8.2: xxh3-64 of bytes 0..120), which tells
+        /// this root from another of the same sequence (an older build's, say).
+        checksum: u64,
     },
     /// An entry type this build does not know, written by a newer one (its checksum
     /// passed). A reader treats it as the end of the history before it. So is a `Catalog`
@@ -198,10 +216,10 @@ impl FeedEntry {
                 tables,
             } => {
                 p.push(1);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&opened_at.to_le_bytes());
-                p.extend_from_slice(&retention_bytes.to_le_bytes());
-                p.extend_from_slice(&retention_age_secs.to_le_bytes());
+                put_u64s(
+                    &mut p,
+                    &[*session, *opened_at, *retention_bytes, *retention_age_secs],
+                );
                 p.extend_from_slice(&streams.to_le_bytes());
                 match tables {
                     FeedTables::All => {
@@ -219,12 +237,15 @@ impl FeedEntry {
             }
             FeedEntry::Root { session, sequence } => {
                 p.push(2);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&sequence.to_le_bytes());
+                put_u64s(&mut p, &[*session, *sequence]);
             }
             FeedEntry::Unfed { sequence } => {
                 p.push(3);
                 p.extend_from_slice(&sequence.to_le_bytes());
+            }
+            FeedEntry::RootIntent { sequence, checksum } => {
+                p.push(5);
+                put_u64s(&mut p, &[*sequence, *checksum]);
             }
             FeedEntry::Catalog {
                 session,
@@ -232,15 +253,21 @@ impl FeedEntry {
                 seqno_ceiling,
                 timestamp,
                 edits,
+                names,
             } => {
                 p.push(4);
-                p.extend_from_slice(&session.to_le_bytes());
-                p.extend_from_slice(&sequence.to_le_bytes());
-                p.extend_from_slice(&seqno_ceiling.to_le_bytes());
-                p.extend_from_slice(&timestamp.to_le_bytes());
+                put_u64s(&mut p, &[*session, *sequence, *seqno_ceiling, *timestamp]);
                 p.extend_from_slice(&(edits.len() as u32).to_le_bytes());
                 for e in edits {
                     e.encode(&mut p);
+                }
+                // None: no count either, the layout #1493 wrote (and its frozen golden).
+                if !names.is_empty() {
+                    p.extend_from_slice(&(names.len() as u32).to_le_bytes());
+                    for (table, name) in names {
+                        p.extend_from_slice(&table.0.to_le_bytes());
+                        crate::varint::put_bytes(&mut p, name.as_bytes());
+                    }
                 }
             }
             FeedEntry::Unknown(t) => p.push(*t),
@@ -291,6 +318,10 @@ impl FeedEntry {
                 sequence: r.u64()?,
             },
             3 => FeedEntry::Unfed { sequence: r.u64()? },
+            5 => FeedEntry::RootIntent {
+                sequence: r.u64()?,
+                checksum: r.u64()?,
+            },
             4 => {
                 let (session, sequence, seqno_ceiling, timestamp) =
                     (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
@@ -306,7 +337,26 @@ impl FeedEntry {
                     edits.push(edit);
                     rest = &rest[used..];
                 }
-                if !rest.is_empty() {
+                // The names (D315 2b) follow the edits; an entry that ends after them (the
+                // layout #1493 wrote, frozen in `feed_sidecar_catalog.bin`) names none.
+                let mut r = Reader::new(rest, WHAT);
+                let n = if r.remaining() == 0 {
+                    0
+                } else {
+                    r.u32()? as usize
+                };
+                // Each pair takes at least 5 bytes (a u32 and a varint length): a count the
+                // payload can't hold is damage, and never sizes an allocation. A count of 0
+                // is never written (no names, no count), so it's damage too: each entry has
+                // one encoding (simp724's N1 on #1515).
+                if n > r.remaining() / 5 || (n == 0 && rest.len() != r.remaining()) {
+                    return Err(Error::Corrupt { what: WHAT });
+                }
+                let mut names = Vec::with_capacity(n);
+                for _ in 0..n {
+                    names.push((TableId(r.u32()?), r.string()?));
+                }
+                if r.remaining() != 0 {
                     return Err(Error::Corrupt { what: WHAT });
                 }
                 return Ok(FeedEntry::Catalog {
@@ -315,6 +365,7 @@ impl FeedEntry {
                     seqno_ceiling,
                     timestamp,
                     edits,
+                    names,
                 });
             }
             t => return Ok(FeedEntry::Unknown(t)),
@@ -326,10 +377,24 @@ impl FeedEntry {
     }
 }
 
+/// `vals`, little-endian, in order.
+fn put_u64s(p: &mut Vec<u8>, vals: &[u64]) {
+    for v in vals {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
 /// Decodes the entries after the header, up to the first torn or invalid one. Returns them
 /// and the length of the valid prefix of `bytes` (where a writer truncates before
 /// appending).
 pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
+    let (entries, end) = decode_entries_at(bytes);
+    (entries.into_iter().map(|(_, e)| e).collect(), end)
+}
+
+/// [`decode_entries`], each entry with the offset of its frame in `bytes`: where a writer
+/// cuts the file, or overwrites an entry in place (D315 amendment).
+pub fn decode_entries_at(bytes: &[u8]) -> (Vec<(usize, FeedEntry)>, usize) {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(head) = bytes.get(pos..pos + 8) {
@@ -343,7 +408,7 @@ pub fn decode_entries(bytes: &[u8]) -> (Vec<FeedEntry>, usize) {
         let Ok(entry) = FeedEntry::decode_payload(payload) else {
             break;
         };
-        out.push(entry);
+        out.push((pos, entry));
         pos += 8 + len;
     }
     (out, pos)

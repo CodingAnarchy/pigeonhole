@@ -411,3 +411,20 @@ fn a_requested_read_only_open_never_creates_the_file() {
     no_io(&vfs);
     assert!(!vfs.exists(Path::new(DB)).unwrap());
 }
+
+/// #1348 (ICR 0109 amendment): a requested read-only open is a true read-only one. On media
+/// that can't be written (no file opened for writing, created or removed) it opens and
+/// replays a crashed writer's log, and two run at once.
+#[test]
+fn a_requested_read_only_open_runs_on_read_only_media() {
+    let vfs = crashed_db(5907, 2, 30, 30);
+    vfs.set_read_only_media(true);
+    let mut o = common::options(Arc::clone(&vfs), 2, 16 << 20);
+    o.merge_operators.register(Arc::new(Concat));
+    o.read_only = true;
+    let first = Engine::open(Path::new(DB), o.clone()).unwrap();
+    // A second beside it, through the shared writer byte.
+    open_and_check(&vfs, o, 60);
+    first.close().unwrap();
+    vfs.set_read_only_media(false);
+}

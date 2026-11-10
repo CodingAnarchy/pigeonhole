@@ -1,0 +1,2 @@
+### Changed
+- `Options::read_only(true)` is a true read-only open (#1348, ICR 0109 amendment). It opens the database's files read-only, so it works on read-only media (a mounted backup, a read-only container layer, a snapshot volume). It takes the writer lock shared, so several read-only opens run at once, and creates no shared memory. A writer still can't open while one is open, nor one while a writer is (`WriterLocked`, whose message now names read-only opens). A reader process can't attach to a read-only handle.

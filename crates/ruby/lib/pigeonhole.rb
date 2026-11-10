@@ -42,6 +42,7 @@ module Pigeonhole
   end
 end
 
+require_relative "pigeonhole/fiber"
 require_relative "pigeonhole/api"
 require_relative "pigeonhole/memory"
 require_relative "pigeonhole/index"

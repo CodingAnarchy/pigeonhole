@@ -37,6 +37,8 @@ assert_eq!(names, [b"Ada".to_vec(), b"Grace".to_vec()]);
 
 **Everything the scan selects passes through unchanged:** families, qualifier prefix and range, `versions(n)`, `time_range`, `value_filter`, `snapshot(&s)` and `limit`. The batches hold exactly a plain scan's cells, in the same order. A reader process exports the same way through `ReadTable::scan`, while the writer keeps running.
 
+**A scan you've already started** exports with `ArrowScan::from_rows(rows, &options)` (ICR 0120): the batches begin at the iterator's next row and read at the snapshot it took. That's what the Python bindings' `scan(...).to_arrow()` uses.
+
 ## The schema: one Arrow row per cell
 | column | type | notes |
 |---|---|---|

@@ -28,6 +28,8 @@ on:
       - 'crates/bench/examples/readshapes.rs'
       - 'crates/bench/examples/writepath.rs'
       - 'crates/bench/examples/ycsb.rs'
+      - 'crates/bench/examples/textshapes.rs'
+      - 'crates/text/**'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
       - 'scripts/instruction-ceilings.py'
@@ -48,21 +50,7 @@ env:
   # D218, and its work happens in the kernel, where callgrind does not count it (and valgrind
   # runs its ring waits slowly). Base and head both read this.
   PIGEONHOLE_IO: pread
-  # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
-  # the head's sources of these files, so a new or changed example still has a baseline.
-  EXAMPLES: hotrow readshapes writepath ycsb scanrate
-  # The write shapes run with `Options::commit_spin(ZERO)` (crates/bench/examples/support/
-  # shards.rs): how often a waiting client polls depends on thread timing (D198), so counting
-  # it would make the shapes nondeterministic. The default spin is checked on wall time
-  # instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
-  # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in the
-  # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
-  # checked for regressions on every PR.
-  SHAPES: >-
-    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
-    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,flush,compact
-    ycsb:ycsb-c,ycsb-a
-    scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+  # The examples (EXAMPLES) and shapes (SHAPES) are per job: see the matrix below.
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read
@@ -87,9 +75,47 @@ env:
 
 jobs:
   instructions:
-    name: hotrow instructions per cell (callgrind)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Two jobs in parallel (#1575): the read and write shapes, and the text-search shapes,
+    # which alone took about 20 minutes a side under valgrind and pushed one job to its
+    # 60-minute timeout. Each builds and counts only its own examples, and checks only its
+    # own shapes against the ceilings.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hotrow instructions per cell (callgrind)
+            # Examples built at base and head (crates/bench/examples/NAME.rs). The base is
+            # built with the head's sources of these files, so a new or changed example still
+            # has a baseline.
+            examples: hotrow readshapes writepath ycsb scanrate
+            # The hot row's three states run too (scripts/instructions-per-cell.sh's first
+            # argument); `-` skips them.
+            hotrow: hotrow
+            # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in
+            # the contract of scripts/instructions-per-cell.sh. Add a shape here and it is
+            # reported and checked for regressions on every PR. The write shapes run with
+            # `Options::commit_spin(ZERO)` (crates/bench/examples/support/shards.rs): how
+            # often a waiting client polls depends on thread timing (D198), so counting it
+            # would make the shapes nondeterministic. The default spin is checked on wall
+            # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
+            shapes: >-
+              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
+              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
+              ycsb:ycsb-c,ycsb-a
+              scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+          - name: text search instructions per search (callgrind)
+            # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs).
+            examples: textshapes
+            hotrow: '-'
+            shapes: >-
+              textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2
+    env:
+      EXAMPLES: ${{ matrix.examples }}
+      SHAPES: ${{ matrix.shapes }}
+      HOTROW: ${{ matrix.hotrow }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -163,7 +189,19 @@ jobs:
               fi
               groups+=("/tmp/bin-$side/$g")
             done
-            scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
+            # The text shapes' index, built natively once per side (about 25 s) and opened
+            # read-only by every text shape: valgrind runs only the searches (#1560 PR 0). The
+            # build pins its clock and ids, so each side indexes the same bytes of text into
+            # the same layout. It also checks the corpus (the hub term's postings).
+            if [ -x "/tmp/bin-$side/textshapes" ]; then
+              "/tmp/bin-$side/textshapes" build "/tmp/textidx-$side"
+              export TEXTSHAPES_INDEX="/tmp/textidx-$side"
+            else
+              unset TEXTSHAPES_INDEX
+            fi
+            hot="/tmp/bin-$side/$HOTROW"
+            [ "$HOTROW" = - ] && hot=-
+            scripts/instructions-per-cell.sh "$hot" "${groups[@]}" > "/tmp/$side.txt"
           done
           if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
             echo "a side counted nothing: base $(wc -l < /tmp/base.txt) lines, head $(wc -l < /tmp/head.txt)"

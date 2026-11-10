@@ -247,6 +247,9 @@ struct FeedChildReport {
     delivered: Vec<(u32, u64)>,
     expired: u64,
     errors: u64,
+    /// 1 if the drain's deadline stopped it short of the parent's seqno.
+    #[serde(default)]
+    drain_timeouts: u64,
     secs: f64,
     /// User + system CPU seconds over the run (Linux), `None` elsewhere.
     cpu_secs: Option<f64>,
@@ -267,6 +270,7 @@ pub(crate) struct FeedChildrenReport {
     pub(crate) hist: Histogram,
     pub(crate) expired: u64,
     pub(crate) errors: u64,
+    pub(crate) drain_timeouts: u64,
     pub(crate) cpu_per_sec: Option<f64>,
     pub(crate) wakeups_per_sec: Option<f64>,
 }
@@ -303,7 +307,19 @@ pub(crate) fn spawn_feed(db: &Path, n: usize) -> Result<FeedChildren, String> {
 }
 
 impl FeedChildren {
-    /// Closes every child's stdin and merges their reports.
+    /// Tells every child to stop once its feed covers `through` (bounded by
+    /// [`DRAIN_WAIT`](super::feed::DRAIN_WAIT)): the seqno on its stdin, which then closes.
+    pub(crate) fn drain(&mut self, through: u64) {
+        for (_, stdin, _) in &mut self.children {
+            if let Some(mut s) = stdin.take() {
+                // A child that already exited reports anyway, or fails `stop`.
+                let _ = writeln!(s, "{through}");
+            }
+        }
+    }
+
+    /// Closes every child's stdin (a child not told to [`drain`](Self::drain) stops at
+    /// once) and merges their reports.
     pub(crate) fn stop(mut self) -> Result<FeedChildrenReport, String> {
         for (_, stdin, _) in &mut self.children {
             drop(stdin.take());
@@ -313,6 +329,7 @@ impl FeedChildren {
             hist: Histogram::new(),
             expired: 0,
             errors: 0,
+            drain_timeouts: 0,
             cpu_per_sec: Some(0.0),
             wakeups_per_sec: Some(0.0),
         };
@@ -327,6 +344,7 @@ impl FeedChildren {
             out.hist.merge(&Histogram::from_sparse(&r.delivered));
             out.expired += r.expired;
             out.errors += r.errors;
+            out.drain_timeouts += r.drain_timeouts;
             let secs = r.secs.max(1e-9);
             out.cpu_per_sec = out.cpu_per_sec.zip(r.cpu_secs).map(|(a, c)| a + c / secs);
             out.wakeups_per_sec = out
@@ -374,7 +392,9 @@ fn wakeups() -> Option<u64> {
 }
 
 /// `phdb-bench reader --feed`: attaches to `path` with `Pigeonhole::open_reader`, follows the
-/// `bench` table's durable feed from now until stdin closes, then prints its report: the
+/// `bench` table's durable feed from now until stdin closes (and its feed covers the seqno
+/// written there, if any, for at most 30 s), then prints
+/// its report: the
 /// delivery latencies (wall clock minus each commit's timestamp), and its CPU and wakeups
 /// over the run, so a backoff's idle cost is measured beside its latency.
 pub fn child_feed(path: &Path) -> Result<(), String> {
@@ -388,13 +408,13 @@ pub fn child_feed(path: &Path) -> Result<(), String> {
     let table = reader.table("bench").map_err(|e| e.to_string())?;
     let open = || table.feed().open();
     let feed = open().map_err(|e| e.to_string())?;
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(super::feed::Stop::default());
     {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut sink);
-            stop.store(true, Ordering::Release);
+            let mut sink = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut sink);
+            stop.drain(sink.trim().parse().unwrap_or(0));
         });
     }
     let (cpu0, wake0) = (cpu_secs(), wakeups());
@@ -406,6 +426,7 @@ pub fn child_feed(path: &Path) -> Result<(), String> {
         delivered: followed.hist.to_sparse(),
         expired: followed.expired,
         errors: followed.errors,
+        drain_timeouts: followed.drain_timeouts,
         secs,
         cpu_secs: cpu0.zip(cpu_secs()).map(|(a, b)| b - a),
         wakeups: wake0.zip(wakeups()).map(|(a, b)| b.saturating_sub(a)),

@@ -145,6 +145,107 @@ fn same_database_is_one_open() {
     again.close().unwrap();
 }
 
+/// ICR 0116 (D316 A2): the memtable gauges. The limit is set from the start and holds every
+/// byte used; writes raise the bytes used, and a flush gives them back. The arena updates
+/// the gauge as chunks are taken and returned. A flushed memtable's chunks come back when the
+/// shard handles the flush's completion, which `flush()` may return a moment before, so the
+/// reads poll; 5 s is only a hang guard. Nothing else holds the memtable then: the flush task
+/// drops its readers before it reports. It used to report first, and a shard that won that
+/// race left the chunks deferred until its next allocation, which an idle shard never makes
+/// (#1597's Windows CI run).
+#[test]
+fn memtable_bytes_rise_with_writes_and_fall_after_a_flush() {
+    let db = db();
+    let t = table(&db);
+    let wait_for = |what: &str, pred: &dyn Fn(&pigeonhole::EngineMetrics) -> bool| {
+        let start = std::time::Instant::now();
+        loop {
+            let m = db.engine_metrics();
+            if pred(&m) {
+                return m;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}: {m:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let start = wait_for("a limit", &|m| m.memtable_limit_bytes > 0);
+    assert!(start.memtable_bytes <= start.memtable_limit_bytes);
+    let value = vec![7u8; 4096];
+    for i in 0..256u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", &value)
+            .commit()
+            .unwrap();
+    }
+    let written = wait_for("bytes used after 1 MiB of writes", &|m| {
+        m.memtable_bytes > start.memtable_bytes
+    });
+    assert!(written.memtable_bytes <= written.memtable_limit_bytes);
+    assert_eq!(written.memtable_limit_bytes, start.memtable_limit_bytes);
+    db.flush().unwrap();
+    wait_for("bytes given back after the flush", &|m| {
+        m.memtable_bytes < written.memtable_bytes
+    });
+    drop(t);
+    db.close().unwrap();
+}
+
+/// ICR 0116 (D316 A3): group syncs' in-flight time. `GroupSync` commits each wait for a
+/// group sync, so the time grows with them; `Buffered` commits never add to it. A real
+/// directory, so the syncs take real time.
+#[test]
+fn group_sync_nanos_grow_with_durable_commits_only() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("gs.phdb"), Options::default().shards(1)).unwrap();
+    let t = table(&db);
+    let before = db.engine_metrics();
+    for i in 0..20u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", b"v")
+            .durability(Durability::GroupSync)
+            .commit()
+            .unwrap();
+    }
+    let durable = db.engine_metrics();
+    assert!(durable.group_syncs > before.group_syncs, "{durable:?}");
+    assert!(
+        durable.group_sync_nanos > before.group_sync_nanos,
+        "{durable:?}"
+    );
+    for i in 0..20u32 {
+        t.mutate(&(100 + i).to_be_bytes())
+            .put("a", b"q", b"v")
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
+    }
+    let buffered = db.engine_metrics();
+    assert_eq!(buffered.group_syncs, durable.group_syncs);
+    assert_eq!(buffered.group_sync_nanos, durable.group_sync_nanos);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// ICR 0115: `path` is the path as given to the open, relative or not, on every clone, and
+/// `is_closed` answers for every clone once one closes.
+#[test]
+fn path_is_the_path_given_to_open() {
+    let vfs = SimVfs::new(8);
+    let db = Pigeonhole::open("/db/./named.phdb", sim_options(&vfs)).unwrap();
+    assert_eq!(db.path(), std::path::Path::new("/db/./named.phdb"));
+    let clone = db.clone();
+    assert_eq!(clone.path(), db.path());
+    assert!(!clone.is_closed());
+    db.close().unwrap();
+    assert!(clone.is_closed());
+    drop(clone);
+    // A relative path stays relative: it is not canonicalised against the working
+    // directory (the simulated filesystem never consults one).
+    let db = Pigeonhole::open("db/rel.phdb", sim_options(&vfs)).unwrap();
+    assert_eq!(db.path(), std::path::Path::new("db/rel.phdb"));
+    db.close().unwrap();
+}
+
 #[test]
 fn drop_table_removes_it_and_its_data() {
     let db = db();
@@ -3637,4 +3738,83 @@ fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
 /// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087); 0 if absent.
 fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
     v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
+}
+
+/// #1595: a backup sized each new SST's extent at the target SST size (64 MiB), aligned to
+/// its size, so every family with memtable data took a 64 MiB slot of the copy: six small
+/// families made a copy of over 384 MiB, nearly all free (on Windows, real bytes to write,
+/// hash and send to a replica). Now a memtable's SST is sized from its bytes, so a copy stays
+/// about the size of what it holds: from a snapshot taken now (`backup`), and from an older
+/// one whose memtables have since been flushed (`backup_at`, a replica's bootstrap). The
+/// rewrite of an SST holding commits above the snapshot is the engine's
+/// `backup_below_an_ssts_commits_rewrites_it_without_them`.
+#[test]
+fn a_backup_s_file_is_about_the_size_of_what_it_holds() {
+    const FAMILIES: [&str; 6] = ["f0", "f1", "f2", "f3", "f4", "f5"];
+    let dir = TempDir::new("backup-size");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(2).memtable_budget(4 << 20);
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let mut builder = db.table("t").unwrap();
+    for f in FAMILIES {
+        builder = builder.family(f, Family::default());
+    }
+    let t = builder.create_if_missing().unwrap();
+    let write = |round: u8| {
+        for (i, f) in FAMILIES.iter().enumerate() {
+            for r in 0..20u8 {
+                t.mutate(&[b'r', r])
+                    .put(f, b"q", &[round, i as u8, r])
+                    .commit()
+                    .unwrap();
+            }
+        }
+    };
+    // Every family's commits only in memtables: the copy writes six SSTs from them.
+    write(1);
+    let source = std::fs::metadata(&path).unwrap().len();
+    let held = dir.0.join("held.phdb");
+    db.backup(&held).unwrap();
+    // The file's length, not its blocks: a sparse copy's free tail costs nothing on some file
+    // systems, and every byte on others.
+    let len = std::fs::metadata(&held).unwrap().len();
+    assert!(
+        len < 64 << 20 && len <= source + (8 << 20),
+        "a copy of {} families' memtables is {len} bytes (the source is {source}): a 64 MiB \
+         slot per family's SST",
+        FAMILIES.len()
+    );
+
+    // An older snapshot, then newer commits and a flush: the copy is of the snapshot's view,
+    // its memtables written without the newer commits.
+    let snapshot = db.snapshot().unwrap();
+    write(2);
+    db.flush().unwrap();
+    let older = dir.0.join("older.phdb");
+    db.backup_at(&snapshot, &older).unwrap();
+    let len = std::fs::metadata(&older).unwrap().len();
+    let source = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len < 64 << 20 && len <= source + (8 << 20),
+        "a copy of {} families at an older snapshot is {len} bytes (the source is {source})",
+        FAMILIES.len()
+    );
+    drop(snapshot);
+
+    // Both copies hold what they should.
+    for (copy_path, round) in [(&held, 1u8), (&older, 1u8)] {
+        let copy = Pigeonhole::open(copy_path, opts().create_if_missing(false)).unwrap();
+        let ct = copy.table("t").unwrap().open().unwrap();
+        for (i, f) in FAMILIES.iter().enumerate() {
+            assert_eq!(
+                value(&ct, b"r\x07", f, b"q").as_deref(),
+                Some(&[round, i as u8, 7][..]),
+                "{copy_path:?} {f}"
+            );
+        }
+        drop(ct);
+        copy.close().unwrap();
+    }
+    drop(t);
+    db.close().unwrap();
 }

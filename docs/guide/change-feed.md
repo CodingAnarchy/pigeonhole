@@ -64,9 +64,54 @@ for change in commit.changes() {
 
 ## Where it starts
 - **After now** (the default): the commits after `open()`.
-- **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed.
+- **`from_snapshot(&snapshot)`:** the commits after those the snapshot sees. This is how a consumer starts from a known state without missing or repeating anything: read the snapshot, then follow the feed. To seed a copy elsewhere, back the same snapshot up with `db.backup_at(&snapshot, path)`: the copy holds exactly what the snapshot sees, and the feed starts at the first commit it doesn't hold. Use a `durable_snapshot()` for a copy that holds only durable commits.
 - **`from_oldest()`:** the oldest history kept, across reopens too: it starts at the oldest earlier open whose history every shard still keeps whole. Under load that history can be recycled before the feed reaches it, which expires the feed at once, so prefer a snapshot.
 - **`resume(&token)`:** after the last commit a feed delivered before it gave that token.
+
+## A feed of every table
+`Pigeonhole::feed()` follows every table, including tables created after it opened, as one stream of the whole database's commits. It needs the change feed on for every table: no `feed_tables` list in this open or in any earlier open its history spans. `next` gives its commits. `next_event` gives the same commits as `FeedEvent::Commit`, and the changes to the tables themselves as `FeedEvent::Catalog`, each in its place in commit order:
+
+```rust
+use pigeonhole::{CatalogEdit, Family, FeedEvent, FeedRetention, Options, Pigeonhole};
+use std::time::Duration;
+
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(
+    dir.join("app.phdb"),
+    Options::default().change_feed(FeedRetention::bytes(64 << 20)),
+)?;
+let mut feed = db.feed().open()?;
+let users = db.table("users")?.family("p", Family::default()).create()?;
+users.mutate(b"user:1").put("p", b"name", b"ada").commit()?;
+
+let wait = Duration::from_secs(5);
+match feed.next_event(wait)?.expect("the create") {
+    FeedEvent::Catalog(change) => match &change.edits()[0] {
+        CatalogEdit::TableCreated { table, families, .. } => {
+            assert_eq!((table.as_str(), families[0].name.as_str()), ("users", "p"));
+        }
+        other => panic!("{other:?}"),
+    },
+    other => panic!("{other:?}"),
+}
+match feed.next_event(wait)?.expect("the commit") {
+    FeedEvent::Commit(commit) => assert_eq!(commit.changes()[0].table(), "users"),
+    other => panic!("{other:?}"),
+}
+# drop(feed);
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **A `CatalogChange`** holds the edits one catalog change made: `TableCreated` (with every family's options, as `FamilyInfo`), `FamilyAdded` and `TableDropped`, each naming its table. Its `seqno` places it: every commit below it came before the change, every commit at or above it comes after.
+- **Starts:** a feed opened now, or `from_snapshot`, passes over the changes its start already sees, so the tables that exist are not created again. A token resumes just past the last event, a commit or a catalog change.
+- **Tokens:** a feed of every table resumes only from a token of a feed of every table. A table's feed may resume from one: it follows part of what that feed did, from the same position.
+- **Names:** a change to a table dropped before the feed reached it comes with empty names, unless the feed delivered the table's creation.
+- **A sidecar failure** (the feed's `-feed` file can't be written) stops this session from recording catalog changes. A feed of every table in the writer's process expires at once. In a reader process, it waits at the next catalog change's place in commit order until the database reopens. Feeds of some tables carry on. Every token taken since expires at the next open, as for any sidecar failure. Writes go on.
+- **Async:** `nonblocking::FeedEventStream` is `FeedStream` for events, and `Feed::poll_next_event` is the same one level down.
+- **Replicas** (unstable, behind the `__unstable-replication` feature; D315): a database that applies another's feed of every table takes only its primary's changes. Its own writes and schema changes fail with `ReadOnly`, and so do pigeonhole's own background writers on it, such as an agent memory store's consolidation or an index build. Table names starting with `__pigeonhole.` are reserved everywhere.
 
 ## Tokens
 Take `feed.token()` after handling a commit, and store it with what the commit fed, ideally in the same write. `FeedToken::as_bytes` and `FeedToken::from_bytes` round-trip it. Resuming continues exactly after the last commit delivered, so a crash between handling a commit and storing its token delivers that commit again, never skips it. Make your handling idempotent, or store the token atomically with its effect.
@@ -107,10 +152,10 @@ By default a feed delivers a commit once it's durable at its commit's level. So 
 
 ## When a feed expires
 A feed that can't continue without a gap fails with `ErrorCode::FeedExpired`, and stays failed. It never skips silently. This happens when:
-- retention recycled the history it needs: raise `FeedRetention` if a slow consumer falls behind;
+- retention recycled the history it needs: raise `FeedRetention` if a slow consumer falls behind. A feed far enough behind to fill its read-ahead (64 MiB of commits it has read but not delivered) keeps only part of it in memory and reads the rest from the log again later, so retention must keep that history too. A feed that falls that far behind can therefore expire, where one that held every commit in memory wouldn't have;
 - the database was opened since with the feed off, without these tables, or with another explicit shard count;
 - a power loss took commits a `visible()` feed had delivered;
-- a short window after any metadata commit (such as a flush's, a checkpoint's, a compaction's, a schema change's or a shrink's) before the feed's record of it is safe: a process crash before the record is written (a single write, microseconds), or a power loss before it is synced.
+- a short window after any metadata commit (such as a flush's, a checkpoint's, a compaction's, a schema change's or a shrink's): a power loss before the feed's record of it is synced. A process crash there no longer expires a feed: the next open finishes the record from the metadata commit itself.
 
 Once a feed has expired, `Feed::oldest_retained` says how far back the history it needed still goes, when that's known. To recover, rebuild what the feed maintained from a snapshot and start a new feed `from_snapshot` of it.
 

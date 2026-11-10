@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use pigeonhole::{
-    ChangeKind, Commit, ErrorCode, Family, Feed, FeedRetention, FeedToken, Options, Pigeonhole,
-    Table, Value,
+    CatalogEdit, ChangeKind, Commit, ErrorCode, Family, Feed, FeedEvent, FeedRetention, FeedToken,
+    Options, Pigeonhole, Table, Value,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -701,5 +701,249 @@ fn a_feed_of_every_table_resumes_only_from_its_own_kind_of_token() {
         "a table's feed from an all-tables token"
     );
     drop((one, all, again, sub, a, b));
+    db.close().unwrap();
+}
+
+/// One event, as a short string: `c<seqno>:<table>/<family>` for a commit (its first
+/// change), `+t[f,g]`, `+t/f` or `-t` for a catalog change's edits.
+fn event(feed: &mut Feed) -> String {
+    match feed
+        .next_event(WAIT)
+        .unwrap()
+        .expect("an event within the wait")
+    {
+        FeedEvent::Commit(c) => {
+            let ch = &c.changes()[0];
+            format!("c{}:{}/{}", c.seqno(), ch.table(), ch.family())
+        }
+        FeedEvent::Catalog(change) => change
+            .edits()
+            .iter()
+            .map(|e| match e {
+                CatalogEdit::TableCreated {
+                    table, families, ..
+                } => {
+                    let f: Vec<&str> = families.iter().map(|f| f.name.as_str()).collect();
+                    format!("+{table}[{}]", f.join(","))
+                }
+                CatalogEdit::FamilyAdded { table, family, .. } => {
+                    format!("+{table}/{}", family.name)
+                }
+                CatalogEdit::TableDropped { table, .. } => format!("-{table}"),
+                other => panic!("an edit this test doesn't know: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => panic!("an event this test doesn't know: {other:?}"),
+    }
+}
+
+/// D315 PR 2b: `next_event` on a feed of every table delivers each catalog change in its
+/// place among the commits: a created table with its families, an added family, a dropped
+/// table, each named; a catalog change's seqno sits above every commit before it and at or
+/// below every commit after. `next` passes the changes over but still names the commits of
+/// a family added later, and a table's own feed never sees a catalog change.
+#[test]
+fn a_feed_of_every_table_delivers_catalog_changes_in_commit_order() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("events.phdb"), fed()).unwrap();
+    let (a, _b) = tables(&db);
+    let mut events = db.feed().open().unwrap();
+    let mut commits = db.feed().open().unwrap();
+    let mut placed = db.feed().open().unwrap();
+    let mut one = a.feed().open().unwrap();
+    let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("g", Family::default())
+        .family("n", Family::counter())
+        .create()
+        .unwrap();
+    let s2 = c.mutate(b"r2").put("g", b"q", b"2").commit().unwrap();
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("h", Family::default())
+        .open()
+        .unwrap();
+    let s3 = c.mutate(b"r3").put("h", b"q", b"3").commit().unwrap();
+    drop(c);
+    db.drop_table("c").unwrap();
+    let s4 = a.mutate(b"r4").put("f", b"q", b"4").commit().unwrap();
+
+    let got: Vec<String> = (0..7).map(|_| event(&mut events)).collect();
+    assert_eq!(
+        got,
+        [
+            format!("c{}:a/f", s1.seqno),
+            "+c[g,n]".into(),
+            format!("c{}:c/g", s2.seqno),
+            "+c/h".into(),
+            format!("c{}:c/h", s3.seqno),
+            "-c".into(),
+            format!("c{}:a/f", s4.seqno),
+        ]
+    );
+    assert!(events.try_next_event().unwrap().is_none(), "nothing more");
+
+    // The seqnos place each change between the commits around it.
+    let seqnos: Vec<(bool, u64)> = (0..7)
+        .map(
+            |_| match placed.next_event(WAIT).unwrap().expect("an event") {
+                FeedEvent::Commit(c) => (false, c.seqno()),
+                FeedEvent::Catalog(change) => (true, change.seqno()),
+                other => panic!("{other:?}"),
+            },
+        )
+        .collect();
+    for w in seqnos.windows(3) {
+        if let [(false, before), (true, change), (false, after)] = *w {
+            assert!(before < change && change <= after, "{seqnos:?}");
+        }
+    }
+
+    let got: Vec<String> = (0..4)
+        .map(|_| {
+            let c = next(&mut commits);
+            let ch = &c.changes()[0];
+            format!("c{}:{}/{}", c.seqno(), ch.table(), ch.family())
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            format!("c{}:a/f", s1.seqno),
+            format!("c{}:c/g", s2.seqno),
+            format!("c{}:c/h", s3.seqno),
+            format!("c{}:a/f", s4.seqno),
+        ],
+        "`next` passes the catalog changes over"
+    );
+    for want in [s1.seqno, s4.seqno] {
+        match one.next_event(WAIT).unwrap().expect("a commit") {
+            FeedEvent::Commit(c) => assert_eq!(c.seqno(), want),
+            other => panic!("a table's feed delivered {other:?}"),
+        }
+    }
+    drop((events, commits, placed, one, a));
+    db.close().unwrap();
+}
+
+/// D315 PR 2b: a token resumes just past the last event, a commit or a catalog change,
+/// across a reopen; and a table that existed before the feed opened and was dropped after
+/// the token is still named on resume, though the catalog no longer holds it (the `Catalog`
+/// entry's names). A feed opened now passes over the changes before it, so the tables that
+/// already exist are not created again.
+#[test]
+fn a_token_resumes_just_past_the_last_event_and_names_a_dropped_table() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("resume.phdb");
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let (a, b) = tables(&db);
+    let mut feed = db.feed().open().unwrap();
+    let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    assert_eq!(event(&mut feed), format!("c{}:a/f", s1.seqno));
+    let after_commit = feed.token();
+    drop(b);
+    db.drop_table("b").unwrap();
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("g", Family::default())
+        .create()
+        .unwrap();
+    let s2 = c.mutate(b"r2").put("g", b"q", b"2").commit().unwrap();
+    assert_eq!(event(&mut feed), "-b");
+    let after_change = feed.token();
+    drop((feed, a, c));
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    for (token, want) in [
+        (&after_commit, vec!["-b".to_string(), "+c[g]".into()]),
+        (&after_change, vec!["+c[g]".to_string()]),
+    ] {
+        let mut f = db.feed().resume(token).open().unwrap();
+        let mut got: Vec<String> = want.iter().map(|_| event(&mut f)).collect();
+        got.push(event(&mut f));
+        let mut want = want.clone();
+        want.push(format!("c{}:c/g", s2.seqno));
+        assert_eq!(got, want);
+        assert!(f.try_next_event().unwrap().is_none(), "nothing seen twice");
+    }
+    db.close().unwrap();
+}
+
+/// D315 PR 2b: a feed of every table from a snapshot delivers exactly the catalog changes
+/// the snapshot didn't see: read the snapshot, then follow the feed.
+#[test]
+fn a_feed_of_every_table_from_a_snapshot_starts_with_the_changes_it_did_not_see() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("snap.phdb"), fed()).unwrap();
+    let (a, _b) = tables(&db);
+    a.mutate(b"r0").put("f", b"q", b"0").commit().unwrap();
+    let before = db.snapshot().unwrap();
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("g", Family::default())
+        .create()
+        .unwrap();
+    let after = db.snapshot().unwrap();
+    let s1 = c.mutate(b"r1").put("g", b"q", b"1").commit().unwrap();
+    let mut from_before = db.feed().from_snapshot(&before).open().unwrap();
+    let mut from_after = db.feed().from_snapshot(&after).open().unwrap();
+    drop((before, after));
+    let commit = format!("c{}:c/g", s1.seqno);
+    assert_eq!(
+        [event(&mut from_before), event(&mut from_before)],
+        ["+c[g]".to_string(), commit.clone()]
+    );
+    assert_eq!(event(&mut from_after), commit);
+    assert!(from_after.try_next_event().unwrap().is_none());
+    drop((from_before, from_after, a, c));
+    db.close().unwrap();
+}
+
+/// ICR 0114 amendment (for `phdb serve`'s hubs, #1518): `Feed::position` covers every
+/// delivered commit and moves while only other tables write, and a table created again
+/// under its old name has another `feed_id`.
+#[test]
+fn a_feed_s_position_and_a_table_s_feed_id() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("pos.phdb"), fed()).unwrap();
+    let (a, b) = tables(&db);
+    let mut feed = a.feed().open().unwrap();
+    let start = feed.position();
+    let s1 = a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    assert_eq!(next(&mut feed).seqno(), s1.seqno);
+    assert!(feed.position().seqno() >= s1.seqno);
+    assert!(feed.position().covers(&start));
+    let other = b.mutate(b"r2").put("f", b"q", b"2").commit().unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    while feed.position().seqno() < other.seqno {
+        assert!(feed.try_next().unwrap().is_none(), "nothing of a's");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            feed.position()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(feed.position().catalog_sequence(), 0);
+
+    let id = b.feed_id();
+    assert_ne!(id, a.feed_id());
+    drop(b);
+    db.drop_table("b").unwrap();
+    let b = db
+        .table("b")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    assert_ne!(b.feed_id(), id, "ids are never reused");
+    drop((feed, a, b));
     db.close().unwrap();
 }

@@ -70,9 +70,15 @@ fn a_run_reports_its_feed_subscribers_and_the_feed_s_syncs() {
         (&1.into(), &1.into(), &1.into()),
         "{f}"
     );
-    // Buffered commits: every subscriber is delivered the phase's commits.
-    for kind in ["durable_delivery", "visible_delivery", "reader_delivery"] {
-        assert!(f[kind]["count"].as_u64().unwrap() > 100, "{kind}: {f}");
+    // Buffered commits: every subscriber is delivered the phase's commits. The run drains
+    // each subscriber through the phase's last commit before it reports, so a durable one
+    // that waited on a slow sync still has them all (#1553's Windows run: a 1.2 s sync).
+    // A durable feed opened from now may start below the visible one (commits not yet
+    // synced when it opened), so it can deliver more, never fewer.
+    let visible = f["visible_delivery"]["count"].as_u64().unwrap();
+    assert!(visible > 100, "visible_delivery: {f}");
+    for kind in ["durable_delivery", "reader_delivery"] {
+        assert!(f[kind]["count"].as_u64().unwrap() >= visible, "{kind}: {f}");
     }
     // The visible frontier never trails the durable one.
     assert!(
@@ -80,13 +86,27 @@ fn a_run_reports_its_feed_subscribers_and_the_feed_s_syncs() {
         "{f}"
     );
     assert_eq!(
-        (f["expired"].as_u64(), f["errors"].as_u64()),
-        (Some(0), Some(0)),
+        (
+            f["expired"].as_u64(),
+            f["errors"].as_u64(),
+            f["drain_timeouts"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0)),
         "{f}"
     );
-    // Buffered commits on a durable feed: the feed's own syncs ran, and no group sync.
+    assert!(f["drain_ms"].is_u64(), "{f}");
+    // Buffered commits on a durable feed: the feed's own syncs ran. A Buffered group takes
+    // a group sync only when its record lands in a WAL segment whose header still waits for
+    // the previous rollover's sync (#19, D200): at most one per 64 MiB rollover, so a few in
+    // a run where syncs are slow (#1592's macOS run: 2, with a 650 ms durable p50). The
+    // record has no rollover count, so bound them by the commits instead (plus a few for the
+    // segments already open when the phase began): a regression to a group sync per Buffered
+    // group would be on the order of the commits, far above this.
     assert!(f["background_syncs"].as_u64().unwrap() >= 1, "{f}");
-    assert_eq!(f["group_syncs"].as_u64(), Some(0), "{f}");
+    assert!(
+        f["group_syncs"].as_u64().unwrap() <= 4 + visible / 1000,
+        "{f}"
+    );
     assert_eq!(f["retained_taken"].as_u64(), Some(0), "{f}");
     // Sampled; 0 until a segment the checkpoint passed is kept, which a smoke run may not reach.
     assert!(f["retained_wal_peak"].is_u64(), "{f}");

@@ -143,5 +143,8 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `insta` (dev, `filters`) | Apache-2.0 | cli | Snapshot tests of `phdb`'s output (the spec's "snapshot tests of CLI output"). |
 | `arrow-array`, `arrow-buffer`, `arrow-schema` 60 (no default features; `arrow-array/ffi` behind pigeonhole-arrow's `ffi` feature) | Apache-2.0 | arrow, cli | The `RecordBatch` export (#691, D5; owner, 2026-10-21). One major, pinned; the `arrow` umbrella crate is not used. 34 crates with their dependencies (chrono comes in through `arrow-array`). |
 | `arrow-ipc` 60 (no default features) | Apache-2.0 | cli only | `phdb dump --format arrow`'s IPC stream (#691, D6; owner, 2026-10-21). Adds `flatbuffers` (Apache-2.0). |
+| `opentelemetry` 0.33 (no default features; `metrics`) | Apache-2.0 | otel | The `Meter` an application hands `pigeonhole_otel::register`, and the observable instruments it builds (D316, #1458; owner, 2026-11-04). The API crate only, with no dependencies of its own at these features; the application picks the SDK and exporter. Its minor releases are breaking, so `pigeonhole-otel` has its own 0.N line. |
+| `opentelemetry_sdk` 0.33 (dev, `metrics`, `testing`) | Apache-2.0 | otel | The in-memory exporter the export tests read every metric back through. |
+| `opentelemetry-prometheus` 0.33, `prometheus` 0.14 (dev) | Apache-2.0 | otel | The observability guide's Prometheus example, and the test that each metric's documented Prometheus name is the exporter's own. |
 
 zstd (Phase 2), io_uring (Phase 3), `futures-core` (Phase 3 async) and the bench comparison runners are not added yet.

@@ -40,7 +40,7 @@ pub(crate) fn commit_info(c: pigeonhole::CommitInfo) -> proto::CommitInfo {
 }
 
 /// A vector's elements, decoded from the packed little-endian bytes.
-enum Elements {
+pub(crate) enum Elements {
     F32(Vec<f32>),
     I8(Vec<i8>),
     Bits(Vec<u8>),
@@ -48,7 +48,7 @@ enum Elements {
     Bf16(Vec<u16>),
 }
 
-fn elements(v: &proto::Vector) -> Result<Elements> {
+pub(crate) fn elements(v: &proto::Vector) -> Result<Elements> {
     let dim = v.dim as usize;
     let data = &v.data;
     let want = |each: usize| {
@@ -108,75 +108,245 @@ fn value_of(v: Option<&proto::Value>) -> Result<&value::Kind> {
         .ok_or_else(|| ApiError::invalid("a put needs a value"))
 }
 
-/// Applies `writes` to a row mutation.
+/// A typed value, decoded from its proto form.
+pub(crate) enum Typed<'w> {
+    Bytes(&'w [u8]),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Vector(Elements),
+}
+
+/// One write, checked and decoded. A row mutation, a batch and a transaction all buffer
+/// these, through one dispatch (`dispatch!`). A transaction prepares a request's writes
+/// before buffering any (simp724's T1 on #1511), so a malformed one fails with nothing
+/// buffered.
+pub(crate) enum TxnOp<'w> {
+    Put {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        value: Typed<'w>,
+    },
+    Incr {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        delta: i64,
+    },
+    Aggregate {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: Option<u64>,
+        input: Typed<'w>,
+    },
+    Merge {
+        family: &'w str,
+        qualifier: &'w [u8],
+        operand: &'w [u8],
+    },
+    DeleteCell {
+        family: &'w str,
+        qualifier: &'w [u8],
+        ts: u64,
+    },
+    DeleteColumn {
+        family: &'w str,
+        qualifier: &'w [u8],
+    },
+    DeleteFamily {
+        family: &'w str,
+    },
+    DeleteRow,
+}
+
+fn typed(kind: &value::Kind) -> Result<Typed<'_>> {
+    Ok(match kind {
+        value::Kind::Bytes(b) => Typed::Bytes(b),
+        value::Kind::I64(n) => Typed::I64(*n),
+        value::Kind::U64(n) => Typed::U64(*n),
+        value::Kind::F64(x) => Typed::F64(*x),
+        value::Kind::Vector(v) => Typed::Vector(elements(v)?),
+    })
+}
+
+/// When an aggregate's input is checked against a vector: a transaction decodes the input
+/// first, so a vector with malformed elements still raises the element error, as it always
+/// did (the coordinator on #1555's N1); a mutation refuses a vector input before decoding it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorInput {
+    RefuseFirst,
+    DecodeFirst,
+}
+
+/// One write, checked and decoded.
+fn txn_op(w: &proto::Write, aggregate: VectorInput) -> Result<TxnOp<'_>> {
+    Ok(
+        match w
+            .op
+            .as_ref()
+            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
+        {
+            write::Op::Put(p) => TxnOp::Put {
+                family: &p.family,
+                qualifier: &p.qualifier,
+                ts: p.timestamp,
+                value: typed(value_of(p.value.as_ref())?)?,
+            },
+            write::Op::Incr(i) => TxnOp::Incr {
+                family: &i.family,
+                qualifier: &i.qualifier,
+                ts: i.timestamp,
+                delta: i.delta,
+            },
+            write::Op::Aggregate(a) => {
+                let kind = value_of(a.input.as_ref())?;
+                let refuse =
+                    || ApiError::invalid("an aggregate input is an i64, u64, f64 or bytes");
+                let vector = matches!(kind, value::Kind::Vector(_));
+                if vector && aggregate == VectorInput::RefuseFirst {
+                    return Err(refuse());
+                }
+                let input = typed(kind)?;
+                if vector {
+                    return Err(refuse());
+                }
+                TxnOp::Aggregate {
+                    family: &a.family,
+                    qualifier: &a.qualifier,
+                    ts: a.timestamp,
+                    input,
+                }
+            }
+            write::Op::Merge(g) => TxnOp::Merge {
+                family: &g.family,
+                qualifier: &g.qualifier,
+                operand: &g.operand,
+            },
+            write::Op::DeleteCell(d) => TxnOp::DeleteCell {
+                family: &d.family,
+                qualifier: &d.qualifier,
+                ts: d.timestamp,
+            },
+            write::Op::DeleteColumn(d) => TxnOp::DeleteColumn {
+                family: &d.family,
+                qualifier: &d.qualifier,
+            },
+            write::Op::DeleteFamily(d) => TxnOp::DeleteFamily { family: &d.family },
+            write::Op::DeleteRow(_) => TxnOp::DeleteRow,
+        },
+    )
+}
+
+/// Checks and decodes a row's `writes` for a transaction, buffering nothing.
+pub(crate) fn txn_ops(writes: &[proto::Write]) -> Result<Vec<TxnOp<'_>>> {
+    writes
+        .iter()
+        .map(|w| txn_op(w, VectorInput::DecodeFirst))
+        .collect()
+}
+
+/// Buffers one decoded op through `$call!(method, args...)`, the target's way of calling
+/// its typed write methods (`RowMutation`'s take the cell's coordinates; a batch's and a
+/// transaction's take the table and row first). One match for the three targets.
+macro_rules! dispatch {
+    ($op:expr, $call:ident) => {
+        match $op {
+            TxnOp::Put {
+                family: f,
+                qualifier: q,
+                ts,
+                value,
+            } => {
+                let (f, q) = (*f, *q);
+                match (value, *ts) {
+                    (Typed::Bytes(b), None) => $call!(put, f, q, b),
+                    (Typed::Bytes(b), Some(ts)) => $call!(put_at, f, q, ts, b),
+                    (Typed::I64(n), None) => $call!(put_i64, f, q, *n),
+                    (Typed::I64(n), Some(ts)) => $call!(put_i64_at, f, q, ts, *n),
+                    (Typed::F64(x), None) => $call!(put_f64, f, q, *x),
+                    (Typed::F64(x), Some(ts)) => $call!(put_f64_at, f, q, ts, *x),
+                    (Typed::U64(n), None) => $call!(put_u64, f, q, *n),
+                    (Typed::U64(n), Some(ts)) => $call!(put_u64_at, f, q, ts, *n),
+                    (Typed::Vector(v), ts) => match (v, ts) {
+                        (Elements::F32(x), None) => $call!(put_vector_f32, f, q, x),
+                        (Elements::F32(x), Some(ts)) => $call!(put_vector_f32_at, f, q, ts, x),
+                        (Elements::I8(x), None) => $call!(put_vector_i8, f, q, x),
+                        (Elements::I8(x), Some(ts)) => $call!(put_vector_i8_at, f, q, ts, x),
+                        (Elements::Bits(x), None) => $call!(put_vector_bits, f, q, x),
+                        (Elements::Bits(x), Some(ts)) => $call!(put_vector_bits_at, f, q, ts, x),
+                        (Elements::F16(x), None) => $call!(put_vector_f16, f, q, x),
+                        (Elements::F16(x), Some(ts)) => $call!(put_vector_f16_at, f, q, ts, x),
+                        (Elements::Bf16(x), None) => $call!(put_vector_bf16, f, q, x),
+                        (Elements::Bf16(x), Some(ts)) => $call!(put_vector_bf16_at, f, q, ts, x),
+                    },
+                }
+            }
+            TxnOp::Incr {
+                family,
+                qualifier,
+                ts,
+                delta,
+            } => match ts {
+                None => $call!(incr, family, qualifier, *delta),
+                Some(ts) => $call!(incr_at, family, qualifier, *ts, *delta),
+            },
+            TxnOp::Aggregate {
+                family: f,
+                qualifier: q,
+                ts,
+                input,
+            } => {
+                let (f, q) = (*f, *q);
+                match (input, *ts) {
+                    (Typed::I64(n), None) => $call!(aggregate, f, q, *n),
+                    (Typed::I64(n), Some(ts)) => $call!(aggregate_at, f, q, ts, *n),
+                    (Typed::U64(n), None) => $call!(aggregate_u64, f, q, *n),
+                    (Typed::U64(n), Some(ts)) => $call!(aggregate_u64_at, f, q, ts, *n),
+                    (Typed::F64(x), None) => $call!(aggregate_f64, f, q, *x),
+                    (Typed::F64(x), Some(ts)) => $call!(aggregate_f64_at, f, q, ts, *x),
+                    (Typed::Bytes(b), None) => $call!(aggregate_bytes, f, q, b),
+                    (Typed::Bytes(b), Some(ts)) => $call!(aggregate_bytes_at, f, q, ts, b),
+                    // `txn_op` refuses a vector input before decoding it.
+                    (Typed::Vector(_), _) => {}
+                }
+            }
+            TxnOp::Merge {
+                family,
+                qualifier,
+                operand,
+            } => $call!(merge, family, qualifier, operand),
+            TxnOp::DeleteCell {
+                family,
+                qualifier,
+                ts,
+            } => $call!(delete_cell, family, qualifier, *ts),
+            TxnOp::DeleteColumn { family, qualifier } => $call!(delete_column, family, qualifier),
+            TxnOp::DeleteFamily { family } => $call!(delete_family, family),
+            TxnOp::DeleteRow => $call!(delete_row,),
+        }
+    };
+}
+
+/// Applies `writes` to a row mutation, one at a time.
 pub(crate) fn mutation<'t>(
     mut m: RowMutation<'t>,
     writes: &[proto::Write],
 ) -> Result<RowMutation<'t>> {
     for w in writes {
-        m = match w
-            .op
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
-        {
-            write::Op::Put(p) => {
-                let (f, q) = (p.family.as_str(), &p.qualifier[..]);
-                match (value_of(p.value.as_ref())?, p.timestamp) {
-                    (value::Kind::Bytes(b), None) => m.put(f, q, b),
-                    (value::Kind::Bytes(b), Some(ts)) => m.put_at(f, q, ts, b),
-                    (value::Kind::I64(n), None) => m.put_i64(f, q, *n),
-                    (value::Kind::I64(n), Some(ts)) => m.put_i64_at(f, q, ts, *n),
-                    (value::Kind::F64(x), None) => m.put_f64(f, q, *x),
-                    (value::Kind::F64(x), Some(ts)) => m.put_f64_at(f, q, ts, *x),
-                    (value::Kind::U64(n), None) => m.put_u64(f, q, *n),
-                    (value::Kind::U64(n), Some(ts)) => m.put_u64_at(f, q, ts, *n),
-                    (value::Kind::Vector(v), ts) => match (elements(v)?, ts) {
-                        (Elements::F32(x), None) => m.put_vector_f32(f, q, &x),
-                        (Elements::F32(x), Some(ts)) => m.put_vector_f32_at(f, q, ts, &x),
-                        (Elements::I8(x), None) => m.put_vector_i8(f, q, &x),
-                        (Elements::I8(x), Some(ts)) => m.put_vector_i8_at(f, q, ts, &x),
-                        (Elements::Bits(x), None) => m.put_vector_bits(f, q, &x),
-                        (Elements::Bits(x), Some(ts)) => m.put_vector_bits_at(f, q, ts, &x),
-                        (Elements::F16(x), None) => m.put_vector_f16(f, q, &x),
-                        (Elements::F16(x), Some(ts)) => m.put_vector_f16_at(f, q, ts, &x),
-                        (Elements::Bf16(x), None) => m.put_vector_bf16(f, q, &x),
-                        (Elements::Bf16(x), Some(ts)) => m.put_vector_bf16_at(f, q, ts, &x),
-                    },
-                }
-            }
-            write::Op::Incr(i) => match i.timestamp {
-                None => m.incr(&i.family, &i.qualifier, i.delta),
-                Some(ts) => m.incr_at(&i.family, &i.qualifier, ts, i.delta),
-            },
-            write::Op::Aggregate(a) => {
-                let (f, q) = (a.family.as_str(), &a.qualifier[..]);
-                match (value_of(a.input.as_ref())?, a.timestamp) {
-                    (value::Kind::I64(n), None) => m.aggregate(f, q, *n),
-                    (value::Kind::I64(n), Some(ts)) => m.aggregate_at(f, q, ts, *n),
-                    (value::Kind::U64(n), None) => m.aggregate_u64(f, q, *n),
-                    (value::Kind::U64(n), Some(ts)) => m.aggregate_u64_at(f, q, ts, *n),
-                    (value::Kind::F64(x), None) => m.aggregate_f64(f, q, *x),
-                    (value::Kind::F64(x), Some(ts)) => m.aggregate_f64_at(f, q, ts, *x),
-                    (value::Kind::Bytes(b), None) => m.aggregate_bytes(f, q, b),
-                    (value::Kind::Bytes(b), Some(ts)) => m.aggregate_bytes_at(f, q, ts, b),
-                    (value::Kind::Vector(_), _) => {
-                        return Err(ApiError::invalid(
-                            "an aggregate input is an i64, u64, f64 or bytes",
-                        ));
-                    }
-                }
-            }
-            write::Op::Merge(g) => m.merge(&g.family, &g.qualifier, &g.operand),
-            write::Op::DeleteCell(d) => m.delete_cell(&d.family, &d.qualifier, d.timestamp),
-            write::Op::DeleteColumn(d) => m.delete_column(&d.family, &d.qualifier),
-            write::Op::DeleteFamily(d) => m.delete_family(&d.family),
-            write::Op::DeleteRow(_) => m.delete_row(),
-        };
+        let op = txn_op(w, VectorInput::RefuseFirst)?;
+        macro_rules! on_mutation {
+            ($method:ident, $($a:expr),*) => {
+                m = m.$method($($a),*)
+            };
+        }
+        dispatch!(&op, on_mutation);
     }
     Ok(m)
 }
 
-/// Applies one row's `writes` to a batch.
+/// Applies one row's `writes` to a batch, one at a time. A batch takes neither `u64` nor
+/// vector puts, nor aggregate inputs: refused as they come, before their values decode.
 pub(crate) fn batch(
     b: &mut WriteBatch,
     table: &Table,
@@ -184,56 +354,53 @@ pub(crate) fn batch(
     writes: &[proto::Write],
 ) -> Result<()> {
     for w in writes {
-        match w
-            .op
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("a write needs an op"))?
-        {
-            write::Op::Put(p) => {
-                let (f, q) = (p.family.as_str(), &p.qualifier[..]);
-                match (value_of(p.value.as_ref())?, p.timestamp) {
-                    (value::Kind::Bytes(v), None) => b.put(table, row, f, q, v),
-                    (value::Kind::Bytes(v), Some(ts)) => b.put_at(table, row, f, q, ts, v),
-                    (value::Kind::I64(n), None) => b.put_i64(table, row, f, q, *n),
-                    (value::Kind::I64(n), Some(ts)) => b.put_i64_at(table, row, f, q, ts, *n),
-                    (value::Kind::F64(x), None) => b.put_f64(table, row, f, q, *x),
-                    (value::Kind::F64(x), Some(ts)) => b.put_f64_at(table, row, f, q, ts, *x),
-                    (value::Kind::U64(_) | value::Kind::Vector(_), _) => {
-                        return Err(ApiError::invalid(
-                            "a batch put takes bytes, i64 or f64 (use Mutate for u64 and vectors)",
-                        ));
-                    }
-                };
+        // The batch's only guard against u64 and vector puts and aggregate inputs: `dispatch!`
+        // expands those arms for `WriteBatch` too (ai1249's N2 on #1555).
+        match w.op.as_ref() {
+            Some(write::Op::Put(p))
+                if matches!(
+                    p.value.as_ref().and_then(|v| v.kind.as_ref()),
+                    Some(value::Kind::U64(_) | value::Kind::Vector(_))
+                ) =>
+            {
+                return Err(ApiError::invalid(
+                    "a batch put takes bytes, i64 or f64 (use Mutate for u64 and vectors)",
+                ));
             }
-            write::Op::Incr(i) => {
-                match i.timestamp {
-                    None => b.incr(table, row, &i.family, &i.qualifier, i.delta),
-                    Some(ts) => b.incr_at(table, row, &i.family, &i.qualifier, ts, i.delta),
-                };
-            }
-            write::Op::Merge(g) => {
-                b.merge(table, row, &g.family, &g.qualifier, &g.operand);
-            }
-            write::Op::DeleteCell(d) => {
-                b.delete_cell(table, row, &d.family, &d.qualifier, d.timestamp);
-            }
-            write::Op::DeleteColumn(d) => {
-                b.delete_column(table, row, &d.family, &d.qualifier);
-            }
-            write::Op::DeleteFamily(d) => {
-                b.delete_family(table, row, &d.family);
-            }
-            write::Op::DeleteRow(_) => {
-                b.delete_row(table, row);
-            }
-            write::Op::Aggregate(_) => {
+            Some(write::Op::Aggregate(_)) => {
                 return Err(ApiError::invalid(
                     "a batch doesn't take aggregate inputs (use Mutate)",
                 ));
             }
+            _ => {}
         }
+        let op = txn_op(w, VectorInput::RefuseFirst)?;
+        macro_rules! on_batch {
+            ($method:ident, $($a:expr),*) => {{
+                b.$method(table, row, $($a),*);
+            }};
+        }
+        dispatch!(&op, on_batch);
     }
     Ok(())
+}
+
+/// Buffers prepared ops in a transaction. Nothing here fails: what only the engine can check
+/// (a family, a size) is recorded in the transaction and fails its commit, as in-process.
+pub(crate) fn txn_apply(
+    t: &mut pigeonhole::Transaction,
+    table: &Table,
+    row: &[u8],
+    ops: &[TxnOp<'_>],
+) {
+    for op in ops {
+        macro_rules! on_txn {
+            ($method:ident, $($a:expr),*) => {{
+                t.$method(table, row, $($a),*);
+            }};
+        }
+        dispatch!(op, on_txn);
+    }
 }
 
 pub(crate) fn condition(c: Option<&proto::Condition>) -> Result<pigeonhole::Condition> {
@@ -302,92 +469,157 @@ fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
     }
 }
 
-/// A selection's parts, checked once and applied to row reads and multi-gets alike.
+/// Applies a selection to any of the read builders, which share these methods.
+macro_rules! select {
+    ($s:expr, $snap:expr, $r:expr) => {{
+        let mut r = $r;
+        if let Some(s) = $s {
+            if !s.families.is_empty() {
+                r = r.families(s.families.iter().map(String::as_str));
+            }
+            if !s.qualifier_prefix.is_empty() {
+                r = r.qualifier_prefix(&s.qualifier_prefix);
+            }
+            if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
+                r = r.qualifier_bounds(
+                    bound(s.qualifier_start.as_ref()),
+                    bound(s.qualifier_end.as_ref()),
+                );
+            }
+            if s.all_versions {
+                r = r.versions(0);
+            } else if s.versions > 0 {
+                r = r.versions(s.versions);
+            }
+            if let Some(t) = &s.time_range {
+                r = r.time_range(t.start..t.end);
+            }
+            if s.column_limit > 0 {
+                r = r.column_limit(s.column_limit);
+            }
+            if s.value_filter.is_some() {
+                r = r.value_filter(value_filter(s.value_filter.as_ref())?);
+            }
+        }
+        if let Some(snap) = $snap {
+            r = r.snapshot(snap);
+        }
+        Ok(r)
+    }};
+}
+
+/// `Graph.Traverse`'s edge selection (qualifiers, time range, value filter) on `t`.
+pub(crate) fn edges<'t>(
+    mut t: pigeonhole::Traverse<'t>,
+    r: &proto::TraverseRequest,
+) -> Result<pigeonhole::Traverse<'t>> {
+    if !r.qualifier_prefix.is_empty() {
+        t = t.qualifier_prefix(&r.qualifier_prefix);
+    }
+    if r.qualifier_start.is_some() || r.qualifier_end.is_some() {
+        t = t.qualifier_bounds(
+            bound(r.qualifier_start.as_ref()),
+            bound(r.qualifier_end.as_ref()),
+        );
+    }
+    if let Some(range) = &r.time_range {
+        t = t.time_range(range.start..range.end);
+    }
+    if r.value_filter.is_some() {
+        t = t.value_filter(value_filter(r.value_filter.as_ref())?);
+    }
+    Ok(t)
+}
+
+/// A `Vectors.Nearest` query, decoded: an `f32` query serves `f32`, `f16` and `bf16`
+/// families (as `nearest_f32` does), and `i8` and bit queries their own.
+pub(crate) enum NearestQuery {
+    F32(Vec<f32>),
+    I8(Vec<i8>),
+    Bits(Vec<u8>),
+}
+
+pub(crate) fn nearest_query(v: &proto::Vector) -> Result<NearestQuery> {
+    Ok(match elements(v)? {
+        Elements::F32(x) => NearestQuery::F32(x),
+        Elements::I8(x) => NearestQuery::I8(x),
+        Elements::Bits(x) => NearestQuery::Bits(x),
+        Elements::F16(_) | Elements::Bf16(_) => {
+            return Err(ApiError::invalid(
+                "a nearest query is f32, i8 or bit: query an f16 or bf16 family with f32 \
+                 components",
+            ));
+        }
+    })
+}
+
+impl NearestQuery {
+    pub(crate) fn on_scan<'t>(&self, s: pigeonhole::Scan<'t>, k: usize) -> pigeonhole::Nearest<'t> {
+        match self {
+            Self::F32(q) => s.nearest_f32(q, k),
+            Self::I8(q) => s.nearest_i8(q, k),
+            Self::Bits(q) => s.nearest_bits(q, k),
+        }
+    }
+
+    pub(crate) fn on_keys<'t>(
+        &self,
+        r: pigeonhole::KeysRead<'t>,
+        k: usize,
+    ) -> pigeonhole::Nearest<'t> {
+        match self {
+            Self::F32(q) => r.nearest_f32(q, k),
+            Self::I8(q) => r.nearest_i8(q, k),
+            Self::Bits(q) => r.nearest_bits(q, k),
+        }
+    }
+}
+
+/// A selection's parts, checked once and applied to row reads and multi-gets alike, at the
+/// pinned snapshot its `snapshot_id` names (resolved by the service, `at`), or now.
 pub(crate) struct Select<'s> {
     s: Option<&'s proto::Selection>,
+    snapshot: Option<pigeonhole::Snapshot>,
 }
 
 impl<'s> Select<'s> {
     pub(crate) fn new(s: Option<&'s proto::Selection>) -> Result<Self> {
-        if let Some(s) = s
-            && !s.snapshot_id.is_empty()
-        {
-            // Pinned snapshots arrive with D313's ticket 4; until then no id exists.
-            return Err(ApiError::not_found("no such snapshot"));
-        }
-        Ok(Self { s })
+        Ok(Self { s, snapshot: None })
+    }
+
+    /// Reads at `snapshot` (a pinned snapshot session's), or now with `None`.
+    pub(crate) fn at(mut self, snapshot: Option<pigeonhole::Snapshot>) -> Self {
+        self.snapshot = snapshot;
+        self
     }
 
     pub(crate) fn aggregate(&self) -> Option<&'s proto::AggregateQuery> {
         self.s.and_then(|s| s.aggregate.as_ref())
     }
 
-    pub(crate) fn row<'t>(
-        &self,
-        mut r: pigeonhole::RowRead<'t>,
-    ) -> Result<pigeonhole::RowRead<'t>> {
-        let Some(s) = self.s else { return Ok(r) };
-        if !s.families.is_empty() {
-            r = r.families(s.families.iter().map(String::as_str));
-        }
-        if !s.qualifier_prefix.is_empty() {
-            r = r.qualifier_prefix(&s.qualifier_prefix);
-        }
-        if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
-            r = r.qualifier_bounds(
-                bound(s.qualifier_start.as_ref()),
-                bound(s.qualifier_end.as_ref()),
-            );
-        }
-        if s.all_versions {
-            r = r.versions(0);
-        } else if s.versions > 0 {
-            r = r.versions(s.versions);
-        }
-        if let Some(t) = &s.time_range {
-            r = r.time_range(t.start..t.end);
-        }
-        if s.column_limit > 0 {
-            r = r.column_limit(s.column_limit);
-        }
-        if s.value_filter.is_some() {
-            r = r.value_filter(value_filter(s.value_filter.as_ref())?);
-        }
-        Ok(r)
+    pub(crate) fn row<'t>(&self, r: pigeonhole::RowRead<'t>) -> Result<pigeonhole::RowRead<'t>> {
+        select!(self.s, self.snapshot.as_ref(), r)
     }
 
-    pub(crate) fn keys<'t>(
+    pub(crate) fn keys<'t>(&self, r: pigeonhole::KeysRead<'t>) -> Result<pigeonhole::KeysRead<'t>> {
+        select!(self.s, self.snapshot.as_ref(), r)
+    }
+
+    /// A scan of `range` in `table` (no range: the whole table) with this selection.
+    pub(crate) fn scan<'t>(
         &self,
-        mut r: pigeonhole::KeysRead<'t>,
-    ) -> Result<pigeonhole::KeysRead<'t>> {
-        let Some(s) = self.s else { return Ok(r) };
-        if !s.families.is_empty() {
-            r = r.families(s.families.iter().map(String::as_str));
-        }
-        if !s.qualifier_prefix.is_empty() {
-            r = r.qualifier_prefix(&s.qualifier_prefix);
-        }
-        if s.qualifier_start.is_some() || s.qualifier_end.is_some() {
-            r = r.qualifier_bounds(
-                bound(s.qualifier_start.as_ref()),
-                bound(s.qualifier_end.as_ref()),
-            );
-        }
-        if s.all_versions {
-            r = r.versions(0);
-        } else if s.versions > 0 {
-            r = r.versions(s.versions);
-        }
-        if let Some(t) = &s.time_range {
-            r = r.time_range(t.start..t.end);
-        }
-        if s.column_limit > 0 {
-            r = r.column_limit(s.column_limit);
-        }
-        if s.value_filter.is_some() {
-            r = r.value_filter(value_filter(s.value_filter.as_ref())?);
-        }
-        Ok(r)
+        table: &'t pigeonhole::Table,
+        range: Option<&proto::KeyRange>,
+    ) -> Result<pigeonhole::Scan<'t>> {
+        use proto::key_range::Range;
+        let r = match range.and_then(|r| r.range.as_ref()) {
+            Some(Range::Prefix(p)) => table.scan_prefix(p),
+            Some(Range::Bounds(b)) => {
+                table.scan_bounds(bound(b.start.as_ref()), bound(b.end.as_ref()))
+            }
+            None => table.scan_bounds(Bound::Unbounded, Bound::Unbounded),
+        };
+        select!(self.s, self.snapshot.as_ref(), r)
     }
 }
 
@@ -452,6 +684,23 @@ macro_rules! readable {
 
 readable!(pigeonhole::Cell);
 readable!(pigeonhole::CellRef<'_>);
+
+/// A value as the feed delivers it (`Change::value`), in its proto form.
+pub(crate) fn value_out(v: pigeonhole::Value<'_>) -> proto::Value {
+    let kind = match v {
+        pigeonhole::Value::I64(n) | pigeonhole::Value::Varint(n) => value::Kind::I64(n),
+        pigeonhole::Value::F64(x) => value::Kind::F64(x),
+        pigeonhole::Value::Vector(v) => value::Kind::Vector(proto::Vector {
+            element: element_out(v.element()),
+            dim: v.dim(),
+            data: v.as_bytes().to_vec().into(),
+        }),
+        pigeonhole::Value::Bytes(b) => value::Kind::Bytes(b.to_vec().into()),
+        // A kind a newer library adds: its bytes are all a v1 client can take.
+        _ => value::Kind::Bytes(Vec::new().into()),
+    };
+    proto::Value { kind: Some(kind) }
+}
 
 fn element_out(e: Element) -> i32 {
     (match e {
@@ -558,4 +807,243 @@ pub(crate) fn row(r: pigeonhole::RowRef<'_>, q: Option<&proto::AggregateQuery>) 
 /// D308's size of a cell: its qualifier, its value and 16 bytes.
 pub(crate) fn cell_bytes(c: &proto::Cell) -> u64 {
     (c.qualifier.len() + c.value.len() + 16) as u64
+}
+
+// ---- Schema (D313 ticket 6): families in and out ----
+
+fn element_in(e: i32) -> Result<Element> {
+    Ok(
+        match proto::Element::try_from(e).unwrap_or(proto::Element::Unspecified) {
+            proto::Element::F32 => Element::F32,
+            proto::Element::F16 => Element::F16,
+            proto::Element::Bf16 => Element::BF16,
+            proto::Element::I8 => Element::I8,
+            proto::Element::Bit => Element::Bit,
+            proto::Element::Unspecified => {
+                return Err(ApiError::invalid("a vector family needs its element type"));
+            }
+        },
+    )
+}
+
+fn metric_in(m: i32) -> Result<pigeonhole::Metric> {
+    use pigeonhole::Metric;
+    Ok(
+        match proto::Metric::try_from(m).unwrap_or(proto::Metric::Unspecified) {
+            proto::Metric::L2 => Metric::L2,
+            proto::Metric::Cosine => Metric::Cosine,
+            proto::Metric::InnerProduct => Metric::InnerProduct,
+            proto::Metric::Hamming => Metric::Hamming,
+            proto::Metric::Unspecified => {
+                return Err(ApiError::invalid("a vector family needs its metric"));
+            }
+        },
+    )
+}
+
+fn metric_out(m: pigeonhole::Metric) -> i32 {
+    use pigeonhole::Metric;
+    (match m {
+        Metric::L2 => proto::Metric::L2,
+        Metric::Cosine => proto::Metric::Cosine,
+        Metric::InnerProduct => proto::Metric::InnerProduct,
+        Metric::Hamming => proto::Metric::Hamming,
+        _ => proto::Metric::Unspecified,
+    }) as i32
+}
+
+/// A `VectorSpec` as the library's (a vector family's or an IVF index's).
+pub(crate) fn vector_spec_in(v: &proto::VectorSpec) -> Result<pigeonhole::VectorSpec> {
+    pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
+        .map_err(|e| ApiError::invalid(e.message()))
+}
+
+/// A `FamilySpec` as the `Family` to create: unset options take the library's defaults.
+pub(crate) fn family_in(s: &proto::FamilySpec) -> Result<pigeonhole::Family> {
+    use pigeonhole::{Aggregation as A, BloomParams, Family, HistogramParams, QuantileParams};
+    use proto::family_spec::Kind;
+    let bad = |what: &str, e: pigeonhole::Error| {
+        ApiError::invalid(format!("family {}: {what}: {}", s.name, e.message()))
+    };
+    let narrow =
+        |what: &str| ApiError::invalid(format!("family {}: {what} is out of range", s.name));
+    let mut f = match &s.kind {
+        None => Family::default(),
+        Some(Kind::MergeOperator(op)) => Family::default().merge_operator(op),
+        Some(Kind::Vector(v)) => Family::vector(
+            pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
+                .map_err(|e| bad("the vector spec", e))?,
+        ),
+        Some(Kind::Aggregate(a)) => {
+            use proto::AggregationKind as K;
+            let kind = K::try_from(a.kind).unwrap_or(K::Unspecified);
+            Family::aggregate(match kind {
+                K::Sum => A::Sum,
+                K::Min => A::Min,
+                K::Max => A::Max,
+                K::Hll => A::Hll,
+                K::BitOr => A::BitOr,
+                K::BitAnd => A::BitAnd,
+                K::BitXor => A::BitXor,
+                K::MinF64 => A::MinF64,
+                K::MaxF64 => A::MaxF64,
+                K::SumF64 => A::SumF64,
+                K::MeanVar => A::MeanVar,
+                K::Set => A::Set,
+                K::Histogram => A::Histogram(
+                    HistogramParams::new(a.histogram_bounds.clone())
+                        .map_err(|e| bad("the histogram bounds", e))?,
+                ),
+                K::Quantiles => {
+                    let mut q = QuantileParams::default();
+                    if let Some(n) = a.quantile_mantissa_bits {
+                        q = q.mantissa_bits(u8::try_from(n).map_err(|_| narrow("mantissa_bits"))?);
+                    }
+                    if let Some(n) = a.quantile_max_buckets {
+                        q = q.max_buckets(u16::try_from(n).map_err(|_| narrow("max_buckets"))?);
+                    }
+                    A::Quantiles(q)
+                }
+                K::Bloom => A::Bloom(
+                    BloomParams::new(
+                        a.bloom_bits,
+                        u8::try_from(a.bloom_hashes).map_err(|_| narrow("bloom_hashes"))?,
+                    )
+                    .map_err(|e| bad("the bloom filter", e))?,
+                ),
+                K::Unspecified => {
+                    return Err(ApiError::invalid(format!(
+                        "family {}: an aggregate family needs its kind",
+                        s.name
+                    )));
+                }
+            })
+        }
+    };
+    if let Some(n) = s.max_versions {
+        f = f.max_versions(n);
+    }
+    // 0 is "no TTL", as `DescribeTable` reports it, so a described family creates again.
+    if let Some(us) = s.ttl_micros.filter(|&us| us > 0) {
+        f = f.ttl(std::time::Duration::from_micros(us));
+    }
+    if let Some(n) = s.bloom_bits {
+        f = f.bloom_bits(u8::try_from(n).map_err(|_| narrow("bloom_bits"))?);
+    }
+    if let Some(n) = s.blob_threshold {
+        f = f.blob_threshold(n);
+    }
+    if let Some(n) = s.block_size {
+        f = f.block_size(n);
+    }
+    if let Some(c) = &s.compression {
+        use proto::CompressionCodec as C;
+        f = match C::try_from(c.codec).unwrap_or(C::Unspecified) {
+            C::Unspecified => f,
+            C::None => f.compression(pigeonhole::Compression::None),
+            C::Lz4 => f.compression(pigeonhole::Compression::Lz4),
+            C::Zstd => f.compression(pigeonhole::Compression::Zstd(if c.zstd_level == 0 {
+                3
+            } else {
+                i8::try_from(c.zstd_level).map_err(|_| narrow("zstd_level"))?
+            })),
+        };
+    }
+    f = match proto::Priority::try_from(s.cache_priority).unwrap_or(proto::Priority::Unspecified) {
+        proto::Priority::Unspecified => f,
+        proto::Priority::Low => f.cache_priority(pigeonhole::Priority::Low),
+        proto::Priority::Normal => f.cache_priority(pigeonhole::Priority::Normal),
+        proto::Priority::High => f.cache_priority(pigeonhole::Priority::High),
+    };
+    f = match proto::CompactionStyle::try_from(s.compaction)
+        .unwrap_or(proto::CompactionStyle::Unspecified)
+    {
+        proto::CompactionStyle::Unspecified => f,
+        proto::CompactionStyle::Leveled => f.compaction(pigeonhole::Compaction::Leveled),
+        proto::CompactionStyle::Tiered => f.compaction(pigeonhole::Compaction::Tiered),
+        proto::CompactionStyle::FifoByTime => f.compaction(pigeonhole::Compaction::FifoByTime),
+    };
+    Ok(f)
+}
+
+/// A family as `DescribeTable` returns it: every option set, as stored.
+pub(crate) fn family_out(i: &pigeonhole::FamilyInfo) -> proto::FamilySpec {
+    use pigeonhole::Aggregation as A;
+    use proto::AggregationKind as K;
+    use proto::family_spec::Kind;
+    let kind = if let Some(a) = &i.aggregation {
+        let mut out = proto::Aggregation::default();
+        out.kind = match a {
+            A::Sum => K::Sum,
+            A::Min => K::Min,
+            A::Max => K::Max,
+            A::Hll => K::Hll,
+            A::BitOr => K::BitOr,
+            A::BitAnd => K::BitAnd,
+            A::BitXor => K::BitXor,
+            A::MinF64 => K::MinF64,
+            A::MaxF64 => K::MaxF64,
+            A::SumF64 => K::SumF64,
+            A::MeanVar => K::MeanVar,
+            A::Set => K::Set,
+            A::Histogram(p) => {
+                out.histogram_bounds = p.bounds();
+                K::Histogram
+            }
+            A::Quantiles(q) => {
+                out.quantile_mantissa_bits = Some(u32::from(q.get_mantissa_bits()));
+                out.quantile_max_buckets = Some(u32::from(q.get_max_buckets()));
+                K::Quantiles
+            }
+            A::Bloom(b) => {
+                out.bloom_bits = b.bits();
+                out.bloom_hashes = u32::from(b.hashes());
+                K::Bloom
+            }
+            _ => K::Unspecified,
+        } as i32;
+        Some(Kind::Aggregate(out))
+    } else if let Some(v) = &i.vector {
+        Some(Kind::Vector(proto::VectorSpec {
+            dim: v.dim(),
+            element: element_out(v.element()),
+            metric: metric_out(v.metric()),
+        }))
+    } else {
+        i.merge_operator.clone().map(Kind::MergeOperator)
+    };
+    let (codec, zstd_level) = match i.compression {
+        pigeonhole::Compression::None => (proto::CompressionCodec::None, 0),
+        pigeonhole::Compression::Lz4 => (proto::CompressionCodec::Lz4, 0),
+        pigeonhole::Compression::Zstd(l) => (proto::CompressionCodec::Zstd, i32::from(l)),
+        _ => (proto::CompressionCodec::Unspecified, 0),
+    };
+    proto::FamilySpec {
+        name: i.name.clone(),
+        kind,
+        max_versions: Some(i.max_versions),
+        ttl_micros: Some(
+            i.ttl
+                .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+        ),
+        bloom_bits: Some(u32::from(i.bloom_bits)),
+        blob_threshold: Some(i.blob_threshold),
+        compression: Some(proto::Compression {
+            codec: codec as i32,
+            zstd_level,
+        }),
+        block_size: Some(i.block_size),
+        cache_priority: match i.cache_priority {
+            pigeonhole::Priority::Low => proto::Priority::Low,
+            pigeonhole::Priority::Normal => proto::Priority::Normal,
+            pigeonhole::Priority::High => proto::Priority::High,
+            _ => proto::Priority::Unspecified,
+        } as i32,
+        compaction: match i.compaction {
+            pigeonhole::Compaction::Leveled => proto::CompactionStyle::Leveled,
+            pigeonhole::Compaction::Tiered => proto::CompactionStyle::Tiered,
+            pigeonhole::Compaction::FifoByTime => proto::CompactionStyle::FifoByTime,
+            _ => proto::CompactionStyle::Unspecified,
+        } as i32,
+    }
 }

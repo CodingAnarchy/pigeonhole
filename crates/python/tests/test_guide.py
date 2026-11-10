@@ -16,4 +16,7 @@ def test_the_guide_has_examples():
 
 @pytest.mark.parametrize("block", BLOCKS, ids=[f"block{i}" for i in range(len(BLOCKS))])
 def test_a_guide_example_runs(block, tmp_path, capsys):
+    # A block that hands data to an optional Arrow consumer runs only where it's installed.
+    for name in re.findall(r"^import (pyarrow|polars|duckdb)\b", block, re.M):
+        pytest.importorskip(name)
     exec(compile(block, str(GUIDE), "exec"), {"path": tmp_path / "guide.phdb"})

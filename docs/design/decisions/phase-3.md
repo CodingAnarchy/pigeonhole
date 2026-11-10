@@ -4328,6 +4328,8 @@ The same rules hold for all three protocols, and every call path enforces scopes
 
 **The limits, stated in the guide:** one writer node, so no replication or HA, only backup and restore; the file on local disk; one machine's throughput. Read replicas (#1436) and partitions (D317, #1482) build on this service layer.
 
+**Amendment, 2026-11-09: how the MCP tools reach the service layer (cli692, ticket 8c-2; coordinator's option B, refined; ai1249 for §7).** §7's "each tool calls the service layer, and stdio drives it with `block_on`" can't hold as written: the service layer is built on `serve`'s own dependencies (prost and tonic types, Tokio), which the default `phdb` build that `phdb mcp` ships in doesn't have. Instead, the tools reach the database through a `Backend` trait at their own database surface (tables, families, table handles, a write batch, table creation). `phdb mcp` implements it with the database it opened, as before and Tokio-free. `phdb serve`'s `/mcp` implements it through `Service`'s own `table()`, `create_table` and `drop_table`, after one `Service::admit` that holds every per-call rule (the scope, a replica's write refusal, the request size, the in-flight budget) and that `answer()` itself calls too. So no rule exists twice, and MCP keeps its own paging, cursors and answers. The MCP tests run against both backends. Rejected: ungating `serve`'s dependencies into every build, and a serve-side gate that mirrors the service's rules (it would drift, and would already miss the `__phdb_` prefix and #1651's refusal).
+
 <a id="d314"></a>
 ## D314 — A row mutation's counters can return their values after its commit: `commit_returning`, folded on the row's shard right after the commit applies (perf2, design; owner decision, 2026-11-03; reviewed by simp724 and perf287; engine, pigeonhole, #1440, ICR 0113)
 
@@ -4360,8 +4362,41 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 - **When the caller has the value:** only once the commit meets its durability level.
 - **How long a value stays unique:** as long as its commit survives. That means across power loss with `GroupSync` or `Sync`, across a process crash with `Buffered`, and only within the open with `None`. Other readers may see the new total first (D227).
 - **After `OutcomeUnknown`:** there is no value, and a blind retry counts the increment twice if it landed.
+- **Visible, not durable (simp724's C2 on #1445):** a value folds the newest *visible* versions (D227). After a crash, the part of it that came from a commit that wasn't durable can be gone. For example, a cross-shard `Buffered` increment that recovery drops whole (D83) can be gone even when the returning commit survives. Callers whose writers are all at least as durable as the returning commit are unaffected.
 
 **Testing.** `tests/returning.rs` is a model-check target of its own. Its families are a plain `sum`, `sum_v2` (2 versions), `sum_ttl` and `f`. Returning commits there include members of concurrent batches beside blind cross-shard writers, with and without deletes. Each value is compared with the model's fold at *Y*, and the run asserts the fast path is taken. Its sweep is conditional: it runs on #1440's PRs and on any PR touching counter or returning apply code (REQUIRE_SWEEPS=6).
+
+**Amendment 1 (perf2, design; coordinator 2026-11-04; reviewed by simp724 and cli692 on #1445; ICR 0113 amendment): get-and-set, a column's value just before the commit.** `RowMutation::return_previous(family, qualifier)` asks `commit_returning` for that column of the row as it was just before the commit, and `Returned::previous(family, qualifier) -> Result<Option<Cell>>` hands it back. The result struct is renamed `Returned`, and `Incremented` stays as an alias (cli692's N1).
+- **The value:** the column's newest visible version at *Y*−1, with the TTL judged at the commit's timestamp. That's what a get just before the commit returned, except that a get judges TTL at its own time. It's the column's newest version whatever timestamp the commit writes, so for a bucketed counter it may be another bucket than the one written (cli692's N3; an `_at` form can come later).
+  - Column, family and row deletes below *Y* hide it (`None`).
+  - In an aggregate family it's the folded value, so `put_i64(0)` with `return_previous` drains a counter.
+  - Several writes to one cell in the commit all sit at *Y*, so none of them is seen.
+- **Chains (simp724's C1):** with default timestamps, or explicit ones that increase per cell, *N* concurrent swaps of one cell each return the one before, so every previous value is returned once. This follows from the ordering rule above, unchanged: a returning member waits through `Reply::Returning` whatever it asks for.
+  - A put at an explicit timestamp below the newest version leaves that version newest, so the next swap returns it again.
+- **The read:** a point read through the view (`read_before`, beside `fold_returning` in the apply loop), with the read path's pooled resolver. There's no fast path, because with explicit timestamps an older source can hold a newer version than the active memtable.
+  - It never consults the D290 row cache, which the commit's write-through has already moved to *Y* (simp724's C3).
+  - A separated value costs a blob read on the shard thread.
+  - The request rides in the boxed return slot, so blind commits and plain `commit_returning` are unchanged.
+- **Refusals:** a mutation that asks but writes nothing has nothing to replace, so it's refused with `InvalidArgument` (cli692's N2). So are `commit`, `commit_if` and their async forms on a mutation with requests. Asking twice for one column is asking once (N5).
+- **Durability:** as above, including "visible, not durable". After `OutcomeUnknown` there is no previous value, and a retry that runs after the first attempt landed sees that attempt's write as its previous value: the lease example checks for "the previous holder is me".
+- **Tests:**
+  - `pigeonhole/tests/return_previous.rs`: the chain under flushes, several writes, deletes, C1's exception, a counter drain, the row cache, a blob value, refusals and repeats, and the async form.
+  - `it/returning_order.rs`: a previous-only commit waits for an undecided share, and fails with the wait removed.
+  - `tests/returning.rs`: half the returning commits ask for each column they write, plus one more, checked against the model's newest version at *Y*−1.
+
+**Amendment 2 (perf2, design; reviewed by simp724 and cli692 on #1446; owner sign-off 2026-11-05; ICR 0113 amendment 2): compare-and-set-then-read.** `RowMutation::commit_if_returning(&Condition) -> Result<Checked>` (and `_async`) is a `commit_if` that returns the row's state whichever way the condition goes. `Checked` is `#[must_use]`: `Applied(Returned)` or `NotApplied(Seen)`, with `is_applied()`.
+- **The columns:** `return_current(family, qualifier)` names columns to report, and the condition's own column is always reported.
+  - **Applied:** `Returned::current` is the column as of the commit, at seqno *Y* with TTL at the commit's timestamp, so the condition's column is the new value. `return_previous` gives the old one, at *Y*−1, as in amendment 1.
+  - **NotApplied:** `Seen::current` is the column in the applied state the condition saw, There's no `Seen::seqno` (simp724's P1 on #1566). The check reads the shard's applied state, which can miss a cross-shard share allocated earlier but not yet arrived, so the last seqno handed out isn't one a snapshot reads the same columns at. `Seen` is `#[non_exhaustive]`, so a seqno can come later with a guarantee that holds.
+- **One read decides and reports (simp724's S2):** on the returning path, the condition's column is read once as a cell (`read_before`), and the predicate is matched against that cell. Plain `commit_if` keeps `read_latest`.
+- **Reported columns count as reads (S1):** `conflicts_with_group` treats them as cells the member reads, so a write to one by an earlier member of the group waits the check for the next group. Otherwise a failed check could report a state the row never had in seqno order.
+- **Ordering:** a check waits for shares undecided on its row (`overlaps_undecided`, through its predicate row), as a returning commit does.
+- **Refusals:** `return_current` is refused (`InvalidArgument`) on `commit`, `commit_returning` and plain `commit_if`: "use a transaction" to read other columns as of a plain commit (cli692).
+- **The plumbing:** a separate boxed reply, `Reply::CheckReturning`, fills the return slot at the check (a failed condition) or after the apply. Plain `commit_if` keeps `Reply::Check` and its own code.
+- **Tests:**
+  - `pigeonhole/tests/commit_if_returning.rs`: both outcomes, a missing cell, a separated value, a compare-and-swap loop under 6 threads (each value taken once), refusals and the async form.
+  - `it/returning_order.rs`: a check behind an undecided share (it reports 1005, not 5), and S1's group case. Each is mutation-checked.
+  - The model check: half the checks are returning checks, checked both ways.
 
 <a id="d315"></a>
 ## D315: the change feed's read-replica prerequisites: a feed of every table, catalog events, replication apply (#1436, ICR 0114)
@@ -4391,3 +4426,143 @@ Blind commits pay nothing, because both checks sit behind the existing early-out
 - `readers` `a_reader_process_s_feed_of_every_table_follows_a_table_created_later`.
 
 PR 3 adds an in-process two-database replication test with process and power-loss crashes on both sides.
+
+**Amendment, 2026-11-04 (#1504; the owner's call for 1.2.0; the design is agreed with simp724, including R1–R4; FORMAT §10.4 type 5).** A process crash between a root commit's superblock write and its sidecar Root entry made the next open see a gap, and expire every durable feed. The fix is a `RootIntent` entry `{sequence, checksum}` (type 5, the same framed length as a Root entry):
+- **Before the commit writes anything:** the pager's intent hook appends the commit's staged `Catalog` entry, if any, then the intent, unsynced. A failed append ends the session's appends, but never the commit (R3).
+- **After the commit:** the root-commit observer overwrites that intent in place with its Root entry (R2: only an intent this session appended, at the offset it remembered; otherwise it appends). This is the sidecar's only write in place. In steady state the file holds only the entries it did before, so a 1.1 reader still reads a 1.2 sidecar after clean closes.
+- **The open** resolves a trailing intent of the last session, before it appends:
+  - if the superblock it read has the intent's sequence and checksum, the open adopts it, overwriting it with that session's Root;
+  - if the superblock is one sequence behind, the open cuts the intent off, with its root's Catalog entry;
+  - otherwise it leaves it, and `chain` fails closed on it, as on any intent it reads.
+- **A Catalog entry** counts only once its root's Root entry follows it. Until then the root may never have landed, and a reader reads from it again next time. The Catalog entry and the intent go in one write. The open also cuts a lone trailing Catalog entry for the root one past the superblock's. A reader expires on a Catalog entry followed by neither its Root nor its own intent, which would otherwise park it silently (simp724's F1 on #1526).
+- **A 1.1 build (the owner's call, 2026-11-05: accepted, documented in FORMAT §13 and the 1.2.0 changelog)** expires a feed whose history runs across a 1.2 session that changed the schema with the feed on. 1.1 doesn't know the Catalog entries (type 4) that session recorded, and an unknown entry ends the history. That's fail closed, with no data effect. Sessions without schema changes, and the intents, which clean closes overwrite, stay readable by 1.1 (the `feed_root_intent` corpus entry, resumed by `compat-reader-1.1`).
+- **Only a power loss** in that window can still expire a durable feed. The intent isn't synced, so a power loss can lose or tear it, which reads as a torn tail. #1509 is that half (Post-1.0).
+
+**Testing (the amendment).** In `it::feed_reader`:
+- `a_process_crash_around_a_root_commit_never_expires_a_durable_feed`: held before and after the superblock, for a flush's root and a create's.
+- `an_intent_naming_another_root_of_its_sequence_is_never_adopted`.
+- `a_power_loss_around_a_root_commit_expires_or_keeps_the_whole_history` (R4: lost, torn, mid-file).
+- Mutation-checked for the checksum test, the cut, the adoption, and an observer that appends instead of overwriting.
+
+**Amendment, 2026-11-05: PR 3 as built (the owner chose (A) for the token; ro_compat bit 0 from the ledger; ICR 0114's PR 3 section; simp724's R1–R5).**
+- **Where the token lives.** A reserved table `__pigeonhole.replication` (TableId `u32::MAX`, FamilyId `u32::MAX`, TabletId `u64::MAX`; FORMAT §9's rule). It's created by the first apply, which sets `ro_compat` bit 0 before the commit that creates it (§8.2). Builds without the bit open a replica read-only, so none can drop the state or write into the mirror.
+  - **R1:** the counters never reach the reserved ids (a `debug_assert`).
+  - **R2:** the tablet is never split or merged.
+  - **R3:** the table is hidden from listings, lookups and every feed (its creation is no catalog event), it can't be dropped, and `__pigeonhole.` names are refused at creation.
+  - **R4:** `check` accepts it (the corpus entry), and a backup keeps it.
+  - **R5:** the token goes in the run's commit.
+- **Run-batched, per #755's (a).** `apply_replicated(run, token)` is one atomic `GroupSync` commit of a whole run, token included, not one commit per primary commit as §3 first said. The exactly-once argument is unchanged: the commit and its token are durable together or not at all.
+- **One exception splits a run:** two of its commits writing one cell at one timestamp. One commit can't hold both, since two entries at one seqno read in no set order (the memtable links duplicates). So the run is split there, each part with the token of its own last event, and a crash between parts resumes after the last committed one. A hot counter (every increment at `COUNTER_TS`) splits on every commit: correct but slow, and folding a counter's increments within a run is a later optimization.
+- **Applying.** Each change is pushed exactly as logged (`WriteBatch::push_logged`: kind, explicit timestamp, stored value) and routed without conversion (`route_logged`): an HLL or bloom input is already its state, and a counter write is already prepared. Blobs arrive resolved, and the replica separates them into its own files. The clock's floor is raised to the largest timestamp applied.
+- **Continuity.** Each event carries its stream position before and after (delivered seqno, catalog sequence). A run must chain, and start where the stored state ends: anything else is a gap or an overlap, refused. The first apply needs a database with no tables of its own, and records its start before it applies anything. Bootstrapping from a primary's snapshot is a later change.
+- **A replica takes only its primary's changes** (simp724's R6). Once the state table exists, local writes and local catalog changes fail with `ReadOnly`, since a local table would take the ids the primary assigns next and a local write would diverge the mirror. Promotion lifts it, in a later change.
+- **A run's size** (S1): parts are also cut between primary commits at a quarter of one shard's memtable share (at least 64 KiB).
+- **Catalog changes** apply between runs (`apply_catalog`), in two commits (the manifest's, then the state cell's). A change already applied as it stands is passed over, so the retry after a crash between them is safe.
+- **Testing.** `tests/replication.rs`:
+  - a replica matches its primary;
+  - the refusals;
+  - the same-cell split (mutation-checked);
+  - resumes after process crashes and power losses, including one inside an apply (mutation-checked: a state committed apart fails it).
+  - The corpus entry `replica` opens read-only, and only read-only, with 1.0.0 and 1.1.0.
+
+**Amendment, 2026-11-06: bootstrap and promotion (#1436, ICR 0125; the design on #1436 with simp724's P1/P2 and cli692's serve review).**
+- **Bootstrap:** a backup of one durable snapshot (`backup_at`) and a feed of every table opened `from_snapshot` on it meet exactly. `begin_replication(token)` on the copy creates the state table and stores the token's position and the primary's database id.
+- **Only `begin_replication` creates the state table** (the from-nothing first apply goes through it). A replica of a replica isn't supported in 1.2.0: a replica refuses to be a bootstrap source.
+- **Promote:** drop the state table with a one-way promoted state, so no apply after it runs. Clear `ro_compat` bit 0 once the drop is durable (a writable open repairs a crash between the two), then lift R6's refusal.
+- **The rest is serve's,** in ICR 0112's amendment: the `Replication` service, the replica loop, re-bootstrap on `FeedExpired` through a lock-preserving file swap, and `Admin.Promote`. Read-your-writes on a replica is #1577.
+
+<a id="d316"></a>
+## D316 — `pigeonhole-otel` exports the engine's metrics through OpenTelemetry, and their names are a stable contract (ai1249, design; owner decision, 2026-11-04; reviewed by perf287 and cli692; otel, pigeonhole, #1458, ICR 0115, ICR 0116)
+
+**Decided:** a companion crate, `pigeonhole-otel`, registers a database's metrics with an application's OpenTelemetry `Meter` in one call (`register(&db, &meter)`). The metric list is a stable contract: its names, kinds, units and attributes. A rename or removal needs a new decision and a major version on whatever line the crate is on. The core crates take no OpenTelemetry dependency. The design comment on #1458 (rev 2) is the full record. In summary:
+
+- **Observable only.** Every instrument is an observable counter or gauge, so nothing runs on an engine thread, and commits and reads pay nothing.
+  - **One reading per collection:** the first callback of a collection reads `engine_metrics()`, `recovery_stats()` and `info()` once, on the exporter's thread. The other callbacks reuse that reading for 100 ms.
+  - **The cost** (perf287): about 300 relaxed loads a shard, and `info()`'s catalog walk. `pager.stats()` takes the pager's `alloc` lock, which commits never take.
+- **Names:**
+  - `pigeonhole.` then dot-separated lowercase, with plural nouns for counted events;
+  - UCUM units (`s` as `f64` seconds, `By`, `1`, `{…}` annotations);
+  - outcomes and reasons as attributes, every attribute prefixed `pigeonhole.`;
+  - `.time` for every counter of seconds, leaving `*.duration` to histograms (cli692's N2).
+- **Attributes:** `pigeonhole.db.name` on every metric. By default it's the file name (`Pigeonhole::path()`); the OTel resource tells processes apart.
+  - **The bound:** with the defaults, the number of series doesn't depend on the schema.
+  - **`storage_by_table`** adds `pigeonhole.table` and `pigeonhole.family` to the SST and blob gauges, bounded by the schema.
+  - **Never per row, key or seqno.** `pigeonhole.shard` is reserved; per-shard values are a hidden bench hook, not API.
+- **Monotonic counters:** an automatic recovery's new engine restarts its counters from 0, so the registration carries the old engine's last reading as a base. `Registration::rebind` does the same across a reopen.
+- **Commit latency (A1):** `pigeonhole.commit.engine_latency`, a gauge per durability and quantile (0.5, 0.99, 0.999) over a sliding window (default 60 s). It's computed from D213's buckets, now public as `LatencyHistogram`, as the difference of two readings.
+  - **What it measures:** engine-side latency, from submission to resolution on the shard. It excludes the caller's wake-up and the visibility wait (perf287: 98 µs against the client's 391 µs in #1206).
+  - **The value reported:** the bucket's upper bound, since the buckets are about 1.41× apart.
+  - **Why a gauge:** OTel Rust has no observable histogram.
+- **Versioning (owner, Q1):** `pigeonhole-otel` has its own 0.N line, outside D295's public 1.x line, because its API takes `opentelemetry` types, and each opentelemetry minor is a breaking change.
+- **The rest of the contract (owner, Q2: in 1.2.0, ICR 0116), each in its own PR:**
+  - **A2:** `pigeonhole.memtable.size` and `.limit`, a compare-and-store per group in `publish_arena`;
+  - **A3:** `pigeonhole.wal.group_sync.time`, summing D248's existing `sync_busy_nanos`;
+  - **A4:** `pigeonhole.feed.lag`, with `Feed::progress()` and `visible_seqno()`, stored once per delivered batch.
+- **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
+- **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
+
+<a id="d317"></a>
+## D317 — one database split across `phdb serve` nodes by static key-range partitions (simp724, design; owner sign-off, 2026-11-04; reviewed by perf287 and cli692; cli, #1482, ICR 0117)
+
+**Decided** (the design note on #1482, revision 2, is the full record; the owner set the scope on #1437):
+- **Partitions are whole database files.** A versioned partition map assigns tables, or key ranges of a table (sorted split keys, half-open ranges), to partitions, and partitions to nodes.
+- **The map has two layers.** Which partition holds a key range is fixed once the range holds data. Moving ranges is #1499, in 1.3.0. Which node serves a partition changes by relocation, with a higher epoch.
+- **Every node routes.** Any node takes any call, serves what it owns and forwards the rest over node-to-node gRPC. There are no engine changes: a `Router` in front of D313's service functions, behind the seam D313's ticket 3 landed.
+- **Single-partition operations keep their guarantees.** Writes and transactions that span partitions are refused (`CrossPartition`) before anything is written; transactions and snapshots bind to one partition by a routing key.
+- **Reads fan out.** Scans, multi-gets, KNN and traversal fan out and merge in key order (or to the exact top K). A missing partition fails the read unless the caller opts in to partial results, which name what's missing.
+- **Fencing is manual.** A partition file records its identity and epoch (`__phdb_cluster`). A node writes P only while its newest map names it at that epoch and P isn't fenced. Restarted nodes start fenced.
+- **Later:** cross-node transactions (#1483), failover (#1484), the balancer (#1485) and fencing leases (#1486), all in 1.3.0.
+
+**Tickets:**
+1. the map: proto, validation, distribution and the identity row;
+2. routing and forwarding;
+3. transactions and snapshots bound to one partition;
+4. fan-out reads;
+5. schema in the map;
+6. fencing and relocation;
+7. cluster feeds;
+8. backup and restore, several partitions per node, and the serving guide's cluster chapter, with perf287's partitions-per-node box run.
+
+**Ticket 1** (ICR 0117's first section):
+- **`phdb serve --cluster DIR --node-id ID`** keeps the map in `DIR/cluster-map.json`, written atomically, and holds `DIR/.lock`.
+- **The `Cluster` service:** `GetMap`; `SetMap`, a compare-and-set on the version (a miss is `Conflict`, the coordinator's call); `PushMap`, node to node; and `Status`.
+- **The `cluster` token scope** stands outside read < write < admin.
+- **Pull:** a node pulls a newer map from a peer whose call says it has one.
+- **Divergence:** an equal version with different content is refused and reported as divergent (cli692's M3).
+- **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
+- **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
+
+<a id="d320"></a>
+## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
+
+**Problem.** A `FeedReader` read every stream to its end on each pass and kept every record it hadn't delivered. A consumer that fell behind kept its whole backlog decoded in memory (278,287 entries in one `phdb serve` hub, #1397 ticket 5).
+
+**A stream isn't in key order,** so a reader can't stop a stream early. A Single is keyed by its seqno and a cross-shard commit by its Decision's apply seqno. The coordinator reserves the apply seqno when it decides and queues the DECISION. The next group's Singles get their seqnos when the group forms, so they are larger, but the Singles queued before the DECISION are logged ahead of it. The inversion stays within one group, and group boundaries aren't visible in the WAL. So "every record after this point has a key above k" can't be known from a stream alone.
+
+**Decided (PR 1).** Each pass still reads every stream to its readable end (M1 and rule C are unchanged), but keeps only records with keys at or below a cutoff **C**:
+- **The budget:** 64 MiB of decoded changes (an engine constant, no public knob), counted over `ready` and `held`.
+- **Eviction:** past the budget, the largest keys go first, and C falls below each one.
+  - A held share counts at its id + 1, a lower bound for its round's apply seqno (the allocator reserves the id first). It goes with every share of its round.
+  - A decided round goes with its shares.
+- **Passing over:** a record past C is passed over after its header, with its mutations never filtered or copied. A Prepare with id ≥ C is passed over too.
+  - A Decision past C passes its round over: its shares are dropped and any read later in the pass are passed over. Leaving them held would let rule C drop them as aborted, and the Decision read after the rewind would then expire the feed.
+- **Delivery and position** go up to min(F, C), and so does a feed of every table's catalog event.
+- **The rewind:** once the frontier is past C and nothing is kept below it, the reader reads every stream again from its hint. That's the earliest record not delivered, kept or passed over, the same hint a token carries, so the rewind is a resume from the reader's own token.
+- **Liveness:** a pass that leaves nothing to deliver below a cutoff under the frontier rewinds at once with twice the budget, and a delivery restores the budget. (Only the shares of rounds in flight around the next commit can fill the budget that way.) `Pending` still means every commit up to the frontier was delivered.
+- **The bound:** the reader keeps at most its budget, plus about twice the in-flight cross-shard shares, plus one commit.
+- **The cost:** a reader that stays a backlog B behind re-reads B (frames and headers only) once per budget delivered.
+- **Reader processes** (`ReadTable::feed`) run the same passes, so the cap applies there too.
+- **Retention (simp724's N2 on #1622):** retention follows bytes and age, not subscribers. A capped reader's margin is its hint, as for a token resume: a record it evicted has to be read again from the log. So a rewind can expire a feed that, uncapped, would still hold that record in memory. The guide says so under "When a feed expires".
+- **What the reader remembers between rewinds (simp724's S1 on #1622):** only the passed-over rounds with ids below C, the rounds in flight across C. A share with a larger id is passed over by its id, and C only falls.
+- **`read_through`** is still set after every pass, capped or not. `position()` and the idle fast path take the min with C, and a rewind clears it.
+- **Shares of delivered rounds** that a rewind re-reads without their Decision are never evicted (simp724's N1). Evicting one would put C at or below `delivered` for nothing; rule C drops it.
+
+**Deferred (PR 2): not needed (coordinator, 2026-11-09, on perf287's ticket 5 re-run, #1598).** The option: the writer would log a group's DECISIONs ahead of its Singles, which puts each stream in key order. Each stream could then stop at its first key past C, which removes the re-reads. Older builds' segments aren't in that order, so it would need a per-session marker (a FORMAT and ICR line). The AX102 run (#1397 ticket 5; main 6aca49f1 against d3378ff8, the full table ×2) showed it isn't worth that:
+- **16 hubs × 16 subscribers,** the scenario that falls behind:
+  - `phdb` peak RSS fell from 8.9–15.9 GB to 4.7–5.1 GB, and no longer depends on how far the run falls behind;
+  - each subscriber got 1.3–2.6× more events;
+  - server CPU per put rose 5–6% (180 → 186–191 µs). That's the re-read cost, and all PR 2 could save.
+- **Every other scenario** (0, 1, 16 and 256 subscribers, and tiny) was level between the arms.
+- **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
+
+Revisit PR 2 only if a profile shows the re-reads costing more than that.

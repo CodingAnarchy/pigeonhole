@@ -68,6 +68,11 @@ jobs:
           bundler-cache: true
           working-directory: crates/ruby
           rustup-components: clippy, rustfmt
+          # The cache-clean step downloads cargo-binstall from GitHub releases with plain
+          # `curl -sSL` (no --fail), so an error page fails its checksum and the whole job
+          # (2026-11-09: every Ruby job on #1614, and #1552's macOS run before). Trimming the
+          # cache isn't worth that.
+          cargo-cache-clean: false
       # crates/ruby keeps its own Cargo.lock, which an engine dependency change elsewhere can
       # leave stale. `rake compile` doesn't pass --locked and would quietly rewrite it, so
       # check it first (#1366's crc-fast drifted it unnoticed).
@@ -78,6 +83,9 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Compile the extension
         run: bundle exec rake compile
+        # With the tests' hold seams (`test-hooks`, #1574); the gems are built without them.
+        env:
+          PIGEONHOLE_TEST_HOOKS: '1'
       # crates/ruby is a workspace of its own (the root's `cargo --workspace` jobs don't see it):
       # lint, document and licence-check it here, once.
       - name: clippy, rustdoc and fmt
@@ -86,6 +94,7 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
         run: |
           cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features test-hooks -- -D warnings
           cargo doc --locked --no-deps
           cargo fmt --check
       - uses: taiki-e/install-action@v2

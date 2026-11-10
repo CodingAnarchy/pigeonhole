@@ -1,0 +1,3 @@
+### Fixed
+- **`phdb` no longer hangs a thread that writes to stderr.** The binary held stderr's lock for the life of the process, so a message printed from any thread other than the main one (in `phdb serve`: an accept error, an index rebalancer's error) blocked that thread for good. A Tokio worker lost that way never came back.
+- **`phdb serve`'s change-feed delivery no longer starves under fan-out.** A shared subscription that fell behind kept its delivery worker until it caught up, so other subscriptions and every stream on that runtime stalled. It now yields its worker regularly, and it no longer holds its ring's lock while computing a resume position, which also held up requests (D313 ticket 5, #1397).

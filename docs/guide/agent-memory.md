@@ -72,6 +72,7 @@ store.mark_used(&[hits[0].id.clone()])?;
 - **Filters:** superseded memories are left out unless `include_superseded(true)`, and then each such hit's `superseded_by` names its successor. `session(s)` keeps one session.
 - **Determinism:** with an explicit `snapshot` and `now_us(time)`, the same call always returns the same result.
 - **Either signal alone works:** text alone recalls by keyword and recency, and an embedding alone by similarity and recency.
+- **Async:** `run_async().await` and `run_with_stats_async().await` return exactly what `run` and `run_with_stats` do, with every read asynchronous, so a recall doesn't block an executor thread on the cache's misses. Each namespace's vector, keyword and recency lists are read together. The futures are `Send`, and they work in reader processes too. They're behind the `async` feature, on by default as in `pigeonhole`. One gap remains (#1652): a row longer than a block, in the recall's multi-get, a graph expansion or an IVF list, still has its later blocks read synchronously, counted in `EngineMetrics::async_sync_reads`.
 
 ## Lifecycle
 - **`get(&id)`** returns a memory with all its metadata.
@@ -244,7 +245,20 @@ On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157
 | 10k namespace, fused | 15.3 ms | 13.7 ms | |
 
 - **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (T5's split).
-- **Writes don't contend through it:** 1, 4 and 8 threads remembering into the large namespace committed 1,540, 5,100 and 5,940 memories/s with no conflicts or retries. A list's version only changes when it splits.
+- **Writers gain up to 16 threads, with or without the index, though less past 8.** Threads remembering into the large namespace, 8 s per thread count, three runs (`memrecall … ivf` and `… flat`, the same store without the index, #1477):
+
+  | writers | memories/s with the index | without it | remember p99 with the index |
+  |--:|--:|--:|--:|
+  | 1 | 1,320–1,420 | 1,550–1,760 | 1.1–1.3 ms |
+  | 4 | 3,230–3,910 | 3,650–4,800 | 3.3–4.2 ms |
+  | 8 | 5,820–6,880 | 7,090–7,900 | 5.8–7.9 ms |
+  | 16 | 7,850–8,410 | 9,430–10,160 | 10.0–10.6 ms |
+
+  The 4-writer phase runs first after the build, behind its flush and compaction backlog, so it reads a little low.
+
+  - **How many to use:** up to 8 writers when remember latency matters (p99 under about 8 ms), and 16 for bulk imports. More than 16 wasn't measured.
+  - **The index costs about 10–20% of write throughput,** for the vector copy and list upkeep.
+  - **Writers rarely collide:** one that meets a list mid-split retries its transaction inside `remember`, 1–27 times per 8 s at 4–16 writers, out of 26,000–67,000 memories. A list's version only changes when it splits.
 - **Building it:** the 99k memories took 60 s, about the same rate as T5's builds without the index.
 
 ## Watching for new memories

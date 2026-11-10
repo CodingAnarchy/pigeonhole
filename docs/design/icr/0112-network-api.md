@@ -18,14 +18,16 @@
 | `Vectors` | `Nearest` (exact, D303), and the IVF index: `CreateIndex`, `Insert`, `Delete`, `Search`, `BulkLoad` (client stream), `Verify` |
 | `Text` | the BM25 index (D309): `CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild`, `Verify` |
 | `Memory` | the server's memory store (D311): `Remember`, `Recall`, `MarkUsed`, `Supersede`, `Link`, `Forget`, `Watch` (server stream) |
-| `Admin` | `Health`, `Info`, `Flush`, `Compact`, `Backup`, `BackupDownload` (server stream), `Metrics` |
+| `Admin` | `Health`, `Info`, `Flush`, `Compact`, `Backup`, `BackupDownload` (server stream), `Metrics`, `Promote` (#1436) |
+| `Replication` | `Follow` (a server stream a replica server reads, gRPC only; #1436, the amendment below) |
 
 Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and isn't part of this proto. Its tools call the same service layer.
 
 ## Conventions
 - **Keys and values are `bytes`.** Timestamps are microseconds since the Unix epoch.
 - **Vectors are one packed field** (`Vector.data`, little-endian elements or packed bits), not one field per element. That includes memory embeddings, in the store's element type.
-- **Every read that can return a lot is byte-budgeted:** `Scan`, `MultiGet` and `ReadRow` take `page_bytes` (0 is the server's default, 1 MiB, and the server caps it). Each page reports its own D308 size in `bytes`.
+- **A `Nearest` query is `f32`, `i8` or bit** (D313 ticket 7): an `f16` or `bf16` family takes an `f32` query, as `nearest_f32` does in Rust, and an `f16` or `bf16` query is `InvalidArgument`.
+- **Every read that can return a lot is byte-budgeted:** `Scan`, `MultiGet`, `ReadRow`, `Traverse` and `Nearest` take `page_bytes` (0 is the server's default, 1 MiB, and the server caps it). Each page reports its own D308 size in `bytes`.
 - **Ids the server hands out are opaque strings:** `txn_id`, `snapshot_id`. Clients store and return them, and never parse them. Their encoding (for example the partition and node, under D317) may change.
 - **Opaque positions are `bytes`:** a scan's or multi-get's `next`, a row page's `next`, a feed event's `token`. They're stateless: any server process resumes from them, now or after a restart. Feed tokens aren't comparable byte for byte across streams.
 - **`RoutingKey`** (D317's C1) on `Begin` and `Snapshots.Open` names a row (`table`, `row`) or a partition. A single-node server ignores it. A cluster with more than one partition requires it (`InvalidArgument`), so clients should send it from the start.
@@ -49,9 +51,29 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
   - with `Accept: text/event-stream`, server-sent events: each message is one event's `data:` as JSON, and for `Feed.Subscribe` and `Memory.Watch` the event's `id:` is the message's `token`;
   - otherwise, `application/x-ndjson`, one JSON message per line.
   - A stream's error ends it with a final message: an SSE `event: error`, or an NDJSON line `{"error": ErrorDetail}`.
+- **`Data.Scan`'s stream**, over either protocol:
+  - **It is complete only when its last page's `next` is empty** (simp724's D2 on #1510). A stream can end cleanly with a `next`: a `page_bytes` too small for anything returns an empty page with its position. Resume from it with a larger `page_bytes`.
+  - **Without a `snapshot_id`, each page reads at its own snapshot** (simp724's D1 on #1510). A row is never torn, but rows can change between pages, so the stream isn't one point in time. Pin a snapshot (`Snapshots.Open`) for that.
+  - **A client that stops reading for `--stream-idle-ms`** ends its stream with `DeadlineExceeded` (`REQUEST`): resume from the last page's `next` (perf287's G2 on #1510).
+- **`Feed.Subscribe`'s stream** (D313 R2):
+  - **Every event's `token` resumes just after it**, as an in-process feed's does, whether the event is a commit or a progress event. A progress event's token covers the commits the stream's prefix passed over.
+  - **Streams on the same table set and visibility share one engine subscription.** Past `--max-feed-hubs` distinct sets, a subscription on a new set is `Overloaded`, and so is one past `--max-streams` streams. Both are retry-safe once others end.
+  - **A stream that falls behind** the shared feed's recent history (`--feed-ring-bytes`, a total across table sets), or starts from a token, a snapshot or the oldest commit, reads on its own until it catches up. Its events and tokens are the same either way. At most `--max-catch-up` do so at once; the rest wait their turn.
+  - **An idle stream stays open:** HTTP/2 pings, and SSE keepalive comments (`: keepalive`) every 15 s.
 - **`Last-Event-ID`** on `Feed.Subscribe` or `Memory.Watch` resumes after that token, and takes precedence over the body's `resume`. So an SSE client reconnects natively.
 - **Progress events** (`Progress`, in `FeedEvent` and `MemoryEvent`) carry only a token. The server sends one after a quiet interval (about 10 s), when the stream's position has moved past commits its filters skipped, and never more often than events. A filtered or quiet stream's latest token then stays within the history's retention, so a reconnect doesn't get `FeedExpired` for having missed nothing (perf287's S2).
 - **`Admin.BackupDownload`** is `application/octet-stream`: the backup file's bytes. Over gRPC it's chunks of up to 1 MiB, each with its `backup_id` and `offset`, and the last with `total` and `sha256`. The server keeps the backup for a few minutes after the stream ends or breaks, so a client resumes with `backup_id` and `offset` (over HTTP, `Range: bytes=<offset>-` with `?backup_id=`), and checks the SHA-256 before relying on the copy (perf287's S4).
+  - **Over HTTP,** the response carries the download's id in `X-Pigeonhole-Backup-Id` and the whole file's SHA-256 (hex) in `X-Pigeonhole-Backup-Sha256`, before the first byte. A resume answers `206` with `Content-Range`. An error partway ends the body early, and the SHA-256 check catches the short copy.
+  - **"A few minutes"** is 5 minutes after the download's last reader.
+  - **A stream that ends with no chunk carrying `total`** (or an HTTP body shorter than its `Content-Length`) is incomplete, whatever its status. Resume it from the offset reached, and check the SHA-256 before relying on the copy.
+  - **A fresh download sends nothing until its backup and hash are done** (the SHA-256 comes first), which for a large database is minutes. Clients and proxies need a first-byte timeout that allows for it.
+  - **The pace:** a client must take each chunk (up to 1 MiB) within `--stream-idle-ms`, or the stream ends and it resumes.
+  - **Copies kept:** at most 2. A fresh download at the cap evicts the oldest copy nobody is reading, or is `Overloaded` if every copy is being read. A resume (`backup_id`) is never refused for the cap.
+- **`Admin.Backup` and `Admin.BackupDownload` need the server's `--backup-dir`**; without it, both are `Unsupported`.
+  - **`Backup`** writes to a relative path of plain components that doesn't exist yet and doesn't lead outside the directory through a link in it (`InvalidArgument` otherwise). `.phdb-serve-downloads` is reserved.
+  - **Downloads** are copied into `<backup-dir>/.phdb-serve-downloads` (mode 0700, refused at startup if it's a link). Leftovers from a crash are deleted when the server starts.
+  - **One at a time:** at most `--max-backups` backups run at once (`Overloaded` past it), each on a thread of its own, not the pool reads and syncs share.
+- **`Schema.CreateTable` with `if_missing`** at write scope may add families to an existing table: like creating a table, that's additive. Dropping is the destructive change, and needs admin.
 - **Client streams** (`Vectors.BulkLoad`) take `application/x-ndjson`: one request message per line. The size limit (`--max-request-bytes`) and the in-flight bytes budget apply per message, not per stream, and HTTP/2 flow control throttles the client as the server applies batches, so a long bulk load is fine.
 - **Auth:** `Authorization: Bearer <token>` on every request but `/v1/health`.
 - **Errors:** the HTTP status from the table below, with the body an `ErrorDetail` as JSON (`{"code": "Conflict", "code_num": 13, "message": …}`). `Busy` and `Overloaded` add `Retry-After` (seconds, rounded up).
@@ -83,8 +105,8 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `FeedExpired` | `OUT_OF_RANGE` | 410 | (a read) | no: resubscribe from now |
 | `Unsupported`, `UnsupportedFeature`, `UnsupportedFormat`, `UnknownMergeOperator` | `UNIMPLEMENTED` | 501 | not applied | no |
 | `NoSpace` | `RESOURCE_EXHAUSTED` | 507 | **maybe applied**, for a write; not applied, for a read | no: check the operation id |
-| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no |
-| `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no: check the operation id |
+| `MergeFailed` | `INTERNAL` | 500 | **maybe applied**, for a write; not applied, for a read | no (a read fails the same way again) |
+| `Io` | `INTERNAL` | 500 | **maybe applied**, for a write (D265 treats a commit's `Io` as possibly applied); not applied, for a read | no, for a write (check the operation id); `REQUEST`, for a read |
 | `Corruption` | `DATA_LOSS` | 500 | **maybe applied**, for a write; not applied, for a read | no |
 | `WriterLocked`, `ShmVersionMismatch`, `ShmUnavailable`, `NetworkFilesystem`, `NoReaderSlot` | `UNAVAILABLE` | 503 | not applied (the server can't open the database) | no |
 | **Server codes** | | | | |
@@ -93,9 +115,13 @@ Each row's statuses and its `retry_safe` and `retry_from` are fixed for v1: clie
 | `NotFound` (an id that isn't known, or is another token's) | `NOT_FOUND` | 404 | not applied (but see below) | no |
 | `SessionBusy` (a second concurrent call on one transaction, B2) | `FAILED_PRECONDITION` | 409 | not applied | `REQUEST`, once the first call answers |
 | `TransactionExpired` (idle before any `Commit`, B1) | `ABORTED` | 409 | not applied | `BEGIN` |
+| `TransactionFinished` (a call other than `Commit` on a transaction that received `Commit`; the message names the outcome) | `FAILED_PRECONDITION` | 409 | that call did nothing; the transaction's outcome is `Commit`'s | no: send `Commit` for the outcome |
 | `Overloaded` (shed by the server's limits, R3) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
 | `RequestTooLarge` | `RESOURCE_EXHAUSTED` | 413 | not applied | no |
-| `DeadlineExceeded` (only before a write was submitted, B3) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
+| `DeadlineExceeded` (only before a write was submitted, B3; or a server stream (`Data.Scan`, `Feed.Subscribe`) whose client took no message for `--stream-idle-ms`, resumable from its last page's `next` or its last event's `token`; or an HTTP/1.1 request body that didn't arrive within `--request-timeout-ms`, answered with `Connection: close`, #1601: the same code as every other deadline, not an HTTP-only 408) | `DEADLINE_EXCEEDED` + detail | 504 | not applied | `REQUEST` |
+| `ReplicaBehind` (a read with `x-pigeonhole-min-primary-seqno` that the replica hadn't applied within its deadline, or while it bootstraps, #1577) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied (a read) | `REQUEST`, after the pause |
+| `Unavailable` (a service the server depends on failed or can't be reached: the embedding endpoint, `--embed-url`, refused the connection, didn't connect within half of `--embed-timeout-ms` (at most 3 s), or answered 5xx, 408 or 429; #1617. Or, on a replica, a memory store the replica doesn't have yet; #1618) | `UNAVAILABLE` + `RetryInfo` | 503 + `Retry-After` | not applied | `REQUEST`, after the pause |
+| `FailedPrecondition` (the server's role refuses the call, #1436: `Admin.Promote` on a server that isn't a replica, a replica asked for a bootstrap copy or to be followed. Or the server's configuration does, #1618: a replica's memory store that arrived pinned to another model than `--embed-url`'s or `--memory-model`; and #1651: `Schema.DropTable` of a table of the memory store the server serves) | `FAILED_PRECONDITION` | 409 | not applied | no |
 | `Internal` | `INTERNAL` | 500 | **maybe applied** for a write | no |
 
 A code an older client doesn't know follows its `retry_safe` and `retry_from`.
@@ -112,6 +138,9 @@ A code an older client doesn't know follows its `retry_safe` and `retry_from`.
 - **A write the server has submitted** to the engine answers its real outcome even past the request's deadline, never `DEADLINE_EXCEEDED`.
 - **At shutdown,** in-flight writes end with the engine's outcome: `Closed` means not committed, `OutcomeUnknown` otherwise.
 - **After `Commit` on a transaction, the session answers every call with the recorded outcome until its tombstone expires** (B1). `TransactionExpired` appears only before a `Commit` arrived.
+  - **A `Commit` sent again** answers the first one's outcome (its `CommitInfo`, or its `Conflict` or `OutcomeUnknown`), and commits nothing twice, even if it carries rows.
+  - **Any other call** (`Get`, `GetRow`, `Write`, `Abort`) answers `TransactionFinished`, naming the outcome in its message. It never answers success: an `Abort` that succeeded would read as "not committed".
+  - **A call while the `Commit` runs** answers `SessionBusy`.
 - **`NOT_FOUND` for a `txn_id` that was sent `Commit`** (a restarted server, or an expired tombstone) means the outcome is unknown, not "not applied". The client checks the operation id.
 - **`MutateReturning`'s per-cell `error`** is a value, not an RPC error. The commit succeeded, and only that cell's read failed (D314).
 
@@ -135,3 +164,35 @@ A code an older client doesn't know follows its `retry_safe` and `retry_from`.
 
 ## Callers changed
 None: the contract is new. `phdb serve` (D313's tickets 3 and later) implements it, and D317's `cluster.proto` (ICR 0117) builds on it, reusing `FamilySpec` and `RoutingKey`.
+
+## Amendment: replication (#1436)
+**Status:** proposed with #1436's serve PR; the coordinator approves. The design is [#1436's note](https://github.com/CodingAnarchy/pigeonhole/issues/1436), with cli692's serve review and simp724's engine review folded in. The engine side is ICR 0125. Everything here is additive in v1.
+
+- **A new service, `Replication`** ([`replication.proto`](../../../proto/pigeonhole/v1/replication.proto)), gRPC only, admin scope: `Follow(FollowRequest { token }) -> stream ReplicationBatch`. It streams the primary's durable feed of every table from a replica's token, in batches of opaque events (`pigeonhole`'s hidden `ReplicatedEvent` encoding, versioned by its first byte, so the server never interprets them): at most 256 events, or about 1 MiB, per message. Each message carries `primary_seqno` (the primary's durable frontier, which the stream can deliver up to, for lag; cli692's F5) and `caught_up` (the feed had nothing more to send). A quiet stream sends a message with no events every second. Errors: `FeedExpired` (`OUT_OF_RANGE`) for a token older than the primary keeps, `InvalidArgument` for another database's token, `FailedPrecondition` on a replica (no cascades in 1.2.0, simp724's P2). Each follower reads on a thread of its own and holds a `--max-streams` slot; one that takes nothing for `--stream-idle-ms` ends with `DeadlineExceeded` and resumes from its token.
+- **`Admin.BackupDownloadRequest.replica`** (field 4) asks for a replica's bootstrap copy: a backup of one durable snapshot (`durable` is implied), with `BackupChunk.feed_token` (field 6) in every chunk, the token of a feed of every table opened from that same snapshot. Refused (`FailedPrecondition`) on a replica.
+- **`Admin.Promote(Empty) -> PromoteResponse { primary_token }`**, admin scope, also `POST /v1/Admin/Promote`: stops a replica server's loop (an apply in flight finishes first) and makes the database a primary at the last commit it applied (ICR 0125's `promote`). It answers the primary's token stored with that commit. `FailedPrecondition` on a server that isn't a replica, one already promoted, or one whose first bootstrap hasn't finished.
+- **`InfoResponse.replica`** (field 6), a `ReplicaInfo`, is set on a replica server until it's promoted: the primary's URL, the state (`starting`, `bootstrapping`, `following`, `re-bootstrapping`, `retrying`), `applied_primary_seqno`, `primary_seqno`, `lag_commits`, `lag_ms` and `last_error`; and `bootstrap_phase` (field 8) and `bootstrap_bytes` (field 9): the step a bootstrap is at, or a failed one stopped at, and the copy's bytes received, so a bootstrap that stops says where (#1595).
+- **A replica's write** (every write-scope RPC, and `DropTable`; derived from the scope, so later write RPCs are covered too; a `Commit` with writes is refused by the engine's gate) fails with the engine's `ReadOnly` row of the table (`FAILED_PRECONDITION`, 409, not applied), its message naming the primary: "this server is a replica of <URL>: send writes to the primary".
+- **A new server code, `FailedPrecondition`,** in the table above (the coordinator approved it, with `--change-feed`).
+- **Vector indexes on a replica** are opened as on a primary and searched and verified there; their writes are refused as above. A catalog change applied from the primary, or a new copy swapped in, drops the server's open table and index handles, so the next call opens them on what the replica now holds.
+- **`phdb serve` flags:** `--replica-of URL`, `--replica-token-file FILE` (or `PHDB_REPLICA_TOKEN`), `--replica-run N` (256), and `--change-feed BYTES` (the primary's feed; a database whose feed is on keeps it without the flag). `phdb promote <file>` promotes a stopped replica's file. `--replica-of` refuses to start on a database that has tables and isn't a replica's, since the bootstrap would replace it.
+- **The client side's dependencies:** tonic's `channel`, `tls-ring` and `tls-native-roots` features (rustls with the system's roots), approved by the coordinator; `cargo deny check` passes.
+- **Read-your-writes on a replica (#1577, a later amendment; cli692's call: a header, not a proto field).** A read may carry the request header `x-pigeonhole-min-primary-seqno: <seqno>`, gRPC metadata or an HTTP header: the seqno of the client's commit on the primary, in decimal. On a replica, the read waits until the replica has applied the primary's commits through that seqno, then answers. The wait shares one deadline with the in-flight budget wait, from the request's arrival: the request timeout, or a shorter `grpc-timeout`. Past it, or while the replica bootstraps, the read fails with the new server code `ReplicaBehind` (the table above), or `DeadlineExceeded` when the client's `grpc-timeout` was the bound, as the budget wait answers (cli692's R1 on #1594). A promotion answers every waiting read at once. Every `CommitInfo.seqno` names a commit the primary's feed of every table delivers, so the wait needs no later commit to end. A value that isn't a decimal `u64` is `InvalidArgument`. It applies to read-scope RPCs except `Admin.Info` and `Admin.Metrics`. A server that isn't a replica, or a promoted one, ignores the header. A header rather than a field keeps it out of every read message, and works the same for RPCs added later.
+- **A download answers at once (#1611, a later amendment; wire-compatible, no new field).** Over gRPC, a fresh `Admin.BackupDownload` answers as soon as its copy is registered. While the copy is written and hashed, the server sends a **heartbeat**: a `BackupChunk` with no `data`, the requested `offset`, the `backup_id`, and, for a replica's copy, the `feed_token` once its snapshot is taken. The first goes at once, the rest every second. A client can therefore bound every wait independently of the copy's size (a replica allows 3 s between heartbeats), and a break during the copy resumes the same copy with `backup_id`: a resume of a copy still being written waits for it, with heartbeats. A client already accepted empty chunks at its current offset. HTTP keeps waiting for the whole copy, because its size and SHA-256 go out as headers. A replica no longer needs a separate, longer wait for the first answer.
+
+## Amendment: `Memory` on a replica (#1618)
+The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6).
+- **`--memory NAME` with `--replica-of`** serves the store's `Recall` and `Watch` from what the replica has applied. `x-pigeonhole-min-primary-seqno` applies to them, as to any read-scope RPC. The five memory writes are write-scope, so they fail with the replica's `ReadOnly`, naming the primary (the replication amendment's rule).
+- **The store is opened, never created, on a replica.**
+  - At startup it's opened if the replica's copy has it, so a pin mismatch fails the start; otherwise it's opened when a call first needs it.
+  - It's opened again after every applied catalog change and every re-bootstrap swap. The server drops it before the replica publishes the seqno it applied, so a read waiting for the primary's create sees the store.
+  - The store's forgetter and IVF rebalancer don't run there (ICR 0107's `own_rebalancer` amendment).
+- **A store the replica doesn't have:**
+  - `ReplicaBehind` while the replica is `starting`, `bootstrapping` or `re-bootstrapping`;
+  - otherwise `Unavailable`, widened in the table above: the primary may not have created the store yet, or the replica hasn't applied that yet;
+  - a store pinned to another model than the server's: `FailedPrecondition`.
+- **An open `Memory.Watch` across a re-bootstrap** ends with an error, as `Feed.Subscribe` streams do: `FeedExpired`, or `InvalidArgument` if the store's feed sees the new copy first. Its token is the old copy's, so the client watches again without it. An applied catalog change doesn't end it.
+- **A promote** opens the store as the writer at once, creating it if missing with the server's `--memory-*` options. A failure there doesn't fail the promote: it's `ReplicaInfo.last_error` and the log, and memory calls answer it until the next catalog change.
+
+## Amendment: `Unavailable` (#1617)
+- **A new server code, `Unavailable`,** in the table above (the coordinator approved it on #1617, ai1249's R2): a service the server depends on failed or can't be reached, so nothing was applied and the request may be sent again. Today that's `Memory`'s embedding endpoint (`--embed-url`) refusing the connection, not connecting within half of `--embed-timeout-ms` (at most 3 s; a connect that hangs is an unreachable endpoint, not a slow one), or answering 5xx, 408 or 429. The endpoint's other failures map to existing codes: its timeout (`--embed-timeout-ms`) is `DeadlineExceeded`; a 400, 413 or 422 (the caller's text) is `InvalidArgument`; any other answer, or a reply that isn't an embedding of the store's dimension, is `Internal` (the server's configuration). Clients that don't know the code see it as an unknown server code with its HTTP status and `retry_from`.

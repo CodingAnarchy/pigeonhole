@@ -333,7 +333,6 @@ pub struct Cell {
 }
 
 impl Cell {
-    #[cfg(feature = "async")]
     pub(crate) fn from_data(data: CellData) -> Self {
         Self { data }
     }

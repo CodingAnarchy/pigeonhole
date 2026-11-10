@@ -299,6 +299,37 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Appends one mutation exactly as a primary logged it (D315 PR 3: a replica's apply):
+    /// its kind, explicit timestamp and stored value (tag byte first, as the feed delivers
+    /// it; empty for deletes). The batch is then routed as logged: counter writes aren't
+    /// prepared and HLL or bloom inputs aren't converted again, and a merge may carry its
+    /// timestamp in any family. Not for a batch that also holds ordinary writes: the first
+    /// call marks the whole batch. Not part of the stable API.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_logged(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Timestamp,
+        stored: &[u8],
+    ) -> crate::Result<()> {
+        self.builder.mark_logged();
+        self.builder
+            .push(table, family, kind, row, qualifier, Some(ts), stored)?;
+        Ok(())
+    }
+
+    /// Whether it holds a primary's logged mutations ([`push_logged`](Self::push_logged),
+    /// D315 PR 3): routed as logged, never converted or prepared again. The mark is the
+    /// builder's (`BatchBuilder::is_logged`), in its padding, so the batch doesn't grow.
+    pub(crate) fn logged(&self) -> bool {
+        self.builder.is_logged()
+    }
+
     /// Mutations so far.
     pub fn len(&self) -> usize {
         self.builder.len() + self.row_deletes.len()
@@ -802,6 +833,11 @@ fn wait_reply_spinning<T: Send>(
 /// instead on a thread that drives a shard, which may be the one holding the watermark, and
 /// with `OutcomeUnknown` once visibility can no longer advance (the close finished, or a
 /// shard died): the commit was acknowledged by its shard, but never became visible here.
+///
+/// Always inlined: a plain commit's wait and a conditional commit's both call it, and with
+/// two callers in one binary LTO outlined it out of the commit path (+56 instructions per
+/// commit on `commit-one`, #1566).
+#[inline(always)]
 pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,

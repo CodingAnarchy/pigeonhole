@@ -1027,3 +1027,65 @@ fn a_feed_stream_is_woken_by_a_commit_and_its_token_resumes() {
     drop(stream);
     db.close().unwrap();
 }
+
+/// D315 PR 2b: a `FeedEventStream` over a feed of every table is woken by a catalog change
+/// made on another thread, yields it and then the commit after it, owned, and its token
+/// resumes just past the last event.
+#[test]
+fn a_feed_event_stream_yields_a_catalog_change_then_its_commit() {
+    use pigeonhole::nonblocking::FeedEventStream;
+    use pigeonhole::{CatalogEdit, FeedEvent, FeedRetention, Options};
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("events.phdb"),
+        Options::default()
+            .shards(2)
+            .change_feed(FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    let mut stream = FeedEventStream::new(db.feed().open().unwrap());
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let t = db
+                .table("t")
+                .unwrap()
+                .family("f", pigeonhole::Family::default())
+                .create()
+                .unwrap();
+            t.mutate(b"one").put("f", b"q", b"1").commit().unwrap()
+        })
+    };
+    let mut next = || {
+        let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx));
+        block_on(next).expect("an event").unwrap()
+    };
+    match next() {
+        FeedEvent::Catalog(change) => assert!(
+            matches!(change.edits(), [CatalogEdit::TableCreated { table, families, .. }]
+                if table == "t" && families.len() == 1 && families[0].name == "f"),
+            "{change:?}"
+        ),
+        other => panic!("the create first: {other:?}"),
+    }
+    let token = stream.token();
+    let one = writer.join().unwrap();
+    let mut next = || {
+        let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx));
+        block_on(next).expect("an event").unwrap()
+    };
+    match next() {
+        FeedEvent::Commit(c) => assert_eq!(c.seqno(), one.seqno),
+        other => panic!("the commit: {other:?}"),
+    }
+    drop(stream);
+    let mut stream = FeedEventStream::new(db.feed().resume(&token).open().unwrap());
+    let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx));
+    match block_on(next).expect("an event").unwrap() {
+        FeedEvent::Commit(c) => assert_eq!(c.seqno(), one.seqno, "just past the change"),
+        other => panic!("{other:?}"),
+    }
+    drop(stream);
+    db.close().unwrap();
+}

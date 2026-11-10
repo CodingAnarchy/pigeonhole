@@ -397,6 +397,33 @@ impl FamilyKind {
 /// `kind_params`; they ship together in 1.1.0.
 pub const INCOMPAT_AGGREGATES: u64 = 1 << 0;
 
+/// The `ro_compat` feature bit of a replica's state (bit 0, D315 PR 3; FORMAT §8.2, §9): the
+/// file holds the reserved table [`REPLICA_TABLE`], created by a replica's first apply. A
+/// build that doesn't know it opens the file read-only, so it can't drop the replica's state
+/// or write into the tables it mirrors.
+pub const RO_COMPAT_REPLICA: u64 = 1 << 0;
+
+/// The reserved table that holds a replica's state (D315 PR 3; FORMAT §9): the primary's
+/// feed token and position, written with each run it applies. Never allocated (table ids
+/// count up from 1 and never reach it) and never taken from a primary.
+pub const REPLICA_TABLE: crate::TableId = crate::TableId(u32::MAX);
+
+/// [`REPLICA_TABLE`]'s one family, reserved like it.
+pub const REPLICA_FAMILY: crate::FamilyId = crate::FamilyId(u32::MAX);
+
+/// [`REPLICA_TABLE`]'s one tablet, reserved like it: never split or merged.
+pub const REPLICA_TABLET: crate::TabletId = crate::TabletId(u64::MAX);
+
+/// [`REPLICA_TABLE`]'s name. Table names starting with [`RESERVED_PREFIX`] are refused at
+/// creation from 1.2.
+pub const REPLICA_TABLE_NAME: &str = "__pigeonhole.replication";
+
+/// [`REPLICA_FAMILY`]'s name.
+pub const REPLICA_FAMILY_NAME: &str = "state";
+
+/// The prefix of the table names the engine keeps for itself (D315 PR 3).
+pub const RESERVED_PREFIX: &str = "__pigeonhole.";
+
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
 /// the data the same way.
 ///

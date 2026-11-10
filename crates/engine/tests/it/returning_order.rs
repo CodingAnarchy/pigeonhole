@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, FamilyId, FamilyOptions, Fault, TableId, ValueRef,
-    WriteBatch,
+    Engine, EngineOptions, EngineShard, FamilyId, FamilyOptions, Fault, Predicate, TableId,
+    ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_format::manifest::FamilyKind;
@@ -188,6 +188,135 @@ fn a_share_writing_a_waiting_returning_row_comes_after_it() {
     );
     assert_eq!(*cells[0].value.as_ref().unwrap(), Some(1006));
     assert_eq!(db.value(), 21_006);
+}
+
+/// D314 amendment 1 (#1445): a commit that only asks for a previous value (it writes the
+/// row, but no counter cell: a column delete of another qualifier) waits as a counting one
+/// does, through `Reply::Returning`. Base 5, a cross-shard `+1000` with its decision held;
+/// the previous value of the counter must be 1005, not 5.
+#[test]
+fn a_previous_only_commit_waits_for_a_share_undecided_on_its_row() {
+    let mut db = open(1445);
+    let mut base = db.returning(5);
+    db.answer(&mut base).unwrap();
+    db.engine.inject(Fault::HoldDecides, true);
+    let mut cross = db.cross(1000);
+    db.drive(20);
+    let (t, c) = db.tables[1];
+    let mut b = WriteBatch::new();
+    b.delete_column(t, c, b"r", b"other", None).unwrap();
+    let mut r = db
+        .engine
+        .submit_returning_previous(b, Some(Durability::Buffered), vec![(c, b"n".to_vec())])
+        .expect("submit");
+    db.drive(20);
+    assert!(
+        ready(&mut r).is_none(),
+        "the previous-only commit was answered while a share on its row was undecided there"
+    );
+    db.engine.inject(Fault::HoldDecides, false);
+    assert_eq!(db.engine.release_held_decides(usize::MAX), 1);
+    let (info, cells) = db.answer(&mut r).unwrap();
+    let x = db.answer(&mut cross).unwrap();
+    assert!(x.seqno < info.seqno);
+    assert!(cells.is_empty());
+    let previous = r.take_previous();
+    assert_eq!(previous.len(), 1);
+    let cell = previous[0].value.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        i64::from_le_bytes(cell.stored()[1..9].try_into().unwrap()),
+        1005
+    );
+}
+
+/// D314 amendment 2 (#1446): a returning check reads its row at the check and after its
+/// apply, so it waits for a share undecided on its row as a returning commit does. It
+/// reports the counter with the share's 1000 folded in, not the 5 from before it.
+#[test]
+fn a_returning_check_waits_for_a_share_undecided_on_its_row() {
+    let mut db = open(1446);
+    let mut base = db.returning(5);
+    db.answer(&mut base).unwrap();
+    db.engine.inject(Fault::HoldDecides, true);
+    let mut cross = db.cross(1000);
+    db.drive(20);
+    let (t, c) = db.tables[1];
+    let mut b = WriteBatch::new();
+    b.delete_column(t, c, b"r", b"other", None).unwrap();
+    let exists = Predicate::Exists {
+        family: c,
+        qualifier: b"n".to_vec(),
+    };
+    let mut r = db
+        .engine
+        .submit_check_and_mutate_returning(
+            t,
+            b"r",
+            &exists,
+            b,
+            Some(Durability::Buffered),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("submit");
+    db.drive(20);
+    assert!(
+        ready(&mut r).is_none(),
+        "the returning check was answered while a share on its row was undecided there"
+    );
+    db.engine.inject(Fault::HoldDecides, false);
+    assert_eq!(db.engine.release_held_decides(usize::MAX), 1);
+    let out = db.answer(&mut r).unwrap();
+    let x = db.answer(&mut cross).unwrap();
+    assert!(out.applied);
+    assert!(x.seqno < out.info.expect("applied").seqno);
+    let cell = out.current[0].value.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        i64::from_le_bytes(cell.stored()[1..9].try_into().unwrap()),
+        1005
+    );
+}
+
+/// simp724's S1 on #1446: a returning check's reported columns count as read in its group.
+/// An earlier member of the same group writes a reported column (not the condition's) and
+/// the condition fails: the check waits for the next group, so it reports that write, a
+/// state the row had, rather than the column as it was before the group.
+#[test]
+fn a_returning_check_reports_an_earlier_group_members_write() {
+    let mut db = open(1447);
+    let mut base = db.returning(5);
+    db.answer(&mut base).unwrap();
+    let (t, c) = db.tables[1];
+    // Both submitted before the shard runs, so they land in one group, the write first.
+    let mut w = WriteBatch::new();
+    w.merge(t, c, b"r", b"note", ValueRef::I64(7)).unwrap();
+    let mut write = db
+        .engine
+        .submit(w, Some(Durability::Buffered))
+        .expect("submit");
+    let absent = Predicate::Absent {
+        family: c,
+        qualifier: b"n".to_vec(),
+    };
+    let mut check = db
+        .engine
+        .submit_check_and_mutate_returning(
+            t,
+            b"r",
+            &absent,
+            WriteBatch::new(),
+            Some(Durability::Buffered),
+            Vec::new(),
+            vec![(c, b"note".to_vec())],
+        )
+        .expect("submit");
+    let out = db.answer(&mut check).unwrap();
+    db.answer(&mut write).unwrap();
+    assert!(!out.applied, "n exists");
+    assert_eq!(out.current.len(), 2, "the condition's column, then note");
+    let note = out.current[1].value.as_ref().unwrap().as_ref();
+    let note = note.map(|c| i64::from_le_bytes(c.stored()[1..9].try_into().unwrap()));
+    assert_eq!(note, Some(7), "the earlier member's write, applied first");
 }
 
 /// A returning batch is one row (simp724's B1 on #1453): its cells come back by family,

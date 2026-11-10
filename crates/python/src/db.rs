@@ -1,10 +1,12 @@
 //! Databases (the writer and reader processes), batches and transactions.
 
+use crate::Maybe;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::convert::{self, Val};
@@ -244,27 +246,13 @@ pub(crate) fn open(
     feed_tables: Option<Vec<String>>,
 ) -> PyResult<Database> {
     let mut o = pigeonhole::Options::default().create_if_missing(create);
-    if let Some(n) = shards {
-        o = o.shards(n);
-    }
-    if let Some(d) = durability {
-        o = o.durability(d.into());
-    }
-    if let Some(n) = block_cache {
-        o = o.block_cache(n);
-    }
-    if let Some(n) = row_cache {
-        o = o.row_cache(n);
-    }
-    if let Some(n) = memtable_budget {
-        o = o.memtable_budget(n);
-    }
-    if let Some(d) = shm_dir {
-        o = o.shm_dir(d);
-    }
-    if let Some(b) = read_only_fallback {
-        o = o.read_only_fallback(b);
-    }
+    o = o.maybe(shards, |o, n| o.shards(n));
+    o = o.maybe(durability, |o, d| o.durability(d.into()));
+    o = o.maybe(block_cache, |o, n| o.block_cache(n));
+    o = o.maybe(row_cache, |o, n| o.row_cache(n));
+    o = o.maybe(memtable_budget, |o, n| o.memtable_budget(n));
+    o = o.maybe(shm_dir, |o, d| o.shm_dir(d));
+    o = o.maybe(read_only_fallback, |o, b| o.read_only_fallback(b));
     if change_feed_off {
         if change_feed.is_some() || feed_age.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -288,9 +276,7 @@ pub(crate) fn open(
         }
         (None, None) => {}
     }
-    if let Some(t) = feed_tables {
-        o = o.feed_tables(t);
-    }
+    o = o.maybe(feed_tables, |o, t| o.feed_tables(t));
     let db = py
         .detach(move || pigeonhole::Pigeonhole::open(path, o))
         .or_py()?;
@@ -369,9 +355,7 @@ impl Database {
     ) -> PyResult<Py<PyAny>> {
         let db = self.db()?;
         let mut policy = pigeonhole::RetryPolicy::default();
-        if let Some(n) = max_attempts {
-            policy = policy.max_attempts(n);
-        }
+        policy = policy.maybe(max_attempts, |policy, n| policy.max_attempts(n));
         if let Some(d) = deadline {
             policy = policy.deadline(convert::duration(d)?);
         }
@@ -383,6 +367,14 @@ impl Database {
             let txn = Bound::new(py, Transaction(Mutex::new(Some(txn))))?;
             // A conflict surfaces at commit, or from a read inside `f`.
             let outcome = f.call1((&txn,)).and_then(|out| {
+                // B3: an `async def` body returns an unawaited coroutine, and committing
+                // after it would be an empty commit.
+                if is_coroutine(&out)? {
+                    let _ = out.call_method0("close");
+                    return Err(PyTypeError::new_err(
+                        "transact takes a sync body; use transact_async for an async def",
+                    ));
+                }
                 txn.get().commit_with(py, durability)?;
                 Ok(out.unbind())
             });
@@ -401,11 +393,37 @@ impl Database {
                 return Err(err);
             }
             match policy.next_pause(code, attempt, started.elapsed()) {
-                Some(pause) => py.detach(|| std::thread::sleep(pause)),
+                Some(pause) => {
+                    // Counted as the library's `transact` counts its retries (cli692's N1).
+                    db.note_transaction_retry();
+                    py.detach(|| std::thread::sleep(pause));
+                }
                 None => return Err(err),
             }
             attempt += 1;
         }
+    }
+
+    /// `transact(f)` for an `async def f(txn)` (#1479): a coroutine. Each attempt runs
+    /// `await f(txn)` then `await txn.commit_async()`, and a `Conflict` or `Busy` is retried
+    /// as `transact` retries it (the same attempts, backoff and deadline), sleeping with
+    /// `asyncio.sleep`. Its reads should be `await txn.get_async(...)`.
+    #[pyo3(signature = (f, *, max_attempts=None, deadline=None, durability=None))]
+    fn transact_async<'py>(
+        slf: &Bound<'py, Self>,
+        f: &Bound<'py, PyAny>,
+        max_attempts: Option<u32>,
+        deadline: Option<&Bound<'py, PyAny>>,
+        durability: Option<Durability>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        py.import("pigeonhole._aio")?.getattr("transact")?.call1((
+            slf,
+            f,
+            max_attempts,
+            deadline,
+            durability.map(|d| d as u8),
+        ))
     }
 
     /// Flushes every memtable to the file.
@@ -505,15 +523,9 @@ pub(crate) fn open_reader(
     row_cache: Option<usize>,
 ) -> PyResult<Reader> {
     let mut o = pigeonhole::ReaderOptions::default();
-    if let Some(d) = shm_dir {
-        o = o.shm_dir(d);
-    }
-    if let Some(n) = block_cache {
-        o = o.block_cache(n);
-    }
-    if let Some(n) = row_cache {
-        o = o.row_cache(n);
-    }
+    o = o.maybe(shm_dir, |o, d| o.shm_dir(d));
+    o = o.maybe(block_cache, |o, n| o.block_cache(n));
+    o = o.maybe(row_cache, |o, n| o.row_cache(n));
     let r = py
         .detach(move || pigeonhole::Pigeonhole::open_reader(path, o))
         .or_py()?;
@@ -635,6 +647,37 @@ write_methods!(WriteBatch {
         .map(|i| i.seqno)
     }
 
+    /// `commit()` as an `asyncio.Future` of the running loop (#1479): the commit's sequence
+    /// number. Cancelled while the commit waits for room, nothing is written; once it's
+    /// submitted it may still land.
+    #[pyo3(signature = (*, durability=None))]
+    fn commit_async<'py>(
+        &self,
+        py: Python<'py>,
+        durability: Option<Durability>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let ops = self
+            .ops
+            .lock()
+            .expect("not poisoned")
+            .take()
+            .ok_or_else(|| PyValueError::new_err("the batch was already committed or discarded"))?;
+        let db = self.db.clone();
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let mut b = db.write_batch();
+            for (t, row, op) in &ops {
+                apply!(&mut b, t, row, op);
+            }
+            let f = match durability {
+                Some(d) => b.commit_with_async(d.into()),
+                None => b.commit_async(),
+            };
+            async move { crate::aio::output(f.await, |py, i| i.seqno.into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
@@ -751,6 +794,57 @@ write_methods!(Transaction {
         self.commit_with(py, durability)
     }
 
+    /// `get(...)` as an `asyncio.Future` of the running loop (#1479): the cell, or `None`.
+    /// The read is recorded at the call, so it counts at commit even if this isn't awaited
+    /// first (await reads before committing).
+    fn get_async<'py>(
+        &self,
+        py: Python<'py>,
+        table: &Table,
+        row: &Bound<'_, PyAny>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let t = table.writer()?.clone();
+        let (row, q) = (convert::bytes(row)?, convert::bytes(qualifier)?);
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let read = py.detach(|| {
+            let mut guard = self.0.lock().expect("not poisoned");
+            guard.as_mut().map(|txn| txn.get_async(&t, &row, &family, &q))
+        });
+        let f = read.ok_or_else(done)?;
+        crate::aio::start(py, &event_loop, &fut, move || async move {
+            crate::aio::output(f.await, |py, c| c.map(Cell).into_py_any(py))
+        })?;
+        Ok(fut)
+    }
+
+    /// `commit()` as an `asyncio.Future` of the running loop (#1479): the sequence number,
+    /// or the `Conflict` the sync form raises. Cancelled while it waits for room, nothing is
+    /// written; once it's submitted it may still land.
+    #[pyo3(signature = (*, durability=None))]
+    fn commit_async<'py>(
+        &self,
+        py: Python<'py>,
+        durability: Option<Durability>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let txn = self
+            .0
+            .lock()
+            .expect("not poisoned")
+            .take()
+            .ok_or_else(done)?;
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = match durability {
+                Some(d) => txn.commit_with_async(d.into()),
+                None => txn.commit_async(),
+            };
+            async move { crate::aio::output(f.await, |py, i| i.seqno.into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
     /// Drops the transaction's writes.
     fn rollback(&self) {
         self.0.lock().expect("not poisoned").take();
@@ -776,3 +870,13 @@ write_methods!(Transaction {
         Ok(false)
     }
 });
+
+/// Whether `v` is a coroutine (`inspect.iscoroutine`).
+fn is_coroutine(v: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = v.py();
+    static ISCOROUTINE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let f = ISCOROUTINE.get_or_try_init(py, || {
+        Ok::<_, PyErr>(py.import("inspect")?.getattr("iscoroutine")?.unbind())
+    })?;
+    f.bind(py).call1((v,))?.is_truthy()
+}

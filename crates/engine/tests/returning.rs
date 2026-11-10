@@ -1,8 +1,10 @@
 //! D314's returning increments (#1440) under the model-checked simulation: commits that
 //! return their counters' values, some of them members of concurrent batches beside blind
 //! cross-shard writers, each value checked against the model's fold at its seqno.
-//! `common::families` gives this target a plain `sum`, a `sum_v2` keeping 2 versions, a
-//! `sum_ttl` and `f`.
+//! Half of them also ask for the values the columns they write held just before them
+//! (get-and-set, D314 amendment 1), each checked against the model's newest version at the
+//! seqno below. `common::families` gives this target a plain `sum`, a `sum_v2` keeping 2
+//! versions, a `sum_ttl` and `f`.
 
 mod common;
 
@@ -44,7 +46,8 @@ fn hot_rows_returning_increments_beside_blind_cross_shard_writers() {
         let mut cfg = Config::quiet(600);
         cfg.shards = shards;
         cfg.tasks = 64;
-        (cfg.cas_ppm, cfg.txn_ppm, cfg.returning_ppm) = (0, 0, 600_000);
+        // Some checks too: half of them returning checks (D314 amendment 2).
+        (cfg.cas_ppm, cfg.txn_ppm, cfg.returning_ppm) = (100_000, 0, 600_000);
         cfg.deferred_io = true;
         cfg.spec.zipf_theta = 0.99;
         cfg.spec.rows = 4;
@@ -54,11 +57,23 @@ fn hot_rows_returning_increments_beside_blind_cross_shard_writers() {
         cfg.spec.max_batch = 4;
         // The ordering rule's two halves each have a hand-driven test that fails without
         // them (it/returning_order.rs); random seeds reach the rule's window only rarely.
-        let (mut fast, mut full) = (0, 0);
+        let (mut fast, mut full, mut previous, mut current) = (0, 0, 0, 0);
         for seed in seeds() {
             let st = check(seed, &cfg);
             (fast, full) = (fast + st.returning_fast, full + st.returning_full);
+            previous += st.previous_checked;
+            current += st.current_checked;
         }
+        // Half the checks are returning checks, each column checked whichever way it goes.
+        assert!(
+            current > 0,
+            "{shards} shards: no returning check was checked"
+        );
+        // Half the returning commits ask for previous values (D314 amendment 1).
+        assert!(
+            previous > 0,
+            "{shards} shards: no previous value was checked"
+        );
         // The fast path must run, or the checks above would pass on the full read alone
         // (simp724 on #1440). This mix sends most folds to the full read on purpose (`sum_v2`
         // keeps 2 versions, a new TTL bucket has no base yet, row deletes are frequent, and

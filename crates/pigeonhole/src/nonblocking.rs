@@ -188,11 +188,11 @@ enum ReturningState {
         largest: usize,
         max: usize,
     },
-    Ready(Option<Result<crate::Incremented>>),
+    Ready(Option<Result<crate::Returned>>),
 }
 
 impl Future for ReturningFuture {
-    type Output = Result<crate::Incremented>;
+    type Output = Result<crate::Returned>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
@@ -201,11 +201,13 @@ impl Future for ReturningFuture {
                 table,
                 largest,
                 max,
-            } => match Pin::new(pending).poll(cx) {
+            } => match Pin::new(&mut *pending).poll(cx) {
                 Poll::Ready(r) => {
+                    let previous = pending.take_previous();
                     let out = r
                         .map(|(info, cells)| {
-                            crate::Incremented::new(CommitInfo::from_engine(info), table, cells)
+                            crate::Returned::new(CommitInfo::from_engine(info), table, cells)
+                                .with_previous(previous)
                         })
                         .map_err(|e| crate::write::commit_error(e, *largest, *max));
                     self.state = ReturningState::Ready(None);
@@ -235,6 +237,19 @@ impl RowMutation<'_> {
             state: match self.submit_if_async(condition) {
                 Ok(s) => CheckState::Pending(s),
                 Err(e) => CheckState::Ready(Some(Err(e))),
+            },
+        }
+    }
+
+    /// [`commit_if_returning`](RowMutation::commit_if_returning), as a future, submitted as
+    /// [`commit_if_async`](RowMutation::commit_if_async) is (D210): the same
+    /// [`Checked`](crate::Checked) either way. **Dropped while it still waits for room, it
+    /// writes nothing.**
+    pub fn commit_if_returning_async(self, condition: &Condition) -> CheckReturningFuture {
+        CheckReturningFuture {
+            state: match self.submit_if_returning_async(condition) {
+                Ok(s) => CheckReturningState::Pending(s),
+                Err(e) => CheckReturningState::Ready(Some(Err(e))),
             },
         }
     }
@@ -344,6 +359,45 @@ impl Future for CheckFuture {
                 Poll::Pending => Poll::Pending,
             },
             CheckState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "commit future polled after it resolved",
+                ))
+            })),
+        }
+    }
+}
+
+/// A [`RowMutation::commit_if_returning`] as a future
+/// ([`RowMutation::commit_if_returning_async`], D314 amendment 2).
+#[derive(Debug)]
+#[must_use = "a future does nothing unless polled; dropped once submitted, it does not roll back"]
+pub struct CheckReturningFuture {
+    state: CheckReturningState,
+}
+
+#[derive(Debug)]
+enum CheckReturningState {
+    /// Submitted (or waiting for room, D210), not resolved.
+    Pending(crate::write::SubmittedCheckReturning),
+    /// Refused before submission; `None` once taken.
+    Ready(Option<Result<crate::Checked>>),
+}
+
+impl Future for CheckReturningFuture {
+    type Output = Result<crate::Checked>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            CheckReturningState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
+                Poll::Ready(r) => {
+                    let out = s.outcome(r);
+                    self.state = CheckReturningState::Ready(None);
+                    Poll::Ready(out)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            CheckReturningState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
                 Err(Error::new(
                     crate::ErrorCode::InvalidArgument,
                     "commit future polled after it resolved",
@@ -587,80 +641,111 @@ impl futures_core::Stream for RowStream<'_> {
     }
 }
 
-/// A change feed as a `Stream` of owned commits (D310 PR 5a): [`Feed::poll_next`](crate::Feed::poll_next) for an
-/// async consumer, each commit a copy safe to hold across `.await`. Woken, never spinning,
-/// when the frontier can move. A feed doesn't end on its own: the stream ends only after an
-/// error, which it yields once (`FeedExpired` when the history is gone, `Closed` after
-/// `close()`). Take [`token`](Self::token) after handling a commit, as with the sync feed.
-///
-/// The writer process only: in a reader process the first item is `Unsupported` (#1407);
-/// use the blocking [`Feed::next`](crate::Feed::next) there, on a thread of its own.
-///
-/// ```
-/// use futures_core::Stream;
-/// use pigeonhole::nonblocking::FeedStream;
-/// use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
-///
-/// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = pigeonhole::doc_support::temp_dir();
-/// let db = Pigeonhole::open(
-///     dir.join("app.phdb"),
-///     Options::default().change_feed(FeedRetention::bytes(64 << 20)),
-/// )?;
-/// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
-/// let mut stream = FeedStream::new(t.feed().open()?);
-/// t.mutate(b"row").put("f", b"q", b"v").commit()?;
-/// // Any executor drives it (here a minimal one).
-/// # use pigeonhole::doc_support::block_on;
-/// let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx));
-/// let commit = block_on(next).expect("a feed doesn't end on its own")?;
-/// assert_eq!(commit.changes()[0].row(), b"row");
-/// let _token = stream.token();
-/// # drop(stream);
-/// # db.close()?;
-/// # Ok(())
-/// # }
-/// ```
-#[must_use = "a stream does nothing unless polled"]
-#[derive(Debug)]
-pub struct FeedStream {
-    feed: crate::Feed,
-    done: bool,
-}
-
-impl FeedStream {
-    /// The stream of `feed`'s commits.
-    pub fn new(feed: crate::Feed) -> Self {
-        Self { feed, done: false }
-    }
-
-    /// Where the stream is: [`FeedBuilder::resume`](crate::FeedBuilder::resume) continues
-    /// after the last commit it yielded.
-    pub fn token(&self) -> crate::FeedToken {
-        self.feed.token()
-    }
-
-    /// The feed back, for its blocking calls.
-    pub fn into_inner(self) -> crate::Feed {
-        self.feed
-    }
-}
-
-impl futures_core::Stream for FeedStream {
-    type Item = Result<crate::Commit>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        if this.done {
-            return Poll::Ready(None);
+/// The public streams of a feed's owned items, `$item`s from [`Feed`](crate::Feed)'s `$poll`:
+/// each a clone, the stream ending after the first error. [`FeedStream`] and
+/// [`FeedEventStream`] differ only in those.
+macro_rules! feed_stream {
+    ($(#[$doc:meta])* $name:ident: $item:ident, $poll:ident, $one:literal, $many:literal) => {
+        $(#[$doc])*
+        #[must_use = "a stream does nothing unless polled"]
+        #[derive(Debug)]
+        pub struct $name {
+            feed: crate::Feed,
+            done: bool,
         }
-        match this.feed.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(c)) => Poll::Ready(Some(Ok(c.clone()))),
-            Poll::Ready(Err(e)) => {
-                this.done = true;
-                Poll::Ready(Some(Err(e)))
+
+        impl $name {
+            #[doc = concat!("The stream of `feed`'s ", $many, ".")]
+            pub fn new(feed: crate::Feed) -> Self {
+                Self { feed, done: false }
+            }
+
+            /// Where the stream is: [`FeedBuilder::resume`](crate::FeedBuilder::resume)
+            #[doc = concat!("continues after the last ", $one, " it yielded.")]
+            pub fn token(&self) -> crate::FeedToken {
+                self.feed.token()
+            }
+
+            /// How far the stream has covered its history:
+            /// [`Feed::position`](crate::Feed::position). Not part of the stable API.
+            #[doc(hidden)]
+            pub fn position(&self) -> crate::FeedPosition {
+                self.feed.position()
+            }
+
+            /// The feed back, for its blocking calls.
+            pub fn into_inner(self) -> crate::Feed {
+                self.feed
             }
         }
-    }
+
+        impl futures_core::Stream for $name {
+            type Item = Result<crate::$item>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let this = &mut *self;
+                if this.done {
+                    return Poll::Ready(None);
+                }
+                match this.feed.$poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(item)) => Poll::Ready(Some(Ok(item.clone()))),
+                    Poll::Ready(Err(e)) => {
+                        this.done = true;
+                        Poll::Ready(Some(Err(e)))
+                    }
+                }
+            }
+        }
+    };
+}
+
+feed_stream! {
+    /// A change feed as a `Stream` of owned commits (D310 PR 5a): [`Feed::poll_next`](crate::Feed::poll_next) for an
+    /// async consumer, each commit a copy safe to hold across `.await`. Woken, never spinning,
+    /// when the frontier can move. A feed doesn't end on its own: the stream ends only after an
+    /// error, which it yields once (`FeedExpired` when the history is gone, `Closed` after
+    /// `close()`). Take [`token`](Self::token) after handling a commit, as with the sync feed.
+    ///
+    /// The writer process only: in a reader process the first item is `Unsupported` (#1407);
+    /// use the blocking [`Feed::next`](crate::Feed::next) there, on a thread of its own.
+    ///
+    /// ```
+    /// use futures_core::Stream;
+    /// use pigeonhole::nonblocking::FeedStream;
+    /// use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(
+    ///     dir.join("app.phdb"),
+    ///     Options::default().change_feed(FeedRetention::bytes(64 << 20)),
+    /// )?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// let mut stream = FeedStream::new(t.feed().open()?);
+    /// t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    /// // Any executor drives it (here a minimal one).
+    /// # use pigeonhole::doc_support::block_on;
+    /// let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_next(cx));
+    /// let commit = block_on(next).expect("a feed doesn't end on its own")?;
+    /// assert_eq!(commit.changes()[0].row(), b"row");
+    /// let _token = stream.token();
+    /// # drop(stream);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    FeedStream: Commit, poll_next, "commit", "commits"
+}
+
+feed_stream! {
+    /// A change feed as a `Stream` of owned events (D315): [`FeedStream`] for
+    /// [`Feed::poll_next_event`](crate::Feed::poll_next_event), so a feed of every table
+    /// ([`Pigeonhole::feed`](crate::Pigeonhole::feed)) yields its catalog changes in their place
+    /// among the commits. It ends as `FeedStream` does, and in a reader process too the first
+    /// item is `Unsupported`.
+    FeedEventStream: FeedEvent, poll_next_event, "event", "events"
 }

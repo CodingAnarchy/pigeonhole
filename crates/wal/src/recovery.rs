@@ -8,7 +8,7 @@ use pigeonhole_format::wal::{Decoded, FRAME_SIZE, FrameDecoder, FrameEncoder, Wa
 use pigeonhole_format::{Lsn, Seqno, StreamId};
 use pigeonhole_io::{FileRef, VfsRef};
 
-use crate::stream::{FRAME, Grid, check_options, corrupt, open_existing};
+use crate::stream::{FRAME, Grid, StreamFile, check_options, corrupt, open_existing};
 use crate::{Error, Result, WalOptions, WalStream, stream_path};
 
 /// Frames read from the file at a time.
@@ -372,7 +372,20 @@ impl Recovery {
             end,
             ..
         } = self;
-        let s = match grid {
+        // The file's own slot size, or `opts`' for a file with no segment at all.
+        let segment_size = grid.as_ref().map_or(opts.segment_size, |g| g.segment_size);
+        if grid.is_none() {
+            file.set_len(0)?;
+        }
+        let f = StreamFile {
+            vfs,
+            file,
+            path,
+            stream,
+            db_id,
+        };
+        let mut s = WalStream::blank(f, segment_size, &opts);
+        match grid {
             Some(grid) => {
                 let epochs: Vec<u32> = grid
                     .headers
@@ -388,39 +401,14 @@ impl Recovery {
                     .max(end.epoch())
                     .checked_add(REOPEN_EPOCH_GAP - 1)
                     .ok_or_else(|| crate::stream::corrupt("wal epochs exhausted"))?;
-                let mut s = WalStream::blank(
-                    vfs,
-                    file,
-                    path,
-                    stream,
-                    db_id,
-                    grid.segment_size,
-                    opts.spare_segments,
-                );
-                s.configure_feed(&opts);
                 if opts.retain_segments != 0 {
                     s.feed_marks_ref().set_checkpoint(checkpoint);
                 }
                 s.adopt(&epochs, max_epoch, checkpoint.epoch());
                 s.open_segment(end.epoch(), end.offset())?;
-                s
             }
-            None => {
-                file.set_len(0)?;
-                let mut s = WalStream::blank(
-                    vfs,
-                    file,
-                    path,
-                    stream,
-                    db_id,
-                    opts.segment_size,
-                    opts.spare_segments,
-                );
-                s.configure_feed(&opts);
-                s.open_segment(0, 0)?;
-                s
-            }
-        };
+            None => s.open_segment(0, 0)?,
+        }
         Ok(s)
     }
 }

@@ -873,13 +873,18 @@ impl Options {
     /// [`memtable_budget`](Self::memtable_budget) fails the open with `ReadOnly`. A missing
     /// file isn't created, whatever [`create_if_missing`](Self::create_if_missing) says.
     ///
-    /// **It is still a writer-process open in every other respect:**
-    /// - It takes the writer lock, which needs write access to the file, so it fails on a
-    ///   read-only file or mount.
-    /// - It excludes a running writer, failing with `WriterLocked` while one has the database
-    ///   open. To read beside a running writer, open a reader process
-    ///   ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)), as `phdb` does.
-    /// - It creates the writer's shared-memory region ([`shm_dir`](Self::shm_dir)).
+    /// **A true read-only open** (#1348, ICR 0109 amendment):
+    /// - It opens every file read-only, so it works on read-only media: a mounted backup, a
+    ///   read-only container layer, a snapshot volume.
+    /// - It takes the writer lock *shared*. Several read-only opens run at once, in one
+    ///   process or many, and a writer can't open while any is open (`WriterLocked`), nor a
+    ///   read-only open while a writer is. To read beside a running writer, open a reader
+    ///   process ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)), as `phdb` does.
+    /// - It creates no shared memory: the handle serves only its own process, and a reader
+    ///   process finds no writer to attach to.
+    /// - While one is open, the cleanup a last reader process or the next writer would do
+    ///   waits: a crashed writer's stale shared-memory region, or a cleanly closed writer's
+    ///   log files, stay until a process takes the writer lock again.
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self

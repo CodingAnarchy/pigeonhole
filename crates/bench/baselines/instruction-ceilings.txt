@@ -303,8 +303,21 @@ counter 8661 0.5
 rows 18847 0.3
 level-scans 13814 0.6
 short-scans 13068 0.3
-commit-one 8589 0.3
-commit-sixteen 36382 0.3
+# Raised by D195 (owner decision, 2026-10-09; up to about 0.5% per shape, with its reason):
+# commit-one 8589 -> 8590 (+0.01%), codegen drift on main after #1512 (D316 A2). #1512 sat
+# exactly at 8589, which zero commit-path cost left unchanged, and main's base build in #1515's
+# instructions job counted 8590 on code #1512 doesn't touch.
+# Raised by D195 (#1566, D314 amendment 2): commit-one 8590 -> 8617 (+0.3%). The returning
+# check's own Reply variant is one more arm in the shard's apply and notify matches on every
+# commit: 8581 -> 8591 (+10, +0.12%) on run 42088494045 (571a5bf3), after #1566 removed the
+# rest (wait_visible kept inline). The highest times 1.003, as commit-async's.
+commit-one 8617 0.3
+# Raised by D195 (#1581, #1559 A): commit-sixteen 36382 -> 36521 (+0.38%). It measured
+# 36352 -> 36412 (+60 per commit, +0.17%; run 42133196250), all in ShardState::apply's inlined
+# code (B-tree map, Vec, the futex mutex, shard.rs; integer and tuple code down), and nothing
+# from pigeonhole_cache: inlining and layout moved when the engine binary changed (x86 scratch
+# run 42145473960, perf287 on #1581). The head count times 1.003.
+commit-sixteen 36521 0.3
 flush 2087 0.3
 compact 2615 0.5
 ycsb-c 41605 1.0
@@ -316,16 +329,38 @@ commit-overwrite 10608 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
 # before treating a delta within 10 in the PR's base-vs-head table as cost.
-commit-at 9532 0.3
+# Raised by D195 (#1562, D315 PR 3; the coordinator handed the window over 2026-11-06):
+# commit-at 9532 -> 9573 (+0.43%). Main's base already counted 9530; the head counts 9544
+# (+14, +0.15%) on run 42111190703 (4724affb), the commit path's cost measured per function on
+# commit-one (+13: scratch A/B 42082814541): `Inner::route`'s +3 is simp724's R6, the replica
+# check that refuses local writes on a replica; Engine::commit +3 and Table::mutate +7 are
+# codegen (the batch's mark already sits in BatchBuilder's padding; one gate word instead cost
+# more, 7ba0fa75). commit-one, at 8603, stays under #1566's 8617. The highest times 1.003.
+commit-at 9573 0.3
 scan-narrow 1381 0.3
 scan-small 1358 0.3
 scan-wide 1279 0.3
-commit-async 8713 0.3
+# commit-async (#1517, D314 amendment 1): +6 per commit for RowMutation's boxed return_previous
+# request (8 bytes, moved and dropped) and its refusal test, 8710 -> 8716/8718 on runs
+# 41956036295 and 41959886002: the highest times 1.003.
+commit-async 8745 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
 commit-incr 12706 0.3
 commit-incr-returning 17519 0.3
 commit-incr-returning-spread 34610 0.5
+# D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
+# From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
+# Raised by D195 (#1566, D314 amendment 2): 21668 -> 21731 (+0.29%). 21606 -> 21666 (+60,
+# +0.28%) on run 42088494045 (571a5bf3): RowMutation's request box now holds return_current's
+# columns too (48 bytes, not 24) and commit_returning refuses them. #1566 keeps the engine's
+# state main's (the check's own CheckSlot; read_before::<COLD>); x86 had shown +215 before.
+# The highest times 1.003.
+commit-put-previous 21731 0.3
+# D314 amendment 2 (#1446, #1566): compare-and-set-then-read, commit-overwrite through
+# commit_if_returning (the condition's read, then the cell again as of the commit). From run
+# 42088494045 on 571a5bf3 (29094): times 1.003.
+commit-if-returning 29182 0.3
 scan-narrow-q1 5053 0.3
 scan-wide-q10 1744 0.3
 scan-wide-q1 13395 0.3
@@ -345,3 +380,15 @@ scan-budget-twin 1370 0.3
 knn-exact-f16 1368 0.3
 knn-exact-bf16 1084 0.3
 knn-budget 1069 0.3
+# #1560 PR 0 (perf287's T3): the sync text search's floor before its read path goes async,
+# from textshapes.rs over a 100,000-document index (hub terms of 95,649 and 67,972
+# postings), one pass of each shape's queries. From run 42133495367 on 814f72c1, head counts
+# times 1.003 (base and head agreed to 0.0% on every shape).
+text-term-rare 270408 0.3
+text-term-hub 70603557 0.3
+text-two-terms 27657383 0.3
+text-five-terms 22144727 0.3
+text-two-terms-k100 52001738 0.3
+text-fuzzy 59091020 0.3
+text-phrase 126670191 0.3
+text-phrase-slop2 131159719 0.3

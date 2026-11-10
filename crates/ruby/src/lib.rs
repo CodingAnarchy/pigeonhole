@@ -22,19 +22,24 @@ mod convert;
 mod db;
 mod error;
 mod feed;
+#[cfg(unix)]
+mod fiber;
 mod fork;
 mod gvl;
 mod index;
 mod memory;
+#[cfg(unix)]
+mod offload;
 mod read;
 mod table;
 mod vector;
+mod waits;
 mod walk;
 
 use classes::{
     Cell, Condition, Database, FamilyInfo, Feed, Incremented, KeysPosition, Mutation, Pages,
-    Reader, Row, RowPosition, ScanCursor, ScanPosition, ScanSpec, Snapshot, Table, TableBuilder,
-    Transaction, VectorSpec, WriteBatch,
+    Reader, Row, RowPosition, ScanCursor, ScanPosition, ScanSpec, Seen, Snapshot, Table,
+    TableBuilder, Transaction, VectorSpec, WriteBatch,
 };
 
 /// Defines `Pigeonhole::<name>` with no allocator: instances come only from the library.
@@ -66,6 +71,95 @@ mod entry {
     fn init(ruby: &magnus::Ruby) -> Result<(), magnus::Error> {
         super::init(ruby)
     }
+}
+
+/// The memory store's natives under a fiber scheduler (#1574 PR 3, ICR 0126 amendment 2).
+#[cfg(unix)]
+fn memory_fiber_methods(ruby: &Ruby, native: RModule, mm: RModule) -> Result<(), Error> {
+    use classes::{ConsolidateLoop, ReadStore, Store};
+    class(ruby, native, "PreparedMemory")?;
+    let c = mm.const_get::<_, RClass>("Store")?;
+    c.define_private_method(
+        "native_prepare_remember",
+        method!(Store::prepare_remember, 9),
+    )?;
+    c.define_private_method(
+        "native_prepare_remember_op",
+        method!(Store::prepare_remember_op, 10),
+    )?;
+    c.define_private_method(
+        "native_remember_prepared_in",
+        method!(Store::remember_prepared_in, 2),
+    )?;
+    c.define_private_method("native_link_in", method!(Store::link_in, 5))?;
+    c.define_private_method("native_supersede_in", method!(Store::supersede_in, 3))?;
+    c.define_private_method("native_mark_used_in", method!(Store::mark_used_in, 2))?;
+    c.define_private_method("native_near_dedup_on", method!(Store::near_dedup_on, 0))?;
+    c.define_private_method("native_has_ivf", method!(Store::has_ivf, 0))?;
+    c.define_private_method("native_settle_op", method!(Store::settle_op, 1))?;
+    c.define_private_method("native_recall_op", method!(Store::recall_op, 2))?;
+    let c = mm.const_get::<_, RClass>("ReadStore")?;
+    c.define_private_method("native_recall_op", method!(ReadStore::recall_op, 2))?;
+    let c = mm.const_get::<_, RClass>("ConsolidateLoop")?;
+    c.define_private_method("native_wait_op", method!(ConsolidateLoop::wait_op, 1))?;
+    c.define_private_method(
+        "native_run_once_fiber",
+        method!(ConsolidateLoop::run_once_fiber, 3),
+    )?;
+    #[cfg(feature = "test-hooks")]
+    native.define_singleton_method("offload_hold", function!(offload::hooks::hold, 1))?;
+    Ok(())
+}
+
+/// The fiber bridge's native classes and the ops of each waiting call (#1574, ICR 0126).
+/// Unix only: without them, `lib/pigeonhole/fiber.rb` keeps every call blocking.
+#[cfg(unix)]
+fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> {
+    use fiber::{FiberBridge, FiberOp};
+    m.singleton_class()?
+        .define_private_method("native_fiber_bridge", function!(FiberBridge::new, 0))?;
+    let c = class(ruby, native, "FiberBridgeCore")?;
+    c.define_method("fd", method!(FiberBridge::fd, 0))?;
+    c.define_method("drain", method!(FiberBridge::drain, 0))?;
+    c.define_method("pending", method!(FiberBridge::pending, 0))?;
+    let c = class(ruby, native, "FiberOp")?;
+    c.define_method("id", method!(FiberOp::id, 0))?;
+    c.define_method("done?", method!(FiberOp::is_done, 0))?;
+    c.define_method("take", method!(FiberOp::take, 0))?;
+    c.define_method("cancel", method!(FiberOp::cancel, 0))?;
+
+    #[cfg(feature = "test-hooks")]
+    {
+        use fiber::hooks::Gate;
+        let c = class(ruby, native, "Gate")?;
+        c.define_singleton_method("new", function!(Gate::new, 0))?;
+        c.define_method("op", method!(Gate::op, 1))?;
+        c.define_method("open", method!(Gate::open, 0))?;
+        c.define_method("counts", method!(Gate::counts, 0))?;
+    }
+
+    let c = m.const_get::<_, RClass>("Mutation")?;
+    c.define_private_method("native_commit_op", method!(Mutation::commit_op, 1))?;
+    c.define_private_method("native_commit_if_op", method!(Mutation::commit_if_op, 2))?;
+    c.define_private_method(
+        "native_commit_returning_op",
+        method!(Mutation::commit_returning_op, 1),
+    )?;
+    c.define_private_method(
+        "native_commit_if_returning_op",
+        method!(Mutation::commit_if_returning_op, 2),
+    )?;
+    let c = m.const_get::<_, RClass>("Feed")?;
+    c.define_private_method("native_next_op", method!(crate::classes::Feed::next_op, 1))?;
+    let mem_mod = m.const_get::<_, RModule>("Memory")?;
+    let c = mem_mod.const_get::<_, RClass>("Watch")?;
+    c.define_private_method("native_next_op", method!(crate::classes::Watch::next_op, 1))?;
+    memory_fiber_methods(ruby, native, mem_mod)?;
+    let c = m.const_get::<_, RClass>("WriteBatch")?;
+    c.define_private_method("native_commit_op", method!(WriteBatch::commit_op, 2))?;
+    let c = m.const_get::<_, RClass>("Transaction")?;
+    c.define_private_method("native_commit_op", method!(Transaction::commit_op, 2))?;
+    Ok(())
 }
 
 /// Defines the `Pigeonhole` module, its classes and their native methods.
@@ -144,19 +238,36 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_private_method("native_put_vector", method!(Mutation::put_vector, 4))?;
     c.define_private_method("native_delete", method!(Mutation::delete, 3))?;
     c.define_private_method("native_durability", method!(Mutation::set_durability, 1))?;
-    c.define_method("commit", method!(Mutation::commit, 0))?;
-    c.define_method("commit_if", method!(Mutation::commit_if, 1))?;
+    c.define_private_method("native_commit", method!(Mutation::commit, 0))?;
+    c.define_private_method("native_commit_if", method!(Mutation::commit_if, 1))?;
+    c.define_private_method(
+        "native_return_previous",
+        method!(Mutation::return_previous, 2),
+    )?;
     c.define_private_method(
         "native_commit_returning",
         method!(Mutation::commit_returning, 0),
     )?;
+    c.define_private_method(
+        "native_return_current",
+        method!(Mutation::return_current, 2),
+    )?;
+    c.define_private_method(
+        "native_commit_if_returning",
+        method!(Mutation::commit_if_returning, 1),
+    )?;
 
     let c = class(ruby, m, "Incremented")?;
     c.define_method("seqno", method!(Incremented::seqno, 0))?;
+    c.define_private_method("native_previous", method!(Incremented::previous, 2))?;
+    c.define_private_method("native_current", method!(Incremented::current, 2))?;
     c.define_private_method("native_value", method!(Incremented::value, 3))?;
     c.define_method("to_h", method!(Incremented::to_h, 0))?;
     c.define_method("size", method!(Incremented::size, 0))?;
     c.define_method("inspect", method!(Incremented::inspect, 0))?;
+
+    let c = class(ruby, m, "Seen")?;
+    c.define_private_method("native_current", method!(Seen::current, 2))?;
 
     let c = class(ruby, m, "WriteBatch")?;
     writes!(c, WriteBatch);
@@ -279,6 +390,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     c.define_method("close", method!(ScanCursor::close, 0))?;
     memory_classes(ruby, m)?;
     index_classes(ruby, m)?;
+    #[cfg(unix)]
+    fiber_classes(ruby, m, native)?;
     Ok(())
 }
 
@@ -479,10 +592,10 @@ fn memory_classes(ruby: &Ruby, m: RModule) -> Result<(), Error> {
     c.define_method("ivf", method!(Store::ivf, 0))?;
     c.define_private_method("native_remember", method!(Store::remember, 9))?;
     c.define_private_method("native_remember_in", method!(Store::remember_in, 10))?;
-    c.define_method("delete", method!(Store::delete, 1))?;
+    c.define_private_method("native_delete", method!(Store::delete, 1))?;
     c.define_method("delete_in", method!(Store::delete_in, 2))?;
     c.define_private_method("native_link", method!(Store::link, 4))?;
-    c.define_method("supersede", method!(Store::supersede, 2))?;
+    c.define_private_method("native_supersede", method!(Store::supersede, 2))?;
     c.define_private_method("native_mark_used", method!(Store::mark_used, 1))?;
     c.define_private_method("native_get", method!(Store::get, 1))?;
     c.define_private_method("native_verify", method!(Store::verify, 0))?;

@@ -30,6 +30,11 @@ module Pigeonhole
   # Keys or seeds: an Array of Strings, or another Enumerable of them (a Set).
   type keys = Array[String] | Enumerable[String]
 
+  # Whether the waiting calls yield to a running fiber scheduler (default true); false keeps
+  # them blocking process-wide (ICR 0126).
+  def self.fiber_scheduler: () -> bool
+  def self.fiber_scheduler=: (boolish on) -> boolish
+
   def self.open: (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
                   ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
                   ?shm_dir: path?, ?read_only_fallback: bool?, ?change_feed: Integer?,
@@ -246,19 +251,43 @@ module Pigeonhole
     def put_vector: (name family, String qualifier, vector_in vector, ?ts: Integer?) -> self
     def delete: (?name? family, ?String? qualifier, ?ts: Integer?) -> self
     def durability: (durability durability) -> self
+    def return_previous: (name family, String qualifier) -> self
     def commit: () -> Integer
     def commit_if: (Condition condition) -> Integer?
     def commit_returning: () -> Incremented
+    def return_current: (name family, String qualifier) -> self
+    def commit_if_returning: (Condition condition) -> Checked
   end
 
-  # The counter cells a Mutation#commit_returning wrote, after its commit.
+  # What Mutation#commit_if_returning returns: whether the condition held, with the row
+  # either way.
+  class Checked
+    attr_reader returned: Incremented?
+    attr_reader seen: Seen?
+    def initialize: (Incremented? returned, Seen? seen) -> void
+    def applied?: () -> bool
+    def inspect: () -> String
+  end
+
+  # The row as a failed Mutation#commit_if_returning's condition saw it.
+  class Seen
+    def current: (name family, String qualifier) -> Cell?
+  end
+
+  # The counter cells a Mutation#commit_returning wrote, after its commit, and the columns
+  # return_previous asked for, as they were before it.
   class Incremented
     def seqno: () -> Integer
     def value: (name family, String qualifier, ?ts: Integer?) -> Integer?
+    def previous: (name family, String qualifier) -> Cell?
+    def current: (name family, String qualifier) -> Cell?
     def to_h: () -> Hash[[String, String, Integer], Integer?]
     def size: () -> Integer
     def inspect: () -> String
   end
+
+  # Incremented's name since 1.2 (ICR 0113): the same class.
+  class Returned = Incremented
 
   # Writes to any rows and tables, committed atomically.
   class WriteBatch

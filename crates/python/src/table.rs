@@ -1,10 +1,12 @@
 //! Tables: families, the table builder, reads, and writes recorded as operations that one
 //! engine call applies (a row mutation, a batch or a transaction).
 
+use crate::Maybe;
 use std::ops::Bound as KeyBound;
 use std::sync::Mutex;
 
 use pigeonhole::{Aggregation, Compression};
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -171,12 +173,8 @@ impl Family {
             }
             "quantiles" => {
                 let mut q = pigeonhole::QuantileParams::default();
-                if let Some(p) = mantissa_bits {
-                    q = q.mantissa_bits(p);
-                }
-                if let Some(n) = max_buckets {
-                    q = q.max_buckets(n);
-                }
+                q = q.maybe(mantissa_bits, |q, p| q.mantissa_bits(p));
+                q = q.maybe(max_buckets, |q, n| q.max_buckets(n));
                 Aggregation::Quantiles(q)
             }
             "bloom" => {
@@ -217,21 +215,13 @@ fn options(
     compression: Option<&str>,
     zstd_level: Option<i8>,
 ) -> PyResult<Family> {
-    if let Some(n) = max_versions {
-        f = f.max_versions(n);
-    }
+    f = f.maybe(max_versions, |f, n| f.max_versions(n));
     if let Some(t) = ttl {
         f = f.ttl(convert::duration(t)?);
     }
-    if let Some(n) = bloom_bits {
-        f = f.bloom_bits(n);
-    }
-    if let Some(n) = block_size {
-        f = f.block_size(n);
-    }
-    if let Some(n) = blob_threshold {
-        f = f.blob_threshold(n);
-    }
+    f = f.maybe(bloom_bits, |f, n| f.bloom_bits(n));
+    f = f.maybe(block_size, |f, n| f.block_size(n));
+    f = f.maybe(blob_threshold, |f, n| f.blob_threshold(n));
     f = match (compression, zstd_level) {
         (None, None) => f,
         (Some("lz4"), None) => f.compression(Compression::Lz4),
@@ -607,18 +597,12 @@ impl Table {
         py.detach(move || {
             either!(&h, |t| {
                 let mut r = t.row(&row).versions(versions);
-                if let Some(f) = &families {
-                    r = r.families(f.iter().map(String::as_str));
-                }
-                if let Some(q) = &qp {
-                    r = r.qualifier_prefix(q);
-                }
-                if let Some(n) = column_limit {
-                    r = r.column_limit(n);
-                }
-                if let Some(s) = &snap {
-                    r = r.snapshot(s);
-                }
+                r = r.maybe(families.as_ref(), |r, f| {
+                    r.families(f.iter().map(String::as_str))
+                });
+                r = r.maybe(qp.as_ref(), |r, q| r.qualifier_prefix(q));
+                r = r.maybe(column_limit, |r, n| r.column_limit(n));
+                r = r.maybe(snap.as_ref(), |r, s| r.snapshot(s));
                 r.read().map(|r| r.map(|r| r.to_owned()))
             })
         })
@@ -665,21 +649,13 @@ impl Table {
                 ),
             }
             .versions(versions);
-            if let Some(f) = &families {
-                s = s.families(f.iter().map(String::as_str));
-            }
-            if let Some(q) = &qp {
-                s = s.qualifier_prefix(q);
-            }
-            if let Some(n) = limit {
-                s = s.limit(n);
-            }
-            if let Some(n) = column_limit {
-                s = s.column_limit(n);
-            }
-            if let Some(sn) = &snap {
-                s = s.snapshot(sn);
-            }
+            s = s.maybe(families.as_ref(), |s, f| {
+                s.families(f.iter().map(String::as_str))
+            });
+            s = s.maybe(qp.as_ref(), |s, q| s.qualifier_prefix(q));
+            s = s.maybe(limit, |s, n| s.limit(n));
+            s = s.maybe(column_limit, |s, n| s.column_limit(n));
+            s = s.maybe(snap.as_ref(), |s, sn| s.snapshot(sn));
             s.into_owned()
         });
         ScanIter::new(scan, chunk)
@@ -1003,6 +979,7 @@ impl Table {
             table,
             row: convert::bytes(row)?,
             ops: Mutex::new(Some(Vec::new())),
+            asked: Mutex::new(Asked::default()),
             durability: Mutex::new(None),
         })
     }
@@ -1032,6 +1009,7 @@ impl Table {
             self.writer()?,
             convert::bytes(row)?,
             vec![op],
+            Asked::default(),
             durability,
             None,
         )
@@ -1057,6 +1035,7 @@ impl Table {
             self.writer()?,
             convert::bytes(row)?,
             vec![op],
+            Asked::default(),
             durability,
             None,
         )
@@ -1087,10 +1066,50 @@ impl Table {
             self.writer()?,
             convert::bytes(row)?,
             vec![op],
+            Asked::default(),
             durability,
         )?;
         r.0.value_at(&family, &q, ts.unwrap_or(0))
             .map_err(|e| returned_value(r.0.info.seqno, e))
+    }
+
+    /// `incr_returning(...)` as an `asyncio.Future` of the running loop (#1479): the
+    /// counter's value after the commit, with the same `None` and `ReturnedValueError` cases.
+    #[pyo3(signature = (row, family, qualifier, delta, *, ts=None, durability=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn incr_returning_async<'py>(
+        &self,
+        py: Python<'py>,
+        row: &Bound<'_, PyAny>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+        delta: i64,
+        ts: Option<u64>,
+        durability: Option<Durability>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let q = convert::bytes(qualifier)?;
+        let row = convert::bytes(row)?;
+        let table = self.writer()?.clone();
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let op = Op::Incr(family.clone(), q.clone(), ts, delta);
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &[op], &Asked::default(), durability)
+                .commit_returning_async();
+            async move {
+                let r = f.await;
+                Box::new(move |py: Python<'_>| {
+                    let value = r.or_py().and_then(|r| {
+                        r.value_at(&family, &q, ts.unwrap_or(0))
+                            .map_err(|e| returned_value(r.info.seqno, e))
+                    });
+                    match value.and_then(|v| v.into_py_any(py)) {
+                        Ok(v) => crate::aio::Entry::Value(v),
+                        Err(e) => crate::aio::Entry::Error(e),
+                    }
+                }) as crate::aio::Output
+            }
+        })?;
+        Ok(fut)
     }
 
     /// Deletes and commits: the row; with `family`, that family; with `qualifier` too, the
@@ -1111,6 +1130,7 @@ impl Table {
             self.writer()?,
             convert::bytes(row)?,
             vec![op],
+            Asked::default(),
             durability,
             None,
         )
@@ -1167,12 +1187,14 @@ pub(crate) fn commit_row(
     table: &pigeonhole::Table,
     row: Vec<u8>,
     ops: Vec<Op>,
+    previous: Asked,
     durability: Option<Durability>,
     condition: Option<pigeonhole::Condition>,
 ) -> PyResult<Option<u64>> {
     let table = table.clone();
     py.detach(move || {
-        let m = row_mutation(&table, &row, &ops, durability);
+        // A mutation with `return_previous` requests is refused here (ICR 0113).
+        let m = row_mutation(&table, &row, &ops, &previous, durability);
         match condition {
             None => m.commit().map(|i| Some(i.seqno)),
             Some(c) => m.commit_if(&c).map(|i| i.map(|i| i.seqno)),
@@ -1188,12 +1210,51 @@ pub(crate) fn commit_row_returning(
     table: &pigeonhole::Table,
     row: Vec<u8>,
     ops: Vec<Op>,
+    previous: Asked,
     durability: Option<Durability>,
 ) -> PyResult<Incremented> {
     let table = table.clone();
-    py.detach(move || row_mutation(&table, &row, &ops, durability).commit_returning())
-        .map(Incremented)
+    let asked = previous.clone();
+    py.detach(move || row_mutation(&table, &row, &ops, &previous, durability).commit_returning())
+        .map(|r| Incremented::new(r, asked))
         .or_py()
+}
+
+/// A column: family and qualifier.
+type Column = (String, Vec<u8>);
+
+/// The columns a mutation's `return_previous` and `return_current` asked for (ICR 0113).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Asked {
+    previous: Vec<Column>,
+    current: Vec<Column>,
+}
+
+impl Asked {
+    /// Whether `return_current` asked for the column, or it's `condition`'s (always
+    /// reported).
+    fn has_current(&self, family: &str, q: &[u8], condition: Option<&Column>) -> bool {
+        self.current
+            .iter()
+            .chain(condition)
+            .any(|(f, cq)| f == family && cq == q)
+    }
+}
+
+/// The column a condition reads, which `commit_if_returning` always reports.
+fn condition_column(c: &pigeonhole::Condition) -> Option<Column> {
+    use pigeonhole::Condition as C;
+    match c {
+        C::Exists { family, qualifier }
+        | C::Absent { family, qualifier }
+        | C::Value {
+            family, qualifier, ..
+        } => Some((family.clone(), qualifier.clone())),
+        // `Condition` is non-exhaustive. A variant added later that reads a column must be
+        // named here, or `current` treats its column as unasked: `InvalidArgument`, not
+        // `ReturnedValueError` (ai1249's nit on #1579).
+        _ => None,
+    }
 }
 
 /// `ops` buffered on a row mutation of `row`, uncommitted.
@@ -1201,12 +1262,11 @@ fn row_mutation<'t>(
     table: &'t pigeonhole::Table,
     row: &[u8],
     ops: &[Op],
+    asked: &Asked,
     durability: Option<Durability>,
 ) -> pigeonhole::RowMutation<'t> {
     let mut m = table.mutate(row);
-    if let Some(d) = durability {
-        m = m.durability(d.into());
-    }
+    m = m.maybe(durability, |m, d| m.durability(d.into()));
     for op in ops {
         m = match op {
             Op::Put(f, q, None, Val::Bytes(b)) => m.put(f, q, b),
@@ -1244,6 +1304,12 @@ fn row_mutation<'t>(
             Op::DeleteCell(f, q, ts) => m.delete_cell(f, q, *ts),
         };
     }
+    for (f, q) in &asked.previous {
+        m = m.return_previous(f, q);
+    }
+    for (f, q) in &asked.current {
+        m = m.return_current(f, q);
+    }
     m
 }
 
@@ -1255,6 +1321,8 @@ pub(crate) struct Mutation {
     row: Vec<u8>,
     /// `None` once committed.
     ops: Mutex<Option<Vec<Op>>>,
+    /// The columns `return_previous` and `return_current` asked for.
+    asked: Mutex<Asked>,
     durability: Mutex<Option<Durability>>,
 }
 
@@ -1390,13 +1458,157 @@ impl Mutation {
         self.finish(py, Some(condition.0.clone()))
     }
 
+    /// Asks `commit_returning` for the column `family:qualifier` as it was just before the
+    /// commit, read in the same step: `previous(family, qualifier)` on the result (ICR 0113).
+    /// Only `commit_returning` (and its async form) takes such a mutation: `commit` and
+    /// `commit_if` raise `InvalidArgument`, as does a mutation that writes nothing. Asking
+    /// twice for one column is one request.
+    fn return_previous<'py>(
+        slf: &Bound<'py, Self>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, Self>> {
+        let q = convert::bytes(qualifier)?;
+        // Under the writes' lock, as a commit takes both (ai1249's Q1 on #1552): a commit on
+        // another thread either sees this request or makes it fail as already committed.
+        let ops = slf.get().ops.lock().expect("not poisoned");
+        if ops.is_none() {
+            return Err(PyValueError::new_err("the mutation was already committed"));
+        }
+        slf.get()
+            .asked
+            .lock()
+            .expect("not poisoned")
+            .previous
+            .push((family, q));
+        drop(ops);
+        Ok(slf.clone())
+    }
+
+    /// Asks `commit_if_returning` for the column `family:qualifier` as it is, whichever way
+    /// the condition goes (D314 amendment 2, ICR 0113): as of the commit when it applies,
+    /// as the condition saw it when it doesn't. The condition's own column is always
+    /// reported, without asking. Only `commit_if_returning` (and its async form) takes
+    /// such a mutation: `commit`, `commit_if` and `commit_returning` raise `InvalidArgument`.
+    /// Asking twice for one column is one request.
+    fn return_current<'py>(
+        slf: &Bound<'py, Self>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, Self>> {
+        let q = convert::bytes(qualifier)?;
+        // Under the writes' lock, as `return_previous` (ai1249's Q1 on #1552).
+        let ops = slf.get().ops.lock().expect("not poisoned");
+        if ops.is_none() {
+            return Err(PyValueError::new_err("the mutation was already committed"));
+        }
+        slf.get()
+            .asked
+            .lock()
+            .expect("not poisoned")
+            .current
+            .push((family, q));
+        drop(ops);
+        Ok(slf.clone())
+    }
+
+    /// Commits every write atomically if `condition` holds, like `commit_if`, and reports
+    /// the row either way (compare-and-set, then read; D314 amendment 2): a `Checked`. When
+    /// it applied, `checked.returned` is the `Returned` (the counters, `return_previous`'s
+    /// columns, and `current` as of the commit); when it didn't, `checked.seen` is the
+    /// `Seen` (`current` as the condition saw it), and nothing was written. A mutation that
+    /// writes nothing is a check-and-read.
+    fn commit_if_returning(&self, py: Python<'_>, condition: &Condition) -> PyResult<Checked> {
+        let (table, row, ops, asked, durability) = self.parts()?;
+        let c = condition.0.clone();
+        let column = condition_column(&c);
+        let req = asked.clone();
+        let r = py
+            .detach(move || {
+                row_mutation(&table, &row, &ops, &req, durability).commit_if_returning(&c)
+            })
+            .or_py()?;
+        Checked::new(py, r, asked, column)
+    }
+
+    /// `commit_if_returning(condition)` as an `asyncio.Future` of the running loop: the
+    /// `Checked`.
+    fn commit_if_returning_async<'py>(
+        &self,
+        py: Python<'py>,
+        condition: &Condition,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, asked, durability) = self.parts()?;
+        let c = condition.0.clone();
+        let column = condition_column(&c);
+        let req = asked.clone();
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f =
+                row_mutation(&table, &row, &ops, &req, durability).commit_if_returning_async(&c);
+            async move {
+                crate::aio::output(f.await, move |py, r| {
+                    Ok(Py::new(py, Checked::new(py, r, asked, column)?)?.into_any())
+                })
+            }
+        })?;
+        Ok(fut)
+    }
+
     /// Commits every write atomically, like `commit`, and returns each counter cell it
-    /// incremented or set, as a read at the commit sees it (D314). Concurrent increments of
+    /// incremented or set, as a read at the commit sees it (D314), and the columns
+    /// `return_previous` asked for, as they were just before it. Concurrent increments of
     /// one cell each get their own value.
     fn commit_returning(&self, py: Python<'_>) -> PyResult<Incremented> {
-        let ops = self.take()?;
-        let durability = *self.durability.lock().expect("not poisoned");
-        commit_row_returning(py, &self.table, self.row.clone(), ops, durability)
+        let (_, _, ops, previous, durability) = self.parts()?;
+        commit_row_returning(py, &self.table, self.row.clone(), ops, previous, durability)
+    }
+
+    /// `commit()` as an `asyncio.Future` of the running loop (#1479): the commit's sequence
+    /// number. No thread waits for it. Cancelled while the commit waits for room, nothing is
+    /// written; once it's submitted it may still land (`asyncio.shield` keeps the outcome).
+    fn commit_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, previous, durability) = self.parts()?;
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &ops, &previous, durability).commit_async();
+            async move { crate::aio::output(f.await, |py, i| i.seqno.into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
+    /// `commit_if(condition)` as an `asyncio.Future`: the sequence number, or `None` when
+    /// the condition failed.
+    fn commit_if_async<'py>(
+        &self,
+        py: Python<'py>,
+        condition: &Condition,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, previous, durability) = self.parts()?;
+        let c = condition.0.clone();
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f = row_mutation(&table, &row, &ops, &previous, durability).commit_if_async(&c);
+            async move { crate::aio::output(f.await, |py, i| i.map(|i| i.seqno).into_py_any(py)) }
+        })?;
+        Ok(fut)
+    }
+
+    /// `commit_returning()` as an `asyncio.Future`: the `Incremented` cells.
+    fn commit_returning_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (event_loop, fut) = crate::aio::new_future(py)?;
+        let (table, row, ops, previous, durability) = self.parts()?;
+        let asked = previous.clone();
+        crate::aio::start(py, &event_loop, &fut, move || {
+            let f =
+                row_mutation(&table, &row, &ops, &previous, durability).commit_returning_async();
+            async move {
+                crate::aio::output(f.await, move |py, r| {
+                    Ok(Py::new(py, Incremented::new(r, asked))?.into_any())
+                })
+            }
+        })?;
+        Ok(fut)
     }
 }
 
@@ -1406,39 +1618,68 @@ impl Mutation {
         py: Python<'_>,
         condition: Option<pigeonhole::Condition>,
     ) -> PyResult<Option<u64>> {
-        let ops = self.take()?;
-        let durability = *self.durability.lock().expect("not poisoned");
+        let (_, _, ops, previous, durability) = self.parts()?;
         commit_row(
             py,
             &self.table,
             self.row.clone(),
             ops,
+            previous,
             durability,
             condition,
         )
     }
 
-    /// The buffered writes, taken for a commit.
-    fn take(&self) -> PyResult<Vec<Op>> {
-        self.ops
-            .lock()
-            .expect("not poisoned")
-            .take()
-            .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))
+    /// What a commit takes: the table, the row, the buffered writes and the durability.
+    fn parts(&self) -> PyResult<CommitParts> {
+        let (ops, previous) = {
+            let mut ops = self.ops.lock().expect("not poisoned");
+            let taken = ops
+                .take()
+                .ok_or_else(|| PyValueError::new_err("the mutation was already committed"))?;
+            // Under the writes' lock, as `return_previous` pushes (Q1).
+            let previous = std::mem::take(&mut *self.asked.lock().expect("not poisoned"));
+            (taken, previous)
+        };
+        let durability = *self.durability.lock().expect("not poisoned");
+        Ok((
+            self.table.clone(),
+            self.row.clone(),
+            ops,
+            previous,
+            durability,
+        ))
     }
 }
+
+/// What a mutation's commit takes: its table, row, writes, `return_previous` requests and
+/// durability.
+type CommitParts = (
+    pigeonhole::Table,
+    Vec<u8>,
+    Vec<Op>,
+    Asked,
+    Option<Durability>,
+);
 
 /// The counter cells a `Mutation.commit_returning()` incremented or set, after its commit
 /// (D314): `value(family, qualifier, ts=None)`, or index it with `(family, qualifier)` or
 /// `(family, qualifier, ts)`. Iterating gives the keys `(family, qualifier, ts)`, `ts` 0 for
 /// a plain counter, in the order the mutation first wrote each.
+///
+/// It also holds the columns `return_previous` asked for, as they were just before the
+/// commit: `previous(family, qualifier)`. `Returned` is the same class (ICR 0113).
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Incremented(pigeonhole::Incremented);
+pub(crate) struct Incremented(pigeonhole::Incremented, Asked, Option<Column>);
 
 /// One of `Incremented.cells()`: family, qualifier, ts, value.
 type IncrementedCell<'py> = (String, Bound<'py, PyBytes>, u64, Option<i64>);
 
 impl Incremented {
+    pub(crate) fn new(r: pigeonhole::Incremented, asked: Asked) -> Self {
+        Self(r, asked, None)
+    }
+
     /// The cell `key` names: `(family, qualifier)` or `(family, qualifier, ts)`.
     fn key(key: &Bound<'_, PyAny>) -> PyResult<(String, Vec<u8>, u64)> {
         let t = key.cast::<pyo3::types::PyTuple>().map_err(|_| {
@@ -1505,6 +1746,44 @@ impl Incremented {
         }
     }
 
+    /// The column `family:qualifier` that `return_previous` asked for, as it was just before
+    /// the commit: its newest visible version then, as a `Cell`, or `None` if it had none.
+    /// Raises `InvalidArgument` if the mutation didn't ask for that column, and
+    /// `ReturnedValueError` if it couldn't be read after the commit applied: **the commit
+    /// succeeded** then, so don't retry it.
+    fn previous(&self, family: &str, qualifier: &Bound<'_, PyAny>) -> PyResult<Option<Cell>> {
+        let q = convert::bytes(qualifier)?;
+        let asked = self
+            .1
+            .previous
+            .iter()
+            .any(|(f, aq)| f == family && *aq == q);
+        let r = self.0.previous(family, &q);
+        if asked {
+            r.map(|c| c.map(Cell))
+                .map_err(|e| returned_value(self.0.info.seqno, e))
+        } else {
+            // `InvalidArgument`, naming the column.
+            r.map(|c| c.map(Cell)).or_py()
+        }
+    }
+
+    /// After an applied `commit_if_returning`: the column `family:qualifier` as of the
+    /// commit (the condition's own column is the new value; `return_previous` gives the old
+    /// one), or `None` if a read at the commit sees none. Raises `InvalidArgument` if neither
+    /// `return_current` nor the condition named the column, and `ReturnedValueError` if it
+    /// couldn't be read after the commit applied.
+    fn current(&self, family: &str, qualifier: &Bound<'_, PyAny>) -> PyResult<Option<Cell>> {
+        let q = convert::bytes(qualifier)?;
+        let r = self.0.current(family, &q).map(|c| c.map(Cell));
+        if self.1.has_current(family, &q, self.2.as_ref()) {
+            r.map_err(|e| returned_value(self.0.info.seqno, e))
+        } else {
+            // `InvalidArgument`, naming the column.
+            r.or_py()
+        }
+    }
+
     /// Every cell as `(family, qualifier, ts, value)`, in the order the mutation first wrote
     /// each; raises `ReturnedValueError` for the first unreadable value, as `value` does.
     fn cells<'py>(&self, py: Python<'py>) -> PyResult<Vec<IncrementedCell<'py>>> {
@@ -1552,6 +1831,85 @@ impl Incremented {
             self.0.info.seqno,
             self.0.iter().count()
         )
+    }
+}
+
+/// What `Mutation.commit_if_returning` returns (D314 amendment 2): whether the condition
+/// held (`applied`), with the row either way: `returned` when it applied, `seen` when it
+/// didn't (and nothing was written).
+#[pyclass(module = "pigeonhole", frozen)]
+pub(crate) struct Checked {
+    returned: Option<Py<Incremented>>,
+    seen: Option<Py<Seen>>,
+}
+
+impl Checked {
+    fn new(
+        py: Python<'_>,
+        r: pigeonhole::Checked,
+        asked: Asked,
+        column: Option<Column>,
+    ) -> PyResult<Self> {
+        Ok(match r {
+            pigeonhole::Checked::Applied(ret) => Self {
+                returned: Some(Py::new(py, Incremented(ret, asked, column))?),
+                seen: None,
+            },
+            pigeonhole::Checked::NotApplied(seen) => Self {
+                returned: None,
+                seen: Some(Py::new(py, Seen(seen))?),
+            },
+        })
+    }
+}
+
+#[pymethods]
+impl Checked {
+    /// Whether the condition held and the mutation committed.
+    #[getter]
+    fn applied(&self) -> bool {
+        self.returned.is_some()
+    }
+
+    /// When it applied: the `Returned` (`current`, `previous`, the counters), else `None`.
+    #[getter]
+    fn returned(&self, py: Python<'_>) -> Option<Py<Incremented>> {
+        self.returned.as_ref().map(|r| r.clone_ref(py))
+    }
+
+    /// When it didn't: the `Seen` (`current` as the condition saw it), else `None`.
+    #[getter]
+    fn seen(&self, py: Python<'_>) -> Option<Py<Seen>> {
+        self.seen.as_ref().map(|s| s.clone_ref(py))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Checked(applied={})",
+            if self.applied() { "True" } else { "False" }
+        )
+    }
+}
+
+/// The row as a failed `commit_if_returning`'s condition saw it: `current(family,
+/// qualifier)` for the condition's column and `return_current`'s.
+#[pyclass(module = "pigeonhole", frozen)]
+pub(crate) struct Seen(pigeonhole::Seen);
+
+#[pymethods]
+impl Seen {
+    /// The column as the condition saw it: its newest visible version then, as a `Cell`, or
+    /// `None` if it had none. Raises `InvalidArgument` if neither `return_current` nor the
+    /// condition named it. Nothing was written, so a read error here is an ordinary one.
+    fn current(&self, family: &str, qualifier: &Bound<'_, PyAny>) -> PyResult<Option<Cell>> {
+        self.0
+            .current(family, &convert::bytes(qualifier)?)
+            .map(|c| c.map(Cell))
+            .or_py()
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "Seen(...)"
     }
 }
 

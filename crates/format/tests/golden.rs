@@ -683,6 +683,7 @@ fn feed_sidecar_catalog() {
                 },
                 Edit::DropTable { table: TableId(3) },
             ],
+            names: Vec::new(),
         },
         FeedEntry::Root {
             session: 0x0123_4567_89ab_cdef,
@@ -716,6 +717,107 @@ fn feed_sidecar_catalog() {
     let (decoded, end) = decode_entries(&log);
     assert_eq!(decoded, [FeedEntry::Unknown(4), entries[1].clone()]);
     assert_eq!(end, log.len(), "nothing cut off");
+}
+
+/// D315 2b: a `Catalog` entry's names, after its edits, of the tables its `PutFamily` and
+/// `DropTable` edits name without their `CreateTable` (`feed_sidecar_catalog.bin`, frozen,
+/// is the layout without them, which still reads as naming none). A names count the payload
+/// can't hold is damage: the entry doesn't decode, and nothing is allocated for it.
+#[test]
+fn feed_sidecar_catalog_names() {
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, decode_entries};
+    use pigeonhole_format::manifest::{Edit, FamilyOptions};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Catalog {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 43,
+            seqno_ceiling: 1200,
+            timestamp: 1_767_225_600_000_002,
+            edits: vec![
+                Edit::PutFamily {
+                    table: TableId(5),
+                    family: FamilyId(12),
+                    name: "n".into(),
+                    options: FamilyOptions::default(),
+                },
+                Edit::DropTable { table: TableId(3) },
+            ],
+            names: vec![(TableId(5), "pages".into()), (TableId(3), "old".into())],
+        },
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 43,
+        },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar_catalog_names.bin", &file);
+    let bytes = golden("feed_sidecar_catalog_names.bin");
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+
+    // The names count claims more pairs than the bytes after it could hold.
+    let mut payload = vec![4u8];
+    for v in [1u64, 44, 2000, 1_767_225_600_000_003] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    payload.extend_from_slice(&5u32.to_le_bytes());
+    payload.push(0);
+    let mut log = Vec::new();
+    log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+    log.extend_from_slice(&payload);
+    let (decoded, end) = decode_entries(&log);
+    assert!(decoded.is_empty(), "{decoded:?}");
+    assert_eq!(end, 0, "the reader stops at the damaged entry");
+
+    // A names count of 0, which the encoder never writes (no names, no count): one entry,
+    // one encoding (simp724's N1 on #1515). Without it the same entry decodes.
+    let entry = |count: Option<u32>| {
+        let mut payload = vec![4u8];
+        for v in [1u64, 44, 2000, 1_767_225_600_000_003] {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(c) = count {
+            payload.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut log = Vec::new();
+        log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+        log.extend_from_slice(&payload);
+        decode_entries(&log).0
+    };
+    assert!(entry(Some(0)).is_empty(), "a zero count is damage");
+    assert!(matches!(&entry(None)[..], [FeedEntry::Catalog { names, .. }] if names.is_empty()));
+
+    // The trailer is framed by the entry, never read as one more edit (simp724): a decoder
+    // that expects an edit where the names start fails closed. Emulated by claiming one
+    // more edit than the entry holds, with a valid CRC.
+    let mut one = Vec::new();
+    entries[0].encode(&mut one);
+    let mut payload = one[8..].to_vec();
+    let count = 1 + 4 * 8;
+    let edits = u32::from_le_bytes(payload[count..count + 4].try_into().unwrap());
+    payload[count..count + 4].copy_from_slice(&(edits + 1).to_le_bytes());
+    let mut log = Vec::new();
+    log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    log.extend_from_slice(&pigeonhole_format::checksum::crc32c(&payload).to_le_bytes());
+    log.extend_from_slice(&payload);
+    let (decoded, _) = decode_entries(&log);
+    assert!(
+        !matches!(decoded.first(), Some(FeedEntry::Catalog { .. })),
+        "names misread as an edit: {decoded:?}"
+    );
 }
 
 #[test]
@@ -1019,4 +1121,47 @@ fn every_on_disk_golden_file_is_frozen() {
         "golden files not in tests/golden-frozen.txt; append:\n{}",
         missing.join("\n")
     );
+}
+
+/// D315 amendment (#1504): the sidecar's `RootIntent` entry, type 5. It is the length of a
+/// `Root` entry, framing included, so a root commit's observer overwrites its intent in
+/// place with one write; an older build that knows types 1-4 reads it as unknown, the end
+/// of the history before it, which it only ever meets after a crash (a clean session ends
+/// with every intent overwritten).
+#[test]
+fn feed_sidecar_root_intent() {
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, decode_entries};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 42,
+        },
+        FeedEntry::RootIntent {
+            sequence: 43,
+            checksum: 0x5eed_c0de_1234_abcd,
+        },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar_root_intent.bin", &file);
+    let bytes = golden("feed_sidecar_root_intent.bin");
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+
+    // The same framed length as the Root entry that overwrites it.
+    let (mut intent, mut root) = (Vec::new(), Vec::new());
+    entries[1].encode(&mut intent);
+    FeedEntry::Root {
+        session: 7,
+        sequence: 43,
+    }
+    .encode(&mut root);
+    assert_eq!(intent.len(), root.len());
 }

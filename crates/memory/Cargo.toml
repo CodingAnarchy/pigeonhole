@@ -18,14 +18,23 @@ pigeonhole-text = { workspace = true }
 pigeonhole-vector = { workspace = true }
 twox-hash = { workspace = true, features = ["xxhash3_128"] }
 getrandom = { workspace = true }
+futures-core = { workspace = true, optional = true }
 
 [features]
+# `Recall::run_async` and `run_with_stats_async` (#1560, ICR 0124), on the async forms of
+# `pigeonhole`'s, `pigeonhole-text`'s and `pigeonhole-vector`'s reads; default-on, as there.
+default = ["async"]
+async = ["pigeonhole/async", "pigeonhole-text/async", "pigeonhole-vector/async", "dep:futures-core"]
 # Hold seams for this crate's tests (`hooks`, as ICR 0085's): hidden, outside the semver
 # promise; never turn it on in an application.
-__unstable-hooks = []
+__unstable-hooks = ["pigeonhole-vector/__unstable-hooks"]
 
 [dev-dependencies]
 pigeonhole-memory = { path = ".", features = ["__unstable-hooks"] }
+# The async recall's tests run on the simulated device with deferred I/O (#1560), which
+# `Options::vfs` (a test hook, ICR 0085) puts the store on.
+pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
+pigeonhole-io = { workspace = true }
 
 [lints]
 workspace = true

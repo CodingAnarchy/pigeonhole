@@ -369,6 +369,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 | Set | Bit | Feature |
 |---|---|---|
 | `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 15, and a family's `kind_params`, §9.2.1), and vector families with value tag `0x04` (D303; `kind` 16, §3.7). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `ro_compat` | 0 | A replica's state (D315 PR 3): the reserved table of §9's rule, created by a replica's first apply. Set, in both pages, before the manifest commit that creates it, so a build that doesn't know it opens the file read-only and can't drop the replica's state or write into the tables it mirrors. Created only by a replica's bootstrap or its first apply, and kept while the table exists. Promoting a replica to a primary (#1436, ICR 0125) drops the table in one manifest commit, then clears the bit in both pages before the next one, once the drop is durable; a writable open that finds the bit with no state table (a crash between the two) clears it. |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -384,7 +385,7 @@ Byte-range locks on single bytes at absolute file offsets (decision D3; refined 
 
 | Offset | Byte | Held |
 |---|---|---|
-| 8192 | writer | exclusive by the one writer; a second writer fails with `WriterLocked` |
+| 8192 | writer | exclusive by the one writer; a second writer fails with `WriterLocked`. Shared by each true read-only open (`Options::read_only`, #1348), which takes no presence and creates no shared memory: read-only opens run together, and a writer's exclusive lock and a read-only open's shared one exclude each other |
 | 8193 | presence | shared by every process with the database open; a process that can upgrade it to exclusive at close is the last one. A process that cannot releases its shared lock and tries the exclusive lock a few more times (1, 2, 4 and 8 ms later), so two processes closing at once do not both conclude another is still open (#150 item 4.7). Both may conclude they are last; the cleanup that follows is idempotent |
 | 8194 | shm-init | exclusive while a process creates, validates or rebuilds the shared-memory region |
 | 2^62 + i | reader slot *i* | exclusive by the reader process that owns shared-memory reader slot *i* (§11.5), from before it claims the slot until after it frees it (layout version 3, #693). Far beyond any file's end, so it never covers data (Windows' locks are mandatory) |
@@ -403,6 +404,7 @@ The manifest is a **snapshot block** plus a **delta log** (decision D7). The sna
 - **Compaction of the manifest:** when the delta would not fit in the log extent, or the live log exceeds the snapshot's length, the writer writes a new snapshot block and a fresh, empty log (new extents) and commits that root. The old snapshot and log extents are retired at that version. A shrink also rewrites them to move them toward the start of the file, but only into free space below them: where there is none, its delta goes into the log even past the snapshot's length (a reader bounds the log only by its extent).
 - **Open:** read the superblocks, the snapshot block and the live log: three reads, independent of history.
 - **Reader catch-up:** a reader at version `v` re-reads the superblock and, if the snapshot is unchanged, only the log bytes after its last position.
+- **Reserved ids (D315 PR 3).** `TableId` `u32::MAX`, `FamilyId` `u32::MAX` and `TabletId` `u64::MAX` are reserved for a replica's state: the table `__pigeonhole.replication`, its one family `state` (one version kept) and its one tablet. The id counters count up from 1 and never reach them, and a replica never takes them from a primary. The table exists only with `ro_compat` bit 0 set (§8.2); builds that know it hide it from listings, lookups by name and feeds, refuse to drop it, never split or merge its tablet, and refuse to create any table whose name starts with `__pigeonhole.`. Its one cell (row `replication`, qualifier `state`, timestamp 1) holds the primary feed's position and token after the last event the replica applied, written in the same commit as that event's changes.
 
 ### 9.1 Block header (64 bytes)
 
@@ -566,7 +568,20 @@ The change feed's sidecar (D310), `data.phdb-feed` beside `data.phdb`. It isn't 
 - a **Session** entry, from an open with the feed on (creating the file if it's missing, or replacing one whose header is another database's or damaged);
 - an **Unfed** entry, from an open with the feed off, only if the file exists.
 
-A feeding session then appends a **Root** entry after each root commit it makes (§8.2), including its close's. Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry appended while the previous sync was in flight (D310 call 4). A failed sync ends the session's appends. A lost entry (a crash between a root commit and its entry's sync, or a failed sync) only makes the next comparison see a gap.
+A feeding session records each root commit it makes (§8.2), including its close's, in two steps (the D315 amendment, #1504):
+1. **Before the commit writes anything,** it appends a **RootIntent** entry naming the new superblock, after the commit's Catalog entry if it has one, in one write. That append isn't synced.
+2. **Once the commit is durable,** it **overwrites that intent in place with the Root entry**: the same framed length, one write. This is the sidecar's only write in place. If the session appended no intent for the commit, it appends the Root entry instead.
+
+Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry written while the previous sync was in flight (D310 call 4). A failed write or sync ends the session's appends.
+
+**An open resolves a RootIntent the last session left as the file's last entry,** before it appends its own:
+- if the superblock it read has the intent's `sequence` and `checksum`, the root landed, and the open overwrites the intent with that session's Root entry;
+- if the superblock's `sequence` is one less, the root didn't land, and the open cuts the file at the intent, or at the Catalog entry of the same `sequence` just before it;
+- otherwise it leaves it.
+
+A **Catalog entry left last** for the root one past the superblock's (its intent lost, or never appended) is cut off in the same way. **A reader** that finds a Catalog entry followed by neither its root's Root entry nor its own RootIntent expires: that root never landed, and nothing after it could be delivered in order.
+
+So a process crash anywhere in a root commit leaves no gap. A lost or torn entry (a power loss before the sync, or a failed sync) only makes the next comparison see one.
 
 Header (40 bytes):
 
@@ -589,14 +604,15 @@ Header (40 bytes):
 | Session | `1` | `session` u64 (random, nonzero), `opened_at` u64 (the superblock `sequence` the open read, before any root commit of its own), `retention_bytes` u64, `retention_age_secs` u64 (0 = none), `streams` u32 (WAL streams, the shard count), `all_tables` u8 (1 = every table), `count` u32, then `count` × `table` u32 (zero when `all_tables` is 1) |
 | Root | `2` | `session` u64, `sequence` u64 (the new superblock's) |
 | Unfed | `3` | `sequence` u64 (the superblock `sequence` the open read) |
-| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Appended just before that root commit's Root entry, in the same append |
+| Catalog | `4` | `session` u64, `sequence` u64 (the root's, as its Root entry records it), `seqno_ceiling` u64 and `timestamp` u64 (the manifest commit's `seqno_ceiling` and `ts_floor`, §9.3 tag 12), `count` u32, then `count` manifest edits (§9.3's framing: tag u8, length, body), `CreateTable`, `PutFamily` and `DropTable` in the order they applied (D315). Then, only if there are any, the names: `names` u32, then `names` × (`table` u32, `name` as varint length + bytes), one for each table a `PutFamily` or `DropTable` names that no `CreateTable` of the same entry creates, once each, as the catalog named it before the edits applied (D315 2b), so a reader names a dropped table without the catalog. An entry that ends after its edits has none. A `names` count of 0, or one above the bytes left over 5, doesn't decode, so each entry has one encoding. Appended just before that root commit's RootIntent, in the same append, before the commit writes. It counts only once that root's Root entry follows it: until then, the root may not have landed |
+| RootIntent | `5` | `sequence` u64 (the new superblock's), `checksum` u64 (its checksum, §8.2: the xxh3-64 of bytes 0..120). A root commit about to happen, overwritten by its Root entry once durable (the same framed length: 25 bytes). One left by a crash is resolved by the next open, as above; any other one a reader reads breaks the chain (D315 amendment) |
 
 **Torn and unknown entries:**
 - A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
-- A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
+- A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one. Cutting there is fail-closed even when the damage is mid-file (a Root entry torn by a power loss during its overwrite in place, with later entries after it, simp724's R1 on #1504): the entries cut include that root's Root entry, while the superblock is at that root or later, so the next open's `opened_at` is above the last recorded `sequence`, and the chain breaks there.
 - An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it. So does a Catalog entry holding an edit the reader can't decode: it isn't torn, and a writer doesn't cut it off.
 
-**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal.
+**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal. A RootIntent entry breaks the chain: a resolved one is gone, so one still in the file is the live session's commit in progress, after the entries the chain reads, or an intent no open could decide.
 
 The history ends at any of these:
 - a segment marked 0, or marked by another session;
@@ -654,7 +670,7 @@ A writer always builds a new generation: create the new region, store `state = a
 | 184 | 4 | `row_epoch_flags` u32: bit 0, the writer raises the slots (its row cache is on) |
 | 188 | 4 | padding, so `cross_held` is 8-aligned |
 | 192 | 8 | `cross_held` u64, atomic (layout version 6, D278): the lowest decided cross-shard seqno not yet applied on every participant, `u64::MAX` when none (§11.3) |
-| 200 | 8 | `catalog_hold` u64, atomic (layout version 9, D315): the ceiling of a catalog change whose §10.4 Catalog entry isn't appended yet, `u64::MAX` when none. The writer stores it under its seqno allocator's lock, before `next_seqno` passes it, and the change feed's frontier stays below it (§11.3) |
+| 200 | 8 | `catalog_hold` u64, atomic (layout version 9, D315): the ceiling of a catalog change whose §10.4 Catalog entry isn't appended yet, `u64::MAX` when none. The writer stores it under its seqno allocator's lock, before `next_seqno` passes it, and a feed of every table's frontier stays below it (§11.3). A feed of some tables doesn't read it |
 | 200 | 3896 | reserved |
 
 ### 11.2 Watermarks
@@ -797,6 +813,8 @@ From 1.0.0 (D269):
   - unknown `compat` bits are ignored and kept; §8.2 says what a compat feature's data may rely on.
 - **Features are flagged only once used.** A bit is set in both superblock pages before the first structure that uses the feature is written, so a file that doesn't use a new feature stays readable and writable by every older 1.x build.
 - **Unknown values are never corruption.** A value of a frozen enum that this build doesn't know, in bytes whose checksum passes, decodes to `UnsupportedFeature` (ICR 0058): key kind, value tag, compression, block, filter and manifest block kinds, family settings, WAL record and fragment types, must-understand edit tags (§9.3), SST and WAL segment feature bits. With the file-level bit set first, an older build normally refuses at open; the per-structure error is the backstop.
+- **The change feed's history across versions** (§10.4; the owner's call, 2026-11-05). The sidecar has no feature bit: a build reads every entry type it knows, and an unknown one ends the history before it. A 1.2 session that changed the schema (created, dropped or extended a table) with the feed on recorded those changes as Catalog entries (type 4, D315), which 1.1 builds don't know. So a 1.1 build opening the file expires every feed whose history runs across such a change (`FeedExpired`): fail closed, never a skipped commit, and no effect on the data. Sessions that changed no schema, and 1.2's root-commit intents (type 5), which a clean close overwrites with Root entries, leave a sidecar a 1.1 build reads. The corpus checks it: `compat-reader-1.1` resumes `feed_root_intent`'s token.
+- **A replica's file in an older build** (D315 PR 3). It carries `ro_compat` bit 0 (§8.2), which every release before 1.2 lacks, so those builds open it read-only only (reader processes, or `read_only_fallback`). They list the state table `__pigeonhole.replication` as an ordinary table and can read it; they can't change it. The corpus checks it: both compat readers must open the `replica` entry read-only, and only read-only.
 - **What isn't promised:** the shared-memory layout (§11), the API (semver covers it separately), and files written by 2.0 (format 5), which no 1.x build opens. 2.0 comes with upgrade tooling.
 - **How it's checked:** golden files for every structure (`crates/format/tests/golden`, frozen at 1.0 by the append-only hash list `crates/format/tests/golden-frozen.txt`), a corpus of files written by the 1.0 release that every later build opens in CI, and, once 1.0.0 is published, a job that opens files from `main` with 1.0.0.
 

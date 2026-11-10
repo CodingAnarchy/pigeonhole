@@ -143,7 +143,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::WouldBlock(fetch) => write!(f, "a cache-only read missed ({fetch:?})"),
             Error::Corruption(what) => write!(f, "corruption: {what}"),
-            Error::WriterLocked => f.write_str("another process holds the writer lock"),
+            Error::WriterLocked => f.write_str("the writer lock is held: by a running writer, or by a read-only open (in this process or another)"),
             Error::ShmVersionMismatch { found, expected } => write!(
                 f,
                 "shared-memory layout version {found} differs from this build's {expected}"

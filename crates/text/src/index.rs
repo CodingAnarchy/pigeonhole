@@ -18,6 +18,10 @@ use crate::query::Query;
 use crate::search::Search;
 use crate::tokenizer::{Standard, Tokenizer};
 
+/// Documents one page of a rebuild reads under one snapshot before their transactions run
+/// (#1514): its view lives for the page's scan only.
+const REBUILD_PAGE: u64 = 256;
+
 /// A full-text index over one source column (D309).
 ///
 /// Clones share one handle. Every write to the source column must go through the index
@@ -119,6 +123,22 @@ impl Rows {
         match self {
             Rows::W(t) => t.get_at(s, row, family, qualifier),
             Rows::R(t) => t.get_at(s, row, family, qualifier),
+        }
+    }
+
+    /// [`Rows::get_at`] as a future (#1560): a cache or memtable hit resolves at its first
+    /// poll.
+    #[cfg(feature = "async")]
+    pub(crate) fn get_at_async(
+        &self,
+        s: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::nonblocking::GetFuture {
+        match self {
+            Rows::W(t) => t.get_at_async(s, row, family, qualifier),
+            Rows::R(t) => t.get_at_async(s, row, family, qualifier),
         }
     }
 
@@ -554,12 +574,19 @@ impl Index {
         let t = &w.table;
         // The flag first: every write in flight read it, so they conflict and retry into Busy.
         t.mutate(GLOBAL).put(META, REPAIR, b"").commit()?;
-        let s = w.db.snapshot()?;
         for prefix in [POST_PREFIX, FWD_PREFIX, STATS_ROW] {
-            let mut keys = Vec::new();
-            for row in t.scan_prefix(prefix).snapshot(&s).iter()? {
-                keys.push(row?.key().to_vec());
-            }
+            // The keys first, under a snapshot and an iterator dropped before anything below
+            // commits (#1514): held across this thread's own commits, they would pin the
+            // memtables a commit waiting for room needs, until the write-stall timeout. With
+            // the repair flag set, no write lands meanwhile.
+            let keys = {
+                let s = w.db.snapshot()?;
+                let mut keys = Vec::new();
+                for row in t.scan_prefix(prefix).snapshot(&s).iter()? {
+                    keys.push(row?.key().to_vec());
+                }
+                keys
+            };
             for chunk in keys.chunks(256) {
                 let mut batch = w.db.write_batch();
                 for k in chunk {
@@ -574,42 +601,80 @@ impl Index {
     }
 
     fn rebuild_inner(&self, repairing: bool) -> Result<RebuildStats> {
+        use std::ops::Bound;
         let inn = &*self.inner;
         let w = self.w();
-        let s = w.db.snapshot()?;
         let mut stats = RebuildStats::default();
         let q = inn.source.qualifier.as_slice();
-        let docs = inn
-            .src
-            .scan_prefix(b"")
-            .family(&inn.source.family)
-            .qualifier_bounds(std::ops::Bound::Included(q), std::ops::Bound::Included(q))
-            .snapshot(&s)
-            .iter()?;
-        for row in docs {
-            let doc = row?.key().to_vec();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            // A page of documents, under a snapshot and an iterator dropped before the page's
+            // transactions commit (#1514): held across them, they would pin the memtables a
+            // commit waiting for room needs, until the write-stall timeout. Each transaction
+            // reads the document's current text itself, so the snapshot only chooses which
+            // documents to visit.
+            let page: Vec<Vec<u8>> = {
+                let s = w.db.snapshot()?;
+                let start = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                let mut page = Vec::new();
+                for row in inn
+                    .src
+                    .scan_bounds(start, Bound::Unbounded)
+                    .family(&inn.source.family)
+                    .qualifier_bounds(Bound::Included(q), Bound::Included(q))
+                    .snapshot(&s)
+                    .limit(REBUILD_PAGE)
+                    .iter()?
+                {
+                    page.push(row?.key().to_vec());
+                }
+                page
+            };
+            let Some(last) = page.last() else {
+                return Ok(stats);
+            };
+            after = Some(last.clone());
+            let full = page.len() as u64 == REBUILD_PAGE;
+            self.rebuild_page(&page, repairing, &mut stats)?;
+            if !full {
+                return Ok(stats);
+            }
+        }
+    }
+
+    /// Re-indexes each of `docs`, one transaction each (`rebuild_inner`'s page).
+    fn rebuild_page(
+        &self,
+        docs: &[Vec<u8>],
+        repairing: bool,
+        stats: &mut RebuildStats,
+    ) -> Result<()> {
+        let inn = &*self.inner;
+        let w = self.w();
+        let q = inn.source.qualifier.as_slice();
+        for doc in docs {
             stats.documents += 1;
             let ((changed, bad), _) = w.db.transact(&RetryPolicy::default(), |tx| {
                 if !repairing {
                     self.check_not_repairing(tx)?;
                 }
                 // The current text, not the snapshot's: a put since the scan wins.
-                let text = match tx.get(&w.src, &doc, &inn.source.family, q)? {
+                let text = match tx.get(&w.src, doc, &inn.source.family, q)? {
                     None => return Ok((false, false)),
                     Some(c) => match std::str::from_utf8(c.value()) {
                         Ok(t) => t.to_owned(),
                         Err(_) => return Ok((false, true)),
                     },
                 };
-                let old = self.read_forward(tx, &doc)?;
+                let old = self.read_forward(tx, doc)?;
                 let new = self.analyse(&text)?;
-                let changed = self.apply(tx, &doc, &old, &new, Mode::Rebuild)?;
+                let changed = self.apply(tx, doc, &old, &new, Mode::Rebuild)?;
                 Ok::<_, Tx>((changed, false))
             })?;
             stats.changed += u64::from(changed);
             stats.invalid_utf8 += u64::from(bad);
         }
-        Ok(stats)
+        Ok(())
     }
 
     fn check_not_repairing(&self, txn: &mut Transaction) -> Result<()> {

@@ -324,6 +324,16 @@ end
 - **One-commit writes:** `table.put`, `table.incr` and `table.delete` each commit at once and return the commit's sequence number.
 - **`table.mutate(row)`** collects one row's writes for a single commit: `put`, `put_u64`, `incr`, `aggregate` and `delete`, then `commit`, or `commit_if(Pigeonhole::Condition.absent(family, qualifier))`, which returns `nil` when the condition fails.
 - **Increments that return the value (D314):** `table.mutate(row)....commit_returning` commits like `commit` and returns a frozen `Pigeonhole::Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts: nil)`, or all with `to_h` (`{[family, qualifier, ts] => value}`). `table.incr_returning(...)` is the one-cell form and returns the new value, with the GVL released. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `nil` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts: 0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `Pigeonhole::ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its `cause`): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `:group_sync` (the default) or `:sync` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
+- **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Pigeonhole::Cell`, or `nil` if it had none.
+  - **A lease handoff, for example:** one commit takes the lease and says whom it displaced. That's an **unconditional takeover**: it doesn't check that the lease was free or expired. Taking it only then needs a condition: `commit_if_returning`, next.
+  - The displaced holder finds out at its next guarded write. **Guard every holder write** with `commit_if(Pigeonhole::Condition.equals(family, holder_column, own_id))`, which returns `nil` once another holder has taken over.
+  - Optionally, an `incr` of an epoch counter in the same commit gives the new holder a fencing token (`r.value(...)`), so systems downstream can refuse an older holder's work.
+  - **The rules:** only `commit_returning` takes such a mutation: `commit` and `commit_if` raise `Pigeonhole::InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Pigeonhole::Returned` is the same class as `Pigeonhole::Incremented`, under the name the Rust struct has had since 1.2.
+- **Compare and set, then read (#1446):** `commit_if_returning(condition)` is a `commit_if` that returns the row whichever way the condition goes (D314 amendment 2), with the GVL released. It returns a frozen `Pigeonhole::Checked`: `applied?`, then either `returned` (a `Pigeonhole::Returned`) when it committed, or `seen` (a `Pigeonhole::Seen`) when it didn't and nothing was written.
+  - `returned.current(family, qualifier)` is a column as of the commit, so the condition's own column has the value this commit wrote. `previous` and the counters work as for `commit_returning`.
+  - `seen.current(family, qualifier)` is the column as the condition saw it: the value it compared, or `nil` where it was missing. A compare-and-swap loop retries from it with no extra read.
+  - The condition's column is always reported. Ask for more with `return_current(family, qualifier)`. Only `commit_if_returning` takes it: `commit`, `commit_if` and `commit_returning` raise `Pigeonhole::InvalidArgument` ("use a transaction"), because a `get` after a commit may already see a later writer's. A mutation with no writes is a check-and-read.
+  - `current` raises `InvalidArgument` for a column that neither `return_current` nor the condition named. On `returned` it raises `ReturnedValueError` if the read failed after the commit applied. [Compare and set, then read](data-modeling.md#compare-and-set-then-read-commit_if_returning) has the details.
 - **`db.write_batch { |batch| ... }`** commits every write in the block at once (the same write methods, with a table and row first). It commits when the block returns normally (`next` included), and discards on an exception, a `break`, a `throw` or an early `return`.
 - **`db.transaction { |txn| ... }`** is an optimistic transaction: `txn.get` and `txn.get_row` read at its snapshot, and the commit checks them. Like `write_batch`, it commits on a normal return and rolls back otherwise. A transaction belongs to one thread of control. It's safe to share between threads (calls serialise), but its reads and writes must make sense in whatever order they land.
 - **`db.transact(max_attempts:, deadline:, durability:) { |txn| ... }`** runs the block in a transaction and commits it, retrying on `Conflict` and `Busy` with backoff, as the Rust `RetryPolicy` does. It returns the block's value. The block may run more than once, so it should have no other effects.
@@ -368,6 +378,34 @@ Pigeonhole.open(path, create: true) do |db|
   r = seq.mutate("orders").incr("n", "next", 1).incr("n", "shipped", 1).commit_returning
   raise "value" unless r.value("n", "next") == 2
   raise "to_h" unless r.to_h == { ["n", "next", 0] => 2, ["n", "shipped", 0] => 1 }
+
+  # A lease handoff: an unconditional takeover that says whom it displaced, with a fencing
+  # epoch for the new holder.
+  leases = db.table("leases").family("s").family("epoch", Pigeonhole::Family.counter).create
+  leases.mutate("lease:42").put("s", "holder", "worker-3").incr("epoch", "n", 1).commit
+  r = leases.mutate("lease:42")
+            .put("s", "holder", "worker-7")
+            .incr("epoch", "n", 1)
+            .return_previous("s", "holder")
+            .commit_returning
+  raise "previous" unless r.previous("s", "holder").value == "worker-3"
+  raise "fence" unless r.value("epoch", "n") == 2 # worker-7's fencing token
+  # worker-3 finds out at its next write, which (like every holder write) is guarded.
+  mine = Pigeonhole::Condition.equals("s", "holder", "worker-3")
+  raise "stale" unless leases.mutate("lease:42").put("s", "beat", "3").commit_if(mine).nil?
+
+  # Compare and swap: take the next number, retrying from what a failed attempt saw.
+  leases.mutate("seq").put("s", "v", "41").commit
+  seen = "0"
+  loop do
+    r = leases.mutate("seq")
+              .put("s", "v", (Integer(seen) + 1).to_s)
+              .commit_if_returning(Pigeonhole::Condition.equals("s", "v", seen))
+    break if r.applied?
+
+    seen = r.seen.current("s", "v").value
+  end
+  raise "taken" unless seen == "41"
 end
 ```
 
@@ -376,9 +414,55 @@ end
 - **`Pigeonhole::Family.new(max_versions:, ttl:, bloom_bits:, block_size:, blob_threshold:, compression:, zstd_level:)`** sets a family's options. `Family.counter` makes a counter family, and `Family.aggregate(kind, ...)` an aggregate one (`:sum`, `:hll`, `:histogram`, ...).
 - **`table.family_info(name)`** reads a family's stored options. Its Symbol-valued ones (`aggregation`, `compression`, `cache_priority`, `compaction`) come back as Symbols, `counter?` is a predicate, and `ttl` is seconds or `nil`.
 
+## Fiber schedulers
+Under a fiber scheduler (Async, Falcon, or any `Fiber::Scheduler`), a commit lets the thread's other fibers run while it waits, instead of blocking the thread (#1574, ICR 0126). Nothing changes in your code: the same methods behave as Ruby's own `IO`, `Queue` and `sleep` do under a scheduler.
+
+```ruby
+require "async"
+
+Pigeonhole.open(path, create: true) do |db|
+  events = db.table("events").family("f").create
+  Async do |task|
+    # 100 fibers on one thread, each committing while the others run.
+    100.times.map do |i|
+      task.async { events.put("k#{i}", "f", "q", "v", durability: :sync) }
+    end.each(&:wait)
+  end
+  raise "missing" unless events.get("k99", "f", "q")
+end
+```
+
+- **What yields:**
+  - `WriteBatch#commit` and `Transaction#commit`, and the block forms of `write_batch` and `transaction`;
+  - `Database#transact` (its retry pause is `sleep`, which yields already);
+  - `Mutation#commit`, `commit_if`, `commit_returning` and `commit_if_returning`;
+  - `Table#put`, `incr`, `incr_returning` and `delete`.
+
+  - `Feed#next` and `each`, and memory `Watch#next` and `each` (the writer process's; a reader process's watch raises `Pigeonhole::Unsupported` for a fiber, so wait on a thread there).
+  - The memory store's writes (`remember`, `delete`, `link`, `supersede` and `mark_used`), `recall` and `recall_with_stats`, and `ConsolidateLoop#run_once`.
+
+  Each commit submits at the call, as before, then waits without holding the thread.
+- **The memory store under a scheduler:**
+  - A write runs as `transact` around its `_in` form (`remember_in`, `delete_in` and the rest), so its commit yields, and it's retried as before.
+  - `recall`, `remember`'s near-dedup lookup, and an IVF store's settle after a write run on a small worker pool of the binding's own (at most 8 threads), and the fiber waits for them.
+  - `ConsolidateLoop#run_once` waits for new memories and for the pass's groups without holding the thread, and calls the block on the calling fiber, so the block may itself yield (an HTTP call to a model, say). Its first step starts the loop without waiting.
+- **What still blocks** (releasing the GVL, as before): reads (`get`, `scan` and the rest, which are usually cache hits), memory `get`, `verify`, `forget` and `consolidate`, and every call on Windows.
+- **Opting out:** `Fiber.blocking { ... }` keeps the calls inside it blocking. `Pigeonhole.fiber_scheduler = false` does it for the whole process, which keeps 1.1's behaviour for an application that can't check its call sites yet.
+- **A commit is now a point where the thread's other fibers run.** So [don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) applies across fibers too. A snapshot or open scan that one fiber keeps while another fiber on the thread commits can make that commit wait for room the snapshot pins, and it ends in `Busy` after the write-stall timeout. Finish or release snapshots and scans before a commit that may yield.
+- **Stopping a waiting fiber** (`Async::Task#stop`, a timeout, `Thread#raise`) ends its wait and raises in it, as for any other wait.
+  - A commit still waiting for room writes nothing.
+  - One already submitted may still land, and its result is lost (D210), so the outcome is unknown, as after `OutcomeUnknown`.
+  - For `incr_returning` and `commit_returning`, a landed commit's values are lost: a gap in a sequence, never a repeat.
+  - `transact` doesn't retry a stopped attempt.
+  - A feed or watch `next` loses nothing: a commit it had already taken is the next one any call returns, and `token` still points before it.
+  - A memory write ends as a stopped `transact` does. `recall` stopped while it runs finishes on its worker, and its result is dropped.
+  - A `ConsolidateLoop#run_once` stopped while it waits for new memories loses nothing: the next step reads them. Stopped during its passes, it raises once the pass has ended, as an interrupt does, and the loop is ready for the next step.
+- **One consumer per feed or watch at a time.** A second fiber's `next` while one waits raises `Pigeonhole::Error`, and so does a thread's `next` while a fiber waits on the same feed, or a fiber's while a thread does. `token`, `try_next` and `close` from anywhere stay fine.
+- **Threads and processes:** each thread's fibers share one small bridge (a pipe and its file descriptors). A forked child makes its own and leaves the parent's open.
+
 ## Readers, threads and processes
 - **Processes:** one process opens a database as the writer (`Pigeonhole.open`). Others open it as readers (`Pigeonhole.open_reader(path)`), which see every commit and can't write: a reader's table raises `Pigeonhole::ReadOnly` on writes ([reader processes](readers.md)).
-- **Threads:** every engine call releases the GVL, so Ruby threads run reads and commits in parallel. The handles are safe to share between threads.
+- **Threads:** every engine call releases the GVL, so Ruby threads run reads and commits in parallel. The handles are safe to share between threads. Under a fiber scheduler, commits also let the thread's other fibers run ([Fiber schedulers](#fiber-schedulers)).
 - **Interrupts:** an engine call can't be interrupted midway. A `Thread#raise`, `Thread#kill` or Ctrl-C that arrives during a call lands when the call returns, and a commit that ran stays committed. Calls are bounded, so the wait is short.
 - **Forking servers (Puma, Unicorn, Pitchfork with `preload_app`):**
   - A forked child can't use a handle it inherited: every call raises `Pigeonhole::Unsupported`.

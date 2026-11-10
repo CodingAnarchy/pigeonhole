@@ -461,44 +461,16 @@ impl Reader {
         if meta.len < FOOTER_LEN as u64 || meta.len > meta.extent.len() {
             return Err(corrupt("sst length"));
         }
-        let base = meta.extent.offset();
-        let limit = meta.len - FOOTER_LEN as u64;
-        let mut tail = [0; FOOTER_LEN];
-        if cache_only {
-            // The footer goes through the cache only here, so a cache-only open can fetch it
-            // and run again; a sync open reads it directly, as before.
-            let key = BlockKey {
-                file: crate::sst_cache_file(meta.id),
-                offset: limit,
-            };
-            match cache.get(key) {
-                Some(h) if h.len() == FOOTER_LEN => tail.copy_from_slice(&h),
-                _ => {
-                    return Err(crate::Error::WouldBlock(Box::new(Fetch::one(
-                        file,
-                        base + limit,
-                        FOOTER_LEN,
-                        Then::Footer {
-                            cache,
-                            key,
-                            priority,
-                        },
-                    ))));
-                }
-            }
-        } else {
-            read_into(&file, &mut tail, base + limit)?;
-        }
-        let footer = Footer::decode(&tail)?;
         let blocks = Blocks {
             file,
             id: meta.id,
-            base,
-            limit,
+            base: meta.extent.offset(),
+            limit: meta.len - FOOTER_LEN as u64,
             cache,
             uncached: Arc::new(BlockCache::disabled()),
             recycled: OnceLock::new(),
         };
+        let footer = Footer::decode(&blocks.footer(cache_only, priority)?)?;
         // A cache-only open reads only from the cache, and fills it with what it fetches
         // (the properties block too), so its retry finds everything.
         let read = |addr: BlockAddr, kind: BlockKind, fill: bool| {
@@ -553,6 +525,37 @@ impl Reader {
 }
 
 impl Blocks {
+    /// The SST's footer bytes. Only a cache-only open reads it through the cache, so it can
+    /// fetch it and run again (`WouldBlock` with the fetch on a miss); a sync open reads it
+    /// directly.
+    fn footer(&self, cache_only: bool, priority: Priority) -> Result<[u8; FOOTER_LEN]> {
+        let mut tail = [0; FOOTER_LEN];
+        if !cache_only {
+            read_into(&self.file, &mut tail, self.base + self.limit)?;
+            return Ok(tail);
+        }
+        let key = BlockKey {
+            file: crate::sst_cache_file(self.id),
+            offset: self.limit,
+        };
+        match self.cache.get(key) {
+            Some(h) if h.len() == FOOTER_LEN => {
+                tail.copy_from_slice(&h);
+                Ok(tail)
+            }
+            _ => Err(crate::Error::WouldBlock(Box::new(Fetch::one(
+                self.file.clone(),
+                self.base + self.limit,
+                FOOTER_LEN,
+                Then::Footer {
+                    cache: Arc::clone(&self.cache),
+                    key,
+                    priority,
+                },
+            )))),
+        }
+    }
+
     fn check(&self, addr: BlockAddr) -> Result<()> {
         let end = addr.offset.checked_add(u64::from(addr.len));
         if (addr.len as usize) < TRAILER_LEN || end.is_none_or(|e| e > self.limit) {

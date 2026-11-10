@@ -9,6 +9,8 @@
 
 use pyo3::prelude::*;
 
+mod aio;
+mod arrow;
 mod budget;
 mod convert;
 mod db;
@@ -18,6 +20,7 @@ mod memory;
 mod read;
 mod table;
 mod vector;
+mod waits;
 mod walk;
 
 /// The native module.
@@ -36,10 +39,21 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<table::FamilyInfo>()?;
     m.add_class::<table::Mutation>()?;
     m.add_class::<table::Incremented>()?;
+    m.add_class::<table::Checked>()?;
+    m.add_class::<table::Seen>()?;
+    // ICR 0113: `Returned`, the Rust struct's name since 1.2, is the same class.
+    m.add("Returned", m.getattr("Incremented")?)?;
     m.add_class::<read::Cell>()?;
     m.add_class::<read::Row>()?;
     m.add_class::<read::Snapshot>()?;
     m.add_class::<read::ScanIter>()?;
+    m.add_class::<arrow::ArrowStream>()?;
+    m.add_class::<aio::Retry>()?;
+    #[cfg(feature = "test-hooks")]
+    {
+        m.add_class::<aio::hooks::Gate>()?;
+        m.add_function(wrap_pyfunction!(aio::hooks::transaction_retries, m)?)?;
+    }
     m.add_class::<vector::VectorSpec>()?;
     m.add_class::<walk::Hop>()?;
     m.add_class::<walk::Traversal>()?;
@@ -65,3 +79,17 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
+
+/// Applies an optional builder setting: `b.maybe(opt, |b, v| b.method(v))` is `b` with
+/// `method(v)` when `opt` is `Some(v)`, and `b` unchanged otherwise. Every binding method
+/// that maps optional keyword arguments onto a Rust builder chains these, one per argument.
+pub(crate) trait Maybe: Sized {
+    fn maybe<T>(self, value: Option<T>, set: impl FnOnce(Self, T) -> Self) -> Self {
+        match value {
+            Some(v) => set(self, v),
+            None => self,
+        }
+    }
+}
+
+impl<B> Maybe for B {}

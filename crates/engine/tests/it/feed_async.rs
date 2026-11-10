@@ -99,6 +99,7 @@ fn poll(feed: &mut FeedReader, waker: &Waker) -> Option<Seqno> {
         Poll::Ready(Ok(Next::Commit(c))) => Some(c.seqno),
         Poll::Ready(Ok(Next::Pending)) => panic!("Ready(Pending)"),
         Poll::Ready(Ok(Next::Expired(e))) => panic!("expired: {e:?}"),
+        Poll::Ready(Ok(Next::Catalog(e))) => panic!("a catalog event in a per-table feed: {e:?}"),
         Poll::Ready(Err(e)) => panic!("{e}"),
         Poll::Pending => None,
     }

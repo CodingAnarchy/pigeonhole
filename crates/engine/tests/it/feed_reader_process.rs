@@ -145,6 +145,7 @@ fn ready(feed: &mut FeedReader) -> Result<Got, Error> {
             }
             Next::Pending => return Ok(out),
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     }
 }
@@ -382,6 +383,7 @@ fn a_reader_process_delivers_a_separated_value() {
             Next::Commit(c) => break c.clone(),
             Next::Pending => continue,
             Next::Expired(e) => panic!("expired: {e:?}"),
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
         }
     };
     assert_eq!(c.seqno, seqno);
@@ -394,6 +396,177 @@ fn a_reader_process_delivers_a_separated_value() {
     assert!(value[1..] == large[..]);
     drop(feed);
     drop(r);
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// D315 PR 2b: a feed of every table in a reader process delivers the writer's catalog
+/// changes from the sidecar, each in its place among the commits, as the writer's own feed
+/// does; and a start now passes over the changes the reader's view already reflects.
+#[test]
+fn a_reader_process_feed_of_every_table_delivers_catalog_changes() {
+    use pigeonhole_format::manifest::Edit;
+    let vfs = SimVfs::new(4131);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _b) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let c = (*w
+        .db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap())
+    .clone();
+    w.settle();
+    let s1 = w.commit(&[(&c, b"c1")]);
+    w.db.drop_table(c.id).unwrap();
+    w.settle();
+    let s2 = w.commit(&[(&a, b"a2")]);
+    vfs.enter_process(READER);
+    let mut got = Vec::new();
+    for _ in 0..1000 {
+        match feed.try_next().unwrap() {
+            Next::Commit(cm) => got.push(format!("c{}", cm.seqno)),
+            Next::Catalog(ev) => got.push(
+                ev.edits
+                    .iter()
+                    .map(|e| match e {
+                        Edit::CreateTable { name, .. } => format!("+{name}"),
+                        Edit::PutFamily { name, .. } => format!("/{name}"),
+                        Edit::DropTable { table } => {
+                            let name = ev.names.iter().find(|(t, _)| t == table);
+                            format!("-{}", name.map_or("?", |(_, n)| n.as_str()))
+                        }
+                        other => panic!("{other:?}"),
+                    })
+                    .collect::<String>(),
+            ),
+            Next::Pending if got.len() == 4 => break,
+            Next::Pending => std::thread::yield_now(),
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            "+c/g".to_string(),
+            format!("c{s1}"),
+            "-c".into(),
+            format!("c{s2}")
+        ]
+    );
+    drop(feed);
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// simp724 on #1493 and F2 on #1515 (D315 2b): once the writer's sidecar appends stop, the
+/// next catalog change's hold stays up for the rest of the session. A feed of every table in
+/// a reader process, which can't see the stop, waits at it: nothing at or above that
+/// change's ceiling, even after a later change (which takes no hold of its own). A table's
+/// feed doesn't read the hold and carries on. Mutation-checked: without `release_catalog`'s
+/// freeze, and with a later change taking its own hold.
+#[test]
+fn a_reader_process_feed_of_every_table_waits_at_a_frozen_hold() {
+    use pigeonhole_io::sim::FaultPlan;
+    let vfs = SimVfs::new(4132);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _b) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut all = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    let mut one = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let below = w.commit(&[(&a, b"below")]);
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    w.db.create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    w.settle();
+    assert_eq!(vfs.scheduled_fired(), 1, "the Catalog append failed");
+    vfs.set_faults(FaultPlan::none());
+    let above = w.commit(&[(&a, b"above")]);
+    let d = (*w
+        .db
+        .create_table("d", &[("g".into(), FamilyOptions::default())])
+        .unwrap())
+    .clone();
+    w.settle();
+    let later = w.commit(&[(&d, b"later")]);
+    vfs.enter_process(READER);
+    let mut got_one = Vec::new();
+    let mut got_all = Vec::new();
+    for _ in 0..200 {
+        got_one.extend(ready(&mut one).unwrap().into_iter().map(|(s, _)| s));
+        loop {
+            match all.try_next().unwrap() {
+                Next::Commit(c) => got_all.push(c.seqno),
+                Next::Catalog(e) => panic!("a change with no entry: {e:?}"),
+                Next::Pending => break,
+                Next::Expired(e) => panic!("expired: {e:?}"),
+            }
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(got_one, [below, above], "a table's feed carries on");
+    assert_eq!(
+        got_all,
+        [below],
+        "nothing at or above the frozen ceiling ({later})"
+    );
+    drop((all, one));
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// #1515's follow-up (D315): a reader process's feed of every table delivers each catalog
+/// change on an idle database, though no seqno moves: its backoff's polls load the sidecar
+/// even when the frontier didn't move. A create, then a drop, with no commit anywhere.
+#[test]
+fn a_reader_process_feed_of_every_table_delivers_catalog_changes_on_an_idle_database() {
+    use pigeonhole_format::manifest::Edit;
+    let vfs = SimVfs::new(4133);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let _ = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    // Read to the frontier first, so the next polls take the frontier-unchanged path.
+    assert!(matches!(feed.try_next().unwrap(), Next::Pending));
+    let next_catalog = |feed: &mut FeedReader, vfs: &Arc<SimVfs>| -> Vec<Edit> {
+        vfs.enter_process(READER);
+        for _ in 0..2000 {
+            match feed.try_next().unwrap() {
+                Next::Catalog(ev) => return ev.edits.clone(),
+                Next::Pending => std::thread::yield_now(),
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("no catalog change delivered on an idle database");
+    };
+    vfs.enter_process(WRITER);
+    let c = (*w
+        .db
+        .create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap())
+    .clone();
+    w.settle();
+    let edits = next_catalog(&mut feed, &vfs);
+    assert!(matches!(edits[0], Edit::CreateTable { table, .. } if table == c.id));
+    vfs.enter_process(WRITER);
+    w.db.drop_table(c.id).unwrap();
+    w.settle();
+    let edits = next_catalog(&mut feed, &vfs);
+    assert!(matches!(edits[..], [Edit::DropTable { table }] if table == c.id));
+    drop(feed);
     vfs.enter_process(WRITER);
     w.close();
 }

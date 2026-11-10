@@ -92,6 +92,38 @@ with ph.open(path, create=True) as db:
         assert len(t.row(b"timeline", snapshot=snap)) == 25
 ```
 
+### A scan as Arrow batches
+**`scan(...).to_arrow()`** hands a scan's cells to pandas, Polars, DuckDB or pyarrow without a Python object per cell (#1480, ICR 0120). It returns an `ArrowStream`: Arrow batches with one Arrow row per cell, in the same schema as the Rust `pigeonhole-arrow` crate and `phdb dump --format arrow` (see [Arrow](arrow.md)).
+- **The consumers:** an `ArrowStream` speaks the Arrow PyCapsule protocol, so Polars (`pl.DataFrame(stream)`), DuckDB (a query naming the variable) and pyarrow (`pa.RecordBatchReader.from_stream(stream)`) take it directly. `stream.to_pyarrow()` is the same reader in one call. For pandas, call `.read_pandas()` on that reader.
+- **No new required dependency:** pyarrow is optional. `pip install pigeonhole-db[arrow]` adds it (18.0 or later), for `to_pyarrow()`.
+- **The selection:** the batches hold the scan's cells: its prefix or range, `families`, `qualifier_prefix`, `versions` (0 for every version), `limit`, `column_limit` and `snapshot`.
+- **The options:** `to_arrow`'s keyword arguments are the export's.
+  - `batch_cells` (default 8192) and `batch_bytes` (default 8 MiB) close a batch, so memory stays bounded by one batch.
+  - `typed_values=True` adds `value_i64` and `value_f64`; `vector_dim=n` adds `value_vector`.
+  - `utf8_keys`, `row_dictionary`, and `ts="uint64"` change the key and timestamp types.
+- **One consumer per scan:** `to_arrow()` takes the scan, so the iterator ends, and it works only on a scan not yet iterated. A stream is read once: a second consumer raises `ValueError`. Close a stream you never hand over (`with t.scan().to_arrow() as s:`, or `s.close()`), as with a scan, to release its snapshot.
+- **Errors while reading:** `to_arrow()` raises pigeonhole's own exceptions for its arguments and for the scan. A read that fails later, mid-stream (the database closed under it, say), comes out of the consumer as the consumer's own exception, carrying pigeonhole's message. For pyarrow that's an `ArrowInvalid` reading `External error: the database is closed`, not a `pigeonhole` error class, so catch the consumer's exception type there.
+- **Don't write while a stream is open on the same thread:** an open stream holds its scan's snapshot, like a live scan, so a commit from that thread can wait on room only that snapshot holds, and fail with `Busy` after the write-stall timeout. Read the stream to the end (or close it) first. See [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit).
+- **The GIL:** the stream reads without the GIL, but a consumer that keeps the GIL while it reads blocks other Python threads for that long.
+
+```python
+import pigeonhole as ph
+import polars as pl
+import pyarrow as pa
+
+with ph.open(path, create=True) as db:
+    t = db.table("events").family("e").create()
+    with db.write_batch() as wb:
+        for i in range(1000):
+            wb.put(t, f"u{i % 10}:{i:04}", "e", "n", i)
+    df = pl.DataFrame(t.scan(prefix="u3:").to_arrow(typed_values=True))
+    assert df.height == 100 and df["value_i64"].sum() == sum(range(3, 1000, 10))
+
+    reader = t.scan().to_arrow().to_pyarrow()    # a pyarrow.RecordBatchReader
+    assert reader.read_all().num_rows == 1000
+    assert isinstance(reader, pa.RecordBatchReader)
+```
+
 ### Reads within a byte budget
 For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
 - **`scan_within(prefix, bytes=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.
@@ -127,6 +159,16 @@ with ph.open(path, create=True) as db:
 - **`Table.put`, `incr` and `delete`** each commit one change.
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
 - **Increments that return the value (D314):** `mutate(row)....commit_returning()` commits like `commit` and returns an `Incremented`: each counter cell the mutation incremented or set, as a read at the commit sees it. Read one with `value(family, qualifier, ts=None)` or `r[family, qualifier]`; iterating gives the keys `(family, qualifier, ts)`. `Table.incr_returning(...)` is the one-cell form and returns the new value. Concurrent increments each get their own value (`N` callers adding 1 from zero get exactly `1..N`), so they serve sequence numbers and ID allocation. A value is `None` when a read at the commit sees no cell: a counter the mutation deleted (`delete(family, qualifier, ts=0)`), or a bucket already past the family's TTL. A failed commit raises its usual exception, which is safe to retry. If the commit applied but reading the value failed, you get `ph.ReturnedValueError` instead (with the commit's `seqno`, and the read's error as its cause): **the increment landed**, so don't retry it. Values are unique only for as long as the commit survives, so use `Durability.GROUP_SYNC` (the default) or `SYNC` for IDs; after `OutcomeUnknown` there is no value, and a retry counts twice if the first increment landed. The [Counters](data-modeling.md#counters) section's Durability and `OutcomeUnknown` notes cover both.
+- **Values a commit replaced (#1445):** `return_previous(family, qualifier)` on a mutation asks `commit_returning()` for that column as it was just before the commit, read in the same step. `previous(family, qualifier)` on the result is its newest visible version then, as a `Cell`, or `None` if it had none.
+  - **A lease handoff, for example:** one commit takes the lease and says whom it displaced. That's an **unconditional takeover**: it doesn't check that the lease was free or expired. Taking it only then needs a condition: `commit_if_returning`, next.
+  - The displaced holder finds out at its next guarded write. **Guard every holder write** with `commit_if(Condition.equals(family, holder_column, own_id))`, which returns `None` once another holder has taken over.
+  - Optionally, an `incr` of an epoch counter in the same commit gives the new holder a fencing token (`r.value(...)`), so systems downstream can refuse an older holder's work.
+  - **The rules:** only `commit_returning()` (and `commit_returning_async()`) takes such a mutation: `commit()` and `commit_if()` raise `InvalidArgument`, as does a mutation that writes nothing. `previous` raises `InvalidArgument` for a column the mutation didn't ask for, and `ReturnedValueError` if the read failed after the commit applied, as `value` does. `Returned` is the same class as `Incremented`, under the name the Rust struct has had since 1.2.
+- **Compare and set, then read (#1446):** `commit_if_returning(condition)` is a `commit_if` that returns the row whichever way the condition goes (D314 amendment 2). It returns a frozen `Checked`: `applied`, then either `returned` (a `Returned`) when it committed, or `seen` (a `Seen`) when it didn't and nothing was written. `commit_if_returning_async` is the asyncio form.
+  - `returned.current(family, qualifier)` is a column as of the commit, so the condition's own column has the value this commit wrote. `previous` and the counters work as for `commit_returning`.
+  - `seen.current(family, qualifier)` is the column as the condition saw it: the value it compared, or `None` where it was missing. A compare-and-swap loop retries from it with no extra read.
+  - The condition's column is always reported. Ask for more with `return_current(family, qualifier)`. Only `commit_if_returning` takes it: `commit`, `commit_if` and `commit_returning` raise `InvalidArgument` ("use a transaction"), because a `get` after a commit may already see a later writer's. A mutation with no writes is a check-and-read.
+  - `current` raises `InvalidArgument` for a column that neither `return_current` nor the condition named. On `returned` it raises `ReturnedValueError` if the read failed after the commit applied. [Compare and set, then read](data-modeling.md#compare-and-set-then-read-commit_if_returning) has the details.
 - **`db.write_batch()`** spans rows and tables atomically. As a context manager, it commits on a clean exit and writes nothing if the block raises.
 - **`db.transaction()`** is optimistic: its reads see one snapshot, and `commit()` raises `Conflict` if a cell it read changed meanwhile.
 - **`db.transact(fn)`** runs `fn(txn)` and retries it on `Conflict` and `Busy`, with backoff. It returns what `fn` returned. `fn` may run more than once, so keep its side effects inside the transaction.
@@ -157,6 +199,38 @@ with ph.open(path, create=True) as db:
     r = seq.mutate(b"orders").incr("n", b"next", 1).incr("n", b"shipped", 1).commit_returning()
     assert r.value("n", b"next") == 2 and r["n", b"shipped"] == 1
     assert list(r) == [("n", b"next", 0), ("n", b"shipped", 0)]
+
+    # A lease handoff: an unconditional takeover that says whom it displaced, with a
+    # fencing epoch for the new holder.
+    leases = db.table("leases").family("s").family("epoch", ph.Family.counter()).create()
+    leases.mutate(b"lease:42").put("s", b"holder", b"worker-3").incr("epoch", b"n", 1).commit()
+    r = (
+        leases.mutate(b"lease:42")
+        .put("s", b"holder", b"worker-7")
+        .incr("epoch", b"n", 1)
+        .return_previous("s", b"holder")
+        .commit_returning()
+    )
+    assert r.previous("s", b"holder").value == b"worker-3"
+    assert r.value("epoch", b"n") == 2  # worker-7's fencing token
+    # worker-3 finds out at its next write, which (like every holder write) is guarded.
+    mine = ph.Condition.equals("s", b"holder", b"worker-3")
+    assert leases.mutate(b"lease:42").put("s", b"beat", b"3").commit_if(mine) is None
+
+    # Compare and swap: take the next number, retrying from what a failed attempt saw.
+    leases.mutate(b"seq").put("s", b"v", b"41").commit()
+    seen = b"0"
+    while True:
+        n = int(seen)
+        r = (
+            leases.mutate(b"seq")
+            .put("s", b"v", str(n + 1).encode())
+            .commit_if_returning(ph.Condition.equals("s", b"v", seen))
+        )
+        if r.applied:
+            break
+        seen = r.seen.current("s", b"v").value
+    assert n == 41
 ```
 
 ## Vectors
@@ -233,6 +307,22 @@ with ph.open(path, create=True, change_feed=64 << 20) as db:
 - **Writing.** `store.remember(ns, text, embedding=..., kind=..., importance=..., source=..., session=..., links=[(id, mem.LinkType.DERIVED_FROM, 0.5)], pinned=...)` returns `Remembered(id, outcome)`, where `outcome` is `"new"`, `"merged"` (an exact duplicate) or `"similar"` (a near duplicate the store's `NearDedup(policy="skip")` didn't write). `delete`, `link`, `supersede` and `mark_used` take ids as `MemoryId` or their text form.
 - **Transactions.** `remember_in(txn, ...)`, `delete_in` and `forget_in` write in a `pigeonhole.Transaction` and commit with it. They read in the transaction, so they're safe inside `db.transact(fn)`, whose retries re-read. `remember_in` skips near dedup, whose check reads outside the transaction: call `store.near_duplicate(ns, text, embedding=...)` first if you need it. Its reads are at the transaction's snapshot, which doesn't see the transaction's own writes, so two `remember_in` of the same text in one transaction both write. `forget_in` returns `"deleted"`, `"protected"`, `"not_due"` or `"gone"`, and none of these is an error.
 - **Recall.** `store.recall(namespaces, text=..., embedding=..., k=10, byte_budget=..., weights=mem.Weights(...), fusion="rrf", include_superseded=..., session=..., snapshot=..., with_signals=...)` returns `RecallHit`s, best first, at one snapshot. `recall_with_stats` adds `RecallStats` (`truncated` says the budget cut the hits). `expand=mem.Expand(hops=1)` also follows the best candidates' links both ways, and gives the memories it reaches a `graph` signal (`Weights(graph=)`, 0.5 by default). `RecallStats.expanded` counts them.
+- **Async recall.** `await store.recall_async(...)` and `await store.recall_with_stats_async(...)` take `recall`'s keywords and return what it does. `ReadStore` has both too.
+  - **Where it runs:** the call returns at once, and the recall runs, sync, on a thread of a small pool the binding keeps for it. Commits, gets and feed waits keep the asyncio bridge's own thread, so many concurrent recalls hold up neither the event loop nor the commits awaited beside them.
+  - **The pool:** as many threads as the machine's parallelism, from 2 to 16. Set `PIGEONHOLE_ASYNCIO_POOL_THREADS` (1 to 256) before the first async recall to choose another size. Its threads start with the first async recall and live as long as the process. They bound how many recalls run at once: the rest wait in the pool's queue, not on the event loop.
+  - **A cancelled recall:** one still queued never runs. One already running finishes on its thread, and its result is dropped.
+  - **Against `asyncio.to_thread(store.recall, ...)`:** at one caller they take the same time. With many callers, `to_thread` runs more recalls a second (its default executor has up to 32 threads), but the event loop stalls meanwhile: commits awaited beside the recalls took 2 ms at p99 with 16 callers, and 1.9 ms at p50 with 32. `recall_async` kept them near 80 µs at p99. Pick `to_thread` for recall throughput alone, `recall_async` when the same loop also commits or serves requests.
+
+    Measured on the 16-core reference machine (#1657, g45), 50,000 memories, with an 8-thread pool:
+
+    | callers | `to_thread` recalls/s | `recall_async` recalls/s | commit p99 meanwhile: `to_thread` / `recall_async` |
+    |---|---|---|---|
+    | 1 | 17 | 17 | 56–68 µs / 63–64 µs |
+    | 16 | 180–196 | 127–132 | 2.0–2.3 ms / 78–84 µs |
+    | 32 | 265–270 | 124–128 | 4.4–4.9 ms / 79–138 µs |
+    | 16, block cache too small (reads from the page cache) | 108–111 | 83–91 | 262–413 µs / 138–355 µs |
+
+    The 8 threads capped `recall_async` at about 127 recalls/s, the reason the pool now follows the cores.
 - **Forgetting.** With a policy (`forget=mem.ForgetPolicy(...)` or `store.set_forget_policy(...)`), a thread of the crate's own forgets in the background. `store.forget(policy=..., after=...)` runs one pass now.
 - **Consolidation.** `store.consolidate(ns, fn, policy=mem.ConsolidatePolicy(...))` calls `fn(group)`, a Python callable, for each group of episodic memories. It returns a list of `mem.Memory` to keep in their place (none keeps the group, marked consolidated).
   - **The callable runs outside every transaction, with no lock held,** so it may call the store (`recall` for context) and take its time, for example calling a model.
@@ -266,6 +356,68 @@ with ph.open(path, create=True) as db, mem.Store.create(
         "user:dana", summarise, policy=mem.ConsolidatePolicy(min_age=0)
     )
     assert passed.committed == 1
+```
+
+## asyncio
+The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutine awaiting a commit or a feed holds no thread. This replaces `asyncio.to_thread(...)` around the sync calls.
+- **The `_async` forms:**
+  - `Mutation.commit_async()`, `commit_if_async(condition)` and `commit_returning_async()`;
+  - `Table.incr_returning_async(...)`;
+  - `WriteBatch.commit_async()` and `Transaction.commit_async()`, both with `durability=`;
+  - `Transaction.get_async(...)`;
+  - `Feed.next_async()`;
+  - `Database.transact_async(f)`.
+- **What they return:** the same results and errors as the sync forms (`Conflict`, `ReturnedValueError` and the rest).
+  - Each but `transact_async` returns an `asyncio.Future` of the loop it was called on. Call and await it on that loop.
+  - It works with `await`, `asyncio.gather`, `wait_for`, `shield` and `asyncio.timeout`. It isn't a coroutine, so wrap it in `asyncio.ensure_future` rather than `create_task`.
+  - Called with no running loop, it raises `RuntimeError` and spends nothing.
+- **`transact_async(f)` takes an `async def f(txn)`,** retried on `Conflict` and `Busy` exactly as `transact` retries a sync body (the same attempts, backoff and deadline), sleeping with `asyncio.sleep`.
+  - Read with `await txn.get_async(...)`, and await reads before committing.
+  - A sync body is refused with `TypeError`, as is an `async def` passed to `transact`.
+  - `txn.get_row` has no async form yet, so it can block the loop on a cache miss.
+- **`Feed.next_async()`** waits for the next commit. For a timeout, use `asyncio.wait_for(feed.next_async(), t)`.
+  - A timeout or a cancel loses nothing: the commit it would have returned is the next one any call returns, and `feed.token()` still points before it.
+  - One wait at a time: a second `next_async`, or a sync `next`, during one raises `ValueError`, and so does a `next_async` while another thread's sync `next` waits.
+- **Cancelling a commit:**
+  - Cancelled while it waits for room (an async commit waits when its shard has too many in flight), nothing is written.
+  - Once it's submitted, it may still land, and the task can't tell which happened. To keep the outcome, await `asyncio.shield(m.commit_async())`.
+- **How it runs:** one `pigeonhole-asyncio` thread per process hands results to the event loops. The engine's threads never take the GIL to do it. Any asyncio loop works, uvloop included.
+- **The memory store (#1479's second PR):**
+  - `Store.remember_async`, `delete_async`, `link_async`, `supersede_async` and `mark_used_async` take the sync forms' arguments and return their results. Each commit is awaited, and retried as `transact` retries.
+  - Their reads inside the transaction can block the loop on a cache miss.
+  - `remember_async`'s near-dedup lookup (on a store with near dedup) and an IVF store's settle run on a worker thread.
+  - `Store.watch(...)` gives a `Watch` of the store's memory events, with `next`, `try_next` and `next_async`, under the same rules as `Feed.next_async`. `next_async` works in the writer process only: a reader's watch (`ReadStore.watch`) raises `Unsupported` there, so use `next` on a thread of its own.
+  - `Store.consolidate_loop(...)` gives a `ConsolidateLoop`. Its `run_once_async` awaits new memories without holding a thread, and a timeout loses no events. It runs the due passes, and so your consolidator, on a worker thread. It returns after the first commit with memory events, where the sync `run_once` reads until its timeout, so call it in a loop.
+  - Recall isn't async yet (#1560).
+- **An awaited write is a commit:** finish or drop snapshots, scans and Arrow streams before you await a write. A `remember_async`'s settle may commit splits too. Holding a snapshot across them is [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) with the event loop as the thread: the write waits for room only your snapshot holds, and ends in `Busy`.
+- **Not yet async:** reads outside a transaction, and memory recall (#1560). Call them through `asyncio.to_thread` meanwhile.
+
+```python
+import asyncio
+
+import pigeonhole as ph
+
+
+async def main(db, t):
+    seqno = await t.mutate(b"u1").put("f", b"name", b"Ada").commit_async()
+    n = await t.incr_returning_async(b"u1", "n", b"logins", 1)
+
+    async def rename(txn):
+        cell = await txn.get_async(t, b"u1", "f", b"name")
+        txn.put(t, b"u1", "f", b"name", cell.value + b" L.")
+
+    await db.transact_async(rename)
+    many = await asyncio.gather(
+        *[t.mutate(f"k{i}").put("f", b"q", b"v").commit_async() for i in range(100)]
+    )
+    return seqno, n, len(many)
+
+
+with ph.open(path, create=True) as db:
+    t = db.table("users").family("f").family("n", ph.Family.counter()).create()
+    seqno, n, many = asyncio.run(main(db, t))
+    assert n == 1 and many == 100
+    assert t.get(b"u1", "f", b"name").value == b"Ada L."
 ```
 
 ## Readers, threads and processes

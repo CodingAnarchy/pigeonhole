@@ -107,3 +107,22 @@ pub(crate) fn take_fail_loop_save(name: &str) -> bool {
 pub fn ivf_pending(store: &crate::Store) -> usize {
     store.ivf_pending_len()
 }
+
+/// The store's IVF index's list lengths, in list order, or `None` without an index: an
+/// inspection helper. A background index's lists only split when its rebalancer runs, so a
+/// test counts the lists to see whether one does (#1640).
+///
+/// # Errors
+/// As [`Store::verify`](crate::Store::verify).
+pub fn ivf_list_lens(store: &crate::Store) -> crate::Result<Option<Vec<u64>>> {
+    store.ivf_list_lens()
+}
+
+/// Whether the store's IVF index has the crate's own rebalancing thread, or `None` without an
+/// index: an inspection helper. Set when the store opens its index as the writer does
+/// (`pigeonhole_vector::Index::open`); never with [`OpenOptions::own_rebalancer`](
+/// crate::OpenOptions::own_rebalancer), which a replica's or a read-only open uses. It stays
+/// set after the thread ends (#1640).
+pub fn ivf_rebalancer_started(store: &crate::Store) -> Option<bool> {
+    store.ivf_rebalancer_started()
+}

@@ -279,6 +279,29 @@ impl Builder {
             .map_err(|e| commit_error(e, largest, max_value))
     }
 
+    /// [`commit_returning`](Self::commit_returning), also returning the columns of
+    /// `previous_of` as they were just before the commit (D314 amendment 1).
+    fn commit_returning_previous(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+        previous_of: PreviousOf,
+    ) -> Result<(
+        CommitInfo,
+        Vec<pigeonhole_engine::Returned>,
+        Vec<pigeonhole_engine::Previous>,
+    )> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let largest = self.largest_value;
+        engine
+            .commit_returning_previous(self.batch, durability.map(Durability::engine), previous_of)
+            .map(|(info, cells, previous)| (CommitInfo::from_engine(info), cells, previous))
+            .map_err(|e| commit_error(e, largest, max_value))
+    }
+
     /// Submits a returning commit as an async one (D314, D210).
     #[cfg(feature = "async")]
     fn submit_returning(
@@ -286,15 +309,19 @@ impl Builder {
         engine: &pigeonhole_engine::Engine,
         max_value: usize,
         durability: Option<Durability>,
+        previous_of: Option<Box<PreviousOf>>,
     ) -> Result<(pigeonhole_engine::PendingReturning, usize)> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let largest = self.largest_value;
-        engine
-            .submit_returning(self.batch, durability.map(Durability::engine))
-            .map(|p| (p, largest))
-            .map_err(|e| commit_error(e, largest, max_value))
+        let durability = durability.map(Durability::engine);
+        match previous_of {
+            None => engine.submit_returning(self.batch, durability),
+            Some(of) => engine.submit_returning_previous(self.batch, durability, *of),
+        }
+        .map(|p| (p, largest))
+        .map_err(|e| commit_error(e, largest, max_value))
     }
 
     /// Commits through `db`, reporting the first builder error instead if there was one.
@@ -504,6 +531,22 @@ pub struct RowMutation<'t> {
     row: Vec<u8>,
     builder: Builder,
     durability: Option<Durability>,
+    /// The columns [`return_previous`](Self::return_previous) and
+    /// [`return_current`](Self::return_current) asked for. Boxed, so a mutation that asks
+    /// for none carries a null pointer (#1517).
+    requests: Option<Box<Requests>>,
+}
+
+/// The columns a mutation asked [`RowMutation::return_previous`] for.
+type PreviousOf = Vec<(FamilyId, Vec<u8>)>;
+
+/// A mutation's requests for column values (D314 amendments 1 and 2).
+#[derive(Debug, Default)]
+struct Requests {
+    /// [`RowMutation::return_previous`]'s columns.
+    previous: PreviousOf,
+    /// [`RowMutation::return_current`]'s columns.
+    current: PreviousOf,
 }
 
 impl<'t> RowMutation<'t> {
@@ -513,6 +556,16 @@ impl<'t> RowMutation<'t> {
             row: row.to_vec(),
             builder: Builder::default(),
             durability: None,
+            requests: None,
+        }
+    }
+
+    /// Refuses value requests on a commit that doesn't return them, so none is dropped
+    /// silently (D314 amendments 1 and 2).
+    #[inline(always)]
+    fn no_previous(&mut self) {
+        if let Some(r) = self.requests.as_deref() {
+            refuse_previous(&mut self.builder, !r.current.is_empty());
         }
     }
 
@@ -893,8 +946,86 @@ impl RowMutation<'_> {
         self
     }
 
+    /// Asks [`commit_returning`](Self::commit_returning) for this row's `family:qualifier`
+    /// as it was just before the commit: its newest visible version then, what a `get` at
+    /// that point returns (get-and-set; D314 amendment 1). Read it with
+    /// [`Returned::previous`]. Usually a cell this mutation writes; any column of the row
+    /// works, and asking twice for one column is asking once. Concurrent commits that each
+    /// write a cell and ask for its previous value get a chain: each sees the one before it.
+    ///
+    /// It is the column's newest version, whatever timestamp this mutation writes: for a
+    /// bucketed counter (`incr_at`) that may be another bucket than the one written, whose
+    /// new value is [`Returned::value_at`]'s. A mutation that writes nothing has nothing to
+    /// replace: `commit_returning` refuses it (`InvalidArgument`), as
+    /// [`commit`](Self::commit) and [`commit_if`](Self::commit_if) refuse any mutation with
+    /// such a request.
+    ///
+    /// Durability is as [`commit_returning`](Self::commit_returning)'s. After
+    /// `OutcomeUnknown` there is no previous value, and a retry after the first attempt
+    /// landed sees that attempt's own write as its previous value: compare it with what you
+    /// wrote. Chains hold with default timestamps, or explicit ones that increase per cell:
+    /// a put at a timestamp below the newest version leaves that version newest, and the
+    /// next swap returns it again.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db.table("leases")?.family("s", Family::default()).create_if_missing()?;
+    /// t.mutate(b"lease:42").put("s", b"holder", b"worker-3").commit()?;
+    /// let r = t
+    ///     .mutate(b"lease:42")
+    ///     .put("s", b"holder", b"worker-7")
+    ///     .return_previous("s", b"holder")
+    ///     .commit_returning()?;
+    /// let old = r.previous("s", b"holder")?.expect("held before");
+    /// assert_eq!(old.value(), b"worker-3");
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn return_previous(mut self, family: &str, qualifier: &[u8]) -> Self {
+        match self.table.family_id(family) {
+            Ok(id) => {
+                let of = &mut self.requests.get_or_insert_default().previous;
+                if !of.iter().any(|(f, q)| *f == id && q == qualifier) {
+                    of.push((id, qualifier.to_vec()));
+                }
+            }
+            Err(e) => self.builder.fail(e),
+        }
+        self
+    }
+
+    /// Asks [`commit_if_returning`](Self::commit_if_returning) for the column
+    /// `family:qualifier` of this row as it is, whichever way the condition goes (D314
+    /// amendment 2, #1446): as of the commit when it applies
+    /// ([`Returned::current`]), as the condition saw it when it doesn't
+    /// ([`Seen::current`]). The condition's own column is always returned, without asking.
+    /// Asking twice for one column is asking once.
+    ///
+    /// Only `commit_if_returning` takes it: `commit`, `commit_returning` and `commit_if`
+    /// refuse it with `InvalidArgument`. To read other columns as of a plain commit, use a
+    /// transaction: a `get` after a commit may see a later writer's.
+    pub fn return_current(mut self, family: &str, qualifier: &[u8]) -> Self {
+        match self.table.family_id(family) {
+            Ok(id) => {
+                let of = &mut self.requests.get_or_insert_default().current;
+                if !of.iter().any(|(f, q)| *f == id && q == qualifier) {
+                    of.push((id, qualifier.to_vec()));
+                }
+            }
+            Err(e) => self.builder.fail(e),
+        }
+        self
+    }
+
     /// Commits.
-    pub fn commit(self) -> Result<CommitInfo> {
+    pub fn commit(mut self) -> Result<CommitInfo> {
+        self.no_previous();
         let RowMutation {
             table,
             builder,
@@ -917,7 +1048,11 @@ impl RowMutation<'_> {
     /// A value is as durable as the commit, which returns only once it meets its durability
     /// level; with [`Durability::Buffered`] or [`Durability::None`] a crash can lose the commit
     /// and hand its value out again. After [`ErrorCode::OutcomeUnknown`](crate::ErrorCode)
-    /// there is no value, and retrying the increment counts it twice if it landed.
+    /// there is no value, and retrying the increment counts it twice if it landed. Values
+    /// fold the newest *visible* versions: after a crash, what came from another commit that
+    /// wasn't durable (a cross-shard `Buffered` one, say) can be gone even if this one
+    /// survives. [`return_previous`](Self::return_previous) adds the values columns held
+    /// just before the commit.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};
@@ -931,18 +1066,25 @@ impl RowMutation<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn commit_returning(self) -> Result<Incremented> {
+    pub fn commit_returning(self) -> Result<Returned> {
         let RowMutation {
             table,
             builder,
             durability,
+            requests,
             ..
         } = self;
+        if let Some(r) = requests {
+            if !r.current.is_empty() {
+                return Err(current_refused());
+            }
+            return commit_returning_previous(table, builder, durability, r.previous);
+        }
         let generation = table.db.before_commit()?;
         let (info, cells) = builder
             .commit_returning(&table.engine(), table.db.max_value, durability)
             .map_err(|e| table.db.after_commit_closed(generation, e))?;
-        Ok(Incremented::new(info, &table.info, cells))
+        Ok(Returned::new(info, &table.info, cells))
     }
 
     /// Submits as an async returning commit (D314, D210).
@@ -958,15 +1100,21 @@ impl RowMutation<'_> {
         let watch = self.table.db.watch();
         let max_value = self.table.db.max_value;
         let info = Arc::clone(&self.table.info);
+        let previous = match self.requests {
+            Some(r) if !r.current.is_empty() => return Err(watch.refused(current_refused())),
+            Some(r) => Some(Box::new(r.previous)),
+            None => None,
+        };
         self.builder
-            .submit_returning(&self.table.engine(), max_value, self.durability)
+            .submit_returning(&self.table.engine(), max_value, self.durability, previous)
             .map(|(p, largest)| (p, info, largest, max_value))
             .map_err(|e| watch.refused(e))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
-    pub(crate) fn submit_async(self) -> Result<Submitted> {
+    pub(crate) fn submit_async(mut self) -> Result<Submitted> {
+        self.no_previous();
         let watch = self.table.db.watch();
         self.builder
             .submit_async(
@@ -984,6 +1132,7 @@ impl RowMutation<'_> {
     /// pending check submits once admitted when it has to wait for room.
     #[cfg(feature = "async")]
     pub(crate) fn submit_if_async(mut self, condition: &Condition) -> Result<SubmittedCheck> {
+        self.no_previous();
         if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
@@ -1010,9 +1159,47 @@ impl RowMutation<'_> {
             .map_err(|e| watch.refused(commit_error(e, largest_value, max_value)))
     }
 
+    /// Submits as an async returning check (D314 amendment 2, D210).
+    #[cfg(feature = "async")]
+    pub(crate) fn submit_if_returning_async(
+        mut self,
+        condition: &Condition,
+    ) -> Result<SubmittedCheckReturning> {
+        if let Some(e) = self.builder.error.take() {
+            return Err(e);
+        }
+        let predicate = self.predicate(condition)?;
+        let requests = self.requests.take().map(|r| *r).unwrap_or_default();
+        let (db, table) = (&self.table.db, self.table.info.id);
+        let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
+        let durability = self.durability;
+        let watch = db.watch();
+        let info = Arc::clone(&self.table.info);
+        self.table
+            .engine()
+            .submit_check_and_mutate_returning_async(
+                table,
+                &self.row,
+                &predicate,
+                self.builder.batch,
+                durability.map(Durability::engine),
+                requests.previous,
+                requests.current,
+            )
+            .map(|pending| SubmittedCheckReturning {
+                pending,
+                info,
+                largest_value,
+                max_value,
+                watch,
+            })
+            .map_err(|e| watch.refused(commit_error(e, largest_value, max_value)))
+    }
+
     /// Commits only if `condition` holds on this row, atomically (BigTable's
     /// `check_and_mutate`; Phase 2). Returns `None` if the condition failed.
     pub fn commit_if(mut self, condition: &Condition) -> Result<Option<CommitInfo>> {
+        self.no_previous();
         if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
@@ -1038,6 +1225,84 @@ impl RowMutation<'_> {
         } else {
             None
         })
+    }
+
+    /// [`commit_if`](RowMutation::commit_if) that returns the row's state whichever way the
+    /// condition goes (compare-and-set-then-read, D314 amendment 2, #1446).
+    ///
+    /// - **[`Checked::Applied`]:** the [`Returned`] of the commit: its counters folded
+    ///   ([`Returned::value`]), [`return_previous`](Self::return_previous)'s columns as they
+    ///   were just before it, and [`return_current`](Self::return_current)'s, the
+    ///   condition's own column included, as of the commit ([`Returned::current`]): the
+    ///   condition's column is the new value, `return_previous` gives the old one.
+    /// - **[`Checked::NotApplied`]:** the [`Seen`] columns, the condition's own included, in
+    ///   the applied state the condition saw: read once, so the value it compared is the
+    ///   value returned, and a column it found missing is `None`.
+    ///
+    /// [`return_previous`](Self::return_previous)'s columns are reported only when it
+    /// applies. When it doesn't, nothing changed, so a column's value then is its current
+    /// one: ask for it with [`return_current`](Self::return_current) and read it from
+    /// [`Seen::current`].
+    ///
+    /// A mutation that writes nothing is a check-and-read, as with
+    /// [`commit_if`](Self::commit_if): when the condition holds it commits an empty
+    /// mutation and returns `Applied` with the columns as they are; when it fails, `NotApplied`.
+    ///
+    /// Nothing is written when the condition fails. When it holds, durability and
+    /// `OutcomeUnknown` are as [`commit_returning`](Self::commit_returning)'s: after
+    /// `OutcomeUnknown` nothing is returned, and a retry that finds its own earlier write
+    /// sees it as a failed condition.
+    ///
+    /// ```
+    /// use pigeonhole::{Checked, Condition, Family, Options, Pigeonhole, ValueFilter};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db.table("wf")?.family("s", Family::default()).create_if_missing()?;
+    /// t.mutate(b"order:7").put("s", b"state", b"paid").commit()?;
+    /// let packed = Condition::Value {
+    ///     family: "s".into(),
+    ///     qualifier: b"state".to_vec(),
+    ///     filter: ValueFilter::Equals(b"packed".to_vec()),
+    /// };
+    /// // Advance from "packed" to "shipped", or learn the state it is in.
+    /// match t.mutate(b"order:7").put("s", b"state", b"shipped").commit_if_returning(&packed)? {
+    ///     Checked::Applied(_) => unreachable!("it was paid, not packed"),
+    ///     Checked::NotApplied(seen) => {
+    ///         assert_eq!(seen.current("s", b"state")?.unwrap().value(), b"paid");
+    ///     }
+    /// }
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn commit_if_returning(mut self, condition: &Condition) -> Result<Checked> {
+        if let Some(e) = self.builder.error.take() {
+            return Err(e);
+        }
+        let predicate = self.predicate(condition)?;
+        let requests = self.requests.take().map(|r| *r).unwrap_or_default();
+        let db = &self.table.db;
+        let largest = self.builder.largest_value;
+        let generation = db.before_commit()?;
+        let r = self
+            .table
+            .engine()
+            .check_and_mutate_returning(
+                self.table.info.id,
+                &self.row,
+                &predicate,
+                self.builder.batch,
+                self.durability.map(Durability::engine),
+                requests.previous,
+                requests.current,
+            )
+            .map_err(|e| {
+                db.after_commit_closed(generation, commit_error(e, largest, db.max_value))
+            })?;
+        Checked::from_engine(r, &self.table.info)
     }
 
     /// The engine's form of `condition`, on this row's table.
@@ -1092,6 +1357,32 @@ impl SubmittedCheck {
         } else {
             None
         })
+    }
+}
+
+/// An async returning check, submitted ([`RowMutation::commit_if_returning_async`]).
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub(crate) struct SubmittedCheckReturning {
+    pub(crate) pending: pigeonhole_engine::PendingCheckReturning,
+    info: Arc<pigeonhole_engine::TableInfo>,
+    largest_value: usize,
+    max_value: usize,
+    watch: crate::db::Watch,
+}
+
+#[cfg(feature = "async")]
+impl SubmittedCheckReturning {
+    /// The public result of the engine's outcome.
+    pub(crate) fn outcome(
+        &self,
+        r: pigeonhole_engine::Result<pigeonhole_engine::CheckReturned>,
+    ) -> Result<Checked> {
+        let r = r.map_err(|e| {
+            self.watch
+                .refused(commit_error(e, self.largest_value, self.max_value))
+        })?;
+        Checked::from_engine(r, &self.info)
     }
 }
 
@@ -1997,6 +2288,34 @@ impl Transaction {
         result
     }
 
+    /// The sequence number of the snapshot the transaction reads at (ICR 0118): every read
+    /// sees the commits up to it and none after. It's the same number
+    /// [`Snapshot::seqno`](crate::Snapshot::seqno) gives for a snapshot taken at that
+    /// moment, so the two can be compared.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// let first = t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    ///
+    /// let txn = db.transaction()?;
+    /// assert!(txn.snapshot_seqno() >= first.seqno, "it sees the commit before it");
+    /// let later = t.mutate(b"row").put("f", b"q", b"w").commit()?;
+    /// assert!(txn.snapshot_seqno() < later.seqno, "and not the one after");
+    /// # drop(txn);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_seqno(&self) -> u64 {
+        self.txn.snapshot().seqno()
+    }
+
     /// Reads a cell at the transaction's snapshot and records the read: a commit that writes
     /// this cell, or deletes its family or row, makes the transaction conflict; one that writes
     /// another cell of the row doesn't (D275).
@@ -2743,21 +3062,200 @@ impl Transaction {
     }
 }
 
-/// The counter cells a [`RowMutation::commit_returning`] incremented or set, after its
-/// commit (D314).
+/// Refuses a `return_previous` request on a commit that returns nothing. Out of line, so
+/// `commit` and the async submits pay one test for it (#1517: inlined, `commit-async` cost
+/// 8 instructions more).
+#[cold]
+#[inline(never)]
+fn refuse_previous(builder: &mut Builder, current: bool) {
+    builder.fail(if current {
+        current_refused()
+    } else {
+        Error::new(
+            crate::ErrorCode::InvalidArgument,
+            "return_previous needs commit_returning",
+        )
+    });
+}
+
+/// `return_current` on a commit other than `commit_if_returning` (cli692's Q1 on #1446).
+#[cold]
+fn current_refused() -> Error {
+    Error::new(
+        crate::ErrorCode::InvalidArgument,
+        "return_current needs commit_if_returning; to read other columns as of a plain \
+         commit, use a transaction",
+    )
+}
+
+/// [`RowMutation::commit_returning`] for a mutation that asked for previous values. Out of
+/// line, so the plain path keeps its shape and inlining (#1517).
+#[inline(never)]
+fn commit_returning_previous(
+    table: &TableCore,
+    builder: Builder,
+    durability: Option<Durability>,
+    previous_of: PreviousOf,
+) -> Result<Returned> {
+    let generation = table.db.before_commit()?;
+    let (info, cells, previous) = builder
+        .commit_returning_previous(&table.engine(), table.db.max_value, durability, previous_of)
+        .map_err(|e| table.db.after_commit_closed(generation, e))?;
+    Ok(Returned::new_with_previous(
+        info,
+        &table.info,
+        cells,
+        previous,
+    ))
+}
+
+/// A returning commit's previous values, kept as timestamp and stored bytes (so
+/// [`Returned`] holds no cache block and stays `UnwindSafe`). Out of line: most returning
+/// commits ask for none.
+#[cold]
+fn previous_cells(previous: Vec<pigeonhole_engine::Previous>) -> Vec<PreviousCell> {
+    previous
+        .into_iter()
+        .map(|p| {
+            let value = p
+                .value
+                .map(|v| v.map(|c| (c.timestamp(), c.stored().to_vec())))
+                .map_err(Error::from);
+            (p.family, p.qualifier, value)
+        })
+        .collect()
+}
+
+/// The asked-for column `family:qualifier` among `cells`, as an owned `Cell`;
+/// `InvalidArgument` if it wasn't asked for (`what`: "previous" or "current").
+/// Always inlined, as [`Returned::previous`]'s body was before it was shared (#1566).
+#[inline(always)]
+fn column(
+    table: &pigeonhole_engine::TableInfo,
+    cells: &[PreviousCell],
+    family: &str,
+    qualifier: &[u8],
+    what: &str,
+) -> Result<Option<crate::Cell>> {
+    let id = table.family(family).map(|f| f.id);
+    cells
+        .iter()
+        .find(|(f, q, _)| Some(*f) == id && q == qualifier)
+        .map(|c| match &c.2 {
+            Ok(v) => Ok(v.as_ref().map(|(ts, stored)| {
+                crate::Cell::from_data(pigeonhole_engine::CellData::from_stored(
+                    *ts,
+                    stored.clone(),
+                ))
+            })),
+            Err(e) => Err(e.clone()),
+        })
+        .unwrap_or_else(|| {
+            Err(Error::new(
+                crate::ErrorCode::InvalidArgument,
+                format!("the commit did not ask for the {what} {family}:{qualifier:?}"),
+            ))
+        })
+}
+
+/// What a [`RowMutation::commit_if_returning`] returns (D314 amendment 2): whether the
+/// condition held, with the row's state either way. A failed condition is an outcome, not
+/// an error: the retry loop's branch that does the work.
+#[must_use = "a check's outcome says whether the write happened"]
+#[derive(Debug, Clone)]
+pub enum Checked {
+    /// The condition held and the mutation committed.
+    Applied(Returned),
+    /// The condition failed and nothing was written.
+    NotApplied(Seen),
+}
+
+impl Checked {
+    /// Whether the condition held and the mutation committed.
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Checked::Applied(_))
+    }
+
+    fn from_engine(
+        r: pigeonhole_engine::CheckReturned,
+        table: &Arc<pigeonhole_engine::TableInfo>,
+    ) -> Result<Self> {
+        Ok(match (r.applied, r.info) {
+            (true, Some(info)) => {
+                let mut ret = Returned::new_with_previous(
+                    CommitInfo::from_engine(info),
+                    table,
+                    r.cells,
+                    r.previous,
+                );
+                ret.current = previous_cells(r.current);
+                Checked::Applied(ret)
+            }
+            (true, None) => {
+                // The shard notifies every applied check with its commit's info.
+                debug_assert!(false, "a check applied without its commit info");
+                return Err(Error::new(
+                    ErrorCode::OutcomeUnknown,
+                    "internal error: the conditional commit applied, but its commit info is \
+                     missing",
+                ));
+            }
+            (false, _) => Checked::NotApplied(Seen {
+                table: Arc::clone(table),
+                current: previous_cells(r.current),
+            }),
+        })
+    }
+}
+
+/// The row as a failed [`commit_if_returning`](RowMutation::commit_if_returning)'s
+/// condition saw it (D314 amendment 2): the condition's own column and
+/// [`return_current`](RowMutation::return_current)'s, in the applied state the condition
+/// was evaluated against.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct Incremented {
+pub struct Seen {
+    table: Arc<pigeonhole_engine::TableInfo>,
+    current: Vec<PreviousCell>,
+}
+
+impl Seen {
+    /// The column `family:qualifier` as the condition saw it: its newest visible version
+    /// then (value and timestamp). `Ok(None)` if it had none (a condition that failed on a
+    /// missing cell reports it missing). `InvalidArgument` if the mutation didn't ask for
+    /// it and it isn't the condition's column.
+    pub fn current(&self, family: &str, qualifier: &[u8]) -> Result<Option<crate::Cell>> {
+        column(&self.table, &self.current, family, qualifier, "current")
+    }
+}
+
+/// The 1.1.0 name of [`Returned`], from when it held counters only (D314 amendment 1).
+pub type Incremented = Returned;
+
+/// What a [`RowMutation::commit_returning`] returns (D314): the counter cells it
+/// incremented or set, after its commit, and the columns
+/// [`return_previous`](RowMutation::return_previous) asked for, as they were before it.
+/// Named `Incremented` in 1.1.0, which stays as an alias.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Returned {
     /// The commit.
     pub info: CommitInfo,
     table: Arc<pigeonhole_engine::TableInfo>,
-    cells: Vec<IncrementedCell>,
+    cells: Vec<ReturnedCell>,
+    previous: Vec<PreviousCell>,
+    current: Vec<PreviousCell>,
 }
 
-/// One cell of an [`Incremented`]: family, qualifier, timestamp, value.
-type IncrementedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
+/// One cell of a [`Returned`]: family, qualifier, timestamp, value.
+type ReturnedCell = (FamilyId, Vec<u8>, u64, Result<Option<i64>>);
 
-impl Incremented {
+/// One previous value of a [`Returned`]: family, qualifier, and the version before the
+/// commit as its timestamp and stored bytes. Kept as bytes, not a `Cell` (which may pin a
+/// cache block), so `Returned` stays `UnwindSafe` as 1.1.0's `Incremented` was.
+type PreviousCell = (FamilyId, Vec<u8>, Result<Option<(u64, Vec<u8>)>>);
+
+impl Returned {
     pub(crate) fn new(
         info: CommitInfo,
         table: &Arc<pigeonhole_engine::TableInfo>,
@@ -2770,7 +3268,63 @@ impl Incremented {
                 .into_iter()
                 .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
                 .collect(),
+            previous: Vec::new(),
+            current: Vec::new(),
         }
+    }
+
+    /// [`new`](Self::new) with the previous values a [`RowMutation::return_previous`]
+    /// commit asked for. Apart from `new`, which plain returning commits inline (a third
+    /// caller of `new` put its collect out of line, about 30 instructions a commit, #1517).
+    #[cold]
+    pub(crate) fn new_with_previous(
+        info: CommitInfo,
+        table: &Arc<pigeonhole_engine::TableInfo>,
+        cells: Vec<pigeonhole_engine::Returned>,
+        previous: Vec<pigeonhole_engine::Previous>,
+    ) -> Self {
+        Self {
+            info,
+            table: Arc::clone(table),
+            cells: cells
+                .into_iter()
+                .map(|c| (c.family, c.qualifier, c.ts, c.value.map_err(Error::from)))
+                .collect(),
+            previous: previous_cells(previous),
+            current: Vec::new(),
+        }
+    }
+
+    /// With the previous values a [`RowMutation::return_previous`] commit asked for.
+    #[cfg(feature = "async")]
+    pub(crate) fn with_previous(mut self, previous: Vec<pigeonhole_engine::Previous>) -> Self {
+        if !previous.is_empty() {
+            self.previous = previous_cells(previous);
+        }
+        self
+    }
+
+    /// The column `family:qualifier` that [`RowMutation::return_previous`] asked for, as it
+    /// was just before the commit: its newest visible version then (value and timestamp),
+    /// with the family's TTL judged at the commit's timestamp (D314 amendment 1).
+    ///
+    /// `Ok(None)` if it had no visible version. An `Err` is the error that kept the value
+    /// from being read once the commit had applied: **the commit succeeded**, so don't retry
+    /// it. `InvalidArgument` if the mutation didn't ask for that column.
+    pub fn previous(&self, family: &str, qualifier: &[u8]) -> Result<Option<crate::Cell>> {
+        column(&self.table, &self.previous, family, qualifier, "previous")
+    }
+
+    /// The column `family:qualifier` that [`RowMutation::return_current`] asked for, or the
+    /// condition's own column, as of a [`commit_if_returning`](RowMutation::commit_if_returning)
+    /// that applied: its newest version at the commit (D314 amendment 2). The condition's
+    /// column is the value this commit wrote; [`previous`](Self::previous) gives the old one.
+    ///
+    /// `Ok(None)` if it has no visible version. An `Err` is the error that kept the value
+    /// from being read once the commit had applied: **the commit succeeded**, so don't retry
+    /// it. `InvalidArgument` if the mutation didn't ask for that column.
+    pub fn current(&self, family: &str, qualifier: &[u8]) -> Result<Option<crate::Cell>> {
+        column(&self.table, &self.current, family, qualifier, "current")
     }
 
     /// The counter `incr` (or `put_i64`) wrote in `family` at `qualifier`, after the commit.

@@ -281,21 +281,39 @@ fn a_shard_in_compaction_backoff_parks_and_retries_on_time() {
         let a = attempts(&failed.lock().unwrap());
         (a[1], a[2])
     };
-    // Inside the backoff after the third failure (at least 4 s: 1 s doubling per failure in
-    // a row, and writes may have failed some first): the process idles.
-    std::thread::sleep(Duration::from_millis(300));
+    // Inside the backoff after the third failure: twice the wait before it (1 s doubling per
+    // failure in a row; writes may have failed some first). Timed from the attempts' own
+    // timestamps, never from when the loop above noticed the third: a slow runner noticing it
+    // late, or a shorter schedule than 1-2-4 s, put the fourth retry inside a window measured
+    // from then (#1573's macOS job: 4 attempts against 3).
+    let previous = third.duration_since(second);
+    // `previous` runs from the second attempt's start, and each wait from its attempt's end,
+    // so it can overstate a wait by an attempt's length: ending the window `previous` after
+    // the third attempt keeps it well inside a wait of twice that.
+    let from = (third + Duration::from_millis(300)).max(Instant::now());
+    let until = third + previous;
+    if from < until {
+        std::thread::sleep(from.saturating_duration_since(Instant::now()));
+    }
     let (cpu0, wall0) = (process_cpu(), Instant::now());
-    std::thread::sleep(Duration::from_millis(3_000));
+    std::thread::sleep(until.saturating_duration_since(Instant::now()));
     let (cpu, wall) = (process_cpu() - cpu0, wall0.elapsed());
     assert_eq!(
         attempts(&failed.lock().unwrap()).len(),
         3,
-        "retried during the backoff"
+        "retried during the backoff ({previous:?} after the second, so due {:?} after the third)",
+        previous * 2
     );
-    assert!(
-        cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
-        "{cpu:?} of CPU in {wall:?} of backoff (issue #89)"
-    );
+    // The process idles: measured over what's left of the window, when there's enough to
+    // measure (a runner that noticed the third attempt very late leaves too little).
+    if wall >= Duration::from_millis(500) {
+        assert!(
+            cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
+            "{cpu:?} of CPU in {wall:?} of backoff (issue #89)"
+        );
+    } else {
+        eprintln!("idle_cpu: only {wall:?} of the backoff window left to measure; skipped");
+    }
     // The fourth attempt fires on time: twice the previous wait after the third.
     let deadline = Instant::now() + Duration::from_secs(30);
     while attempts(&failed.lock().unwrap()).len() < 4 {
@@ -303,10 +321,11 @@ fn a_shard_in_compaction_backoff_parks_and_retries_on_time() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let gap = attempts(&failed.lock().unwrap())[3].duration_since(third);
-    let previous = third.duration_since(second);
     let ratio = gap.as_secs_f64() / previous.as_secs_f64();
+    // At least two failures in a row came before it, so at least 2 s; the 1-2-4 s schedule
+    // gives 4 s, and earlier write failures may shift it (the ratio is the check).
     assert!(
-        gap >= Duration::from_secs(4) && (1.8..2.2).contains(&ratio),
+        gap >= Duration::from_secs(2) && (1.8..2.2).contains(&ratio),
         "retried {gap:?} after the third failure, after {previous:?} before it"
     );
     fail.store(false, Ordering::Release);
