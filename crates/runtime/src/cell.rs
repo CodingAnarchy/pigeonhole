@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::signal::Signal;
-use crate::{Inbox, ShardCore, ShardHandler, ShardId};
+use crate::{ShardCore, ShardHandler, ShardId};
 
 /// How long `ShardCell::check_backstop` waits for a notify already under way (a producer
 /// between its publish and its notify) before it counts a lost wake.
@@ -70,15 +70,33 @@ struct RunWord {
     /// this shard: when the hosting driver's park ran out the backstop, the shard had work
     /// and no notify had found it announced asleep, even after a grace for one in flight
     /// (`ShardCell::check_backstop`). Should stay 0. Written by the hosting driver only;
-    /// read through the inbox's caller entry, so 0 with caller-runs off.
+    /// read through the shard's caller entry (`CallerEntry`), so 0 with caller-runs off.
     backstop_wakes: AtomicU64,
+    /// Callers' turns that handled a message (`Engine::caller_turns`, the metric
+    /// `caller_turns`).
+    turns: AtomicU64,
+    /// The work hint (#1176 rev 3.1, C3): caller-run commits submitted, counted by the
+    /// committing client as it starts its caller wait, and the count the token's holder read
+    /// when it last found the queue empty. A client tries the token only while `sent >
+    /// drained`. A hint: a stale value costs a turn that finds nothing, or a client that
+    /// leaves its message to the driver, whose wakeup the submit's notify already guarantees.
+    /// It lives here, not on the inbox, so a runtime with caller-runs off carries none of it
+    /// (D321).
+    sent: AtomicU64,
+    drained: AtomicU64,
 }
 
 /// A shard a committing client may run (#1176): the runtime's entry, on the shard's inbox.
 pub(crate) trait CallerTurn: Send + Sync {
-    /// Runs a caller's turn if the token is free and the driver doesn't want it. Returns
-    /// whether a turn ran.
+    /// Runs a caller's turn if the work hint says something may be queued, the token is
+    /// free and the driver doesn't want it. Returns whether a turn ran.
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool;
+
+    /// Counts a caller-run commit submitted, for the work hint.
+    fn note_sent(&self);
+
+    /// Callers' turns that handled a message. Relaxed.
+    fn turns(&self) -> u64;
 
     /// Lost wakes the park backstop recovered on the shard (see `RunWord::backstop_wakes`).
     /// Relaxed.
@@ -107,6 +125,9 @@ impl<H: ShardHandler> ShardCell<H> {
                 skipped: AtomicBool::new(false),
                 caller_busy: AtomicU64::new(0),
                 backstop_wakes: AtomicU64::new(0),
+                turns: AtomicU64::new(0),
+                sent: AtomicU64::new(0),
+                drained: AtomicU64::new(0),
             },
             id,
             signal,
@@ -224,13 +245,6 @@ impl<H: ShardHandler> ShardCell<H> {
         self.run.caller_busy.swap(0, Ordering::Relaxed)
     }
 
-    /// Runs `f` on the shard's inbox (its caller-run entry is set there at start).
-    pub(crate) fn with_inbox(&self, f: impl FnOnce(&Inbox<H::Msg>)) {
-        if let Some(core) = self.driver_wait() {
-            f(core.inbox());
-        }
-    }
-
     /// Shutdown: takes the core out for good, once any caller's turn ends. The cell holds
     /// nothing from then on. `None` for a shard whose turn panicked.
     pub(crate) fn close(&self) -> Option<ShardCore<H>> {
@@ -243,14 +257,36 @@ impl<H: ShardHandler> ShardCell<H> {
     }
 }
 
+impl<H: ShardHandler> ShardCell<H> {
+    /// Notes the queue found empty, for the work hint. Read after the empty look: a message
+    /// that came in between is then counted drained, which only keeps a client from trying;
+    /// the driver's wake for it is the submit's notify.
+    pub(crate) fn note_drained(&self) {
+        self.run
+            .drained
+            .store(self.run.sent.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
 impl<H: ShardHandler> CallerTurn for ShardCell<H> {
+    fn note_sent(&self) {
+        self.run.sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn turns(&self) -> u64 {
+        self.run.turns.load(Ordering::Relaxed)
+    }
+
     fn backstop_wakes(&self) -> u64 {
         self.run.backstop_wakes.load(Ordering::Relaxed)
     }
 
     fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
         let run = &self.run;
-        if run.state.load(Ordering::Relaxed) != FREE || run.driver_wants.load(Ordering::Relaxed) {
+        if run.sent.load(Ordering::Relaxed) <= run.drained.load(Ordering::Relaxed)
+            || run.state.load(Ordering::Relaxed) != FREE
+            || run.driver_wants.load(Ordering::Relaxed)
+        {
             return false;
         }
         let Some(mut turn) = self.try_take(CALLER) else {
@@ -259,12 +295,13 @@ impl<H: ShardHandler> CallerTurn for ShardCell<H> {
         let vfs = Arc::clone(&turn.vfs);
         let start = vfs.monotonic_nanos();
         // No ring: any I/O the turn starts completes inline (#1176 rev 3, §4).
-        let (notify, handled) =
-            pigeonhole_io::inline_io(|| turn.caller_turn(own_done, &run.driver_wants));
+        let (notify, handled) = pigeonhole_io::inline_io(|| {
+            turn.caller_turn(own_done, &run.driver_wants, &|| self.note_drained())
+        });
         let spent = vfs.monotonic_nanos().saturating_sub(start);
         self.signal.add_busy(spent);
         if handled > 0 {
-            self.signal.add_caller_turn();
+            run.turns.fetch_add(1, Ordering::Relaxed);
         }
         run.caller_busy.fetch_add(spent, Ordering::Relaxed);
         // Work the turn left for the driver (a refused message, a task it spawned or woke, a
@@ -337,6 +374,9 @@ pub(crate) trait DriverShard<H: ShardHandler>: Send + Sized + 'static {
 pub(crate) trait DriverTurn<H: ShardHandler>: DerefMut<Target = ShardCore<H>> {
     /// The driver has work a caller may not take ([`ShardCell::want`]).
     fn want(&self);
+
+    /// The driver's look found the queue empty ([`ShardCell::note_drained`]).
+    fn note_drained(&self);
 }
 
 /// A shard on its way to another driver (a move is rare: boxed, it keeps the handoff small).
@@ -397,6 +437,9 @@ impl<H: ShardHandler> DriverShard<H> for ShardCore<H> {
 impl<H: ShardHandler> DriverTurn<H> for &mut ShardCore<H> {
     #[inline(always)]
     fn want(&self) {}
+
+    #[inline(always)]
+    fn note_drained(&self) {}
 }
 
 impl<H: ShardHandler> DriverShard<H> for Arc<ShardCell<H>> {
@@ -450,6 +493,10 @@ impl<H: ShardHandler> DriverShard<H> for Arc<ShardCell<H>> {
 impl<H: ShardHandler> DriverTurn<H> for Turn<'_, H> {
     fn want(&self) {
         self.cell.want();
+    }
+
+    fn note_drained(&self) {
+        self.cell.note_drained();
     }
 }
 

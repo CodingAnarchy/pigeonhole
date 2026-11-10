@@ -182,7 +182,7 @@ pub struct RuntimeConfig {
     pub idle_spin_cap: Duration,
     /// Engine-owned mode, opt-in (D321, D198's C2): a client
     /// waiting on a message it queued may run the shard's turn itself when no thread is
-    /// running it ([`Submitter::try_caller_turn`]), taking only what
+    /// running it ([`CallerEntry::try_run`]), taking only what
     /// [`ShardHandler::caller_may_take`] allows. Off by default.
     #[doc(hidden)]
     pub caller_runs: bool,
@@ -340,36 +340,9 @@ struct Inbox<M> {
     /// Submits against shutdown (`submit_gate`).
     gate: submit_gate::SubmitGate,
     signal: Arc<Signal>,
-    /// The shard's caller-run entry (#1176), set at start when caller-runs is on.
-    caller: std::sync::OnceLock<Arc<dyn cell::CallerTurn>>,
-    /// Caller-runs' work hint (#1176 rev 3.1, C3): messages submitted (counted only with
-    /// caller-runs on), and the count the token's holder last read before finding the queue
-    /// empty. A client takes the token only while `sent > drained`. It's a hint: a stale
-    /// value costs a turn that finds nothing, or a client that leaves a message to the
-    /// driver, whose wakeup the submit's own notify already guarantees.
-    sent: std::sync::atomic::AtomicU64,
-    drained: std::sync::atomic::AtomicU64,
-    /// `RuntimeConfig::caller_runs`: whether the hint is kept at all. Off, submits and
-    /// turns skip it for one branch, so the default pays nothing else (D193's ceilings).
-    caller_runs: bool,
 }
 
 impl<M> Inbox<M> {
-    /// Notes the queue found empty, for the work hint (caller-runs only). Read after the
-    /// empty look: a message that came in between is then counted drained, which only keeps
-    /// a client from trying; the driver's wake for it is the submit's notify.
-    #[cold]
-    fn note_drained(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.drained.store(self.sent.load(Relaxed), Relaxed);
-    }
-
-    /// Whether the work hint says something may be queued.
-    fn maybe_queued(&self) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.sent.load(Relaxed) > self.drained.load(Relaxed)
-    }
-
     fn close(&self) {
         self.gate.close();
         self.signal.force_wake();
@@ -458,40 +431,49 @@ impl<M: Send + 'static> Submitter<M> {
         let sent = inbox.tx.send(msg);
         inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
-        if inbox.caller_runs {
-            inbox
-                .sent
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         inbox.signal.notify();
         Ok(())
     }
+}
 
-    /// Turns committing clients ran on the target shard that handled at least one message,
-    /// since the runtime started (caller-runs, #1176). Relaxed.
-    #[doc(hidden)]
-    pub fn caller_turns(&self) -> u64 {
-        self.inbox.signal.caller_turns()
+/// A shard's caller-run entry (D321, [`Runtime::callers`]): a committing client waiting on
+/// its message to the shard runs the shard's turn through it. The engine keeps these apart
+/// from the submitters, so a runtime with caller-runs off carries nothing of caller-runs on
+/// its submit path.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct CallerEntry(Arc<dyn cell::CallerTurn>);
+
+impl fmt::Debug for CallerEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallerEntry").finish_non_exhaustive()
+    }
+}
+
+impl CallerEntry {
+    /// Counts a caller-run commit submitted to the shard, for the work hint: call it once
+    /// per commit, after its submit and before its first [`try_run`](Self::try_run).
+    pub fn note_sent(&self) {
+        self.0.note_sent();
     }
 
-    /// Lost wakes the caller-runs park backstop recovered on the target shard: work it had
-    /// when its driver's park ran out that no notify had signalled (#1176, #1502; should
-    /// stay 0). 0 with caller-runs off. Relaxed.
-    #[doc(hidden)]
-    pub fn caller_backstop_wakes(&self) -> u64 {
-        self.inbox.caller.get().map_or(0, |c| c.backstop_wakes())
+    /// If no thread is running the shard and something may be queued, runs a turn of it on
+    /// this thread: up to [`CALLER_BATCH`] queued messages the handler allows, foreground
+    /// only, ending early once `own_done` says the caller's own message was answered. Never
+    /// waits for the shard. Returns whether a turn ran.
+    pub fn try_run(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
+        self.0.try_run(own_done)
     }
 
-    /// Caller-runs (D321): if no thread is running the target shard and caller-runs is on,
-    /// runs a turn of it on this thread: up to [`CALLER_BATCH`] queued messages the
-    /// handler allows, foreground only, ending early once `own_done` says the caller's own
-    /// message was answered. Never waits for the shard. Returns whether a turn ran.
-    #[doc(hidden)]
-    pub fn try_caller_turn(&self, own_done: &mut dyn FnMut() -> bool) -> bool {
-        match self.inbox.caller.get() {
-            Some(c) if self.inbox.maybe_queued() => c.try_run(own_done),
-            _ => false,
-        }
+    /// Callers' turns on the shard that handled a message. Relaxed.
+    pub fn turns(&self) -> u64 {
+        self.0.turns()
+    }
+
+    /// Lost wakes the caller-runs park backstop recovered on the shard: work it had when its
+    /// driver's park ran out that no notify had signalled (#1502; should stay 0). Relaxed.
+    pub fn backstop_wakes(&self) -> u64 {
+        self.0.backstop_wakes()
     }
 }
 
@@ -565,10 +547,6 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
-    /// `RuntimeConfig::caller_runs` (#1176): whether a look that finds the queue empty
-    /// notes it for the work hint. Off, the look is main's exactly, plus this branch on the
-    /// empty path only.
-    caller_runs: bool,
     /// Messages handled and background slices run, in all (`ShardDriver::work_count`).
     work_done: u64,
     /// Turns in a row that ended before their background slices because a future of the
@@ -657,7 +635,6 @@ impl<H: ShardHandler> ShardCore<H> {
             submitters,
             spawner,
             vfs,
-            caller_runs,
             ..
         } = self;
         let mut ctx = ShardContext {
@@ -677,12 +654,7 @@ impl<H: ShardHandler> ShardCore<H> {
                     handler.handle(&mut ctx, msg);
                     n += 1;
                 }
-                Err(_) => {
-                    if *caller_runs {
-                        submitters[usize::from(id.0)].inbox.note_drained();
-                    }
-                    break;
-                }
+                Err(_) => break,
             }
         }
         if n > 0 {
@@ -704,6 +676,7 @@ impl<H: ShardHandler> ShardCore<H> {
         &mut self,
         own_done: &mut dyn FnMut() -> bool,
         wants: &std::sync::atomic::AtomicBool,
+        drained: &dyn Fn(),
     ) -> (bool, usize) {
         let _shard = EnterShard::new(self.id);
         let deadline_before = self.next_deadline();
@@ -737,7 +710,7 @@ impl<H: ShardHandler> ShardCore<H> {
                     None => match rx.try_recv() {
                         Ok(m) => m,
                         Err(_) => {
-                            submitters[usize::from(id.0)].inbox.note_drained();
+                            drained();
                             break;
                         }
                     },
@@ -925,9 +898,6 @@ impl<H: ShardHandler> ShardCore<H> {
         self.signal().prepare_sleep();
         if self.stash.is_none() {
             self.stash = self.rx.try_recv().ok();
-            if self.caller_runs && self.stash.is_none() {
-                self.inbox().note_drained();
-            }
         }
         if self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back() {
             self.signal().awake();
@@ -1009,10 +979,6 @@ fn build<H: ShardHandler>(
                     tx,
                     gate: submit_gate::SubmitGate::new(),
                     signal: Arc::new(Signal::new()),
-                    caller: std::sync::OnceLock::new(),
-                    sent: std::sync::atomic::AtomicU64::new(0),
-                    drained: std::sync::atomic::AtomicU64::new(0),
-                    caller_runs: config.caller_runs,
                 }),
             }
         })
@@ -1044,7 +1010,6 @@ fn build<H: ShardHandler>(
             released: false,
             own_ring: false,
             spin: IdleSpin::new(config.idle_spin, config.idle_spin_cap),
-            caller_runs: config.caller_runs,
         })
         .collect();
     (submitters, cores)
@@ -1135,6 +1100,9 @@ pub struct Runtime<H: ShardHandler> {
     pinning: Pinning,
     /// The CPUs the driver threads pinned themselves to, in driver order (ICR 0101).
     driver_cpus: Vec<usize>,
+    /// Each shard's caller-run entry, in shard order, with caller-runs on (D321); empty
+    /// with it off.
+    callers: Vec<CallerEntry>,
 }
 
 impl<H: ShardHandler> fmt::Debug for Runtime<H> {
@@ -1213,6 +1181,7 @@ impl<H: ShardHandler> Runtime<H> {
             workers: Vec::new(),
             plan: None,
             driver_cpus: Vec::new(),
+            callers: Vec::new(),
             pinning: Pinning {
                 threads,
                 unpinned,
@@ -1232,15 +1201,16 @@ impl<H: ShardHandler> Runtime<H> {
         // How the drivers hold their shards, chosen once (D321): behind the run token with
         // caller-runs on, plainly (the driver loop as before caller-runs) with it off.
         let spawned = if config.caller_runs {
-            let cells = cores.into_iter().map(|core| {
-                let cell = Arc::new(cell::ShardCell::new(core));
-                let entry: Arc<dyn cell::CallerTurn> = Arc::clone(&cell) as _;
-                cell.with_inbox(|inbox| {
-                    let _ = inbox.caller.set(entry);
-                });
-                cell
-            });
-            spawn_drivers(&config, &shared, k, &cpu, cells)?
+            let cells: Vec<_> = cores
+                .into_iter()
+                .map(|core| Arc::new(cell::ShardCell::new(core)))
+                .collect();
+            // Shard order: `callers()[i]` is shard `i`'s.
+            rt.callers = cells
+                .iter()
+                .map(|cell| CallerEntry(Arc::clone(cell) as Arc<dyn cell::CallerTurn>))
+                .collect();
+            spawn_drivers(&config, &shared, k, &cpu, cells.into_iter())?
         } else {
             spawn_drivers(&config, &shared, k, &cpu, cores.into_iter())?
         };
@@ -1322,6 +1292,13 @@ impl<H: ShardHandler> Runtime<H> {
             workers,
             pool: pool.map(WorkerPool),
         })
+    }
+
+    /// Each shard's caller-run entry, in shard order, with caller-runs on (D321); empty with
+    /// it off.
+    #[doc(hidden)]
+    pub fn callers(&self) -> &[CallerEntry] {
+        &self.callers
     }
 
     /// Submitter for `shard`.
@@ -1639,7 +1616,8 @@ impl<H: ShardHandler> ShardDriver<H> {
     pub fn run_caller_turn(&mut self) -> bool {
         let wants = std::sync::atomic::AtomicBool::new(false);
         let core = &mut self.core;
-        let (_, handled) = pigeonhole_io::inline_io(|| core.caller_turn(&mut || false, &wants));
+        let (_, handled) =
+            pigeonhole_io::inline_io(|| core.caller_turn(&mut || false, &wants, &|| {}));
         handled > 0
     }
 

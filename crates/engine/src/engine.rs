@@ -1765,6 +1765,9 @@ impl Engine {
                     .map(|i| rt.submitter(ShardId(i as u16)))
                     .collect();
                 let _ = shared.submitters.set(submitters);
+                if !rt.callers().is_empty() {
+                    let _ = shared.callers.set(rt.callers().into());
+                }
                 *inner.runtime.lock().unwrap_or_else(PoisonError::into_inner) = Some(rt);
                 None
             }
@@ -1899,9 +1902,9 @@ impl Engine {
     pub fn caller_turns(&self) -> u64 {
         self.inner
             .shared
-            .submitters
+            .callers
             .get()
-            .map_or(0, |subs| subs.iter().map(|s| s.caller_turns()).sum())
+            .map_or(0, |callers| callers.iter().map(|c| c.turns()).sum())
     }
 
     /// Creates a table with its families (a manifest commit).
@@ -3890,11 +3893,15 @@ impl Engine {
                 m.shard_busy_nanos += sub.busy_nanos();
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
                 m.shard_spin_time_nanos += sub.spin_nanos();
-                m.caller_turns += sub.caller_turns();
-                m.caller_backstop_wakes += sub.caller_backstop_wakes();
                 let (fallbacks, room) = sub.background_take_backs();
                 m.background_take_backs.0 += fallbacks;
                 m.background_take_backs.1 += room;
+            }
+        }
+        if let Some(callers) = shared.callers.get() {
+            for c in callers.iter() {
+                m.caller_turns += c.turns();
+                m.caller_backstop_wakes += c.backstop_wakes();
             }
         }
         let w = &shared.visibility;
@@ -7027,7 +7034,6 @@ impl Shared {
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
-            caller_runs: options.caller_runs,
             tail_index: false,
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),
@@ -7064,6 +7070,7 @@ impl Shared {
             wal_pin_bytes: 0,
             feed: None,
             submitters: std::sync::OnceLock::new(),
+            callers: std::sync::OnceLock::new(),
             wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,

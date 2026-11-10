@@ -629,9 +629,9 @@ fn wait_body(
         return Ok(info);
     }
     if let Some(shard) = caller
-        && shared.caller_runs
+        && let Some(callers) = shared.callers.get()
     {
-        return wait_as_caller(shared, waiter, shard);
+        return wait_as_caller(shared, waiter, &callers[usize::from(shard.0)]);
     }
     let mut spin = SpinWait::new(window);
     let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
@@ -1395,10 +1395,10 @@ const CALLER_POLLS: u32 = 32;
 fn wait_as_caller(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
-    shard: pigeonhole_runtime::ShardId,
+    entry: &pigeonhole_runtime::CallerEntry,
 ) -> crate::Result<CommitInfo> {
     let mut spin = SpinWait::new(shared.commit_spin_nanos);
-    let Settled { info, batch } = wait_reply_as_caller(shared, waiter, &mut spin, shard)?;
+    let Settled { info, batch } = wait_reply_as_caller(shared, waiter, &mut spin, entry)?;
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
     Ok(info)
@@ -1409,13 +1409,14 @@ fn wait_reply_as_caller<T: Send>(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<T>>,
     spin: &mut SpinWait,
-    shard: pigeonhole_runtime::ShardId,
+    entry: &pigeonhole_runtime::CallerEntry,
 ) -> crate::Result<T> {
     if shared.drivers.current_drives() {
         // A thread that drives a shard never blocks here (D88): as `wait_reply_spinning`.
         return wait_reply_spinning(shared, waiter, spin);
     }
-    let sub = shared.submitter(shard);
+    // The work hint: this commit is queued until its turn takes it.
+    entry.note_sent();
     let mut polled = None;
     let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -1434,7 +1435,7 @@ fn wait_reply_as_caller<T: Send>(
         }
         polls = polls.wrapping_add(1);
         if polls.is_multiple_of(CALLER_POLLS) {
-            sub.try_caller_turn(&mut || ready_now(waiter, &mut polled));
+            entry.try_run(&mut || ready_now(waiter, &mut polled));
             return polled.is_some();
         }
         false

@@ -23,6 +23,7 @@ perf287's full-scale gate A/B (D321) found two things. The option cuts buffered 
 ## Off costs nothing
 - **The drivers:** with the option off, the runtime's drivers hold their shards as plain `ShardCore`s (a type parameter chosen at start), so they run the loop as before caller-runs.
 - **The commit path:** a blocking commit's spinning wait tests the option once, and the caller path is out of line.
+- **The submit path and the shard's drain:** they're main's. The caller entries, the work hint and the turn count live in the run token's cell, reached through the engine's `Shared::callers`, which is set only with the option on.
 - **Checked by:** x86 callgrind on #1502 against the D193/D195 ceilings.
 
 ## Callers changed

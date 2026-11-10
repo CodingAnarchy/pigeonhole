@@ -4605,7 +4605,7 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 **Zero off-cost by type (the evaluation's condition (b)).** With caller-runs off, nothing of it runs and almost nothing of it is compiled into the default paths:
 - **The drivers:** they hold their shards as plain `ShardCore`s, chosen when the runtime starts by a type parameter on the driver loop (`DriverShard`). The loop is main's: no token, skip mark, backstop or branch on the option.
 - **A blocking commit's wait:** it tests the option once, on its spinning path only. The caller path is a separate, `#[cold]` function.
-- **Submit:** it keeps one test of the option, which guards the inbox's work-hint count.
+- **Submit and the turn's drain:** they're main's. The work hint, the turn count and the caller entries live in the run token's cell and the engine's `Shared::callers`, not on the inbox or the wakeup signal.
 - **x86 callgrind** on the PR confirms the instruction ceilings (D193, D195) hold.
 
 **What it amends:**

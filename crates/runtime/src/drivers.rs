@@ -1008,7 +1008,7 @@ fn spin_poll<H: ShardHandler, S: DriverShard<H>>(
             if core.stash.is_none() {
                 core.stash = core.rx.try_recv().ok();
                 if S::CALLER_RUNS && core.stash.is_none() {
-                    core.inbox().note_drained();
+                    core.note_drained();
                 }
             }
             if core.stash.is_some() || core.signal().task_woken() || core.inbox().is_closed() {
@@ -1037,13 +1037,25 @@ fn spin_poll<H: ShardHandler, S: DriverShard<H>>(
         for cell in cores.iter_mut() {
             // A caller holding the token sees `skipped` at its release and wakes the thread:
             // announce sleep for the shard all the same, so that wake reaches it.
-            let looked = cell.look().map(|mut t| t.check_before_sleep());
+            let looked = cell.look().map(|mut t| {
+                let found = t.check_before_sleep();
+                if S::CALLER_RUNS && !found {
+                    t.note_drained();
+                }
+                found
+            });
             hit |= match looked {
                 Some(found) => found,
                 // Announce sleep first, then retry (as in the turns above).
                 None => {
                     cell.signal().prepare_sleep();
-                    cell.look().is_some_and(|mut t| t.check_before_sleep())
+                    cell.look().is_some_and(|mut t| {
+                        let found = t.check_before_sleep();
+                        if S::CALLER_RUNS && !found {
+                            t.note_drained();
+                        }
+                        found
+                    })
                 }
             };
         }

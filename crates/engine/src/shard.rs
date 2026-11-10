@@ -524,8 +524,6 @@ pub(crate) struct Shared {
     pub flush_backoff_nanos: u64,
     /// `EngineOptions::commit_spin_nanos` (D198).
     pub commit_spin_nanos: u64,
-    /// `EngineOptions::caller_runs` (#1176): a waiting committer may run its shard's turn.
-    pub caller_runs: bool,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
     pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,
@@ -600,6 +598,10 @@ pub(crate) struct Shared {
     pub feed: Option<Arc<crate::feed::Feed>>,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
+    /// Each shard's caller-run entry, in shard order: set at an engine-owned open with
+    /// `EngineOptions::caller_runs` (D321), never otherwise. A waiting committer may run its
+    /// shard's turn through it.
+    pub callers: std::sync::OnceLock<Box<[pigeonhole_runtime::CallerEntry]>>,
     /// Per shard, a handle on its WAL stream's count of submitted, unfinished I/O
     /// (`IoTracker`), set when the stream is attached at open (`ShardState::set_wal`); the
     /// close waits on them after the runtime's threads are joined (#824), so a reopen in
