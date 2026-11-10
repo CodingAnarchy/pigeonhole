@@ -3638,3 +3638,59 @@ fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
 fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
     v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }
+
+/// #1595: a backup sized each new SST's extent at the target SST size (64 MiB), aligned to
+/// its size, so every family with memtable data took a 64 MiB slot of the copy: six small
+/// families made a copy of over 384 MiB, nearly all free (on Windows, real bytes to write
+/// and hash). Now a memtable's SST is sized from its bytes, so a copy stays about the size
+/// of what it holds. The rewrite of an SST holding commits above the snapshot is the
+/// engine's `backup_below_an_ssts_commits_rewrites_it_without_them`.
+#[test]
+fn a_backup_s_file_is_about_the_size_of_what_it_holds() {
+    const FAMILIES: [&str; 6] = ["f0", "f1", "f2", "f3", "f4", "f5"];
+    let dir = TempDir::new("backup-size");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(2).memtable_budget(4 << 20);
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let mut builder = db.table("t").unwrap();
+    for f in FAMILIES {
+        builder = builder.family(f, Family::default());
+    }
+    let t = builder.create_if_missing().unwrap();
+    // Every family's commits only in memtables: the copy writes six SSTs from them.
+    for (i, f) in FAMILIES.iter().enumerate() {
+        for r in 0..20u8 {
+            t.mutate(&[b'r', r])
+                .put(f, b"q", &[1, i as u8, r])
+                .commit()
+                .unwrap();
+        }
+    }
+    let source = std::fs::metadata(&path).unwrap().len();
+    let held = dir.0.join("held.phdb");
+    db.backup(&held).unwrap();
+    // The file's length, not its blocks: a sparse copy's free tail costs nothing on some file
+    // systems, and every byte on others.
+    let len = std::fs::metadata(&held).unwrap().len();
+    assert!(
+        len < 64 << 20 && len <= source + (8 << 20),
+        "a copy of {} families' memtables is {len} bytes (the source is {source}): a 64 MiB \
+         slot per family's SST",
+        FAMILIES.len()
+    );
+
+    // The copy holds what it should.
+    let copy = Pigeonhole::open(&held, opts().create_if_missing(false)).unwrap();
+    let ct = copy.table("t").unwrap().open().unwrap();
+    for (i, f) in FAMILIES.iter().enumerate() {
+        assert_eq!(
+            value(&ct, b"r\x07", f, b"q").as_deref(),
+            Some(&[1, i as u8, 7][..]),
+            "{f}"
+        );
+    }
+    drop(ct);
+    copy.close().unwrap();
+    drop(t);
+    db.close().unwrap();
+}
