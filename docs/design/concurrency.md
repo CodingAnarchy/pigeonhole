@@ -27,6 +27,7 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 | Caller thread | A client thread running a shard's turn itself while it waits (caller-runs, D321's opt-in `EngineOptions::caller_runs`, off by default). It holds the shard's run token, so it is the one thread touching that shard's state for the turn; see appendix D's caller-runs table. |
 | Manifest pump | Whoever holds the manifest exclusion (`Shared::manifest_busy`) and runs `manifest::begin` / `end`: a shard thread's `ManifestPump` task, or a client thread in `commit_req_from_thread` / `drain_sync`. |
 | Background task | A cooperative task (flush, compaction, WAL spares, `ClockTimer`) on a shard's scheduler or the runtime's pool. |
+| Open-time pre-size | With `wal_preallocate` (D157 amendment, ICR 0130), one scoped thread per WAL stream (`pigeonhole-wal-presize`) inside `Engine::open`, before the runtime starts. Each runs `SpareSegments::prepare_ring` on its own stream, under the WAL crate's spare-pool lock (uncontended: nothing else runs yet), and all are joined before any shard takes a turn. No primitive is added. |
 | Completion | The thread that resolves an I/O completion or a `Notifier`, and so runs the continuations chained to it. |
 | Reader process | Another process attached read-only through shared memory (`Role::Reader`). |
 
