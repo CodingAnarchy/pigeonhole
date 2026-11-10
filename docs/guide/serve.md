@@ -394,9 +394,9 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 
     Past about 64 partitions × 16 shards, a checkpoint comes every 64 commits and costs more per event.
   - **`allow_partial: true`** keeps the stream going when a partition's node can't be reached. A `partition_state` event says which partition is missing, and again when it's back. Its commits then continue from where they left off, with none skipped. Without it, the stream ends with `PartitionUnavailable` naming the partition; resume once the node is back.
-  - **Limits:** a subscription holds a `--max-streams` place on the node it entered, and one on each partition's node. It buffers up to 256 KiB on its entry node and on each partition's node: (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
+  - **Limits:** a subscription holds a `--max-streams` place on the node it entered, and one on each partition's node. An entry node that also serves one of its partitions holds two. It buffers up to 256 KiB on its entry node and on each partition's node: (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
   - **Expiry:** a token can't resume after its partitions' map changed under it (a new table in a subscription of every table), or after a partition was relocated: `FeedExpired`, subscribe again.
-  - A start from a snapshot comes with cluster transactions and snapshots.
+  - A start from a snapshot isn't supported on a cluster subscription.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.

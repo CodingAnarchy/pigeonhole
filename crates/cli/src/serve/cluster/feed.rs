@@ -72,7 +72,7 @@ struct Ctx {
     prefix: Bytes,
     visible: bool,
     /// The subscription's connection to each peer, made on first use (S1).
-    channels: Mutex<HashMap<String, Channel>>,
+    channels: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Channel>>>>,
 }
 
 /// A component's stream of encoded events.
@@ -88,8 +88,12 @@ struct Part {
     /// Commits through this seqno after `at` are passed over (`skip_through`); 0: none.
     skip: u64,
     events: Option<Events>,
-    /// While unavailable (only with `allow_partial`): when to try again, and why.
+    /// While unavailable (only with `allow_partial`): when to try again.
     retry: Option<tokio::time::Instant>,
+    /// An open of it is running in the background.
+    opening: bool,
+    /// Reported unavailable, and not yet available again.
+    unavailable: bool,
 }
 
 /// `Feed.Subscribe` on a cluster node: opens every component, then merges them on a task of
@@ -146,7 +150,7 @@ pub(crate) async fn subscribe(
         Some(S::FromOldest(true)) => placed.keys().map(|p| (p.clone(), At::Oldest)).collect(),
         Some(S::FromSnapshot(_)) => {
             return Err(ApiError::unsupported(
-                "a feed from a snapshot in a cluster comes with D317's ticket 3",
+                "a snapshot start isn't supported on a cluster subscription",
             ));
         }
         Some(S::Resume(bytes)) => {
@@ -172,6 +176,8 @@ pub(crate) async fn subscribe(
             tables,
             events: None,
             retry: None,
+            opening: false,
+            unavailable: false,
         })
         .collect();
     let cluster_id = routes.cluster_id().to_owned();
@@ -200,6 +206,7 @@ pub(crate) async fn subscribe(
         next_checkpoint: 1,
         moved: false,
         states: Vec::new(),
+        opens: tokio::task::JoinSet::new(),
     };
     merge.open_all().await?;
     let limits = service.feed_limits();
@@ -286,6 +293,10 @@ struct Merge {
     moved: bool,
     /// `PartitionState` events to send.
     states: Vec<proto::FeedEvent>,
+    /// Parts opening again in the background, each bounded by the request timeout, so
+    /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
+    /// #1700).
+    opens: tokio::task::JoinSet<(usize, Result<Events, ApiError>)>,
 }
 
 /// What a component's event was.
@@ -316,11 +327,7 @@ impl Merge {
             opened[i] = Some(result);
         }
         for (i, result) in opened.into_iter().enumerate() {
-            match result.expect("every part was opened") {
-                Ok(events) => self.parts[i].events = Some(events),
-                Err(e) if self.allow_partial && retryable(&e) => self.unavailable(i, &e),
-                Err(e) => return Err(in_partition(&self.parts[i].partition, e)),
-            }
+            self.opened(i, result.expect("every part was opened"))?;
         }
         Ok(())
     }
@@ -346,12 +353,57 @@ impl Merge {
         }
     }
 
-    /// Part `i` is unavailable: reported, and tried again after [`RETRY`].
+    /// Part `i` is unavailable: reported once, and tried again after [`RETRY`].
     fn unavailable(&mut self, i: usize, e: &ApiError) {
         let p = &mut self.parts[i];
         p.events = None;
         p.retry = Some(tokio::time::Instant::now() + RETRY);
-        self.states.push(state_event(&p.partition, Some(e)));
+        if !p.unavailable {
+            p.unavailable = true;
+            self.states.push(state_event(&p.partition, Some(e)));
+        }
+    }
+
+    /// An open of part `i` finished: its stream from now on, and reported available again
+    /// if it wasn't; or unavailable until the next try (`allow_partial`), or the stream's
+    /// end.
+    fn opened(&mut self, i: usize, result: Result<Events, ApiError>) -> Result<(), ApiError> {
+        self.parts[i].opening = false;
+        match result {
+            Ok(events) => {
+                let p = &mut self.parts[i];
+                p.events = Some(events);
+                p.retry = None;
+                if std::mem::take(&mut p.unavailable) {
+                    self.states.push(state_event(&p.partition, None));
+                }
+                Ok(())
+            }
+            Err(e) if self.allow_partial && retryable(&e) => {
+                self.unavailable(i, &e);
+                Ok(())
+            }
+            Err(e) => Err(in_partition(&self.parts[i].partition, e)),
+        }
+    }
+
+    /// Starts opening part `i` again in the background, from its position, where the map
+    /// puts it; after pulling the map from its current owner first (`pull`: that owner
+    /// answered `WrongPartition`, so its map is newer).
+    fn reopen(&mut self, i: usize, pull: bool) {
+        let owner = self
+            .ctx
+            .node
+            .routes()
+            .as_ref()
+            .and_then(|r| r.owner(&self.parts[i].partition).cloned());
+        let p = &mut self.parts[i];
+        p.retry = None;
+        p.opening = true;
+        let (ctx, open, epoch) = (Arc::clone(&self.ctx), self.request(i), self.parts[i].epoch);
+        let pull = pull.then_some(owner).flatten();
+        self.opens
+            .spawn(async move { (i, ctx.reopen(open, epoch, pull).await) });
     }
 
     async fn run(&mut self, sink: &Sink, quiet: Duration) -> Result<(), ApiError> {
@@ -381,22 +433,25 @@ impl Merge {
                         Some(Err(e)) => Some(e),
                         None => Some(ApiError::partition_unavailable("its stream ended")),
                     };
-                    if let Some(e) = ended {
-                        self.parts[i].events = None;
-                        if let Err(e) = self.failed(i, e).await {
-                            self.last_checkpoint(sink).await;
-                            return Err(e);
-                        }
+                    if let Some(e) = ended
+                        && let Err(e) = self.failed(i, e)
+                    {
+                        self.last_checkpoint(sink).await;
+                        return Err(e);
+                    }
+                }
+                Some(done) = self.opens.join_next(), if !self.opens.is_empty() => {
+                    let (i, result) = done.map_err(|e| ApiError::internal(e.to_string()))?;
+                    if let Err(e) = self.opened(i, result) {
+                        self.last_checkpoint(sink).await;
+                        return Err(e);
                     }
                 }
                 () = sleep_until(retry_at) => {
                     let now = tokio::time::Instant::now();
                     for i in 0..self.parts.len() {
-                        if self.parts[i].retry.is_some_and(|at| at <= now)
-                            && let Err(e) = self.reopen(i).await
-                        {
-                            self.last_checkpoint(sink).await;
-                            return Err(e);
+                        if self.parts[i].retry.is_some_and(|at| at <= now) {
+                            self.reopen(i, false);
                         }
                     }
                 }
@@ -427,6 +482,9 @@ impl Merge {
             // its own checkpoints.
             Kind::Progress | Kind::Other => Ok(None),
             Kind::Commit => {
+                // A part's commits arrive in seqno order and those through `skip` are passed
+                // over by its node, so any commit is past it (simp724's N2).
+                self.parts[i].skip = 0;
                 self.since_checkpoint += 1;
                 let mut tail = Vec::with_capacity(16 + self.parts[i].partition.len());
                 put_field(
@@ -497,82 +555,18 @@ impl Merge {
 
     /// Part `i`'s stream failed with `e`: opened again where the map now puts it after a
     /// `WrongPartition`; otherwise unavailable (`allow_partial`), or the stream's end.
-    async fn failed(&mut self, i: usize, e: ApiError) -> Result<(), ApiError> {
+    fn failed(&mut self, i: usize, e: ApiError) -> Result<(), ApiError> {
+        self.parts[i].events = None;
         if e.code == "WrongPartition" {
             // The owner's map is newer: take it, then open the part where it says.
-            self.pull_from_owner(i).await;
-            return match self.reopen_now(i).await {
-                Ok(()) => Ok(()),
-                Err(e) if self.allow_partial && retryable(&e) => {
-                    self.unavailable(i, &e);
-                    Ok(())
-                }
-                Err(e) => Err(in_partition(&self.parts[i].partition, e)),
-            };
+            self.reopen(i, true);
+            return Ok(());
         }
         if self.allow_partial && retryable(&e) {
             self.unavailable(i, &e);
             return Ok(());
         }
         Err(in_partition(&self.parts[i].partition, e))
-    }
-
-    /// Pulls the map from part `i`'s owner (a `WrongPartition` says it's newer).
-    async fn pull_from_owner(&mut self, i: usize) {
-        let owner = self
-            .ctx
-            .node
-            .routes()
-            .as_ref()
-            .and_then(|r| r.owner(&self.parts[i].partition).cloned());
-        if let Some(o) = owner {
-            let _ = self
-                .ctx
-                .node
-                .pull_now(&o.node, &o.address, self.map_version)
-                .await;
-        }
-    }
-
-    /// A retry of unavailable part `i`: available again, or unavailable until the next.
-    async fn reopen(&mut self, i: usize) -> Result<(), ApiError> {
-        match self.reopen_now(i).await {
-            Ok(()) => Ok(()),
-            Err(e) if retryable(&e) => {
-                self.parts[i].retry = Some(tokio::time::Instant::now() + RETRY);
-                Ok(())
-            }
-            Err(e) => Err(in_partition(&self.parts[i].partition, e)),
-        }
-    }
-
-    /// Opens part `i` from its position where the current map puts it. A partition whose
-    /// epoch moved was relocated: its position can't resume there (`FeedExpired`).
-    async fn reopen_now(&mut self, i: usize) -> Result<(), ApiError> {
-        let epoch = {
-            let routes = self.ctx.node.routes();
-            let routes = routes
-                .as_ref()
-                .ok_or_else(|| ApiError::partition_unavailable("no map"))?;
-            self.map_version = self.map_version.max(routes.map_version());
-            routes
-                .owner(&self.parts[i].partition)
-                .map_or(0, |o| o.epoch)
-        };
-        if epoch != self.parts[i].epoch {
-            return Err(expired(format!(
-                "partition {:?} was relocated (epoch {} to {epoch}): subscribe again",
-                self.parts[i].partition, self.parts[i].epoch
-            )));
-        }
-        let events = Arc::clone(&self.ctx).open(self.request(i)).await?;
-        let was_unavailable = self.parts[i].retry.take().is_some();
-        self.parts[i].events = Some(events);
-        if was_unavailable {
-            self.states
-                .push(state_event(&self.parts[i].partition, None));
-        }
-        Ok(())
     }
 }
 
@@ -705,8 +699,58 @@ struct Open {
 }
 
 impl Ctx {
-    /// Opens a component where the map puts its partition: here, or on its node.
+    /// Opens a component where the map puts its partition: here, or on its node. Bounded by
+    /// the request timeout, the connection and the first response included, so a node that
+    /// accepts connections but never answers can't hold an open forever.
     async fn open(self: Arc<Self>, open: Open) -> Result<Events, ApiError> {
+        let within = self.service.request_timeout();
+        let partition = open.partition.clone();
+        tokio::time::timeout(within, Arc::clone(&self).open_now(open))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ApiError::partition_unavailable(format!(
+                    "partition {partition:?}'s node didn't answer within {} ms",
+                    within.as_millis()
+                )))
+            })
+    }
+
+    /// A background reopen ([`Merge::reopen`]): after `pull`'s map, if given (bounded by the
+    /// request timeout too), and only at the epoch the part's position is from.
+    async fn reopen(
+        self: Arc<Self>,
+        mut open: Open,
+        epoch: u64,
+        pull: Option<super::route::Owner>,
+    ) -> Result<Events, ApiError> {
+        if let Some(o) = pull {
+            let within = self.service.request_timeout();
+            let _ = tokio::time::timeout(
+                within,
+                self.node.pull_now(&o.node, &o.address, open.map_version),
+            )
+            .await;
+        }
+        let now = {
+            let routes = self.node.routes();
+            let routes = routes
+                .as_ref()
+                .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
+            open.map_version = open.map_version.max(routes.map_version());
+            routes.owner(&open.partition).map_or(0, |o| o.epoch)
+        };
+        if now != epoch {
+            // A relocation by promotion gives the partition another history (ticket 6 lets a
+            // relocation by file copy keep it).
+            return Err(expired(format!(
+                "partition {:?} was relocated (epoch {epoch} to {now}): subscribe again",
+                open.partition
+            )));
+        }
+        self.open(open).await
+    }
+
+    async fn open_now(self: Arc<Self>, open: Open) -> Result<Events, ApiError> {
         let owner = {
             let routes = self.node.routes();
             let routes = routes
@@ -756,31 +800,30 @@ impl Ctx {
         }))
     }
 
-    /// The subscription's connection to the peer at `address` (S1): its own, made on first
-    /// use and shared by its components there, never by forwarded calls.
+    /// The subscription's connection to the peer at `address` (S1): its own, made once on
+    /// first use (concurrent opens wait for the one connect, simp724's N1) and shared by its
+    /// components there, never by forwarded calls.
     async fn channel(&self, address: &str) -> Result<Channel, ApiError> {
-        if let Some(c) = self
-            .channels
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(address)
-        {
-            return Ok(c.clone());
-        }
-        let endpoint = self
-            .node
-            .endpoint(address)
-            .map_err(|e| ApiError::partition_unavailable(format!("node at {address}: {e}")))?;
-        let channel = endpoint.connect().await.map_err(|e| {
-            ApiError::partition_unavailable(format!(
-                "the partition's node at {address} can't be reached: {e}"
-            ))
-        })?;
-        self.channels
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(address.to_owned(), channel.clone());
-        Ok(channel)
+        let cell = Arc::clone(
+            self.channels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(address.to_owned())
+                .or_default(),
+        );
+        let channel = cell
+            .get_or_try_init(|| async {
+                let endpoint = self.node.endpoint(address).map_err(|e| {
+                    ApiError::partition_unavailable(format!("node at {address}: {e}"))
+                })?;
+                endpoint.connect().await.map_err(|e| {
+                    ApiError::partition_unavailable(format!(
+                        "the partition's node at {address} can't be reached: {e}"
+                    ))
+                })
+            })
+            .await?;
+        Ok(channel.clone())
     }
 }
 

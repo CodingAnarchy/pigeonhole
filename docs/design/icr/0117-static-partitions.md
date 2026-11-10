@@ -120,7 +120,7 @@
 - **Order:** a partition's commits keep its order, so each row's do. There's no order across partitions.
 - **`FeedEvent.partition`** (field 5) names the partition each event came from. `FeedCommit.seqno` is that partition's own seqno: it's comparable only with seqnos of the same partition.
 - **Tables the map doesn't place** answer `NotFound`.
-- **A start from a snapshot** is `Unsupported` until ticket 3.
+- **A start from a snapshot** is `Unsupported` (the coordinator's call; a one-partition version is #1701, Post-1.0).
 - **A cluster node takes `--change-feed`** for its partition, as a single node does.
 
 **Tokens are checkpoints** (D317 §8 as amended; option (C), the coordinator's call after perf287's numbers):

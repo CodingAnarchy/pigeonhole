@@ -618,3 +618,70 @@ fn a_subscriber_that_stops_reading_doesnt_hold_up_forwarded_calls() {
         drop(stalled);
     });
 }
+
+#[test]
+fn a_partition_whose_node_never_answers_doesnt_hold_up_the_others() {
+    // simp724's S1 on #1700: b accepts connections but never answers, so every open of p2
+    // waits out the request timeout (5 s here). Those opens run in the background: p1's
+    // commits keep arriving promptly across several retry rounds.
+    let rt = runtime();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut map = the_map(1, &[ports[0], ports[1], ports[2]]);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    // Bound, listening, never served: connections complete and then hear nothing.
+    let _silent_b = it.next().unwrap();
+    let (_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (a, c) = (ports[0], ports[2]);
+    rt.block_on(async {
+        let mut s = subscribe(
+            c,
+            SubscribeRequest {
+                allow_partial: true,
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(10), s.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&first.event, Some(Event::PartitionState(st)) if st.partition == "p2" && !st.available),
+            "{first:?}"
+        );
+        // Across about three retry rounds of 5 s opens.
+        let started = std::time::Instant::now();
+        let mut i = 0;
+        while started.elapsed() < Duration::from_secs(12) {
+            let row = format!("a{i:04}");
+            let wrote = std::time::Instant::now();
+            put(a, &row, "v").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            assert_eq!(seen[0].rows, std::slice::from_ref(&row));
+            assert!(
+                wrote.elapsed() < Duration::from_secs(1),
+                "p1's commit {row} took {:?} behind p2's opens",
+                wrote.elapsed()
+            );
+            i += 1;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(i >= 20, "{i}");
+    });
+    rt.shutdown_background();
+    let _ = db_a.map(pigeonhole::Pigeonhole::close);
+}
