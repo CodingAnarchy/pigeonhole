@@ -109,3 +109,30 @@ fn the_ring_counts_the_change_feeds_retention_and_a_reopen_fills_only_whats_miss
     check(&table(&db), 6);
     db.close().expect("close");
 }
+
+#[test]
+fn a_preallocating_reopen_grows_a_ring_another_open_created() {
+    // `phdb serve` over a store created elsewhere: the first open without the option (and the
+    // feed on, so the clean close keeps the stream), the reopen with it.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("later.phdb");
+    let feed = |o: Options| o.change_feed(FeedRetention::bytes(4 * SEG));
+    let db = Pigeonhole::open(&path, feed(options(false))).expect("open");
+    let t = table(&db);
+    write(&t, 1);
+    drop(t);
+    db.close().expect("close");
+    let before = wal_len(&path);
+    assert!(
+        before < (RING + 4) * SEG,
+        "the first open didn't pre-size: {before}"
+    );
+    let db = Pigeonhole::open(&path, feed(options(true))).expect("reopen");
+    assert_eq!(
+        wal_len(&path),
+        (RING + 4) * SEG,
+        "the reopen grew the ring to its target"
+    );
+    check(&table(&db), 1);
+    db.close().expect("close");
+}

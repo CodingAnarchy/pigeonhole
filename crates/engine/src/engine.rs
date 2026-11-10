@@ -1570,6 +1570,9 @@ impl Engine {
                 let i = stream.0 as usize;
                 let opts = stream_wal_opts(&shared, wal_opts, &rec);
                 let wal = rec.into_stream(opts)?;
+                if options.wal_preallocate {
+                    presize.push((wal.spares(), opts.retain_segments));
+                }
                 let _ = shared.metrics[i].wal.set(wal.counters());
                 note_feed_marks(&shared, i, &wal);
                 states[i].set_wal(Box::new(wal));
