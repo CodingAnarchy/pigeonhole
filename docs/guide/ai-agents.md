@@ -70,6 +70,29 @@ or, for a project, a `.mcp.json` at its root:
 
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
+## Remote MCP (`phdb serve`)
+> **Status:** on `main` for 1.2.0 (#1397). The data tools are served; the memory tools follow.
+
+[`phdb serve`](cli.md#phdb-serve) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
+
+```json
+{
+  "mcpServers": {
+    "pigeonhole": {
+      "type": "http",
+      "url": "https://db.internal:7448/mcp",
+      "headers": {"Authorization": "Bearer ${PIGEONHOLE_TOKEN}"}
+    }
+  }
+}
+```
+
+- **The token's scope decides the tools.** A read token gets the read tools only, and a write tool called anyway is refused (`PermissionDenied`). A write token gets `write` and `create_table` too. A replica offers the read tools whatever the token.
+- **The server's rules apply to every call:** its in-flight and concurrency limits, the reserved `__phdb_` table prefix, and on a replica, read-your-writes with `x-pigeonhole-min-primary-seqno`.
+- **Sessions** last until the client ends them, or until idle for `--mcp-session-idle-ms` (30 min) or older than `--mcp-session-lifetime-ms` (24 h). After that the client gets 404 and starts a new one, as MCP clients do. A session answers up to `--mcp-session-requests` (8) requests at once; past that, the extra request gets `Overloaded` and is retried.
+- **`nearest` appears for every session** once any session, or the application, creates the first vector family: each session's next request carries `notifications/tools/list_changed`.
+- **Results** are cut as with `phdb mcp`, at `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB). A session keeps up to `--mcp-session-cache-bytes` (8 MiB) of traversal results for its cursors.
+
 ## The tools
 Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md) (the server advertises `listChanged`, and after any tool call that finds the list changed, such as the first vector family appearing, whether this session or the writer added it, it sends `notifications/tools/list_changed`), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
 

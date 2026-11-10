@@ -25,6 +25,7 @@ mod connection_tests;
 mod data_tests;
 mod feed_tests;
 mod http1_tests;
+mod mcp_tests;
 mod memory_tests;
 mod replica_tests;
 mod session_tests;
@@ -80,7 +81,16 @@ fn limits() -> Limits {
             snapshot_lifetime: Duration::from_secs(600),
             max_sessions: 64,
             max_per_token: 16,
+            mcp_idle: Duration::from_secs(60),
+            mcp_lifetime: Duration::from_secs(600),
         },
+        mcp: crate::mcp::Limits {
+            result_bytes: 32 << 10,
+            value_bytes: 4 << 10,
+            feed_bytes: None,
+            cache_bytes: 8 << 20,
+        },
+        mcp_session_requests: 8,
     }
 }
 

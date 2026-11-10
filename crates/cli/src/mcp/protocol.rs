@@ -8,6 +8,9 @@
 //! the agent sees and can act on; only protocol mistakes (an unknown method or tool,
 //! malformed JSON-RPC) are JSON-RPC errors.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
 use serde_json::{Map, Value, json};
 
 use super::memory::{GUIDE, Memory};
@@ -33,14 +36,32 @@ const INVALID_PARAMS: i64 = -32602;
 /// MCP's code for a resource that doesn't exist.
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
-/// The protocol versions this server speaks, newest first. The tool shapes are the same in
-/// each; `structuredContent` (2025-06-18) is sent to every client, and older ones ignore it.
-/// (`/mcp`, 8c-3, will offer 2025-03-26 and later only: 2024-11-05's HTTP transport is
-/// HTTP+SSE, ai1249's M3 on D313.)
-const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// How the client reaches the server: each transport speaks its own protocol versions
+/// (ai1249's M3 on D313). The tool shapes are the same in each; `structuredContent`
+/// (2025-06-18) is sent to every client, and older ones ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// `phdb mcp`: one JSON-RPC message per line on standard input and output.
+    Stdio,
+    /// `phdb serve`'s `/mcp`: Streamable HTTP. 2024-11-05 defined the older HTTP+SSE
+    /// transport instead, so it isn't offered there.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    Http,
+}
+
+impl Transport {
+    /// The protocol versions it speaks, newest first.
+    pub(crate) fn versions(self) -> &'static [&'static str] {
+        const ALL: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+        match self {
+            Self::Stdio => ALL,
+            Self::Http => &ALL[..3],
+        }
+    }
+}
 
 /// What a session's requests reach: the tools and the memory store.
-pub(super) trait Host {
+pub(crate) trait Host {
     /// The memory store, with `--memory`.
     fn memory(&self) -> Option<&Memory>;
     /// The tools, as `tools/list` gives them.
@@ -51,26 +72,57 @@ pub(super) trait Host {
     fn call(&self, name: &str, args: &Map<String, Value>) -> Option<Outcome>;
 }
 
-/// One client's session.
+/// One client's session. Its state sits behind its own small locks, so a server can answer
+/// several of a session's requests at once (ai1249's N1 on #1660): a message never holds
+/// one across a tool call.
 #[derive(Debug, Default)]
 pub(crate) struct Session {
     /// The tool names the client was last given (`tools/list`): when a call changes them
     /// (`create_table` adding the first vector family brings `nearest`), the server sends
     /// `notifications/tools/list_changed` (#1356). `None` until the client lists.
-    listed: Option<Vec<String>>,
-    /// Whether a message since the last check held a `tools/call`: only then is the list
-    /// checked (ai1249 on #1379), so a ping or a notification costs no catalog walk.
-    called: bool,
+    listed: Mutex<Option<Vec<String>>>,
+    /// Whether a message since the last check held a `tools/call`, or the catalog may have
+    /// changed under the session: only then is the list checked (ai1249 on #1379), so a
+    /// ping or a notification costs no catalog walk.
+    called: AtomicBool,
+    /// The protocol version `initialize` settled on, once it has: on `/mcp`, a later
+    /// request's `MCP-Protocol-Version` must match it.
+    version: OnceLock<&'static str>,
 }
 
-/// The protocol, for any transport's sessions.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Core;
+impl Session {
+    /// The protocol version `initialize` settled on, once it has.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn version(&self) -> Option<&'static str> {
+        self.version.get().copied()
+    }
+
+    /// The catalog may have changed under the session (another session's `create_table`,
+    /// on a shared server): check the list after the next message, as after a call (M2).
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn catalog_moved(&self) {
+        self.called.store(true, Ordering::Relaxed);
+    }
+
+    fn listed(&self) -> MutexGuard<'_, Option<Vec<String>>> {
+        // A panic while it was held left a whole value: every change is one store.
+        self.listed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The protocol over one transport.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Core {
+    transport: Transport,
+}
 
 impl Core {
+    pub(crate) fn new(transport: Transport) -> Self {
+        Self { transport }
+    }
     /// One message's text: a request, a notification or a batch (2025-03-26). Returns the
     /// reply, if any is due.
-    pub(super) fn message(&self, host: &dyn Host, s: &mut Session, text: &str) -> Option<Value> {
+    pub(crate) fn message(&self, host: &dyn Host, s: &Session, text: &str) -> Option<Value> {
         let msg: Value = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(e) => return Some(error(Value::Null, PARSE_ERROR, &format!("not JSON: {e}"))),
@@ -89,20 +141,25 @@ impl Core {
 
     /// `notifications/tools/list_changed` if a call since the last check changed the tools
     /// from those last listed, once per change.
-    pub(super) fn list_changed(&self, host: &dyn Host, s: &mut Session) -> Option<Value> {
-        if !std::mem::take(&mut s.called) {
+    pub(crate) fn list_changed(&self, host: &dyn Host, s: &Session) -> Option<Value> {
+        if !s.called.swap(false, Ordering::Relaxed) {
             return None;
         }
-        let before = s.listed.as_ref()?;
+        if s.listed().is_none() {
+            return None;
+        }
+        // The catalog walk runs outside the lock; a concurrent `tools/list` may have
+        // replaced the list meanwhile, and the comparison is with whatever is there now.
         let now = host.names();
-        if *before == now {
+        let mut listed = s.listed();
+        if listed.as_ref().is_none_or(|before| *before == now) {
             return None;
         }
-        s.listed = Some(now);
+        *listed = Some(now);
         Some(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}))
     }
 
-    fn one(&self, host: &dyn Host, s: &mut Session, msg: Value) -> Option<Value> {
+    fn one(&self, host: &dyn Host, s: &Session, msg: Value) -> Option<Value> {
         let Value::Object(msg) = msg else {
             return Some(error(
                 Value::Null,
@@ -128,17 +185,21 @@ impl Core {
     fn request(
         &self,
         host: &dyn Host,
-        s: &mut Session,
+        s: &Session,
         method: &str,
         params: &Value,
     ) -> Result<Value, (i64, String)> {
         match method {
             "initialize" => {
                 let asked = params["protocolVersion"].as_str().unwrap_or("");
-                let version = PROTOCOL_VERSIONS
+                let versions = self.transport.versions();
+                let version = versions
                     .iter()
                     .find(|&&v| v == asked)
-                    .unwrap_or(&PROTOCOL_VERSIONS[0]);
+                    .copied()
+                    .unwrap_or(versions[0]);
+                // A repeated `initialize` keeps the first one's version.
+                let version = *s.version.get_or_init(|| version);
                 let mut capabilities = json!({"tools": {"listChanged": true}});
                 let mut instructions = INSTRUCTIONS.to_owned();
                 if let Some(m) = host.memory() {
@@ -160,7 +221,7 @@ impl Core {
             "ping" => Ok(json!({})),
             "tools/list" => {
                 let tools = host.list();
-                s.listed = Some(
+                *s.listed() = Some(
                     tools
                         .iter()
                         .filter_map(|t| t["name"].as_str().map(str::to_owned))
@@ -169,7 +230,7 @@ impl Core {
                 Ok(json!({"tools": tools}))
             }
             "tools/call" => {
-                s.called = true;
+                s.called.store(true, Ordering::Relaxed);
                 let name = params["name"]
                     .as_str()
                     .ok_or((INVALID_PARAMS, "tools/call needs a tool name".to_owned()))?;
@@ -225,4 +286,22 @@ fn tool_result(outcome: Outcome) -> Value {
 
 pub(super) fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Transport;
+
+    #[test]
+    fn each_transport_speaks_its_own_protocol_versions() {
+        // ai1249's M3 on D313: 2024-11-05's HTTP transport is HTTP+SSE, so Streamable HTTP
+        // offers 2025-03-26 and later only.
+        assert_eq!(Transport::Stdio.versions().last(), Some(&"2024-11-05"));
+        assert!(!Transport::Http.versions().contains(&"2024-11-05"));
+        assert_eq!(Transport::Http.versions().last(), Some(&"2025-03-26"));
+        assert_eq!(
+            Transport::Http.versions()[0],
+            Transport::Stdio.versions()[0]
+        );
+    }
 }
