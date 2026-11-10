@@ -11,6 +11,11 @@
 pub(crate) mod cli;
 pub(crate) mod identity;
 pub(crate) mod map;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the router, ticket 2's next commit, routes by it")
+)]
+pub(crate) mod route;
 #[cfg(test)]
 mod tests;
 
