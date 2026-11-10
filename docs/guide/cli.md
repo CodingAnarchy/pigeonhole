@@ -497,6 +497,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
   - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, scans and other reads across partitions, schema calls (`ListTables` included), feeds, backups, `Info` and `/mcp`.
   - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
+  - **Flags:** a cluster node takes `--shard-spin` and `--shm-dir` as a single node does, for its partition. `--change-feed`, `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
   - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.

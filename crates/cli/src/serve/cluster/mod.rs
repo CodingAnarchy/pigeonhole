@@ -850,6 +850,7 @@ const CLUSTER_CALLS: usize = 16;
 
 /// `phdb serve --cluster DIR`.
 pub(crate) fn run(
+    cli: &crate::args::Cli,
     args: &ServeArgs,
     dir: &Path,
     stderr: &mut dyn std::io::Write,
@@ -981,7 +982,10 @@ pub(crate) fn run(
     };
     let cluster_id = node.state().map.as_ref().map(|(m, _)| m.cluster_id.clone());
     let db = match (&local, &cluster_id) {
-        (Some((p, epoch)), Some(c)) => Some(open_partition(dir, c, p, *epoch)?),
+        (Some((p, epoch)), Some(c)) => {
+            let options = partition_options(args.shard_spin, cli.shm_dir.as_deref());
+            Some(open_partition(dir, c, p, *epoch, options)?)
+        }
         _ => None,
     };
     let placement = Arc::new(match &db {
@@ -1050,6 +1054,19 @@ pub(crate) fn run(
     )
 }
 
+/// The options a cluster node opens its partition with: the server's shard poll (none by
+/// default, D198 amendment 4) and `--shm-dir`, as a single node's (cli692's M1 on #1686).
+pub(crate) fn partition_options(
+    shard_spin: config::ShardSpin,
+    shm_dir: Option<&Path>,
+) -> pigeonhole::Options {
+    let options = shard_spin.apply(pigeonhole::Options::default());
+    match shm_dir {
+        Some(dir) => options.shm_dir(dir),
+        None => options,
+    }
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -1058,6 +1075,7 @@ fn open_partition(
     cluster_id: &str,
     partition: &str,
     epoch: u64,
+    options: pigeonhole::Options,
 ) -> Result<pigeonhole::Pigeonhole, Failure> {
     let path = dir.join(format!("{partition}.phdb"));
     if !path.exists() {
@@ -1067,7 +1085,7 @@ fn open_partition(
             path.display()
         )));
     }
-    let db = pigeonhole::Pigeonhole::open(&path, pigeonhole::Options::default())
+    let db = pigeonhole::Pigeonhole::open(&path, options)
         .map_err(|e| Failure::db("open the partition", &e))?;
     let want = identity::Identity {
         cluster_id: cluster_id.to_owned(),

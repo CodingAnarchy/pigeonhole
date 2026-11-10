@@ -260,7 +260,7 @@ pub(crate) fn run(
     stderr: &mut dyn std::io::Write,
 ) -> Result<ExitStatus, Failure> {
     if let Some(dir) = &args.cluster {
-        return cluster::run(args, dir, stderr);
+        return cluster::run(cli, args, dir, stderr);
     }
     let tokens = tokens(args)?;
     let tls = match (&args.tls_cert, &args.tls_key) {

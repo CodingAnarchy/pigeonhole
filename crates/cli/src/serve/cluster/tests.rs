@@ -908,3 +908,33 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
     let _ = db_a.close();
     let _ = db_b.close();
 }
+
+#[test]
+fn a_partition_opens_with_the_servers_shard_poll() {
+    // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
+    // database does, so its default runs no poll (D198 amendment 4).
+    let dir = test_dir();
+    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None)
+        .create_if_missing(true);
+    let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
+    let t = db
+        .table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..200u32 {
+        t.mutate(format!("r{i}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let spin = db
+        .internal_metrics()
+        .into_iter()
+        .find(|(n, _)| *n == "shard_spin_time_nanos")
+        .map_or(0, |(_, v)| v);
+    assert_eq!(spin, 0, "a partition opened with --shard-spin 0 polled");
+    drop(t);
+    db.close().unwrap();
+}
