@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use pigeonhole_format::wal::{
@@ -16,6 +16,7 @@ use pigeonhole_format::wal::{
 use pigeonhole_format::{Durability, FormatVersion, Lsn, StreamId};
 use pigeonhole_io::{Completion, FileRef, IoBuf, OpenOptions, VfsRef};
 
+use crate::direct::{Direct, Submit, Waiter};
 use crate::{CommitTicket, Error, Result, Wal, WalOptions, parent_dir, stream_path, sync_parent};
 
 /// Frame size as a file offset.
@@ -72,7 +73,7 @@ pub(crate) struct StreamFile {
 }
 
 /// `m`'s guard, poisoned or not, as every lock in this file took it.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -208,6 +209,9 @@ struct Shared {
     /// spare preparation still running settles with its slots blank once its writes in
     /// flight landed, and a held header's chain ends with an error instead of its write.
     closing_io: AtomicBool,
+    /// A direct stream's writer (D324): set when the stream opens, if it asked for direct
+    /// I/O and the file system took it.
+    direct: OnceLock<Direct>,
 }
 
 /// One operation (or a chain of them) a stream submitted and not finished: counted in
@@ -391,9 +395,18 @@ pub struct WalCounters {
     rollover_blocks: AtomicU64,
     rollover_waits: AtomicU64,
     retained_taken: AtomicU64,
+    direct: AtomicBool,
 }
 
 impl WalCounters {
+    /// Whether the stream writes its records with direct I/O (D324, [`WalOptions::direct`]):
+    /// asked for, and the file system took it when the stream opened.
+    ///
+    /// [`WalOptions::direct`]: crate::WalOptions::direct
+    pub fn direct(&self) -> bool {
+        self.direct.load(Ordering::Relaxed)
+    }
+
     /// Rollovers that found no recyclable or ready slot and grew the file inline.
     pub fn inline_grows(&self) -> u64 {
         self.inline_grows.load(Ordering::Relaxed)
@@ -874,6 +887,41 @@ impl Shared {
         done
     }
 
+    /// Submits a direct write ([`Direct::push`]) counted as the stream's I/O in flight; its
+    /// completion submits the next one. A failed or refused write poisons the stream.
+    fn submit_direct(self: &Arc<Self>, write: Option<Submit>) {
+        let Some(write) = write else {
+            return;
+        };
+        let d = self.direct.get().expect("a direct stream");
+        let Some(token) = self.track() else {
+            let end = write.end;
+            drop(write);
+            let next = d.finish(Err(pigeonhole_io::ErrorKind::Other), end, || {
+                self.poisoned.store(true, Ordering::Release);
+            });
+            debug_assert!(next.is_none());
+            return;
+        };
+        let shared = Arc::clone(self);
+        d.submit(write, move |r, end| {
+            let _token = token;
+            let d = shared.direct.get().expect("a direct stream");
+            let next = d.finish(r, end, || shared.poisoned.store(true, Ordering::Release));
+            shared.submit_direct(next);
+        });
+    }
+
+    /// Runs `then` once every byte before `upto` is in the file, or with the error of the
+    /// direct write that failed: at once on a buffered stream, whose writes return once they
+    /// are in.
+    fn when_written(&self, upto: Lsn, then: Waiter) {
+        match self.direct.get() {
+            None => then(Ok(())),
+            Some(d) => d.after(upto, then),
+        }
+    }
+
     /// Ends sync `ticket` as failed and wakes whatever that settles; the caller then reports
     /// the error.
     fn end_failed_sync(&self, ticket: u64) {
@@ -890,6 +938,29 @@ fn poisoned_io() -> pigeonhole_io::Error {
         pigeonhole_io::ErrorKind::Other,
         "wal stream poisoned by a failed sync",
     )
+}
+
+/// The stream file's handle for direct I/O (D324), if `on` and the file system takes it with
+/// an alignment the frame layout meets. A file system that refuses direct I/O leaves the
+/// stream buffered: decided here only, so a direct write's later failure is an I/O error like
+/// any other.
+pub(crate) fn open_direct(vfs: &VfsRef, path: &Path, on: bool) -> Result<Option<FileRef>> {
+    if !on {
+        return Ok(None);
+    }
+    let mut o = OpenOptions::read();
+    o.write = true;
+    o.direct = true;
+    let file = match vfs.open(path, o) {
+        Ok(f) => f,
+        Err(e) if e.kind == pigeonhole_io::ErrorKind::Unsupported => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let align = file.direct_align().unwrap_or(IoBuf::ALIGN) as u64;
+    if align == 0 || align > IoBuf::ALIGN as u64 || FRAME % align != 0 {
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 /// Zero-fills slot `slot` of a stream file.
@@ -1402,6 +1473,8 @@ pub struct WalStream {
     held: Option<HeldHeader>,
     /// The epoch the current segment's slot held before, if it was recycled.
     stale: Option<u32>,
+    /// Whether records go through [`Shared::direct`] (D324).
+    direct: bool,
     shared: Arc<Shared>,
 }
 
@@ -1567,6 +1640,7 @@ impl WalStream {
         check_options(&opts)?;
         let path = stream_path(db_path, stream);
         let file = vfs.open(&path, OpenOptions::read_write_create())?;
+        let direct = open_direct(vfs, &path, opts.direct)?;
         file.set_len(0)?;
         let f = StreamFile {
             vfs: Arc::clone(vfs),
@@ -1575,7 +1649,43 @@ impl WalStream {
             stream,
             db_id,
         };
-        Ok(Self::blank(f, opts.segment_size, &opts))
+        let mut s = Self::blank(f, opts.segment_size, &opts);
+        s.install_direct(direct);
+        Ok(s)
+    }
+
+    /// Makes the stream direct (D324) with `file`, its handle opened by [`open_direct`],
+    /// before its first segment starts.
+    pub(crate) fn install_direct(&mut self, file: Option<FileRef>) {
+        let Some(file) = file else {
+            return;
+        };
+        let align = file.direct_align().unwrap_or(IoBuf::ALIGN) as u64;
+        let _ = self
+            .shared
+            .direct
+            .set(Direct::new(file, align, self.segment_size));
+        self.direct = true;
+        self.shared.counters.direct.store(true, Ordering::Relaxed);
+    }
+
+    /// Blocks until every byte before `upto` is in the file (a direct stream's writes
+    /// complete later; a buffered stream's already have).
+    fn wait_written(&self, upto: Lsn) -> Result<()> {
+        if !self.direct {
+            return Ok(());
+        }
+        let (done, resolver) = Completion::<()>::pair();
+        self.shared
+            .when_written(upto, Box::new(move |r| resolver.resolve(r)));
+        crate::foreground::exempt(|| done.wait())?;
+        Ok(())
+    }
+
+    /// Position past the last byte handed over: to the kernel on a buffered stream, to
+    /// [`Shared::direct`] on a direct one.
+    fn handed(&self) -> Lsn {
+        Lsn::new(self.epoch, self.written_off as u32)
     }
 
     /// A stream over `f` with no current segment yet, its slots `segment_size` bytes, with
@@ -1615,6 +1725,7 @@ impl WalStream {
             buf: Vec::new(),
             held: None,
             stale: None,
+            direct: false,
             shared: Arc::new(Shared {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
@@ -1627,6 +1738,7 @@ impl WalStream {
                 in_flight: Mutex::new(0),
                 in_flight_done: Condvar::new(),
                 closing_io: AtomicBool::new(false),
+                direct: OnceLock::new(),
             }),
         };
         s.configure_feed(opts);
@@ -1697,7 +1809,11 @@ impl WalStream {
             let zeros = vec![0u8; ZERO_CHUNK.min(self.segment_size as usize)];
             zero_fill(&self.file, self.segment_size, self.slot, &zeros)?;
         }
-        self.write()
+        self.write()?;
+        // Its sync follows (blocking or submitted): a direct write must have landed first.
+        let lsn = self.handed();
+        self.wait_written(lsn)?;
+        Ok(lsn)
     }
 
     /// `open_segment` after its sync (`synced`, which covers data and length).
@@ -1955,6 +2071,9 @@ impl WalStream {
         self.epoch = epoch;
         self.marks.set_head(epoch);
         self.written_off = 0;
+        if let Some(d) = self.shared.direct.get() {
+            d.start(slot, epoch, 0);
+        }
         self.enc = FrameEncoder::new(epoch, FRAME);
         self.buf.resize(FRAME_SIZE, 0);
         let header = SegmentHeader {
@@ -1998,20 +2117,37 @@ impl WalStream {
         let end = Lsn::new(self.epoch, self.written_off as u32);
         if self.spare_ready() {
             let shared = Arc::clone(&self.shared);
+            let file = Arc::clone(&self.file);
             let synced = Arc::new(RolloverSync::default());
             let settle = Arc::clone(&synced);
             // A failure poisons the stream at once and surfaces from the next `write_buf`.
-            drop(self.shared.submit_durable_sync(&self.file).map(move |r| {
-                if r.is_ok() {
-                    shared.durable.fetch_max(end.0, Ordering::Release);
-                }
-                settle.settle(&r);
-                r
-            }));
+            // A direct stream's sync follows the segment's last write (D324).
+            self.shared.when_written(
+                end,
+                Box::new(move |r| {
+                    if let Err(e) = r {
+                        settle.settle(&Err(e));
+                        return;
+                    }
+                    let durable = Arc::clone(&shared);
+                    drop(shared.submit_durable_sync(&file).map(move |r| {
+                        if r.is_ok() {
+                            durable.durable.fetch_max(end.0, Ordering::Release);
+                        }
+                        settle.settle(&r);
+                        r
+                    }));
+                }),
+            );
             self.start_segment(end.epoch(), end.offset(), false)?;
             // Hold the header back; the records after it are written as they come.
             let frame = self.buf.split_off(0);
             self.written_off = FRAME;
+            if let Some(d) = self.shared.direct.get() {
+                // The header goes on its own (buffered, `release_header`): a frame of its
+                // own, so no direct write shares its blocks.
+                d.start(self.slot, self.epoch, FRAME);
+            }
             self.held = Some(HeldHeader {
                 frame,
                 at: self.slot as u64 * self.segment_size,
@@ -2024,6 +2160,7 @@ impl WalStream {
             // D30's remaining fallback, counted: no recyclable or prepared slot was ready
             // although `blocked` held the engine back for one (a group larger than the
             // segment's last quarter, or a failed preparation).
+            self.wait_written(end)?;
             crate::foreground::exempt(|| self.shared.durable_sync(|| self.file.sync_data()))?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
             self.shared
@@ -2057,7 +2194,11 @@ impl WalStream {
     fn poisoned_error(&mut self) -> Error {
         match self.held.as_ref().and_then(|h| h.synced.take_error()) {
             Some(e) => e.into(),
-            None => Error::Poisoned,
+            // A direct write that failed off this thread (D324).
+            None => match self.shared.direct.get().and_then(Direct::failure) {
+                Some(e) => e.into(),
+                None => Error::Poisoned,
+            },
         }
     }
 
@@ -2097,12 +2238,51 @@ impl WalStream {
             self.release_header()?;
         }
         if !self.buf.is_empty() {
-            let at = self.slot as u64 * self.segment_size + self.written_off;
-            self.file.write_at(&self.buf, at)?;
+            if self.direct {
+                self.push_direct();
+            } else {
+                let at = self.slot as u64 * self.segment_size + self.written_off;
+                self.file.write_at(&self.buf, at)?;
+            }
             self.written_off += self.buf.len() as u64;
             self.buf.clear();
         }
         Ok(())
+    }
+
+    /// [`Wal::submit_sync`] on a direct stream (D324) with no header held, after `write`:
+    /// the sync is submitted once every byte handed over is in the file. Nothing waits here.
+    #[cold]
+    #[inline(never)]
+    fn submit_direct_sync(&mut self) -> Result<Completion<Lsn>> {
+        let upto = self.handed();
+        let (done, resolver) = Completion::pair();
+        let (shared, file) = (Arc::clone(&self.shared), Arc::clone(&self.file));
+        // The sync itself, once its bytes (and any held header) are written.
+        let sync = move |r: pigeonhole_io::Result<()>| {
+            if let Err(e) = r {
+                resolver.resolve(Err(e));
+                return;
+            }
+            let durable = Arc::clone(&shared);
+            drop(shared.submit_durable_sync(&file).map(move |r| {
+                let r = r.map(|()| {
+                    durable.durable.fetch_max(upto.0, Ordering::Release);
+                    upto
+                });
+                resolver.resolve(r);
+                Ok(())
+            }));
+        };
+        self.shared.when_written(upto, Box::new(sync));
+        Ok(done)
+    }
+
+    /// Hands the buffer to the direct writer (D324), submitting a write if none is in flight.
+    fn push_direct(&self) {
+        let d = self.shared.direct.get().expect("a direct stream");
+        let write = d.push(self.written_off, &self.buf);
+        self.shared.submit_direct(write);
     }
 
     /// Frames a record of `len` bytes, given as `parts`, into the buffer, rolling over first
@@ -2155,7 +2335,9 @@ impl Wal for WalStream {
             self.shared.drive_open_io();
             held.synced.wait();
         }
-        let lsn = self.write()?;
+        self.write()?;
+        let lsn = self.handed();
+        self.wait_written(lsn)?;
         let r = self.shared.durable_sync(|| self.file.sync_data());
         self.poison_on_err(r)?;
         self.shared.durable.fetch_max(lsn.0, Ordering::Release);
@@ -2165,6 +2347,9 @@ impl Wal for WalStream {
     fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
         let _fg = crate::foreground::Foreground::enter();
         let lsn = self.write()?;
+        if self.direct && self.held.is_none() {
+            return self.submit_direct_sync();
+        }
         let Some(held) = &self.held else {
             let shared = Arc::clone(&self.shared);
             return Ok(self.shared.submit_durable_sync(&self.file).map(move |r| {
@@ -2175,7 +2360,7 @@ impl Wal for WalStream {
         };
         // The header still waits for the previous segment's sync: chain this sync after it
         // and after the header's write, without waiting here (#19). Everything appended so
-        // far is written already, up to `upto`.
+        // far is handed over, up to `upto` (on a direct stream, possibly still in flight).
         let upto = Lsn::new(self.epoch, self.written_off as u32);
         let (done, resolver) = Completion::pair();
         let (shared, file) = (Arc::clone(&self.shared), Arc::clone(&self.file));
@@ -2208,29 +2393,59 @@ impl Wal for WalStream {
                     resolver.resolve(Err(e));
                     return Ok(());
                 }
-                let synced = Arc::clone(&shared);
-                drop(shared.submit_durable_sync(&file).map(move |r| {
-                    let _chain = chain;
-                    let r = r.map(|()| {
-                        synced.durable.fetch_max(upto.0, Ordering::Release);
-                        upto
-                    });
-                    resolver.resolve(r);
-                    Ok(())
-                }));
+                // A direct stream's records may still be in flight (D324): sync after them.
+                let sharing = Arc::clone(&shared);
+                shared.when_written(
+                    upto,
+                    Box::new(move |r| {
+                        if let Err(e) = r {
+                            resolver.resolve(Err(e));
+                            return;
+                        }
+                        let synced = Arc::clone(&sharing);
+                        drop(sharing.submit_durable_sync(&file).map(move |r| {
+                            let _chain = chain;
+                            let r = r.map(|()| {
+                                synced.durable.fetch_max(upto.0, Ordering::Release);
+                                upto
+                            });
+                            resolver.resolve(r);
+                            Ok(())
+                        }));
+                    }),
+                );
                 Ok(())
             }));
         });
         Ok(done)
     }
 
+    fn submit_write(&mut self) -> Result<Completion<Lsn>> {
+        let _fg = crate::foreground::Foreground::enter();
+        let lsn = self.write()?;
+        if !self.direct {
+            return Ok(Completion::ready(Ok(lsn)));
+        }
+        let upto = self.handed();
+        let (done, resolver) = Completion::pair();
+        self.shared
+            .when_written(upto, Box::new(move |r| resolver.resolve(r.map(|()| upto))));
+        Ok(done)
+    }
+
     fn written(&self) -> Lsn {
         // Records written under a held header are not handed over yet: a process crash
         // would lose them with the header (#19).
-        match &self.held {
+        let handed = match &self.held {
             Some(held) => held.prev_end,
-            None => Lsn::new(self.epoch, self.written_off as u32),
+            None => self.handed(),
+        };
+        if self.direct {
+            // A direct write lands when it completes (D324).
+            let d = self.shared.direct.get().expect("a direct stream");
+            return handed.min(d.written());
         }
+        handed
     }
 
     fn durable(&self) -> Lsn {

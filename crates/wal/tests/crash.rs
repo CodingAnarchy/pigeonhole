@@ -521,9 +521,23 @@ fn deferred_workload_until(
             }
         }
         let written = wal.write();
+        // A direct stream's write fails off this thread (D324), so a crash under a held
+        // header surfaces only once the wait below ends, after the window: count the window
+        // the wait began in.
+        let held_waiting = wal.held_header();
         let synced = written.and_then(|_| {
-            if strongest == Durability::Buffered && group.iter().all(|t| wal.satisfies(t)) {
-                return Ok(false);
+            if strongest == Durability::Buffered {
+                // A direct stream's write lands later (D324): a Buffered group waits for it,
+                // not for a sync (at once on a buffered stream). Under a held header it still
+                // needs the sync that writes the header.
+                if !wal.header_held() {
+                    let c = wal.submit_write()?;
+                    drive(sim, || c.is_ready());
+                    c.wait().map_err(Error::from)?;
+                }
+                if group.iter().all(|t| wal.satisfies(t)) {
+                    return Ok(false);
+                }
             }
             let c = wal.submit_sync()?;
             drive(sim, || c.is_ready());
@@ -539,7 +553,7 @@ fn deferred_workload_until(
                 }
             }
             Err(e) => {
-                held_at_crash = wal.held_header();
+                held_at_crash = wal.held_header().or(held_waiting);
                 note(&mut trace, e);
                 break;
             }

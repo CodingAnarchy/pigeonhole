@@ -27,6 +27,8 @@ pub fn opts(frames: u64, spare: u32) -> WalOptions {
     let mut o = WalOptions::default();
     o.segment_size = frames * FRAME_SIZE as u64;
     o.spare_segments = spare;
+    // `crash_direct.rs` runs `crash.rs` on direct streams (D324).
+    o.direct = module_path!().starts_with("crash_direct::");
     o
 }
 

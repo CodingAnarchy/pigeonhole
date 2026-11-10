@@ -377,6 +377,7 @@ impl Recovery {
         if grid.is_none() {
             file.set_len(0)?;
         }
+        let direct = crate::stream::open_direct(&vfs, &path, opts.direct)?;
         let f = StreamFile {
             vfs,
             file,
@@ -385,6 +386,7 @@ impl Recovery {
             db_id,
         };
         let mut s = WalStream::blank(f, segment_size, &opts);
+        s.install_direct(direct);
         match grid {
             Some(grid) => {
                 let epochs: Vec<u32> = grid

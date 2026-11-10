@@ -57,6 +57,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod direct;
 mod feed;
 mod foreground;
 mod mem;
@@ -188,6 +189,11 @@ pub struct WalOptions {
     /// The change-feed session id written into every segment header this stream writes
     /// (FORMAT §10.2, bytes 76..84; D310), 0 for none.
     pub feed_session: u64,
+    /// Write the stream's records through a handle opened for direct I/O (D324, #1621):
+    /// whole aligned blocks, one write in flight, so a record write never waits on a page
+    /// the previous sync is writing back. Decided when the stream opens: a file system that
+    /// refuses direct I/O keeps buffered writes ([`WalCounters::direct`]). Off by default.
+    pub direct: bool,
 }
 
 impl Default for WalOptions {
@@ -197,6 +203,7 @@ impl Default for WalOptions {
             spare_segments: 2,
             retain_segments: 0,
             feed_session: 0,
+            direct: false,
         }
     }
 }
@@ -277,6 +284,16 @@ pub trait Wal: Send + fmt::Debug {
     /// asynchronous write path must keep that order, or hold the feed's written watermark
     /// itself until its write completes.
     fn write(&mut self) -> Result<Lsn>;
+
+    /// [`Wal::write`], then a completion that resolves once every appended byte is in the
+    /// file, with the position written: at once where `write` returns only then (the
+    /// default), later on a direct stream (D324), whose writes complete off the caller's
+    /// thread. A record under a held segment header (#19) also needs that header, which a
+    /// sync writes: [`Wal::written`] decides, as always.
+    fn submit_write(&mut self) -> Result<Completion<Lsn>> {
+        let lsn = self.write()?;
+        Ok(Completion::ready(Ok(lsn)))
+    }
 
     /// Writes (if needed) and fdatasyncs, blocking. After this, every ticket appended so far
     /// satisfies `GroupSync` and `Sync`. For tests and shutdown; shards use
