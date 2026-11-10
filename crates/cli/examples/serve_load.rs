@@ -53,8 +53,9 @@ struct Args {
     dir: PathBuf,
     #[arg(long, default_value_t = 7462)]
     port: u16,
-    /// The database's shard count when it's built (default: `phdb serve`'s, half the
-    /// physical cores).
+    /// The database's shard count when it's built (default: `phdb serve`'s for a database it
+    /// creates, half the physical cores, not the library's one per core). A database already
+    /// in `--dir` keeps its own.
     #[arg(long)]
     shards: Option<usize>,
     /// Rows in the table.
@@ -267,11 +268,15 @@ fn build(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if file.exists() {
         return Ok(file);
     }
-    let mut opts = Options::default().create_if_missing(true);
-    if let Some(n) = args.shards {
-        opts = opts.shards(n);
-    }
-    let db = Pigeonhole::open(&file, opts)?;
+    // `phdb serve`'s default (`placement::default_shards`): the library's one shard per
+    // physical core would leave the network side no cores of its own (perf287 on #1697).
+    let shards = args
+        .shards
+        .unwrap_or_else(|| (num_cpus::get_physical() / 2).max(1));
+    let db = Pigeonhole::open(
+        &file,
+        Options::default().create_if_missing(true).shards(shards),
+    )?;
     let t = db.table("t")?.family("f", Family::default()).create()?;
     let value = vec![b'v'; args.value_bytes];
     let mut batch = db.write_batch();
