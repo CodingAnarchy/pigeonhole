@@ -1151,9 +1151,33 @@ impl ScanCursor {
     /// inside [`ScanCursor::counted`]: `Ready(Ok(()))` when it does, or once the block it
     /// reads is fetched; `Pending` while that fetch is in flight (its completion wakes the
     /// task). It never moves the cursor. On a sync cursor, or one reading synchronously, it
-    /// is `Ready` at once. Out of line: the sync steps stay as they are (#1167).
-    #[inline(never)]
+    /// is `Ready` at once. Its common case, a step within a block already probed, is checked
+    /// inline, borrowing only; the rest is out of line (#1167, ai1249's N1 on #1665).
+    #[inline]
     pub fn poll_cell_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        let Some(nb) = &self.nb else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        if nb.fetch.is_none()
+            && (!self.in_row
+                || nb.sync
+                || self
+                    .last_lane
+                    .is_none_or(|i| nb.probed == Some((i, self.lanes[i].block_stamp()))))
+        {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        self.poll_cell_ready_slow(cx)
+    }
+
+    /// [`ScanCursor::poll_cell_ready`] past its inline check: a fetch in flight, or a block
+    /// not probed yet.
+    #[cold]
+    #[inline(never)]
+    fn poll_cell_ready_slow(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<()>> {

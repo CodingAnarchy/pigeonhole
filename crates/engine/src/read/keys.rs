@@ -640,9 +640,31 @@ impl KeyCursor {
     /// completion registered to wake the task. It never moves the cursor. Every source the
     /// step moves is asked in turn, so a shadowed version's older SST is fetched too
     /// (perf287 on #1652). On a cursor never polled, or one reading synchronously, it is
-    /// `Ready` at once. Out of line: the sync steps stay as they are (#1167).
-    #[inline(never)]
+    /// `Ready` at once. Its common case, a step within a block already probed, is checked
+    /// inline, borrowing only; the rest is out of line (#1167, ai1249's N1 on #1665).
+    #[inline]
     pub fn poll_cell_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let Some(nb) = &self.nb else {
+            return Poll::Ready(Ok(()));
+        };
+        if nb.cell_fetch.is_none() && !nb.sync {
+            match (self.current, self.last_lane) {
+                (None, _) | (_, None) => return Poll::Ready(Ok(())),
+                (Some(_), Some(i)) => {
+                    if nb.cell_probed == Some((i, self.reads[i].lane.block_stamp())) {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+            }
+        }
+        self.poll_cell_ready_slow(cx)
+    }
+
+    /// [`KeyCursor::poll_cell_ready`] past its inline check: a fetch in flight, or a block
+    /// not probed yet.
+    #[cold]
+    #[inline(never)]
+    fn poll_cell_ready_slow(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let Some(mut nb) = self.nb.take() else {
             return Poll::Ready(Ok(()));
         };
