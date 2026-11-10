@@ -68,7 +68,7 @@ fn test_dir() -> PathBuf {
     dir
 }
 
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         max_request_bytes: 1 << 20,
         inflight_bytes: 16 << 20,

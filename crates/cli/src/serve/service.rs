@@ -236,11 +236,21 @@ impl ServiceOp {
     }
 
     /// The RPC's name, `Service.Method`, for logs.
+    /// What [`Service::admit`] checks this call against.
+    pub(crate) fn admit(&self) -> Admit {
+        Admit {
+            what: self.name(),
+            scope: self.scope(),
+            writes: self.writes(),
+            size: self.size(),
+        }
+    }
+
     pub(crate) fn name(&self) -> &'static str {
         RPCS[self.index()]
     }
 
-    fn scope(&self) -> Scope {
+    pub(crate) fn scope(&self) -> Scope {
         match self {
             // A transaction's reads, and its Commit (one that carries writes is checked
             // for write scope where it's answered: a read-only Commit is a consistent read).
@@ -305,7 +315,7 @@ impl ServiceOp {
     }
 
     /// The decoded request's size, which the in-flight bytes budget counts.
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         match self {
             Self::Get(r) => r.encoded_len(),
             Self::MultiGet(r) => r.encoded_len(),
@@ -364,7 +374,7 @@ impl ServiceOp {
     /// on #1583): every write-scope RPC writes, and `DropTable` is the one admin-scope
     /// write. A transaction's `Commit` is read scope; one with writes is refused by the
     /// engine's gate (R6).
-    fn writes(&self) -> bool {
+    pub(crate) fn writes(&self) -> bool {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }
 }
@@ -852,6 +862,11 @@ impl Service {
         })
     }
 
+    /// `--request-timeout-ms`: the bound a forwarded call gets (D317 ticket 2).
+    pub(crate) fn request_timeout(&self) -> std::time::Duration {
+        self.limits.request_timeout
+    }
+
     /// The partition served here, if any: for the node's own work (health, metrics,
     /// shutdown), which a node that only routes does without one.
     pub(crate) fn part_opt(&self) -> Option<&Partition> {
@@ -1094,13 +1109,7 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
-        let admit = Admit {
-            what: op.name(),
-            scope: op.scope(),
-            writes: op.writes(),
-            size: op.size(),
-        };
-        let budget = self.admit(&admit, caller, prepaid).await?;
+        let budget = self.admit(&op.admit(), caller, prepaid).await?;
         let reply = self.answer(op, caller, budget).await;
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.

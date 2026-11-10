@@ -9,6 +9,7 @@
 //! partition's identity under it.
 
 pub(crate) mod cli;
+pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod route;
@@ -142,6 +143,8 @@ pub(crate) struct Node {
     /// The routes of the newest map, swapped whole with it: read on every routed call
     /// without a lock (D317 ticket 2; `load()`'s guard, never `load_full()`, perf287).
     routes: arc_swap::ArcSwapOption<route::Routes>,
+    /// One awaited map pull at a time ([`Node::pull_now`]).
+    pulling: tokio::sync::Mutex<()>,
 }
 
 impl Node {
@@ -166,6 +169,7 @@ impl Node {
             state: Mutex::new(state),
             installing: Mutex::new(()),
             routes: arc_swap::ArcSwapOption::new(routes),
+            pulling: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -517,6 +521,17 @@ impl Node {
         &self,
         address: &str,
     ) -> Result<proto::cluster_client::ClusterClient<tonic::transport::Channel>, String> {
+        let channel = self
+            .endpoint(address)?
+            .connect()
+            .await
+            .map_err(|e| format!("connecting to {address}: {e}"))?;
+        Ok(proto::cluster_client::ClusterClient::new(channel))
+    }
+
+    /// How this node dials the peer at `address` (the map's `host:port`): its TLS settings,
+    /// and a connect within the push timeout.
+    pub(crate) fn endpoint(&self, address: &str) -> Result<tonic::transport::Endpoint, String> {
         let url = format!("{}://{address}", self.peers.scheme);
         let mut endpoint = tonic::transport::Endpoint::from_shared(url.clone())
             .map_err(|e| format!("{url}: {e}"))?
@@ -530,15 +545,49 @@ impl Node {
                 .tls_config(tls)
                 .map_err(|e| format!("TLS to {url}: {e}"))?;
         }
-        let channel = endpoint
-            .connect()
+        Ok(endpoint)
+    }
+
+    /// Pulls the map from node `from` at `address` now, and waits for it to be installed,
+    /// unless this node's map is already past `past` (D317 ticket 2: a `WrongPartition`
+    /// answer means the owner has a newer map). Single-flight: concurrent callers wait on
+    /// one pull, and the ones after it find the map moved on.
+    pub(crate) async fn pull_now(
+        self: &Arc<Self>,
+        from: &str,
+        address: &str,
+        past: u64,
+    ) -> Result<(), String> {
+        let _one = self.pulling.lock().await;
+        if self.state().version() > past {
+            return Ok(());
+        }
+        let pulled = async {
+            let mut client = self.client(address).await?;
+            let req = self.request(GetMapRequest {})?;
+            client
+                .get_map(req)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|s| s.message().to_owned())
+        };
+        let map = tokio::time::timeout(self.peers.push_timeout, pulled)
             .await
-            .map_err(|e| format!("connecting to {url}: {e}"))?;
-        Ok(proto::cluster_client::ClusterClient::new(channel))
+            .map_err(|_| "timed out".to_owned())??;
+        if map.map_version <= past {
+            return Err(format!(
+                "node {from}'s map is version {}, no newer than this node's",
+                map.map_version
+            ));
+        }
+        self.push_map_async(map, Some(from.to_owned()))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message)
     }
 
     /// `message` as a call to a peer: the node's token, id and map version.
-    fn request<T>(&self, message: T) -> Result<Request<T>, String> {
+    pub(crate) fn request<T>(&self, message: T) -> Result<Request<T>, String> {
         let mut req = Request::new(message);
         let md = req.metadata_mut();
         if let Some(token) = &self.peers.token {
@@ -630,7 +679,9 @@ const DIVERGENT: &str = "divergent map";
 
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
-struct ClusterGrpc(Arc<Node>);
+/// The `Cluster` service: the node, and on a node that serves data (not a bare node in a
+/// test) the server, which a `Forward` is served through.
+struct ClusterGrpc(Arc<Node>, Option<Arc<super::Shared>>);
 
 impl ClusterGrpc {
     fn caller<T>(&self, req: &Request<T>, scopes: &[Scope], what: &str) -> Result<Caller, Status> {
@@ -702,12 +753,22 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
 
     /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope only.
     /// The node serves it through its router once that lands; until then it's refused.
+    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope; the
+    /// call is then checked for the caller it names, and served only if this node's map
+    /// gives it the key.
     async fn forward(
         &self,
         req: Request<proto::ForwardRequest>,
     ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "forward a call")?;
-        Err(ApiError::unsupported("this node doesn't serve forwarded calls yet").into())
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let msg = req.into_inner();
+        let caller = forward::caller_of(msg.caller)?;
+        let op = forward::op_of(msg.op)?;
+        let reply = shared.router.serve_forwarded(op, &caller).await?;
+        Ok(tonic::Response::new(forward::reply_to_forward(reply)?))
     }
 }
 
@@ -765,8 +826,12 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
 /// their own: a node busy with data must still take a map, or a re-forward's pull fails
 /// exactly when it matters (cli692's 3). `Forward` itself is a data call: an owner that
 /// sheds it answers `Overloaded`, which the forwarding node passes back.
-pub(crate) fn routes(node: Arc<Node>, max_request_bytes: usize) -> axum::Router {
-    let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node)))
+pub(crate) fn routes(
+    node: Arc<Node>,
+    shared: Option<Arc<super::Shared>>,
+    max_request_bytes: usize,
+) -> axum::Router {
+    let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes);
     axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))

@@ -172,6 +172,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     let app = match shared.router.cluster_node() {
         Some(node) => app.merge(super::cluster::routes(
             Arc::clone(node),
+            Some(Arc::clone(&shared)),
             limits.max_request_bytes,
         )),
         None => app,

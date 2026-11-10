@@ -354,7 +354,6 @@ impl ApiError {
     /// D317 (ICR 0117): this node's map no longer gives it the key a forwarded call names.
     /// The sending node pulls the newer map and forwards once more; a client that routes
     /// directly refreshes its map. `map_version` is this node's.
-    #[expect(dead_code, reason = "the Forward handler, the next commit")]
     pub(crate) fn wrong_partition(map_version: u64, message: impl Into<String>) -> Self {
         Self::new(
             "WrongPartition",
@@ -427,6 +426,28 @@ impl ApiError {
             retry_after_ms: self.retry_after_ms,
             retry_from: self.retry_from as i32,
         }
+    }
+
+    /// The error a peer's status carries, as [`to_status`](Self::to_status) wrote it (D317
+    /// ticket 2: a forwarded call's answer passes back as the owner gave it). `None` for a
+    /// status without an `ErrorDetail`, a transport failure that no server sent.
+    pub(crate) fn from_status(status: &tonic::Status) -> Option<Self> {
+        let rpc = RpcStatus::decode(status.details()).ok()?;
+        let detail = rpc
+            .details
+            .iter()
+            .find(|a| a.type_url == "type.googleapis.com/pigeonhole.v1.ErrorDetail")
+            .and_then(|a| ErrorDetail::decode(a.value.as_slice()).ok())?;
+        let grpc = status.code();
+        Some(Self {
+            http: http_for(grpc, &detail.code),
+            code: detail.code,
+            code_num: detail.code_num,
+            message: detail.message,
+            grpc,
+            retry_from: RetryFrom::try_from(detail.retry_from).unwrap_or(RetryFrom::Unspecified),
+            retry_after_ms: detail.retry_after_ms,
+        })
     }
 
     /// As a gRPC status, with the `google.rpc.Status` details ICR 0112 promises: the
@@ -551,6 +572,27 @@ struct RpcDuration {
     nanos: i32,
 }
 
+/// The HTTP status this server gives `grpc` (every code maps to one but `RESOURCE_EXHAUSTED`,
+/// which `code` tells apart), for an error a peer answered over gRPC.
+fn http_for(grpc: tonic::Code, code: &str) -> StatusCode {
+    use tonic::Code as G;
+    match grpc {
+        G::Ok => StatusCode::OK,
+        G::InvalidArgument => StatusCode::BAD_REQUEST,
+        G::NotFound => StatusCode::NOT_FOUND,
+        G::AlreadyExists | G::Aborted | G::FailedPrecondition => StatusCode::CONFLICT,
+        G::PermissionDenied => StatusCode::FORBIDDEN,
+        G::Unauthenticated => StatusCode::UNAUTHORIZED,
+        G::ResourceExhausted if code == "RequestTooLarge" => StatusCode::PAYLOAD_TOO_LARGE,
+        G::ResourceExhausted => StatusCode::INSUFFICIENT_STORAGE,
+        G::OutOfRange => StatusCode::GONE,
+        G::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+        G::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        G::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Any, ApiError, RetryFrom, RpcStatus};
@@ -628,5 +670,48 @@ mod tests {
             rpc.details[1].type_url,
             "type.googleapis.com/google.rpc.RetryInfo"
         );
+    }
+
+    #[test]
+    fn an_error_survives_a_trip_through_a_peers_status() {
+        // D317 ticket 2: what an owner answers is what the forwarding node answers.
+        for e in [
+            ApiError::wrong_partition(7, "not here"),
+            ApiError::cross_partition("two partitions"),
+            ApiError::partition_unavailable("down"),
+            ApiError::overloaded("busy"),
+            ApiError::outcome_unknown("lost"),
+            ApiError::request_too_large(10),
+            ApiError::invalid("bad"),
+            ApiError::not_found("gone"),
+            ApiError::permission_denied("write"),
+            ApiError::from_code(ErrorCode::Conflict, "lost the race"),
+        ] {
+            let back = ApiError::from_status(&e.to_status()).expect("a detail");
+            assert_eq!(
+                (
+                    &back.code,
+                    back.code_num,
+                    &back.message,
+                    back.grpc,
+                    back.http,
+                    back.retry_from,
+                    back.retry_after_ms
+                ),
+                (
+                    &e.code,
+                    e.code_num,
+                    &e.message,
+                    e.grpc,
+                    e.http,
+                    e.retry_from,
+                    e.retry_after_ms
+                ),
+                "{}",
+                e.code
+            );
+        }
+        // A transport failure carries no detail: no server answered it.
+        assert!(ApiError::from_status(&tonic::Status::unavailable("connection reset")).is_none());
     }
 }

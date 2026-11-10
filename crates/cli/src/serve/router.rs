@@ -9,9 +9,10 @@
 use std::sync::Arc;
 
 use super::auth::Caller;
+use super::cluster::forward::{self, Forwarder};
 use super::cluster::route::Routes;
 use super::errors::ApiError;
-use super::proto::RowWrites;
+use super::proto::{ForwardRequest, RowWrites};
 use super::replica::ReadDeadline;
 use super::service::{Service, ServiceOp, ServiceReply};
 
@@ -21,6 +22,7 @@ use super::service::{Service, ServiceOp, ServiceReply};
 pub(crate) struct Cluster {
     node: Arc<super::cluster::Node>,
     local: Option<String>,
+    forwarder: Forwarder,
 }
 
 /// Where a call goes.
@@ -45,9 +47,14 @@ impl Router {
         node: Arc<super::cluster::Node>,
         local: Option<String>,
     ) -> Self {
+        let forwarder = Forwarder::new(Arc::clone(&node));
         Self {
             service,
-            cluster: Some(Cluster { node, local }),
+            cluster: Some(Cluster {
+                node,
+                local,
+                forwarder,
+            }),
         }
     }
 
@@ -64,23 +71,101 @@ impl Router {
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
-            let partition = {
-                let routes = cluster.node.routes();
-                let Some(routes) = routes.as_ref() else {
-                    return Err(ApiError::partition_unavailable(
-                        "this cluster node has no map yet",
-                    ));
-                };
-                route(routes, &op)?
-            };
-            if cluster.local.as_deref() != Some(partition.as_str()) {
-                // Forwarding to the owning node is this ticket's next commit.
-                return Err(ApiError::partition_unavailable(format!(
-                    "partition {partition:?} is served by another node"
-                )));
+            let target = cluster.target(&op)?;
+            if let Some(owner) = target {
+                return self.forward(cluster, op, caller, prepaid, owner).await;
             }
         }
         self.service.call(op, caller, prepaid).await
+    }
+
+    /// Forwards `op` to `owner`, the node serving its partition. The entry node's own checks
+    /// run first (scope, size, the in-flight budget, held until the owner answers). A
+    /// `WrongPartition` answer means the owner's map is newer: this node pulls it (awaited,
+    /// single-flight) and routes once more; a second one goes to the client. The forwarded
+    /// node never forwards on.
+    async fn forward(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        owner: Target,
+    ) -> Result<ServiceReply, ApiError> {
+        let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
+        let writes = op.writes();
+        let req = ForwardRequest {
+            map_version: owner.map_version,
+            caller: Some(forward::forwarded_caller(caller)?),
+            op: Some(forward::op_to_forward(op)?),
+        };
+        let timeout = self.service.request_timeout();
+        let again = req.clone();
+        let reply = cluster
+            .forwarder
+            .send(&owner.address, req, timeout, writes)
+            .await;
+        let reply = match reply {
+            Err(e) if e.code == "WrongPartition" => {
+                cluster
+                    .node
+                    .pull_now(&owner.node, &owner.address, owner.map_version)
+                    .await
+                    .map_err(|why| {
+                        ApiError::partition_unavailable(format!(
+                            "node {} has a newer cluster map, which this node couldn't take: \
+                             {why}",
+                            owner.node
+                        ))
+                    })?;
+                let op = forward::op_of(again.op.clone())?;
+                match cluster.target(&op)? {
+                    // The newer map gives the key to this node.
+                    None => return self.service.call(op, caller, Some(budget)).await,
+                    Some(next) => {
+                        let mut again = again;
+                        again.map_version = next.map_version;
+                        cluster
+                            .forwarder
+                            .send(&next.address, again, timeout, writes)
+                            .await
+                    }
+                }
+            }
+            reply => reply,
+        };
+        drop(budget);
+        forward::reply_of(reply?)
+    }
+
+    /// A call another node forwarded here (D317 ticket 2): served only if this node's map
+    /// gives it the key, otherwise `WrongPartition` with this node's map version. Never
+    /// forwarded on, so a split view of the map can't bounce a call between nodes.
+    pub(crate) async fn serve_forwarded(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
+        let Some(cluster) = &self.cluster else {
+            return Err(ApiError::unsupported("this node isn't a cluster node"));
+        };
+        {
+            let routes = cluster.node.routes();
+            let Some(routes) = routes.as_ref() else {
+                return Err(ApiError::wrong_partition(
+                    0,
+                    "this node has no cluster map yet",
+                ));
+            };
+            let p = route(routes, &op)?;
+            if cluster.local.as_deref() != Some(p.as_str()) {
+                return Err(ApiError::wrong_partition(
+                    routes.map_version(),
+                    format!("this node doesn't serve partition {p:?}"),
+                ));
+            }
+        }
+        self.service.call(op, caller, None).await
     }
 
     /// [`dispatch`](Self::dispatch) once a replica has applied the client's
@@ -99,6 +184,37 @@ impl Router {
             .await_primary(&op, min_primary_seqno?, deadline)
             .await?;
         self.dispatch(op, caller, prepaid).await
+    }
+}
+
+/// Where a routed call goes when it isn't this node's.
+pub(crate) struct Target {
+    node: String,
+    address: String,
+    map_version: u64,
+}
+
+impl Cluster {
+    /// `None`: `op`'s partition is served here; otherwise the node serving it.
+    fn target(&self, op: &ServiceOp) -> Result<Option<Target>, ApiError> {
+        let routes = self.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Err(ApiError::partition_unavailable(
+                "this cluster node has no map yet",
+            ));
+        };
+        let partition = route(routes, op)?;
+        if self.local.as_deref() == Some(partition.as_str()) {
+            return Ok(None);
+        }
+        let owner = routes.owner(&partition).ok_or_else(|| {
+            ApiError::internal(format!("the map lists no node for partition {partition:?}"))
+        })?;
+        Ok(Some(Target {
+            node: owner.node.clone(),
+            address: owner.address.clone(),
+            map_version: routes.map_version(),
+        }))
     }
 }
 
