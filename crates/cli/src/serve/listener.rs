@@ -79,6 +79,9 @@ pub(crate) struct Connections {
     accept_errors: AtomicU64,
     /// A slot was freed: an accept loop out of descriptors waits for it.
     closed: tokio::sync::Notify,
+    /// How each served connection ended, for a test's failure message (#1668).
+    #[cfg(test)]
+    ended: std::sync::Mutex<Vec<String>>,
 }
 
 impl Connections {
@@ -89,7 +92,15 @@ impl Connections {
             refused: AtomicU64::new(0),
             accept_errors: AtomicU64::new(0),
             closed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            ended: std::sync::Mutex::default(),
         })
+    }
+
+    /// How the connections served so far ended, in order (#1668).
+    #[cfg(test)]
+    pub(crate) fn ended(&self) -> Vec<String> {
+        self.ended.lock().unwrap().clone()
     }
 
     /// A slot for a new connection, or `None` at the cap.
@@ -227,6 +238,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FirstByte<S> {
     }
 }
 
+/// How a connection's serving ended.
+// Its fields are read through `Debug`, by tests only (#1668).
+#[allow(dead_code)]
+#[derive(Debug)]
+enum Ended {
+    /// Dropped at the first-byte deadline.
+    Silent,
+    /// The TLS handshake failed or timed out.
+    Handshake,
+    /// hyper's connection ended, with its result.
+    Served(Result<(), String>),
+}
+
 /// Serves one connection: dropped if no byte arrives within `first_byte` (the deadline ends
 /// at the first byte, not the first request: a slow header is HTTP/1.1's header timeout's,
 /// and an HTTP/2 connection that sent its preface may idle on pings).
@@ -236,7 +260,8 @@ async fn serve_one<S>(
     service: TowerToHyperService<axum::Router>,
     watcher: hyper_util::server::graceful::Watcher,
     first_byte: Duration,
-) where
+) -> Ended
+where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let got = Arc::new(AtomicBool::new(false));
@@ -250,16 +275,19 @@ async fn serve_one<S>(
             .into_owned(),
     );
     tokio::pin!(conn);
+    let served = |r: Result<(), Box<dyn std::error::Error + Send + Sync>>| {
+        Ended::Served(r.map_err(|e| e.to_string()))
+    };
     tokio::select! {
-        _ = &mut conn => return,
+        r = &mut conn => return served(r),
         () = tokio::time::sleep(first_byte) => {}
     }
     if !got.load(Ordering::Relaxed) {
         // Silent since it connected: returning drops `conn`, and with it the socket, which
         // closes; the task's end frees the slot (cli692's N2 on #1653).
-        return;
+        return Ended::Silent;
     }
-    let _ = conn.await;
+    served(conn.await)
 }
 
 pub(crate) async fn serve(
@@ -341,18 +369,19 @@ pub(crate) async fn serve(
         let first_byte = bounds.first_byte;
         let tls = tls.clone();
         tokio::spawn(async move {
-            let _slot = slot;
-            match tls {
+            let ended = match tls {
                 None => serve_one(builder, stream, service, watcher, first_byte).await,
                 Some(acceptor) => {
-                    let Ok(Ok(tls)) =
-                        tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
-                    else {
-                        return;
-                    };
-                    serve_one(builder, tls, service, watcher, first_byte).await;
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(tls)) => serve_one(builder, tls, service, watcher, first_byte).await,
+                        _ => Ended::Handshake,
+                    }
                 }
-            }
+            };
+            #[cfg(test)]
+            slot.0.ended.lock().unwrap().push(format!("{ended:?}"));
+            let _ = ended;
+            drop(slot);
         });
     }
     drop(listener);
