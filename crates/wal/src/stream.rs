@@ -1134,6 +1134,16 @@ impl SpareSegments {
         let out = match result {
             Ok(()) => {
                 let filled = to_fill.len() as u32;
+                // SCRATCH (g52, not for merge): PIGEONHOLE_PREP_LOG=1 logs each preparation.
+                if std::env::var_os("PIGEONHOLE_PREP_LOG").is_some_and(|v| v == "1") {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    eprintln!(
+                        "PREP {t} filled {filled} grown {grown} total {}",
+                        pool.total
+                    );
+                }
                 pool.ready.append(&mut to_fill);
                 pool.ready.sort_unstable();
                 Ok(filled)

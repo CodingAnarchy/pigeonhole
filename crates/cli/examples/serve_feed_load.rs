@@ -308,7 +308,13 @@ fn prepare(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
         Options::default()
             .create_if_missing(true)
             .shards(args.shards)
-            .change_feed(FeedRetention::bytes(1 << 30)),
+            .change_feed(FeedRetention::bytes(
+                // SCRATCH (g52, not for merge): PH_FEED_RETENTION bytes, else 1 GiB.
+                std::env::var("PH_FEED_RETENTION")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1 << 30),
+            )),
     )?;
     for t in ["busy", "tiny"]
         .into_iter()
