@@ -261,8 +261,13 @@ async fn tables(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
 }
 
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
-    // Liveness only, with no token: whether the database is open and not failed.
-    let ok = !shared.router.service.part.db.is_failed();
+    // Liveness only, with no token: whether the database is open and not failed. A node that
+    // only routes has none, and is up while it runs (D317 ticket 2).
+    let ok = shared
+        .router
+        .service
+        .part_opt()
+        .is_none_or(|p| !p.db.is_failed());
     let reply = proto::HealthResponse {
         status: if ok { "ok" } else { "failed" }.into(),
     };

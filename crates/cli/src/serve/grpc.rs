@@ -518,7 +518,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         _req: Request<proto::Empty>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
-        let ok = !self.0.router.service.part.db.is_failed();
+        let ok = !self.0.router.service.part()?.db.is_failed();
         Ok(Response::new(proto::HealthResponse {
             status: if ok { "ok" } else { "failed" }.into(),
         }))

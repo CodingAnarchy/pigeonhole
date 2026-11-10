@@ -591,7 +591,7 @@ fn a_client_that_stops_reading_loses_its_scan_after_the_idle_timeout() {
         scan_request(1000, 0, first.next.to_vec()),
     ));
     assert_eq!(join(&pages), whole_rows(30));
-    let text = s.shared.metrics.render(&service.part.db);
+    let text = s.shared.metrics.render(Some(&service.part().unwrap().db));
     assert!(
         text.contains(
             r#"pigeonhole_serve_requests_total{rpc="Data.Scan",outcome="DeadlineExceeded"} 1"#
@@ -819,7 +819,7 @@ fn a_table_open_overtaken_by_a_catalog_change_keeps_nothing() {
     let svc = &s.shared.router.service;
     // The steps of `Service::table`, with a catalog change between the open and the keep.
     let started = svc.table_generation();
-    let t = svc.part.db.table("t").unwrap().open().unwrap();
+    let t = svc.part().unwrap().db.table("t").unwrap().open().unwrap();
     svc.tables_changed();
     assert!(
         svc.keep_table("t", &t, started).is_none(),

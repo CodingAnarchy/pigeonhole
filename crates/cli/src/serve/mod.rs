@@ -359,18 +359,15 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed runtime", &e))?;
-    shared
-        .router
-        .service
-        .part
-        .feeds
-        .run_on(feed_runtime.handle().clone());
+    if let Some(part) = shared.router.service.part_opt() {
+        part.feeds.run_on(feed_runtime.handle().clone());
+    }
 
     let served = runtime.block_on(async {
         // SIGUSR1 writes a report of the feed hubs and their clients to stderr (#1397).
         #[cfg(unix)]
-        {
-            let feeds = Arc::clone(&shared.router.service.part.feeds);
+        if let Some(part) = shared.router.service.part_opt() {
+            let feeds = Arc::clone(&part.feeds);
             tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
                 let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
@@ -409,7 +406,9 @@ pub(crate) fn run(
         let stopping = Arc::clone(&shared);
         let signal = async move {
             shutdown_signal().await;
-            stopping.router.service.part.bulk.stop();
+            if let Some(part) = stopping.router.service.part_opt() {
+                part.bulk.stop();
+            }
         };
         let bounds = listener::Bounds {
             connections: Arc::clone(&shared.router.service.connections),
@@ -428,10 +427,12 @@ pub(crate) fn run(
     // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.
-    shared.router.service.part.bulk.close();
-    // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
-    shared.router.service.part.texts.close();
-    shared.router.service.part.indexes.close();
+    if let Some(part) = shared.router.service.part_opt() {
+        part.bulk.close();
+        // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
+        part.texts.close();
+        part.indexes.close();
+    }
     let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
     let closed = db.close().map_err(|e| Failure::db("close", &e));
     served?;

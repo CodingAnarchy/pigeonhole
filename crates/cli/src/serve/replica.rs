@@ -618,7 +618,11 @@ impl Replica {
     /// Follows the primary from the stored token (bootstrapping first if there is none)
     /// until it stops.
     async fn follow(&self, shared: &Shared, stop: &mut watch::Receiver<bool>) -> Halt {
-        let db = shared.router.service.part.db.clone();
+        // A replica is a single node's mode: its service always serves the database.
+        let db = match shared.router.service.part() {
+            Ok(p) => p.db.clone(),
+            Err(e) => return Halt::Failed(e.message),
+        };
         let token = loop {
             let stored = {
                 let db = db.clone();
@@ -768,7 +772,13 @@ impl Replica {
     /// dropped (or dropped and made again) on the primary must not serve from its old one.
     async fn apply_catalog(&self, shared: &Shared, event: ReplicatedEvent) -> Result<(), String> {
         let applied = event.primary_seqno();
-        let db = shared.router.service.part.db.clone();
+        let db = shared
+            .router
+            .service
+            .part()
+            .map_err(|e| e.message)?
+            .db
+            .clone();
         let outcome = tokio::task::spawn_blocking(move || db.apply_catalog(&event, event.token()))
             .await
             .map_err(|e| format!("applying a catalog change: {e}"));
@@ -787,7 +797,11 @@ impl Replica {
         stop: &mut watch::Receiver<bool>,
     ) -> Result<(), Halt> {
         let service = &shared.router.service;
-        let db = service.part.db.clone();
+        let db = service
+            .part()
+            .map_err(|e| Halt::Failed(e.message))?
+            .db
+            .clone();
         let side = side_path(db.path());
         // A stop mid-download leaves a partial side file: harmless, since the next
         // bootstrap truncates it (`File::create`) before writing (cli692's N4 on #1583).

@@ -63,12 +63,12 @@ pub(crate) struct McpSession {
 }
 
 impl McpSession {
-    fn new(shared: &Arc<Shared>, caller: &Caller) -> Self {
+    fn new(shared: &Arc<Shared>, caller: &Caller, db: Pigeonhole) -> Self {
         let service = &shared.router.service;
         let writable = caller.scope.allows(Scope::Write) && !refuses_writes(shared);
         let backend = ServeBackend {
             shared: Arc::downgrade(shared),
-            db: service.part.db.clone(),
+            db,
             writable,
             replica: service.replica.is_some(),
         };
@@ -265,6 +265,14 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Err(e) => return e.into_response(),
     };
     let service = &shared.router.service;
+    // `/mcp` serves one database's tools: a node that only routes has none (D317 ticket 2).
+    let db = match service.part() {
+        Ok(p) => p.db.clone(),
+        Err(_) => {
+            return ApiError::unsupported("/mcp needs a node that serves a database")
+                .into_response();
+        }
+    };
     let budget = match service.reserve(length).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -287,7 +295,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Some(Err(_)) => return ApiError::not_found("no such MCP session").into_response(),
         // No session yet: only an `initialize` starts one.
         None if is_initialize(&text) => {
-            let session = Arc::new(McpSession::new(&shared, &caller));
+            let session = Arc::new(McpSession::new(&shared, &caller, db.clone()));
             match service.sessions.open_mcp(caller.token, session) {
                 Ok(id) => {
                     started = Some(Started {
