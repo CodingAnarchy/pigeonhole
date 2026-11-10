@@ -8,11 +8,9 @@
 //!
 //! The store is on the simulated device with its I/O deferred and completed after each
 //! `Pending`, so every block a recall misses is fetched and no read completes at submit,
-//! which would count as synchronous on real files. A recall reads asynchronously except
-//! where the engine's async key-set reads walk a row past its first block, which they read
-//! synchronously (#1652): the multi-get's memory rows, a graph expansion's traversal and
-//! the IVF search's list rows. Under load, 28 of 7,680 recalls counted one such read, and
-//! none counted two; the test bounds both.
+//! which would count as synchronous on real files. A recall reads nothing synchronously:
+//! since #1652, the engine's key-set reads (the multi-get's memory rows, a graph expansion's
+//! traversal, the IVF search's list rows) fetch a row's later blocks too.
 #![cfg(feature = "async")]
 
 use std::future::Future;
@@ -29,8 +27,6 @@ use pigeonhole_memory::{
 const PATH: &str = "/db/mem.phdb";
 const MODEL: &str = "test-embed-v1";
 const DIM: usize = 4;
-/// Synchronous reads a recall may count while #1652 is open: one seen at most.
-const MAX_SYNC_READS: u64 = 2;
 
 struct Rng(u64);
 
@@ -261,9 +257,6 @@ struct Seen {
     budget_cut_mid_walk: usize,
     truncated: usize,
     pendings: u32,
-    recalls: usize,
-    /// Recalls that counted a synchronous read (#1652).
-    sync_reading: usize,
 }
 
 #[test]
@@ -302,14 +295,7 @@ fn async_equals_sync_over_random_stores_and_recalls() {
                 }
             };
             assert_eq!(got, want, "{ctx}");
-            // A key-set read's row past its first block is still read synchronously (#1652):
-            // a memory row of the multi-get that straddles a block, a hub's links in the
-            // expansion's traversal, an IVF list row its split hasn't reached. Which rows
-            // straddle depends on the SST layout the build's flush and compaction timing
-            // gave, so a recall may count one; each read otherwise is asynchronous.
-            assert!(reads <= MAX_SYNC_READS, "{ctx}: {reads} synchronous reads");
-            seen.recalls += 1;
-            seen.sync_reading += usize::from(reads > 0);
+            assert_eq!(reads, 0, "{ctx}: synchronous reads");
             let (hits, _) = drive(
                 &vfs,
                 case.apply(store.recall(&case.namespaces), &s, now)
@@ -335,10 +321,6 @@ fn async_equals_sync_over_random_stores_and_recalls() {
     }
     // The paths the test claims to cover.
     assert!(seen.pendings > 0, "nothing was fetched: {seen:?}");
-    assert!(
-        seen.sync_reading * 10 <= seen.recalls,
-        "more than one recall in ten read synchronously: {seen:?}"
-    );
     assert!(seen.ivf > 0, "no IVF recall: {seen:?}");
     assert!(seen.fallbacks > 0, "no IVF fall-back: {seen:?}");
     assert!(seen.expanded > 0, "no expansion: {seen:?}");

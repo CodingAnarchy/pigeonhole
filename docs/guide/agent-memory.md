@@ -114,7 +114,7 @@ store.mark_used(&[hits[0].id.clone()])?;
 - **Filters:** superseded memories are left out unless `include_superseded(true)`, and then each such hit's `superseded_by` names its successor. `session(s)` keeps one session.
 - **Determinism:** with an explicit `snapshot` and `now_us(time)`, the same call always returns the same result.
 - **Either signal alone works:** text alone recalls by keyword and recency, and an embedding alone by similarity and recency.
-- **Async:** `run_async().await` and `run_with_stats_async().await` return exactly what `run` and `run_with_stats` do, with every read asynchronous, so a recall doesn't block an executor thread on the cache's misses. Each namespace's vector, keyword and recency lists are read together. The futures are `Send`, and they work in reader processes too. They're behind the `async` feature, on by default as in `pigeonhole`. One gap remains (#1652): a row longer than a block, in the recall's multi-get, a graph expansion or an IVF list, still has its later blocks read synchronously, counted in `EngineMetrics::async_sync_reads`.
+- **Async:** `run_async().await` and `run_with_stats_async().await` return exactly what `run` and `run_with_stats` do, with every read asynchronous, so a recall doesn't block an executor thread on the cache's misses. Each namespace's vector, keyword and recency lists are read together. The futures are `Send`, and they work in reader processes too. They're behind the `async` feature, on by default as in `pigeonhole`.
 
 ## Lifecycle
 - **`get(&id)`** returns a memory with all its metadata.
