@@ -261,3 +261,76 @@ fn a_grpc_reply_whose_window_stays_shut_is_dropped_after_the_idle_limit() {
         1
     );
 }
+
+/// cli692's R1 on #1661: an HTTP/2 client whose initial window is 0 never has its reply's
+/// body polled at all, so no slice is ever handed out. The watchdog starts when the body is
+/// wrapped, so the share still comes back after `--stream-idle-ms`.
+#[test]
+fn a_reply_to_a_client_with_a_zero_initial_window_is_dropped_after_the_idle_limit() {
+    use prost::Message;
+    let idle = Duration::from_millis(500);
+    let s = budgeted(20 << 20, Duration::from_millis(400), idle, 8);
+    let addr = s.url.trim_start_matches("http://").to_owned();
+    let req = proto::MultiGetRequest {
+        table: "t".into(),
+        keys: (0..8)
+            .map(|i| format!("big{i}").into_bytes().into())
+            .collect(),
+        page_bytes: 8 << 20,
+        ..Default::default()
+    };
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&u32::try_from(req.encoded_len()).unwrap().to_be_bytes());
+    framed.extend_from_slice(&req.encode_to_vec());
+    let replies = Arc::clone(&s.shared.router.service.replies);
+    let bytes = move || replies.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    s.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (client, conn) = h2::client::Builder::new()
+                .initial_window_size(0)
+                .handshake::<_, axum::body::Bytes>(tcp)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let mut client = client.ready().await.unwrap();
+            let request = axum::http::Request::post("/pigeonhole.v1.Data/MultiGet")
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .unwrap();
+            let (response, mut send) = client.send_request(request, false).unwrap();
+            send.send_data(framed.into(), true).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), 200);
+            // The reply is charged, and its body is never polled: the window is 0.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while bytes() == 0 {
+                assert!(std::time::Instant::now() < deadline, "never charged");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The share comes back anyway.
+            while bytes() > 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a never-polled reply kept its share"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(response);
+        })
+        .await
+        .expect("within 30 s");
+    });
+    assert_eq!(
+        s.shared
+            .router
+            .service
+            .replies
+            .idle_drops
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}

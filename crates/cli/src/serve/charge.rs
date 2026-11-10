@@ -11,10 +11,10 @@
 //!   router, moves it into a [`ChargedBody`] around the body.
 //! - **A client that stops reading** (cli692's D1): the body hands its data to the transport
 //!   in [`PIECE`]-sized slices (zero-copy), so HTTP/2 holds about one slice beyond the
-//!   client's window. A body with data still to hand out after a slice starts a watchdog:
-//!   after `--stream-idle-ms` without a slice taken, it drops the rest and the charge, and
-//!   the body ends with `DeadlineExceeded` if it's polled again. A reply handed out whole
-//!   starts none.
+//!   client's window. A wrapped body (a reply over one slice) starts a watchdog when it's
+//!   wrapped: after `--stream-idle-ms` without a slice taken, it drops the rest and the
+//!   charge, and the body ends with `DeadlineExceeded` if it's polled again. A reply within
+//!   one slice is never wrapped, so it starts none.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -202,18 +202,23 @@ fn wrap(mut resp: Response<Body>, idle: Duration) -> Response<Body> {
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+    // The watchdog starts now, not at the first slice (cli692's R1 on #1661): a client whose
+    // initial window is 0 never has its body polled, so a watchdog started there would
+    // never start. It holds only a weak handle, so a body that ends or is dropped frees
+    // everything at once, and the watchdog ends at its next look.
+    let stats = Arc::clone(&charge.stats);
+    let slot = Arc::new(Mutex::new(Slot {
+        rest: Bytes::new(),
+        charge: Some(charge),
+        progress: Instant::now(),
+        expired: false,
+    }));
+    tokio::spawn(watchdog(Arc::downgrade(&slot), idle, stats));
     resp.map(|inner| {
         Body::new(ChargedBody {
             inner,
-            slot: Arc::new(Mutex::new(Slot {
-                rest: Bytes::new(),
-                charge: Some(charge),
-                progress: Instant::now(),
-                expired: false,
-            })),
-            idle,
+            slot,
             grpc,
-            watching: false,
             done: false,
         })
     })
@@ -234,28 +239,13 @@ struct Slot {
 pub(crate) struct ChargedBody {
     inner: Body,
     slot: Arc<Mutex<Slot>>,
-    idle: Duration,
     grpc: bool,
-    watching: bool,
     done: bool,
 }
 
 impl ChargedBody {
     fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// A watchdog, started once a slice has been handed out with more to come: it drops the
-    /// rest and the charge after `idle` without progress. It holds only a weak handle, so a
-    /// body dropped meanwhile frees everything at once.
-    fn watch(&mut self, stats: Arc<ReplyStats>) {
-        if self.watching {
-            return;
-        }
-        self.watching = true;
-        let slot = Arc::downgrade(&self.slot);
-        let idle = self.idle;
-        tokio::spawn(watchdog(slot, idle, stats));
     }
 
     /// How the body ends once the watchdog dropped it: for gRPC, trailers saying
@@ -315,27 +305,21 @@ impl http_body::Body for ChargedBody {
             return Poll::Ready(None);
         }
         loop {
-            let (piece, more, stats) = {
+            let piece = {
                 let mut s = this.lock();
                 if s.expired {
                     drop(s);
                     return this.expired();
                 }
                 if s.rest.is_empty() {
-                    (None, false, None)
+                    None
                 } else {
                     let n = s.rest.len().min(PIECE);
-                    let piece = s.rest.split_to(n);
                     s.progress = Instant::now();
-                    let more = !s.rest.is_empty();
-                    let stats = s.charge.as_ref().map(|c| Arc::clone(&c.stats));
-                    (Some(piece), more, stats)
+                    Some(s.rest.split_to(n))
                 }
             };
             if let Some(piece) = piece {
-                if more && let Some(stats) = stats {
-                    this.watch(stats);
-                }
                 return Poll::Ready(Some(Ok(Frame::data(piece))));
             }
             match Pin::new(&mut this.inner).poll_frame(cx) {
