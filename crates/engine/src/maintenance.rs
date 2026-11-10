@@ -189,7 +189,12 @@ fn copy_into(
             let mut sources = Vec::new();
             mem_sources(set, &all, &mut sources);
             let options = writer_options(&meta.options, t.table, f, t.id, created);
-            let mut sink = copy_at(shared, pager, &sst_ids, options, sources, seqno, closing)?;
+            // Sized from the memtables' bytes, as a flush is (#1595: the target SST size
+            // here reserved a 64 MiB-aligned extent per family, so a copy of a few hundred
+            // KiB of memtables was hundreds of MiB, nearly all free).
+            let bytes: u64 = set.readers.iter().map(|r| r.bytes()).sum();
+            let extent = bytes.min(shared.picker.target_sst_bytes);
+            let mut sink = copy_at(pager, &sst_ids, options, sources, extent, seqno, closing)?;
             mem_edits.extend(sink.take_edits(t.id, f, 0));
         }
     }
@@ -249,7 +254,14 @@ fn copy_into(
             reader.iter(all.clone(), ReadOptions::default()).into(),
         )];
         let options = writer_options(&info.options, table, family, tablet, created);
-        let mut sink = copy_at(shared, pager, &sst_ids, options, sources, seqno, closing)?;
+        // About the source's length: it loses commits, never gains any, but the family's
+        // options (compression, block size, filter) may have changed since the source was
+        // written, hence the slack. An underestimate only cuts one more SST.
+        let extent = meta
+            .len
+            .saturating_mul(2)
+            .min(shared.picker.target_sst_bytes);
+        let mut sink = copy_at(pager, &sst_ids, options, sources, extent, seqno, closing)?;
         for (out, refs) in sink.outputs.drain(..).zip(sink.refs.drain(..)) {
             for &(tablet, family, level) in &slots {
                 rewritten.push(Edit::AddSst {
@@ -444,20 +456,17 @@ fn writer_options(
 /// are written as they are: a blob pointer keeps naming its blob file, which the copy holds
 /// under the same id.
 fn copy_at(
-    shared: &Shared,
     pager: &Arc<Pager>,
     sst_ids: &Arc<AtomicU64>,
     options: SstWriterOptions,
     sources: Vec<Source>,
+    extent: u64,
     seqno: pigeonhole_format::Seqno,
     closing: &dyn Fn() -> Result<()>,
 ) -> Result<SstSink> {
-    let mut sink = SstSink::new(
-        Arc::clone(pager),
-        Arc::clone(sst_ids),
-        options,
-        shared.picker.target_sst_bytes,
-    );
+    // `extent` is what each new SST's extent is asked for at: about what `sources` hold, at
+    // most the target SST size (as a flush), so a small copy takes a small extent (#1595).
+    let mut sink = SstSink::new(Arc::clone(pager), Arc::clone(sst_ids), options, extent);
     if sources.is_empty() {
         return Ok(sink);
     }
