@@ -2,12 +2,13 @@
 //!
 //! - **What:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` (their
 //!   `page_bytes`), `Memory.Recall` (its byte budget), and `Get` (its cell, after the read).
-//! - **When (revised after g46, with cli692's H1 and H2):**
+//! - **When (revised after g46, with cli692's H1):**
 //!   - A read whose cap is within the default page (1 MiB) builds its reply first. A reply
 //!     within one slice then takes nothing: its share would be freed at the response
-//!     anyway. A larger one takes its exact size if it's free now. If it isn't, or a strict
-//!     reservation is waiting, the strict path: the reply is dropped, the cap reserved, and
-//!     the read run again.
+//!     anyway. A larger one takes its exact size if it's free now. If it isn't, the strict
+//!     path: the reply is dropped, the cap reserved, and the read run again. (Tokio's
+//!     semaphore gives a waiting reservation every free permit as it queues, and each
+//!     release to the queue first, so a `try_acquire` can't overtake a waiting one.)
 //!   - A read with a larger cap reserves it before reading, then trims to its size.
 //!   - `Get` (no cap) and a recall within the default page are charged once built, waiting
 //!     for their size if need be; they're never built twice.
@@ -15,7 +16,7 @@
 //!   - A reservation that can't be had within the request timeout answers `Overloaded`, as
 //!     a request body's share does.
 //!   - What's unaccounted is replies being built within the default page: at most
-//!     `--max-concurrent` × 1 MiB.
+//!     `--max-concurrent` × 1 MiB of protobuf.
 //! - **Until:** the reply's body has been written to the connection, or dropped. The handler
 //!   puts a [`Charged`] in the response's extensions; [`attach`], a layer over the whole
 //!   router, moves it into a [`ChargedBody`] around the body.
@@ -55,9 +56,6 @@ pub(crate) struct ReplyStats {
     /// Reads that found the budget full once built: their reply dropped, the cap reserved,
     /// and the read run again (the strict path).
     pub(crate) rereads: AtomicU64,
-    /// Strict reservations waiting for the budget: while any do, built replies don't take
-    /// permits ahead of them (cli692's H2 on #1567).
-    pub(crate) waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl ReplyStats {
@@ -105,11 +103,7 @@ impl Charge {
         stats: &Arc<ReplyStats>,
     ) -> Result<Self, ApiError> {
         let n = bytes.clamp(1, total.max(1));
-        // Counted while it waits, so `try_charge` leaves the permits to it (cli692's H2).
-        stats.waiting.fetch_add(1, Ordering::AcqRel);
-        let permit = acquire(inflight, n, wait).await;
-        stats.waiting.fetch_sub(1, Ordering::AcqRel);
-        let permit = permit?;
+        let permit = acquire(inflight, n, wait).await?;
         stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(Self {
             permit,

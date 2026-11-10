@@ -399,3 +399,77 @@ fn a_default_page_read_that_finds_the_budget_full_goes_the_strict_way() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(rereads(), 1);
 }
+
+/// cli692's B1 on #1661: a strict reservation that's cancelled while it waits (the request
+/// dropped: its client gone, or its deadline) leaves nothing behind. A later read within
+/// the default page still builds first and takes its share, with no re-read.
+#[test]
+fn a_cancelled_waiting_reservation_changes_nothing_after() {
+    let s = budgeted(10 << 20, Duration::from_secs(5), Duration::from_secs(30), 8);
+    let t = s
+        .shared
+        .router
+        .service
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    for i in 0..2 {
+        t.mutate(format!("mid{i}").as_bytes())
+            .put("f", b"q", &vec![b'y'; 400 << 10])
+            .commit()
+            .unwrap();
+    }
+    let mut stuck = stuck_multi_get(&s, 8);
+    wait_for("the stuck reply's charge", || reply_bytes(&s) > 8 << 20);
+    let held = reply_bytes(&s);
+    // A large-page read waits for its 8 MiB, and is dropped while it waits.
+    let service = &s.shared.router.service;
+    let waited = s.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            service.call(
+                ServiceOp::MultiGet(proto::MultiGetRequest {
+                    table: "t".into(),
+                    keys: vec![b"big0".to_vec().into()],
+                    page_bytes: 8 << 20,
+                    ..Default::default()
+                }),
+                &Caller::anonymous(),
+                None,
+            ),
+        )
+        .await
+    });
+    assert!(waited.is_err(), "the reservation was waiting when dropped");
+    // The stuck client reads its reply: the budget is free again.
+    stuck
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0usize;
+    while got < held as usize {
+        match stuck.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => panic!("reading the reply: {e}"),
+        }
+    }
+    wait_for("the charge back", || reply_bytes(&s) == 0);
+    // A default-page read over one slice: built first, its share taken, no re-read.
+    let (status, _) = s.post(
+        "MultiGet",
+        &json!({"table": "t", "keys": [b64(b"mid0"), b64(b"mid1")]}),
+        None,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        service
+            .replies
+            .rereads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a read after a cancelled reservation went the strict way"
+    );
+}

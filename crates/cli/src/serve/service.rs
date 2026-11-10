@@ -1468,9 +1468,9 @@ impl Service {
     ///   share would be given back at the response anyway. So the hot small-read path does
     ///   no budget work (g46's readrow-small).
     /// - **HTTP/JSON's share** is twice the protobuf's, fitted to the rendered body later.
-    /// - **Nothing is taken while a strict reservation waits** (cli692's H2): Tokio's
-    ///   `try_acquire` doesn't queue behind waiters, so it would starve a large reservation
-    ///   under steady load. The reply goes the waiting way instead.
+    /// - **A waiting reservation keeps its place:** Tokio's semaphore gives a queued
+    ///   `acquire_many` every free permit and each release to the queue first, so this
+    ///   `try_acquire` can't overtake it.
     fn try_charge(&self, caller: &Caller, reply: ServiceReply) -> (ServiceReply, bool) {
         let size = reply.encoded_len() + super::charge::GRPC_FRAME;
         let want = if caller.json {
@@ -1480,9 +1480,6 @@ impl Service {
         };
         if want <= super::charge::PIECE {
             return (reply, true);
-        }
-        if self.replies.waiting.load(Ordering::Acquire) > 0 {
-            return (reply, false);
         }
         match super::charge::Charge::try_reserve(
             &self.inflight,

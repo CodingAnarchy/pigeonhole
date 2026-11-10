@@ -415,7 +415,7 @@ u1   profile  name       1761030000000000  Ada
         - A reply of 64 KiB or less takes no share: it goes to the connection whole.
         - A larger one takes exactly its size if it's free. If it isn't, the read drops its reply, reserves its page as above, and reads again. `pigeonhole_serve_reply_rereads_total` counts these.
         - `Get` and a recall within the default page wait for their size instead of reading again.
-        - So what's built before it's counted is at most `--max-concurrent` × 1 MiB.
+        - So what's built before it's counted is at most `--max-concurrent` × 1 MiB (of protobuf; its JSON is larger).
       - **Trimmed and held:** a reply keeps only its own size (its encoded message, or its rendered JSON), and holds it until it has been written to the connection.
       - **Refused:** a read whose share can't be had within `--request-timeout-ms` gets `Overloaded` (503 with `Retry-After`), having read nothing. So a burst of large reads pushes back rather than growing the server's memory.
     - **A client that takes nothing of its reply** for `--stream-idle-ms` loses it: the server drops the reply's unsent part and gives its share back. The client's stream then ends with `DeadlineExceeded` (over gRPC) or a cut-off body (over HTTP/1.1) once it reads again or its connection closes. Meanwhile the server holds at most about 64 KiB of that reply.

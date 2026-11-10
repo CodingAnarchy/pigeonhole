@@ -200,14 +200,14 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
 ## Amendment: unary read replies count against `--inflight-bytes` (#1567)
 The design is on #1567, with cli692's review (D1, D2).
 - **Which replies:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` (by `page_bytes`, 1 MiB when 0, at most 8 MiB), `Memory.Recall` (by its byte budget) and `Get`.
-- **When they're charged (revised after perf287's g46, with cli692's H1 and H2):**
+- **When they're charged (revised after perf287's g46, with cli692's H1):**
   - **A cap above the default page (1 MiB)** is reserved before the read: twice that for HTTP/JSON (D2). Such reads build on the Tokio workers, so nothing else would bound them. `--inflight-bytes` ÷ `page_bytes` caps how many build at once.
   - **Within the default page,** the reply is built first:
     - a reply within one 64 KiB slice takes no share (it goes to the transport whole);
-    - a larger one takes its exact size if it's free and no strict reservation is waiting (H2);
+    - a larger one takes its exact size if it's free (a waiting reservation holds every free permit, so it can't be overtaken);
     - else the strict path: the reply is dropped, the cap reserved, and the read run again (`reply_rereads_total`).
   - **`Get` and a recall within the default page** wait for their size instead of reading again.
-  - **What's built unaccounted** is at most `--max-concurrent` × 1 MiB.
+  - **What's built unaccounted** is at most `--max-concurrent` × 1 MiB of protobuf.
 - **Trimmed, then held:** a built reply keeps only its own size (the encoded message, or the rendered JSON), and holds it until it has been written to the connection.
 - **New answers:**
   - a unary read whose share isn't free within `--request-timeout-ms` is `Overloaded`, retry-safe, with nothing read;
