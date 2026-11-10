@@ -89,7 +89,7 @@ Eight tools, each with a JSON schema and a description written for the agent. `t
 **Errors.** A tool that fails returns a result with `isError` and `{"error": {"code", "code_num", "message"}}`, with the [`ErrorCode`](errors.md) name when the database refused the call (`TableNotFound`, `FamilyNotFound`, `ReadOnly`, ...) and `Usage` for a bad argument. The agent sees it and can correct the call. An unknown argument is an error, not ignored, so a misspelt `limt` doesn't silently scan 100 rows.
 
 ## The memory tools
-`phdb mcp --memory NAME` adds six tools over a [`pigeonhole-memory`](agent-memory.md) store named `NAME` (its tables are `mem_NAME` and `mem_NAME_text`). The store keeps memories with ranked recall, deduplication, superseding and forgetting, so an agent doesn't have to model them in tables itself. When the database is writable and the store is missing, the server creates it.
+`phdb mcp --memory NAME` adds six tools over a [`pigeonhole-memory`](agent-memory.md) store named `NAME` (its tables are `mem_NAME`, `mem_NAME_text` and, with an IVF index, `mem_NAME_ivf`: `Store::table_names`). The store keeps memories with ranked recall, deduplication, superseding and forgetting, so an agent doesn't have to model them in tables itself. When the database is writable and the store is missing, the server creates it.
 
 ```sh
 phdb mcp --create --memory agent memory.phdb                          # keyword and recency recall
@@ -121,7 +121,7 @@ Reopening a store with a model flag that names another model than the store's fa
 
 **Keyword matching.** `--memory-normalization nfkc` makes a new store's keyword recall match ligatures and full-width forms against plain text, for memories from PDFs, OCR or East Asian sources (`nfc` is the default; `none` compares code points as written). It's fixed when the store is created: for an existing store, a value other than the store's stops the server at startup.
 
-**Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs. A store whose application set a policy forgets under it too.
+**Forgetting.** `--memory-episodic-ttl HOURS` gives a new store a forget policy: its episodic memories are deleted that many hours after they were made, unless pinned or the source of a summary. The store forgets in the background while the server runs, and only when the server can write: a server whose database is read-only (it fell back to a read-only open) or a reader process (`--read-only`, or when another process is the writer) deletes nothing (#1648). A store whose application set a policy forgets under it too.
 
 ## Long results and cursors
 A result that would pass `--max-result-bytes` stops early and carries a `cursor`. Calling the same tool again with the same arguments plus that `cursor` returns the next part. An agent pages through anything this way, a million-edge hub included, without flooding its context.
