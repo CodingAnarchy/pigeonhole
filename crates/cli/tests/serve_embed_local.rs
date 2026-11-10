@@ -113,9 +113,11 @@ impl Serve {
         r["id"].as_str().unwrap().to_owned()
     }
 
-    /// The stderr lines written so far: everything the start wrote (the advice follows the
-    /// serving line before a request is served), read until the reader has been quiet a
-    /// moment.
+    /// The stderr lines written so far: everything the start wrote, read until the reader
+    /// has been quiet a moment. The start writes the advice right after the serving line and
+    /// before it serves anything, so by the time a request has been answered it's in the
+    /// pipe: the 200 ms only lets the reader thread hand over what's already there
+    /// (cli692's N3 on #1690).
     #[cfg(target_os = "linux")]
     fn lines(&mut self) -> &[String] {
         while let Ok(line) = self.stderr.recv_timeout(Duration::from_millis(200)) {
@@ -135,6 +137,15 @@ impl Serve {
         let rest: Vec<String> = self.stderr.iter().collect();
         self.seen.extend(rest);
         (status.code().unwrap_or(-1), self.seen.join("\n"))
+    }
+}
+
+/// A test that fails before [`Serve::stop`] doesn't leave the server running with the model
+/// loaded (cli692's N1 on #1690). After `stop` the child is reaped, and these do nothing.
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -200,19 +211,20 @@ fn serve_embed_local_embeds_text_in_the_process() {
 #[cfg(target_os = "linux")]
 fn embedder_threads_follow_the_placement(pid: u32, stderr: &[String]) {
     let allowed = |status: &str| {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
-            .map(|v| v.trim().to_owned())
-            .unwrap()
+        cpus(
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .unwrap(),
+        )
     };
     let advised = stderr.iter().find_map(|l| {
         l.split_whitespace()
             .find_map(|w| w.strip_prefix("CANDLE_CPU_MASK="))
-            .map(|v| v.trim_end_matches([',', '.', ';']).to_owned())
+            .map(cpus)
     });
-    let want = match &advised {
-        Some(list) => list.clone(),
+    let want = match advised {
+        Some(set) => set,
         None => {
             eprintln!(
                 "the shards aren't pinned here, so there's no network mask: checking the \
@@ -252,6 +264,22 @@ fn b64(bytes: &[u8]) -> String {
                 out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
             } else {
                 out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A CPU list (`0-2,8`) as its set of CPUs: the kernel's list and the advice's are compared
+/// as sets, not as text (cli692's N2 on #1690).
+#[cfg(target_os = "linux")]
+fn cpus(list: &str) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => out.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()),
+            None => {
+                out.insert(part.parse::<usize>().unwrap());
             }
         }
     }
