@@ -171,13 +171,20 @@ impl Tokens {
         !self.0.is_empty()
     }
 
-    /// Whether a token whose SHA-256 digest is `digest` is listed: a forwarded call's
-    /// (D317 ticket 3), whose entry node matched the token itself. Compared as
-    /// [`caller`](Self::caller) compares.
-    pub(crate) fn lists(&self, digest: &[u8; 32]) -> bool {
-        let mut found = false;
+    /// The caller a forwarded call's token digest identifies here (D317 ticket 3): this
+    /// node's own entry for it, so its scope and namespaces are this node's, or `None` when
+    /// it isn't listed. Compared as [`caller`](Self::caller) compares.
+    pub(crate) fn caller_by_digest(&self, digest: &[u8; 32]) -> Option<Caller> {
+        let mut found = None;
         for e in &self.0 {
-            found |= constant_time_eq(&e.digest, digest);
+            if constant_time_eq(&e.digest, digest) && found.is_none() {
+                found = Some(Caller {
+                    principal: Principal::from_digest(e.digest),
+                    scope: e.scope,
+                    namespaces: e.namespaces.clone(),
+                    json: false,
+                });
+            }
         }
         found
     }

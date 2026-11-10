@@ -461,9 +461,25 @@ fn data_node_with(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    let limits = crate::serve::server_tests::limits();
+    data_node_limits(rt, dir, id, local, listener, tokens, limits)
+}
+
+/// [`data_node_with`] under `limits`.
+fn data_node_limits(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
-    let limits = crate::serve::server_tests::limits();
     let metrics = Arc::new(Metrics::default());
     let db = local.map(|p| {
         let db = pigeonhole::Pigeonhole::open(
@@ -785,9 +801,11 @@ impl Rng {
 
 #[test]
 fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
-    // D317 §12's model test, single-partition half: every single-key call and every
-    // one-partition batch answers as a single database would, whichever node it enters;
-    // every cross-partition batch is refused with nothing written. The oracle is a map.
+    // D317 §12's model test, single-partition half: every single-key call, every
+    // one-partition batch, and every transaction and snapshot (ticket 3) answers as a single
+    // database would, whichever node each call enters; every cross-partition batch, and
+    // every row outside a session's partition, is refused with nothing written. The oracle
+    // is a map.
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -814,9 +832,15 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
         super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
     }
     let mut it = listeners.into_iter();
-    let (_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
-    let (_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
-    let (_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    // Every session counts against the caps until its record expires, as on a single node,
+    // and the workload's are all one (anonymous) caller's: room for every one it opens.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.leases.max_sessions = 1 << 16;
+    limits.leases.max_per_token = 1 << 16;
+    let node = |dir: &PathBuf, id, local, l| data_node_limits(&rt, dir, id, local, l, "", limits);
+    let (_a, db_a) = node(&dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_b, db_b) = node(&dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_c, _) = node(&dirs[2], "c", None, it.next().unwrap());
     // Rows on both sides of the split at "m".
     let rows: Vec<String> = ["a", "f", "k", "lz", "m", "n", "s", "z"]
         .iter()
@@ -836,14 +860,174 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
         .unwrap_or(300u64);
     rt.block_on(async {
         let mut clients = Vec::new();
+        let mut tx = Vec::new();
+        let mut snaps = Vec::new();
         for &port in &ports {
             clients.push(data(port).await);
+            tx.push(txns(port).await);
+            snaps.push(snapshots(port).await);
         }
+        let read_req = |row: &str| super::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        };
+        let value_of = |r: super::proto::GetResponse| {
+            r.cell.map(|c| String::from_utf8(c.value.to_vec()).unwrap())
+        };
         for i in 0..ops {
             let entry = rng.below(3) as usize;
-            let c = &mut clients[entry];
             let at = format!("seed {seed}, op {i}, entry node {entry}");
-            match rng.below(4) {
+            let kind = rng.below(6);
+            if kind == 4 {
+                // A transaction, each call through a random node: reads of its partition see
+                // its snapshot, a row of the other is CrossPartition, and the commit applies
+                // its writes, unless a put to a row it read came between (Conflict).
+                let home = rows[rng.below(rows.len() as u64) as usize].clone();
+                let id = tx[entry]
+                    .begin(super::proto::BeginRequest {
+                        durability: 0,
+                        route: route_row(&home),
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: begin at {home}: {e}"))
+                    .into_inner()
+                    .txn_id;
+                assert!(id.starts_with(&format!("p{}:", part(&home))), "{at}: {id}");
+                let seen = model.clone();
+                let (mut read, mut wrote) = (Vec::new(), Vec::new());
+                for step in 0..1 + rng.below(4) {
+                    let via = rng.below(3) as usize;
+                    let row = rows[rng.below(rows.len() as u64) as usize].clone();
+                    let mine = part(&row) == part(&home);
+                    let at = format!("{at}, step {step} via {via}");
+                    if rng.below(2) == 0 && !wrote.contains(&row) {
+                        let got = tx[via]
+                            .get(super::proto::TxnGetRequest {
+                                txn_id: id.clone(),
+                                table: "users".into(),
+                                row: row.as_bytes().to_vec().into(),
+                                family: "f".into(),
+                                qualifier: b"q".to_vec().into(),
+                            })
+                            .await;
+                        match got {
+                            Ok(r) if mine => {
+                                assert_eq!(
+                                    value_of(r.into_inner()).as_ref(),
+                                    seen.get(&row),
+                                    "{at}: txn get {row}"
+                                );
+                                read.push(row);
+                            }
+                            Err(e) if !mine => assert_eq!(code(&e), "CrossPartition", "{at}: {e}"),
+                            other => panic!("{at}: txn get {row}: {other:?}"),
+                        }
+                    } else {
+                        let reply = tx[via]
+                            .write(super::proto::TxnWriteRequest {
+                                txn_id: id.clone(),
+                                rows: vec![put_row(&row, &format!("t{i}"))],
+                            })
+                            .await;
+                        match reply {
+                            Ok(_) if mine => wrote.push(row),
+                            Err(e) if !mine => assert_eq!(code(&e), "CrossPartition", "{at}: {e}"),
+                            other => panic!("{at}: txn write {row}: {other:?}"),
+                        }
+                    }
+                }
+                // Sometimes a put to a row it read comes first; sometimes it aborts.
+                let interfere = !read.is_empty() && rng.below(3) == 0;
+                if interfere {
+                    let row = &read[rng.below(read.len() as u64) as usize];
+                    clients[rng.below(3) as usize]
+                        .mutate(super::proto::MutateRequest {
+                            writes: Some(put_row(row, &format!("x{i}"))),
+                            durability: 0,
+                        })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                    model.insert(row.clone(), format!("x{i}"));
+                }
+                let via = rng.below(3) as usize;
+                if rng.below(4) == 0 {
+                    tx[via]
+                        .abort(super::proto::TxnAbortRequest { txn_id: id.clone() })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: abort via {via}: {e}"));
+                    continue;
+                }
+                let reply = tx[via]
+                    .commit(super::proto::TxnCommitRequest {
+                        txn_id: id.clone(),
+                        rows: Vec::new(),
+                    })
+                    .await;
+                // A transaction without writes commits as a consistent read, whatever came
+                // between.
+                let interfere = interfere && !wrote.is_empty();
+                match reply {
+                    Ok(_) if !interfere => {
+                        for row in wrote {
+                            model.insert(row, format!("t{i}"));
+                        }
+                    }
+                    Err(e) if interfere => assert_eq!(code(&e), "Conflict", "{at}: {e}"),
+                    other => panic!("{at}: commit via {via} (interfered: {interfere}): {other:?}"),
+                }
+                continue;
+            }
+            if kind == 5 {
+                // A snapshot opened through one node, read through others after a put: its
+                // partition's rows as they were, another partition's CrossPartition.
+                let home = rows[rng.below(rows.len() as u64) as usize].clone();
+                let id = snaps[entry]
+                    .open(super::proto::OpenSnapshotRequest {
+                        durable: false,
+                        route: route_row(&home),
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: open at {home}: {e}"))
+                    .into_inner()
+                    .snapshot_id;
+                let seen = model.clone();
+                let row = &rows[rng.below(rows.len() as u64) as usize];
+                clients[rng.below(3) as usize]
+                    .mutate(super::proto::MutateRequest {
+                        writes: Some(put_row(row, &format!("s{i}"))),
+                        durability: 0,
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                model.insert(row.clone(), format!("s{i}"));
+                for _ in 0..2 {
+                    let via = rng.below(3) as usize;
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let mut req = read_req(row);
+                    req.snapshot_id = id.clone();
+                    match clients[via].get(req).await {
+                        Ok(r) if part(row) == part(&home) => assert_eq!(
+                            value_of(r.into_inner()).as_ref(),
+                            seen.get(row),
+                            "{at}: get {row} at the snapshot via {via}"
+                        ),
+                        Err(e) if part(row) != part(&home) => {
+                            assert_eq!(code(&e), "CrossPartition", "{at}: {e}");
+                        }
+                        other => panic!("{at}: get {row} at the snapshot via {via}: {other:?}"),
+                    }
+                }
+                snaps[rng.below(3) as usize]
+                    .release(super::proto::ReleaseSnapshotRequest { snapshot_id: id })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: release: {e}"));
+                continue;
+            }
+            let c = &mut clients[entry];
+            match kind {
                 0 | 1 => {
                     let row = &rows[rng.below(rows.len() as u64) as usize];
                     let value = format!("v{i}");
@@ -1303,9 +1487,12 @@ fn a_snapshot_reads_its_own_partition_through_any_node() {
 
 #[test]
 fn a_session_is_its_tokens_on_every_node() {
-    // a and c list every token; b, p2's node, doesn't list t0ken-c.
-    let all = format!("write t0ken-a\nwrite t0ken-b\nwrite t0ken-c\ncluster {NODE_TOKEN}\n");
-    let b_tokens = format!("write t0ken-a\nwrite t0ken-b\ncluster {NODE_TOKEN}\n");
+    // a and c list every token; b, p2's node, doesn't list t0ken-c, and lists t0ken-d as
+    // read where the others list it as write.
+    let all = format!(
+        "write t0ken-a\nwrite t0ken-b\nwrite t0ken-c\nwrite t0ken-d\ncluster {NODE_TOKEN}\n"
+    );
+    let b_tokens = format!("write t0ken-a\nwrite t0ken-b\nread t0ken-d\ncluster {NODE_TOKEN}\n");
     let t = Three::start([&all, &b_tokens, &all]);
     let [a, _, c] = t.ports;
     t.rt.block_on(async {
@@ -1331,5 +1518,22 @@ fn a_session_is_its_tokens_on_every_node() {
         assert!(!e.message().contains(&digest[..16]), "{e}");
         // On p1, whose node lists it, it's served.
         begin(c, "alice", Some("t0ken-c")).await.unwrap();
+        // The partition's node decides the scope by its own entry (cli692's R1 on #1702):
+        // t0ken-d writes to p1, and is refused writing to p2.
+        let write = |row: &str| super::proto::MutateRequest {
+            writes: Some(put_row(row, "d")),
+            durability: 0,
+        };
+        data(c)
+            .await
+            .mutate(with(write("alice"), Some("t0ken-d")))
+            .await
+            .unwrap();
+        let e = data(c)
+            .await
+            .mutate(with(write("zed"), Some("t0ken-d")))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
     });
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use super::Node;
-use crate::serve::auth::{ANONYMOUS, Caller, Principal, Scope, Tokens};
+use crate::serve::auth::{ANONYMOUS, Caller, Scope, Tokens};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
     ForwardRequest, ForwardResponse, ForwardedCaller, cluster_client::ClusterClient,
@@ -176,10 +176,12 @@ pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiEr
     })
 }
 
-/// The caller a forward is for, on the owner: never more than `write` (D317 ticket 2), and
-/// bound to its token's digest (ticket 3), so its sessions are its own here as on a single
-/// node. The entry node matched the token; this node checks it lists it too, since a
-/// cluster's nodes list the same tokens. Without tokens here, every caller is anyone.
+/// The caller a forward is for, on the owner (D317 ticket 3): this node's own entry for
+/// the token's digest, so its scope (capped at `write`, D317 ticket 2) and namespaces are
+/// what this node lists, and its sessions are bound to the token as on a single node
+/// (cli692's R1 on #1702). A digest this node doesn't list, or any digest on a node without
+/// tokens, is `PermissionDenied` (R2): a cluster's nodes list the same tokens. Without
+/// tokens anywhere, the forward's scope and namespaces stand, and the caller is anyone.
 pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<Caller, ApiError> {
     let f = f.ok_or_else(|| ApiError::invalid("a forward names no caller"))?;
     let scope = match f.scope.as_str() {
@@ -191,25 +193,38 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<C
             )));
         }
     };
-    let principal = if tokens.any() {
-        // Never the digest in the message (cli692's S1 on ticket 3).
-        let unknown = ApiError::unlisted_token;
-        let digest: [u8; 32] = f.token_digest.as_ref().try_into().map_err(|_| unknown())?;
-        if !tokens.lists(&digest) {
-            return Err(unknown());
+    if !tokens.any() {
+        if !f.token_digest.is_empty() {
+            return Err(ApiError::unlisted_token());
         }
-        Principal::from_digest(digest)
-    } else {
-        ANONYMOUS
+        return Ok(Caller {
+            principal: ANONYMOUS,
+            scope,
+            namespaces: (!f.all_namespaces).then_some(f.namespaces),
+            // The reply goes back to the forwarding node as protobuf; that node charges and
+            // renders it for its own client (#1567).
+            json: false,
+        });
+    }
+    // Never the digest in the message (cli692's S1 on ticket 3).
+    let digest: [u8; 32] = f
+        .token_digest
+        .as_ref()
+        .try_into()
+        .map_err(|_| ApiError::unlisted_token())?;
+    let mut caller = tokens
+        .caller_by_digest(&digest)
+        .ok_or_else(ApiError::unlisted_token)?;
+    caller.scope = match caller.scope {
+        Scope::Read => Scope::Read,
+        Scope::Write | Scope::Admin => Scope::Write,
+        Scope::Cluster => {
+            return Err(ApiError::permission_denied(
+                "make a data call with a cluster token",
+            ));
+        }
     };
-    Ok(Caller {
-        principal,
-        scope,
-        namespaces: (!f.all_namespaces).then_some(f.namespaces),
-        // The reply goes back to the forwarding node as protobuf; that node charges and
-        // renders it for its own client (#1567).
-        json: false,
-    })
+    Ok(caller)
 }
 
 /// A routed call as a forward's op. Only what [`crate::serve::router`] routes reaches here.
@@ -311,7 +326,50 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{caller_of, classify};
+    use crate::serve::auth::{Scope, Tokens};
+    use crate::serve::proto::ForwardedCaller;
+
+    fn forwarded(scope: &str, token: &[u8]) -> Option<ForwardedCaller> {
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(token).into();
+        Some(ForwardedCaller {
+            scope: scope.into(),
+            namespaces: Vec::new(),
+            all_namespaces: true,
+            token_digest: if token.is_empty() {
+                Default::default()
+            } else {
+                digest.to_vec().into()
+            },
+        })
+    }
+
+    /// The owner's own entry for the token decides the forwarded caller's scope and
+    /// namespaces, whatever the entry node sent (cli692's R1 on #1702); a digest it doesn't
+    /// list, or any digest on a node without tokens, is refused (R2).
+    #[test]
+    fn a_forwarded_caller_is_what_this_node_lists_for_its_token() {
+        let tokens =
+            Tokens::parse("read ns=team-a t0ken\nadmin b0ss\ncluster n0de\n", "t").unwrap();
+        let c = caller_of(forwarded("write", b"t0ken"), &tokens).unwrap();
+        assert_eq!(c.scope, Scope::Read);
+        assert_eq!(c.namespaces, Some(vec!["team-a".to_owned()]));
+        let boss = caller_of(forwarded("read", b"b0ss"), &tokens).unwrap();
+        assert_eq!((boss.scope, boss.namespaces), (Scope::Write, None));
+        for (f, why) in [
+            (forwarded("write", b"other"), "unlisted"),
+            (forwarded("write", b""), "no digest"),
+            (forwarded("write", b"n0de"), "a cluster token"),
+        ] {
+            let e = caller_of(f, &tokens).unwrap_err();
+            assert_eq!(e.code, "PermissionDenied", "{why}: {}", e.message);
+        }
+        let none = Tokens::parse("", "t").unwrap();
+        let e = caller_of(forwarded("write", b"t0ken"), &none).unwrap_err();
+        assert_eq!(e.code, "PermissionDenied", "{}", e.message);
+        let anyone = caller_of(forwarded("write", b""), &none).unwrap();
+        assert_eq!(anyone.scope, Scope::Write);
+    }
 
     /// tonic's status for a failed connect, as the channel builds it: a `ConnectError` around
     /// the OS's error.
