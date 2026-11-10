@@ -152,12 +152,18 @@ A few rare cases still read synchronously, inside the future or, for a read whos
 Making scan steps resumable, so the last case never blocks, is tracked in [#398](https://github.com/CodingAnarchy/pigeonhole/issues/398).
 
 ## Interrupted system calls with io_uring (Linux)
-With io_uring (the default on Linux), a thread of yours that reads through the database, blocking or async, can see `ErrorKind::Interrupted` (`EINTR`) from its own system calls, though no signal was sent (#1688).
+With io_uring (the default on Linux), a thread of yours that submits I/O through the database can see `ErrorKind::Interrupted` (`EINTR`) from its own system calls, though no signal was sent (#1688). The I/O it submits is an async read's (`get_async`, `read_async`, a scan stream) or a scan's readahead, blocking or async. A blocking point read reads the file on your thread directly (`pread`) and submits nothing.
 
-- **Why.** In engine-owned mode, your threads submit their I/O to the engine's shared ring. The kernel hands the ring's completions back to the thread that submitted them as task work. That task work wakes the thread from an interruptible wait, the way a signal would. In application-owned mode, a thread that drives no shard runs its I/O inline, and a driving thread has a ring of its own that completes only in its own calls (on Linux 6.1 and later), so neither sees it.
-- **Which calls.** Only calls the kernel never restarts after a signal: signal(7) lists them. A socket read or write with a timeout (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which std's `set_read_timeout` and `set_write_timeout` set) is the common one. A plain blocking read or write without a timeout is restarted, and you never see it.
+- **Why.** In engine-owned mode, your threads submit that I/O to the engine's shared ring. The engine's reaper thread waits for the completions, but the kernel runs part of each completion as task work on the thread that submitted it. That task work wakes the thread from an interruptible wait, the way a signal would.
+- **Application-owned mode:**
+  - a thread that drives no shard runs its I/O inline, so it never sees this;
+  - a driving thread has a ring of its own. On Linux 6.1 and later, that ring completes only inside the thread's own calls, so the thread doesn't see this either. Before 6.1 the ring is a plain one, and that thread (your event loop) can see it too.
+- **Which calls.** Only calls the kernel doesn't restart after a signal: signal(7) lists them.
+  - **A socket read or write with a timeout** (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which std's `set_read_timeout` and `set_write_timeout` set) is the common one.
+  - **`epoll_wait`** as well. Async runtimes already retry it; a hand-written event loop should too.
+  - **Restarted transparently, so you never see it:** a plain blocking read or write without a timeout, and, in the same measurement, `poll`.
 - **What to do.** Retry on `Interrupted`, as POSIX code does for signals. std's `read_exact`, `write_all` and `read_to_end` already retry; a bare `read` or `write` returns the error. Or open with `Options::io_backend(IoBackend::Pread)` (or set `PIGEONHOLE_IO=pread`): its I/O threads take the completions, and your threads see none of this.
-- **Kernel flags don't avoid it.** Measured on Linux 7.2, `IORING_SETUP_COOP_TASKRUN` (with or without `TASKRUN_FLAG`) still interrupts the wait: it skips the IPI to a running thread, but still wakes a sleeping one. Only a ring each submitting thread owns (`SINGLE_ISSUER` with `DEFER_TASKRUN`, which the shard threads' rings use) avoids it, and the shared ring has many submitters.
+- **Kernel flags don't avoid it.** Measured on Linux 7.2, `IORING_SETUP_COOP_TASKRUN` (with or without `TASKRUN_FLAG`) still interrupts the wait: it skips the IPI to a running thread, but still wakes a sleeping one. Only a ring each submitting thread owns (`SINGLE_ISSUER` with `DEFER_TASKRUN`, as the shard threads' rings are) avoids it, and the shared ring has many submitters.
 
 ## Application-owned mode
 With `open_application_owned`, the blocking `commit`, `commit_if`, a transaction's `commit` (and so `transact`), `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
