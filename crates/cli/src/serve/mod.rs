@@ -336,6 +336,47 @@ pub(crate) fn run(
         metrics,
     });
 
+    serve_shared(
+        Serving {
+            args,
+            shared,
+            placement,
+            tls,
+            serving: args.db_file().display().to_string(),
+            db: Some(db),
+            replica,
+        },
+        stderr,
+    )
+}
+
+/// What [`serve_shared`] serves.
+pub(crate) struct Serving<'a> {
+    pub args: &'a ServeArgs,
+    pub shared: Arc<Shared>,
+    pub placement: Arc<placement::Placement>,
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
+    /// What the startup line says is served: the file, or a cluster node's partition.
+    pub serving: String,
+    /// The database to close last; `None` on a cluster node that only routes.
+    pub db: Option<Pigeonhole>,
+    pub replica: Option<Arc<replica::Replica>>,
+}
+
+/// Serves `shared` until a shutdown signal, then shuts down in order: the request runtime,
+/// the feed runtime, a bulk load's, the text rebuild's and the vector indexes' threads, and
+/// the database last. One copy for a single node and a cluster node (D317 ticket 2,
+/// cli692's (a)): the order is subtle.
+fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitStatus, Failure> {
+    let Serving {
+        args,
+        shared,
+        placement,
+        tls,
+        serving,
+        db,
+        replica,
+    } = s;
     let enter = Arc::clone(&placement);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.io_threads)
@@ -388,7 +429,7 @@ pub(crate) fn run(
         let _ = writeln!(
             stderr,
             "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed and {} blocking threads on {} free CPUs, {})",
-            args.db_file().display(),
+            serving,
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
             placement.io_threads,
@@ -433,8 +474,16 @@ pub(crate) fn run(
         part.texts.close();
         part.indexes.close();
     }
-    let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
-    let closed = db.close().map_err(|e| Failure::db("close", &e));
+    let closed = match db {
+        Some(db) => {
+            let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
+            db.close().map_err(|e| Failure::db("close", &e))
+        }
+        None => {
+            let _ = writeln!(stderr, "phdb serve: stopped");
+            Ok(())
+        }
+    };
     served?;
     closed?;
     Ok(ExitStatus::SUCCESS)
