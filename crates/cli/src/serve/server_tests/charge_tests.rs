@@ -17,6 +17,8 @@ fn budgeted(budget: usize, timeout: Duration, idle: Duration, rows: usize) -> Se
         .shared
         .router
         .service
+        .part()
+        .unwrap()
         .db
         .table("t")
         .unwrap()
@@ -354,6 +356,8 @@ fn a_default_page_read_that_finds_the_budget_full_goes_the_strict_way() {
         .shared
         .router
         .service
+        .part()
+        .unwrap()
         .db
         .table("t")
         .unwrap()
@@ -412,6 +416,8 @@ fn a_cancelled_waiting_reservation_changes_nothing_after() {
         .shared
         .router
         .service
+        .part()
+        .unwrap()
         .db
         .table("t")
         .unwrap()

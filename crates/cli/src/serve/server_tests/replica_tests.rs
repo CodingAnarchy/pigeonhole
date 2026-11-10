@@ -336,7 +336,7 @@ fn concurrent_promotes_promote_once_and_rebalancers_start_after() {
         assert_eq!(status, 200, "{hits}");
         assert_eq!(hit_ids(&hits), [b64(b"a")]);
     };
-    let indexes = &r.shared.router.service.indexes;
+    let indexes = &r.shared.router.service.part().unwrap().indexes;
     search(&r);
     assert_eq!(indexes.rebalancing(), 0, "no rebalancer on a replica");
 
@@ -382,10 +382,10 @@ fn a_swap_ends_the_old_copy_s_feed_streams_with_an_error() {
     let s = Server::start("", limits());
     let other = Server::start("", limits());
     write_row(&other, b"theirs");
-    let db = &s.shared.router.service.db;
+    let db = &s.shared.router.service.part().unwrap().db;
     let side = s.dir.join("side.phdb");
     {
-        let theirs = &other.shared.router.service.db;
+        let theirs = &other.shared.router.service.part().unwrap().db;
         let snap = theirs.durable_snapshot().unwrap();
         theirs.backup_at(&snap, &side).unwrap();
     }

@@ -4,15 +4,15 @@
 //! `Status` reads a partition's identity row.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::{
     ClusterMap, GetMapRequest, Node as MapNode, Partition, SetMapRequest, SplitKey, StatusRequest,
     TablePlacement, split_key,
 };
-use super::{MapState, Node, Peers, identity, read_map, router};
+use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
 
 fn test_dir() -> PathBuf {
@@ -37,20 +37,19 @@ fn node(dir: &Path, id: &str) -> Arc<Node> {
         let json = super::map::canonical_json(&m);
         state.map = Some((super::map::canonical(&m), json));
     }
-    Arc::new(Node {
-        dir: dir.to_path_buf(),
-        id: id.into(),
-        loopback_only: true,
-        tokens: Tokens::parse("", "none").unwrap(),
-        peers: Peers {
+    Node::new(
+        dir,
+        id,
+        true,
+        Tokens::parse("", "none").unwrap(),
+        Peers {
             token: None,
             scheme: "http",
             ca: None,
             push_timeout: Duration::from_millis(500),
         },
-        state: Mutex::new(state),
-        installing: Mutex::new(()),
-    })
+        state,
+    )
 }
 
 /// Serves `node` on `listener` until the sender is dropped or fired.
@@ -60,7 +59,7 @@ fn serve(
     listener: std::net::TcpListener,
 ) -> tokio::sync::oneshot::Sender<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let app = router(Arc::clone(node), 16 << 20);
+    let app = routes(Arc::clone(node), None, 16 << 20);
     rt.spawn(async move {
         listener.set_nonblocking(true).unwrap();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -423,4 +422,519 @@ fn a_cluster_token_alone_pushes_and_an_admin_token_alone_sets() {
         assert!(n.allowed(&who(t), readers, "read").is_ok(), "{t}");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A data-serving cluster node in this process (D317 ticket 2): its map in `dir`, the
+/// partition `local` (stamped and holding table `users`) if it has one, served on
+/// `listener` through the same router `phdb serve --cluster` builds.
+fn data_node(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
+    use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
+    let node = node(dir, id);
+    let limits = crate::serve::server_tests::limits();
+    let metrics = Arc::new(Metrics::default());
+    let db = local.map(|p| {
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join(format!("{p}.phdb")),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        identity::write(
+            &db,
+            &identity::Identity {
+                cluster_id: "c1".into(),
+                partition_id: p.into(),
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        db.table("users")
+            .unwrap()
+            .family("f", pigeonhole::Family::default())
+            .create_if_missing()
+            .unwrap();
+        db
+    });
+    let service = match &db {
+        Some(db) => Service::new(db.clone(), limits, 2, Arc::clone(&metrics)),
+        None => Service::routing_only(limits, 2, Arc::clone(&metrics)),
+    };
+    let shared = Arc::new(Shared {
+        router: Router::cluster(service, node, local.map(str::to_owned)),
+        tokens: Tokens::parse("", "none").unwrap(),
+        limits,
+        metrics,
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let app = crate::serve::http::router(shared);
+    rt.spawn(async move {
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        crate::serve::listener::serve(
+            listener,
+            None,
+            app,
+            async {
+                let _ = stopped.await;
+            },
+            Duration::from_millis(100),
+            None,
+            crate::serve::listener::Bounds {
+                connections: crate::serve::listener::Connections::new(64),
+                first_byte: Duration::from_secs(5),
+            },
+        )
+        .await;
+    });
+    (stop, db)
+}
+
+async fn data(port: u16) -> super::proto::data_client::DataClient<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    super::proto::data_client::DataClient::new(channel)
+}
+
+fn put_row(row: &str, value: &str) -> super::proto::RowWrites {
+    use super::proto::{Put, RowKey, Value, Write, value, write};
+    super::proto::RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+        }),
+        writes: vec![Write {
+            op: Some(write::Op::Put(Put {
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                timestamp: None,
+                value: Some(Value {
+                    kind: Some(value::Kind::Bytes(value.as_bytes().to_vec().into())),
+                }),
+            })),
+        }],
+    }
+}
+
+async fn get_row(port: u16, row: &str) -> Result<Option<Vec<u8>>, tonic::Status> {
+    let reply = data(port)
+        .await
+        .get(super::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        })
+        .await?;
+    Ok(reply.into_inner().cell.map(|c| c.value.to_vec()))
+}
+
+/// The code a status carries in its `ErrorDetail`.
+fn code(status: &tonic::Status) -> String {
+    crate::serve::errors::ApiError::from_status(status).map_or_else(String::new, |e| e.code)
+}
+
+#[test]
+fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_them() {
+    // a serves p1 (users < "m"), b serves p2 (users >= "m"), c serves nothing and routes.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut map = the_map(1, &[ports[0], ports[1], ports[2]]);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    rt.block_on(async {
+        // Writes through the router land in their partitions; reads through any node agree.
+        for (entry, row, value) in [(c, "alice", "1"), (c, "zed", "2"), (a, "nina", "3")] {
+            data(entry)
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(put_row(row, value)),
+                    durability: 0,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{row} through {entry}: {e}"));
+        }
+        for port in [a, b, c] {
+            assert_eq!(get_row(port, "alice").await.unwrap(), Some(b"1".to_vec()));
+            assert_eq!(get_row(port, "zed").await.unwrap(), Some(b"2".to_vec()));
+            assert_eq!(get_row(port, "nina").await.unwrap(), Some(b"3".to_vec()));
+        }
+        // A batch across partitions is refused before anything is written.
+        let e = data(c)
+            .await
+            .batch(super::proto::BatchRequest {
+                rows: vec![put_row("bob", "x"), put_row("yan", "y")],
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        assert_eq!(get_row(c, "bob").await.unwrap(), None);
+        assert_eq!(get_row(c, "yan").await.unwrap(), None);
+        // A batch inside one partition is forwarded whole.
+        data(a)
+            .await
+            .batch(super::proto::BatchRequest {
+                rows: vec![put_row("xavi", "4"), put_row("yan", "5")],
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(get_row(b, "yan").await.unwrap(), Some(b"5".to_vec()));
+        // Calls a later ticket brings are refused, naming it.
+        let e = data(c)
+            .await
+            .scan(super::proto::ScanRequest {
+                table: "users".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Unsupported", "{e}");
+        assert!(e.message().contains("ticket 4"), "{e}");
+    });
+    // Each row is in its partition's file, and only there.
+    let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
+        db.table("users")
+            .unwrap()
+            .open()
+            .unwrap()
+            .get(row.as_bytes(), "f", b"q")
+            .unwrap()
+            .map(|c| c.value().to_vec())
+    };
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    assert_eq!(cell(&db_a, "alice"), Some(b"1".to_vec()));
+    assert_eq!(cell(&db_a, "zed"), None);
+    assert_eq!(cell(&db_b, "zed"), Some(b"2".to_vec()));
+    assert_eq!(cell(&db_b, "alice"), None);
+    // The owner of p2 stops: a read through the router is PartitionUnavailable (retry-safe),
+    // and a write refused before it reached the owner is too.
+    drop(stop_b);
+    rt.block_on(async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let e = get_row(c, "zed").await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let e = data(c)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(put_row("zoe", "6")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        // p1's rows are still served.
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+    drop(stop_a);
+    let _ = db_a.close();
+    let _ = db_b.close();
+}
+
+#[test]
+fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sender_catches_up() {
+    // v1: p1 on a, p2 on b, c routes. v2 moves p2 to a (epoch 2) and reaches a and b only.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::write_map(dir, &super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    let mut v2 = v1.clone();
+    v2.map_version = 2;
+    for p in &mut v2.partitions {
+        if p.id == "p2" {
+            p.node = "a".into();
+            p.epoch = 2;
+        }
+    }
+    rt.block_on(async {
+        for port in [a, b] {
+            client(port)
+                .await
+                .push_map(super::proto::PushMapRequest {
+                    map: Some(v2.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(version(c).await, 1);
+        // c routes "zed" to b by its v1. b's v2 says p2 is a's: WrongPartition, though b
+        // still has p2's file open, so b writes nothing. c pulls v2 from b and routes to a,
+        // whose v2 gives it p2, which it hasn't open (relocation is ticket 6).
+        let e = data(c)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(put_row("zed", "moved")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("ticket 6"), "{e}");
+        assert_eq!(version(c).await, 2, "c pulled the newer map");
+        // A direct call to b is refused the same way: its map moved p2 away.
+        let e = get_row(b, "zed").await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        // p1 is still served wherever the call enters.
+        data(c)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(put_row("alice", "1")),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+    let db_b = db_b.unwrap();
+    assert_eq!(
+        db_b.table("users")
+            .unwrap()
+            .open()
+            .unwrap()
+            .get(b"zed", "f", b"q")
+            .unwrap()
+            .map(|c| c.value().to_vec()),
+        None,
+        "the node p2 moved away from wrote nothing"
+    );
+    let _ = db_b.close();
+    let _ = db_a.map(pigeonhole::Pigeonhole::close);
+}
+
+/// The cluster model test's random source: splitmix64, seeded and reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[test]
+fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
+    // D317 §12's model test, single-partition half: every single-key call and every
+    // one-partition batch answers as a single database would, whichever node it enters;
+    // every cross-partition batch is refused with nothing written. The oracle is a map.
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("cluster model seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    let mut rng = Rng(seed);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut map = the_map(1, &[ports[0], ports[1], ports[2]]);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    // Rows on both sides of the split at "m".
+    let rows: Vec<String> = ["a", "f", "k", "lz", "m", "n", "s", "z"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}")))
+        .collect();
+    let part = |row: &str| {
+        if row.as_bytes() < b"m".as_slice() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut model: std::collections::HashMap<String, String> = Default::default();
+    let ops = std::env::var("PIGEONHOLE_STRESS_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300u64);
+    rt.block_on(async {
+        let mut clients = Vec::new();
+        for &port in &ports {
+            clients.push(data(port).await);
+        }
+        for i in 0..ops {
+            let entry = rng.below(3) as usize;
+            let c = &mut clients[entry];
+            let at = format!("seed {seed}, op {i}, entry node {entry}");
+            match rng.below(4) {
+                0 | 1 => {
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let value = format!("v{i}");
+                    c.mutate(super::proto::MutateRequest {
+                        writes: Some(put_row(row, &value)),
+                        durability: 0,
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                    model.insert(row.clone(), value);
+                }
+                2 => {
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let got = c
+                        .get(super::proto::GetRequest {
+                            table: "users".into(),
+                            row: row.as_bytes().to_vec().into(),
+                            family: "f".into(),
+                            qualifier: b"q".to_vec().into(),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: get {row}: {e}"))
+                        .into_inner()
+                        .cell
+                        .map(|c| String::from_utf8(c.value.to_vec()).unwrap());
+                    assert_eq!(got.as_ref(), model.get(row), "{at}: get {row}");
+                }
+                _ => {
+                    // A batch of two to four rows: one partition commits whole, two refuse.
+                    let n = 2 + rng.below(3) as usize;
+                    let picked: Vec<String> = (0..n)
+                        .map(|_| rows[rng.below(rows.len() as u64) as usize].clone())
+                        .collect();
+                    let value = format!("b{i}");
+                    let reply = c
+                        .batch(super::proto::BatchRequest {
+                            rows: picked.iter().map(|r| put_row(r, &value)).collect(),
+                            durability: 0,
+                        })
+                        .await;
+                    let one = picked.iter().all(|r| part(r) == part(&picked[0]));
+                    match reply {
+                        Ok(_) if one => {
+                            for r in &picked {
+                                model.insert(r.clone(), value.clone());
+                            }
+                        }
+                        Err(e) if !one => {
+                            assert_eq!(code(&e), "CrossPartition", "{at}: {e}");
+                        }
+                        other => panic!("{at}: batch {picked:?}: {other:?}"),
+                    }
+                }
+            }
+        }
+    });
+    // Every row is in its own partition's file only, holding the model's value.
+    let read = |db: &pigeonhole::Pigeonhole, row: &str| {
+        db.table("users")
+            .unwrap()
+            .open()
+            .unwrap()
+            .get(row.as_bytes(), "f", b"q")
+            .unwrap()
+            .map(|c| String::from_utf8(c.value().to_vec()).unwrap())
+    };
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    for row in &rows {
+        let (home, other) = if part(row) == 1 {
+            (&db_a, &db_b)
+        } else {
+            (&db_b, &db_a)
+        };
+        assert_eq!(
+            read(home, row).as_ref(),
+            model.get(row),
+            "seed {seed}: {row}"
+        );
+        assert_eq!(
+            read(other, row),
+            None,
+            "seed {seed}: {row} in the wrong file"
+        );
+    }
+    let _ = db_a.close();
+    let _ = db_b.close();
+}
+
+#[test]
+fn a_partition_opens_with_the_servers_shard_poll() {
+    // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
+    // database does, so its default runs no poll (D198 amendment 4).
+    let dir = test_dir();
+    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None)
+        .create_if_missing(true);
+    let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
+    let t = db
+        .table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..200u32 {
+        t.mutate(format!("r{i}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let spin = db
+        .internal_metrics()
+        .into_iter()
+        .find(|(n, _)| *n == "shard_spin_time_nanos")
+        .map_or(0, |(_, v)| v);
+    assert_eq!(spin, 0, "a partition opened with --shard-spin 0 polled");
+    drop(t);
+    db.close().unwrap();
 }

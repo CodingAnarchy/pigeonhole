@@ -9,8 +9,10 @@
 //! partition's identity under it.
 
 pub(crate) mod cli;
+pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
+pub(crate) mod route;
 #[cfg(test)]
 mod tests;
 
@@ -32,7 +34,7 @@ use super::proto::{
     self, ClusterMap, GetMapRequest, LocalPartition, NodePush, NodeStatus, PushMapRequest,
     PushMapResponse, SetMapRequest, SetMapResponse, StatusRequest,
 };
-use super::{ServeArgs, config, listener, tls};
+use super::{ServeArgs, config, tls};
 use crate::ExitStatus;
 use crate::exit::Failure;
 
@@ -138,9 +140,49 @@ pub(crate) struct Node {
     /// Serializes installs (check, persist, publish), so the file and `state` take maps in
     /// one order; held only on blocking threads (cli692's R2).
     installing: Mutex<()>,
+    /// The routes of the newest map, swapped whole with it: read on every routed call
+    /// without a lock (D317 ticket 2; `load()`'s guard, never `load_full()`, perf287).
+    routes: arc_swap::ArcSwapOption<route::Routes>,
+    /// One awaited map pull at a time ([`Node::pull_now`]).
+    pulling: tokio::sync::Mutex<()>,
 }
 
 impl Node {
+    fn new(
+        dir: &Path,
+        id: &str,
+        loopback_only: bool,
+        tokens: Tokens,
+        peers: Peers,
+        state: MapState,
+    ) -> Arc<Self> {
+        let routes = state
+            .map
+            .as_ref()
+            .map(|(m, _)| Arc::new(route::Routes::new(m)));
+        Arc::new(Self {
+            dir: dir.to_path_buf(),
+            id: id.to_owned(),
+            loopback_only,
+            tokens,
+            peers,
+            state: Mutex::new(state),
+            installing: Mutex::new(()),
+            routes: arc_swap::ArcSwapOption::new(routes),
+            pulling: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// The newest map's routes, `None` before the node has a map. A guard, not a clone of
+    /// the `Arc`: read on every routed call.
+    pub(crate) fn routes(&self) -> arc_swap::Guard<Option<Arc<route::Routes>>> {
+        self.routes.load()
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, MapState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -220,8 +262,11 @@ impl Node {
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
         let version = canonical.map_version;
+        let routes = Arc::new(route::Routes::new(&canonical));
         let mut st = self.state();
         st.map = Some((canonical, json));
+        // Under the state lock, so the routes never run behind the map `GetMap` answers.
+        self.routes.store(Some(routes));
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
@@ -480,6 +525,17 @@ impl Node {
         &self,
         address: &str,
     ) -> Result<proto::cluster_client::ClusterClient<tonic::transport::Channel>, String> {
+        let channel = self
+            .endpoint(address)?
+            .connect()
+            .await
+            .map_err(|e| format!("connecting to {address}: {e}"))?;
+        Ok(proto::cluster_client::ClusterClient::new(channel))
+    }
+
+    /// How this node dials the peer at `address` (the map's `host:port`): its TLS settings,
+    /// and a connect within the push timeout.
+    pub(crate) fn endpoint(&self, address: &str) -> Result<tonic::transport::Endpoint, String> {
         let url = format!("{}://{address}", self.peers.scheme);
         let mut endpoint = tonic::transport::Endpoint::from_shared(url.clone())
             .map_err(|e| format!("{url}: {e}"))?
@@ -493,15 +549,49 @@ impl Node {
                 .tls_config(tls)
                 .map_err(|e| format!("TLS to {url}: {e}"))?;
         }
-        let channel = endpoint
-            .connect()
+        Ok(endpoint)
+    }
+
+    /// Pulls the map from node `from` at `address` now, and waits for it to be installed,
+    /// unless this node's map is already past `past` (D317 ticket 2: a `WrongPartition`
+    /// answer means the owner has a newer map). Single-flight: concurrent callers wait on
+    /// one pull, and the ones after it find the map moved on.
+    pub(crate) async fn pull_now(
+        self: &Arc<Self>,
+        from: &str,
+        address: &str,
+        past: u64,
+    ) -> Result<(), String> {
+        let _one = self.pulling.lock().await;
+        if self.state().version() > past {
+            return Ok(());
+        }
+        let pulled = async {
+            let mut client = self.client(address).await?;
+            let req = self.request(GetMapRequest {})?;
+            client
+                .get_map(req)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|s| s.message().to_owned())
+        };
+        let map = tokio::time::timeout(self.peers.push_timeout, pulled)
             .await
-            .map_err(|e| format!("connecting to {url}: {e}"))?;
-        Ok(proto::cluster_client::ClusterClient::new(channel))
+            .map_err(|_| "timed out".to_owned())??;
+        if map.map_version <= past {
+            return Err(format!(
+                "node {from}'s map is version {}, no newer than this node's",
+                map.map_version
+            ));
+        }
+        self.push_map_async(map, Some(from.to_owned()))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message)
     }
 
     /// `message` as a call to a peer: the node's token, id and map version.
-    fn request<T>(&self, message: T) -> Result<Request<T>, String> {
+    pub(crate) fn request<T>(&self, message: T) -> Result<Request<T>, String> {
         let mut req = Request::new(message);
         let md = req.metadata_mut();
         if let Some(token) = &self.peers.token {
@@ -593,7 +683,9 @@ const DIVERGENT: &str = "divergent map";
 
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
-struct ClusterGrpc(Arc<Node>);
+/// The `Cluster` service: the node, and on a node that serves data (not a bare node in a
+/// test) the server, which a `Forward` is served through.
+struct ClusterGrpc(Arc<Node>, Option<Arc<super::Shared>>);
 
 impl ClusterGrpc {
     fn caller<T>(&self, req: &Request<T>, scopes: &[Scope], what: &str) -> Result<Caller, Status> {
@@ -662,6 +754,32 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(tonic::Response::new(status))
     }
+
+    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope only.
+    /// The node serves it through its router once that lands; until then it's refused.
+    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope; the
+    /// call is then checked for the caller it names, and served only if this node's map
+    /// gives it the key.
+    async fn forward(
+        &self,
+        req: Request<proto::ForwardRequest>,
+    ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
+        self.caller(&req, &[Scope::Cluster], "forward a call")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let msg = req.into_inner();
+        let caller = forward::caller_of(msg.caller)?;
+        let op = forward::op_of(msg.op)?;
+        let reply = shared.router.serve_forwarded(op, &caller).await?;
+        let (reply, charge) = forward::reply_to_forward(reply)?;
+        let mut resp = tonic::Response::new(reply);
+        // A read's charge lasts until the reply's body is written: `routes` holds it there.
+        if let Some(c) = charge {
+            resp.extensions_mut().insert(super::charge::Charged::new(c));
+        }
+        Ok(resp)
+    }
 }
 
 fn http_caller(
@@ -713,30 +831,40 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
     }
 }
 
-async fn http_health() -> Response {
-    axum::Json(proto::HealthResponse {
-        status: "ok".into(),
-    })
-    .into_response()
-}
-
-/// The node's routes: the `Cluster` service over gRPC, its HTTP/JSON forms (`PushMap` is
-/// gRPC only), and health. Peers call each other over gRPC only, so only gRPC calls carry
-/// the map-version headers that start a pull; the HTTP forms are for operators (cli692's
-/// N6).
-fn router(node: Arc<Node>, max_request_bytes: usize) -> axum::Router {
-    let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node)))
+/// The `Cluster` service's routes, gRPC and HTTP, which the data listener mounts beside the
+/// data routes (D317 ticket 2). Outside the server's load shedding, with a small limit of
+/// their own: a node busy with data must still take a map, or a re-forward's pull fails
+/// exactly when it matters (cli692's 3). `Forward` itself is a data call: an owner that
+/// sheds it answers `Overloaded`, which the forwarding node passes back.
+pub(crate) fn routes(
+    node: Arc<Node>,
+    shared: Option<Arc<super::Shared>>,
+    max_request_bytes: usize,
+) -> axum::Router {
+    let idle = shared.as_ref().map(|s| s.limits.stream_idle);
+    let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes);
-    axum::Router::new()
-        .route("/v1/health", get(http_health))
+    let mut app = axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))
         .with_state(node)
-        .route_service("/pigeonhole.v1.Cluster/{*method}", grpc)
+        .route_service("/pigeonhole.v1.Cluster/{*method}", grpc);
+    // A forwarded read's charge (#1567) moves into its reply's body, as the data routes'
+    // `prepay` does, so it's held until the reply is written (cli692's F1 on ticket 2).
+    if let Some(idle) = idle {
+        app = app.layer(axum::middleware::map_response(
+            move |resp: axum::response::Response| async move { super::charge::hold(resp, idle) },
+        ));
+    }
+    app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
 }
+
+/// `Cluster` calls a node runs at once: map reads and installs, pushes and pulls are few.
+const CLUSTER_CALLS: usize = 16;
 
 /// `phdb serve --cluster DIR`.
 pub(crate) fn run(
+    cli: &crate::args::Cli,
     args: &ServeArgs,
     dir: &Path,
     stderr: &mut dyn std::io::Write,
@@ -830,71 +958,171 @@ pub(crate) fn run(
         state.map = Some((map::canonical(&m), json));
     }
     let version = state.version();
-    let node = Arc::new(Node {
-        dir: dir.to_path_buf(),
-        id: id.clone(),
+    let node = Node::new(
+        dir,
+        &id,
         loopback_only,
         tokens,
-        peers: Peers {
+        Peers {
             token,
             scheme: if tls.is_some() { "https" } else { "http" },
             ca,
             push_timeout: Duration::from_millis(args.cluster_push_timeout_ms.max(1)),
         },
-        state: Mutex::new(state),
-        installing: Mutex::new(()),
+        state,
+    );
+    // The partition the map gives this node, opened and checked against the map; none
+    // before a first map, or when the map gives it none (the node only routes). Several
+    // per node come with D317's ticket 8.
+    let local = {
+        let routes = node.routes();
+        match routes.as_ref() {
+            None => None,
+            Some(r) => {
+                let mut mine: Vec<&str> = r.partitions_of(&id).collect();
+                mine.sort_unstable();
+                if mine.len() > 1 {
+                    return Err(Failure::usage(&format!(
+                        "the map gives node {id} {} partitions ({}): several per node come \
+                         with D317's ticket 8",
+                        mine.len(),
+                        mine.join(", ")
+                    )));
+                }
+                mine.first()
+                    .map(|p| ((*p).to_owned(), r.owner(p).map_or(0, |o| o.epoch)))
+            }
+        }
+    };
+    let cluster_id = node.state().map.as_ref().map(|(m, _)| m.cluster_id.clone());
+    let db = match (&local, &cluster_id) {
+        (Some((p, epoch)), Some(c)) => {
+            let options = partition_options(args.shard_spin, cli.shm_dir.as_deref());
+            Some(open_partition(dir, c, p, *epoch, options)?)
+        }
+        _ => None,
+    };
+    let placement = Arc::new(match &db {
+        Some(db) => super::placement::Placement::plan(
+            db,
+            args.io_threads,
+            args.blocking_threads,
+            args.feed_threads,
+        ),
+        None => super::placement::Placement::routes_only(args.io_threads, args.blocking_threads),
     });
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.io_threads.unwrap_or(2).max(1))
-        .thread_name("phdb-cluster")
-        .enable_all()
-        .build()
-        .map_err(|e| Failure::io("start the runtime", &e))?;
-    let served = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(args.listen)
-            .await
-            .map_err(|e| Failure::io(&format!("listen on {}", args.listen), &e))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| Failure::io("listen", &e))?;
-        let _ = writeln!(
-            stderr,
-            "phdb serve: cluster node {id} of {} on {addr} ({}, {}; map version {version})",
-            dir.display(),
-            if tls.is_some() { "TLS" } else { "no TLS" },
-            if node.tokens.any() {
-                "tokens required"
-            } else {
-                "no tokens"
-            },
-        );
-        // A node that restarts with a map takes a newer one from its peers, then pushes.
-        if version > 0 {
-            let n = Arc::clone(&node);
+    let limits = args.limits();
+    let metrics = Arc::new(super::service::Metrics::default());
+    let service = match &db {
+        Some(db) => super::service::Service::new(
+            db.clone(),
+            limits,
+            placement.blocking_threads,
+            Arc::clone(&metrics),
+        )
+        .placement(&placement),
+        None => super::service::Service::routing_only(
+            limits,
+            placement.blocking_threads,
+            Arc::clone(&metrics),
+        ),
+    };
+    let serving = match &local {
+        Some((p, epoch)) => format!(
+            "partition {p} (epoch {epoch}) as cluster node {id} of {}; map version {version}",
+            dir.display()
+        ),
+        None => format!(
+            "no partition, routing only, as cluster node {id} of {}; map version {version}",
+            dir.display()
+        ),
+    };
+    let shared = Arc::new(super::Shared {
+        router: super::router::Router::cluster(service, Arc::clone(&node), local.map(|(p, _)| p)),
+        // The data calls' tokens: the same file the node's own calls read.
+        tokens: super::tokens(args)?,
+        limits,
+        metrics,
+    });
+    // A node that restarts with a map takes a newer one from its peers, then pushes.
+    let start: Option<Box<dyn FnOnce() + Send>> = (version > 0).then(|| {
+        let n = Arc::clone(&node);
+        Box::new(move || {
             tokio::spawn(async move {
                 n.sync_on_start().await;
             });
-        }
-        listener::serve(
-            listener,
-            tls,
-            router(Arc::clone(&node), args.max_request_bytes),
-            super::shutdown_signal(),
-            Duration::from_millis(args.shutdown_grace_ms),
-            args.http2_send_buffer
-                .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
-            listener::Bounds {
-                connections: listener::Connections::new(listener::default_max_connections(
-                    listener::open_file_limit(),
-                )),
-                first_byte: Duration::from_secs(30),
-            },
-        )
-        .await;
-        Ok::<_, Failure>(())
+        }) as Box<dyn FnOnce() + Send>
     });
-    runtime.shutdown_timeout(Duration::from_secs(5));
-    let _ = writeln!(stderr, "phdb serve: cluster node {id} stopped");
-    served?;
-    Ok(ExitStatus::SUCCESS)
+    super::serve_shared(
+        super::Serving {
+            args,
+            shared,
+            placement,
+            tls,
+            serving,
+            db,
+            replica: None,
+            start,
+        },
+        stderr,
+    )
+}
+
+/// The options a cluster node opens its partition with: the server's shard poll (none by
+/// default, D198 amendment 4) and `--shm-dir`, as a single node's (cli692's M1 on #1686).
+pub(crate) fn partition_options(
+    shard_spin: config::ShardSpin,
+    shm_dir: Option<&Path>,
+) -> pigeonhole::Options {
+    let options = shard_spin.apply(pigeonhole::Options::default());
+    match shm_dir {
+        Some(dir) => options.shm_dir(dir),
+        None => options,
+    }
+}
+
+/// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
+/// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
+/// stamped for another cluster or partition, or the map moved past it: refused, not served.
+fn open_partition(
+    dir: &Path,
+    cluster_id: &str,
+    partition: &str,
+    epoch: u64,
+    options: pigeonhole::Options,
+) -> Result<pigeonhole::Pigeonhole, Failure> {
+    let path = dir.join(format!("{partition}.phdb"));
+    if !path.exists() {
+        return Err(Failure::usage(&format!(
+            "the map gives this node partition {partition}, but {} doesn't exist: create it \
+             with phdb cluster init-partition",
+            path.display()
+        )));
+    }
+    let db = pigeonhole::Pigeonhole::open(&path, options)
+        .map_err(|e| Failure::db("open the partition", &e))?;
+    let want = identity::Identity {
+        cluster_id: cluster_id.to_owned(),
+        partition_id: partition.to_owned(),
+        epoch,
+    };
+    match identity::read(&db) {
+        Ok(Some(id)) if id == want => Ok(db),
+        found => {
+            let _ = db.close();
+            let found = match found {
+                Ok(Some(id)) => format!(
+                    "partition {:?} of cluster {:?} at epoch {}",
+                    id.partition_id, id.cluster_id, id.epoch
+                ),
+                Ok(None) => "no identity row (run phdb cluster init-partition)".to_owned(),
+                Err(e) => e,
+            };
+            Err(Failure::usage(&format!(
+                "{} isn't partition {partition:?} of cluster {cluster_id:?} at the map's epoch \
+                 {epoch}: it says {found}",
+                path.display()
+            )))
+        }
+    }
 }
