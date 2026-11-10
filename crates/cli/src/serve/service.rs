@@ -1074,18 +1074,20 @@ impl Service {
             ServiceOp::MultiGet(r) => {
                 drop(budget);
                 let cap = cap(r.page_bytes);
-                self.read_charged(caller, cap, || {
-                    let r = r.clone();
-                    async move { self.multi_get(r, caller).await.map(ServiceReply::MultiGet) }
+                self.read_charged(caller, cap, r, |r| async move {
+                    self.multi_get(r, caller)
+                        .await
+                        .map(|(reply, r)| (ServiceReply::MultiGet(reply), r))
                 })
                 .await
             }
             ServiceOp::ReadRow(r) => {
                 drop(budget);
                 let cap = cap(r.page_bytes);
-                self.read_charged(caller, cap, || {
-                    let r = r.clone();
-                    async move { self.read_row(r, caller).await.map(ServiceReply::ReadRow) }
+                self.read_charged(caller, cap, r, |r| async move {
+                    self.read_row(r, caller)
+                        .await
+                        .map(|(reply, r)| (ServiceReply::ReadRow(reply), r))
                 })
                 .await
             }
@@ -1259,18 +1261,18 @@ impl Service {
             ServiceOp::Traverse(r) => {
                 drop(budget);
                 let cap = cap(r.page_bytes);
-                self.read_charged(caller, cap, || {
-                    let r = r.clone();
-                    async move { self.traverse(r, caller).await.map(ServiceReply::Traverse) }
+                self.read_charged(caller, cap, r, |r| async move {
+                    let reply = self.traverse(&r, caller).await?;
+                    Ok((ServiceReply::Traverse(reply), r))
                 })
                 .await
             }
             ServiceOp::Nearest(r) => {
                 drop(budget);
                 let cap = cap(r.page_bytes);
-                self.read_charged(caller, cap, || {
-                    let r = r.clone();
-                    async move { self.nearest(r, caller).await.map(ServiceReply::Nearest) }
+                self.read_charged(caller, cap, r, |r| async move {
+                    let reply = self.nearest(&r, caller).await?;
+                    Ok((ServiceReply::Nearest(reply), r))
                 })
                 .await
             }
@@ -1420,26 +1422,31 @@ impl Service {
     ///   most `--max-concurrent` × the default page (cli692's H1).
     /// - **A larger cap:** reserved before the read, as before g46, since its builds run on
     ///   the Tokio workers and would otherwise be bounded only by `--max-concurrent` × 8 MiB.
-    async fn read_charged<Fut>(
+    ///
+    /// The read takes the request and gives it back with its reply, so the fast path never
+    /// copies it; only the strict path reads it a second time (perf287's g54 profile).
+    async fn read_charged<R, Fut>(
         &self,
         caller: &Caller,
         cap: usize,
-        read: impl Fn() -> Fut,
+        mut r: R,
+        read: impl Fn(R) -> Fut,
     ) -> Result<ServiceReply, ApiError>
     where
-        Fut: Future<Output = Result<ServiceReply, ApiError>>,
+        Fut: Future<Output = Result<(ServiceReply, R), ApiError>>,
     {
         if cap <= FAST_CAP {
-            let reply = read().await.map_err(ApiError::for_read)?;
+            let (reply, back) = read(r).await.map_err(ApiError::for_read)?;
             let (reply, settled) = self.try_charge(caller, reply);
             if settled {
                 return Ok(reply);
             }
             drop(reply);
+            r = back;
             self.replies.rereads.fetch_add(1, Ordering::Relaxed);
         }
         let charge = self.reserve_reply(caller, cap).await?;
-        let reply = read().await.map_err(ApiError::for_read)?;
+        let (reply, _) = read(r).await.map_err(ApiError::for_read)?;
         Ok(self.charged(caller, reply, charge))
     }
 
@@ -1928,34 +1935,38 @@ impl Service {
         &self,
         r: proto::MultiGetRequest,
         caller: &Caller,
-    ) -> Result<proto::MultiGetResponse, ApiError> {
+    ) -> Result<(proto::MultiGetResponse, proto::MultiGetRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
+        // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let select = convert::Select::new(r.selection.as_ref())?.at(at);
-            let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
-            let mut read = select.keys(table.keys(&keys))?;
-            let after;
-            if !r.after.is_empty() {
-                after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
-                read = read.resume_after(&after);
-            }
-            let page = read.read_within(budget)?;
-            let q = select.aggregate();
-            Ok(proto::MultiGetResponse {
-                rows: page
-                    .rows()
-                    .iter()
-                    .map(|row| convert::row(row.view(), q))
-                    .collect(),
-                next: page
-                    .resume()
-                    .map(|p| p.to_bytes().into())
-                    .unwrap_or_default(),
-                bytes: page.bytes(),
-            })
+            let reply = (|| -> Result<proto::MultiGetResponse, ApiError> {
+                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                let select = convert::Select::new(r.selection.as_ref())?.at(at);
+                let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
+                let mut read = select.keys(table.keys(&keys))?;
+                let after;
+                if !r.after.is_empty() {
+                    after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
+                    read = read.resume_after(&after);
+                }
+                let page = read.read_within(budget)?;
+                let q = select.aggregate();
+                Ok(proto::MultiGetResponse {
+                    rows: page
+                        .rows()
+                        .iter()
+                        .map(|row| convert::row(row.view(), q))
+                        .collect(),
+                    next: page
+                        .resume()
+                        .map(|p| p.to_bytes().into())
+                        .unwrap_or_default(),
+                    bytes: page.bytes(),
+                })
+            })()?;
+            Ok((reply, r))
         })
         .await
     }
@@ -1967,7 +1978,7 @@ impl Service {
     /// it can fetch), so it holds no blocking thread.
     async fn traverse(
         &self,
-        r: proto::TraverseRequest,
+        r: &proto::TraverseRequest,
         caller: &Caller,
     ) -> Result<proto::TraverseResponse, ApiError> {
         if r.seeds.is_empty() {
@@ -1981,7 +1992,7 @@ impl Service {
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let seeds = KeySet::from_unsorted(r.seeds.iter().map(|k| &k[..]));
-        let mut t = convert::edges(table.traverse(&seeds).family(&r.family), &r)?
+        let mut t = convert::edges(table.traverse(&seeds).family(&r.family), r)?
             .hops(r.hops.max(1))
             .parents(r.parents)
             .byte_budget(page_bytes(r.page_bytes));
@@ -2025,7 +2036,7 @@ impl Service {
     /// task, as `Traverse`.
     async fn nearest(
         &self,
-        r: proto::NearestRequest,
+        r: &proto::NearestRequest,
         caller: &Caller,
     ) -> Result<proto::NearestResponse, ApiError> {
         use proto::nearest_request::Source;
@@ -2385,7 +2396,7 @@ impl Service {
         &self,
         r: proto::ReadRowRequest,
         caller: &Caller,
-    ) -> Result<proto::ReadRowResponse, ApiError> {
+    ) -> Result<(proto::ReadRowResponse, proto::ReadRowRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
@@ -2394,56 +2405,62 @@ impl Service {
         } else {
             r.page_cells as usize
         };
+        // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let select = convert::Select::new(r.selection.as_ref())?.at(at);
-            let mut read = select.row(table.row(&r.row))?;
-            let after;
-            if !r.after.is_empty() {
-                after = RowPosition::from_bytes(&r.after).map_err(ApiError::from)?;
-                read = read.resume_after(&after);
-            }
-            let q = select.aggregate();
-            // One column per engine page, so the byte budget is checked at every column
-            // boundary: a page is cut before the column that wouldn't fit, and only a
-            // single column larger than the budget goes over it (D308's rule).
-            let mut pages = read.pages(1)?;
-            let mut out: Option<proto::Row> = None;
-            let (mut bytes, mut cells) = (0u64, 0usize);
-            let mut next = Vec::new();
-            let mut more = false;
-            while let Some(page) = pages.next()? {
-                let part = convert::row(page, q);
-                let part_bytes: u64 = part.cells.iter().map(convert::cell_bytes).sum();
-                let first = out.is_none();
-                if !first && (bytes + part_bytes > budget || cells + part.cells.len() > cells_cap) {
-                    more = true;
-                    break;
+            let reply = (|| -> Result<proto::ReadRowResponse, ApiError> {
+                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                let select = convert::Select::new(r.selection.as_ref())?.at(at);
+                let mut read = select.row(table.row(&r.row))?;
+                let after;
+                if !r.after.is_empty() {
+                    after = RowPosition::from_bytes(&r.after).map_err(ApiError::from)?;
+                    read = read.resume_after(&after);
                 }
-                bytes += part_bytes;
-                cells += part.cells.len();
-                match &mut out {
-                    None => out = Some(part),
-                    Some(row) => row.cells.extend(part.cells),
+                let q = select.aggregate();
+                // One column per engine page, so the byte budget is checked at every column
+                // boundary: a page is cut before the column that wouldn't fit, and only a
+                // single column larger than the budget goes over it (D308's rule).
+                let mut pages = read.pages(1)?;
+                let mut out: Option<proto::Row> = None;
+                let (mut bytes, mut cells) = (0u64, 0usize);
+                let mut next = Vec::new();
+                let mut more = false;
+                while let Some(page) = pages.next()? {
+                    let part = convert::row(page, q);
+                    let part_bytes: u64 = part.cells.iter().map(convert::cell_bytes).sum();
+                    let first = out.is_none();
+                    if !first
+                        && (bytes + part_bytes > budget || cells + part.cells.len() > cells_cap)
+                    {
+                        more = true;
+                        break;
+                    }
+                    bytes += part_bytes;
+                    cells += part.cells.len();
+                    match &mut out {
+                        None => out = Some(part),
+                        Some(row) => row.cells.extend(part.cells),
+                    }
+                    next = pages.position().map(|p| p.to_bytes()).unwrap_or_default();
+                    if bytes >= budget || cells >= cells_cap {
+                        more = true;
+                        break;
+                    }
                 }
-                next = pages.position().map(|p| p.to_bytes()).unwrap_or_default();
-                if bytes >= budget || cells >= cells_cap {
-                    more = true;
-                    break;
+                if let Some(row) = &out {
+                    bytes += row.key.len() as u64;
                 }
-            }
-            if let Some(row) = &out {
-                bytes += row.key.len() as u64;
-            }
-            Ok(proto::ReadRowResponse {
-                row: out,
-                next: if more {
-                    next.into()
-                } else {
-                    Default::default()
-                },
-                bytes,
-            })
+                Ok(proto::ReadRowResponse {
+                    row: out,
+                    next: if more {
+                        next.into()
+                    } else {
+                        Default::default()
+                    },
+                    bytes,
+                })
+            })()?;
+            Ok((reply, r))
         })
         .await
     }
