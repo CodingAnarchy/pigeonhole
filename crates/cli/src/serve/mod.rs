@@ -31,6 +31,7 @@ mod handles;
 mod http;
 mod indexes;
 mod listener;
+mod mcp;
 mod memory;
 mod memslot;
 mod placement;

@@ -72,11 +72,8 @@ const MAX_K: u64 = 1_000;
 /// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
 const MAX_COMMITS: u64 = 1_000;
 const MAX_WAIT_MS: u64 = 30_000;
-/// The largest traversal result the server keeps for its cursors (#1254), about: counted in
-/// node-key bytes, plus 4 a node for parents. Past it, a cursor runs the traversal again.
-const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
-pub(super) type Outcome = Result<Map<String, Value>, Failure>;
+pub(crate) type Outcome = Result<Map<String, Value>, Failure>;
 
 impl super::protocol::Host for Tools {
     fn memory(&self) -> Option<&super::memory::Memory> {
@@ -96,7 +93,7 @@ impl super::protocol::Host for Tools {
     }
 }
 
-pub(super) struct Tools {
+pub(crate) struct Tools {
     /// The database, through the tools' surface on it (8c-2): the one `phdb mcp` opened,
     /// or `phdb serve`'s service layer.
     db: Box<dyn Backend>,
@@ -122,7 +119,7 @@ struct CachedTraversal {
 }
 
 impl Tools {
-    pub(super) fn new(
+    pub(crate) fn new(
         db: Box<dyn Backend>,
         writable: bool,
         limits: Limits,
@@ -223,10 +220,7 @@ impl Tools {
         };
         let mut tables = Vec::new();
         for t in names {
-            let families = self
-                .db
-                .families(&t)
-                .map_err(|e| Failure::db(&format!("table {t}"), &e))?;
+            let families = self.db.families(&t)?;
             let families: Vec<Value> = families.iter().map(family_brief).collect();
             tables.push(json!({"name": t, "families": families}));
         }
@@ -554,7 +548,7 @@ impl Tools {
                         .sum::<usize>()
                 })
                 .sum();
-            if bytes <= MAX_CACHED_TRAVERSAL_BYTES {
+            if bytes <= self.limits.cache_bytes {
                 *self.traversal.lock().expect("not poisoned") = Some(CachedTraversal {
                     fingerprint,
                     run,
@@ -803,7 +797,7 @@ impl Tools {
                     .db
                     .open_for_write(name)
                     .ok_or_else(|| Failure::read_only(self.db.mode()))?
-                    .map_err(|e| Failure::db(&format!("ops[{i}]: table {name}"), &e))?;
+                    .map_err(|f| f.within(&format!("ops[{i}]")))?;
                 tables.insert(name.to_owned(), t);
             }
         }
@@ -839,7 +833,6 @@ impl Tools {
         if families.is_empty() {
             return Err(Failure::usage("families: at least one"));
         }
-        let fail = |e: pigeonhole::Error| Failure::db(&format!("create_table {table}"), &e);
         let mut specs = Vec::with_capacity(families.len());
         for (i, f) in families.iter().enumerate() {
             let spec = match f {
@@ -854,8 +847,7 @@ impl Tools {
         let t = self
             .db
             .create_table(table, specs)
-            .ok_or_else(|| Failure::read_only(self.db.mode()))?
-            .map_err(fail)?;
+            .ok_or_else(|| Failure::read_only(self.db.mode()))??;
         let families: Vec<Value> = t
             .families()
             .into_iter()

@@ -46,7 +46,7 @@ pub(super) const GUIDE: &str = include_str!("memory_guide.md");
 /// The memory tools over one store: `phdb mcp`'s arguments and answers around the store's
 /// operations in [`MemCore`], the one implementation `phdb serve`'s `Memory` service shares
 /// (D313 ticket 8b).
-pub(super) struct Memory {
+pub(crate) struct Memory {
     name: String,
     core: MemCore,
     /// Whether writes can succeed.
