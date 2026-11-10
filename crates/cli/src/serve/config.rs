@@ -162,6 +162,14 @@ pub(crate) struct ServeArgs {
     /// bootstraps again.
     #[arg(long, value_name = "BYTES")]
     pub change_feed: Option<u64>,
+    /// Don't size each shard's write-ahead log at start-up. By default `serve` gives every
+    /// shard's log the slots it holds when busy before it accepts connections (about 320 MiB
+    /// a shard at the defaults, plus the change feed's retention), written and synced at the
+    /// open, so the logs never grow while commits wait on them (#1621, ICR 0130). With this
+    /// flag they grow on demand instead: less disk and a faster start, but a slower commit
+    /// tail while they grow.
+    #[arg(long)]
+    pub no_wal_preallocate: bool,
     /// Serve this database as a replica of the primary server at this URL (`http://` or
     /// `https://`): it bootstraps from the primary's backup, then follows its durable
     /// commits, and refuses writes until `Admin.Promote`. Reads see a consistent prefix of

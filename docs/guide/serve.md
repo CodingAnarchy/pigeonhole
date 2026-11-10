@@ -18,7 +18,7 @@ cargo install pigeonhole-cli --features serve
 cargo install pigeonhole-cli --features serve,embed-local
 ```
 
-**Start** it on a database file. `--create` makes the file if it's missing:
+**Start** it on a database file. `--create` makes the file if it's missing. For a quick try, add `--no-wal-preallocate`, so the start doesn't write each shard's log in full first ([below](#running-it)):
 
 ```sh
 phdb serve app.phdb --create
@@ -32,6 +32,10 @@ phdb serve: serving app.phdb on 127.0.0.1:7448 (no TLS, no tokens; 8 network, 2 
 - **The startup line** says what the server runs with: TLS, tokens, its threads, and where they run ([Threads and placement](#threads-and-placement)).
 - **Stopping:** Ctrl-C or SIGTERM. In-flight requests get `--shutdown-grace-ms` to finish, and then the server closes the database cleanly.
 - **A new database's shards:** `--shards` sets the count. The default is half the physical cores, which leaves the other half for the network side. An existing database keeps its own count.
+- **Start-up writes the logs in full** (#1621, ICR 0130). Before it accepts connections, `serve` gives each shard's write-ahead log every slot it holds when busy, zero-filled and synced. That's 5 slots of 64 MiB a shard at the defaults (two for unflushed writes, two spares and the slot in use), plus the change feed's retention spread over the shards (at least 2 slots a shard with the feed on). Otherwise each log grows while the server runs, and its zero-fill lengthens commits' tail latency for as long as it grows.
+  - **Disk:** slots × 64 MiB per shard, from the start. At the defaults that's 320 MiB a shard: about 1.25 GiB on 4 shards and 5 GiB on 16. With the feed on, a shard holds at least 7 slots (about 1.75 GiB on 4 shards, 7 GiB on 16). With `--change-feed 4294967296` (4 GiB) on 16 shards, it's 9 slots a shard, about 9 GiB.
+  - **Time:** the open writes and syncs all of it, every shard's log in parallel, which takes a few seconds on NVMe before `serving ... on` appears. A database whose feed is on keeps its logs across a clean stop, so a restart adds no slot and only zero-fills again the ones the last run never used. Without the feed the logs are removed at a clean stop, and the next start writes them again.
+  - **`--no-wal-preallocate`** turns this off: the logs start at one slot a shard and grow on demand. Use it for a small or development database, tests, or a server with little write traffic, where the disk and the start-up time aren't worth it.
 
 ### Security
 - **TLS:** `--tls-cert` and `--tls-key` take PEM files; every connection is then TLS.
@@ -249,7 +253,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
   - **`unpinned`:** no shard is pinned, and the threads run where the OS puts them. That's macOS (no hard affinity), a host with too few free CPUs, a CPU quota narrower than the affinity set, or an OS that refused the pin. `/metrics` counts the engine's threads pinned and not (`pigeonhole_threads{pigeonhole_thread_pinned}`).
 - **The server's background threads** run off the shards' cores too: an index's rebalancer (`phdb-serve-rebalance`), a bulk load (`phdb-serve-bulk-load`) and a text rebuild (`phdb-serve-text-rebuild`). So do the embedder's threads with `--embed-local` ([Agent memory](#agent-memory)).
 
-- **The shards' poll:** a shard thread sleeps as soon as its queue is empty (`--shard-spin 0`, the default). The library's embedded default polls up to a millisecond first, which saves a wakeup per commit, but behind a network round trip the wakeup is small, and on a busy server the poll was a quarter to half of the CPU per put. `--shard-spin US` sets a fixed poll in microseconds (at most 10,000), and `--shard-spin adaptive` restores the library's default.
+- **The shards' poll:** a shard thread sleeps as soon as its queue is empty (`--shard-spin 0`, the default). The library's embedded default polls up to a millisecond first, which saves a wakeup per commit, but behind a network round trip the wakeup is small, and on a busy server (about 55,000 puts a second over 4 shards on the reference machine, perf287's g51) the poll was a quarter to half of the CPU per put. At low rates it costs little. `--shard-spin US` sets a fixed poll in microseconds (at most 10,000), and `--shard-spin adaptive` restores the library's default.
 
 > **Coming with D313 ticket 9b:** a switch that turns the mask off, for operators on shared hosts, and the serve bench's measured p99 and p99.9 with and without it. This section gets both then.
 
