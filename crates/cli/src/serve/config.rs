@@ -198,6 +198,29 @@ pub(crate) struct ServeArgs {
     /// that doesn't pulls it later.
     #[arg(long, value_name = "MS", default_value_t = 2_000, requires = "cluster")]
     pub cluster_push_timeout_ms: u64,
+    /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
+    /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
+    pub mcp_max_result_bytes: usize,
+    /// The longest value a `/mcp` read returns whole by default, as with `phdb mcp
+    /// --max-value-bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 << 10)]
+    pub mcp_max_value_bytes: usize,
+    /// How long a `/mcp` session may sit idle between requests, in milliseconds, before it
+    /// ends (the client then gets 404 and starts a new session).
+    #[arg(long, value_name = "MS", default_value_t = 30 * 60 * 1000)]
+    pub mcp_session_idle_ms: u64,
+    /// The longest a `/mcp` session lives, in milliseconds, however busy.
+    #[arg(long, value_name = "MS", default_value_t = 24 * 60 * 60 * 1000)]
+    pub mcp_session_lifetime_ms: u64,
+    /// Requests one `/mcp` session may have running at once. One past it waits briefly,
+    /// then gets a retryable error.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub mcp_session_requests: usize,
+    /// The bytes one `/mcp` session may keep for its cursors (a cut traversal's result).
+    /// A larger result isn't kept: its cursor runs the traversal again.
+    #[arg(long, value_name = "BYTES", default_value_t = 8 << 20)]
+    pub mcp_session_cache_bytes: usize,
 }
 
 impl ServeArgs {
@@ -230,6 +253,10 @@ pub(crate) struct Limits {
     pub request_timeout: Duration,
     pub stream_idle: Duration,
     pub leases: Leases,
+    /// The remote MCP tools' result limits and a session's cursor cache.
+    pub mcp: crate::mcp::Limits,
+    /// Requests one `/mcp` session may have running at once.
+    pub mcp_session_requests: usize,
 }
 
 impl ServeArgs {
@@ -261,7 +288,16 @@ impl ServeArgs {
                 snapshot_lifetime: Duration::from_millis(self.snapshot_lifetime_ms.max(1)),
                 max_sessions: self.max_sessions.max(1),
                 max_per_token: self.max_sessions_per_token.max(1),
+                mcp_idle: Duration::from_millis(self.mcp_session_idle_ms.max(1)),
+                mcp_lifetime: Duration::from_millis(self.mcp_session_lifetime_ms.max(1)),
             },
+            mcp: crate::mcp::Limits {
+                result_bytes: self.mcp_max_result_bytes,
+                value_bytes: self.mcp_max_value_bytes,
+                feed_bytes: None,
+                cache_bytes: self.mcp_session_cache_bytes,
+            },
+            mcp_session_requests: self.mcp_session_requests.max(1),
         }
     }
 }

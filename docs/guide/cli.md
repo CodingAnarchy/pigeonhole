@@ -4,7 +4,7 @@
 
 > **Status:** released in 1.0.0 ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). Every command works: `info`, `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell`. CI installs it from a checkout and runs it.
 
-**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary; from a checkout, `cargo install --path crates/cli`.
+**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary; from a checkout, `cargo install --path crates/cli`. On every platform but Windows, `phdb` uses jemalloc as its memory allocator (the default `jemalloc` feature, D322), which needs a C compiler and `make` to build; [Performance](performance.md#allocator) has the measurements and how to leave it out.
 
 ## Commands
 
@@ -343,7 +343,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots`, the change feed (`Feed.Subscribe`), `Schema`, `Admin`, `Graph.Traverse`, and `Vectors` (`Nearest` and the IVF index, with `BulkLoad`), `Text`, and `Memory` (with `--memory`) over gRPC and HTTP/JSON. Remote MCP at `/mcp` follows; ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots`, the change feed (`Feed.Subscribe`), `Schema`, `Admin`, `Graph.Traverse`, and `Vectors` (`Nearest` and the IVF index, with `BulkLoad`), `Text`, and `Memory` (with `--memory`) over gRPC and HTTP/JSON, and `phdb mcp`'s data tools as remote MCP at `/mcp` (the memory tools there follow). ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
@@ -371,6 +371,7 @@ u1   profile  name       1761030000000000  Ada
   - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
   - **Allow for the silence before the first byte:** the server backs up and hashes first. A stream that ends without its final chunk (the one with the size and SHA-256) is incomplete: resume it. Check the SHA-256 before relying on the copy.
   - **One at a time:** backups run one at a time by default (`--max-backups`), off the threads reads use.
+- **Remote MCP** at `/mcp`: [the agent guide's remote section](ai-agents.md#remote-mcp-phdb-serve). Its own flags are `--mcp-max-result-bytes`, `--mcp-max-value-bytes`, `--mcp-session-idle-ms`, `--mcp-session-lifetime-ms`, `--mcp-session-requests` and `--mcp-session-cache-bytes`.
 - **Pinned snapshots** (`Snapshots.Open`, `Release`) make reads agree across requests: pass the `snapshot_id` as `GetRequest.snapshot_id`, or as `Selection.snapshot_id` for `MultiGet`, `ReadRow` and `Scan`. Each read renews the snapshot's lease (`--snapshot-idle-ms`, 60 s; at most `--snapshot-lifetime-ms`, 10 min). A held snapshot holds back version and blob GC, so release it when done. Reads already running when it's released finish; later ones, and a scan's later pages, get `NotFound`.
 - **Graph and vector reads** run on the request's task, holding no blocking thread, and take a `snapshot_id` as the other reads do.
   - `Graph.Traverse` walks one edge family from its seeds, hop by hop: a node is a row, an edge a column whose qualifier is the destination's row key. `hops` is at most 64 (0 is 1), and `per_node_limit`, `hop_limit` and `max_nodes` bound it (0 for each is the library's default). Its reply is byte-budgeted like a `MultiGet`'s: `page_bytes` of nodes (a node counts its key and 16 bytes, plus 4 with `parents`), 0 for the server's default of 1 MiB, capped at 8 MiB. The hop the budget cuts keeps its in-budget prefix, the traversal ends there, and `stats.cut_by_budget` says so. The edge selection is `qualifier_prefix` or bounds, a time range and a value filter. With `parents`, each hop gives each node's source as an index into the hop before (the seeds, for hop 1).
