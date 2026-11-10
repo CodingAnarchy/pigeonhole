@@ -7,7 +7,7 @@ fn the_clusters_reserved_tables_are_hidden_and_refused() {
     // A partition's identity table (D317, ICR 0117) is the server's own: not listed, not
     // readable, and its prefix is refused to every schema call.
     let s = Server::start("", limits());
-    let db = s.shared.router.service.db.clone();
+    let db = s.shared.router.service.part.db.clone();
     super::cluster::identity::write(
         &db,
         &super::cluster::identity::Identity {

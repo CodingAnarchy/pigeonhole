@@ -255,7 +255,7 @@ async fn tables(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
 
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
     // Liveness only, with no token: whether the database is open and not failed.
-    let ok = !shared.router.service.db.is_failed();
+    let ok = !shared.router.service.part.db.is_failed();
     let reply = proto::HealthResponse {
         status: if ok { "ok" } else { "failed" }.into(),
     };

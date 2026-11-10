@@ -38,15 +38,16 @@ fn a_feed_streams_commits_under_its_prefix_and_resumes_from_a_token() {
         s.shared
             .router
             .service
+            .part
             .feeds
             .stats
             .rejoined
             .load(Ordering::Relaxed)
             >= 1
     );
-    let text = s.shared.metrics.render(&s.shared.router.service.db);
+    let text = s.shared.metrics.render(&s.shared.router.service.part.db);
     let mut text = text;
-    super::service::render_feeds(&mut text, &s.shared.router.service.feeds);
+    super::service::render_feeds(&mut text, &s.shared.router.service.part.feeds);
     assert!(text.contains("pigeonhole_serve_feed_hubs 1"), "{text}");
 }
 
@@ -115,7 +116,7 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
         want[1..],
         "every commit under the prefix, once, in order"
     );
-    let stats = &s.shared.router.service.feeds.stats;
+    let stats = &s.shared.router.service.part.feeds.stats;
     assert!(
         stats.fell_behind.load(Ordering::Relaxed) >= 1,
         "it fell off the ring"
@@ -272,6 +273,7 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
         .shared
         .router
         .service
+        .part
         .db
         .table("t")
         .unwrap()
@@ -316,7 +318,7 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
         }
         assert_eq!(got[i], want, "prefix {:?}, seed {seed}", prefixes[i]);
     }
-    let stats = &s.shared.router.service.feeds.stats;
+    let stats = &s.shared.router.service.part.feeds.stats;
     let (fell, rejoined, waits) = (
         stats.fell_behind.load(Ordering::Relaxed),
         stats.rejoined.load(Ordering::Relaxed),
@@ -395,6 +397,7 @@ fn feed_streams_and_hubs_are_capped() {
     s.shared
         .router
         .service
+        .part
         .db
         .table("u")
         .unwrap()
@@ -451,7 +454,7 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     };
     let mut first = direct_feed(&s, oldest());
     let mut second = direct_feed(&s, oldest());
-    let feeds = &s.shared.router.service.feeds;
+    let feeds = &s.shared.router.service.part.feeds;
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
@@ -484,7 +487,7 @@ fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
     let mut l = limits();
     l.max_catch_up = 1;
     let s = Server::start("", l);
-    let db = &s.shared.router.service.db;
+    let db = &s.shared.router.service.part.db;
     db.table("u")
         .unwrap()
         .family("f", Family::default())
@@ -519,7 +522,7 @@ fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
             .commit()
             .unwrap();
     }
-    let feeds = &s.shared.router.service.feeds;
+    let feeds = &s.shared.router.service.part.feeds;
     // The Oldest client delivers r1 first; then all three are on the ring.
     let got_c = drain(&s, &mut c, Duration::from_millis(300));
     assert_eq!(got_c.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r1]);

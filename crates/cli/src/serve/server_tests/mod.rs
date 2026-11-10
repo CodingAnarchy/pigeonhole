@@ -365,9 +365,9 @@ impl Drop for Server {
             }
             rt.shutdown_timeout(Duration::from_secs(5));
         }
-        self.shared.router.service.bulk.close();
-        self.shared.router.service.texts.close();
-        let _ = self.shared.router.service.db.clone().close();
+        self.shared.router.service.part.bulk.close();
+        self.shared.router.service.part.texts.close();
+        let _ = self.shared.router.service.part.db.clone().close();
         if !self.keep_dir {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -588,6 +588,7 @@ fn write_row(s: &Server, row: &[u8]) -> u64 {
         .shared
         .router
         .service
+        .part
         .db
         .table("t")
         .unwrap()
@@ -663,7 +664,7 @@ fn caught_up(primary: &Server, token: Option<&str>) -> impl Fn(&Json) -> bool {
         info.get("replica").is_none(),
         "a primary has no replica section: {info}"
     );
-    let seqno = primary.shared.router.service.db.visible_seqno();
+    let seqno = primary.shared.router.service.part.db.visible_seqno();
     move |r: &Json| {
         r["state"] == "following"
             // A 64-bit field is a string, and absent when 0.

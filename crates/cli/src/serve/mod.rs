@@ -361,6 +361,7 @@ pub(crate) fn run(
     shared
         .router
         .service
+        .part
         .feeds
         .run_on(feed_runtime.handle().clone());
 
@@ -368,7 +369,7 @@ pub(crate) fn run(
         // SIGUSR1 writes a report of the feed hubs and their clients to stderr (#1397).
         #[cfg(unix)]
         {
-            let feeds = Arc::clone(&shared.router.service.feeds);
+            let feeds = Arc::clone(&shared.router.service.part.feeds);
             tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
                 let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
@@ -407,7 +408,7 @@ pub(crate) fn run(
         let stopping = Arc::clone(&shared);
         let signal = async move {
             shutdown_signal().await;
-            stopping.router.service.bulk.stop();
+            stopping.router.service.part.bulk.stop();
         };
         let bounds = listener::Bounds {
             connections: Arc::clone(&shared.router.service.connections),
@@ -426,10 +427,10 @@ pub(crate) fn run(
     // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.
-    shared.router.service.bulk.close();
+    shared.router.service.part.bulk.close();
     // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
-    shared.router.service.texts.close();
-    shared.router.service.indexes.close();
+    shared.router.service.part.texts.close();
+    shared.router.service.part.indexes.close();
     let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
     let closed = db.close().map_err(|e| Failure::db("close", &e));
     served?;

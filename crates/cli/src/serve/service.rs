@@ -716,10 +716,6 @@ struct TableCache {
 
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
-    pub(crate) db: Pigeonhole,
-    /// Read on every call, changed only when a table is first used: a snapshot swapped
-    /// whole, never a lock (perf287's note 3 on D313).
-    tables: ArcSwap<TableCache>,
     /// The in-flight bytes budget (R3), in bytes.
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
@@ -731,27 +727,11 @@ pub(crate) struct Service {
     /// Feed and watch streams at once (`--max-streams`): a stream outlives its request's
     /// `--max-concurrent` slot, as a scan does.
     streams: Arc<Semaphore>,
-    /// The feed fan-out's hubs (D313 R2).
-    pub(crate) feeds: Arc<super::feed::Feeds>,
-    /// `--backup-dir`, and the backup downloads kept for resumes.
-    backups: Arc<super::backup::Backups>,
-    /// The vector indexes open, and their rebalancing threads.
-    pub(crate) indexes: Arc<super::indexes::Indexes>,
-    /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
-    pub(crate) bulk: super::bulk::BulkLoads,
-    /// The text indexes open, and the running rebuild.
-    pub(crate) texts: Arc<super::texts::Texts>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
     text_rebuilds: Arc<Semaphore>,
-    /// The memory store (`--memory`), if the server serves one: opened when a call needs
-    /// it, and again after the catalog or the engine changes (#1618).
-    memory: Option<Arc<super::memslot::MemSlot>>,
     /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
     /// can't take every blocking thread (ai1249's M6 on D313 §7).
     memory_calls: Arc<Semaphore>,
-    /// Held across a table's create or drop and the cache update after it, so the cache ends
-    /// at the live table whatever the order (simp724's C1 on #1527).
-    schema: tokio::sync::Mutex<()>,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -764,6 +744,35 @@ pub(crate) struct Service {
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
     placement: Option<Arc<super::placement::Placement>>,
+    /// The partition served here: the database and what's opened on it (D317's S1, cli692's
+    /// split of node and partition state).
+    pub(crate) part: Partition,
+}
+
+/// What a node opens on the database it serves: the engine, the table cache, the indexes,
+/// the feeds, the memory store and the bulk loads (D317 ticket 2, cli692's S1). The node's
+/// own state (connections, budgets, pools, sessions, limits, metrics) stays on [`Service`].
+pub(crate) struct Partition {
+    pub(crate) db: Pigeonhole,
+    /// Read on every call, changed only when a table is first used: a snapshot swapped
+    /// whole, never a lock (perf287's note 3 on D313).
+    tables: ArcSwap<TableCache>,
+    /// The feed fan-out's hubs (D313 R2).
+    pub(crate) feeds: Arc<super::feed::Feeds>,
+    /// `--backup-dir`, and the backup downloads kept for resumes.
+    backups: Arc<super::backup::Backups>,
+    /// The vector indexes open, and their rebalancing threads.
+    pub(crate) indexes: Arc<super::indexes::Indexes>,
+    /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
+    pub(crate) bulk: super::bulk::BulkLoads,
+    /// The text indexes open, and the running rebuild.
+    pub(crate) texts: Arc<super::texts::Texts>,
+    /// The memory store (`--memory`), if the server serves one: opened when a call needs
+    /// it, and again after the catalog or the engine changes (#1618).
+    memory: Option<Arc<super::memslot::MemSlot>>,
+    /// Held across a table's create or drop and the cache update after it, so the cache ends
+    /// at the live table whatever the order (simp724's C1 on #1527).
+    schema: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Service {
@@ -783,8 +792,6 @@ impl Service {
     ) -> Self {
         Self {
             connections: super::listener::Connections::new(limits.max_connections),
-            db: db.clone(),
-            tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
@@ -792,31 +799,35 @@ impl Service {
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             sessions: super::sessions::Sessions::new(limits.leases),
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
-            backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
-            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None)),
-            bulk: super::bulk::BulkLoads::default(),
-            texts: Arc::new(super::texts::Texts::new(db.clone())),
             text_rebuilds: Arc::new(Semaphore::new(1)),
-            memory: None,
             memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
-            schema: tokio::sync::Mutex::new(()),
-            feeds: super::feed::Feeds::new(
-                db.clone(),
-                super::feed::FeedLimits {
-                    ring_bytes: limits.feed_ring_bytes,
-                    max_hubs: limits.max_feed_hubs,
-                    max_catch_up: limits.max_catch_up,
-                    quiet: limits.feed_quiet,
-                    stream_idle: limits.stream_idle,
-                    client_events: limits.feed_client_events,
-                    client_bytes: limits.feed_client_bytes,
-                },
-            ),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
             metrics,
             replica: None,
             placement: None,
+            part: Partition {
+                db: db.clone(),
+                tables: ArcSwap::from_pointee(TableCache::default()),
+                backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
+                indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None)),
+                bulk: super::bulk::BulkLoads::default(),
+                texts: Arc::new(super::texts::Texts::new(db.clone())),
+                memory: None,
+                schema: tokio::sync::Mutex::new(()),
+                feeds: super::feed::Feeds::new(
+                    db.clone(),
+                    super::feed::FeedLimits {
+                        ring_bytes: limits.feed_ring_bytes,
+                        max_hubs: limits.max_feed_hubs,
+                        max_catch_up: limits.max_catch_up,
+                        quiet: limits.feed_quiet,
+                        stream_idle: limits.stream_idle,
+                        client_events: limits.feed_client_events,
+                        client_bytes: limits.feed_client_bytes,
+                    },
+                ),
+            },
         }
     }
 
@@ -826,7 +837,7 @@ impl Service {
         self.replica = Some(replica);
         // A replica's rebalancer could only fail (its writes are refused, R6): none runs
         // until a promote (cli692's F3 on #1583).
-        self.indexes.pause_rebalancing(true);
+        self.part.indexes.pause_rebalancing(true);
         self
     }
 
@@ -866,7 +877,7 @@ impl Service {
     /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
         self.handles_changed();
-        if let Some(memory) = &self.memory {
+        if let Some(memory) = &self.part.memory {
             memory.clear();
         }
     }
@@ -876,12 +887,12 @@ impl Service {
     /// each name opens it again. A forgotten background index's rebalancer sees its index
     /// close and ends. An open running across this keeps nothing (#1632).
     fn handles_changed(&self) {
-        self.tables.rcu(|c| TableCache {
+        self.part.tables.rcu(|c| TableCache {
             generation: c.generation + 1,
             map: HashMap::new(),
         });
-        self.indexes.forget();
-        self.texts.forget();
+        self.part.indexes.forget();
+        self.part.texts.forget();
     }
 
     /// The served database was replaced under the handle (#1436's bootstrap): the table
@@ -889,10 +900,10 @@ impl Service {
     /// engine, and go.
     pub(crate) fn engine_replaced(&self) {
         self.tables_changed();
-        if let Some(memory) = &self.memory {
+        if let Some(memory) = &self.part.memory {
             memory.replaced();
         }
-        self.feeds.fail_all();
+        self.part.feeds.fail_all();
         self.sessions.drop_idle();
     }
 
@@ -904,7 +915,7 @@ impl Service {
         dir: Option<&std::path::Path>,
         max_backups: usize,
     ) -> Result<Self, String> {
-        self.backups = super::backup::Backups::new(dir, max_backups)?;
+        self.part.backups = super::backup::Backups::new(dir, max_backups)?;
         Ok(self)
     }
 
@@ -913,11 +924,12 @@ impl Service {
     /// `Replication.Follow`'s (a replica catching up reads and encodes at full speed,
     /// cli692's F1 on #1583).
     pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
-        let indexes = super::indexes::Indexes::new(self.db.clone(), Some(Arc::clone(placement)));
+        let indexes =
+            super::indexes::Indexes::new(self.part.db.clone(), Some(Arc::clone(placement)));
         // A replica's pause survives the rebuild, whichever is set first.
         indexes.pause_rebalancing(self.replica.is_some());
-        self.indexes = Arc::new(indexes);
-        self.bulk.placement = Some(Arc::clone(placement));
+        self.part.indexes = Arc::new(indexes);
+        self.part.bulk.placement = Some(Arc::clone(placement));
         self.placement = Some(Arc::clone(placement));
         self
     }
@@ -930,7 +942,7 @@ impl Service {
         calls: usize,
     ) -> Self {
         let Some(slot) = slot else { return self };
-        self.memory = Some(Arc::new(slot));
+        self.part.memory = Some(Arc::new(slot));
         if calls > 0 {
             self.memory_calls = Arc::new(Semaphore::new(calls));
         }
@@ -941,19 +953,19 @@ impl Service {
     /// catalog change between them (#1632).
     #[cfg(test)]
     pub(crate) fn table_generation(&self) -> u64 {
-        self.tables.load().generation
+        self.part.tables.load().generation
     }
 
     /// Whether the table cache holds a handle for `name`.
     #[cfg(test)]
     pub(crate) fn table_cached(&self, name: &str) -> bool {
-        self.tables.load().map.contains_key(name)
+        self.part.tables.load().map.contains_key(name)
     }
 
     /// The memory store's slot, for a test to inspect the store it holds (#1640).
     #[cfg(test)]
     pub(crate) fn memory_slot(&self) -> Option<&Arc<super::memslot::MemSlot>> {
-        self.memory.as_ref()
+        self.part.memory.as_ref()
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -1091,7 +1103,7 @@ impl Service {
             }
             ServiceOp::ListTables(_) => {
                 drop(budget);
-                let mut tables = self.db.tables();
+                let mut tables = self.part.db.tables();
                 // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
                 tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
@@ -1110,14 +1122,14 @@ impl Service {
             }
             ServiceOp::Info(_) => {
                 drop(budget);
-                let db = self.db.clone();
+                let db = self.part.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
-                let mut tables = self.db.tables();
+                let mut tables = self.part.db.tables();
                 // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
                 tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
                 tables.sort();
                 Ok(ServiceReply::Info(proto::InfoResponse {
-                    path: self.db.path().display().to_string(),
+                    path: self.part.db.path().display().to_string(),
                     file_bytes: info.file_bytes,
                     free_bytes: info.free_bytes.unwrap_or(0),
                     tables,
@@ -1127,19 +1139,20 @@ impl Service {
             }
             ServiceOp::Flush(_) => {
                 drop(budget);
-                self.db.flush_async().await?;
+                self.part.db.flush_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
             ServiceOp::Compact(_) => {
                 drop(budget);
-                self.db.compact_async().await?;
+                self.part.db.compact_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
             ServiceOp::Backup(r) => {
                 drop(budget);
-                let (db, backups) = (self.db.clone(), Arc::clone(&self.backups));
+                let (db, backups) = (self.part.db.clone(), Arc::clone(&self.part.backups));
                 // On a thread of its own, one backup at a time (perf287's D1 on #1527).
                 let bytes = self
+                    .part
                     .backups
                     .on_backup_thread(move || {
                         let path = backups.prepare_target(&r.path)?;
@@ -1165,16 +1178,16 @@ impl Service {
                         "this server isn't a replica (--replica-of)",
                     ));
                 };
-                let primary_token = replica.promote(&self.db).await?;
+                let primary_token = replica.promote(&self.part.db).await?;
                 // A primary now: background indexes rebalance again, from handles opened
                 // afresh (cli692's F3 on #1583).
-                self.indexes.forget();
-                self.indexes.pause_rebalancing(false);
+                self.part.indexes.forget();
+                self.part.indexes.pause_rebalancing(false);
                 // The memory store opens as the writer now, at once, created if missing
                 // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
                 // is what's promoted): it's the replica's last error, and memory calls answer
                 // it until the next clear.
-                if let Some(memory) = &self.memory {
+                if let Some(memory) = &self.part.memory {
                     memory.promote();
                     let slot = Arc::clone(memory);
                     let opened = self.blocking(move || slot.get()).await;
@@ -1338,7 +1351,8 @@ impl Service {
             ServiceOp::VectorBulkLoad(op) => {
                 drop(budget);
                 let index = self.index(&op.index).await?;
-                self.bulk
+                self.part
+                    .bulk
                     .run(index, op)
                     .await
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
@@ -1375,14 +1389,14 @@ impl Service {
     async fn table(&self, name: &str) -> Result<Table, ApiError> {
         loop {
             let generation = {
-                let cache = self.tables.load();
+                let cache = self.part.tables.load();
                 if let Some(t) = cache.map.get(name) {
                     return Ok(t.clone());
                 }
                 cache.generation
             };
             reserved(name)?;
-            let db = self.db.clone();
+            let db = self.part.db.clone();
             let owned = name.to_owned();
             let table = self
                 .blocking(move || db.table(&owned)?.open().map_err(ApiError::from))
@@ -1398,7 +1412,7 @@ impl Service {
     /// after `generation`, the one the open started at (#1632).
     pub(crate) fn keep_table(&self, name: &str, table: &Table, generation: u64) -> Option<Table> {
         let mut kept = None;
-        self.tables.rcu(|c| {
+        self.part.tables.rcu(|c| {
             if c.generation != generation {
                 kept = None;
                 return Arc::clone(c);
@@ -1431,8 +1445,8 @@ impl Service {
             .iter()
             .map(|f| Ok((f.name.clone(), convert::family_in(f)?)))
             .collect::<Result<Vec<_>, ApiError>>()?;
-        let _schema = self.schema.lock().await;
-        let db = self.db.clone();
+        let _schema = self.part.schema.lock().await;
+        let db = self.part.db.clone();
         let (name, if_missing) = (r.name.clone(), r.if_missing);
         let table = self
             .blocking(move || {
@@ -1447,7 +1461,7 @@ impl Service {
                 })
             })
             .await?;
-        self.tables.rcu(|c| {
+        self.part.tables.rcu(|c| {
             let mut c = TableCache::clone(c);
             c.map.insert(r.name.clone(), table.clone());
             c
@@ -1463,7 +1477,7 @@ impl Service {
         // The memory store this server serves keeps its data in its own tables: dropping one
         // would leave the slot over a dropped table, and a restart would re-create the store
         // empty (cli692's N1 on #1650, #1651). The crate names them.
-        if let Some(memory) = &self.memory {
+        if let Some(memory) = &self.part.memory {
             let store = memory.name();
             if pigeonhole_memory::Store::table_names(store).contains(&name) {
                 return Err(ApiError::failed_precondition(format!(
@@ -1472,8 +1486,8 @@ impl Service {
                 )));
             }
         }
-        let _schema = self.schema.lock().await;
-        let db = self.db.clone();
+        let _schema = self.part.schema.lock().await;
+        let db = self.part.db.clone();
         let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
@@ -1485,11 +1499,11 @@ impl Service {
 
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
     pub(crate) fn metrics_text(&self) -> String {
-        let mut text = self.metrics.render(&self.db);
+        let mut text = self.metrics.render(&self.part.db);
         self.connections.render(&mut text);
         render_sessions(&mut text, &self.sessions);
-        render_feeds(&mut text, &self.feeds);
-        render_bulk(&mut text, &self.bulk.gauges);
+        render_feeds(&mut text, &self.part.feeds);
+        render_bulk(&mut text, &self.part.bulk.gauges);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
         }
@@ -1510,7 +1524,7 @@ impl Service {
             ));
         };
         super::replica::follow(
-            &self.db,
+            &self.part.db,
             r.token.to_vec(),
             slot,
             self.limits.stream_idle,
@@ -1547,10 +1561,10 @@ impl Service {
             ));
         }
         let (id, copy) = if r.backup_id.is_empty() {
-            let (db, durable, replica) = (self.db.clone(), r.durable, r.replica);
+            let (db, durable, replica) = (self.part.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
-            self.backups.fresh_download(move |p, started| {
+            self.part.backups.fresh_download(move |p, started| {
                 if replica {
                     // A replica's bootstrap (#1436): a durable snapshot's copy, and the
                     // token of a feed of every table from that same snapshot, sent with the
@@ -1570,19 +1584,19 @@ impl Service {
                 Ok(Vec::new())
             })?
         } else {
-            (r.backup_id.clone(), self.backups.open(&r.backup_id)?)
+            (r.backup_id.clone(), self.part.backups.open(&r.backup_id)?)
         };
         // A kept copy: an offset past it is refused now. One still being written is checked
         // once it's ready.
         if let Copy::Ready(kept) = &*copy.borrow()
             && r.offset > kept.total
         {
-            self.backups.release(&id);
+            self.part.backups.release(&id);
             return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
         let (backups, pool, idle) = (
-            Arc::clone(&self.backups),
+            Arc::clone(&self.part.backups),
             Arc::clone(&self.blocking),
             self.limits.stream_idle,
         );
@@ -1900,10 +1914,10 @@ impl Service {
 
     /// The IVF index `name`, from the cache, or opened on the blocking pool on a miss.
     async fn index(&self, name: &str) -> Result<Arc<pigeonhole_vector::Index>, ApiError> {
-        if let Some(i) = self.indexes.cached(name) {
+        if let Some(i) = self.part.indexes.cached(name) {
             return Ok(i);
         }
-        let indexes = Arc::clone(&self.indexes);
+        let indexes = Arc::clone(&self.part.indexes);
         let name = name.to_owned();
         self.blocking(move || indexes.get(&name)).await
     }
@@ -1937,7 +1951,7 @@ impl Service {
                 options = options.rebalance(pigeonhole_vector::Rebalance::Background);
             }
         }
-        let indexes = Arc::clone(&self.indexes);
+        let indexes = Arc::clone(&self.part.indexes);
         self.blocking(move || indexes.create(&r.name, spec, options, r.if_missing))
             .await?;
         Ok(proto::Empty {})
@@ -2048,10 +2062,10 @@ impl Service {
 
     /// The text index `name`, from the cache, or opened on the blocking pool on a miss.
     async fn text_index(&self, name: &str) -> Result<Arc<pigeonhole_text::Index>, ApiError> {
-        if let Some(i) = self.texts.cached(name) {
+        if let Some(i) = self.part.texts.cached(name) {
             return Ok(i);
         }
-        let texts = Arc::clone(&self.texts);
+        let texts = Arc::clone(&self.part.texts);
         let name = name.to_owned();
         self.blocking(move || texts.get(&name)).await
     }
@@ -2065,7 +2079,7 @@ impl Service {
         let options = super::texts::options(&r)?;
         let table = self.table(&r.source_table).await?;
         let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
-        let texts = Arc::clone(&self.texts);
+        let texts = Arc::clone(&self.part.texts);
         self.blocking(move || texts.create(&r.name, source, options, r.if_missing))
             .await?;
         Ok(proto::Empty {})
@@ -2147,9 +2161,9 @@ impl Service {
                 "the server is already rebuilding a text index",
             ));
         };
-        let placement = self.bulk.placement.clone();
+        let placement = self.part.bulk.placement.clone();
         let (tx, rx) = oneshot::channel();
-        self.texts.spawn_rebuild(move || {
+        self.part.texts.spawn_rebuild(move || {
             if let Some(p) = placement {
                 p.enter();
             }
@@ -2367,7 +2381,7 @@ impl Service {
     /// or the replica hasn't applied that yet; ICR 0112).
     async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
         use super::memslot::Entry;
-        let slot = self.memory.clone().ok_or_else(|| {
+        let slot = self.part.memory.clone().ok_or_else(|| {
             ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
         })?;
         let entry = match slot.cached() {
@@ -2483,7 +2497,7 @@ impl Service {
         caller: &Caller,
     ) -> Result<super::memory::MemoryEvents, ApiError> {
         // Before the store: a swap from here on ends the watch.
-        let swaps = self.memory.as_ref().map(|m| m.swaps());
+        let swaps = self.part.memory.as_ref().map(|m| m.swaps());
         let core = self.memory_core().await?;
         let Some(swaps) = swaps else {
             return Err(ApiError::unsupported(
@@ -2548,7 +2562,7 @@ impl Service {
         drop(budget);
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
-        self.feeds.subscribe(
+        self.part.feeds.subscribe(
             super::feed::Spec {
                 tables,
                 prefix: r.prefix.to_vec(),
@@ -2566,7 +2580,7 @@ impl Service {
         r: proto::BeginRequest,
         caller: &Caller,
     ) -> Result<proto::BeginResponse, ApiError> {
-        let txn = self.db.transaction()?;
+        let txn = self.part.db.transaction()?;
         let snapshot_seqno = txn.snapshot_seqno();
         let txn_id = self
             .sessions
@@ -2734,9 +2748,9 @@ impl Service {
         caller: &Caller,
     ) -> Result<proto::OpenSnapshotResponse, ApiError> {
         let snapshot = if r.durable {
-            self.db.durable_snapshot()?
+            self.part.db.durable_snapshot()?
         } else {
-            self.db.snapshot()?
+            self.part.db.snapshot()?
         };
         let seqno = snapshot.seqno();
         let snapshot_id = self.sessions.open_snapshot(caller.token, snapshot)?;
@@ -2815,7 +2829,7 @@ impl Service {
             rows.push((table, key.row, rw.writes));
         }
         let durability = convert::durability(r.durability);
-        let db = self.db.clone();
+        let db = self.part.db.clone();
         let info = self
             .detached("Data.Batch", budget, async move {
                 let mut b = db.write_batch();
