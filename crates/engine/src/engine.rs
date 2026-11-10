@@ -29,7 +29,7 @@ use pigeonhole_runtime::{
 };
 use pigeonhole_shm::{Presence, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
 use pigeonhole_sst::SstWriterOptions;
-use pigeonhole_wal::{Recovery, Wal, WalStream, discover_streams, stream_path};
+use pigeonhole_wal::{Recovery, SpareSegments, Wal, WalStream, discover_streams, stream_path};
 use smallvec::SmallVec;
 
 use crate::catalog::{Catalog, FamilyMeta, MergeKind};
@@ -1491,6 +1491,8 @@ impl Engine {
             && streams.len() == shards
             && streams.iter().enumerate().all(|(i, s)| s.0 as usize == i);
         let mut have_wal = vec![false; shards];
+        // Streams to pre-size before the shards start (`wal_preallocate`).
+        let mut presize: Vec<(SpareSegments, u32)> = Vec::new();
         // The shards the replay applied a commit's shares to: its records' holders (D266),
         // whichever shards held them before (a reopen places tablets again).
         let holders_of = |coordinator: StreamId, seqno: Seqno| -> crate::shard::Holders {
@@ -1594,6 +1596,9 @@ impl Engine {
                     let opts = stream_wal_opts(&shared, wal_opts, &rec);
                     let mut wal = rec.into_stream(opts)?;
                     wal.checkpoint(end)?;
+                    if options.wal_preallocate {
+                        presize.push((wal.spares(), opts.retain_segments));
+                    }
                     let _ = shared.metrics[i].wal.set(wal.counters());
                     note_feed_marks(&shared, i, &wal);
                     states[i].set_wal(Box::new(wal));
@@ -1623,10 +1628,15 @@ impl Engine {
         for (stream, wal) in missing.iter().zip(WalStream::create_all(
             &vfs, path, &missing, db_id, wal_opts,
         )?) {
+            if options.wal_preallocate {
+                presize.push((wal.spares(), wal_opts.retain_segments));
+            }
             let _ = shared.metrics[stream.0 as usize].wal.set(wal.counters());
             note_feed_marks(&shared, stream.0 as usize, &wal);
             states[stream.0 as usize].set_wal(Box::new(wal));
         }
+        // Before any shard takes a write (D157 amendment, ICR 0130).
+        preallocate_wal(&presize, shared.wal_pin_bytes)?;
         for s in &mut states {
             s.finish_replay();
         }
@@ -4267,6 +4277,46 @@ fn stream_wal_opts(
         opts.retain_segments = feed.retain_for(slot);
     }
     opts
+}
+
+/// [`EngineOptions::wal_preallocate`] (D157 amendment, #1621, ICR 0130): sizes each stream's
+/// ring to what it holds in steady state, zero-filled and synced, one thread per stream. The
+/// ring is the slot in use, ⌈`pin_bytes` / slot⌉ of unflushed log (the checkpoint's lag,
+/// D229), the spares and the change feed's retention. `streams` pairs each stream's spares
+/// with its retention in segments. A reopened stream's slots count, so a ring already that
+/// size gets nothing.
+fn preallocate_wal(streams: &[(SpareSegments, u32)], pin_bytes: u64) -> Result<()> {
+    let slots = |spares: &SpareSegments, retain: u32| {
+        let pinned = pin_bytes.div_ceil(spares.segment_size().max(1));
+        u32::try_from(pinned)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+            .saturating_add(spares.target())
+            .saturating_add(retain)
+    };
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = streams
+            .iter()
+            .map(|(spares, retain)| {
+                let n = slots(spares, *retain);
+                std::thread::Builder::new()
+                    .name("pigeonhole-wal-presize".into())
+                    .spawn_scoped(scope, move || spares.prepare_ring(n))
+            })
+            .collect();
+        // Every thread is joined before an error returns (the scope joins the rest).
+        let mut out = Ok(());
+        for job in jobs {
+            let r = match job {
+                Ok(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                Err(e) => Err(pigeonhole_io::Error::os("spawn a WAL pre-size thread", e).into()),
+            };
+            if out.is_ok() {
+                out = r.map(|_| ()).map_err(Error::from);
+            }
+        }
+        out
+    })
 }
 
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
