@@ -4328,6 +4328,8 @@ The same rules hold for all three protocols, and every call path enforces scopes
 
 **The limits, stated in the guide:** one writer node, so no replication or HA, only backup and restore; the file on local disk; one machine's throughput. Read replicas (#1436) and partitions (D317, #1482) build on this service layer.
 
+**Amendment, 2026-11-09: how the MCP tools reach the service layer (cli692, ticket 8c-2; coordinator's option B, refined; ai1249 for §7).** §7's "each tool calls the service layer, and stdio drives it with `block_on`" can't hold as written: the service layer is built on `serve`'s own dependencies (prost and tonic types, Tokio), which the default `phdb` build that `phdb mcp` ships in doesn't have. Instead, the tools reach the database through a `Backend` trait at their own database surface (tables, families, table handles, a write batch, table creation). `phdb mcp` implements it with the database it opened, as before and Tokio-free. `phdb serve`'s `/mcp` implements it through `Service`'s own `table()`, `create_table` and `drop_table`, after one `Service::admit` that holds every per-call rule (the scope, a replica's write refusal, the request size, the in-flight budget) and that `answer()` itself calls too. So no rule exists twice, and MCP keeps its own paging, cursors and answers. The MCP tests run against both backends. Rejected: ungating `serve`'s dependencies into every build, and a serve-side gate that mirrors the service's rules (it would drift, and would already miss the `__phdb_` prefix and #1651's refusal).
+
 <a id="d314"></a>
 ## D314 — A row mutation's counters can return their values after its commit: `commit_returning`, folded on the row's shard right after the commit applies (perf2, design; owner decision, 2026-11-03; reviewed by simp724 and perf287; engine, pigeonhole, #1440, ICR 0113)
 
@@ -4498,6 +4500,37 @@ PR 3 adds an in-process two-database replication test with process and power-los
   - **A4:** `pigeonhole.feed.lag`, with `Feed::progress()` and `visible_seqno()`, stored once per delivered batch.
 - **Consumers:** `phdb serve`'s `/metrics` (D313, #1397) exports these names, and its own request, session and stream metrics follow these rules.
 - **Writer only in v1** (`register_reader` is reserved). The Python and Ruby bindings have no access in 1.2.0.
+
+<a id="d317"></a>
+## D317 — one database split across `phdb serve` nodes by static key-range partitions (simp724, design; owner sign-off, 2026-11-04; reviewed by perf287 and cli692; cli, #1482, ICR 0117)
+
+**Decided** (the design note on #1482, revision 2, is the full record; the owner set the scope on #1437):
+- **Partitions are whole database files.** A versioned partition map assigns tables, or key ranges of a table (sorted split keys, half-open ranges), to partitions, and partitions to nodes.
+- **The map has two layers.** Which partition holds a key range is fixed once the range holds data. Moving ranges is #1499, in 1.3.0. Which node serves a partition changes by relocation, with a higher epoch.
+- **Every node routes.** Any node takes any call, serves what it owns and forwards the rest over node-to-node gRPC. There are no engine changes: a `Router` in front of D313's service functions, behind the seam D313's ticket 3 landed.
+- **Single-partition operations keep their guarantees.** Writes and transactions that span partitions are refused (`CrossPartition`) before anything is written; transactions and snapshots bind to one partition by a routing key.
+- **Reads fan out.** Scans, multi-gets, KNN and traversal fan out and merge in key order (or to the exact top K). A missing partition fails the read unless the caller opts in to partial results, which name what's missing.
+- **Fencing is manual.** A partition file records its identity and epoch (`__phdb_cluster`). A node writes P only while its newest map names it at that epoch and P isn't fenced. Restarted nodes start fenced.
+- **Later:** cross-node transactions (#1483), failover (#1484), the balancer (#1485) and fencing leases (#1486), all in 1.3.0.
+
+**Tickets:**
+1. the map: proto, validation, distribution and the identity row;
+2. routing and forwarding;
+3. transactions and snapshots bound to one partition;
+4. fan-out reads;
+5. schema in the map;
+6. fencing and relocation;
+7. cluster feeds;
+8. backup and restore, several partitions per node, and the serving guide's cluster chapter, with perf287's partitions-per-node box run.
+
+**Ticket 1** (ICR 0117's first section):
+- **`phdb serve --cluster DIR --node-id ID`** keeps the map in `DIR/cluster-map.json`, written atomically, and holds `DIR/.lock`.
+- **The `Cluster` service:** `GetMap`; `SetMap`, a compare-and-set on the version (a miss is `Conflict`, the coordinator's call); `PushMap`, node to node; and `Status`.
+- **The `cluster` token scope** stands outside read < write < admin.
+- **Pull:** a node pulls a newer map from a peer whose call says it has one.
+- **Divergence:** an equal version with different content is refused and reported as divergent (cli692's M3).
+- **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
+- **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
 
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)

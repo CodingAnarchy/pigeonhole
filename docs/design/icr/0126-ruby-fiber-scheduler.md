@@ -51,6 +51,22 @@ This is the design note on #1574, §3:
   - **A loop's first step** starts it without waiting, because a loop that hasn't stepped has no position to wait from.
 - **New internals** (under `Pigeonhole::Native`, not public API): `PreparedMemory`; the private natives `native_prepare_remember`, `native_prepare_remember_op`, `native_remember_prepared_in`, `native_link_in`, `native_supersede_in`, `native_mark_used_in`, `native_near_dedup_on`, `native_has_ivf`, `native_settle_op` and `native_recall_op` on the stores; and `native_wait_op` and `native_run_once_fiber` on `ConsolidateLoop`. With `test-hooks`, `Native.offload_hold` holds the pool's jobs, a hold seam for the tests.
 
+## Amendment 3: recall stays on the offload pool (#1574 PR 4, measured)
+- **The plan was** to move `recall` and `recall_with_stats` off the offload pool once `Recall::run_async` (#1560 PR 3, #1654) landed, polling it through the bridge on the fiber's own thread as the commits are.
+- **Measured,** the move loses throughput. Under Async on a Mac: 2,000 memories, recall with text and an 8-d embedding at k 10, 40 recalls per fiber, and a fiber timing `durability: :sync` puts alongside. Two runs each:
+
+  | build | c=1 recalls/s | c=16 recalls/s | commit p50 alongside (c=16) |
+  |---|---|---|---|
+  | offload pool, sync recall (kept) | 199 / 205 | 2,952 / 3,215 | 4.96 / 3.71 ms |
+  | `Recall::run_async` polled on the scheduler's thread | 160 / 154 | 866 / 873 | 3.75 / 3.75 ms |
+
+  - **Why:** the pool runs up to 8 recalls in parallel on other cores, while polling on the scheduler's thread runs every recall's CPU on that one thread. At c=1 the async recall itself costs about 1.3× the sync one (perf2's measurement on #1657).
+  - **Commits** alongside are no worse on the pool: the sync commit's fsync dominates.
+  - **Python found the same** with one bridge thread (#1657: 66 recalls/s against `to_thread`'s 315), and added a poll pool there.
+- **So `recall` stays on the offload pool.** #1574's goal, that a recall doesn't block the fiber scheduler, is already met that way, at about 3.6× the throughput. Nothing changes in the binding.
+- **What the pool path still costs:** a recall stopped while it runs finishes on its worker, and its result is dropped (the Cancellation section's memory line).
+- **Revisit** if the async recall's per-call cost falls below the sync one's (#1652, and perf287's box measurements of the ratio). A pool of poll threads driving `run_async`, like #1657's, would then be the shape to measure against this one.
+
 ## Cancellation
 A fiber raised into while it waits drops its op's future, as D210 defines:
 - a commit still waiting for room writes nothing;
@@ -62,4 +78,4 @@ So it's the same outcome as Python's asyncio forms (ICR 0121).
 
 ## Known effects
 - **After a fork,** the child leaves the parent's bridge open (two file descriptors for each thread that had waited) and makes its own (S1).
-- **`recall`** moves from the offload pool to `Recall::run_async` once #1560 PR 3 lands (#1574 PR 4), with no Ruby-visible change.
+- **`recall`** stays on the offload pool: measured against `Recall::run_async` polled on the scheduler's thread, the pool kept about 3.6× the throughput at 16 concurrent recalls (amendment 3).

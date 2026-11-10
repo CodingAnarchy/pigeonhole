@@ -232,6 +232,7 @@ impl pigeonhole_memory::OpenOptions
 pub fn pigeonhole_memory::OpenOptions::model(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_memory::OpenOptions::new() -> Self
 pub fn pigeonhole_memory::OpenOptions::own_forgetter(self) -> Self
+pub fn pigeonhole_memory::OpenOptions::own_rebalancer(self) -> Self
 pub fn pigeonhole_memory::OpenOptions::without_embeddings(self) -> Self
 pub struct pigeonhole_memory::PreparedMemory
 pub struct pigeonhole_memory::ReadStore
@@ -266,6 +267,9 @@ pub fn pigeonhole_memory::Recall<'a>::text(self, impl core::convert::Into<alloc:
 pub fn pigeonhole_memory::Recall<'a>::weights(self, pigeonhole_memory::Weights) -> Self
 pub fn pigeonhole_memory::Recall<'a>::with_embeddings(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::with_signals(self, bool) -> Self
+impl<'a> pigeonhole_memory::Recall<'a>
+pub async fn pigeonhole_memory::Recall<'a>::run_async(self) -> pigeonhole_memory::Result<alloc::vec::Vec<pigeonhole_memory::RecallHit>>
+pub async fn pigeonhole_memory::Recall<'a>::run_with_stats_async(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
 impl core::fmt::Debug for pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Recall<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::RecallHit
@@ -328,7 +332,9 @@ pub fn pigeonhole_memory::Store::set_forget_policy(&self, core::option::Option<p
 pub fn pigeonhole_memory::Store::settle(&self)
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::supersede_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::Store::table_names(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn pigeonhole_memory::Store::take_forgetter(&self) -> core::option::Option<pigeonhole_memory::Forgetter>
+pub fn pigeonhole_memory::Store::take_rebalancer(&self) -> core::option::Option<pigeonhole_vector::rebalancer::Rebalancer>
 pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
 pub fn pigeonhole_memory::Store::watch(&self, &[&str]) -> pigeonhole_memory::WatchBuilder
 impl pigeonhole_memory::Store

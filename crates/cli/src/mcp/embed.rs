@@ -121,14 +121,9 @@ impl Endpoint {
         &self.model
     }
 
-    /// `text`'s embedding. A failure's message names the endpoint and what went wrong, never
-    /// the key.
-    pub(crate) fn embed(&self, text: &str) -> Result<Vec<f32>, Failure> {
-        self.embed_classified(text).map_err(|(_, f)| f)
-    }
-
-    /// [`embed`](Self::embed), with what kind of failure it was, for a server to answer by
-    /// (ai1249's R2 on #1617).
+    /// `text`'s embedding, or the kind of failure with its message, which names the endpoint
+    /// and what went wrong, never the key (ai1249's R2 on #1617). Both front-ends call it
+    /// through [`crate::memcore::Embedder`].
     pub(crate) fn embed_classified(&self, text: &str) -> Result<Vec<f32>, (EmbedFault, Failure)> {
         #[cfg(feature = "embed")]
         {
