@@ -190,7 +190,9 @@ impl Gate {
 
     /// Holds every later submitted write of `path` (a WAL spare segment's zero-fill, a held
     /// header): the write is not performed and its completion stays pending until
-    /// [`Gate::release_writes`]. Blocking writes (`write_at`) are unaffected.
+    /// [`Gate::release_writes`]. Blocking writes (`write_at`) are unaffected, and so are a
+    /// direct stream's record writes (D324, Linux), which go through their own handle: the
+    /// hold is for the writes beside the records, and holding those would stall every commit.
     pub fn hold_writes(&self, path: &Path) {
         self.rules
             .lock()
@@ -287,6 +289,9 @@ struct GateFile {
     path: PathBuf,
     inner: FileRef,
     gate: Arc<Gate>,
+    /// Opened for direct I/O: a direct WAL stream's record-write handle (D324), whose
+    /// writes a write hold lets through.
+    direct: bool,
 }
 
 impl GateFile {
@@ -326,6 +331,7 @@ impl Vfs for GateVfs {
     ) -> pigeonhole_io::Result<FileRef> {
         Ok(Arc::new(GateFile {
             path: path.to_path_buf(),
+            direct: opts.direct,
             inner: self.inner.open(path, opts)?,
             gate: Arc::clone(&self.gate),
         }))
@@ -433,13 +439,14 @@ impl pigeonhole_io::File for GateFile {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {
-        if self
-            .gate
-            .rules
-            .lock()
-            .unwrap()
-            .hold_writes
-            .contains(&self.path)
+        if !self.direct
+            && self
+                .gate
+                .rules
+                .lock()
+                .unwrap()
+                .hold_writes
+                .contains(&self.path)
         {
             let (completion, resolver) = Completion::pair();
             self.gate.held_writes.lock().unwrap().push((
