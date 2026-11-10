@@ -839,10 +839,12 @@ impl std::fmt::Debug for Service {
 impl Service {
     /// The partition served here. A cluster node the map gives no partition only routes:
     /// the router forwards or refuses every call that needs one before it reaches the
-    /// service, so this answers only a call that slipped past it (D317 ticket 2).
+    /// service, so this answers only a call that slipped past it, a server bug. `Internal`,
+    /// not a retryable code, so a client doesn't loop on it (cli692's note 1 on d0c6312a).
     pub(crate) fn part(&self) -> Result<&Partition, ApiError> {
-        self.part_opt()
-            .ok_or_else(|| ApiError::unavailable("this node serves no partition"))
+        self.part_opt().ok_or_else(|| {
+            ApiError::internal("this cluster node only routes and serves no partition")
+        })
     }
 
     /// The partition served here, if any: for the node's own work (health, metrics,

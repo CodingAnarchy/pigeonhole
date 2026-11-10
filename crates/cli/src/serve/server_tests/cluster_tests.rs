@@ -57,7 +57,7 @@ fn a_node_that_only_routes_answers_for_its_own_state_without_a_partition() {
     let e = svc.part().err().expect("no partition");
     assert_eq!(
         (e.code.as_str(), e.grpc),
-        ("Unavailable", tonic::Code::Unavailable)
+        ("Internal", tonic::Code::Internal)
     );
     assert!(svc.user_tables().is_empty());
     assert_eq!(svc.catalog(), 0);
