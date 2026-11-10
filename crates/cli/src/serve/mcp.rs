@@ -237,6 +237,8 @@ struct Gate<'a> {
     session: &'a McpSession,
     shared: &'a Shared,
     caller: &'a Caller,
+    /// Whether `post` took a memory place (M6) for this message, before its pool thread.
+    memory_place: bool,
 }
 
 impl Host for Gate<'_> {
@@ -283,6 +285,19 @@ impl Host for Gate<'_> {
         if let Err(e) = service.check(&admit, self.caller) {
             return Some(Err(failure(e)));
         }
+        // A memory tool runs under a memory place (M6). `post` takes it before the pool
+        // thread for a message it sees calling one. One it didn't see (a tool name spelled
+        // with JSON escapes) fails closed: a place now, without waiting (a wait here, holding
+        // the pool thread, is the order the RPCs never take), else `Overloaded` (ai1249's R1
+        // on #1679).
+        let _memory = if name.starts_with("memory_") && !self.memory_place {
+            match service.memory_try_place() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(failure(e))),
+            }
+        } else {
+            None
+        };
         // A poll can wait up to 30 s: it holds a `--max-streams` place for that long, as a
         // feed stream does (ai1249's note on 8c), though it needs no hub.
         let _stream = if name == "feed_poll" {
@@ -419,6 +434,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     } else {
         None
     };
+    let memory_place = _memory.is_some();
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
     let answered = service
@@ -427,6 +443,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
                 session: &session,
                 shared: &shared_owned,
                 caller: &caller_owned,
+                memory_place,
             };
             let core = Core::new(Transport::Http);
             let reply = core.message(&gate, &session.protocol, &text);
@@ -515,7 +532,8 @@ pub(crate) async fn delete(State(shared): State<Arc<Shared>>, headers: HeaderMap
 
 /// Whether `text` (a message or a batch) calls a memory tool.
 fn calls_memory(text: &str) -> bool {
-    // Most messages name no memory tool: skip the parse (ai1249's N3 on #1679).
+    // Most messages name no memory tool: skip the parse (ai1249's N3 on #1679). One whose
+    // name is spelled with JSON escapes gets past this; `Gate::call` catches it (R1).
     if !text.contains("\"memory_") {
         return false;
     }

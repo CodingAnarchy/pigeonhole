@@ -2562,6 +2562,15 @@ impl Service {
             .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
     }
 
+    /// A place under the memory sub-limit now, or `Overloaded`: for a call already on a
+    /// blocking-pool thread, which mustn't wait for one (`/mcp`'s fallback, ai1249's R1 on
+    /// #1679).
+    pub(crate) fn memory_try_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        Arc::clone(&self.memory_calls)
+            .try_acquire_owned()
+            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
+    }
+
     /// A memory write: detached (its real outcome even if the client goes away), on the
     /// blocking pool under the memory sub-limit, with the caller's namespaces.
     async fn memory_write<T: Send + std::fmt::Debug + 'static>(

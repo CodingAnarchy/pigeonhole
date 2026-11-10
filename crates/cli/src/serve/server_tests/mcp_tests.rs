@@ -691,3 +691,39 @@ fn a_memory_tool_racing_a_memory_rpc_takes_the_memory_place_first() {
         assert_eq!(rpc.join().unwrap(), 200);
     }
 }
+
+#[test]
+fn a_memory_tool_spelled_with_escapes_still_takes_a_memory_place() {
+    // ai1249's R1 on #1679: `post` spots memory tool calls cheaply, so a name spelled with
+    // JSON escapes gets past it; the call itself then takes a place without waiting, or is
+    // refused. With the one place held elsewhere, it must not run.
+    let s = memory_mcp("");
+    let id = session(&s, None);
+    let held = s.block_on(s.shared.router.service.memory_place()).unwrap();
+    let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\u006demory_recall","arguments":{"namespace":"a","text":"x"}}}"#;
+    assert!(!raw.contains("\"memory_"));
+    let mut resp = agent()
+        .post(format!("{}/mcp", s.url))
+        .header("content-type", "application/json")
+        .header("mcp-session-id", id.as_str())
+        .send(raw)
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let reply: Json = resp.body_mut().read_json().unwrap();
+    let result = &reply["result"];
+    assert_eq!(result["isError"], true, "{reply}");
+    assert_eq!(
+        result["structuredContent"]["error"]["code"], "Overloaded",
+        "{reply}"
+    );
+    // The place back, the same call runs.
+    drop(held);
+    let mut resp = agent()
+        .post(format!("{}/mcp", s.url))
+        .header("content-type", "application/json")
+        .header("mcp-session-id", id.as_str())
+        .send(raw)
+        .unwrap();
+    let reply: Json = resp.body_mut().read_json().unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
