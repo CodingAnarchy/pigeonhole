@@ -32,6 +32,25 @@ pub(crate) const MAX_SEGMENT_SIZE: u64 = (1 << 32) - FRAME;
 /// millisecond on NVMe.
 const ZERO_CHUNK: usize = 256 << 10;
 
+/// g47's knob: `PIGEONHOLE_ZERO_CHUNK` bytes per stepped zero-fill write (a multiple of
+/// 4 KiB), else [`ZERO_CHUNK`].
+fn zero_chunk() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("PIGEONHOLE_ZERO_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0 && n % 4096 == 0)
+            .unwrap_or(ZERO_CHUNK)
+    })
+}
+
+/// g47's knob: `PIGEONHOLE_NO_EARLY=1` turns the early rollover off.
+fn no_early() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var_os("PIGEONHOLE_NO_EARLY").is_some_and(|v| v == "1"))
+}
+
 /// Appends between checks for an early rollover out of an `Extended` slot (D319).
 const EARLY_CHECK_EVERY: u32 = 64;
 
@@ -1277,7 +1296,7 @@ impl SparePrep {
             }
             self.allocated = true;
         }
-        let len = ZERO_CHUNK.min((size - self.next_offset) as usize);
+        let len = zero_chunk().min((size - self.next_offset) as usize);
         let buf = match self.buffers.pop() {
             Some(b) if b.len() == len => b,
             _ => IoBuf::zeroed(len),
@@ -1999,7 +2018,7 @@ impl WalStream {
         self.stale = (source == SlotSource::Recycled).then_some(self.slots[slot]);
         // A segment in an `Extended` slot (unwritten extents) leaves it early, once a spare is
         // ready (D319, `append_parts`).
-        self.early = if source == SlotSource::Extended {
+        self.early = if source == SlotSource::Extended && !no_early() {
             EARLY_CHECK_EVERY
         } else {
             0
