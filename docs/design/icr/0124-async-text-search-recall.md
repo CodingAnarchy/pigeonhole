@@ -38,6 +38,13 @@
   - **Reader processes:** every read a recall makes has an async form in a reader process, so `ReadStore`'s async recall refuses nothing beyond what its sync recall refuses.
   - **Not exactly zero synchronous reads:** the engine's async key-set reads still read a row past its first block synchronously (#1652). That covers the multi-get's memory rows, the expansion's traversal and the IVF search's list rows. So the property test bounds the count rather than asserting zero: under load, 28 of 7,680 recalls counted one such read, and none counted two. #1652 then tightens the bound to 0.
 
+- **Amendment (#1560 PR 4):** Python, the design note's §8.
+  - **The names:** `Store.recall_async` and `recall_with_stats_async`, and the same on `ReadStore`. They take `recall`'s keywords and resolve to its result. The stubs type them as `asyncio.Future`.
+  - **B1:** the binding never polls a recall at the call. `aio::start_on_bridge` starts it on a **poll pool** of threads, private to `aio.rs`. On the one bridge thread, 16 concurrent recalls ran at a fifth of `to_thread`'s rate and held commit completions to 20 ms p50. With the pool, commits stay near 110 µs p50 (`crates/python/bench/recall_concurrency.py`). Commits, gets and feed waits keep the bridge thread and their inline poll (D210).
+  - **Offload, not a polled `run_async` (g45, the coordinator's call):** the future runs the sync `run_with_stats` in its one poll, on a pool thread, as Ruby's binding does. A polled `run_with_stats_async` cost 1.6× a recall's time at one caller and ran at about half the offload's rate at 16 and 32 callers, and 2.5× slower with the block cache too small. Rust's own `run_async` costs only 1.18–1.20× at one caller on Linux, so the rest was the binding's per-poll hand-offs and GIL. Both kept commits near 80 µs p99, against `to_thread`'s 2 ms. The deviation from the note's goal: a recall's reads block its pool thread, not the loop's or an executor's, and the pool bounds how many run at once.
+  - **The pool's size:** the machine's parallelism, from 2 to 16, or `PIGEONHOLE_ASYNCIO_POOL_THREADS` (1 to 256), read once when the pool starts. At 8 threads the offload was capped near 127 recalls/s at both 16 and 32 callers.
+  - **Cancellation:** a recall still queued is dropped without running; one already running finishes on its thread and its result is dropped.
+
 ## Why
 #1479's tier 2: an async server or agent loop must not block an executor thread on a text search's or a recall's reads.
 
