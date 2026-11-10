@@ -424,7 +424,7 @@ impl<'t> RowRead<'t> {
         if !any {
             return Ok(None);
         }
-        self.core.row_shape.observe(&buf);
+        self.core.row_shape.observe(&mut buf);
         buf.key = self.row;
         Ok(Some(RowRef::owned(buf)))
     }
@@ -463,7 +463,7 @@ impl RowRead<'_> {
                         Ok(r) => {
                             return Ok(Err(r.map_err(crate::Error::from).map(|any| {
                                 any.then(|| {
-                                    self.core.row_shape.observe(&buf);
+                                    self.core.row_shape.observe(&mut buf);
                                     buf.key = std::mem::take(&mut self.row);
                                     Row::new(buf)
                                 })
