@@ -198,7 +198,7 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
 - **A new server code, `Unavailable`,** in the table above (the coordinator approved it on #1617, ai1249's R2): a service the server depends on failed or can't be reached, so nothing was applied and the request may be sent again. Today that's `Memory`'s embedding endpoint (`--embed-url`) refusing the connection, not connecting within half of `--embed-timeout-ms` (at most 3 s; a connect that hangs is an unreachable endpoint, not a slow one), or answering 5xx, 408 or 429. The endpoint's other failures map to existing codes: its timeout (`--embed-timeout-ms`) is `DeadlineExceeded`; a 400, 413 or 422 (the caller's text) is `InvalidArgument`; any other answer, or a reply that isn't an embedding of the store's dimension, is `Internal` (the server's configuration). Clients that don't know the code see it as an unknown server code with its HTTP status and `retry_from`.
 
 ## Amendment: remote MCP at `/mcp` (#1397, D313 ticket 8c-3a)
-`phdb serve` serves `phdb mcp`'s data tools over MCP's Streamable HTTP transport at `/mcp`, on the same port. The tools, their arguments, their paging and cursors, and their answers are `phdb mcp`'s. The memory tools follow in 8c-3b.
+`phdb serve` serves `phdb mcp`'s tools over MCP's Streamable HTTP transport at `/mcp`, on the same port. The tools, their arguments, their paging and cursors, and their answers are `phdb mcp`'s. The data tools came in 8c-3a, and the memory tools in 8c-3b (below).
 - **Requests:**
   - `POST /mcp` carries one JSON-RPC message, or a batch (2025-03-26). The reply is `application/json`. It's `text/event-stream` when `notifications/tools/list_changed` rides along: the reply's event, then the notification's. A message with nothing to answer (a notification) gets 202.
   - `GET /mcp` gets 405: the server opens no stream of its own.
@@ -220,3 +220,8 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
   - On a replica, `x-pigeonhole-min-primary-seqno` makes a request wait for the primary's seqno, as an RPC does.
 - **`list_changed` across sessions:** the service keeps a catalog generation, which a create or drop (or a replica's catalog change) moves. A session that saw an older one checks its tool list on its next request, and announces a change there, as after its own calls.
 - **Result limits:** `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB), `phdb mcp`'s `--max-result-bytes` and `--max-value-bytes`.
+- **The memory tools (8c-3b):** with `--memory NAME`, `/mcp` serves `phdb mcp`'s six memory tools, the `memory://guide` resource and the instructions' memory paragraph, over the store the `Memory` service serves (its slot, reopened after a catalog change or a replica's re-bootstrap).
+  - Each call passes `admit` with read scope (`memory_recall`) or write scope (the other five), and is limited to the token's namespaces (M4): a call naming another is refused with `PermissionDenied`, as the RPCs refuse it.
+  - A request holding a memory tool call takes a place under the memory sub-limit (M6, `--memory-calls`) before its blocking-pool thread, the order the `Memory` RPCs take them in. A place that isn't free within the request timeout answers `Overloaded`.
+  - The default recall budget is `--mcp-max-result-bytes`, as `phdb mcp`'s is its `--max-result-bytes`.
+- **The memory flags at startup:** `phdb serve --memory` now refuses, as `phdb mcp` always has, a `--memory-dim` or `--memory-normalization` that differs from an existing store's.

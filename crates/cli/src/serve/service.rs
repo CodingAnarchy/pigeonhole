@@ -971,8 +971,8 @@ impl Service {
         self.tables.load().map.contains_key(name)
     }
 
-    /// The memory store's slot, for a test to inspect the store it holds (#1640).
-    #[cfg(test)]
+    /// The memory store's slot: `/mcp`'s memory tools (8c-3b), and a test's inspection of
+    /// the store it holds (#1640).
     pub(crate) fn memory_slot(&self) -> Option<&Arc<super::memslot::MemSlot>> {
         self.memory.as_ref()
     }
@@ -2490,7 +2490,6 @@ impl Service {
     /// while its copy is still arriving, else `Unavailable` (the primary hasn't created it,
     /// or the replica hasn't applied that yet; ICR 0112).
     async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        use super::memslot::Entry;
         let slot = self.memory.clone().ok_or_else(|| {
             ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
         })?;
@@ -2503,6 +2502,27 @@ impl Service {
                 self.memory_blocking(move || slot.get()).await?
             }
         };
+        self.entry_core(&slot, entry)
+    }
+
+    /// [`memory_core`](Self::memory_core) on a blocking thread that already holds a memory
+    /// place (M6) and a pool place: a `/mcp` memory tool's (8c-3b). It opens the store here
+    /// if need be.
+    pub(crate) fn memory_core_blocking(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
+        let slot = self.memory.as_ref().ok_or_else(|| {
+            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
+        })?;
+        let entry = slot.get()?;
+        self.entry_core(slot, entry)
+    }
+
+    /// The core a slot's entry holds, or why there's none.
+    fn entry_core(
+        &self,
+        slot: &super::memslot::MemSlot,
+        entry: super::memslot::Entry,
+    ) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
+        use super::memslot::Entry;
         match entry {
             Entry::Core(core) => Ok(core),
             Entry::Failed(e) => Err(e),
@@ -2527,12 +2547,28 @@ impl Service {
         &self,
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let slot = budget_within(&self.memory_calls, 1, self.limits.request_timeout)
-            .await
-            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))?;
+        let slot = self.memory_place().await?;
         let r = self.blocking(f).await;
         drop(slot);
         r
+    }
+
+    /// A place under the memory sub-limit (M6), waited for within the request timeout. Taken
+    /// before a blocking-pool place, always: `/mcp` takes it before its request's pool thread
+    /// too, so the two are never waited for in the other order.
+    pub(crate) async fn memory_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        budget_within(&self.memory_calls, 1, self.limits.request_timeout)
+            .await
+            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
+    }
+
+    /// A place under the memory sub-limit now, or `Overloaded`: for a call already on a
+    /// blocking-pool thread, which mustn't wait for one (`/mcp`'s fallback, ai1249's R1 on
+    /// #1679).
+    pub(crate) fn memory_try_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        Arc::clone(&self.memory_calls)
+            .try_acquire_owned()
+            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
     }
 
     /// A memory write: detached (its real outcome even if the client goes away), on the

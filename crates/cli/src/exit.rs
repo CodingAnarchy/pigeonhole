@@ -142,6 +142,17 @@ impl Failure {
         }
     }
 
+    /// A call outside what the caller may do: a namespace beyond its token's, on `phdb
+    /// serve`'s `/mcp` (8c-3b).
+    pub(crate) fn permission_denied(message: &str) -> Self {
+        Self {
+            code: "PermissionDenied".into(),
+            code_num: None,
+            message: message.into(),
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// The same failure, naming the script or `-c` line it came from.
     pub(crate) fn at_line(mut self, line: usize) -> Self {
         self.message = format!("line {line}: {}", self.message);

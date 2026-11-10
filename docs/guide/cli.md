@@ -343,7 +343,7 @@ u1   profile  name       1761030000000000  Ada
 ```
 
 ### `phdb serve`
-> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots`, the change feed (`Feed.Subscribe`), `Schema`, `Admin`, `Graph.Traverse`, and `Vectors` (`Nearest` and the IVF index, with `BulkLoad`), `Text`, and `Memory` (with `--memory`) over gRPC and HTTP/JSON, and `phdb mcp`'s data tools as remote MCP at `/mcp` (the memory tools there follow). ICR 0112 is the full contract.
+> **Status:** in progress for 1.2.0 (D313, #1397). This build serves the `Data` service (`Get`, `MultiGet`, `ReadRow`, `Scan`, `Mutate`, `CheckAndMutate`, `Batch`, `MutateReturning`), `Transactions`, `Snapshots`, the change feed (`Feed.Subscribe`), `Schema`, `Admin`, `Graph.Traverse`, and `Vectors` (`Nearest` and the IVF index, with `BulkLoad`), `Text`, and `Memory` (with `--memory`) over gRPC and HTTP/JSON, and `phdb mcp`'s tools as remote MCP at `/mcp`. ICR 0112 is the full contract.
 
 `phdb serve` owns the database and serves it on one port, by default `127.0.0.1:7448`. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`, the request message as proto3 JSON) share the port. It runs until Ctrl-C or SIGTERM, lets in-flight requests finish within `--shutdown-grace-ms`, and closes the database cleanly.
 
