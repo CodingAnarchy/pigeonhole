@@ -56,7 +56,7 @@ Remote MCP (Streamable HTTP at `/mcp`, D313 §7) speaks MCP's own JSON-RPC and i
   - **Without a `snapshot_id`, each page reads at its own snapshot** (simp724's D1 on #1510). A row is never torn, but rows can change between pages, so the stream isn't one point in time. Pin a snapshot (`Snapshots.Open`) for that.
   - **A client that stops reading for `--stream-idle-ms`** ends its stream with `DeadlineExceeded` (`REQUEST`): resume from the last page's `next` (perf287's G2 on #1510).
 - **`Feed.Subscribe`'s stream** (D313 R2):
-  - **Every event's `token` resumes just after it**, as an in-process feed's does, whether the event is a commit or a progress event. A progress event's token covers the commits the stream's prefix passed over.
+  - **Every event's `token` resumes just after it**, as an in-process feed's does, whether the event is a commit or a progress event. A progress event's token covers the commits the stream's prefix passed over. The one exception is a cluster subscription over several partitions, whose tokens are checkpoints ([amendment below](#amendment-cluster-feeds-d317-ticket-7)).
   - **Streams on the same table set and visibility share one engine subscription.** Past `--max-feed-hubs` distinct sets, a subscription on a new set is `Overloaded`, and so is one past `--max-streams` streams. Both are retry-safe once others end.
   - **A stream that falls behind** the shared feed's recent history (`--feed-ring-bytes`, a total across table sets), or starts from a token, a snapshot or the oldest commit, reads on its own until it catches up. Its events and tokens are the same either way. At most `--max-catch-up` do so at once; the rest wait their turn.
   - **An idle stream stays open:** HTTP/2 pings, and SSE keepalive comments (`: keepalive`) every 15 s.
@@ -242,3 +242,22 @@ The design is on #1567, with cli692's review (D1, D2).
   - a unary read whose share isn't free within `--request-timeout-ms` is `Overloaded`, retry-safe, with nothing read;
   - a reply whose client takes nothing of it for `--stream-idle-ms` is dropped and its share freed (D1). Over gRPC its stream then ends with `DEADLINE_EXCEEDED` in the trailers, after an incomplete message; over HTTP/1.1 the body is cut off. A client sees either once it reads again or its connection closes.
 - **Metrics:** `pigeonhole_serve_inflight_reply_bytes` (charged now), `pigeonhole_serve_reply_idle_drops_total` and `pigeonhole_serve_reply_rereads_total`.
+
+## Amendment: cluster feeds (D317 ticket 7)
+`Feed.Subscribe` on a cluster node is specified in [ICR 0117's ticket 7 section](0117-static-partitions.md#ticket-7-cluster-feeds). The wire changes are additive:
+- **`SubscribeRequest`:**
+  - `allow_partial` (7);
+  - `skip_through` (8, `repeated PartitionSeqno { partition, seqno }`);
+  - `checkpoint_every` (9).
+
+  All three are for a cluster only. A single node refuses them with `InvalidArgument`.
+- **`FeedEvent`:**
+  - `partition` (5), set on a cluster's events;
+  - a new oneof arm, `PartitionState partition_state` (6).
+
+  Field 3 stays planned for D315's catalog events.
+- **Tokens on a cluster subscription over several partitions are checkpoints.** Only some events carry one, and the rest carry an empty `token`.
+  - **Resume:** a resume from the last checkpoint may deliver again up to 64 commits that came after it. A client recognises them by `(partition, commit.seqno)`, since seqnos compare only within a partition, or names them in `skip_through`.
+  - **One partition:** a one-partition subscription, or `checkpoint_every: 1`, carries a token on every event, as a single node does.
+  - **SSE:** an event without a token is sent without an `id:` line, so an SSE client's `Last-Event-ID` stays at the last checkpoint and its native reconnect resumes there.
+- **A cluster token isn't a single node's,** and neither resumes the other (`InvalidArgument`).

@@ -163,6 +163,7 @@ fn a_quiet_stream_still_moves_its_token() {
     let event = proto::FeedEvent {
         token: b"\x01\x02".to_vec().into(),
         event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
+        partition: String::new(),
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["token"], "AQI=");

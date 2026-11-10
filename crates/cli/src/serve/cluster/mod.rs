@@ -9,12 +9,14 @@
 //! partition's identity under it.
 
 pub(crate) mod cli;
+pub(crate) mod feed;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod route;
 #[cfg(test)]
 mod tests;
+pub(crate) mod token;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -780,6 +782,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         }
         Ok(resp)
     }
+
+    type ForwardSubscribeStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<proto::FeedEvent, Status>> + Send>,
+    >;
+
+    /// Served by a route of its own ([`feed::ForwardSubscribeGrpc`]), ahead of this one.
+    async fn forward_subscribe(
+        &self,
+        _req: Request<proto::ForwardSubscribeRequest>,
+    ) -> Result<tonic::Response<Self::ForwardSubscribeStream>, Status> {
+        Err(Status::unimplemented(
+            "this node doesn't serve data, so it has no partition to subscribe to",
+        ))
+    }
 }
 
 fn http_caller(
@@ -842,6 +858,13 @@ pub(crate) fn routes(
     max_request_bytes: usize,
 ) -> axum::Router {
     let idle = shared.as_ref().map(|s| s.limits.stream_idle);
+    // A cluster subscription's parts last as long as it does: outside the limit below, each
+    // holding a `--max-streams` place instead (D317 ticket 7).
+    let streams = shared.as_ref().map(|shared| feed::ForwardSubscribeGrpc {
+        node: Arc::clone(&node),
+        shared: Arc::clone(shared),
+        max_request_bytes,
+    });
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes);
     let mut app = axum::Router::new()
@@ -856,7 +879,11 @@ pub(crate) fn routes(
             move |resp: axum::response::Response| async move { super::charge::hold(resp, idle) },
         ));
     }
-    app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
+    let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
+    match streams {
+        Some(svc) => app.route_service(feed::FORWARD_SUBSCRIBE, svc),
+        None => app,
+    }
 }
 
 /// `Cluster` calls a node runs at once: map reads and installs, pushes and pulls are few.
@@ -891,11 +918,6 @@ pub(crate) fn run(
             args.create,
             "--create",
             "D317's ticket 2 (partitions are created by phdb cluster init-partition)",
-        ),
-        (
-            args.change_feed.is_some(),
-            "--change-feed",
-            "D317's ticket 7 (cluster feeds)",
         ),
     ];
     if let Some((_, flag, ticket)) = refused.iter().find(|(set, _, _)| *set) {
@@ -997,7 +1019,8 @@ pub(crate) fn run(
     let cluster_id = node.state().map.as_ref().map(|(m, _)| m.cluster_id.clone());
     let db = match (&local, &cluster_id) {
         (Some((p, epoch)), Some(c)) => {
-            let options = partition_options(args.shard_spin, cli.shm_dir.as_deref());
+            let options =
+                partition_options(args.shard_spin, cli.shm_dir.as_deref(), args.change_feed);
             Some(open_partition(dir, c, p, *epoch, options)?)
         }
         _ => None,
@@ -1069,16 +1092,21 @@ pub(crate) fn run(
 }
 
 /// The options a cluster node opens its partition with: the server's shard poll (none by
-/// default, D198 amendment 4) and `--shm-dir`, as a single node's (cli692's M1 on #1686).
+/// default, D198 amendment 4), `--shm-dir` and `--change-feed`, as a single node's (cli692's
+/// M1 on #1686). A partition whose feed is on keeps it without the flag (D317 ticket 7).
 pub(crate) fn partition_options(
     shard_spin: config::ShardSpin,
     shm_dir: Option<&Path>,
+    change_feed: Option<u64>,
 ) -> pigeonhole::Options {
-    let options = shard_spin.apply(pigeonhole::Options::default());
-    match shm_dir {
-        Some(dir) => options.shm_dir(dir),
-        None => options,
+    let mut options = shard_spin.apply(pigeonhole::Options::default());
+    if let Some(dir) = shm_dir {
+        options = options.shm_dir(dir);
     }
+    if let Some(bytes) = change_feed {
+        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
+    }
+    options
 }
 
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:

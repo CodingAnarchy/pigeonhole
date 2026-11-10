@@ -761,6 +761,19 @@ struct TableCache {
     map: HashMap<String, Table>,
 }
 
+/// The feed fan-out's limits, from the server's.
+fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
+    super::feed::FeedLimits {
+        ring_bytes: limits.feed_ring_bytes,
+        max_hubs: limits.max_feed_hubs,
+        max_catch_up: limits.max_catch_up,
+        quiet: limits.feed_quiet,
+        stream_idle: limits.stream_idle,
+        client_events: limits.feed_client_events,
+        client_bytes: limits.feed_client_bytes,
+    }
+}
+
 /// The database, its open tables, and the limits every call passes through.
 pub(crate) struct Service {
     /// The in-flight bytes budget (R3), in bytes.
@@ -852,18 +865,7 @@ impl Partition {
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
             engine_metrics: pigeonhole_otel::collector(&db),
-            feeds: super::feed::Feeds::new(
-                db.clone(),
-                super::feed::FeedLimits {
-                    ring_bytes: limits.feed_ring_bytes,
-                    max_hubs: limits.max_feed_hubs,
-                    max_catch_up: limits.max_catch_up,
-                    quiet: limits.feed_quiet,
-                    stream_idle: limits.stream_idle,
-                    client_events: limits.feed_client_events,
-                    client_bytes: limits.feed_client_bytes,
-                },
-            ),
+            feeds: super::feed::Feeds::new(db.clone(), feed_limits(limits)),
             db,
         }
     }
@@ -2995,13 +2997,31 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<super::feed::FeedEvents, ApiError> {
+        if r.allow_partial || !r.skip_through.is_empty() || r.checkpoint_every != 0 {
+            return Err(ApiError::invalid(
+                "allow_partial, skip_through and checkpoint_every are for a cluster \
+                 subscription (D317), and this server isn't a cluster node",
+            ));
+        }
+        drop(budget);
+        self.subscribe_part(r, caller, 0, false).await
+    }
+
+    /// A subscription of this server's database: a single node's `Feed.Subscribe`, or one
+    /// partition's part of a cluster subscription (D317 ticket 7), whose `skip` passes over
+    /// commits the client already handled ([`super::feed::Spec::skip`]) and which
+    /// `announce`s its start ([`super::feed::Spec::announce`]). Holds a `--max-streams`
+    /// place either way.
+    pub(crate) async fn subscribe_part(
+        &self,
+        r: proto::SubscribeRequest,
+        caller: &Caller,
+        skip: u64,
+        announce: bool,
+    ) -> Result<super::feed::FeedEvents, ApiError> {
         use super::feed::Start;
         use proto::subscribe_request::Start as S;
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         if r.tables.is_empty() {
             return Err(ApiError::invalid("a subscription names at least one table"));
         }
@@ -3025,7 +3045,6 @@ impl Service {
                 Start::Token(pigeonhole::FeedToken::from_bytes(token.to_vec()))
             }
         };
-        drop(budget);
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         self.part()?.feeds.subscribe(
@@ -3034,10 +3053,18 @@ impl Service {
                 prefix: r.prefix.to_vec(),
                 visible: r.visible,
                 start,
+                skip,
+                announce,
             },
             slot,
             move |e| metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed()),
         )
+    }
+
+    /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
+    /// single client's (D317 ticket 7), on a node that only routes too.
+    pub(crate) fn feed_limits(&self) -> super::feed::FeedLimits {
+        feed_limits(&self.limits)
     }
 
     /// `Transactions.Begin`: a transaction at a snapshot taken now, held for the caller.

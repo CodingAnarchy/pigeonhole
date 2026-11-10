@@ -417,7 +417,7 @@ pub(crate) struct FeedGrpc {
     pub(crate) max_request_bytes: usize,
 }
 
-struct GrpcEvents(super::feed::FeedEvents);
+pub(crate) struct GrpcEvents(pub(crate) super::feed::FeedEvents);
 
 impl Stream for GrpcEvents {
     type Item = Result<Out, Status>;
@@ -448,7 +448,7 @@ impl tonic::codec::Codec for FeedCodec {
     }
 }
 
-struct OutEncoder;
+pub(crate) struct OutEncoder;
 
 impl tonic::codec::Encoder for OutEncoder {
     type Item = Out;
