@@ -197,7 +197,8 @@ async fn acquire(
     }
 }
 
-/// A response's charge, in its extensions (which need `Clone`): taken once, by [`attach`].
+/// A gRPC response's charge, in its extensions (which need `Clone`): taken once, by
+/// [`hold`].
 #[derive(Clone, Debug)]
 pub(crate) struct Charged(Arc<Mutex<Option<Charge>>>);
 
@@ -211,24 +212,25 @@ impl Charged {
     }
 }
 
-/// The layer over the router: a response with a [`Charged`] gets its body wrapped, so the
-/// charge lasts until the body has been written. Others pass through untouched.
-///
-/// A plain function for `tower`'s `MapResponseLayer`, which maps in place: axum's
-/// `map_response` middleware boxed a future for every response on every route, which cost
-/// the smallest reads a few percent (g46's readrow-small).
-pub(crate) fn attach(idle: Duration) -> impl Fn(Response<Body>) -> Response<Body> + Clone {
-    move |resp| wrap(resp, idle)
-}
-
-fn wrap(mut resp: Response<Body>, idle: Duration) -> Response<Body> {
-    let Some(charge) = resp
+/// A gRPC response with a [`Charged`] gets its body wrapped, so the charge lasts until the
+/// body has been written; others pass through untouched. Called by the gRPC routes' own
+/// middleware (`grpc::prepay`) on its way out, so no layer of its own is added: a
+/// router-wide layer, even tower's `MapResponseLayer`, cost readrow-small about 1% in
+/// axum's per-request service boxing and futures (perf287's g54 profile on #1661).
+pub(crate) fn hold(mut resp: Response<Body>, idle: Duration) -> Response<Body> {
+    match resp
         .extensions_mut()
         .remove::<Charged>()
         .and_then(|c| c.take())
-    else {
-        return resp;
-    };
+    {
+        Some(charge) => hold_charge(resp, charge, idle),
+        None => resp,
+    }
+}
+
+/// `resp`'s body holding `charge` until it has been written: an HTTP/JSON reply's, from its
+/// handler, which has the charge at hand (no extension to go through).
+pub(crate) fn hold_charge(resp: Response<Body>, charge: Charge, idle: Duration) -> Response<Body> {
     // A reply within one slice goes to the transport whole, at its first poll, and sits in
     // the stream's own send buffer, bounded per stream (cli692's (a)): its charge is freed
     // here, with no body wrapper to allocate or watchdog to start (#1567).

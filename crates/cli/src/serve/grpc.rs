@@ -115,7 +115,8 @@ pub(crate) async fn prepay(
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
     req.extensions_mut().insert(Arrived(arrived));
     req.extensions_mut().insert(meter);
-    next.run(req).await
+    // A unary read's reply charge (#1567) moves into its body here, on the way out.
+    super::charge::hold(next.run(req).await, limits.stream_idle)
 }
 
 /// The client stream whose messages are each reserved as they arrive.
@@ -339,7 +340,7 @@ macro_rules! unary {
 }
 
 /// A unary reply as its response, a read's charge (#1567) in its extensions, which the
-/// router's layer moves into the body ([`super::charge::attach`]).
+/// gRPC routes' middleware moves into the body on the way out ([`super::charge::hold`]).
 fn respond<T>(
     reply: ServiceReply,
     pick: impl FnOnce(ServiceReply) -> Option<T>,

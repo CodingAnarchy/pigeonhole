@@ -133,11 +133,6 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                 .service(replication),
         )
         .with_state(Arc::clone(&shared))
-        // A read's reply holds its share of the budget until its body has been written
-        // (#1567): the layer moves the response's charge into its body.
-        .layer(tower::util::MapResponseLayer::new(super::charge::attach(
-            limits.stream_idle,
-        )))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
         // alone would queue callers in `poll_ready`.
         .layer(
@@ -458,11 +453,7 @@ async fn call(
 
 /// `resp` holding `charge`: fitted to its rendered body (larger than the protobuf it was
 /// reserved for, or smaller), waiting for the difference if need be (cli692's D2 on #1567).
-async fn charged(
-    shared: &Shared,
-    mut resp: Response,
-    mut charge: super::charge::Charge,
-) -> Response {
+async fn charged(shared: &Shared, resp: Response, mut charge: super::charge::Charge) -> Response {
     use http_body::Body as _;
     if let Some(len) = resp.body().size_hint().exact()
         && let Err(e) = charge
@@ -475,9 +466,9 @@ async fn charged(
     {
         return e.into_response();
     }
-    resp.extensions_mut()
-        .insert(super::charge::Charged::new(charge));
-    resp
+    // Held by the body until it has been written (#1567): here, not in a layer of its own
+    // (perf287's g54 profile on #1661).
+    super::charge::hold_charge(resp, charge, shared.limits.stream_idle)
 }
 
 /// A message of a server stream: its JSON, and its SSE `id:` if it has one.
