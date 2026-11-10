@@ -1666,6 +1666,12 @@ pub(crate) enum ShardMsg {
         /// the shard poisons itself) or had dropped it: the coordinator never acks `Ok`.
         error: Option<PrepareError>,
     },
+    /// A direct stream's write (D324) covering groups up to `group` finished: they are
+    /// written where a crash recovers them.
+    WriteDone {
+        group: u64,
+        result: std::result::Result<Lsn, pigeonhole_io::Error>,
+    },
     /// A WAL sync covering groups up to `group` finished.
     SyncDone {
         group: u64,
@@ -1998,8 +2004,12 @@ struct Group {
     /// Some record of the group is past what the stream has written where a crash
     /// recovers it ([`pigeonhole_wal::Wal::written`]): its segment's header still waits for
     /// the previous rollover's sync (#19, D200). Such a group holds the watermark until it
-    /// resolves; any other group is visible once applied (D227).
+    /// resolves; any other group is visible once applied (D227). On a direct stream (D324)
+    /// every group is unwritten until its write completes ([`ShardMsg::WriteDone`]).
     unwritten: bool,
+    /// The group waits for its write and no sync (Buffered records on a direct stream,
+    /// D324): its [`ShardMsg::WriteDone`] resolves it.
+    at_write: bool,
 }
 
 /// A cross-shard commit this shard coordinates.
@@ -7715,6 +7725,7 @@ impl ShardState {
             first,
             members: admitted,
             unwritten: false,
+            at_write: false,
         };
         self.next_group += 1;
         let mut need_group_sync = false;
@@ -7728,6 +7739,9 @@ impl ShardState {
         // The end of the last Buffered record: `write` may not cover it while a segment
         // header is held back (#19).
         let mut buffered_end: Option<Lsn> = None;
+        // A direct stream's write completion (D324), when the group's records are not in the
+        // file yet.
+        let mut write_done: Option<pigeonhole_io::Completion<Lsn>> = None;
         // The end of the group's last written record (any level but `None`), for D227.
         let mut group_end: Option<Lsn> = None;
         #[cfg(feature = "test-hooks")]
@@ -7876,6 +7890,9 @@ impl ShardState {
                     && m.durability == Durability::Buffered
                     && m.ticket.is_some()
                     && m.failed.is_none()
+                    // A direct stream's write completes later (D324): the PREPARE votes when
+                    // its group resolves, once the write landed.
+                    && !self.wal.as_ref().is_some_and(|w| w.is_direct())
                 {
                     self.send_vote(m.seqno, coordinator, &mut m.voted, None, ctx);
                 }
@@ -7893,6 +7910,19 @@ impl ShardState {
             // recovers it: then the group stays hidden until a sync resolves it, which
             // writes the held header first (D200).
             group.unwritten = group_end.is_some_and(|end| end > wal.written());
+            // A direct stream's write lands later (D324): with no header held back, that is
+            // the only reason a record is unwritten. Its completion makes the group visible,
+            // and resolves it if it needs no sync.
+            if group.unwritten && !wal.header_held() {
+                match wal.submit_write() {
+                    Ok(c) => write_done = Some(c),
+                    Err(_) => {
+                        self.poison(crate::health::FailureCause::Io);
+                        self.fail_all(group.members, true, ctx);
+                        return;
+                    }
+                }
+            }
             // A Buffered ticket `write` did not cover: its record is in a segment whose
             // header still waits for the previous rollover's sync (#19). Resolve the group
             // through a sync then, which writes that header first.
@@ -7900,6 +7930,9 @@ impl ShardState {
             let held = last_sync.is_none()
                 && !(need_group_sync && unsynced)
                 && buffered_end.is_some_and(|end| end > wal.written());
+            // On a direct stream with no header held, its write is enough.
+            group.at_write = held && write_done.is_some();
+            let held = held && !group.at_write;
             if (need_group_sync && unsynced) || held {
                 if last_sync.is_none()
                     && self.group_sync_depth != 0
@@ -8074,9 +8107,14 @@ impl ShardState {
         }
         self.spawn_flush(ctx);
 
+        // A direct stream's write (D324): visibility, and resolution for a group needing no
+        // sync. Asked for before the group's sync, so its message comes first.
+        if let Some(c) = write_done {
+            self.on_write_done(c, group.id, ctx);
+        }
         // Resolution: now, when its sync completes, or (batched) when the next one does.
         match last_sync {
-            None if batched => {
+            None if batched || group.at_write => {
                 self.unresolved.push_back(group);
                 self.publish_watermark();
             }
@@ -8705,6 +8743,58 @@ impl ShardState {
             });
             Ok(())
         }));
+    }
+
+    /// Sends [`ShardMsg::WriteDone`] for groups through `through` once `completion`, a direct
+    /// stream's write (D324), resolves.
+    #[cold]
+    #[inline(never)]
+    fn on_write_done(
+        &self,
+        completion: pigeonhole_io::Completion<Lsn>,
+        through: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let submitter = ctx.submitter(self.id).clone();
+        drop(completion.map(move |r| {
+            let _ = submitter.submit(ShardMsg::WriteDone {
+                group: through,
+                result: r,
+            });
+            Ok(())
+        }));
+    }
+
+    /// A direct stream's write covering groups through `through` finished (D324): they are
+    /// written where a crash recovers them, so visible once applied (D227), and a group that
+    /// needed no sync resolves. A failed write is a failed sync's case: the shard dies.
+    #[cold]
+    #[inline(never)]
+    fn write_done(
+        &mut self,
+        through: u64,
+        result: std::result::Result<Lsn, pigeonhole_io::Error>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        if result.is_err() {
+            self.resolve_through(through, result, ctx);
+            return;
+        }
+        for g in self.unresolved.iter_mut().take_while(|g| g.id <= through) {
+            g.unwritten = false;
+        }
+        while let Some(at) = self
+            .unresolved
+            .iter()
+            .take_while(|g| g.id <= through)
+            .position(|g| g.at_write)
+        {
+            let group = self.unresolved.remove(at).expect("found");
+            self.publish_watermark();
+            self.resolve_group(group, Ok(()), ctx);
+        }
+        self.publish_watermark();
+        self.try_finish_close(ctx);
     }
 
     /// Group syncs' in-flight time up to `now` (D248): the integral of the syncs in flight.
@@ -11842,6 +11932,7 @@ impl ShardState {
                 ctx,
             ),
             ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
+            ShardMsg::WriteDone { group, result } => self.write_done(group, result, ctx),
             ShardMsg::SyncDone {
                 group,
                 result,

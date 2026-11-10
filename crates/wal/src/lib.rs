@@ -285,6 +285,12 @@ pub trait Wal: Send + fmt::Debug {
     /// itself until its write completes.
     fn write(&mut self) -> Result<Lsn>;
 
+    /// Whether the stream writes direct (D324): its [`Wal::write`] returns before the bytes
+    /// are in the file, and [`Wal::written`] moves when they are. `false` by default.
+    fn is_direct(&self) -> bool {
+        false
+    }
+
     /// [`Wal::write`], then a completion that resolves once every appended byte is in the
     /// file, with the position written: at once where `write` returns only then (the
     /// default), later on a direct stream (D324), whose writes complete off the caller's

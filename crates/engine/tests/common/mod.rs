@@ -793,6 +793,9 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     o.reader_slots = 8;
     o.wal.segment_size = 8 * 32 * 1024;
     o.wal.spare_segments = 1;
+    // `PIGEONHOLE_WAL_DIRECT=1`: the WAL streams write their records direct (D324), each
+    // write completing later, so a group waits for its write as well as its sync.
+    o.wal.direct = std::env::var("PIGEONHOLE_WAL_DIRECT").as_deref() == Ok("1");
     // The page file grows ahead of need from 4 MiB, by 4 MiB blocks (64 MiB from 128 MiB by
     // default, the largest extent), so crash runs cover those growths too. A block holds a
     // flush's extent at the budgets these tests use.

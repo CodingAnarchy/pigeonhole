@@ -2420,6 +2420,10 @@ impl Wal for WalStream {
         Ok(done)
     }
 
+    fn is_direct(&self) -> bool {
+        self.direct
+    }
+
     fn submit_write(&mut self) -> Result<Completion<Lsn>> {
         let _fg = crate::foreground::Foreground::enter();
         let lsn = self.write()?;
