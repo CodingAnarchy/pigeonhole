@@ -400,7 +400,7 @@ impl<'t> RowRead<'t> {
         };
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
-        let mut buf = RowBuf::new(info, 0);
+        let mut buf = self.core.row_shape.buf(info);
         let table = self.core.info.id;
         let any = match &snapshot {
             // The retry only with a supervisor (`Db::supervised`).
@@ -424,6 +424,7 @@ impl<'t> RowRead<'t> {
         if !any {
             return Ok(None);
         }
+        self.core.row_shape.observe(&mut buf);
         buf.key = self.row;
         Ok(Some(RowRef::owned(buf)))
     }
@@ -451,7 +452,7 @@ impl RowRead<'_> {
                 Some((info, families)) => {
                     // First at the call, as the sync read (#709): a hit needs no future, so
                     // concurrent readers share no reference count beyond the sync read's.
-                    let mut buf = RowBuf::new(info, 0);
+                    let mut buf = self.core.row_shape.buf(info);
                     let missed = match engine.try_read_row_latest(
                         table,
                         &self.row,
@@ -462,6 +463,7 @@ impl RowRead<'_> {
                         Ok(r) => {
                             return Ok(Err(r.map_err(crate::Error::from).map(|any| {
                                 any.then(|| {
+                                    self.core.row_shape.observe(&mut buf);
                                     buf.key = std::mem::take(&mut self.row);
                                     Row::new(buf)
                                 })

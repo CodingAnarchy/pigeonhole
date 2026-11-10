@@ -179,11 +179,18 @@ pub(crate) struct TableCore {
     pub(crate) db: Arc<Db>,
     pub(crate) info: Arc<TableInfo>,
     pub(crate) cached: crate::db::Cached,
+    /// Its rows' sizes, for a point read's buffers (#1558 item 1).
+    pub(crate) row_shape: crate::cell::RowShape,
 }
 
 impl TableCore {
     pub(crate) fn new(db: Arc<Db>, info: Arc<TableInfo>, cached: crate::db::Cached) -> Self {
-        Self { db, info, cached }
+        Self {
+            db,
+            info,
+            cached,
+            row_shape: crate::cell::RowShape::default(),
+        }
     }
 
     /// The engine for one operation: the handle's cached one while it is current.

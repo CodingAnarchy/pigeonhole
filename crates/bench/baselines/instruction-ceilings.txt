@@ -53,6 +53,13 @@
 # commit-at -1.1%, commit-overwrite -1.0%, commit-sixteen -3.3%, ycsb-a -0.3%) from its head
 # run on main f6f4125 (run 38054911220) with `instruction-ceilings.py lower`.
 #
+# Lowered after #1677 (#1558 items 1-2: a point read sizes its row buffers from the table's
+# rows and reuses a dropped row's per thread: ycsb-c -6.0%, ycsb-a -4.9%, row and rows -5.3%,
+# versions -1.7%), by D195 as the coordinator asked (2026-11-10), from its head run
+# 42759671963 on 1b3fb113: row 2373 -> 2247, rows 18847 -> 17845, versions 5290 -> 5195,
+# ycsb-c 41605 -> 39116, ycsb-a 25844 -> 24626 (the workflow's "can be lowered to", the head
+# count times 1 + headroom). Only these five; the others it lists moved by under 0.1%.
+#
 # Raised by owner decision (2026-10-10): counter 9451 -> 9502 (9454 times 1.005), headroom
 # 0.3% -> 0.5%, kept permanently by a second owner decision the same day. #472 found counter
 # deterministic outside the instructions job (about 70 runs at 9430-9432, across CPUs, build
@@ -295,12 +302,12 @@ compacted 1216 0.3
 get-mem 5699 0.1
 get-sst 16701 0.5
 get-miss 3402 0.3
-row 2373 1.0
+row 2247 1.0
 scan 1290 0.3
 scan-filtered 5445 0.3
-versions 5290 0.3
+versions 5195 0.3
 counter 8661 0.5
-rows 18847 0.3
+rows 17845 0.3
 level-scans 13814 0.6
 short-scans 13068 0.3
 # Raised by D195 (owner decision, 2026-10-09; up to about 0.5% per shape, with its reason):
@@ -320,11 +327,11 @@ commit-one 8617 0.3
 commit-sixteen 36521 0.3
 flush 2087 0.3
 compact 2615 0.5
-ycsb-c 41605 1.0
+ycsb-c 39116 1.0
 # ycsb-a (#1305): identical code is usually flat, with occasional outliers up to about 40 per
 # unit (0.16%) from the commit handoff (Signal::wake_target / park_for_reply), inside its 1.0%
 # headroom. Re-run once before treating a delta within 40 in the PR's base-vs-head table as cost.
-ycsb-a 25844 1.0
+ycsb-a 24626 1.0
 commit-overwrite 10608 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
