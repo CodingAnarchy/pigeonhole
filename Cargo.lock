@@ -2235,6 +2235,7 @@ dependencies = [
  "pbjson",
  "pigeonhole",
  "pigeonhole-arrow",
+ "pigeonhole-embed",
  "pigeonhole-format",
  "pigeonhole-io",
  "pigeonhole-memory",
