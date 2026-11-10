@@ -20,7 +20,11 @@
     - `embedding_model` takes the element (A1);
     - `open_dir` was dropped as a second spelling of `LoadOptions::dir` (N1);
     - `Model::max_tokens` lets a caller warn about truncation (N2).
-- **`phdb mcp`** (PR 2): `--embed-local`, `--embed-model-dir` and `--embed-offline`, behind a cargo feature `embed-local`, off by default (D318 Q4).
+- **`phdb mcp` and `phdb serve --memory`** (PR 2): `--embed-local`, `--embed-model-dir` and `--embed-offline` in the shared memory flags, behind a cargo feature `embed-local`, off by default (D318 Q4).
+  - **The flags:** `--embed-local` conflicts with `--embed-url` and `--memory-model`, and the other two need it. Without the feature, `--embed-local` fails as unsupported (exit 6).
+  - **Embedding:** a memory is embedded as a passage and a recall's text as a query. A new store is pinned to `Model::id()` with `Model::dim()`, so no probe embedding runs.
+  - **In `phdb serve`:** the embedder's pool gets `min(free CPUs, 4)` threads, and `on_thread_start` enters the network side's placement (cli692's A2 on #1591). `--embed-timeout-ms` doesn't bound a local embed; `--memory-calls` still bounds how many run at once.
+  - **candle's own pool:** it reads `CANDLE_NUM_THREADS`, `CANDLE_CPU_MASK` (Linux) and `RAYON_NUM_THREADS` from the environment (candle-core 0.11.1's `utils.rs`). With the shards pinned and either variable unset, startup prints one `phdb serve: --embed-local:` line on stderr. It gives the missing ones to export and restart with, since setting them in-process needs `unsafe`: `CANDLE_CPU_MASK=<the placement's CPUs>`, and `CANDLE_NUM_THREADS=<the embedder's threads>`. The mask alone would leave the pool a thread per core, crowded onto those CPUs (cli692's N2 on #1671). `phdb mcp` has no placement, and prints nothing.
 
 ## Why
 #1345: a local agent gets semantic recall without running or trusting an embedding service, from a model whose vectors match the ones `pigeonhole-memory`'s published recall numbers were measured with (D311 T5).
@@ -32,6 +36,5 @@ None. Everything is new, and `pigeonhole-memory` is unchanged and doesn't depend
 `embedding_model` returns `pigeonhole-memory`'s `EmbeddingModel`, and `Element` and `ErrorCode` are `pigeonhole`'s. A major release of either crate is therefore a new 0.N minor here, which the crate's own line allows (cli692's N3).
 
 ## Follow-ups
-- PR 2: `phdb mcp --embed-local`.
 - PR 3: memrecall's `--embed-local` rerun on the AX102.
 - Later, separately: the Python and Ruby bindings. No second model: the owner kept bge-small alone (D318, 2026-11-09).

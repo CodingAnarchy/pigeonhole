@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use pigeonhole_engine::{CellData, FamilyId, TableInfo, ValueRef};
 
@@ -471,6 +472,114 @@ pub(crate) struct RowCell {
     cell: Cell,
 }
 
+/// A table's row sizes, for sizing a point read's buffers up front (#1558 item 1): without
+/// it each read grew its qualifiers and cells from empty, a `realloc` per doubling,
+/// which was the top allocation site on ycsb-c (g50). Each is the largest seen, capped, so
+/// it stops changing once the table's rows have been seen: after that the shared handle's
+/// counters are only read, never written.
+#[derive(Debug, Default)]
+pub(crate) struct RowShape {
+    qualifiers: AtomicU32,
+    cells: AtomicU32,
+}
+
+impl RowShape {
+    /// The caps: a row larger than this still reads correctly, it just grows past them.
+    const QUALIFIERS_MAX: u32 = 4 << 10;
+    const CELLS_MAX: u32 = 64;
+
+    /// An empty row for `info`'s families, with room for the largest row seen (capped). Not
+    /// the key: a point read moves the caller's key in. Its buffers are a row this thread
+    /// dropped, if one is pooled (#1558 item 2), else new.
+    #[inline]
+    pub(crate) fn buf(&self, info: Arc<TableInfo>) -> RowBuf {
+        let (qualifiers, cells) = self.buffers();
+        RowBuf {
+            info: Some(info),
+            key: Vec::new(),
+            qualifiers,
+            cells,
+            last_family: None,
+        }
+    }
+
+    /// [`RowShape::buf`]'s buffers: a pooled pair if there is one, with room reserved.
+    #[inline]
+    fn buffers(&self) -> Pooled {
+        let (mut q, mut c) = recycled().unwrap_or_default();
+        q.reserve(self.qualifiers.load(Relaxed) as usize);
+        c.reserve(self.cells.load(Relaxed) as usize);
+        (q, c)
+    }
+
+    /// Records `buf`'s sizes if one is larger than seen so far (and under its cap), and
+    /// trims a buffer far larger than its row before the row goes to the caller (perf2's
+    /// R1 on #1677): a caller may keep the row, and a 1-cell row sized for the table's widest
+    /// would hold some 15 KiB. A table of like-sized rows never trims.
+    #[inline]
+    pub(crate) fn observe(&self, buf: &mut RowBuf) {
+        buf.fit();
+        self.record(buf);
+    }
+
+    #[inline]
+    fn record(&self, buf: &RowBuf) {
+        fn grow(at: &AtomicU32, len: usize, max: u32) {
+            let len = (len as u32).min(max);
+            if len > at.load(Relaxed) {
+                at.fetch_max(len, Relaxed);
+            }
+        }
+        grow(&self.qualifiers, buf.qualifiers.len(), Self::QUALIFIERS_MAX);
+        grow(&self.cells, buf.cells.len(), Self::CELLS_MAX);
+    }
+}
+
+/// Rows' buffers a thread keeps for its next point reads (#1558 item 2): a dropped row's
+/// qualifiers and cells, emptied, so a thread reading row after row stops allocating them.
+/// Bounded in count and in each buffer's size ([`RowShape`]'s caps): with a cell about 170
+/// bytes (an inline value's 128-byte array), a thread holds at most about 4 × (4 KiB +
+/// 64 × 170 B) ≈ 60 KiB. A row dropped on another thread feeds that thread's pool: nothing
+/// crosses threads, and no lock is taken.
+const POOLED_ROWS: usize = 4;
+
+type Pooled = (Vec<u8>, Vec<RowCell>);
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Pooled>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A pooled pair of buffers, if this thread has one.
+#[inline]
+fn recycled() -> Option<Pooled> {
+    POOL.try_with(|p| p.try_borrow_mut().ok()?.pop())
+        .ok()
+        .flatten()
+}
+
+impl Drop for RowBuf {
+    fn drop(&mut self) {
+        let (q, c) = (&mut self.qualifiers, &mut self.cells);
+        if q.capacity() == 0
+            || q.capacity() > RowShape::QUALIFIERS_MAX as usize
+            || c.capacity() > RowShape::CELLS_MAX as usize
+        {
+            return;
+        }
+        let (mut q, mut c) = (std::mem::take(q), std::mem::take(c));
+        q.clear();
+        c.clear();
+        // At thread exit the pool may be gone; the buffers are then just freed.
+        let _ = POOL.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut()
+                && p.len() < POOLED_ROWS
+            {
+                p.push((q, c));
+            }
+        });
+    }
+}
+
 /// The storage behind [`Row`] and [`RowRef`]: a few buffers per row, none per cell.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RowBuf {
@@ -526,8 +635,10 @@ impl RowBuf {
     pub(crate) fn new(info: Arc<TableInfo>, cells: usize) -> Self {
         Self {
             info: Some(info),
+            key: Vec::new(),
+            qualifiers: Vec::new(),
             cells: Vec::with_capacity(cells),
-            ..Self::default()
+            last_family: None,
         }
     }
 
@@ -540,6 +651,20 @@ impl RowBuf {
             qualifiers: Vec::with_capacity(self.qualifiers.len()),
             cells: Vec::with_capacity(self.cells.len()),
             last_family: self.last_family,
+        }
+    }
+
+    /// Shrinks a buffer more than four times its length (with a floor of 4 cells and 256
+    /// qualifier bytes) to that floor or its length, for a row handed to a caller.
+    #[inline]
+    pub(crate) fn fit(&mut self) {
+        let cells = self.cells.len().max(4);
+        if self.cells.capacity() > 4 * cells {
+            self.cells.shrink_to(cells);
+        }
+        let qualifiers = self.qualifiers.len().max(256);
+        if self.qualifiers.capacity() > 4 * qualifiers {
+            self.qualifiers.shrink_to(qualifiers);
         }
     }
 
@@ -824,5 +949,112 @@ impl Row {
     /// A borrowed view.
     pub fn view(&self) -> RowRef<'_> {
         RowRef::borrowed(&self.buf)
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    /// The calling thread's pooled pairs (an inspection helper).
+    fn pooled() -> usize {
+        POOL.with(|p| p.borrow().len())
+    }
+
+    fn drain() {
+        POOL.with(|p| p.borrow_mut().clear());
+    }
+
+    /// A row with `cells` empty cells and `q` qualifier bytes, with exactly that capacity.
+    fn row(cells: usize, q: usize) -> RowBuf {
+        let mut b = RowBuf::default();
+        b.qualifiers.reserve_exact(q);
+        b.qualifiers.resize(q, b'q');
+        b.cells.reserve_exact(cells);
+        for _ in 0..cells {
+            b.cells.push(RowCell {
+                family: 0,
+                qualifier: 0..1,
+                cell: Cell {
+                    data: CellData::EMPTY,
+                },
+            });
+        }
+        b
+    }
+
+    /// A row from `shape`'s buffers, as a point read starts one.
+    fn started(shape: &RowShape) -> RowBuf {
+        let (qualifiers, cells) = shape.buffers();
+        let mut b = RowBuf::default();
+        b.qualifiers = qualifiers;
+        b.cells = cells;
+        b
+    }
+
+    /// perf2's R1: a small row read after the table's widest doesn't keep the widest's
+    /// capacity once it's handed out.
+    #[test]
+    fn a_small_row_after_a_wide_one_keeps_a_small_capacity() {
+        drain();
+        let shape = RowShape::default();
+        let mut wide = row(64, 4096);
+        shape.observe(&mut wide);
+        drop(wide);
+        // The same table: sized from the shape (and from the pooled wide pair).
+        let mut small = started(&shape);
+        small.qualifiers.extend_from_slice(b"q");
+        small.cells.append(&mut row(1, 0).cells);
+        shape.observe(&mut small);
+        assert!(
+            small.cells.capacity() <= 16,
+            "{} cells",
+            small.cells.capacity()
+        );
+        assert!(
+            small.qualifiers.capacity() <= 1024,
+            "{} bytes",
+            small.qualifiers.capacity()
+        );
+        // Another table (a fresh shape), through the pool only.
+        drop(row(64, 4096));
+        let other = RowShape::default();
+        let mut small = started(&other);
+        assert!(small.cells.capacity() >= 64, "the pooled pair was taken");
+        small.cells.append(&mut row(1, 0).cells);
+        other.observe(&mut small);
+        assert!(
+            small.cells.capacity() <= 16,
+            "{} cells",
+            small.cells.capacity()
+        );
+    }
+
+    #[test]
+    fn the_pool_keeps_four_pairs_within_the_caps() {
+        drain();
+        for _ in 0..6 {
+            drop(row(8, 64));
+        }
+        assert_eq!(pooled(), 4);
+        drain();
+        drop(row(RowShape::CELLS_MAX as usize + 1, 64));
+        drop(row(8, RowShape::QUALIFIERS_MAX as usize + 1));
+        assert_eq!(pooled(), 0, "an over-cap row isn't pooled");
+    }
+
+    /// A row dropped by another thread-local's destructor, after the pool may be gone, is
+    /// freed without a panic (`try_with`; destructor order isn't specified).
+    #[test]
+    fn a_row_dropped_at_thread_exit_does_not_panic() {
+        thread_local! {
+            static HELD: std::cell::RefCell<Option<RowBuf>> = const { std::cell::RefCell::new(None) };
+        }
+        std::thread::spawn(|| {
+            drop(row(8, 64)); // the pool exists
+            HELD.with(|h| *h.borrow_mut() = Some(row(8, 64)));
+        })
+        .join()
+        .expect("thread exit with a held row");
     }
 }

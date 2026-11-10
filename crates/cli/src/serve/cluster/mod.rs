@@ -772,7 +772,13 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let caller = forward::caller_of(msg.caller)?;
         let op = forward::op_of(msg.op)?;
         let reply = shared.router.serve_forwarded(op, &caller).await?;
-        Ok(tonic::Response::new(forward::reply_to_forward(reply)?))
+        let (reply, charge) = forward::reply_to_forward(reply)?;
+        let mut resp = tonic::Response::new(reply);
+        // A read's charge lasts until the reply's body is written: `routes` holds it there.
+        if let Some(c) = charge {
+            resp.extensions_mut().insert(super::charge::Charged::new(c));
+        }
+        Ok(resp)
     }
 }
 
@@ -835,14 +841,22 @@ pub(crate) fn routes(
     shared: Option<Arc<super::Shared>>,
     max_request_bytes: usize,
 ) -> axum::Router {
+    let idle = shared.as_ref().map(|s| s.limits.stream_idle);
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes);
-    axum::Router::new()
+    let mut app = axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))
         .with_state(node)
-        .route_service("/pigeonhole.v1.Cluster/{*method}", grpc)
-        .layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
+        .route_service("/pigeonhole.v1.Cluster/{*method}", grpc);
+    // A forwarded read's charge (#1567) moves into its reply's body, as the data routes'
+    // `prepay` does, so it's held until the reply is written (cli692's F1 on ticket 2).
+    if let Some(idle) = idle {
+        app = app.layer(axum::middleware::map_response(
+            move |resp: axum::response::Response| async move { super::charge::hold(resp, idle) },
+        ));
+    }
+    app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
 }
 
 /// `Cluster` calls a node runs at once: map reads and installs, pushes and pulls are few.

@@ -168,7 +168,15 @@ impl Router {
             reply => reply,
         };
         drop(budget);
-        forward::reply_of(reply?)
+        let reply = forward::reply_of(reply?)?;
+        // A read's reply is charged here too, for this node's own client: its front-end
+        // holds the charge until the reply is written (#1567, cli692's F1 on ticket 2).
+        match reply {
+            ServiceReply::Get(_) | ServiceReply::ReadRow(_) => {
+                self.service.charge_built(caller, reply).await
+            }
+            reply => Ok(reply),
+        }
     }
 
     /// A call another node forwarded here (D317 ticket 2): served only if this node's map

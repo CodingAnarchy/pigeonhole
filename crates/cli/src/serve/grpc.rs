@@ -115,7 +115,8 @@ pub(crate) async fn prepay(
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
     req.extensions_mut().insert(Arrived(arrived));
     req.extensions_mut().insert(meter);
-    next.run(req).await
+    // A unary read's reply charge (#1567) moves into its body here, on the way out.
+    super::charge::hold(next.run(req).await, limits.stream_idle)
 }
 
 /// The client stream whose messages are each reserved as they arrive.
@@ -331,11 +332,27 @@ async fn call<T>(
 /// A unary RPC: the call, and its reply's variant.
 macro_rules! unary {
     ($shared:expr, $req:expr, $op:ident, $reply:ident) => {
-        match call($shared, $req, ServiceOp::$op).await? {
-            ServiceReply::$reply(r) => Ok(Response::new(r)),
-            _ => Err(unexpected()),
-        }
+        respond(call($shared, $req, ServiceOp::$op).await?, |r| match r {
+            ServiceReply::$reply(r) => Some(r),
+            _ => None,
+        })
     };
+}
+
+/// A unary reply as its response, a read's charge (#1567) in its extensions, which the
+/// gRPC routes' middleware moves into the body on the way out ([`super::charge::hold`]).
+/// Only valid for a route behind [`prepay`]: anywhere else nothing moves the charge into
+/// the body, so it is released when the extensions drop, before the reply is sent.
+fn respond<T>(
+    reply: ServiceReply,
+    pick: impl FnOnce(ServiceReply) -> Option<T>,
+) -> Result<Response<T>, Status> {
+    let (reply, charge) = reply.uncharge();
+    let mut resp = Response::new(pick(reply).ok_or_else(unexpected)?);
+    if let Some(c) = charge {
+        resp.extensions_mut().insert(super::charge::Charged::new(c));
+    }
+    Ok(resp)
 }
 
 /// `Transactions` over gRPC (D313 §3).
@@ -925,30 +942,30 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::GetRequest>,
     ) -> Result<Response<proto::GetResponse>, Status> {
-        match self.call(req, ServiceOp::Get).await? {
-            ServiceReply::Get(r) => Ok(Response::new(r)),
-            _ => Err(unexpected()),
-        }
+        respond(self.call(req, ServiceOp::Get).await?, |r| match r {
+            ServiceReply::Get(r) => Some(r),
+            _ => None,
+        })
     }
 
     async fn multi_get(
         &self,
         req: Request<proto::MultiGetRequest>,
     ) -> Result<Response<proto::MultiGetResponse>, Status> {
-        match self.call(req, ServiceOp::MultiGet).await? {
-            ServiceReply::MultiGet(r) => Ok(Response::new(r)),
-            _ => Err(unexpected()),
-        }
+        respond(self.call(req, ServiceOp::MultiGet).await?, |r| match r {
+            ServiceReply::MultiGet(r) => Some(r),
+            _ => None,
+        })
     }
 
     async fn read_row(
         &self,
         req: Request<proto::ReadRowRequest>,
     ) -> Result<Response<proto::ReadRowResponse>, Status> {
-        match self.call(req, ServiceOp::ReadRow).await? {
-            ServiceReply::ReadRow(r) => Ok(Response::new(r)),
-            _ => Err(unexpected()),
-        }
+        respond(self.call(req, ServiceOp::ReadRow).await?, |r| match r {
+            ServiceReply::ReadRow(r) => Some(r),
+            _ => None,
+        })
     }
 
     type ScanStream =

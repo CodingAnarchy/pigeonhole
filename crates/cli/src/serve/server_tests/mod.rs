@@ -20,6 +20,7 @@ use super::{Shared, http, listener};
 use super::{bulk, cluster, errors, feed, replica, service, tls};
 
 mod admin_tests;
+mod charge_tests;
 mod cluster_tests;
 mod connection_tests;
 mod data_tests;

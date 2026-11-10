@@ -4580,7 +4580,7 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
 - **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
 - **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.
-- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before.
+- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before. PR 2 gives the same flag to `phdb serve --memory`, with its embedder's threads placed off the shards' CPUs and the startup line for candle's environment (ICR 0119).
 - **The cost, PR 1's first numbers** (a 10-core Apple laptop):
   - **1 thread:** 33, 41 and 138 ms (p50) at 16, 64 and 256 tokens;
   - **4 threads:** 8.4, 18 and 65 ms;
@@ -4678,6 +4678,7 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **`GroupSync`:** extending caller-runs to it was refused in v1.
 - **#1460** closes as "use caller-runs for this workload".
 
+<a id="d322"></a>
 ## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
 
 **Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
@@ -4698,3 +4699,19 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 
 **Note for the serve benches:** `serve_feed_load` and `serve_read_load` run the `phdb` binary, so from this change on their server side runs on jemalloc. Compare their results only with runs from builds on the same side of it.
 
+
+## D323 — `phdb serve`'s `/metrics` carries the engine's metrics under D316's names, through a backend-neutral `pigeonhole-otel` collector (cli692, design; coordinator, 2026-11-10; cli, otel, D313 ticket 9, ICR 0131)
+
+**Problem.** `phdb serve`'s `/metrics` had the server's own metrics: requests, durations, sessions, connections, shedding, feed hubs, bulk loads and the replica. Of the engine's, it had only `async_sync_reads`. An operator couldn't see a write stall, compaction debt, the caches, the file or a recovery. Those are D316's metrics, which `pigeonhole-otel` maps and carries, but only onto an application's OpenTelemetry `Meter`.
+
+**Decided (option B of ticket 9's plan).**
+- **`pigeonhole-otel` gains a `Collector` (ICR 0131):** the same metric table and the same reading as `register`, as plain points or as Prometheus text under `MetricInfo::prometheus_name`'s names. One table and one reading serve both outputs, so the names can't drift. A test checks the text against `opentelemetry-prometheus`'s for the same database.
+- **`phdb serve`** holds a collector for its database, and `/metrics` and `Admin.Metrics` append its text after the server's own. Its counters stay monotonic across an automatic recovery and a replica's re-bootstrap: the engine's generation moves, and the collector carries.
+- **`pigeonhole_async_sync_reads_total`** now comes from the table, under the same name, with the `pigeonhole_db_name` label.
+- **The cost:** the `opentelemetry` API crate (no SDK) enters the `serve` build through `pigeonhole-otel`.
+
+**Rejected.**
+- **(A) `opentelemetry_sdk` and `opentelemetry-prometheus` in serve:** the names would match by construction, but it brings an SDK and the `prometheus` crate into every serve build, with a second registry beside serve's own metrics.
+- **(C) hand-rendering the engine's metrics in serve:** a second copy of D316's mapping and carry logic, which would drift.
+
+**Also under ICR 0131 (ticket 9b):** `phdb serve --affinity on|off`, documented, default `on`. It's for operators on shared hosts, and for R1's acceptance run (the serve bench's p99 and p99.9 with and without the mask).

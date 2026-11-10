@@ -126,16 +126,21 @@ fn classify(status: &tonic::Status, address: &str, writes: bool) -> ApiError {
 }
 
 /// Whether the forward never reached the owner, or reached it and was refused unprocessed:
-/// a connection refused (a channel reconnecting to a node that's down), a `REFUSED_STREAM`
-/// reset, or a `GOAWAY` (the server names the last stream it processed, so the client fails
-/// only streams it didn't). Either way nothing ran (cli692's point 5).
+/// any failure to connect (tonic's `ConnectError`: refused, timed out, unreachable), a
+/// `REFUSED_STREAM` reset, or a `GOAWAY` (the server names the last stream it processed, so
+/// the client fails only streams it didn't). Either way nothing ran (cli692's point 5).
 fn refused_unprocessed(status: &tonic::Status) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(status);
     while let Some(e) = source {
         if let Some(h2) = e.downcast_ref::<h2::Error>() {
             return h2.reason() == Some(h2::Reason::REFUSED_STREAM) || h2.is_go_away();
         }
-        // A channel reconnecting to a node that's down: nothing was sent.
+        // A channel (re)connecting to the owner that couldn't: refused, timed out (Windows
+        // reports a dead loopback port as a connect timeout, not a refusal), or unreachable.
+        // A connection that was never made sent nothing, whatever the OS says inside it.
+        if e.downcast_ref::<tonic::ConnectError>().is_some() {
+            return true;
+        }
         if let Some(io) = e.downcast_ref::<std::io::Error>()
             && io.kind() == std::io::ErrorKind::ConnectionRefused
         {
@@ -182,6 +187,9 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> 
         token: u32::MAX,
         scope,
         namespaces: (!f.all_namespaces).then_some(f.namespaces),
+        // The reply goes back to the forwarding node as protobuf; that node charges and
+        // renders it for its own client (#1567).
+        json: false,
     })
 }
 
@@ -219,9 +227,13 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
     )
 }
 
-/// The owner's reply, as a forward carries it.
-pub(crate) fn reply_to_forward(reply: ServiceReply) -> Result<ForwardResponse, ApiError> {
+/// The owner's reply, as a forward carries it, and a read's charge (#1567), which the
+/// response holds until its body has been written (cli692's F1 on ticket 2).
+pub(crate) fn reply_to_forward(
+    reply: ServiceReply,
+) -> Result<(ForwardResponse, Option<crate::serve::charge::Charge>), ApiError> {
     use forward_response::Reply;
+    let (reply, charge) = reply.uncharge();
     let reply = match reply {
         ServiceReply::Get(r) => Reply::Get(r),
         ServiceReply::ReadRow(r) => Reply::ReadRow(r),
@@ -234,7 +246,7 @@ pub(crate) fn reply_to_forward(reply: ServiceReply) -> Result<ForwardResponse, A
             ));
         }
     };
-    Ok(ForwardResponse { reply: Some(reply) })
+    Ok((ForwardResponse { reply: Some(reply) }, charge))
 }
 
 /// A forward's reply as the call's own, on the entry node.
@@ -252,4 +264,36 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::MutateReturning(r) => ServiceReply::MutateReturning(r),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify;
+
+    /// tonic's status for a failed connect, as the channel builds it: a `ConnectError` around
+    /// the OS's error.
+    fn connect_failed(kind: std::io::ErrorKind) -> tonic::Status {
+        let io = std::io::Error::new(kind, "connect");
+        let err = tonic::ConnectError(Box::new(io));
+        tonic::Status::from_error(Box::new(err))
+    }
+
+    #[test]
+    fn a_forward_that_never_connected_is_retry_safe_however_the_os_says_it() {
+        // Windows reports a closed loopback port as a connect timeout (#1686's CI): that
+        // write was never sent, so it's PartitionUnavailable, not OutcomeUnknown.
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::HostUnreachable,
+        ] {
+            let e = classify(&connect_failed(kind), "127.0.0.1:1", true);
+            assert_eq!(e.code, "PartitionUnavailable", "{kind:?}: {}", e.message);
+        }
+        // A failure after the send, with no connect error, leaves a write's outcome unknown.
+        let e = classify(&tonic::Status::unavailable("connection reset"), "x", true);
+        assert_eq!(e.code, "OutcomeUnknown");
+        let e = classify(&tonic::Status::unavailable("connection reset"), "x", false);
+        assert_eq!(e.code, "PartitionUnavailable");
+    }
 }

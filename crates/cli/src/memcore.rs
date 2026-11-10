@@ -123,25 +123,118 @@ pub(crate) enum EmbedKind {
     Query,
 }
 
-/// What computes embeddings from text: today a remote endpoint (`--embed-url`). #1345's
-/// local model becomes another variant without touching the calls (ai1249).
+/// What computes embeddings from text: a remote endpoint (`--embed-url`), or a model in this
+/// process (`--embed-local`, #1345).
 pub(crate) enum Embedder {
     Remote(Endpoint),
+    /// Boxed: the model's handle is large beside an endpoint's.
+    #[cfg(feature = "embed-local")]
+    Local(Box<pigeonhole_embed::LocalEmbedder>),
+}
+
+/// How `--embed-local`'s model is loaded and where its threads run.
+#[derive(Default)]
+#[cfg_attr(not(feature = "embed-local"), allow(dead_code))]
+pub(crate) struct LocalPlace {
+    /// The pool's threads; unset, `pigeonhole-embed`'s default (`min(cores, 4)`).
+    pub threads: Option<usize>,
+    /// Run first on each of its threads: a server keeps them off the shards' CPUs.
+    pub on_thread_start: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Embedder {
+    /// The embedder the `--embed-url` or `--embed-local` flags ask for, or `None`. A remote
+    /// call waits at most `timeout`; a local one is CPU work, which nothing interrupts.
+    pub(crate) fn from_args(
+        m: &crate::args::MemoryArgs,
+        timeout: std::time::Duration,
+        place: LocalPlace,
+    ) -> std::result::Result<Option<Self>, Failure> {
+        if let Some(url) = &m.embed_url {
+            return Ok(Some(Self::Remote(Endpoint::new(
+                url,
+                m.embed_model.as_deref().unwrap_or_default(),
+                m.embed_key_env.as_deref(),
+                timeout,
+            )?)));
+        }
+        if !m.embed_local {
+            return Ok(None);
+        }
+        #[cfg(feature = "embed-local")]
+        {
+            use pigeonhole_embed::{LoadOptions, LocalEmbedder, Model};
+            let mut options = LoadOptions::new();
+            if let Some(dir) = &m.embed_model_dir {
+                options = options.dir(dir);
+            }
+            if m.embed_offline {
+                options = options.offline();
+            }
+            if let Some(n) = place.threads {
+                options = options.threads(n);
+            }
+            if let Some(f) = place.on_thread_start {
+                options = options.on_thread_start(move || f());
+            }
+            LocalEmbedder::open(Model::BgeSmallEnV15, &options)
+                .map(|e| Some(Self::Local(Box::new(e))))
+                .map_err(|e| Failure::coded(e.code(), format!("--embed-local: {e}")))
+        }
+        #[cfg(not(feature = "embed-local"))]
+        {
+            let _ = place;
+            Err(Failure::unsupported(
+                "--embed-local: this phdb was built without the `embed-local` feature".into(),
+            ))
+        }
+    }
+
     /// The model it computes with.
     pub(crate) fn model(&self) -> &str {
         match self {
             Self::Remote(e) => e.model(),
+            #[cfg(feature = "embed-local")]
+            Self::Local(e) => e.model().id(),
         }
     }
 
-    /// `text`'s embedding. The bound on the call is the endpoint's own timeout, so a slow
-    /// endpoint never leaves a thread stuck past it (ai1249 on ticket 8).
+    /// The embeddings' dimension when it's known without embedding anything: a local
+    /// model's. An endpoint's is learnt from a probe.
+    pub(crate) fn dim(&self) -> Option<u32> {
+        match self {
+            Self::Remote(_) => None,
+            #[cfg(feature = "embed-local")]
+            Self::Local(e) => Some(e.model().dim()),
+        }
+    }
+
+    /// `text`'s embedding. A remote call is bounded by the endpoint's own timeout, so a slow
+    /// endpoint never leaves a thread stuck past it (ai1249 on ticket 8). A local model
+    /// embeds a memory as a passage and a recall's text as a query, with the model's
+    /// retrieval instruction (D318).
     pub(crate) fn embed(&self, text: &str, kind: EmbedKind) -> Result<Vec<f32>> {
+        #[cfg(not(feature = "embed-local"))]
         let _ = kind;
         match self {
+            #[cfg(feature = "embed-local")]
+            Self::Local(e) => {
+                let v = match kind {
+                    EmbedKind::Passage => e
+                        .embed_passages(&[text])
+                        .map(|mut v| v.pop().unwrap_or_default()),
+                    EmbedKind::Query => e.embed_query(text),
+                };
+                v.map_err(|e| {
+                    // The model's own failure, not the caller's: only a text it can't take
+                    // is the request's.
+                    let kind = match e.code() {
+                        ErrorCode::InvalidArgument => MemErrorKind::Rejected,
+                        _ => MemErrorKind::Internal,
+                    };
+                    MemError::of_kind(kind, format!("--embed-local: {e}"))
+                })
+            }
             Self::Remote(e) => e.embed_classified(text).map_err(|(fault, f)| {
                 let kind = match fault {
                     EmbedFault::Timeout => MemErrorKind::Deadline,
@@ -202,14 +295,18 @@ pub(crate) fn create_options(m: &crate::args::MemoryArgs, name: &str) -> Arc<Cre
         let mut options = pigeonhole_memory::StoreOptions::new();
         let model = match (e, &m.memory_model, m.memory_dim) {
             (Some(e), _, _) => {
-                // The dimension is the endpoint's: one probe embedding tells it. Its failure
-                // is the endpoint's (down, slow, or refusing), not the command line's: an
-                // input error, as `phdb mcp` always reported it (ai1249's R1 on #1648).
-                let dim = e
-                    .embed("dimension probe", EmbedKind::Passage)
-                    .map_err(|e| Failure::input(e.message))?
-                    .len();
-                Some((e.model().to_owned(), dim as u32))
+                // A local model's dimension is known. An endpoint's is learnt from one probe
+                // embedding, whose failure is the endpoint's (down, slow, or refusing), not
+                // the command line's: an input error, as `phdb mcp` always reported it
+                // (ai1249's R1 on #1648).
+                let dim = match e.dim() {
+                    Some(dim) => dim,
+                    None => e
+                        .embed("dimension probe", EmbedKind::Passage)
+                        .map_err(|e| Failure::input(e.message))?
+                        .len() as u32,
+                };
+                Some((e.model().to_owned(), dim))
             }
             (None, Some(id), Some(dim)) => Some((id.clone(), dim)),
             _ => None,
@@ -419,6 +516,17 @@ impl MemCore {
             default_budget: budget.0,
             max_budget: budget.1.max(budget.0),
         }))
+    }
+
+    /// The byte budget a recall asking for `asked` runs with (0: the default; past the
+    /// server's maximum it's refused, so the maximum): what the server reserves of
+    /// `--inflight-bytes` for its reply (#1567).
+    #[cfg(feature = "serve")]
+    pub(crate) fn reply_cap(&self, asked: u64) -> u64 {
+        match asked {
+            0 => self.default_budget,
+            b => b.min(self.max_budget),
+        }
     }
 
     /// The store's pinned model.

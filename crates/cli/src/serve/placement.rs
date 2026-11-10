@@ -84,6 +84,24 @@ impl Placement {
         }
     }
 
+    /// The CPUs the network side may run on, as a CPU list (`2-7,10`), when the plan pins
+    /// them: the value for `CANDLE_CPU_MASK`.
+    pub(crate) fn cpu_list(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sched::CpuSet;
+            let mask = self.mask.as_ref()?;
+            let cpus: Vec<usize> = (0..CpuSet::count())
+                .filter(|&c| mask.is_set(c).unwrap_or(false))
+                .collect();
+            Some(format_cpu_list(&cpus))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Called on each Tokio worker and blocking thread as it starts.
     pub(crate) fn enter(&self) {
         #[cfg(target_os = "linux")]
@@ -144,6 +162,26 @@ fn siblings(cpu: usize) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// `cpus` (sorted) as a CPU list, runs joined: `[0, 1, 2, 8]` is `0-2,8`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn format_cpu_list(cpus: &[usize]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cpus.len() {
+        let start = cpus[i];
+        while i + 1 < cpus.len() && cpus[i + 1] == cpus[i] + 1 {
+            i += 1;
+        }
+        out.push(if cpus[i] == start {
+            start.to_string()
+        } else {
+            format!("{start}-{}", cpus[i])
+        });
+        i += 1;
+    }
+    out.join(",")
+}
+
 /// A sysfs CPU list (`0-3,8,10-11`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_cpu_list(list: &str) -> Vec<usize> {
@@ -197,6 +235,9 @@ mod tests {
         assert_eq!(super::parse_cpu_list("0-2,8,10-11"), [0, 1, 2, 8, 10, 11]);
         assert_eq!(super::parse_cpu_list("4"), [4]);
         assert!(super::parse_cpu_list("").is_empty());
+        assert_eq!(super::format_cpu_list(&[0, 1, 2, 8, 10, 11]), "0-2,8,10-11");
+        assert_eq!(super::format_cpu_list(&[4]), "4");
+        assert_eq!(super::format_cpu_list(&[]), "");
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

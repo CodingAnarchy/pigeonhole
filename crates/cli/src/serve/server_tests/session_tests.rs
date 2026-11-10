@@ -267,10 +267,7 @@ fn reads_at_a_pinned_snapshot_agree_until_it_is_released() {
     assert_eq!((status, e["code"].as_str()), (404, Some("NotFound")), "{e}");
     let err = s.block_on(c.scan(req)).unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
-    let text = s
-        .shared
-        .metrics
-        .render(Some(&s.shared.router.service.part().unwrap().db));
+    let text = s.shared.metrics.render();
     let mut text = text;
     super::service::render_sessions(&mut text, &s.shared.router.service.sessions);
     assert!(

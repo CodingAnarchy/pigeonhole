@@ -62,6 +62,36 @@ let _metrics = pigeonhole_otel::register(&db, &provider.meter("my-app"));
 
 The collector's `prometheus` or `prometheusremotewrite` exporter then gives the same names as the Prometheus exporter above.
 
+## Without an OpenTelemetry SDK
+If your server serves its own `/metrics`, or your backend isn't OpenTelemetry, a `Collector` reads the same metrics without a `Meter`. `collect()` gives them as plain points, and `render_prometheus` writes them as Prometheus text, under the names the Prometheus exporter above gives (without its `otel_scope_*` labels and `target_info`):
+
+```rust
+use pigeonhole::{Options, Pigeonhole};
+
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+let metrics = pigeonhole_otel::collector(&db);
+
+// In your /metrics handler:
+let mut text = String::new();
+metrics.render_prometheus(&mut text);
+assert!(text.contains("pigeonhole_commits_total{pigeonhole_db_name=\"app.phdb\""));
+
+// Or the points themselves:
+for point in metrics.collect() {
+    let _ = (point.metric.name, point.value, &point.attributes);
+}
+# drop(metrics);
+# db.close()?;
+# Ok(())
+# }
+```
+
+A collection reads the database on the calling thread, as an exporter's collection does (see [What it costs](#what-it-costs)). `Config::new()…collector(&db)` takes the same options as `register`, and a collector has `rebind` and `watch_feed` too.
+
+**`phdb serve`** does this: its `/metrics` carries every metric below for the database it serves, after the server's own (see the [CLI guide](cli.md)).
+
 ## Options
 `pigeonhole_otel::Config` sets three things:
 - **`db_name`:** the `pigeonhole.db.name` attribute every metric carries. By default it's the database file's name (`app.phdb`). It tells the databases of one process apart. The OpenTelemetry **resource** (`service.name`, `host.name`, `service.instance.id`) tells processes apart, so the same file name on many hosts doesn't collide.
