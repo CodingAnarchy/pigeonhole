@@ -20,6 +20,12 @@ Every data operation has two forms over the same engine: a blocking method, and 
 
 `ReadTable` (reader processes) has `get_async` and `get_at_async` too, and its `row` and `scan` builders have `read_async` and `stream`.
 
+The companion crates have async forms too, on the same engine (#1560, ICR 0124):
+- **Text search:** `pigeonhole-text`'s `Search::run_async` and `run_with_stats_async` ([Full-text search](text-search.md#async)).
+- **Agent memory:** `pigeonhole-memory`'s `Recall::run_async` and `run_with_stats_async` ([Agent memory](agent-memory.md)).
+
+Both return exactly what their blocking `run` returns, yield after a bounded amount of work, and give `Send` futures. A recall still reads a row's later blocks synchronously in a few key-set reads (see [When an async read blocks](#when-an-async-read-blocks)).
+
 ## Any executor, no blocking pool
 The futures depend only on `std::task`, so they run on Tokio, smol, async-std or your own executor. None of them spawns a thread or uses `spawn_blocking`:
 
