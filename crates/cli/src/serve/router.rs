@@ -70,10 +70,29 @@ impl Router {
         caller: &Caller,
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
+        self.dispatch_by(op, caller, prepaid, None).await
+    }
+
+    /// [`dispatch`](Self::dispatch) with the request's deadline, from its arrival: a forward
+    /// takes what's left of it (cli692's F2 on ticket 2); without one, the request timeout
+    /// from now.
+    async fn dispatch_by(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
             let target = cluster.target(&op)?;
             if let Some(owner) = target {
-                return self.forward(cluster, op, caller, prepaid, owner).await;
+                let deadline = deadline.map_or_else(
+                    || tokio::time::Instant::now() + self.service.request_timeout(),
+                    tokio::time::Instant::from_std,
+                );
+                return self
+                    .forward(cluster, op, caller, prepaid, owner, deadline)
+                    .await;
             }
         }
         self.service.call(op, caller, prepaid).await
@@ -91,10 +110,10 @@ impl Router {
         caller: &Caller,
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
         owner: Target,
+        deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
-        // One deadline for the whole forward: the budget's wait, a send, and after a
-        // WrongPartition the pull and the second send (cli692's F2).
-        let deadline = tokio::time::Instant::now() + self.service.request_timeout();
+        // One deadline for the whole forward, from the request's arrival: the budget's wait,
+        // a send, and after a WrongPartition the pull and the second send (cli692's F2).
         let left = || {
             deadline
                 .checked_duration_since(tokio::time::Instant::now())
@@ -202,10 +221,11 @@ impl Router {
         min_primary_seqno: Result<Option<u64>, ApiError>,
         deadline: ReadDeadline,
     ) -> Result<ServiceReply, ApiError> {
+        let at = deadline.at;
         self.service
             .await_primary(&op, min_primary_seqno?, deadline)
             .await?;
-        self.dispatch(op, caller, prepaid).await
+        self.dispatch_by(op, caller, prepaid, Some(at)).await
     }
 }
 
