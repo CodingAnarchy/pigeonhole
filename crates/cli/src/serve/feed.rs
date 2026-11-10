@@ -649,8 +649,8 @@ impl Feeds {
                                 drop(hub);
                                 // A feed with a backlog is always ready, and it isn't part of
                                 // Tokio's budget: without this, a hub that fell behind keeps its
-                                // worker, and other hubs and the clients on the feed runtime
-                                // starve (#1397's fan-out wedge).
+                                // worker, and the other hubs on the hub runtime starve (#1397's
+                                // fan-out wedge; perf287's N1 on #1696).
                                 tokio::task::coop::consume_budget().await;
                             }
                             // An expiry, `Closed`, damage: each client goes on from its own
@@ -1505,10 +1505,11 @@ mod tests {
     }
 
     #[test]
-    fn hubs_and_clients_run_on_the_feed_runtime() {
-        // Ticket 5's (A): with a feed runtime, a subscription's hub and client tasks run
-        // there, not on the request's runtime, and its events still reach the stream the
-        // request side reads.
+    fn hubs_and_clients_run_on_their_own_runtimes() {
+        // Ticket 5's (A) and (C): with a server's runtimes, a subscription's client task runs
+        // on the feed runtime and its hub on the hub runtime, neither on the request's, and
+        // its events still reach the stream the request side reads (perf287's T1 on #1696:
+        // a hub spawned back onto the feed runtime fails here).
         let (_, db, dir) = commits("feedrt", 0);
         let requests = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1518,6 +1519,12 @@ mod tests {
         let delivery = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("phdb-serve-feed")
+            .enable_all()
+            .build()
+            .unwrap();
+        let hubs = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("phdb-serve-feed-hub")
             .enable_all()
             .build()
             .unwrap();
@@ -1534,9 +1541,10 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
             },
         );
-        feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         let before = delivery.metrics().num_alive_tasks();
+        let hubs_before = hubs.metrics().num_alive_tasks();
         requests.block_on(async {
             let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
             let spec = Spec {
@@ -1548,8 +1556,13 @@ mod tests {
             let mut events = feeds.subscribe(spec, slot, |_| {}).unwrap();
             assert_eq!(
                 delivery.metrics().num_alive_tasks(),
-                before + 2,
-                "the hub and the client"
+                before + 1,
+                "the client, on the feed runtime"
+            );
+            assert_eq!(
+                hubs.metrics().num_alive_tasks(),
+                hubs_before + 1,
+                "the hub, on the hub runtime"
             );
             assert_eq!(
                 tokio::runtime::Handle::current()
@@ -1564,6 +1577,7 @@ mod tests {
         drop(t);
         drop(requests);
         drop(delivery);
+        drop(hubs);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
