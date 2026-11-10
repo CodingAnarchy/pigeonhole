@@ -326,6 +326,9 @@ pub(crate) fn check_bind(
     ))
 }
 
+/// `--shard-spin`'s largest window: 10 ms.
+const MAX_SHARD_SPIN_US: u64 = 10_000;
+
 /// `--shard-spin`: the shard threads' poll before they sleep (D198 amendment 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShardSpin {
@@ -342,9 +345,17 @@ impl std::str::FromStr for ShardSpin {
         if s == "adaptive" {
             return Ok(Self::Adaptive);
         }
-        s.parse()
-            .map(Self::Micros)
-            .map_err(|_| format!("{s:?}: microseconds, or `adaptive`"))
+        let us: u64 = s
+            .parse()
+            .map_err(|_| format!("{s:?}: microseconds, or `adaptive`"))?;
+        // A poll past this is a typo, not a setting: it would hold a CPU per shard through
+        // every gap of up to that long (cli692's N1 on #1680).
+        if us > MAX_SHARD_SPIN_US {
+            return Err(format!(
+                "{us} µs: at most {MAX_SHARD_SPIN_US} µs (the library's own cap is 1 ms)"
+            ));
+        }
+        Ok(Self::Micros(us))
     }
 }
 
@@ -389,5 +400,7 @@ mod tests {
         assert_eq!("adaptive".parse::<ShardSpin>(), Ok(ShardSpin::Adaptive));
         assert!("1ms".parse::<ShardSpin>().is_err());
         assert!("-1".parse::<ShardSpin>().is_err());
+        assert_eq!("10000".parse::<ShardSpin>(), Ok(ShardSpin::Micros(10_000)));
+        assert!("1000000".parse::<ShardSpin>().is_err());
     }
 }
