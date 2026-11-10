@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
 use pigeonhole::{Commit, FeedToken, Snapshot, Table};
 use prost::bytes::Bytes;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::convert;
 use super::errors::ApiError;
@@ -46,8 +46,9 @@ use super::proto;
 /// The feed fan-out's limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FeedLimits {
-    /// Bytes of commits the rings hold in all (`--feed-ring-bytes`), tokens included (about
-    /// 45 + 16 × shards bytes each): memory outside R3's in-flight budget. Each hub's ring is
+    /// Bytes of commits the rings hold in all (`--feed-ring-bytes`), as their encoded events,
+    /// tokens included (about 45 + 16 × shards bytes each): memory outside R3's in-flight
+    /// budget. Each hub's ring is
     /// capped at this over the live hubs (perf287's K2 on #1518).
     pub ring_bytes: usize,
     /// Hubs at once (`--max-feed-hubs`): distinct table sets subscribed.
@@ -92,6 +93,67 @@ pub(crate) struct Spec {
     pub start: Start,
 }
 
+/// Where a client is, for the feed dump ([`Feeds::dump`], `phdb serve` on SIGUSR1): two
+/// relaxed stores per batch, read only by the dump.
+#[derive(Debug, Default)]
+struct Tracker {
+    /// [`ON_RING`], [`ON_OWN`] or [`WAITING`].
+    state: AtomicU64,
+    /// On the ring, its next index; on its own stream, the seqno it covered.
+    at: AtomicU64,
+    /// The hub it's counted under (its address): a client that moved to a failed hub's
+    /// replacement is counted there only (perf287's N1 on #1643).
+    hub: AtomicUsize,
+}
+
+const ON_RING: u64 = 0;
+const ON_OWN: u64 = 1;
+/// Waiting for a `--max-catch-up` slot, delivering nothing.
+const WAITING: u64 = 2;
+
+impl Tracker {
+    fn set(&self, state: u64, at: u64) {
+        self.state.store(state, Ordering::Relaxed);
+        self.at.store(at, Ordering::Relaxed);
+    }
+}
+
+/// When a client last took an event, for a send waiting for room: its `--stream-idle-ms`
+/// counts from the last take (simp724's I1 on #1536). A take stores the time; it wakes no
+/// one. A waiting send's one timer, when it fires, reads it and waits on if the client took
+/// something meanwhile (perf287's profile on #1397: a wake and a new timer per take, per
+/// subscriber, were `Client::send`'s 9.6% self at 16 hubs × 16).
+#[derive(Debug)]
+struct TakeClock {
+    /// On Tokio's clock, so a paused test clock pauses it too.
+    base: tokio::time::Instant,
+    /// Nanoseconds from `base` to the last take; 0 before the first.
+    last: AtomicU64,
+}
+
+impl TakeClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// A take, now.
+    fn took(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.store(nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// When the last take was, or `None` before the first.
+    fn last(&self) -> Option<tokio::time::Instant> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(self.base + Duration::from_nanos(n)),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct HubKey {
     /// The tables' feed ids, so a table dropped and created again under its name is another
@@ -100,15 +162,21 @@ struct HubKey {
     visible: bool,
 }
 
-/// One commit in a hub's ring.
+/// One commit in a hub's ring: its encoded event and little else, so a ring's share of
+/// `--feed-ring-bytes` holds as many commits as it can (#1397's 16 hubs × 16, where each
+/// hub's share is a sixteenth). The decoded commit isn't kept: a client with a row prefix
+/// filters the encoded event's changes instead ([`Entry::for_prefix`]).
 pub(crate) struct Entry {
-    commit: Commit,
-    /// The hub feed's token right after this commit.
+    /// The commit's seqno.
+    seqno: u64,
+    /// The hub feed's token right after this commit: a slice of `encoded` when there is
+    /// one (its first field), so it's held once.
     token: Bytes,
     /// The hub feed's position just before it (`Feed::position`): every commit of the spec
     /// at or below it came before this one.
     prev: u64,
-    /// Its share of `--feed-ring-bytes`: the commit, its token and `encoded`.
+    /// Its share of `--feed-ring-bytes`: `encoded` (the token included) or the token, and a
+    /// fixed overhead.
     bytes: usize,
     /// The commit as a client with no prefix gets it, encoded once for every such client on
     /// the ring: `None` if it has no change to send. Encoded by the hub, before the entry is
@@ -116,20 +184,53 @@ pub(crate) struct Entry {
     encoded: Option<Bytes>,
 }
 
+/// An entry's size beside its bytes: the struct (88), the `Arc`'s counts (16) and the ring's
+/// slot (8) (perf287 on #1655).
+const ENTRY_OVERHEAD: usize = 112;
+
 impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
     /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
-    fn new(commit: Commit, token: Bytes) -> Self {
-        let encoded = filtered(&commit, b"")
+    fn new(commit: &Commit, token: Bytes) -> Self {
+        let encoded: Option<Bytes> = filtered(commit, b"")
             .map(|c| prost::Message::encode_to_vec(&commit_event(token.clone(), c)).into());
-        let bytes = entry_bytes(&commit, &token) + encoded.as_ref().map_or(0, Bytes::len);
+        // The token is the event's field 1, which prost writes first: its tag, its length,
+        // then its bytes. Kept as that slice, it isn't held twice.
+        let token = match &encoded {
+            Some(e) => {
+                let at = 1 + prost::encoding::encoded_len_varint(token.len() as u64);
+                match e.get(at..at + token.len()) {
+                    Some(b) if !token.is_empty() && b == &token[..] => {
+                        e.slice(at..at + token.len())
+                    }
+                    _ => token,
+                }
+            }
+            None => token,
+        };
+        let bytes = ENTRY_OVERHEAD + encoded.as_ref().map_or(token.len(), Bytes::len);
         Entry {
-            commit,
+            seqno: commit.seqno(),
             token,
             prev: 0,
             bytes,
             encoded,
         }
+    }
+
+    /// The event a client with `prefix` sends for this entry: the commit's changes to rows
+    /// starting with it, or `None` if there are none. Decoded from `encoded`, in the order a
+    /// filter of the commit gives them.
+    fn for_prefix(&self, prefix: &[u8]) -> Option<proto::FeedEvent> {
+        let bytes = self.encoded.as_ref()?;
+        // From the `Bytes` itself: protogen's `bytes(["."])` makes the row, qualifier, value
+        // and token fields slices of it, not copies (perf287 on #1655).
+        let mut event = <proto::FeedEvent as prost::Message>::decode(bytes.clone()).ok()?;
+        let Some(proto::feed_event::Event::Commit(c)) = &mut event.event else {
+            return None;
+        };
+        c.changes.retain(|ch| ch.row.starts_with(prefix));
+        (!c.changes.is_empty()).then_some(event)
     }
 
     /// The `FeedEvent` a client with no prefix sends for this commit, encoded.
@@ -183,7 +284,7 @@ impl Ring {
         let i = self
             .entries
             .iter()
-            .position(|e| e.commit.seqno() > seqno)
+            .position(|e| e.seqno > seqno)
             .unwrap_or(self.entries.len());
         Some(self.base + i as u64)
     }
@@ -197,6 +298,8 @@ struct Hub {
     stats: Arc<FeedStats>,
     /// Live hubs, shared: each ring's cap is the total over it.
     live: Arc<AtomicU64>,
+    /// Its clients' trackers, for the dump; a gone client's is pruned there.
+    clients: Mutex<Vec<Weak<Tracker>>>,
 }
 
 impl Hub {
@@ -204,11 +307,27 @@ impl Hub {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
+    /// moved to another hub are pruned here whenever the list reaches a power of two, so it
+    /// stays bounded on a server nobody dumps (perf287's R1 on #1643), and in the dump.
+    fn track(&self, tracker: &Arc<Tracker>) {
+        let me = std::ptr::from_ref(self) as usize;
+        tracker.hub.store(me, Ordering::Relaxed);
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if clients.len() >= 16 && clients.len().is_power_of_two() {
+            clients.retain(|w| {
+                w.upgrade()
+                    .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
+            });
+        }
+        clients.push(Arc::downgrade(tracker));
+    }
+
     fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
         let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
-        let mut entry = Entry::new(commit, token.clone());
+        let mut entry = Entry::new(&commit, token.clone());
         let bytes = entry.bytes;
         let mut r = self.ring();
         entry.prev = r.passed;
@@ -259,31 +378,6 @@ impl Drop for Hub {
         // The last client left: the engine subscription (and its shard wakers) goes.
         self.task.abort();
         self.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// A commit's size in the ring: its changes, its token (about 45 + 16 × shards bytes,
-/// feed1248's (1)), and a fixed overhead.
-fn entry_bytes(c: &Commit, token: &[u8]) -> usize {
-    let changes: usize = c
-        .changes()
-        .iter()
-        .map(|ch| {
-            48 + ch.table().len()
-                + ch.family().len()
-                + ch.row().len()
-                + ch.qualifier().len()
-                + ch.value().map_or(0, |v| value_len(&v))
-        })
-        .sum();
-    96 + changes + token.len()
-}
-
-fn value_len(v: &pigeonhole::Value<'_>) -> usize {
-    match v {
-        pigeonhole::Value::Bytes(b) => b.len(),
-        pigeonhole::Value::Vector(v) => v.as_bytes().len(),
-        _ => 8,
     }
 }
 
@@ -368,6 +462,94 @@ impl Feeds {
             ring_bytes: live.iter().map(|h| h.ring().bytes).sum(),
             catching_up: self.limits.max_catch_up.max(1) - self.catch_up.available_permits(),
         }
+    }
+
+    /// A report of every live hub and where its clients are, for `phdb serve` on SIGUSR1
+    /// (#1397's 16 hubs × 16): how far each hub's engine feed is behind the database, its
+    /// ring against its share of `--feed-ring-bytes`, and its clients on the ring (entries
+    /// behind its head), on their own streams (seqnos behind the hub) and waiting for a
+    /// `--max-catch-up` slot. Blocking: it takes a snapshot for the database's seqno.
+    /// Only a Unix server has the signal, hence the allowance elsewhere (Windows CI on #1643).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn dump(&self) -> String {
+        use std::fmt::Write as _;
+        fn spread(mut v: Vec<u64>) -> String {
+            if v.is_empty() {
+                return "-".into();
+            }
+            v.sort_unstable();
+            format!("{}/{}/{}", v[0], v[v.len() / 2], v[v.len() - 1])
+        }
+        let db_seqno = self.db.snapshot().map(|s| s.seqno()).ok();
+        let hubs: Vec<(HubKey, Arc<Hub>)> = {
+            let hubs = self.hubs.lock().unwrap_or_else(PoisonError::into_inner);
+            hubs.iter()
+                .filter_map(|(k, w)| w.upgrade().map(|h| (k.clone(), h)))
+                .collect()
+        };
+        let st = &self.stats;
+        let max_catch_up = self.limits.max_catch_up.max(1);
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "phdb serve: feed dump: {} hubs, database seqno {}; catch-up slots {}/{max_catch_up} in use; \
+             fell behind {}, rejoined {}, catch-up waits {}, hub failures {}",
+            hubs.len(),
+            db_seqno.map_or_else(|| "?".into(), |s| s.to_string()),
+            max_catch_up - self.catch_up.available_permits(),
+            st.fell_behind.load(Ordering::Relaxed),
+            st.rejoined.load(Ordering::Relaxed),
+            st.catch_up_waits.load(Ordering::Relaxed),
+            st.hub_failures.load(Ordering::Relaxed),
+        );
+        for (i, (key, hub)) in hubs.iter().enumerate() {
+            let (base, head, entries, bytes, passed, failed) = {
+                let r = hub.ring();
+                (
+                    r.base,
+                    r.head(),
+                    r.entries.len(),
+                    r.bytes,
+                    r.passed,
+                    r.failed,
+                )
+            };
+            let limit = self.limits.ring_bytes / hub.live.load(Ordering::Relaxed).max(1) as usize;
+            let me = Arc::as_ptr(hub) as usize;
+            let trackers: Vec<Arc<Tracker>> = {
+                let mut c = hub.clients.lock().unwrap_or_else(PoisonError::into_inner);
+                c.retain(|w| {
+                    w.upgrade()
+                        .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
+                });
+                c.iter().filter_map(Weak::upgrade).collect()
+            };
+            let (mut on_ring, mut own, mut waiting) = (Vec::new(), Vec::new(), 0usize);
+            for t in &trackers {
+                let at = t.at.load(Ordering::Relaxed);
+                match t.state.load(Ordering::Relaxed) {
+                    ON_RING => on_ring.push(head.saturating_sub(at)),
+                    ON_OWN => own.push(passed.saturating_sub(at)),
+                    _ => waiting += 1,
+                }
+            }
+            let _ = writeln!(
+                out,
+                "  hub {i} (feeds {:?}, {}{}): engine feed {} seqnos behind (at {passed}); ring {entries} \
+                 entries [{base}, {head}), {bytes}/{limit} bytes; clients: {} on the ring (entries \
+                 behind its head, min/p50/max {}), {} on their own streams (seqnos behind the hub {}), \
+                 {waiting} waiting for a catch-up slot",
+                key.tables,
+                if key.visible { "visible" } else { "durable" },
+                if failed { ", FAILED" } else { "" },
+                db_seqno.map_or_else(|| "?".into(), |s| s.saturating_sub(passed).to_string()),
+                on_ring.len(),
+                spread(on_ring.clone()),
+                own.len(),
+                spread(own.clone()),
+            );
+        }
+        out
     }
 
     /// Fails every hub: the database under them was replaced (#1436's re-bootstrap). Their
@@ -474,6 +656,7 @@ impl Feeds {
                 task,
                 stats,
                 live,
+                clients: Mutex::default(),
             }
         });
         hubs.insert(key, Arc::downgrade(&hub));
@@ -507,8 +690,10 @@ impl Feeds {
         let budget = Arc::new(Semaphore::new(
             self.limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS),
         ));
-        let taken = Arc::new(Notify::new());
+        let taken = Arc::new(TakeClock::new());
         let (end_tx, end_rx) = oneshot::channel();
+        let tracker = Arc::new(Tracker::default());
+        hub.track(&tracker);
         let client = Client {
             feeds: Arc::clone(self),
             hub: Mutex::new(hub),
@@ -519,6 +704,7 @@ impl Feeds {
             tx,
             budget,
             taken: Arc::clone(&taken),
+            tracker,
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
         // than the stream. Its start is kept as the stream's token, never the `Snapshot`: a
@@ -622,9 +808,11 @@ struct Client {
     tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
     /// The client's buffer's free bytes: each event in its channel holds its encoded size.
     budget: Arc<Semaphore>,
-    /// Poked each time the client takes an event: a send waiting for room starts its
-    /// `--stream-idle-ms` again (simp724's I1 on #1536).
-    taken: Arc<Notify>,
+    /// When the client last took an event: a send waiting for room counts its
+    /// `--stream-idle-ms` from it (simp724's I1 on #1536).
+    taken: Arc<TakeClock>,
+    /// Where it is, for the dump.
+    tracker: Arc<Tracker>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -698,6 +886,7 @@ impl Client {
             .stats
             .catch_up_waits
             .fetch_add(1, Ordering::Relaxed);
+        self.tracker.set(WAITING, 0);
         tokio::select! {
             // A client that leaves while queued gives up its place.
             () = self.tx.closed() => Err(ApiError::internal("the client went away")),
@@ -716,6 +905,7 @@ impl Client {
         // Reused across wakes: one allocation per client, not one per commit.
         let mut batch: Vec<Arc<Entry>> = Vec::with_capacity(64);
         loop {
+            self.tracker.set(ON_RING, at);
             let (behind, failed) = {
                 let r = hub.ring();
                 if at < r.base {
@@ -789,10 +979,12 @@ impl Client {
             if hub.ring().failed && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
                 hub_retry = Some(Instant::now());
                 if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
+                    new.track(&self.tracker);
                     *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&new);
                     hub = new;
                 }
             }
+            self.tracker.set(ON_OWN, pos.seqno.unwrap_or(0));
             if let Some(seqno) = pos.seqno {
                 let r = hub.ring();
                 if !r.failed
@@ -858,15 +1050,20 @@ impl Client {
     /// event is encoded once, for every such client (perf287's profile on #1536: building
     /// and encoding the same event per subscriber was two thirds of the feed's CPU).
     async fn cover_entry(&self, e: &Arc<Entry>, pos: &mut Position) -> Result<(), ApiError> {
-        if !self.prefix.is_empty() {
-            return self.cover(&e.commit, &e.token, pos).await;
-        }
-        pos.seqno = Some(e.commit.seqno());
+        pos.seqno = Some(e.seqno);
         pos.token = e.token.clone();
-        if e.commit.seqno() <= self.after || e.encoded().is_none() {
+        if e.seqno <= self.after || e.encoded().is_none() {
             return Ok(());
         }
-        self.send(Out::Shared(Arc::clone(e)), pos).await
+        if self.prefix.is_empty() {
+            return self.send(Out::Shared(Arc::clone(e)), pos).await;
+        }
+        // A prefix: the entry's changes to matching rows, if any (a later progress event
+        // carries the position past one with none).
+        match e.for_prefix(&self.prefix) {
+            Some(event) => self.send(Out::Event(event), pos).await,
+            None => Ok(()),
+        }
     }
 
     /// A progress event, if the position moved since the last event and the stream was quiet.
@@ -927,9 +1124,13 @@ impl Client {
         tokio::pin!(queued);
         // The idle limit counts from the client's last take, not from the start of the wait:
         // a large event may wait for most of the buffer to drain, and a client taking events
-        // all along is slow, not idle (simp724's I1 on #1536).
+        // all along is slow, not idle (simp724's I1 on #1536). One timer: when it fires, a
+        // take since the wait began moves the deadline on, and it waits again.
+        let idle = self.feeds.limits.stream_idle;
+        let began = tokio::time::Instant::now();
+        let timer = tokio::time::sleep_until(began + idle);
+        tokio::pin!(timer);
         loop {
-            let taken = self.taken.notified();
             tokio::select! {
                 // The send first: room that is there wins over a timer that fired meanwhile.
                 biased;
@@ -944,13 +1145,17 @@ impl Client {
                         Err(()) => Err(gone()),
                     };
                 }
-                () = taken => {}
                 () = self.tx.closed() => return Err(gone()),
-                () = tokio::time::sleep(self.feeds.limits.stream_idle) => {
+                () = &mut timer => {
+                    let from = self.taken.last().map_or(began, |t| t.max(began));
+                    if from + idle > tokio::time::Instant::now() {
+                        timer.as_mut().reset(from + idle);
+                        continue;
+                    }
                     return Err(ApiError::deadline(format!(
                         "the client took no feed event for --stream-idle-ms ({} ms); resume \
                          from the last event's token",
-                        self.feeds.limits.stream_idle.as_millis()
+                        idle.as_millis()
                     )));
                 }
             }
@@ -998,8 +1203,8 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 #[derive(Debug)]
 pub(crate) struct FeedEvents {
     events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
-    /// Poked on each take, for a send waiting for room.
-    taken: Arc<Notify>,
+    /// Each take's time, for a send waiting for room.
+    taken: Arc<TakeClock>,
     end: Option<oneshot::Receiver<ApiError>>,
 }
 
@@ -1031,10 +1236,10 @@ impl Out {
     pub(crate) fn into_proto(self) -> proto::FeedEvent {
         match self {
             Out::Event(e) => e,
-            Out::Shared(e) => {
-                let c = filtered(&e.commit, b"").unwrap_or_default();
-                commit_event(e.token.clone(), c)
-            }
+            Out::Shared(e) => e
+                .encoded()
+                .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
+                .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
         }
     }
 
@@ -1065,7 +1270,7 @@ impl FeedEvents {
             // Taken: its bytes go back to the client's buffer.
             Poll::Ready(Some((e, room))) => {
                 drop(room);
-                self.taken.notify_one();
+                self.taken.took();
                 return Poll::Ready(Some(Ok(e)));
             }
             Poll::Pending => return Poll::Pending,
@@ -1130,6 +1335,50 @@ mod tests {
         (out, db, dir)
     }
 
+    /// A hub's tracker list stays bounded without a dump (perf287's R1 on #1643): gone
+    /// clients and those counted under another hub are pruned as it grows.
+    #[test]
+    fn a_hubs_tracker_list_stays_bounded_without_a_dump() {
+        let (head, _) = watch::channel(0);
+        let hub = |head: watch::Sender<u64>| Hub {
+            ring: Mutex::default(),
+            head,
+            task: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .spawn(async {})
+                .abort_handle(),
+            stats: Arc::default(),
+            live: Arc::new(AtomicU64::new(1)),
+            clients: Mutex::default(),
+        };
+        let (a, b) = (hub(head.clone()), hub(head));
+        // Ten thousand clients that came and went.
+        for _ in 0..10_000 {
+            a.track(&Arc::new(Tracker::default()));
+        }
+        assert!(a.clients.lock().unwrap().len() <= 32, "pruned as it grew");
+        // Live clients stay; one that moved to `b` is no longer counted under `a`.
+        let live: Vec<Arc<Tracker>> = (0..20).map(|_| Arc::new(Tracker::default())).collect();
+        for t in &live {
+            a.track(t);
+        }
+        b.track(&live[0]);
+        for _ in 0..64 {
+            a.track(&Arc::new(Tracker::default()));
+        }
+        let me = std::ptr::from_ref(&a) as usize;
+        let counted = a
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|t| t.hub.load(Ordering::Relaxed) == me)
+            .count();
+        assert_eq!(counted, 19, "the 19 live clients still on `a`");
+    }
+
     fn ring(start: u64, commits: &[Commit], evicted: usize) -> Ring {
         let mut r = Ring {
             start_seqno: start,
@@ -1140,7 +1389,7 @@ mod tests {
         for c in commits {
             r.entries.push_back(Arc::new(Entry {
                 prev,
-                ..Entry::new(c.clone(), Bytes::new())
+                ..Entry::new(c, Bytes::new())
             }));
             prev = c.seqno();
         }
@@ -1472,6 +1721,105 @@ mod tests {
     }
 
     #[test]
+    fn a_client_that_stops_taking_times_out_an_idle_limit_after_its_last_take() {
+        // The other half of simp724's I1 on #1536, for the one-timer wait (perf287's profile
+        // on #1397): while one large event waits for the client's buffer to drain, the client
+        // takes events, then stops. It's ended exactly `--stream-idle-ms` after its last
+        // take: not when the limit has passed since the wait began (that was during the
+        // takes), and not later. On a paused clock, so the times are exact.
+        let (_, db, dir) = commits("idle-from-take", 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let idle = Duration::from_millis(250);
+        let feeds = Feeds::new(
+            db.clone(),
+            FeedLimits {
+                ring_bytes: 16 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(3600),
+                stream_idle: idle,
+                client_events: CLIENT_EVENTS,
+                client_bytes: 4096,
+            },
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let mut direct = t.feed().open().unwrap();
+        let ended: Arc<Mutex<Option<(tokio::time::Instant, String)>>> = Arc::default();
+        rt.block_on(async {
+            let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
+            hub.task.abort();
+            let end = Arc::clone(&ended);
+            let mut c = feeds
+                .subscribe(
+                    Spec {
+                        tables: vec![t.clone()],
+                        prefix: Vec::new(),
+                        visible: false,
+                        start: Start::Now,
+                    },
+                    Arc::clone(&slots).try_acquire_owned().unwrap(),
+                    move |e| {
+                        *end.lock().unwrap() = Some((
+                            tokio::time::Instant::now(),
+                            e.map_or_else(String::new, |e| e.code.clone()),
+                        ));
+                    },
+                )
+                .unwrap();
+            // 60 events of over 200 bytes (the buffer holds under 20 of them), then one larger
+            // than the whole buffer, which waits for all of it to drain.
+            for i in 0..61 {
+                let value = if i < 60 {
+                    vec![b'v'; 100]
+                } else {
+                    vec![7u8; 8192]
+                };
+                t.mutate(format!("r{i:04}").as_bytes())
+                    .put("f", b"q", &value)
+                    .commit()
+                    .unwrap();
+                let commit = direct
+                    .next(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .clone();
+                let token = Bytes::copy_from_slice(direct.token().as_bytes());
+                hub.push(commit, token, direct.position().seqno(), 16 << 20);
+            }
+            // 50 takes, 100 ms apart (each under the limit), then none: the large event began
+            // waiting after about 40, so its wait spans the last ten or so.
+            let mut last = tokio::time::Instant::now();
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                use futures_core::Stream as _;
+                std::future::poll_fn(|cx| Pin::new(&mut c).poll_next(cx))
+                    .await
+                    .expect("the stream goes on")
+                    .expect("an event");
+                last = tokio::time::Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let (at, code) = ended.lock().unwrap().clone().expect("the stream ended");
+            assert_eq!(code, "DeadlineExceeded");
+            assert_eq!(
+                at - last,
+                idle,
+                "the idle limit counts from the last take, exactly"
+            );
+            drop((c, hub));
+        });
+        drop(t);
+        drop(rt);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_now_start_keeps_a_commit_pushed_before_its_task_first_runs() {
         // simp724's F5 on #1518, made deterministic: on a current-thread runtime the client's
         // task can't run until the test awaits, so the ring gets the commit first. The start
@@ -1536,7 +1884,7 @@ mod tests {
         let (commits, db, dir) = commits("encoded", 3);
         for c in &commits {
             let token = Bytes::from_static(b"the token right after it");
-            let e = Arc::new(Entry::new(c.clone(), token.clone()));
+            let e = Arc::new(Entry::new(c, token.clone()));
             let want = prost::Message::encode_to_vec(&proto::FeedEvent {
                 token: token.clone(),
                 event: Some(proto::feed_event::Event::Commit(proto::FeedCommit {
@@ -1562,8 +1910,24 @@ mod tests {
             Out::Shared(Arc::clone(&e)).encode(&mut wire).unwrap();
             assert_eq!(wire, want, "the gRPC codec writes those bytes");
             assert_eq!(Out::Shared(Arc::clone(&e)).encoded_len(), want.len());
-            // Counted in the ring's budget (R1, P1).
-            assert_eq!(e.bytes, entry_bytes(c, &token) + want.len());
+            // Counted in the ring's budget (R1, P1): the encoding, which holds the token,
+            // and the fixed overhead. The token is a slice of the encoding, not a copy.
+            assert_eq!(e.bytes, ENTRY_OVERHEAD + want.len());
+            assert_eq!(e.token, token);
+            let enc = e.encoded().unwrap();
+            assert!(
+                enc.as_ptr() <= e.token.as_ptr()
+                    && e.token.as_ptr() as usize + e.token.len()
+                        <= enc.as_ptr() as usize + enc.len(),
+                "the token is held once, inside the encoding"
+            );
+            // A prefix client gets the changes to its rows, as a filter of the commit
+            // would give them.
+            for prefix in [&b""[..], b"r", b"zz"] {
+                let got = e.for_prefix(prefix);
+                let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f));
+                assert_eq!(got, want, "prefix {prefix:?}");
+            }
             let decoded = <proto::FeedEvent as prost::Message>::decode(&want[..]).unwrap();
             assert_eq!(
                 Out::Shared(e).into_proto(),

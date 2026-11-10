@@ -5,7 +5,8 @@
 //!   own do, step by step (ICR 0123): the store's `*_in` form in a `Database#transact`, whose
 //!   commit yields through the bridge, then `settle` on the offload pool. `remember`'s
 //!   near-dedup lookup, a read outside the transaction, runs on the pool before it.
-//! - **`recall`** runs on the offload pool (until `Recall::run_async`, #1560).
+//! - **`recall`** runs on the offload pool: measured, it keeps about 3.6× the throughput of
+//!   `Recall::run_async` polled on the scheduler's thread (ICR 0126 amendment 3).
 //! - **`ConsolidateLoop#run_once`** waits for new memories with `ConsolidateLoop::poll_wait`
 //!   through the bridge, then runs its passes on the step's worker, waiting for the groups
 //!   through the bridge too, so a consolidator block that itself yields (an HTTP call under

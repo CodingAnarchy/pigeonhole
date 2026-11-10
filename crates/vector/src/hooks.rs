@@ -133,3 +133,11 @@ pub(crate) fn failing_after_split() -> bool {
 pub fn shares_state(a: &crate::Index, b: &crate::Index) -> bool {
     Arc::ptr_eq(a.inner(), b.inner())
 }
+
+/// Whether the crate's own rebalancing thread was started for `index`'s state: an
+/// [`Index::open`](crate::Index::open) of a background index starts it, once per state;
+/// `open_with_rebalancer` never does. It stays set after the thread ends. Inspection only
+/// (#1640).
+pub fn rebalancer_thread_started(index: &crate::Index) -> bool {
+    index.inner().thread_started()
+}

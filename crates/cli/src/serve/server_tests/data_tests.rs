@@ -809,3 +809,25 @@ fn metrics_include_each_rpcs_durations() {
         "an RPC never called has no histogram: {text}"
     );
 }
+
+/// A table open that a catalog change (`tables_changed`, as a replica applies one) overtook
+/// keeps nothing, since it may have resolved the name before a drop and create; the next
+/// call opens it again (#1632).
+#[test]
+fn a_table_open_overtaken_by_a_catalog_change_keeps_nothing() {
+    let s = Server::start("", limits());
+    let svc = &s.shared.router.service;
+    // The steps of `Service::table`, with a catalog change between the open and the keep.
+    let started = svc.table_generation();
+    let t = svc.db.table("t").unwrap().open().unwrap();
+    svc.tables_changed();
+    assert!(
+        svc.keep_table("t", &t, started).is_none(),
+        "a stale open is not kept"
+    );
+    assert!(!svc.table_cached("t"));
+    // A call opens it afresh, and keeps it.
+    let value = json!({"bytes": b64(b"v")});
+    assert_eq!(s.post("Mutate", &put("r", "f", "q", value), None).0, 200);
+    assert!(svc.table_cached("t"));
+}

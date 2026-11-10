@@ -17,9 +17,11 @@ use super::service::{Metrics, Service, ServiceOp};
 use super::{Shared, http, listener};
 
 // The serve modules the area files reach as `super::<module>`.
-use super::{bulk, errors, feed, replica, service, tls};
+use super::{bulk, cluster, errors, feed, replica, service, tls};
 
 mod admin_tests;
+mod cluster_tests;
+mod connection_tests;
 mod data_tests;
 mod feed_tests;
 mod http1_tests;
@@ -60,6 +62,7 @@ fn limits() -> Limits {
         max_request_bytes: 1 << 20,
         inflight_bytes: 16 << 20,
         max_concurrent: 64,
+        max_connections: 64,
         max_scans: 4,
         max_streams: 16,
         max_feed_hubs: 8,
@@ -156,18 +159,27 @@ impl Server {
         token: Option<&str>,
         limits: Limits,
     ) -> Self {
+        Self::start_replica_custom(dir, primary, token, limits, Options::default(), |s| s)
+    }
+
+    /// `start_replica_with`, its database opened with `options` and its service changed by
+    /// `f` before it serves.
+    fn start_replica_custom(
+        dir: PathBuf,
+        primary: &str,
+        token: Option<&str>,
+        limits: Limits,
+        options: Options,
+        f: impl FnOnce(Service) -> Service,
+    ) -> Self {
         std::fs::create_dir_all(dir.join("backups")).unwrap();
-        let db = Pigeonhole::open(
-            dir.join("t.phdb"),
-            Options::default().create_if_missing(true),
-        )
-        .unwrap();
+        let db = Pigeonhole::open(dir.join("t.phdb"), options.create_if_missing(true)).unwrap();
         let replica = super::replica::Replica::new(super::replica::ReplicaConfig {
             primary: primary.to_owned(),
             token: token.map(str::to_owned),
             run_events: 4,
         });
-        Self::serve(dir, db, "", limits, Some(replica), |s| s)
+        Self::serve(dir, db, "", limits, Some(replica), f)
     }
 
     fn serve(
@@ -211,6 +223,10 @@ impl Server {
             },
             Duration::from_secs(2),
             None,
+            listener::Bounds {
+                connections: Arc::clone(&shared.router.service.connections),
+                first_byte: limits.request_timeout,
+            },
         ));
         if let Some(r) = &replica {
             let _guard = runtime.enter();
