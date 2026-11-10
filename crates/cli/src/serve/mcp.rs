@@ -373,7 +373,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
                     started = Some(Started {
                         sessions: Arc::clone(&service.sessions),
                         id: id.clone(),
-                        token: caller.principal,
+                        principal: caller.principal,
                         keep: false,
                     });
                     id
@@ -508,14 +508,14 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
 struct Started {
     sessions: Arc<super::sessions::Sessions>,
     id: String,
-    token: crate::serve::auth::Principal,
+    principal: crate::serve::auth::Principal,
     keep: bool,
 }
 
 impl Drop for Started {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = self.sessions.end_mcp(&self.id, self.token);
+            let _ = self.sessions.end_mcp(&self.id, self.principal);
         }
     }
 }

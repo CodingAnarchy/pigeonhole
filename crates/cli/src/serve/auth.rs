@@ -38,10 +38,30 @@ impl Scope {
 /// Who a session belongs to (D317 ticket 3): its token's SHA-256 digest, the same on every
 /// node that lists the token and stable when a token file is reordered or reloaded;
 /// [`ANONYMOUS`] without tokens. Never logged or put in an error (cli692's S1).
-pub(crate) type Principal = [u8; 32];
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Principal([u8; 32]);
+
+impl Principal {
+    /// The principal of the token whose SHA-256 digest is `digest`.
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+/// Redacted (cli692's R1 on ticket 3): a `Caller` or session printed with `{:?}` shows
+/// whether it's anonymous, never the digest.
+impl std::fmt::Debug for Principal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if *self == ANONYMOUS {
+            "Principal(anonymous)"
+        } else {
+            "Principal(..)"
+        })
+    }
+}
 
 /// The principal of a server without tokens.
-pub(crate) const ANONYMOUS: Principal = [0; 32];
+pub(crate) const ANONYMOUS: Principal = Principal([0; 32]);
 
 /// Who is calling: the token that matched (its `principal`), its scope, and its namespace
 /// limit. Sessions are bound to `principal` (D313 §3, D317 ticket 3).
@@ -154,7 +174,7 @@ impl Tokens {
         for e in &self.0 {
             if constant_time_eq(&e.digest, &digest) && found.is_none() {
                 found = Some(Caller {
-                    principal: e.digest,
+                    principal: Principal::from_digest(e.digest),
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,
@@ -187,7 +207,7 @@ pub(crate) fn bearer(header: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scope, Sha256, Tokens};
+    use super::{Principal, Scope, Sha256, Tokens};
     use sha2::Digest;
 
     #[test]
@@ -212,6 +232,46 @@ mod tests {
         assert_eq!(t.caller("hashed").unwrap().scope, Scope::Admin);
         assert!(t.caller("guess").is_none());
         assert!(t.caller("").is_none());
+    }
+
+    /// The same token is the same principal, its SHA-256, whatever the file's line order and
+    /// whether a line holds the token or its digest: nodes agree on it (cli692's R2 on
+    /// D317 ticket 3).
+    #[test]
+    fn a_tokens_principal_is_its_digest_whatever_the_file() {
+        let digest: [u8; 32] = Sha256::digest(b"s3cret").into();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let files = [
+            "write s3cret\nread other\n".to_owned(),
+            "read other\nwrite s3cret\n".to_owned(),
+            format!("read other\nwrite sha256:{hex}\n"),
+        ];
+        for f in &files {
+            let t = Tokens::parse(f, "tokens").unwrap();
+            assert!(
+                t.caller("s3cret").unwrap().principal == Principal::from_digest(digest),
+                "{f}"
+            );
+            assert!(t.caller("other").unwrap().principal != Principal::from_digest(digest));
+        }
+    }
+
+    /// A caller printed with `{:?}` shows no digest (cli692's R1 on D317 ticket 3).
+    #[test]
+    fn a_callers_debug_has_no_digest() {
+        let digest: [u8; 32] = Sha256::digest(b"s3cret").into();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let c = Tokens::parse("write s3cret\n", "t")
+            .unwrap()
+            .caller("s3cret")
+            .unwrap();
+        let shown = format!("{c:?}");
+        assert!(shown.contains("Principal(..)"), "{shown}");
+        assert!(
+            !shown.contains(&hex) && !shown.contains(&format!("{digest:?}")),
+            "{shown}"
+        );
+        assert!(format!("{:?}", super::Caller::anonymous()).contains("Principal(anonymous)"));
     }
 
     #[test]

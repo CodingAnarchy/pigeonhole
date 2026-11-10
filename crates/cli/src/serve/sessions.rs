@@ -63,7 +63,7 @@ enum State {
 }
 
 struct Entry {
-    token: Principal,
+    principal: Principal,
     state: State,
     /// Calls in flight: at most one on a transaction.
     busy: usize,
@@ -94,10 +94,10 @@ struct Table {
 impl Table {
     fn remove(&mut self, id: &Id) -> Option<Entry> {
         let e = self.map.remove(id)?;
-        if let Some(n) = self.per_token.get_mut(&e.token) {
+        if let Some(n) = self.per_token.get_mut(&e.principal) {
             *n -= 1;
             if *n == 0 {
-                self.per_token.remove(&e.token);
+                self.per_token.remove(&e.principal);
             }
         }
         Some(e)
@@ -175,10 +175,10 @@ impl Sessions {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Adds a session for `token`, within the caps.
+    /// Adds a session for `principal`, within the caps.
     fn insert(
         self: &Arc<Self>,
-        token: Principal,
+        principal: Principal,
         state: State,
         durability: Option<Durability>,
         idle: Duration,
@@ -193,17 +193,17 @@ impl Sessions {
                 "the server is at its session limit (--max-sessions)",
             ));
         }
-        let mine = t.per_token.get(&token).copied().unwrap_or(0);
+        let mine = t.per_token.get(&principal).copied().unwrap_or(0);
         if mine >= self.leases.max_per_token {
             return Err(ApiError::overloaded(
                 "this token is at its session limit (--max-sessions-per-token)",
             ));
         }
-        *t.per_token.entry(token).or_insert(0) += 1;
+        *t.per_token.entry(principal).or_insert(0) += 1;
         t.map.insert(
             id,
             Entry {
-                token,
+                principal,
                 state,
                 busy: 0,
                 durability,
@@ -216,15 +216,15 @@ impl Sessions {
         Ok(hex(&id))
     }
 
-    /// Holds `txn` for `token` and returns its id.
+    /// Holds `txn` for `principal` and returns its id.
     pub(crate) fn begin(
         self: &Arc<Self>,
-        token: Principal,
+        principal: Principal,
         txn: Transaction,
         durability: Option<Durability>,
     ) -> Result<String, ApiError> {
         self.insert(
-            token,
+            principal,
             State::Txn(Some(txn)),
             durability,
             self.leases.txn_idle,
@@ -232,14 +232,14 @@ impl Sessions {
         )
     }
 
-    /// Pins `snapshot` for `token` and returns its id.
+    /// Pins `snapshot` for `principal` and returns its id.
     pub(crate) fn open_snapshot(
         self: &Arc<Self>,
-        token: Principal,
+        principal: Principal,
         snapshot: Snapshot,
     ) -> Result<String, ApiError> {
         self.insert(
-            token,
+            principal,
             State::Snapshot(snapshot),
             None,
             self.leases.snapshot_idle,
@@ -247,8 +247,12 @@ impl Sessions {
         )
     }
 
-    /// Takes transaction `id` out for one call by `token`.
-    pub(crate) fn take(self: &Arc<Self>, id: &str, token: Principal) -> Result<Taken, ApiError> {
+    /// Takes transaction `id` out for one call by `principal`.
+    pub(crate) fn take(
+        self: &Arc<Self>,
+        id: &str,
+        principal: Principal,
+    ) -> Result<Taken, ApiError> {
         let gone = || ApiError::not_found("no such transaction");
         let key = parse_id(id).ok_or_else(gone)?;
         let now = Instant::now();
@@ -257,7 +261,7 @@ impl Sessions {
         let e = t
             .map
             .get_mut(&key)
-            .filter(|e| e.token == token)
+            .filter(|e| e.principal == principal)
             .ok_or_else(gone)?;
         match &mut e.state {
             State::Txn(slot) => {
@@ -285,14 +289,14 @@ impl Sessions {
         }
     }
 
-    /// Holds a remote MCP session for `token` and returns its id.
+    /// Holds a remote MCP session for `principal` and returns its id.
     pub(crate) fn open_mcp(
         self: &Arc<Self>,
-        token: Principal,
+        principal: Principal,
         session: Arc<super::mcp::McpSession>,
     ) -> Result<String, ApiError> {
         self.insert(
-            token,
+            principal,
             State::Mcp(session),
             None,
             self.leases.mcp_idle,
@@ -300,11 +304,15 @@ impl Sessions {
         )
     }
 
-    /// MCP session `id`, for one request by `token`: the request holds it busy (so it doesn't
+    /// MCP session `id`, for one request by `principal`: the request holds it busy (so it doesn't
     /// expire under the request) until the guard drops. Another token's id, a malformed one
     /// and an expired one are all `NotFound`, which `/mcp` answers 404: the client starts a
     /// new session.
-    pub(crate) fn mcp(self: &Arc<Self>, id: &str, token: Principal) -> Result<McpGuard, ApiError> {
+    pub(crate) fn mcp(
+        self: &Arc<Self>,
+        id: &str,
+        principal: Principal,
+    ) -> Result<McpGuard, ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let now = Instant::now();
@@ -313,7 +321,7 @@ impl Sessions {
         let e = t
             .map
             .get_mut(&key)
-            .filter(|e| e.token == token)
+            .filter(|e| e.principal == principal)
             .ok_or_else(gone)?;
         let State::Mcp(session) = &e.state else {
             return Err(gone());
@@ -329,12 +337,12 @@ impl Sessions {
     }
 
     /// Ends MCP session `id` (`DELETE /mcp`). Requests already running finish.
-    pub(crate) fn end_mcp(&self, id: &str, token: Principal) -> Result<(), ApiError> {
+    pub(crate) fn end_mcp(&self, id: &str, principal: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let mut t = self.lock();
         match t.map.get(&key) {
-            Some(e) if e.token == token && matches!(e.state, State::Mcp(_)) => {
+            Some(e) if e.principal == principal && matches!(e.state, State::Mcp(_)) => {
                 t.remove(&key);
                 Ok(())
             }
@@ -342,12 +350,12 @@ impl Sessions {
         }
     }
 
-    /// Snapshot `id`, for one read by `token`: the read holds the session busy (so it doesn't
+    /// Snapshot `id`, for one read by `principal`: the read holds the session busy (so it doesn't
     /// expire under the read) until the guard drops.
     pub(crate) fn snapshot(
         self: &Arc<Self>,
         id: &str,
-        token: Principal,
+        principal: Principal,
     ) -> Result<SnapshotGuard, ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
@@ -357,7 +365,7 @@ impl Sessions {
         let e = t
             .map
             .get_mut(&key)
-            .filter(|e| e.token == token)
+            .filter(|e| e.principal == principal)
             .ok_or_else(gone)?;
         let State::Snapshot(snapshot) = &e.state else {
             return Err(gone());
@@ -374,12 +382,12 @@ impl Sessions {
 
     /// Releases snapshot `id` now. Reads already running finish on their own handle; later
     /// ones get `NotFound`.
-    pub(crate) fn release(&self, id: &str, token: Principal) -> Result<(), ApiError> {
+    pub(crate) fn release(&self, id: &str, principal: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
         let key = parse_id(id).ok_or_else(gone)?;
         let mut t = self.lock();
         match t.map.get(&key) {
-            Some(e) if e.token == token && matches!(e.state, State::Snapshot(_)) => {
+            Some(e) if e.principal == principal && matches!(e.state, State::Snapshot(_)) => {
                 t.remove(&key);
                 Ok(())
             }
@@ -693,7 +701,7 @@ mod tests {
 
     /// A test's principal: token `n`'s digest, as far as the session table can tell.
     fn p(n: u8) -> Principal {
-        [n; 32]
+        Principal::from_digest([n; 32])
     }
     use pigeonhole::{Family, Options, Pigeonhole};
 
