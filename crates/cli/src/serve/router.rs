@@ -121,6 +121,13 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
     match op {
         ServiceOp::Get(r) if !r.snapshot_id.is_empty() => Err(later("a snapshot", 3)),
         ServiceOp::Get(r) => one(&r.table, &r.row),
+        ServiceOp::ReadRow(r)
+            if r.selection
+                .as_ref()
+                .is_some_and(|s| !s.snapshot_id.is_empty()) =>
+        {
+            Err(later("a snapshot", 3))
+        }
         ServiceOp::ReadRow(r) => one(&r.table, &r.row),
         ServiceOp::Mutate(r) | ServiceOp::MutateReturning(r) => writes(&r.writes),
         ServiceOp::CheckAndMutate(r) => writes(&r.writes),
@@ -134,7 +141,8 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
                     .ok_or_else(|| ApiError::invalid("a batch's writes name no row"))?;
                 let p = one(&key.table, &key.row)?;
                 if !parts.iter().any(|(q, _)| *q == p) {
-                    let first = format!("{}/{}", key.table, String::from_utf8_lossy(&key.row));
+                    // Escaped, so a binary key reads unambiguously (cli692's nit).
+                    let first = format!("{}/{}", key.table, key.row.escape_ascii());
                     parts.push((p, first));
                 }
             }
