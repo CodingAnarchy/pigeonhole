@@ -84,6 +84,30 @@ fn limits() -> Limits {
     }
 }
 
+/// Where a test server listens.
+#[derive(Clone, Copy)]
+enum Bind {
+    /// `127.0.0.1`, as every other server and endpoint in these tests.
+    Shared,
+    /// `[::1]`, which no other test dials, falling back to `127.0.0.1` where it's missing.
+    /// Tests in this process dial ports that were theirs and are free again: a replica
+    /// reconnecting to a stopped primary, a cluster peer, an endpoint bound and dropped to
+    /// be refused. A port the OS hands out again can bring such a connection to a new
+    /// server; one that counts its connections then counts it (#1668).
+    Apart,
+}
+
+impl Bind {
+    async fn listener(self) -> tokio::net::TcpListener {
+        if let Bind::Apart = self
+            && let Ok(l) = tokio::net::TcpListener::bind("[::1]:0").await
+        {
+            return l;
+        }
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+}
+
 impl Server {
     fn start(tokens: &str, limits: Limits) -> Self {
         Self::start_with(tokens, limits, 1)
@@ -128,6 +152,22 @@ impl Server {
         shards: usize,
         f: impl FnOnce(Service) -> Service,
     ) -> Self {
+        Self::start_at(Bind::Shared, tokens, limits, shards, f)
+    }
+
+    /// [`start`](Self::start) on a loopback address no other test dials, where there is
+    /// one: for a test that counts the connections the server accepts (#1668).
+    fn start_apart(limits: Limits) -> Self {
+        Self::start_at(Bind::Apart, "", limits, 1, |s| s)
+    }
+
+    fn start_at(
+        bind: Bind,
+        tokens: &str,
+        limits: Limits,
+        shards: usize,
+        f: impl FnOnce(Service) -> Service,
+    ) -> Self {
         let dir = test_dir();
         let db = Pigeonhole::open(
             dir.join("t.phdb"),
@@ -143,7 +183,7 @@ impl Server {
             .family("n", Family::counter())
             .create()
             .unwrap();
-        Self::serve(dir, db, tokens, limits, None, f)
+        Self::serve_at(bind, dir, db, tokens, limits, None, f)
     }
 
     /// A replica server (#1436) of the server at `primary`, on `dir`'s `t.phdb` (an empty
@@ -190,6 +230,18 @@ impl Server {
         replica: Option<Arc<super::replica::Replica>>,
         f: impl FnOnce(Service) -> Service,
     ) -> Self {
+        Self::serve_at(Bind::Shared, dir, db, tokens, limits, replica, f)
+    }
+
+    fn serve_at(
+        bind: Bind,
+        dir: PathBuf,
+        db: Pigeonhole,
+        tokens: &str,
+        limits: Limits,
+        replica: Option<Arc<super::replica::Replica>>,
+        f: impl FnOnce(Service) -> Service,
+    ) -> Self {
         let metrics = Arc::new(Metrics::default());
         let mut service = f(Service::new(db, limits, 2, Arc::clone(&metrics))
             .backups(Some(&dir.join("backups")), 1)
@@ -209,9 +261,7 @@ impl Server {
             .build()
             .unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
+        let listener = runtime.block_on(bind.listener());
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = http::router(Arc::clone(&shared));
         runtime.spawn(listener::serve(
