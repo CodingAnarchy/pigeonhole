@@ -254,6 +254,25 @@ fn protocol_mistakes_are_json_rpc_errors_and_tool_mistakes_are_results() {
     assert_eq!(status, 0, "{err}");
 }
 
+/// create_table's error precedence, pinned across 8c-2's move behind the Backend trait (the
+/// coordinator on #1662): the families are parsed before the table is created, which is
+/// when its name is checked (`TableBuilder::finish`), so a call with a bad name and a bad
+/// family reports the family, as it always has; a bad name alone reports the name.
+#[test]
+fn create_table_reports_a_bad_family_before_a_bad_name() {
+    let dir = TempDir::new("mcp-create-order");
+    let mut s = Server::start(&db_path(&dir), &["--create"]);
+    let both = s.fail(
+        "create_table",
+        json!({"table": "", "families": [{"name": "f", "aggregation": "nope"}]}),
+    );
+    let message = both["message"].as_str().unwrap();
+    assert!(message.contains("families[0]"), "{both}");
+    let name = s.fail("create_table", json!({"table": "", "families": ["f"]}));
+    let message = name["message"].as_str().unwrap();
+    assert!(message.contains("empty table name"), "{name}");
+}
+
 #[test]
 fn a_batch_commits_every_operation_or_none() {
     let dir = TempDir::new("mcp-write");

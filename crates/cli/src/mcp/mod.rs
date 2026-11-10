@@ -20,6 +20,7 @@ use crate::args::{Cli, MemoryArgs};
 use crate::exit::Failure;
 use crate::open::{self, Db};
 
+mod backend;
 mod cursor;
 mod embed;
 mod protocol;
@@ -79,7 +80,7 @@ pub(crate) fn run(
             return Err(f);
         }
     };
-    let tools = tools::Tools::new(db, writable, limits, memory);
+    let tools = tools::Tools::new(Box::new(db), writable, limits, memory);
     let served = serve(&tools, &mut std::io::stdin().lock(), stdout);
     let closed = tools.close();
     if let Err(e) = served {
