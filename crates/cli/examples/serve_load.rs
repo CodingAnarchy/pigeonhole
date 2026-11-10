@@ -262,17 +262,30 @@ fn key(i: u64) -> Vec<u8> {
     format!("u{i:08}").into_bytes()
 }
 
-fn build(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// The database in `--dir`, built if missing, and its shard count.
+fn build(args: &Args) -> Result<(PathBuf, usize), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.dir)?;
     let file = args.dir.join("serveload.phdb");
-    if file.exists() {
-        return Ok(file);
-    }
     // `phdb serve`'s default (`placement::default_shards`): the library's one shard per
     // physical core would leave the network side no cores of its own (perf287 on #1697).
     let shards = args
         .shards
         .unwrap_or_else(|| (num_cpus::get_physical() / 2).max(1));
+    if file.exists() {
+        // A database is reused as it was built: one of another shard count than asked for
+        // would measure another placement, so it's refused rather than served.
+        let db = Pigeonhole::open(&file, Options::default())?;
+        let built = db.info()?.shards;
+        db.close()?;
+        if args.shards.is_some_and(|n| n != built) {
+            return Err(format!(
+                "{} has {built} shards, not --shards {shards}: remove it to build it again",
+                file.display()
+            )
+            .into());
+        }
+        return Ok((file, built));
+    }
     let db = Pigeonhole::open(
         &file,
         Options::default().create_if_missing(true).shards(shards),
@@ -289,7 +302,7 @@ fn build(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
     batch.commit_with(Durability::None)?;
     db.flush()?;
     db.close()?;
-    Ok(file)
+    Ok((file, shards))
 }
 
 struct Server(Child);
@@ -675,7 +688,7 @@ fn pin_self(_list: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let file = build(&args)?;
+    let (file, shards) = build(&args)?;
     // The server first, so it doesn't inherit the client's CPUs.
     let server = Server::start(&args, &file)?;
     if let Some(list) = &args.client_cpus {
@@ -684,10 +697,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_all(args, server))
+        .block_on(run_all(args, server, shards))
 }
 
-async fn run_all(args: Args, server: Server) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_all(
+    args: Args,
+    server: Server,
+    shards: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{}", args.port);
     let mut channels = Vec::new();
     for _ in 0..args.conns.max(1) {
@@ -700,7 +717,7 @@ async fn run_all(args: Args, server: Server) -> Result<(), Box<dyn std::error::E
         args.mix.clone()
     };
     println!(
-        "serve_load: {} rows of {} B, {} callers ({} gRPC connections), {} s per row after {} s warm-up; serve args: {:?}",
+        "serve_load: {shards} shards, {} rows of {} B, {} callers ({} gRPC connections), {} s per row after {} s warm-up; serve args: {:?}",
         args.rows,
         args.value_bytes,
         args.clients,
