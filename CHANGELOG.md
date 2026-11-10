@@ -4,6 +4,13 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-10
+
+A fix for the size of backups. Upgrade if you back up databases with data still in memtables, or back up while writes continue. The file format and the shared-memory layout are unchanged, so a 1.1.2 writer and 1.1.0 or 1.1.1 reader processes work together, and files move freely between 1.1.x releases.
+
+### Fixed
+- A backup (`Pigeonhole::backup`, `backup_durable` and `phdb backup`) is about the size of what it holds again. Each SST it wrote from memtables, or rewrote without commits above its snapshot, took a 64 MiB-aligned slot of the copy, so a small database with several families made a copy of hundreds of MiB, nearly all free (#1595, backport of #1615).
+
 ## [1.1.1] - 2026-11-05
 
 A correctness fix for the async nearest-neighbour search. Upgrade if you combine it with a value filter and a column limit. The file format and the shared-memory layout are unchanged, so a 1.1.1 writer and 1.1.0 reader processes work together, and files move freely between 1.1.0 and 1.1.1.
@@ -753,7 +760,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
 [1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1
