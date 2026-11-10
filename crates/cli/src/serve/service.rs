@@ -762,6 +762,10 @@ pub(crate) struct Service {
     memory_calls: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
+    ///
+    /// **Lock order: a blocking-pool place first, then this.** A `/mcp` create holds its
+    /// request's pool thread when it takes this, so an async create or drop takes its pool
+    /// place before this, never while holding it (ai1249's B2 on #1666).
     schema: tokio::sync::Mutex<()>,
     /// The catalog's generation: bumped by a create, a drop, and a replica's catalog
     /// change. A `/mcp` session that saw an older one checks its tool list (ai1249's M2 on
@@ -1508,12 +1512,12 @@ impl Service {
         if_missing: bool,
     ) -> Result<Table, ApiError> {
         reserved(&name)?;
+        // The pool place before `schema` (its lock order).
+        let place = pool_place(&self.blocking).await?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
         let owned = name.clone();
-        let table = self
-            .blocking(move || create_in(&db, &owned, families, if_missing))
-            .await?;
+        let table = held(place, move || create_in(&db, &owned, families, if_missing)).await?;
         self.created(name, &table);
         Ok(table)
     }
@@ -1573,9 +1577,11 @@ impl Service {
                 )));
             }
         }
+        // The pool place before `schema` (its lock order).
+        let place = pool_place(&self.blocking).await?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
+        let dropped = held(place, move || Ok(db.drop_table(&name)?)).await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
         // cached handle goes, not only the name's: drops are rare, and an open of the name
@@ -3011,10 +3017,22 @@ pub(crate) async fn blocking<T: Send + 'static>(
     pool: &Arc<Semaphore>,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let _permit = Arc::clone(pool)
+    held(pool_place(pool).await?, f).await
+}
+
+/// One of `pool`'s permits: a place on the blocking pool.
+async fn pool_place(pool: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
+    Arc::clone(pool)
         .acquire_owned()
         .await
-        .map_err(|_| ApiError::internal("the blocking pool closed"))?;
+        .map_err(|_| ApiError::internal("the blocking pool closed"))
+}
+
+/// Runs a sync-only call on the blocking pool, in the place `_place` holds.
+async fn held<T: Send + 'static>(
+    _place: OwnedSemaphorePermit,
+    f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
@@ -3224,13 +3242,17 @@ async fn budget_within(
 }
 
 /// Creates table `name` with `families` (with `if_missing`, opens it with the families it
-/// lacks added): a sync call, on a blocking thread.
+/// lacks added): a sync call, on a blocking thread. An empty name is refused here for every
+/// caller (`Schema.CreateTable` refuses it earlier, before its families are read).
 fn create_in(
     db: &Pigeonhole,
     name: &str,
     families: Vec<(String, pigeonhole::Family)>,
     if_missing: bool,
 ) -> Result<Table, ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::invalid("empty table name"));
+    }
     let mut b = db.table(name)?;
     for (n, f) in families {
         b = b.family(&n, f);

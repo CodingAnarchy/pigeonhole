@@ -487,3 +487,41 @@ fn sessions_opening_tables_at_once_never_wait_on_each_other() {
         assert!(body.contains("\"isError\":false"), "{body}");
     }
 }
+
+#[test]
+fn a_tool_create_racing_a_drop_takes_the_pool_and_schema_in_one_order() {
+    // ai1249's B2 on #1666: a `/mcp` create holds its request's pool thread and then takes
+    // the schema lock; an RPC create or drop must take its pool place before that lock too,
+    // or with a pool of one each waits on the other for good.
+    blocking_threads(1);
+    let s = Server::start("", limits());
+    let id = session(&s, None);
+    for i in 0..20 {
+        let doomed = format!("d{i}");
+        let (status, e) = s.rpc(
+            "Schema/CreateTable",
+            &json!({"name": doomed, "families": [{"name": "f"}]}),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+        let url = s.url.clone();
+        let dropper = std::thread::spawn(move || {
+            agent()
+                .post(format!("{url}/v1/Schema/DropTable"))
+                .header("content-type", "application/json")
+                .send(json!({"name": doomed}).to_string())
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+        let (out, err) = call(
+            &s,
+            None,
+            &id,
+            "create_table",
+            json!({"table": format!("c{i}"), "families": ["f"]}),
+        );
+        assert!(!err, "{out}");
+        assert_eq!(dropper.join().unwrap(), 200);
+    }
+}
