@@ -1054,6 +1054,14 @@ impl Service {
     /// vector indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2) and
     /// `Replication.Follow`'s (a replica catching up reads and encodes at full speed,
     /// cli692's F1 on #1583).
+    /// A cluster node serving `partition` (D317 ticket 3): its transaction and snapshot ids
+    /// name it, `<partition>:<32 hex>`.
+    pub(crate) fn sessions_on(mut self, partition: &str) -> Self {
+        self.sessions =
+            super::sessions::Sessions::on(self.limits.leases, Some(partition.to_owned()));
+        self
+    }
+
     pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
         let paused = self.replica.is_some();
         if let Some(part) = &mut self.part {

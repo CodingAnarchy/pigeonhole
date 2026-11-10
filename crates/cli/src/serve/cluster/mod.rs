@@ -769,7 +769,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
         let msg = req.into_inner();
-        let caller = forward::caller_of(msg.caller)?;
+        let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
         let op = forward::op_of(msg.op)?;
         let reply = shared.router.serve_forwarded(op, &caller).await?;
         let (reply, charge) = forward::reply_to_forward(reply)?;

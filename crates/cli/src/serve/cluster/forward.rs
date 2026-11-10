@@ -21,7 +21,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use super::Node;
-use crate::serve::auth::{Caller, Scope};
+use crate::serve::auth::{ANONYMOUS, Caller, Principal, Scope, Tokens};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
     ForwardRequest, ForwardResponse, ForwardedCaller, cluster_client::ClusterClient,
@@ -167,11 +167,20 @@ pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiEr
         scope: scope.to_owned(),
         all_namespaces: caller.namespaces.is_none(),
         namespaces: caller.namespaces.clone().unwrap_or_default(),
+        // Its sessions' binding (D317 ticket 3); none on a cluster without tokens.
+        token_digest: if caller.principal == ANONYMOUS {
+            prost::bytes::Bytes::new()
+        } else {
+            prost::bytes::Bytes::copy_from_slice(caller.principal.digest())
+        },
     })
 }
 
-/// The caller a forward is for, on the owner: never more than `write` (D317 ticket 2).
-pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> {
+/// The caller a forward is for, on the owner: never more than `write` (D317 ticket 2), and
+/// bound to its token's digest (ticket 3), so its sessions are its own here as on a single
+/// node. The entry node matched the token; this node checks it lists it too, since a
+/// cluster's nodes list the same tokens. Without tokens here, every caller is anyone.
+pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<Caller, ApiError> {
     let f = f.ok_or_else(|| ApiError::invalid("a forward names no caller"))?;
     let scope = match f.scope.as_str() {
         "read" => Scope::Read,
@@ -182,9 +191,19 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> 
             )));
         }
     };
+    let principal = if tokens.any() {
+        // Never the digest in the message (cli692's S1 on ticket 3).
+        let unknown = ApiError::unlisted_token;
+        let digest: [u8; 32] = f.token_digest.as_ref().try_into().map_err(|_| unknown())?;
+        if !tokens.lists(&digest) {
+            return Err(unknown());
+        }
+        Principal::from_digest(digest)
+    } else {
+        ANONYMOUS
+    };
     Ok(Caller {
-        // Forwarded calls hold no sessions yet (ticket 3 binds them by the token's digest).
-        principal: crate::serve::auth::ANONYMOUS,
+        principal,
         scope,
         namespaces: (!f.all_namespaces).then_some(f.namespaces),
         // The reply goes back to the forwarding node as protobuf; that node charges and
@@ -203,6 +222,14 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::CheckAndMutate(r) => Op::CheckAndMutate(r),
         ServiceOp::MutateReturning(r) => Op::MutateReturning(r),
         ServiceOp::Batch(r) => Op::Batch(r),
+        ServiceOp::Begin(r) => Op::Begin(r),
+        ServiceOp::TxnGet(r) => Op::TxnGet(r),
+        ServiceOp::TxnGetRow(r) => Op::TxnGetRow(r),
+        ServiceOp::TxnWrite(r) => Op::TxnWrite(r),
+        ServiceOp::Commit(r) => Op::Commit(r),
+        ServiceOp::Abort(r) => Op::Abort(r),
+        ServiceOp::OpenSnapshot(r) => Op::OpenSnapshot(r),
+        ServiceOp::ReleaseSnapshot(r) => Op::ReleaseSnapshot(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -223,6 +250,14 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::CheckAndMutate(r) => ServiceOp::CheckAndMutate(r),
             Op::MutateReturning(r) => ServiceOp::MutateReturning(r),
             Op::Batch(r) => ServiceOp::Batch(r),
+            Op::Begin(r) => ServiceOp::Begin(r),
+            Op::TxnGet(r) => ServiceOp::TxnGet(r),
+            Op::TxnGetRow(r) => ServiceOp::TxnGetRow(r),
+            Op::TxnWrite(r) => ServiceOp::TxnWrite(r),
+            Op::Commit(r) => ServiceOp::Commit(r),
+            Op::Abort(r) => ServiceOp::Abort(r),
+            Op::OpenSnapshot(r) => ServiceOp::OpenSnapshot(r),
+            Op::ReleaseSnapshot(r) => ServiceOp::ReleaseSnapshot(r),
         },
     )
 }
@@ -240,6 +275,10 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Mutate(r) => Reply::Mutate(r),
         ServiceReply::CheckAndMutate(r) => Reply::CheckAndMutate(r),
         ServiceReply::MutateReturning(r) => Reply::MutateReturning(r),
+        ServiceReply::Begin(r) => Reply::Begin(r),
+        ServiceReply::Commit(r) => Reply::Commit(r),
+        ServiceReply::OpenSnapshot(r) => Reply::OpenSnapshot(r),
+        ServiceReply::Empty(r) => Reply::Empty(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -262,6 +301,10 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Mutate(r) => ServiceReply::Mutate(r),
             Reply::CheckAndMutate(r) => ServiceReply::CheckAndMutate(r),
             Reply::MutateReturning(r) => ServiceReply::MutateReturning(r),
+            Reply::Begin(r) => ServiceReply::Begin(r),
+            Reply::Commit(r) => ServiceReply::Commit(r),
+            Reply::OpenSnapshot(r) => ServiceReply::OpenSnapshot(r),
+            Reply::Empty(r) => ServiceReply::Empty(r),
         },
     )
 }

@@ -5,7 +5,9 @@ syntax = "proto3";
 package pigeonhole.v1;
 
 import "pigeonhole/v1/data.proto";
+import "pigeonhole/v1/common.proto";
 import "pigeonhole/v1/schema.proto";
+import "pigeonhole/v1/transactions.proto";
 
 service Cluster {
   // The node's newest map. Read, admin or cluster scope.
@@ -155,6 +157,17 @@ message ForwardRequest {
     MutateRequest mutate_returning = 7;
     // Every row in one partition: a batch across partitions is refused before it's sent.
     BatchRequest batch = 8;
+    // A transaction's or a snapshot's calls (D317 ticket 3), on the node serving the
+    // partition it's bound to. Its id names that partition (`<partition>:<id>`). 9 is
+    // ticket 4's `multi_get`.
+    BeginRequest begin = 10;
+    TxnGetRequest txn_get = 11;
+    TxnGetRowRequest txn_get_row = 12;
+    TxnWriteRequest txn_write = 13;
+    TxnCommitRequest commit = 14;
+    TxnAbortRequest abort = 15;
+    OpenSnapshotRequest open_snapshot = 16;
+    ReleaseSnapshotRequest release_snapshot = 17;
   }
 }
 
@@ -166,6 +179,9 @@ message ForwardedCaller {
   // The namespaces the caller's token is limited to. Empty with `all_namespaces`.
   repeated string namespaces = 2;
   bool all_namespaces = 3;
+  // The SHA-256 digest of the caller's token (D317 ticket 3), which its sessions are bound
+  // to; empty on a cluster without tokens. The node it's sent to must list the same token.
+  bytes token_digest = 4;
 }
 
 // A forwarded call's answer: the reply its op has on a single node. Errors travel as the
@@ -178,5 +194,11 @@ message ForwardResponse {
     MutateResponse mutate = 3;
     CheckAndMutateResponse check_and_mutate = 4;
     MutateReturningResponse mutate_returning = 5;
+    // D317 ticket 3 (6 is ticket 4's `multi_get`). A transaction's reads answer `get` and
+    // `read_row`; its writes, `Abort` and `Release` answer `empty`.
+    BeginResponse begin = 7;
+    TxnCommitResponse commit = 8;
+    OpenSnapshotResponse open_snapshot = 9;
+    Empty empty = 10;
   }
 }

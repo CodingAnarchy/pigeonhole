@@ -343,7 +343,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, and serves single-row reads and writes for the whole cluster, forwarding each to the node that owns its row. Transactions, reads across partitions, schema changes, feeds and backups come in the next steps, and this section grows with them.
+**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, and serves single-row reads and writes, transactions and snapshots for the whole cluster, forwarding each to the node that owns its row or partition. Reads across partitions, schema changes, feeds and backups come in the next steps, and this section grows with them.
 
 - **`phdb serve --cluster DIR --node-id ID`** runs a node.
   - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
@@ -361,7 +361,11 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Serving data:** any node takes any call. It serves the call if its partition holds the row, and otherwise forwards it to the node that does. A client needs no map; one that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
   - **What's served:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters, by their row. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
   - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
-  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, scans and other reads across partitions, schema calls (`ListTables` included), feeds, backups, `Info` and `/mcp`.
+  - **Transactions and pinned snapshots** run in one partition, on its node. `Begin` and `Snapshots.Open` must name it in `route`, as a row (`table`, `row`) or a partition id, on every cluster, even one with a single partition. The ids they answer name the partition (`p2:...`), so any node routes the calls on them, and none of them are held by the node you called.
+    - **A row outside the partition** (a transaction's read or write, or a read at the snapshot) is refused with `CrossPartition` before anything is written. A `MultiGet` or `Scan` at a snapshot must stay within its partition. For now, send them to the partition's own node; through another node they come with fan-out reads.
+    - **`Traverse` and `Nearest` at a snapshot** aren't supported on a cluster.
+    - **Tokens:** a session belongs to the token that opened it, on every node. So every node must list the same tokens; a call for a token the partition's node doesn't list is refused with `PermissionDenied`. `--max-sessions` and `--max-sessions-per-token` count on each node separately.
+  - **Refused with `Unsupported`,** naming the step that brings each: scans and other reads across partitions, schema calls (`ListTables` included), feeds, backups, `Info` and `/mcp`.
   - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
   - **Flags:** a cluster node takes `--shard-spin` and `--shm-dir` as a single node does, for its partition. `--change-feed`, `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
   - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.

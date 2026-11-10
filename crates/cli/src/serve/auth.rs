@@ -46,6 +46,11 @@ impl Principal {
     pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }
+
+    /// Its digest, which a forwarded call carries to the partition's node (D317 ticket 3).
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 /// Redacted (cli692's R1 on ticket 3): a `Caller` or session printed with `{:?}` shows
@@ -164,6 +169,17 @@ impl Tokens {
     /// Whether any token is configured.
     pub(crate) fn any(&self) -> bool {
         !self.0.is_empty()
+    }
+
+    /// Whether a token whose SHA-256 digest is `digest` is listed: a forwarded call's
+    /// (D317 ticket 3), whose entry node matched the token itself. Compared as
+    /// [`caller`](Self::caller) compares.
+    pub(crate) fn lists(&self, digest: &[u8; 32]) -> bool {
+        let mut found = false;
+        for e in &self.0 {
+            found |= constant_time_eq(&e.digest, digest);
+        }
+        found
     }
 
     /// The caller a bearer token identifies, or `None` for no match. Every entry is

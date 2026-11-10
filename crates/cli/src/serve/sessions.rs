@@ -130,6 +130,9 @@ pub(crate) struct Sessions {
     table: Mutex<Table>,
     leases: Leases,
     reaper: Once,
+    /// On a cluster node, the partition its sessions are on (D317 ticket 3): ids are
+    /// `<partition>:<32 hex>`, so any node routes a call on one without a lookup.
+    partition: Option<String>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -162,11 +165,38 @@ pub(crate) struct Stats {
 
 impl Sessions {
     pub(crate) fn new(leases: Leases) -> Arc<Self> {
+        Self::on(leases, None)
+    }
+
+    /// The session table of a cluster node serving `partition` (D317 ticket 3): its ids
+    /// name it.
+    pub(crate) fn on(leases: Leases, partition: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             table: Mutex::new(Table::default()),
             leases,
             reaper: Once::new(),
+            partition,
         })
+    }
+
+    /// Session `id` as a client sees it.
+    fn text(&self, id: &Id) -> String {
+        match &self.partition {
+            Some(p) => format!("{p}:{}", hex(id)),
+            None => hex(id),
+        }
+    }
+
+    /// A client's session id as this table's key: `None` for any other form, or another
+    /// partition's (cli692's S4 on ticket 3: `NotFound` either way).
+    fn parse(&self, text: &str) -> Option<Id> {
+        match &self.partition {
+            Some(p) => {
+                let (q, hex) = partition_of(text)?;
+                if q == p { parse_id(hex) } else { None }
+            }
+            None => parse_id(text),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Table> {
@@ -213,7 +243,7 @@ impl Sessions {
                 opened: now,
             },
         );
-        Ok(hex(&id))
+        Ok(self.text(&id))
     }
 
     /// Holds `txn` for `principal` and returns its id.
@@ -254,7 +284,7 @@ impl Sessions {
         principal: Principal,
     ) -> Result<Taken, ApiError> {
         let gone = || ApiError::not_found("no such transaction");
-        let key = parse_id(id).ok_or_else(gone)?;
+        let key = self.parse(id).ok_or_else(gone)?;
         let now = Instant::now();
         let mut t = self.lock();
         t.expire(&key, now, &self.leases);
@@ -314,7 +344,7 @@ impl Sessions {
         principal: Principal,
     ) -> Result<McpGuard, ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
-        let key = parse_id(id).ok_or_else(gone)?;
+        let key = self.parse(id).ok_or_else(gone)?;
         let now = Instant::now();
         let mut t = self.lock();
         t.expire(&key, now, &self.leases);
@@ -339,7 +369,7 @@ impl Sessions {
     /// Ends MCP session `id` (`DELETE /mcp`). Requests already running finish.
     pub(crate) fn end_mcp(&self, id: &str, principal: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such MCP session (ended or expired)");
-        let key = parse_id(id).ok_or_else(gone)?;
+        let key = self.parse(id).ok_or_else(gone)?;
         let mut t = self.lock();
         match t.map.get(&key) {
             Some(e) if e.principal == principal && matches!(e.state, State::Mcp(_)) => {
@@ -358,7 +388,7 @@ impl Sessions {
         principal: Principal,
     ) -> Result<SnapshotGuard, ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
-        let key = parse_id(id).ok_or_else(gone)?;
+        let key = self.parse(id).ok_or_else(gone)?;
         let now = Instant::now();
         let mut t = self.lock();
         t.expire(&key, now, &self.leases);
@@ -384,7 +414,7 @@ impl Sessions {
     /// ones get `NotFound`.
     pub(crate) fn release(&self, id: &str, principal: Principal) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such snapshot (released or expired)");
-        let key = parse_id(id).ok_or_else(gone)?;
+        let key = self.parse(id).ok_or_else(gone)?;
         let mut t = self.lock();
         match t.map.get(&key) {
             Some(e) if e.principal == principal && matches!(e.state, State::Snapshot(_)) => {
@@ -684,6 +714,12 @@ fn hex(id: &Id) -> String {
     })
 }
 
+/// A cluster session id's partition and the rest (D317 ticket 3). Partition ids never hold
+/// `:` (`[a-z0-9_-]`), so the last one splits it.
+pub(crate) fn partition_of(id: &str) -> Option<(&str, &str)> {
+    id.rsplit_once(':')
+}
+
 fn parse_id(s: &str) -> Option<Id> {
     if s.len() != 32 {
         return None;
@@ -872,6 +908,23 @@ mod tests {
         drop(read);
         assert_eq!(s.snapshot(&snap, p(1)).err().unwrap().code, "NotFound");
         assert!(parse_id(&hex(&[0xab; 16])).is_some_and(|id| id == [0xab; 16]));
+        // A cluster node's ids name its partition (D317 ticket 3); a single node's don't, and
+        // neither takes the other's form or another partition's id (cli692's S4).
+        let one = Sessions::new(leases());
+        let p2 = Sessions::on(leases(), Some("p2".into()));
+        let h = hex(&[0xab; 16]);
+        assert_eq!(p2.text(&[0xab; 16]), format!("p2:{h}"));
+        assert_eq!(p2.parse(&format!("p2:{h}")), Some([0xab; 16]));
+        assert_eq!(one.parse(&h), Some([0xab; 16]));
+        for bad in [
+            h.clone(),
+            format!("p1:{h}"),
+            format!("p2:{h}0"),
+            format!("p2:p2:{h}"),
+        ] {
+            assert_eq!(p2.parse(&bad), None, "{bad}");
+        }
+        assert_eq!(one.parse(&format!("p2:{h}")), None);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
