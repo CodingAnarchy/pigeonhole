@@ -1,0 +1,2 @@
+### Changed
+- On Linux, a database whose default durability syncs (`GroupSync`, the default, or `Sync`) writes its WAL records with direct I/O (D324, #1621). A commit no longer waits while the previous group's sync writes back the log's last page. A commit becomes visible once its write has completed. A `Buffered` commit on such a database is acknowledged once its record is on the device. A file system that refuses direct I/O, and other platforms, keep the page cache. No format change.
