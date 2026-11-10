@@ -45,6 +45,24 @@ fn zero_chunk() -> usize {
     })
 }
 
+/// g47's up-front arm (perf2): `PIGEONHOLE_PREFILL=N` grows and zero-fills N slots of a
+/// stream just created, synced, before it goes live, so a run that never needs more never
+/// preps (blocking file I/O, at open).
+fn prefill(w: &WalStream) -> Result<()> {
+    if let Some(n) = std::env::var("PIGEONHOLE_PREFILL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+    {
+        let got = w.spares().prepare(n)?;
+        eprintln!(
+            "PIGEONHOLE_PREFILL: zero-filled {got} slots, {} ready",
+            w.spares().ready()
+        );
+    }
+    Ok(())
+}
+
 /// g47's knob: `PIGEONHOLE_NO_EARLY=1` turns the early rollover off.
 fn no_early() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1600,6 +1618,9 @@ impl WalStream {
             lock(&w.shared.open_io).extend([file_drive, dir_drive]);
             out.push(w);
         }
+        for w in &out {
+            prefill(w)?;
+        }
         Ok(out)
     }
 
@@ -1613,15 +1634,7 @@ impl WalStream {
     ) -> Result<WalStream> {
         let mut s = Self::create_unsynced(vfs, db_path, stream, db_id, opts)?;
         s.open_segment(0, 0)?;
-        // g47's up-front arm (perf2): `PIGEONHOLE_PREFILL=N` grows and zero-fills N slots,
-        // synced, before the stream goes live, so a run that never needs more never preps.
-        if let Some(n) = std::env::var("PIGEONHOLE_PREFILL")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| n > 0)
-        {
-            s.spares().prepare(n)?;
-        }
+        prefill(&s)?;
         Ok(s)
     }
 
