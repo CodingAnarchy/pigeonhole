@@ -267,8 +267,8 @@ fn parse_grpc_timeout(v: &str) -> Option<Duration> {
     })
 }
 
-/// A scan's pages as gRPC messages.
-struct GrpcPages(ScanPages);
+/// A scan's pages as gRPC messages (a cluster's forwarded scan's too, D317 ticket 4a).
+pub(crate) struct GrpcPages(pub(crate) ScanPages);
 
 impl Stream for GrpcPages {
     type Item = Result<proto::ScanPage, Status>;

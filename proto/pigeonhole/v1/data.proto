@@ -52,6 +52,10 @@ message MultiGetRequest {
   uint64 page_bytes = 4;
   // A previous page's `next`, to continue it.
   bytes after = 5;
+  // On a cluster node (D317 §7): skip the keys of a partition that can't be reached, and
+  // name its range in the reply's `missing`, rather than fail with `PartitionUnavailable`.
+  // A single node ignores it.
+  bool allow_partial = 6;
 }
 
 message MultiGetResponse {
@@ -61,6 +65,17 @@ message MultiGetResponse {
   bytes next = 2;
   // This page's size by D308's measure, for sizing a client's buffers.
   uint64 bytes = 3;
+  // With `allow_partial`, on a cluster node: the partitions this page skipped (D317 §7).
+  repeated MissingRange missing = 4;
+}
+
+// A partition's key range a cluster read skipped with `allow_partial` (D317 §7): its keys
+// in `[start, end)` of `table` weren't read. An empty `end` is the table's end.
+message MissingRange {
+  string partition = 1;
+  string table = 2;
+  bytes start = 3;
+  bytes end = 4;
 }
 
 message ReadRowRequest {
@@ -109,6 +124,10 @@ message ScanRequest {
   uint64 page_bytes = 5;
   // A previous page's `next` (a `ScanPosition`), to continue the scan.
   bytes after = 6;
+  // On a cluster node (D317 §7): skip a partition that can't be reached, and name its range
+  // in a page's `missing`, rather than end the stream with `PartitionUnavailable`. A single
+  // node ignores it.
+  bool allow_partial = 7;
 }
 
 message ScanPage {
@@ -119,6 +138,9 @@ message ScanPage {
   bytes next = 2;
   // This page's size by D308's measure, for sizing a client's buffers.
   uint64 bytes = 3;
+  // With `allow_partial`, on a cluster node: the partitions skipped since the page before
+  // (D317 §7).
+  repeated MissingRange missing = 4;
 }
 
 message MutateRequest {

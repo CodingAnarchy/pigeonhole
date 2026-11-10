@@ -9,9 +9,11 @@
 //! partition's identity under it.
 
 pub(crate) mod cli;
+pub(crate) mod fanout;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
+pub(crate) mod position;
 pub(crate) mod route;
 #[cfg(test)]
 mod tests;
@@ -755,8 +757,6 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(status))
     }
 
-    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope only.
-    /// The node serves it through its router once that lands; until then it's refused.
     /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope; the
     /// call is then checked for the caller it names, and served only if this node's map
     /// gives it the key.
@@ -779,6 +779,34 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             resp.extensions_mut().insert(super::charge::Charged::new(c));
         }
         Ok(resp)
+    }
+
+    type ForwardScanStream =
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<proto::ScanPage, Status>> + Send>>;
+
+    /// Node to node: one partition's part of a scan another node fans out (D317 ticket 4a).
+    /// Cluster scope; served for the caller it names, as this node's own scan of the
+    /// partition, if this node's map gives it the partition.
+    async fn forward_scan(
+        &self,
+        req: Request<proto::ForwardScanRequest>,
+    ) -> Result<tonic::Response<Self::ForwardScanStream>, Status> {
+        self.caller(&req, &[Scope::Cluster], "forward a scan")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let msg = req.into_inner();
+        let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
+        let scan = msg
+            .scan
+            .ok_or_else(|| ApiError::invalid("a forwarded scan carries no scan"))?;
+        let pages = shared
+            .router
+            .serve_forwarded_scan(&msg.partition, scan, &caller)
+            .await?;
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+            pages,
+        ))))
     }
 }
 
