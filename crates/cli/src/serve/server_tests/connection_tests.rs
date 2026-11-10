@@ -6,16 +6,23 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 
 /// A server with at most `max` connections, whose requests (and silent connections) time out
-/// after `timeout`.
+/// after `timeout`. It listens apart from the other tests' servers, so the connections it
+/// counts are this test's (#1668).
 fn capped(max: usize, timeout: Duration) -> Server {
     let mut l = limits();
     l.max_connections = max;
     l.request_timeout = timeout;
-    Server::start("", l)
+    Server::start_apart(l)
 }
 
 fn connect(s: &Server) -> TcpStream {
     TcpStream::connect(s.url.trim_start_matches("http://")).unwrap()
+}
+
+/// The server's connection counts, for a failure's message.
+fn counts(s: &Server) -> String {
+    let conns = &s.shared.router.service.connections;
+    format!("open {}, refused {}", conns.open(), conns.refused())
 }
 
 /// `GET /v1/health` on `c`, kept alive: the connection stays open, holding its slot.
@@ -76,7 +83,7 @@ fn a_connection_past_the_cap_is_closed_and_counted() {
         closed_within(&mut c, Duration::from_secs(5)),
         "a connection past the cap was served"
     );
-    assert_eq!(conns.refused(), 1);
+    assert_eq!(conns.refused(), 1, "{}", counts(&s));
     assert_eq!(conns.open(), 2, "a refused connection holds no slot");
     let text = s.shared.router.service.metrics_text();
     for line in [
@@ -121,7 +128,14 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
         closed_within(&mut silent, Duration::from_secs(5)),
         "a silent connection was kept"
     );
-    assert!(started.elapsed() >= timeout / 2, "{:?}", started.elapsed());
+    // Closed early, it was refused at the cap: something else held the slot.
+    assert!(
+        started.elapsed() >= timeout / 2,
+        "{:?}, {}",
+        started.elapsed(),
+        counts(&s)
+    );
+    assert_eq!(conns.refused(), 0, "{}", counts(&s));
     wait_open(&s, 0);
     let mut next = connect(&s);
     health(&mut next);
@@ -136,11 +150,11 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
         !closed_within(&mut h2, timeout * 3),
         "an HTTP/2 connection that sent its preface was dropped as silent"
     );
-    assert_eq!(conns.open(), 1);
+    assert_eq!(conns.open(), 1, "{}", counts(&s));
     // It holds the one slot: another connection is refused.
     let mut over = connect(&s);
     assert!(closed_within(&mut over, Duration::from_secs(5)));
-    assert_eq!(conns.refused(), 1);
+    assert_eq!(conns.refused(), 1, "{}", counts(&s));
 }
 
 /// cli692's N1 on #1653: an HTTP/1.1 keep-alive connection idle between requests has sent
@@ -162,7 +176,12 @@ fn an_idle_keep_alive_connection_is_closed_after_the_request_timeout() {
         closed_within(&mut c, timeout * 4),
         "an idle keep-alive connection was kept past the request timeout"
     );
-    assert!(idle.elapsed() >= timeout / 2, "{:?}", idle.elapsed());
+    assert!(
+        idle.elapsed() >= timeout / 2,
+        "{:?}, {}",
+        idle.elapsed(),
+        counts(&s)
+    );
     wait_open(&s, 0);
     let mut next = connect(&s);
     health(&mut next);
