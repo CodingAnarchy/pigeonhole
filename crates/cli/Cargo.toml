@@ -25,6 +25,10 @@ required-features = ["serve"]
 name = "serve_read_load"
 required-features = ["serve"]
 
+[[example]]
+name = "serve_load"
+required-features = ["serve"]
+
 [features]
 default = ["embed", "jemalloc"]
 # The `phdb` binary's global allocator is jemalloc (D322, #1558): jemalloc measured 9-21% more

@@ -26,7 +26,7 @@ pub(crate) struct Placement {
     pub free_cpus: usize,
     /// How the mask was built, for the startup line: `"off the shards' cores"` (their SMT
     /// siblings too), `"off the shards' CPUs"` (too few CPUs to also leave the siblings
-    /// out), or `"unpinned"`.
+    /// out), `"unpinned"`, or `"unmasked (--affinity off)"`.
     pub mode: &'static str,
 }
 
@@ -35,15 +35,26 @@ impl Placement {
     /// feed threads' default (a quarter, at least 1) is carved out of the network threads'
     /// default rather than added, so the two runtimes don't oversubscribe the CPUs (perf287's
     /// D2 on #1397). An explicit `--io-threads` is taken as given.
+    ///
+    /// Without `affinity` (`--affinity off`), the counts are the same but no mask is set: the
+    /// threads run where the OS puts them (ICR 0131).
     pub(crate) fn plan(
         db: &Pigeonhole,
         io: Option<usize>,
         blocking: Option<usize>,
         feed: Option<usize>,
+        affinity: bool,
     ) -> Self {
         let pinned = db.pinned_shard_cpus();
         #[cfg(target_os = "linux")]
-        let (mask, free, mode) = linux_mask(&pinned);
+        let (mask, free, mode) = match linux_mask(&pinned) {
+            // The counts come from the CPUs the mask would leave, so `off` differs from `on`
+            // only in the mask (R1's acceptance run compares the two).
+            (Some(_), free, _) if !affinity => (None, free, "unmasked (--affinity off)"),
+            planned => planned,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = affinity;
         #[cfg(not(target_os = "linux"))]
         let (free, mode) = (
             std::thread::available_parallelism()
@@ -197,7 +208,7 @@ mod tests {
             Options::default().create_if_missing(true).shards(1),
         )
         .unwrap();
-        let plan = Placement::plan(&db, None, None, None);
+        let plan = Placement::plan(&db, None, None, None, true);
         assert!(
             plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
@@ -210,8 +221,30 @@ mod tests {
                 "{plan:?}"
             );
         }
-        let given = Placement::plan(&db, Some(3), Some(5), Some(2));
+        let given = Placement::plan(&db, Some(3), Some(5), Some(2), true);
         assert_eq!((given.io_threads, given.feed_threads), (3, 2));
+        // `--affinity off`: the same threads, with no mask (ICR 0131).
+        let off = Placement::plan(&db, None, None, None, false);
+        assert_eq!(
+            (
+                off.io_threads,
+                off.blocking_threads,
+                off.feed_threads,
+                off.free_cpus
+            ),
+            (
+                plan.io_threads,
+                plan.blocking_threads,
+                plan.feed_threads,
+                plan.free_cpus
+            ),
+            "{off:?} against {plan:?}"
+        );
+        assert_eq!(off.cpu_list(), None, "{off:?}");
+        assert!(
+            ["unpinned", "unmasked (--affinity off)"].contains(&off.mode),
+            "{off:?}"
+        );
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();

@@ -357,6 +357,7 @@ pub(crate) fn run(
         args.io_threads,
         args.blocking_threads,
         args.feed_threads,
+        args.affinity == config::Affinity::On,
     ));
     let limits = args.limits();
     // A cap above half the open-file limit leaves the database too few descriptors: said,
