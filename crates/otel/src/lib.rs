@@ -25,6 +25,10 @@
 //! # }
 //! ```
 //!
+//! **Without OpenTelemetry**, a [`Collector`] ([`collector`]) reads the same metrics as plain
+//! [`Point`]s, or renders them as Prometheus text under the exporter's names (D323): for a
+//! server with its own `/metrics` endpoint, as `phdb serve` has.
+//!
 //! **The metrics** are listed by [`metrics`], and in the
 //! [observability guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/observability.md)
 //! with what to alert on. Their names, kinds, units and attributes are a stable contract
@@ -119,13 +123,7 @@ impl Config {
     /// Registers `db`'s metrics with `meter` (see [`register`]).
     #[must_use = "dropping the Registration stops reporting"]
     pub fn register(self, db: &Pigeonhole, meter: &Meter) -> Registration {
-        let name = self.db_name.clone().unwrap_or_else(|| default_name(db));
-        let shared = Arc::new(Shared {
-            name: KeyValue::new(attr::DB_NAME, name),
-            storage_by_table: self.storage_by_table,
-            window: self.latency_window,
-            state: Mutex::new(State::new(db)),
-        });
+        let shared = self.shared(db);
         let instruments = SPECS
             .iter()
             .map(|spec| build(spec, meter, &shared))
@@ -134,6 +132,23 @@ impl Config {
             shared,
             _instruments: instruments,
         }
+    }
+
+    /// A [`Collector`] of `db`'s metrics (see [`collector`]).
+    #[must_use]
+    pub fn collector(self, db: &Pigeonhole) -> Collector {
+        Collector {
+            shared: self.shared(db),
+        }
+    }
+
+    fn shared(&self, db: &Pigeonhole) -> Arc<Shared> {
+        Arc::new(Shared {
+            name: self.db_name.clone().unwrap_or_else(|| default_name(db)),
+            storage_by_table: self.storage_by_table,
+            window: self.latency_window,
+            state: Mutex::new(State::new(db)),
+        })
     }
 }
 
@@ -161,7 +176,7 @@ pub struct Registration {
 impl std::fmt::Debug for Registration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Registration")
-            .field("db_name", &self.shared.name.value)
+            .field("db_name", &self.shared.name)
             .finish_non_exhaustive()
     }
 }
@@ -172,7 +187,7 @@ impl Registration {
     /// The `pigeonhole.db.name` attribute stays the one the registration was made with, even
     /// when `db`'s file name differs, so the series continue; the other settings stay too.
     pub fn rebind(&self, db: &Pigeonhole) {
-        self.shared.lock().rebind(db);
+        self.shared.rebind(db);
     }
 
     /// Reports `progress`'s feed as `pigeonhole.feed.lag{pigeonhole.feed.name=name}`: the
@@ -184,19 +199,209 @@ impl Registration {
     /// The feeds watched are the names given here, so they're the series' bound: name each
     /// subscriber of the application, never a per-request or per-user feed.
     pub fn watch_feed(&self, name: impl Into<String>, progress: pigeonhole::FeedProgress) {
-        let name = name.into();
-        let mut state = self.shared.lock();
-        state.feeds.retain(|(n, _)| *n != name);
-        state.feeds.push((name, progress));
-        state.cached = None;
+        self.shared.watch_feed(name.into(), progress);
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut state = self.shared.lock();
-        state.db = None;
-        state.cached = None;
+        self.shared.release();
+    }
+}
+
+/// Reads [`register`]'s metrics without OpenTelemetry (D323, ICR 0131): the same metrics,
+/// names, attributes and counter carrying, as plain [`Point`]s ([`Collector::collect`]) or
+/// as Prometheus text under the names [`MetricInfo::prometheus_name`] gives
+/// ([`Collector::render_prometheus`]). For a server that serves its own `/metrics`, such as
+/// `phdb serve`, or any backend without an OpenTelemetry SDK.
+///
+/// ```
+/// use pigeonhole::{Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let metrics = pigeonhole_otel::collector(&db);
+/// let mut text = String::new();
+/// metrics.render_prometheus(&mut text);
+/// assert!(text.contains("# TYPE pigeonhole_commits_total counter"));
+/// # drop(metrics);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A collection reads the database once (as a [`Registration`]'s does), on the calling
+/// thread: `engine_metrics`, `recovery_stats` and `info`. Collections within 100 ms of each
+/// other share one reading. Dropping the collector releases its handle to the database.
+pub struct Collector {
+    shared: Arc<Shared>,
+}
+
+impl std::fmt::Debug for Collector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Collector")
+            .field("db_name", &self.shared.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`Collector`] of `db`'s metrics, with the default [`Config`] (as [`register`] has).
+#[must_use]
+pub fn collector(db: &Pigeonhole) -> Collector {
+    Config::default().collector(db)
+}
+
+impl Collector {
+    /// Every metric's points now, in [`metrics`]' order. A metric with no values (the change
+    /// feed's while it's off, io_uring's on other backends) has no points. Empty once the
+    /// database is closed.
+    pub fn collect(&self) -> Vec<Point> {
+        let mut out = Vec::new();
+        self.each(|spec, points| {
+            for (value, attrs) in points {
+                out.push(Point {
+                    metric: spec.info,
+                    value: spec.value(value),
+                    attributes: self.attributes(attrs),
+                });
+            }
+        });
+        out
+    }
+
+    /// Appends the metrics to `out` as Prometheus text (exposition format 0.0.4): for each
+    /// metric with points, `# HELP` (its description), `# TYPE`, then one sample per point,
+    /// named by [`MetricInfo::prometheus_name`] and labelled by its attributes with dots as
+    /// underscores (`pigeonhole_db_name`) in name order, as OpenTelemetry's Prometheus
+    /// exporter writes them without its scope labels and `target_info`.
+    pub fn render_prometheus(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        self.each(|spec, points| {
+            if points.is_empty() {
+                return;
+            }
+            let name = spec.info.prometheus_name();
+            let kind = match spec.info.kind {
+                InstrumentKind::Counter => "counter",
+                InstrumentKind::Gauge => "gauge",
+            };
+            let _ = writeln!(out, "# HELP {name} {}", escape_help(spec.info.description));
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            for (value, attrs) in points {
+                out.push_str(&name);
+                // Labels in name order, as the exporter writes them.
+                let mut labels = self.attributes(attrs);
+                labels.sort_unstable_by_key(|(k, _)| *k);
+                for (i, (k, v)) in labels.iter().enumerate() {
+                    out.push(if i == 0 { '{' } else { ',' });
+                    out.push_str(&k.replace('.', "_"));
+                    out.push_str("=\"");
+                    escape_label(out, v);
+                    out.push('"');
+                }
+                // `pigeonhole_db_name` is always there, but a sample without labels has no
+                // braces (ai1249's N2 on #1687).
+                out.push_str(if labels.is_empty() { " " } else { "} " });
+                match spec.value(value) {
+                    PointValue::U64(v) => {
+                        let _ = write!(out, "{v}");
+                    }
+                    PointValue::F64(v) => write_float(out, v),
+                }
+                out.push('\n');
+            }
+        });
+    }
+
+    /// As [`Registration::rebind`].
+    pub fn rebind(&self, db: &Pigeonhole) {
+        self.shared.rebind(db);
+    }
+
+    /// As [`Registration::watch_feed`].
+    pub fn watch_feed(&self, name: impl Into<String>, progress: pigeonhole::FeedProgress) {
+        self.shared.watch_feed(name.into(), progress);
+    }
+
+    /// Calls `f` with each metric's points from one reading, in [`metrics`]' order; not at all
+    /// once the database is closed.
+    fn each(&self, mut f: impl FnMut(&Spec, Points)) {
+        let Some(snap) = self.shared.snapshot() else {
+            return;
+        };
+        for spec in SPECS {
+            let mut points = Vec::new();
+            (spec.read)(&snap, &mut points);
+            f(spec, points);
+        }
+    }
+
+    /// `pigeonhole.db.name`, then a point's own attributes.
+    fn attributes(&self, attrs: Vec<(&'static str, Attr)>) -> Vec<(&'static str, String)> {
+        std::iter::once((attr::DB_NAME, self.shared.name.clone()))
+            .chain(attrs.into_iter().map(|(k, v)| (k, v.into_text())))
+            .collect()
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        self.shared.release();
+    }
+}
+
+/// One value of a metric, from [`Collector::collect`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Point {
+    /// The metric.
+    pub metric: MetricInfo,
+    /// Its value: a count or bytes as `U64`, seconds and ratios as `F64`, as the OpenTelemetry
+    /// instrument [`register`] makes for the metric.
+    pub value: PointValue,
+    /// Its attributes, `pigeonhole.db.name` first, then the metric's
+    /// [`attributes`](MetricInfo::attributes) that the point carries, as text (a level as
+    /// `0`, a flag as `true`).
+    pub attributes: Vec<(&'static str, String)>,
+}
+
+/// A [`Point`]'s value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum PointValue {
+    /// An integer: counts and bytes.
+    U64(u64),
+    /// A float: seconds and ratios.
+    F64(f64),
+}
+
+/// `# HELP`'s escaping: a backslash and a newline.
+fn escape_help(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// A label value's escaping: a backslash, a double quote and a newline.
+fn escape_label(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+}
+
+/// A float as Prometheus text reads it: `NaN`, `+Inf` and `-Inf` spelled its way.
+fn write_float(out: &mut String, v: f64) {
+    use std::fmt::Write as _;
+    if v.is_nan() {
+        out.push_str("NaN");
+    } else if v.is_infinite() {
+        out.push_str(if v > 0.0 { "+Inf" } else { "-Inf" });
+    } else {
+        let _ = write!(out, "{v}");
     }
 }
 
@@ -279,8 +484,80 @@ enum Value {
     F(f64),
 }
 
+/// An attribute's value, kept free of OpenTelemetry's types so that a [`Collector`] can give
+/// it as text and a [`Registration`] as a `KeyValue`.
+#[derive(Clone)]
+enum Attr {
+    Str(&'static str),
+    String(String),
+    Int(i64),
+    Bool(bool),
+}
+
+impl Attr {
+    fn key_value(self, key: &'static str) -> KeyValue {
+        match self {
+            Self::Str(v) => KeyValue::new(key, v),
+            Self::String(v) => KeyValue::new(key, v),
+            Self::Int(v) => KeyValue::new(key, v),
+            Self::Bool(v) => KeyValue::new(key, v),
+        }
+    }
+
+    /// As OpenTelemetry's Prometheus exporter writes it.
+    fn into_text(self) -> String {
+        match self {
+            Self::Str(v) => v.to_owned(),
+            Self::String(v) => v,
+            Self::Int(v) => v.to_string(),
+            Self::Bool(v) => v.to_string(),
+        }
+    }
+}
+
+impl From<&'static str> for Attr {
+    fn from(v: &'static str) -> Self {
+        Self::Str(v)
+    }
+}
+
+impl From<String> for Attr {
+    fn from(v: String) -> Self {
+        Self::String(v)
+    }
+}
+
+impl From<i64> for Attr {
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<bool> for Attr {
+    fn from(v: bool) -> Self {
+        Self::Bool(v)
+    }
+}
+
+/// One attribute of a point.
+fn a(key: &'static str, value: impl Into<Attr>) -> (&'static str, Attr) {
+    (key, value.into())
+}
+
 /// One reading's values of a metric, each with its attributes (`pigeonhole.db.name` aside).
-type Points = Vec<(Value, Vec<KeyValue>)>;
+type Points = Vec<(Value, Vec<(&'static str, Attr)>)>;
+
+impl Spec {
+    /// A reading's value as the metric's instrument type takes it.
+    fn value(&self, v: Value) -> PointValue {
+        match (self.float, v) {
+            (true, Value::F(f)) => PointValue::F64(f),
+            (true, Value::U(u)) => PointValue::F64(u as f64),
+            (false, Value::U(u)) => PointValue::U64(u),
+            (false, Value::F(f)) => PointValue::U64(f as u64),
+        }
+    }
+}
 
 /// One metric: its contract and how it reads a snapshot.
 struct Spec {
@@ -310,8 +587,8 @@ fn one(out: &mut Points, v: u64) {
     out.push((Value::U(v), Vec::new()));
 }
 
-fn kv(key: &'static str, value: &'static str) -> Vec<KeyValue> {
-    vec![KeyValue::new(key, value)]
+fn kv(key: &'static str, value: &'static str) -> Vec<(&'static str, Attr)> {
+    vec![a(key, value)]
 }
 
 fn seconds(nanos: u64) -> Value {
@@ -352,10 +629,7 @@ static SPECS: &[Spec] = &[
                 if let Some(v) = s.latency[i][j] {
                     out.push((
                         Value::F(v),
-                        vec![
-                            KeyValue::new(attr::DURABILITY, *d),
-                            KeyValue::new(attr::QUANTILE, *q),
-                        ],
+                        vec![a(attr::DURABILITY, *d), a(attr::QUANTILE, *q)],
                     ));
                 }
             }
@@ -713,11 +987,11 @@ static SPECS: &[Spec] = &[
         |s, out| {
             out.push((
                 Value::U(s.m.threads_pinned),
-                vec![KeyValue::new(attr::THREAD_PINNED, true)],
+                vec![a(attr::THREAD_PINNED, true)],
             ));
             out.push((
                 Value::U(s.m.threads_started.saturating_sub(s.m.threads_pinned)),
-                vec![KeyValue::new(attr::THREAD_PINNED, false)],
+                vec![a(attr::THREAD_PINNED, false)],
             ));
         }
     ),
@@ -823,10 +1097,7 @@ static SPECS: &[Spec] = &[
         [attr::FEED_NAME],
         "Seqnos between the database's visible seqno and a watched feed's covered position (Registration::watch_feed): about one a commit, so near 0 while the feed keeps up and growing while its subscriber falls behind or after it failed.",
         |s, out| for (name, lag) in &s.feed_lags {
-            out.push((
-                Value::U(*lag),
-                vec![KeyValue::new(attr::FEED_NAME, name.clone())],
-            ));
+            out.push((Value::U(*lag), vec![a(attr::FEED_NAME, name.clone())]));
         }
     ),
     // Health.
@@ -870,9 +1141,9 @@ fn storage(s: &Snapshot, out: &mut Points, f: fn(&pigeonhole::LevelInfo) -> u64)
                     out.push((
                         Value::U(f(l)),
                         vec![
-                            KeyValue::new(attr::LEVEL, i64::from(l.level)),
-                            KeyValue::new(attr::TABLE, t.name.clone()),
-                            KeyValue::new(attr::FAMILY, fam.family.clone()),
+                            a(attr::LEVEL, i64::from(l.level)),
+                            a(attr::TABLE, t.name.clone()),
+                            a(attr::FAMILY, fam.family.clone()),
                         ],
                     ));
                 } else {
@@ -882,10 +1153,7 @@ fn storage(s: &Snapshot, out: &mut Points, f: fn(&pigeonhole::LevelInfo) -> u64)
         }
     }
     for (level, v) in by_level {
-        out.push((
-            Value::U(v),
-            vec![KeyValue::new(attr::LEVEL, i64::from(level))],
-        ));
+        out.push((Value::U(v), vec![a(attr::LEVEL, i64::from(level))]));
     }
 }
 
@@ -900,9 +1168,9 @@ fn blobs(s: &Snapshot, out: &mut Points) {
                     out.push((
                         Value::U(v),
                         vec![
-                            KeyValue::new(attr::BLOB_STATE, state),
-                            KeyValue::new(attr::TABLE, t.name.clone()),
-                            KeyValue::new(attr::FAMILY, fam.family.clone()),
+                            a(attr::BLOB_STATE, state),
+                            a(attr::TABLE, t.name.clone()),
+                            a(attr::FAMILY, fam.family.clone()),
                         ],
                     ));
                 }
@@ -1047,13 +1315,32 @@ impl Snapshot {
 const REUSE: Duration = Duration::from_millis(100);
 
 struct Shared {
-    name: KeyValue,
+    /// The `pigeonhole.db.name` attribute's value.
+    name: String,
     storage_by_table: bool,
     window: Duration,
     state: Mutex<State>,
 }
 
 impl Shared {
+    fn rebind(&self, db: &Pigeonhole) {
+        self.lock().rebind(db);
+    }
+
+    fn watch_feed(&self, name: String, progress: pigeonhole::FeedProgress) {
+        let mut state = self.lock();
+        state.feeds.retain(|(n, _)| *n != name);
+        state.feeds.push((name, progress));
+        state.cached = None;
+    }
+
+    /// Releases the handle to the database: nothing is reported after.
+    fn release(&self) {
+        let mut state = self.lock();
+        state.db = None;
+        state.cached = None;
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // A panic in a callback can't leave the state half-written in a way that matters:
         // the worst is one reading's counters, which the next reading replaces.
@@ -1064,6 +1351,11 @@ impl Shared {
     /// closed.
     fn snapshot(&self) -> Option<Arc<Snapshot>> {
         let mut state = self.lock();
+        // A closed database reports nothing, even within a reading's reuse.
+        if state.db.as_ref().is_none_or(Pigeonhole::is_closed) {
+            state.cached = None;
+            return None;
+        }
         let now = Instant::now();
         if let Some(c) = &state.cached
             && now.duration_since(c.at) < REUSE
@@ -1128,11 +1420,8 @@ impl State {
 
     fn read(&mut self, now: Instant, window: Duration, storage_by_table: bool) -> Option<Snapshot> {
         // A clone (two `Arc`s), so the reading can update the state while it holds the handle.
+        // `Shared::snapshot` checked that the database is open, under the same lock.
         let db = self.db.clone()?;
-        // A closed database reports nothing.
-        if db.is_closed() {
-            return None;
-        }
         let info = db.info().ok();
         let recovery = db.recovery_stats();
         let raw = Raw {
@@ -1244,19 +1533,22 @@ fn build(
             };
             let mut points = Vec::new();
             (spec.read)(&snap, &mut points);
-            for (v, mut attrs) in points {
-                attrs.insert(0, shared.name.clone());
+            for (v, attrs) in points {
+                let attrs: Vec<KeyValue> =
+                    std::iter::once(KeyValue::new(attr::DB_NAME, shared.name.clone()))
+                        .chain(attrs.into_iter().map(|(k, v)| v.key_value(k)))
+                        .collect();
                 emit(v, &attrs);
             }
         }
     };
-    let f64_of = |v: Value| match v {
-        Value::F(f) => f,
-        Value::U(u) => u as f64,
+    let f64_of = |v: Value| match spec.value(v) {
+        PointValue::F64(f) => f,
+        PointValue::U64(u) => u as f64,
     };
-    let u64_of = |v: Value| match v {
-        Value::U(u) => u,
-        Value::F(f) => f as u64,
+    let u64_of = |v: Value| match spec.value(v) {
+        PointValue::U64(u) => u,
+        PointValue::F64(f) => f as u64,
     };
     // The four instruments differ only in their constructor, value type and conversion.
     macro_rules! instrument {

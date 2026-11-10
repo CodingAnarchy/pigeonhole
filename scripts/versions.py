@@ -20,7 +20,8 @@
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
 - **Publish order:** `list` prints `PUBLISH_ORDER`: `INTERNAL`, then `PUBLIC` and `OWN`, with
-  `pigeonhole-cli` last since it depends on `pigeonhole-embed` (#1345 PR 2). `check` fails
+  `pigeonhole-cli` last since it depends on `pigeonhole-embed` (#1345 PR 2) and
+  `pigeonhole-otel` (D323). `check` fails
   unless each crate comes after every pigeonhole crate it depends on (normal and build
   dependencies, which must be on crates.io when it publishes).
 - **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
@@ -58,7 +59,7 @@ OWN = ["otel", "embed"]
 UNPUBLISHED = ["capi", "bench"]
 # The order `list` prints and `publish.sh` publishes in: every published crate once, each after
 # the pigeonhole crates it depends on. `cli` takes `embed` (an own line) for `--embed-local`,
-# so it goes last.
+# and `otel` for `phdb serve`'s `/metrics` (D323), so it goes last.
 PUBLISH_ORDER = INTERNAL + [d for d in PUBLIC if d != "cli"] + OWN + ["cli"]
 
 

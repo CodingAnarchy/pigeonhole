@@ -44,7 +44,7 @@ fn a_feed_streams_commits_under_its_prefix_and_resumes_from_a_token() {
             .load(Ordering::Relaxed)
             >= 1
     );
-    let text = s.shared.metrics.render(&s.shared.router.service.db);
+    let text = s.shared.metrics.render();
     let mut text = text;
     super::service::render_feeds(&mut text, &s.shared.router.service.feeds);
     assert!(text.contains("pigeonhole_serve_feed_hubs 1"), "{text}");

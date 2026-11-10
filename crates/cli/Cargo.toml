@@ -46,6 +46,8 @@ serve = [
     "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",
     "dep:sha2", "dep:arc-swap", "dep:num_cpus", "dep:nix", "dep:futures-core",
     "dep:pigeonhole-vector", "dep:pigeonhole-text", "dep:half", "dep:http-body",
+    # `/metrics`' engine metrics, under D316's names (D323).
+    "dep:pigeonhole-otel",
     # `--replica-of` (#1436): the replica side of replication, hidden in the library.
     "pigeonhole/__unstable-replication",
 ]
@@ -61,6 +63,10 @@ pigeonhole-embed = { workspace = true, optional = true }
 pigeonhole-vector = { workspace = true, optional = true }
 # `phdb serve`'s `Text` RPCs (D313 ticket 7c).
 pigeonhole-text = { workspace = true, optional = true }
+# `phdb serve`'s `/metrics`: the engine's metrics as D316 names them, read through its
+# `Collector` and rendered as Prometheus text (D323). It brings the `opentelemetry` API crate,
+# not an SDK.
+pigeonhole-otel = { workspace = true, optional = true }
 # `phdb serve`'s `Memory`: a memory embedding sent as `f16` or `bf16` is widened (ticket 8a).
 half = { workspace = true, optional = true }
 # `--embed-url`: a synchronous HTTP client, rustls on the ring provider, and the operating
