@@ -20,16 +20,16 @@ use super::service::{Service, ServiceOp, ServiceReply};
 /// serves, if the map gives it one.
 #[derive(Debug)]
 pub(crate) struct Cluster {
-    node: Arc<super::cluster::Node>,
-    local: Option<String>,
-    forwarder: Forwarder,
+    pub(crate) node: Arc<super::cluster::Node>,
+    pub(crate) local: Option<String>,
+    pub(crate) forwarder: Arc<Forwarder>,
 }
 
 /// Where a call goes.
 #[derive(Debug)]
 pub(crate) struct Router {
     pub(crate) service: Service,
-    cluster: Option<Cluster>,
+    pub(crate) cluster: Option<Cluster>,
 }
 
 impl Router {
@@ -47,7 +47,7 @@ impl Router {
         node: Arc<super::cluster::Node>,
         local: Option<String>,
     ) -> Self {
-        let forwarder = Forwarder::new(Arc::clone(&node));
+        let forwarder = Arc::new(Forwarder::new(Arc::clone(&node)));
         Self {
             service,
             cluster: Some(Cluster {
@@ -84,6 +84,20 @@ impl Router {
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
+            // A read across a table's partitions fans out (D317 ticket 4a).
+            match op {
+                ServiceOp::MultiGet(_) => {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    return self
+                        .fan_multi_get(cluster, op, caller, prepaid, deadline)
+                        .await;
+                }
+                ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
+                _ => {}
+            }
             let target = cluster.target(&op)?;
             if let Some(owner) = target {
                 let deadline = deadline.map_or_else(
@@ -340,8 +354,26 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
         | ServiceOp::Commit(_)
         | ServiceOp::Abort(_) => Err(later("a transaction", 3)),
         ServiceOp::OpenSnapshot(_) | ServiceOp::ReleaseSnapshot(_) => Err(later("a snapshot", 3)),
-        ServiceOp::MultiGet(_)
-        | ServiceOp::Scan(_)
+        // One partition's keys of a multi-get another node fans out (D317 ticket 4a): every
+        // key in that partition. A client's multi-get fans out before it gets here.
+        ServiceOp::MultiGet(r) => {
+            let mut parts = r.keys.iter().map(|k| one(&r.table, k));
+            match parts.next() {
+                None => Err(ApiError::invalid("a forwarded multi-get with no keys")),
+                Some(first) => {
+                    let first = first?;
+                    for p in parts {
+                        if p? != first {
+                            return Err(ApiError::invalid(
+                                "a forwarded multi-get's keys are in more than one partition",
+                            ));
+                        }
+                    }
+                    Ok(first)
+                }
+            }
+        }
+        ServiceOp::Scan(_)
         | ServiceOp::Nearest(_)
         | ServiceOp::Traverse(_)
         | ServiceOp::VectorSearch(_)
@@ -360,7 +392,7 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
 
 /// A partition the map gives this node that it doesn't have open: it opens partitions at
 /// start, and moving one in is D317's ticket 6.
-fn not_open(partition: &str) -> ApiError {
+pub(crate) fn not_open(partition: &str) -> ApiError {
     ApiError::partition_unavailable(format!(
         "the map gives this node partition {partition:?}, but it isn't open here: a node \
          opens its partitions at start, and relocation comes with D317's ticket 6"
@@ -368,7 +400,7 @@ fn not_open(partition: &str) -> ApiError {
 }
 
 /// A call a later D317 ticket brings to a cluster.
-fn later(what: &str, ticket: u32) -> ApiError {
+pub(crate) fn later(what: &str, ticket: u32) -> ApiError {
     ApiError::unsupported(format!(
         "{what} in a cluster comes with D317's ticket {ticket}"
     ))
