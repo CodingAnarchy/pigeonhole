@@ -115,6 +115,14 @@ impl Signal {
         self.notify();
     }
 
+    /// Records that the consumer has work beyond its queue, as a woken task does, without
+    /// notifying: a caller's turn leaving work for the driver (#1176), which notifies after
+    /// it releases the shard. The consumer's checks before sleeping read the flag, and its
+    /// next turn clears it.
+    pub(crate) fn mark_task_woken(&self) {
+        self.task_woken.store(true, Ordering::Release);
+    }
+
     /// Records an application wake (`ShardDriver::waker`), then notifies: the consumer's next
     /// [`Signal::sleep_unless`] returns at once if it is not asleep already (#592).
     pub(crate) fn notify_app(&self) {

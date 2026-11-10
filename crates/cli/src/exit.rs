@@ -142,6 +142,17 @@ impl Failure {
         }
     }
 
+    /// A call outside what the caller may do: a namespace beyond its token's, on `phdb
+    /// serve`'s `/mcp` (8c-3b).
+    pub(crate) fn permission_denied(message: &str) -> Self {
+        Self {
+            code: "PermissionDenied".into(),
+            code_num: None,
+            message: message.into(),
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// The same failure, naming the script or `-c` line it came from.
     pub(crate) fn at_line(mut self, line: usize) -> Self {
         self.message = format!("line {line}: {}", self.message);
@@ -197,6 +208,18 @@ impl Failure {
             code_num: Some(code as u32),
             message: format!("{context}: {}", e.message()),
             status: status_of(code),
+        }
+    }
+
+    /// A failure with a server's code (`phdb serve`'s `/mcp`: a refusal from the service
+    /// layer, as its tools' result).
+    #[cfg(feature = "serve")]
+    pub(crate) fn served(code: &str, code_num: u32, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            code_num: Some(code_num),
+            message: message.into(),
+            status: ExitStatus::ERROR,
         }
     }
 

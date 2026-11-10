@@ -122,6 +122,12 @@ pub(crate) struct ServeArgs {
     /// stream's queued delivery.
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(16_384..))]
     pub http2_send_buffer: Option<u64>,
+    /// How long a shard thread polls its queue before it sleeps, in microseconds, or
+    /// `adaptive` for the library's default (D198). The server's default is 0, no poll: a
+    /// network round trip dwarfs the wakeup a poll saves, and on a busy server the poll was
+    /// about a quarter to half of the CPU per put (D198 amendment 4, #1644).
+    #[arg(long, value_name = "US|adaptive", default_value = "0")]
+    pub shard_spin: ShardSpin,
     /// How long in-flight requests may take to finish at shutdown, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 10_000)]
     pub shutdown_grace_ms: u64,
@@ -192,6 +198,29 @@ pub(crate) struct ServeArgs {
     /// that doesn't pulls it later.
     #[arg(long, value_name = "MS", default_value_t = 2_000, requires = "cluster")]
     pub cluster_push_timeout_ms: u64,
+    /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
+    /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
+    pub mcp_max_result_bytes: usize,
+    /// The longest value a `/mcp` read returns whole by default, as with `phdb mcp
+    /// --max-value-bytes`.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 << 10)]
+    pub mcp_max_value_bytes: usize,
+    /// How long a `/mcp` session may sit idle between requests, in milliseconds, before it
+    /// ends (the client then gets 404 and starts a new session).
+    #[arg(long, value_name = "MS", default_value_t = 30 * 60 * 1000)]
+    pub mcp_session_idle_ms: u64,
+    /// The longest a `/mcp` session lives, in milliseconds, however busy.
+    #[arg(long, value_name = "MS", default_value_t = 24 * 60 * 60 * 1000)]
+    pub mcp_session_lifetime_ms: u64,
+    /// Requests one `/mcp` session may have running at once. One past it waits briefly,
+    /// then gets a retryable error.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub mcp_session_requests: usize,
+    /// The bytes one `/mcp` session may keep for its cursors (a cut traversal's result).
+    /// A larger result isn't kept: its cursor runs the traversal again.
+    #[arg(long, value_name = "BYTES", default_value_t = 8 << 20)]
+    pub mcp_session_cache_bytes: usize,
 }
 
 impl ServeArgs {
@@ -224,6 +253,10 @@ pub(crate) struct Limits {
     pub request_timeout: Duration,
     pub stream_idle: Duration,
     pub leases: Leases,
+    /// The remote MCP tools' result limits and a session's cursor cache.
+    pub mcp: crate::mcp::Limits,
+    /// Requests one `/mcp` session may have running at once.
+    pub mcp_session_requests: usize,
 }
 
 impl ServeArgs {
@@ -255,7 +288,16 @@ impl ServeArgs {
                 snapshot_lifetime: Duration::from_millis(self.snapshot_lifetime_ms.max(1)),
                 max_sessions: self.max_sessions.max(1),
                 max_per_token: self.max_sessions_per_token.max(1),
+                mcp_idle: Duration::from_millis(self.mcp_session_idle_ms.max(1)),
+                mcp_lifetime: Duration::from_millis(self.mcp_session_lifetime_ms.max(1)),
             },
+            mcp: crate::mcp::Limits {
+                result_bytes: self.mcp_max_result_bytes,
+                value_bytes: self.mcp_max_value_bytes,
+                feed_bytes: None,
+                cache_bytes: self.mcp_session_cache_bytes,
+            },
+            mcp_session_requests: self.mcp_session_requests.max(1),
         }
     }
 }
@@ -284,9 +326,52 @@ pub(crate) fn check_bind(
     ))
 }
 
+/// `--shard-spin`'s largest window: 10 ms.
+const MAX_SHARD_SPIN_US: u64 = 10_000;
+
+/// `--shard-spin`: the shard threads' poll before they sleep (D198 amendment 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardSpin {
+    /// The library's default for the CPU profile (D198: adaptive under `Embedded`).
+    Adaptive,
+    /// A fixed window, in microseconds; 0 doesn't poll.
+    Micros(u64),
+}
+
+impl std::str::FromStr for ShardSpin {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        if s == "adaptive" {
+            return Ok(Self::Adaptive);
+        }
+        let us: u64 = s
+            .parse()
+            .map_err(|_| format!("{s:?}: microseconds, or `adaptive`"))?;
+        // A poll past this is a typo, not a setting: it would hold a CPU per shard through
+        // every gap of up to that long (cli692's N1 on #1680).
+        if us > MAX_SHARD_SPIN_US {
+            return Err(format!(
+                "{us} µs: at most {MAX_SHARD_SPIN_US} µs (the library's own cap is 1 ms)"
+            ));
+        }
+        Ok(Self::Micros(us))
+    }
+}
+
+impl ShardSpin {
+    /// Applies it to the engine's options.
+    pub(crate) fn apply(self, options: pigeonhole::Options) -> pigeonhole::Options {
+        match self {
+            Self::Adaptive => options,
+            Self::Micros(us) => options.shard_spin(Duration::from_micros(us)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check_bind;
+    use super::{ShardSpin, check_bind};
 
     #[test]
     fn a_reachable_address_needs_tls_and_tokens() {
@@ -306,5 +391,16 @@ mod tests {
             "{e}"
         );
         assert!(check_bind("[::1]:7448".parse().unwrap(), false, false, false).is_ok());
+    }
+
+    #[test]
+    fn shard_spin_takes_microseconds_or_adaptive() {
+        assert_eq!("0".parse::<ShardSpin>(), Ok(ShardSpin::Micros(0)));
+        assert_eq!("200".parse::<ShardSpin>(), Ok(ShardSpin::Micros(200)));
+        assert_eq!("adaptive".parse::<ShardSpin>(), Ok(ShardSpin::Adaptive));
+        assert!("1ms".parse::<ShardSpin>().is_err());
+        assert!("-1".parse::<ShardSpin>().is_err());
+        assert_eq!("10000".parse::<ShardSpin>(), Ok(ShardSpin::Micros(10_000)));
+        assert!("1000000".parse::<ShardSpin>().is_err());
     }
 }

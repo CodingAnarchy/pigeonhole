@@ -20,14 +20,14 @@ use crate::args::{Cli, MemoryArgs};
 use crate::exit::Failure;
 use crate::open::{self, Db};
 
-mod backend;
+pub(crate) mod backend;
 mod cursor;
 mod embed;
-mod protocol;
+pub(crate) mod protocol;
 // `phdb serve`'s memory core embeds through it (D313 ticket 8a), and so does `phdb mcp` (8b).
 pub(crate) use embed::{EmbedFault, Endpoint};
-mod memory;
-mod tools;
+pub(crate) mod memory;
+pub(crate) mod tools;
 
 /// Result-size limits (`--max-result-bytes`, `--max-value-bytes`).
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +38,14 @@ pub(crate) struct Limits {
     pub value_bytes: usize,
     /// `--change-feed`: turn the change feed on with this retention in bytes.
     pub feed_bytes: Option<u64>,
+    /// The largest traversal result the server keeps for its cursors (#1254), about:
+    /// counted in node-key bytes, plus 4 a node for parents. Past it, a cursor runs the
+    /// traversal again. `phdb serve` keeps one per session, so its bound is smaller.
+    pub cache_bytes: usize,
 }
+
+/// `phdb mcp`'s [`Limits::cache_bytes`]: one session per process.
+pub(crate) const STDIO_CACHE_BYTES: usize = 64 << 20;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
@@ -100,8 +107,8 @@ fn serve(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let protocol = protocol::Core;
-    let mut session = protocol::Session::default();
+    let protocol = protocol::Core::new(protocol::Transport::Stdio);
+    let session = protocol::Session::default();
     let mut line = String::new();
     loop {
         line.clear();
@@ -111,12 +118,12 @@ fn serve(
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = protocol.message(tools, &mut session, &line) {
+        if let Some(reply) = protocol.message(tools, &session, &line) {
             writeln!(output, "{reply}")?;
             output.flush()?;
         }
         // After the reply: tell a client that listed the tools when a call changed them.
-        if let Some(note) = protocol.list_changed(tools, &mut session) {
+        if let Some(note) = protocol.list_changed(tools, &session) {
             writeln!(output, "{note}")?;
             output.flush()?;
         }

@@ -16,3 +16,9 @@ unknown-git = "deny"
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # `paste` is unmaintained, with no vulnerability: a build-time proc macro that `gemm` (under
+  # candle, pigeonhole-embed only) pulls in. Owner, 2026-11-05: D318 Q3. Drop this once gemm
+  # no longer depends on it.
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro via gemm (pigeonhole-embed); D318 Q3" },
+]

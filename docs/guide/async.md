@@ -20,6 +20,12 @@ Every data operation has two forms over the same engine: a blocking method, and 
 
 `ReadTable` (reader processes) has `get_async` and `get_at_async` too, and its `row` and `scan` builders have `read_async` and `stream`.
 
+The companion crates have async forms too, on the same engine (#1560, ICR 0124):
+- **Text search:** `pigeonhole-text`'s `Search::run_async` and `run_with_stats_async` ([Full-text search](text-search.md#async)).
+- **Agent memory:** `pigeonhole-memory`'s `Recall::run_async` and `run_with_stats_async` ([Agent memory](agent-memory.md)).
+
+Both return exactly what their blocking `run` returns, yield after a bounded amount of work, and give `Send` futures. A recall still reads a row's later blocks synchronously in a few key-set reads (see [When an async read blocks](#when-an-async-read-blocks)).
+
 ## Any executor, no blocking pool
 The futures depend only on `std::task`, so they run on Tokio, smol, async-std or your own executor. None of them spawns a thread or uses `spawn_blocking`:
 
@@ -142,7 +148,6 @@ A few rare cases still read synchronously, inside the future or, for a read whos
 - a separated (blob) value larger than the blob cache limit (an eighth of the block cache, capped at 1 MiB);
 - a block the cache cannot keep (a cache of size 0, or a block larger than a cache shard), or a single read needing more than 64 fetches;
 - a scan step that needs a block the stream did not predict (for example, after a long skip over deleted or filtered cells).
-- a row longer than one block, read through a set of keys: the multi-get (`KeyRows::next_async`), a traversal (`Traverse::run_async`) and a nearest-neighbour search over keys. Each key's first block is fetched asynchronously, and its later blocks are read synchronously. Until [#1652](https://github.com/CodingAnarchy/pigeonhole/issues/1652) closes this, a `pigeonhole-memory` recall (`Recall::run_async`) reads at most a block or two synchronously. In tests, 28 of 7,680 cold recalls under load read one, and none read two.
 
 Making scan steps resumable, so the last case never blocks, is tracked in [#398](https://github.com/CodingAnarchy/pigeonhole/issues/398).
 

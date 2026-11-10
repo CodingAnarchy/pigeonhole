@@ -280,3 +280,28 @@ jobs:
         env:
           PROPTEST_CASES: 8
           MIRIFLAGS: -Zmiri-disable-isolation
+
+  # pigeonhole-embed's reference test (D318): the local model's vectors against
+  # sentence-transformers'. It needs the model's files (133 MB): restored from the cache, keyed
+  # on their pinned SHA-256s, or downloaded by the crate's own (ignored) download test on a miss.
+  embed-reference:
+    name: embed (reference vectors)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PIGEONHOLE_EMBED_CACHE: ${{ github.workspace }}/.embed-cache
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .embed-cache
+          # model.safetensors, tokenizer.json, config.json: their SHA-256s' first 12 digits.
+          key: embed-bge-small-en-v1.5-5c38ec7c-3c9f31665447-d241a60d5e8f-094f8e891b93
+      - name: model files (download on a cache miss)
+        run: cargo test --release -p pigeonhole-embed --test download -- --ignored
+      - name: reference vectors
+        run: cargo test --release -p pigeonhole-embed --test reference -- --nocapture
+        env:
+          PIGEONHOLE_EMBED_MODEL_DIR: ${{ github.workspace }}/.embed-cache/bge-small-en-v1.5@5c38ec7c405ec4b44b94cc5a9bb96e735b38267a

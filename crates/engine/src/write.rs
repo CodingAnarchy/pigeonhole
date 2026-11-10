@@ -557,7 +557,7 @@ impl Submission {
         if forked(&self.shared) {
             return Err(crate::engine::forked());
         }
-        wait_body(&self.shared, &mut self.waiter, self.spins)
+        wait_body(&self.shared, &mut self.waiter, self.spins, None)
     }
 }
 
@@ -591,18 +591,34 @@ pub(crate) fn wait_blocking(
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
 ) -> crate::Result<CommitInfo> {
-    let r = wait_body(shared, waiter, spins);
+    let r = wait_body(shared, waiter, spins, None);
+    let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
+    r
+}
+
+/// [`wait_blocking`] for a commit sent to `shard`, which this thread may run itself while
+/// its wait spins, with caller-runs on (D321).
+pub(crate) fn wait_blocking_on(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    spins: bool,
+    shard: pigeonhole_runtime::ShardId,
+) -> crate::Result<CommitInfo> {
+    let r = wait_body(shared, waiter, spins, Some(shard));
     let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
     r
 }
 
 /// The wait of a submitted commit: its reply, then visibility (D19), spinning first for a
-/// commit that may (D198).
+/// commit that may (D198). With `caller` and caller-runs on, the spinning wait may run that
+/// shard's turn ([`wait_as_caller`], out of line: with caller-runs off, the wait pays only
+/// the option's test, on the spinning path).
 #[inline]
 fn wait_body(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
+    caller: Option<pigeonhole_runtime::ShardId>,
 ) -> crate::Result<CommitInfo> {
     let window = if spins { shared.commit_spin_nanos } else { 0 };
     if window == 0 {
@@ -611,6 +627,11 @@ fn wait_body(
         recycle(batch);
         wait_visible(shared, info.seqno)?;
         return Ok(info);
+    }
+    if let Some(shard) = caller
+        && let Some(callers) = shared.callers.get()
+    {
+        return wait_as_caller(shared, waiter, &callers[usize::from(shard.0)]);
     }
     let mut spin = SpinWait::new(window);
     let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
@@ -1353,5 +1374,75 @@ impl Txn {
                 None,
             )?
             .wait()
+    }
+}
+
+// ---- caller-runs (#1176) -----------------------------------------------------------------
+//
+// Kept apart from the waits above, which run exactly as without it: with caller-runs off a
+// blocking commit's spinning wait pays one test of the option for it (`wait_body`), and the
+// rest is out of line, so the instruction ceilings (D193) hold (D321).
+
+/// Caller-runs (#1176 rev 3.1, C3): a waiting committer tries its shard's run token once
+/// every this many polls, about a microsecond apart, so polling clients load the run word
+/// rarely enough to stay off the lines its holder writes.
+const CALLER_POLLS: u32 = 32;
+
+/// [`wait_body`]'s spinning wait for a commit with caller-runs on: while it waits, this
+/// thread may run its shard's turn itself whenever no thread is running it.
+#[cold]
+#[inline(never)]
+fn wait_as_caller(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    entry: &pigeonhole_runtime::CallerEntry,
+) -> crate::Result<CommitInfo> {
+    let mut spin = SpinWait::new(shared.commit_spin_nanos);
+    let Settled { info, batch } = wait_reply_as_caller(shared, waiter, &mut spin, entry)?;
+    recycle(batch);
+    wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    Ok(info)
+}
+
+/// [`wait_reply_spinning`], trying the shard's run token every [`CALLER_POLLS`] polls.
+fn wait_reply_as_caller<T: Send>(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<T>>,
+    spin: &mut SpinWait,
+    entry: &pigeonhole_runtime::CallerEntry,
+) -> crate::Result<T> {
+    if shared.drivers.current_drives() {
+        // A thread that drives a shard never blocks here (D88): as `wait_reply_spinning`.
+        return wait_reply_spinning(shared, waiter, spin);
+    }
+    // The work hint: this commit is queued until its turn takes it.
+    entry.note_sent();
+    let mut polled = None;
+    let ready_now = |waiter: &mut Waiter<crate::Result<T>>, polled: &mut Option<_>| {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(&mut *waiter).poll(&mut cx) {
+            Poll::Pending => false,
+            ready => {
+                *polled = Some(ready);
+                true
+            }
+        }
+    };
+    let mut polls = 0u32;
+    spin.poll(|| {
+        if ready_now(waiter, &mut polled) {
+            return true;
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(CALLER_POLLS) {
+            entry.try_run(&mut || ready_now(waiter, &mut polled));
+            return polled.is_some();
+        }
+        false
+    });
+    match polled {
+        Some(Poll::Ready(Some(r))) => r,
+        Some(Poll::Ready(None)) => Err(dropped_reply(shared)),
+        _ => park_for_reply(shared, waiter),
     }
 }

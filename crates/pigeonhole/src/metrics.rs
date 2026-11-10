@@ -442,6 +442,8 @@ pub(crate) fn internal(
         ("shard_wakes", m.shard_idle.1),
         ("shard_pool_busy_nanos", m.shard_pool_busy_nanos),
         ("shard_spin_time_nanos", m.shard_spin_time_nanos),
+        ("caller_turns", m.caller_turns),
+        ("caller_backstop_wakes", m.caller_backstop_wakes),
         ("shard_commit_inflight_nanos", m.shard_commit_inflight_nanos),
         ("commit_parks", m.commit_parks),
         (

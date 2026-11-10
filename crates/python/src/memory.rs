@@ -971,6 +971,15 @@ struct RecallArgs {
 
 impl RecallArgs {
     fn run(self, r: mem::Recall<'_>) -> mem::Result<(Vec<mem::RecallHit>, mem::RecallStats)> {
+        let (r, snapshot) = self.configure(r);
+        match &snapshot {
+            Some(s) => r.snapshot(s).run_with_stats(),
+            None => r.run_with_stats(),
+        }
+    }
+
+    /// `r` with every keyword but the snapshot, which it returns for the caller to lend.
+    fn configure(self, r: mem::Recall<'_>) -> (mem::Recall<'_>, Option<pigeonhole::Snapshot>) {
         let mut r = r
             .include_superseded(self.include_superseded)
             .with_signals(self.with_signals)
@@ -986,11 +995,56 @@ impl RecallArgs {
         r = r.maybe(self.weights, |r, w| r.weights(w));
         r = r.maybe(self.expand, |r, x| r.expand(x));
         r = r.maybe(self.session, |r, s| r.session(s));
-        match &self.snapshot {
-            Some(s) => r.snapshot(s).run_with_stats(),
-            None => r.run_with_stats(),
-        }
+        (r, self.snapshot)
     }
+}
+
+/// The store an async recall runs on: the writer's or a reader process's.
+enum Recaller {
+    W(mem::Store),
+    R(Arc<mem::ReadStore>),
+}
+
+/// `recall_async` and `recall_with_stats_async` (#1560 PR 4, ICR 0124): the recall as an
+/// asyncio future, resolving to its hits, or with `with_stats` its hits and stats. The
+/// future owns the store handle and the arguments, and runs the sync recall in its one poll,
+/// on the asyncio pool (ai1249's B1; the offload form g45 picked: a polled
+/// `run_with_stats_async` cost 1.6x a recall's time at one caller and half `to_thread`'s rate
+/// at 16, all of it the per-poll hand-offs).
+fn recall_future<'py>(
+    py: Python<'py>,
+    store: Recaller,
+    a: RecallArgs,
+    with_stats: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (event_loop, fut) = crate::aio::new_future(py)?;
+    crate::aio::start_on_bridge(py, &event_loop, &fut, move || async move {
+        let ns: Vec<&str> = a.namespaces.iter().map(String::as_str).collect();
+        let out = match &store {
+            Recaller::W(s) => {
+                let r = s.recall(&ns);
+                a.run(r)
+            }
+            Recaller::R(s) => {
+                let r = s.recall(&ns);
+                a.run(r)
+            }
+        };
+        Box::new(move |py: Python<'_>| {
+            let v = out.or_mem().and_then(|o| hits(py, o)).and_then(|(h, st)| {
+                if with_stats {
+                    (h, st).into_py_any(py)
+                } else {
+                    h.into_py_any(py)
+                }
+            });
+            match v {
+                Ok(v) => crate::aio::Entry::Value(v),
+                Err(e) => crate::aio::Entry::Error(e),
+            }
+        }) as crate::aio::Output
+    })?;
+    Ok(fut)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1800,6 +1854,98 @@ impl Store {
         hits(py, out)
     }
 
+    /// `recall(...)` as a coroutine (#1560, ICR 0124): the same hits, with the recall's reads
+    /// asynchronous. It's started on the asyncio bridge's thread rather than polled at
+    /// the call, so a recall's CPU work stays off the event loop. A row longer than a block
+    /// in its key-set reads is still read synchronously (#1652).
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_async<'py>(
+        &self,
+        py: Python<'py>,
+        namespaces: &Bound<'_, PyAny>,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: Option<usize>,
+        candidates: Option<usize>,
+        byte_budget: Option<u64>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        now_us: Option<u64>,
+        half_life: Option<&Bound<'_, PyAny>>,
+        fusion: &str,
+        weights: Option<&Bound<'_, Weights>>,
+        include_superseded: bool,
+        session: Option<String>,
+        with_signals: bool,
+        with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let a = recall_args(
+            namespaces,
+            text,
+            embedding,
+            k,
+            candidates,
+            byte_budget,
+            snapshot,
+            now_us,
+            half_life,
+            fusion,
+            weights,
+            include_superseded,
+            session,
+            with_signals,
+            with_embeddings,
+            expand,
+        )?;
+        recall_future(py, Recaller::W(self.handle()?), a, false)
+    }
+
+    /// `recall_with_stats(...)` as a coroutine: `recall_async`'s hits, with its
+    /// `RecallStats`.
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_with_stats_async<'py>(
+        &self,
+        py: Python<'py>,
+        namespaces: &Bound<'_, PyAny>,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: Option<usize>,
+        candidates: Option<usize>,
+        byte_budget: Option<u64>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        now_us: Option<u64>,
+        half_life: Option<&Bound<'_, PyAny>>,
+        fusion: &str,
+        weights: Option<&Bound<'_, Weights>>,
+        include_superseded: bool,
+        session: Option<String>,
+        with_signals: bool,
+        with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let a = recall_args(
+            namespaces,
+            text,
+            embedding,
+            k,
+            candidates,
+            byte_budget,
+            snapshot,
+            now_us,
+            half_life,
+            fusion,
+            weights,
+            include_superseded,
+            session,
+            with_signals,
+            with_embeddings,
+            expand,
+        )?;
+        recall_future(py, Recaller::W(self.handle()?), a, true)
+    }
+
     /// One forget pass (T2): under `policy` if given, else the store's persisted one
     /// (`InvalidArgument` with neither); `after` resumes where an earlier pass stopped.
     #[pyo3(signature = (*, policy=None, after=None, now_us=None))]
@@ -2127,6 +2273,98 @@ impl ReadStore {
             })
             .or_mem()?;
         hits(py, out)
+    }
+
+    /// `recall(...)` as a coroutine (#1560, ICR 0124): the same hits, with the recall's reads
+    /// asynchronous, in a reader process too. It's started on the asyncio bridge's thread rather than polled at
+    /// the call, so a recall's CPU work stays off the event loop. A row longer than a block
+    /// in its key-set reads is still read synchronously (#1652).
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_async<'py>(
+        &self,
+        py: Python<'py>,
+        namespaces: &Bound<'_, PyAny>,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: Option<usize>,
+        candidates: Option<usize>,
+        byte_budget: Option<u64>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        now_us: Option<u64>,
+        half_life: Option<&Bound<'_, PyAny>>,
+        fusion: &str,
+        weights: Option<&Bound<'_, Weights>>,
+        include_superseded: bool,
+        session: Option<String>,
+        with_signals: bool,
+        with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let a = recall_args(
+            namespaces,
+            text,
+            embedding,
+            k,
+            candidates,
+            byte_budget,
+            snapshot,
+            now_us,
+            half_life,
+            fusion,
+            weights,
+            include_superseded,
+            session,
+            with_signals,
+            with_embeddings,
+            expand,
+        )?;
+        recall_future(py, Recaller::R(self.store()?), a, false)
+    }
+
+    /// `recall_with_stats(...)` as a coroutine: `recall_async`'s hits, with its
+    /// `RecallStats`.
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn recall_with_stats_async<'py>(
+        &self,
+        py: Python<'py>,
+        namespaces: &Bound<'_, PyAny>,
+        text: Option<String>,
+        embedding: Option<Vec<f32>>,
+        k: Option<usize>,
+        candidates: Option<usize>,
+        byte_budget: Option<u64>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        now_us: Option<u64>,
+        half_life: Option<&Bound<'_, PyAny>>,
+        fusion: &str,
+        weights: Option<&Bound<'_, Weights>>,
+        include_superseded: bool,
+        session: Option<String>,
+        with_signals: bool,
+        with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let a = recall_args(
+            namespaces,
+            text,
+            embedding,
+            k,
+            candidates,
+            byte_budget,
+            snapshot,
+            now_us,
+            half_life,
+            fusion,
+            weights,
+            include_superseded,
+            session,
+            with_signals,
+            with_embeddings,
+            expand,
+        )?;
+        recall_future(py, Recaller::R(self.store()?), a, true)
     }
 }
 

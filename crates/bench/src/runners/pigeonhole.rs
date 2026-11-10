@@ -51,6 +51,8 @@ pub(crate) struct Settings {
     /// The cap of a shard's adaptive idle spin (`Options::shard_spin_cap`, #1176), in
     /// microseconds; `None`: the library default.
     pub(crate) shard_spin_cap_micros: Option<u64>,
+    /// Caller-runs, D321 (`Options::caller_runs`): off unless set.
+    pub(crate) caller_runs: bool,
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     pub(crate) shard_threads: Option<usize>,
@@ -518,6 +520,20 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Caller-runs, D321 (`Options::caller_runs`): a committing client runs
+    /// its idle shard's turn itself.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("caller_runs"));
+    /// assert!(PigeonholeRunner::default().caller_runs(true).describe().contains(" caller_runs"));
+    /// ```
+    pub fn caller_runs(mut self, on: bool) -> Self {
+        self.settings.caller_runs = on;
+        self
+    }
+
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     ///
@@ -902,6 +918,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(us) = s.shard_spin_cap_micros {
         options = options.shard_spin_cap(Duration::from_micros(us));
     }
+    if s.caller_runs {
+        options = options.caller_runs(true);
+    }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
     }
@@ -1263,6 +1282,9 @@ impl Runner for PigeonholeRunner {
         }
         if let Some(us) = s.shard_spin_cap_micros {
             _ = write!(d, " shard_spin_cap={us}us");
+        }
+        if s.caller_runs {
+            d.push_str(" caller_runs");
         }
         if let Some(k) = s.shard_threads {
             _ = write!(d, " shard_threads={k}");
@@ -1864,6 +1886,8 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         unpin_passes: im("wal_unpin_passes"),
         unpin_flushes: im("wal_unpin_flushes"),
         wal_inline_syncs: im("wal_inline_syncs"),
+        caller_turns: im("caller_turns"),
+        caller_backstop_wakes: im("caller_backstop_wakes"),
         file_growths: m.file_growths,
         file_growth_nanos: m.file_growth_nanos,
         file_growths_ahead: im("file_growths_ahead"),
@@ -1905,6 +1929,8 @@ pub(crate) const INTERNAL_NAMES: &[&str] = &[
     "wal_unpin_passes",
     "wal_unpin_flushes",
     "wal_inline_syncs",
+    "caller_turns",
+    "caller_backstop_wakes",
     "wal_rollover_blocks",
     "file_growths_ahead",
     "shard_parks",

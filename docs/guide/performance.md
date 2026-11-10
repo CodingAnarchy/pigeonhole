@@ -21,3 +21,77 @@ Pigeonhole is often weighed against SQLite: both are embedded, single-file store
 If your reads must stay under ~20 µs at the 99th percentile and SQLite's single-writer throughput is enough, SQLite meets that and Pigeonhole doesn't yet. If you need more write throughput, a lower median, or bounded write tails under contention, Pigeonhole is ahead on each.
 
 The benchmark is `phdb-bench` in this repository (`--cache-model total --cache 1073741824`, plus `--offered-rate` for the paced runs; [`docs/bench.md`](../bench.md) has the options). The full results are on [#759](https://github.com/CodingAnarchy/pigeonhole/issues/759); these numbers are its 2026-10-29 re-run on `cba09184`. The 1.0 release gate (2026-10-30, `790ae3a0`) didn't repeat this equal-cache comparison; in its contended runs with a 256 MiB cache, YCSB A's row-read p99 was 37 µs at `Buffered` and 35 µs at `GroupSync`, against 43 and 33 µs on `cba09184`.
+
+## Caller-runs: an opt-in for buffered put tails
+
+Each shard's writes run on that shard's thread. A thread waiting on its commit hands the work over and waits for the shard's thread to run it. When the application's threads keep every CPU busy, the shard's thread can wait for a scheduler slice before it runs, and that wait becomes the put's tail latency.
+
+`Options::caller_runs(true)` lets the waiting thread run the shard's work itself whenever no other thread is running that shard. A shard is still run by one thread at a time. It's off by default.
+
+```rust
+use pigeonhole::{Durability, Options, Pigeonhole};
+
+let db = Pigeonhole::open(
+    "data.phdb",
+    Options::default()
+        .durability(Durability::Buffered)
+        .caller_runs(true),
+)?;
+```
+
+**What it applies to:**
+- **Only** single-shard commits at `Durability::Buffered` or `Durability::None` with no condition (`check_and_mutate`), transaction or returned columns.
+- **Never** cross-shard commits, the default `Durability::GroupSync` (which never engages it), flushes or compactions. Those stay on the shard's thread.
+- **Engine-owned databases only:** with `open_application_owned`, your threads already run the shards.
+
+**Turn it on for** buffered writers of large values or wide rows that care about put tail latency more than throughput. **Leave it off for** hot, short commits.
+
+**Measured** on the same machine as above (16 threads, contended, `Buffered`; Pigeonhole without → with caller-runs):
+
+| Workload | Without | With |
+|---|--:|--:|
+| Sparse wide rows, put p99.9 | 473 µs | 94 µs |
+| YCSB E, put p99.9 | 1.8 ms | 0.24 ms |
+| YCSB A with 16 KiB values, throughput | 97K/s | 110K/s (+13%) |
+| Sparse wide-row deletes, throughput | 87K/s | 97K/s (+11%) |
+| Counters, throughput | 1.70M/s | 1.40M/s (−18%) |
+| YCSB A, throughput | 1.52M/s | 1.36M/s (−10%) |
+| YCSB A, put p99 | 20 µs | 27 µs |
+| Skewed load over many shards, against RocksDB | about level | 1.3–1.4× slower, p99 1.6–1.8× higher |
+
+**The costs:**
+- **Short commits lose throughput:** counters lost 18% and YCSB A and its variants 9–11%.
+- **Put p99 rises 20–40%** on short-commit loads: the committing thread now does the shard's work itself rather than handing it off.
+- **Skewed loads queue:** while one thread runs a hot shard, every other thread committing to that shard waits for it.
+
+With default durability nothing changes, since caller-runs never engages.
+
+The full evaluation is on [#1176](https://github.com/CodingAnarchy/pigeonhole/issues/1176) and [#1502](https://github.com/CodingAnarchy/pigeonhole/pull/1502). The decision is D321.
+
+## Allocator
+
+Pigeonhole's library crates don't choose a memory allocator: your application's global allocator is the one they use. On Linux with glibc's malloc, that costs throughput on read-heavy work at high thread counts. The cost isn't lock waits so much as glibc's own allocation paths and freeing on a different thread than allocated, which the engine does when it evicts cached blocks and when you drop rows on another thread.
+
+Measured on the AX102 (AMD Ryzen 9 7950X3D, 32 threads, Linux 6.8, glibc 2.39), `phdb-bench` at full scale, two runs per allocator (#1558):
+
+| workload | glibc malloc | jemalloc 5.3 | mimalloc 2.1 |
+|---|--:|--:|--:|
+| YCSB C (point reads), 32 threads | 3.36–3.38M ops/s | 4.01–4.12M (+21%) | 4.36–4.44M (+31%) |
+| Sparse wide rows, 16 threads, `Buffered` | 100–110K | 118–121K (+13%) | 98–100K (−5%) |
+| YCSB A, 16 threads, `Buffered` | 1.56–1.58M | 1.69–1.72M (+9%) | 1.68M (+7%) |
+
+- **jemalloc** was faster on every workload, for 0–20% more peak memory. It's what the `phdb` binary uses.
+- **mimalloc** was fastest on point reads, but slower on large, growing rows and used up to 30% more memory on YCSB C.
+- **glibc's tunables** (a larger thread cache, `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024:glibc.malloc.tcache_max=65536`) made point reads 10% slower. Don't use them for this.
+
+**In a Rust application,** set the global allocator in your binary, not in a library:
+
+```rust,ignore
+// Cargo.toml: tikv-jemallocator = "0.7"   (not on Windows)
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+```
+
+**From Python or Ruby,** the interpreter's allocator applies. On Linux you can preload jemalloc for the process, for example `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 python app.py` (from the `libjemalloc2` package on Debian and Ubuntu). Measure your own workload first: the gain depends on how many threads read at once.
+
+**The `phdb` binary** (CLI, `phdb serve`, `phdb mcp`) is built with jemalloc on every platform but Windows, as the default `jemalloc` feature of `pigeonhole-cli`. Building it needs a C compiler and `make`. To build without it: `cargo install pigeonhole-cli --no-default-features --features embed`.

@@ -11,14 +11,52 @@ use common::TempDir;
 use pigeonhole::{Options, Pigeonhole};
 use serde_json::{Value, json};
 
-/// A running `phdb mcp`.
+/// Whether this thread's servers are `phdb serve`'s `/mcp` rather than `phdb mcp` (D313
+/// ticket 8c-3a): the [`over_http`] tests run the same bodies with it set, so both
+/// transports must give the same answers.
+mod transport {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HTTP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn http() -> bool {
+        HTTP.with(Cell::get)
+    }
+
+    #[cfg_attr(not(all(feature = "serve", unix)), allow(dead_code))]
+    pub fn set_http() {
+        HTTP.with(|h| h.set(true));
+    }
+}
+
+/// A running `phdb mcp`, or `phdb serve` driven over `/mcp`.
 struct Server {
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    io: Io,
     next_id: u64,
     /// Notifications the server sent, in order (#1356).
     notes: Vec<Value>,
+}
+
+enum Io {
+    /// One JSON-RPC message per line on the child's standard input and output.
+    Stdio {
+        stdin: Option<ChildStdin>,
+        stdout: BufReader<ChildStdout>,
+    },
+    /// `POST /mcp`, one message per request; the replies wait in `replies`.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    Http {
+        /// `None` when the server exited before it served (a startup refusal).
+        url: Option<String>,
+        agent: ureq::Agent,
+        session: Option<String>,
+        version: Option<String>,
+        replies: std::collections::VecDeque<Value>,
+        stderr: std::sync::mpsc::Receiver<String>,
+    },
 }
 
 impl Server {
@@ -50,6 +88,9 @@ impl Server {
 
     /// [`spawn`](Self::spawn) with environment variables set for the server.
     fn spawn_env(path: &Path, flags: &[&str], env: &[(&str, &str)]) -> Self {
+        if transport::http() {
+            return Self::spawn_http(path, flags, env);
+        }
         let mut child = Command::new(env!("CARGO_BIN_EXE_phdb"))
             .arg("mcp")
             .arg(path)
@@ -64,8 +105,86 @@ impl Server {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Self {
             child,
-            stdin,
-            stdout,
+            io: Io::Stdio { stdin, stdout },
+            next_id: 1,
+            notes: Vec::new(),
+        }
+    }
+
+    /// `phdb serve <path>` on a loopback port, with `phdb mcp`'s flags given their `/mcp`
+    /// names.
+    fn spawn_http(path: &Path, flags: &[&str], env: &[(&str, &str)]) -> Self {
+        let flags: Vec<&str> = flags
+            .iter()
+            .map(|f| match *f {
+                "--max-result-bytes" => "--mcp-max-result-bytes",
+                "--max-value-bytes" => "--mcp-max-value-bytes",
+                "--read-only" => panic!("phdb serve has no --read-only: test a read token"),
+                other => other,
+            })
+            .collect();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_phdb"))
+            .arg("serve")
+            .arg(path)
+            .args(["--listen", "127.0.0.1:0"])
+            .args(&flags)
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Its stderr, line by line: the first `serving ... on <addr>` gives the port.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        std::thread::spawn(move || {
+            for line in stderr.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        // Lines before it are kept for `finish`; a server that exits first (a startup
+        // refusal) closes its stderr, and `finish` reports its status.
+        let (keep, rx_kept) = std::sync::mpsc::channel();
+        let mut url = None;
+        while url.is_none() {
+            let line = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(e) => panic!("phdb serve didn't start: {e}"),
+            };
+            if let Some(rest) = line.split(" on ").nth(1)
+                && line.starts_with("phdb serve: serving")
+            {
+                let addr = rest.split_whitespace().next().unwrap();
+                url = Some(format!("http://{addr}/mcp"));
+            }
+            keep.send(line).unwrap();
+        }
+        // The rest of its stderr, after the lines already read.
+        std::thread::spawn(move || {
+            for line in rx {
+                if keep.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let rx = rx_kept;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self {
+            child,
+            io: Io::Http {
+                url,
+                agent,
+                session: None,
+                version: None,
+                replies: std::collections::VecDeque::new(),
+                stderr: rx,
+            },
             next_id: 1,
             notes: Vec::new(),
         }
@@ -76,17 +195,78 @@ impl Server {
     }
 
     fn send_line(&mut self, line: &str) {
-        let stdin = self.stdin.as_mut().unwrap();
-        writeln!(stdin, "{line}").unwrap();
-        stdin.flush().unwrap();
+        match &mut self.io {
+            Io::Stdio { stdin, .. } => {
+                let stdin = stdin.as_mut().unwrap();
+                writeln!(stdin, "{line}").unwrap();
+                stdin.flush().unwrap();
+            }
+            Io::Http {
+                url,
+                agent,
+                session,
+                version,
+                replies,
+                ..
+            } => {
+                let url = url.as_deref().expect("phdb serve exited at startup");
+                let mut req = agent
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream");
+                if let Some(id) = session {
+                    req = req.header("mcp-session-id", id.as_str());
+                }
+                if let Some(v) = version {
+                    req = req.header("mcp-protocol-version", v.as_str());
+                }
+                let mut resp = req.send(line).unwrap();
+                let status = resp.status().as_u16();
+                if let Some(id) = resp.headers().get("mcp-session-id") {
+                    *session = Some(id.to_str().unwrap().to_owned());
+                }
+                let sse = resp
+                    .headers()
+                    .get("content-type")
+                    .is_some_and(|v| v.to_str().unwrap().starts_with("text/event-stream"));
+                let body = resp.body_mut().read_to_string().unwrap();
+                let messages: Vec<Value> = match status {
+                    202 => {
+                        assert!(body.is_empty(), "{body}");
+                        Vec::new()
+                    }
+                    200 if sse => body
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("data: "))
+                        .map(|d| serde_json::from_str(d).unwrap())
+                        .collect(),
+                    200 => vec![serde_json::from_str(&body).unwrap()],
+                    _ => panic!("POST /mcp: {status} {body}"),
+                };
+                for m in messages {
+                    if m.get("id").is_none() && m.get("method").is_some() {
+                        self.notes.push(m);
+                        continue;
+                    }
+                    if let Some(v) = m["result"]["protocolVersion"].as_str() {
+                        *version = Some(v.to_owned());
+                    }
+                    replies.push_back(m);
+                }
+            }
+        }
     }
 
     /// The next reply; notifications before it are kept in `notes`.
     fn reply(&mut self) -> Value {
+        let stdout = match &mut self.io {
+            Io::Stdio { stdout, .. } => stdout,
+            Io::Http { replies, .. } => return replies.pop_front().expect("no reply"),
+        };
         loop {
             let mut line = String::new();
             assert!(
-                self.stdout.read_line(&mut line).unwrap() > 0,
+                stdout.read_line(&mut line).unwrap() > 0,
                 "the server exited"
             );
             let v: Value = serde_json::from_str(&line).unwrap();
@@ -142,14 +322,41 @@ impl Server {
             .collect()
     }
 
-    /// Ends the input and waits for the server to exit, returning its status and stderr.
+    /// Ends the input (over HTTP: the session, then the server, with SIGTERM) and waits for
+    /// the server to exit, returning its status and stderr.
     fn finish(mut self) -> (i32, String) {
-        drop(self.stdin.take());
+        match &mut self.io {
+            Io::Stdio { stdin, .. } => drop(stdin.take()),
+            Io::Http {
+                url,
+                agent,
+                session,
+                ..
+            } => {
+                if let (Some(url), Some(id)) = (url.as_deref(), session.as_deref()) {
+                    let resp = agent
+                        .delete(url)
+                        .header("mcp-session-id", id)
+                        .call()
+                        .unwrap();
+                    assert_eq!(resp.status().as_u16(), 204);
+                }
+                // A server that refused to start has exited already.
+                if url.is_some() {
+                    let killed = Command::new("kill")
+                        .args(["-TERM", &self.child.id().to_string()])
+                        .status()
+                        .unwrap();
+                    assert!(killed.success());
+                }
+            }
+        }
         let out = self.child.wait_with_output().unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+        let stderr = match &self.io {
+            Io::Stdio { .. } => String::from_utf8_lossy(&out.stderr).into_owned(),
+            Io::Http { stderr, .. } => stderr.iter().collect::<Vec<_>>().join("\n"),
+        };
+        (out.status.code().unwrap_or(-1), stderr)
     }
 }
 
@@ -213,7 +420,9 @@ fn a_client_handshakes_and_lists_the_tools() {
     }
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
-    assert!(err.contains("as writer"), "{err}");
+    if !transport::http() {
+        assert!(err.contains("as writer"), "{err}");
+    }
 }
 
 #[test]
@@ -1389,10 +1598,13 @@ fn memory_tools_remember_recall_supersede_and_forget() {
     }
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
-    assert!(
-        err.contains("created memory store agent (no embedding model"),
-        "{err}"
-    );
+    // `phdb mcp`'s startup line; `phdb serve` logs the store's creation its own way.
+    if !transport::http() {
+        assert!(
+            err.contains("created memory store agent (no embedding model"),
+            "{err}"
+        );
+    }
 
     // Reopened, the store is there; a model now is refused, since it has none.
     let mut s = Server::start(&path, &["--memory", "agent"]);
@@ -1481,7 +1693,10 @@ fn a_pinned_store_refuses_another_models_embeddings() {
     );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
-    assert!(err.contains("embedding model m1, 4 dimensions"), "{err}");
+    // `phdb mcp`'s startup line; `phdb serve` logs the store's creation its own way.
+    if !transport::http() {
+        assert!(err.contains("embedding model m1, 4 dimensions"), "{err}");
+    }
 
     // Reopened without a model flag: the pinned one is used. With another: refused.
     let (s, init) = Server::start_env(&path, &["--memory", "agent"], &[]);
@@ -1736,10 +1951,13 @@ fn embed_url_embeds_text_through_the_endpoint() {
     assert!(texts.iter().all(|t| !t.contains("zebra")), "{hits}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
-    assert!(
-        err.contains("embedding model stub-e, 4 dimensions"),
-        "{err}"
-    );
+    // `phdb mcp`'s startup line; `phdb serve` logs the store's creation its own way.
+    if !transport::http() {
+        assert!(
+            err.contains("embedding model stub-e, 4 dimensions"),
+            "{err}"
+        );
+    }
     assert!(!err.contains(key.1), "{err}");
     let seen = stub.requests();
     assert_eq!(seen[0].1["input"], "dimension probe", "{seen:?}");
@@ -1859,4 +2077,96 @@ fn a_correction_is_stored_through_near_dedup() {
     assert_eq!(old["superseded_by"], six["id"], "{hits}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
+}
+
+/// The same tests against `phdb serve`'s `/mcp` (D313 tickets 8c-3a and 8c-3b): the tools
+/// reach the database and the memory store through the service layer there, and must answer
+/// as `phdb mcp` does. (`--read-only` is a reader process, which a server has no
+/// counterpart of: `/mcp`'s read tokens are tested in `serve`'s own tests.)
+#[cfg(all(feature = "serve", unix))]
+mod over_http {
+    fn on_http(test: fn()) {
+        super::transport::set_http();
+        test();
+    }
+
+    #[test]
+    fn a_client_handshakes_and_lists_the_tools() {
+        on_http(super::a_client_handshakes_and_lists_the_tools);
+    }
+
+    #[test]
+    fn protocol_mistakes_are_json_rpc_errors_and_tool_mistakes_are_results() {
+        on_http(super::protocol_mistakes_are_json_rpc_errors_and_tool_mistakes_are_results);
+    }
+
+    #[test]
+    fn create_table_reports_a_bad_family_before_a_bad_name() {
+        on_http(super::create_table_reports_a_bad_family_before_a_bad_name);
+    }
+
+    #[test]
+    fn a_batch_commits_every_operation_or_none() {
+        on_http(super::a_batch_commits_every_operation_or_none);
+    }
+
+    #[test]
+    fn long_results_are_cut_with_cursors_that_continue_them() {
+        on_http(super::long_results_are_cut_with_cursors_that_continue_them);
+    }
+
+    #[test]
+    fn traverse_follows_edges_hop_by_hop() {
+        on_http(super::traverse_follows_edges_hop_by_hop);
+    }
+
+    #[test]
+    fn traverse_pages_come_from_one_cached_result() {
+        on_http(super::traverse_pages_come_from_one_cached_result);
+    }
+
+    #[test]
+    fn vector_families_read_and_write_in_dump_shapes() {
+        on_http(super::vector_families_read_and_write_in_dump_shapes);
+    }
+
+    #[test]
+    fn nearest_ranks_vectors_under_the_selection() {
+        on_http(super::nearest_ranks_vectors_under_the_selection);
+    }
+
+    #[test]
+    fn feed_poll_continues_from_its_token_and_reports_expiry() {
+        on_http(super::feed_poll_continues_from_its_token_and_reports_expiry);
+    }
+
+    #[test]
+    fn a_new_vector_family_announces_nearest() {
+        on_http(super::a_new_vector_family_announces_nearest);
+    }
+    #[test]
+    fn memory_tools_remember_recall_supersede_and_forget() {
+        on_http(super::memory_tools_remember_recall_supersede_and_forget);
+    }
+
+    #[test]
+    fn a_pinned_store_refuses_another_models_embeddings() {
+        on_http(super::a_pinned_store_refuses_another_models_embeddings);
+    }
+
+    #[test]
+    fn a_new_stores_normalization_is_fixed_and_checked_at_startup() {
+        on_http(super::a_new_stores_normalization_is_fixed_and_checked_at_startup);
+    }
+
+    #[test]
+    fn a_correction_is_stored_through_near_dedup() {
+        on_http(super::a_correction_is_stored_through_near_dedup);
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn embed_url_embeds_text_through_the_endpoint() {
+        on_http(super::embed_url_embeds_text_through_the_endpoint);
+    }
 }
