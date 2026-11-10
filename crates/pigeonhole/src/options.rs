@@ -517,19 +517,32 @@ impl Options {
         self
     }
 
-    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
-    /// the API: the default suits applications.
-    ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 200 µs, sized up to 1 ms from the shard's recent gaps; a fixed
-    /// 1 ms with [`CpuProfile::Server`]; a window set here is fixed; D198 as amended
-    /// on 2026-10-19 and 2026-10-30), so a steady stream
-    /// of commits is taken without waking the thread each time, and a store whose clients
-    /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
-    /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
-    /// by application-owned shards, whose loop the application runs.
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
+    /// before it sleeps (D198, ICR 0129). Engine-owned mode only: application-owned shards
+    /// run the application's loop.
+    ///
+    /// - **Default:** 200 µs, sized up to 1 ms from the shard's recent gaps between commits
+    ///   ([`CpuProfile::Embedded`]), or a fixed 1 ms ([`CpuProfile::Server`]). A window set
+    ///   here is fixed.
+    /// - **What it buys:** a steady stream of commits is taken without waking the thread for
+    ///   each one, which saves a wakeup's latency (microseconds, or tens of them on a busy
+    ///   or virtualized host) per commit. An idle database never polls, and polls that keep
+    ///   finding nothing poll less often.
+    /// - **What it costs:** CPU. A shard thread polls through every gap up to the window,
+    ///   so under a steady load it stays busy whether or not work arrives.
+    /// - **`Duration::ZERO`** sleeps at once. Use it for battery-powered or CPU-constrained
+    ///   hosts, and where a commit's latency is dominated by something else, such as a
+    ///   network round trip: `phdb serve` runs without the poll by default, because there
+    ///   it was a quarter to half of the server's CPU per put, and the wakeup it saves is
+    ///   small next to the round trip (D198 amendment 4, #1644).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().shard_spin(Duration::ZERO);
+    /// # let _ = options;
+    /// ```
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
         self

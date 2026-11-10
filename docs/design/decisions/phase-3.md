@@ -172,7 +172,14 @@ RocksDB's sparse-wide `Buffered` put p99 is 17 µs: about 2.9× under `Embedded`
 
 At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. So a window past about 256 µs would cost more poll per gap than 200 µs, and the windows stay at 200–256 µs. That's what keeps the CPU near `Embedded`'s.
 
-*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above).*
+- **Fourth amendment (coordinator, 2026-11-09; #1644, ICR 0129): `phdb serve` runs its shards with no poll, and `Options::shard_spin` is public.** The library's defaults (`Embedded`'s adaptive window, `Server`'s fixed 1 ms) are unchanged.
+  - **Why:** on `phdb serve` at full load (perf287's g51, 16 hubs × 16 subscribers and 0 subscribers, AX102, split CPUs), the drivers are pinned to their own CPUs, so their poll starved no other thread. But it was a quarter to half of the server's CPU per put: 191 → 138 µs at 16 × 16, and 111 → 57 µs at 0 subscribers, with driver CPU 354% → 60% and put p50 level. A network round trip dwarfs the wakeup it saves.
+  - **`phdb serve`:** `shard_spin(Duration::ZERO)` by default. `--shard-spin US` sets a fixed window, and `--shard-spin adaptive` restores the library's.
+  - **To confirm before merge:** perf287's g57, serve's put p50/p99 at a paced 5,000 puts/s and at full load, with the spin unset, 0 and 200 µs. A paced p99 that showed the poll mattering would have made the default a fixed 200 µs instead.
+  - **`Options::shard_spin`** becomes public (ICR 0129), as decision 3 promised: "both windows are documented options that can be set to 0". `shard_spin_cap` and `commit_spin` stay hooks.
+  - **Not done:** a back-off when the poll's CPU is contended, for embedders whose shard threads aren't pinned, is #1678 (#1644's option 1). `sched_yield` yields only within a CPU's own runqueue, so pinned drivers would never see the signal.
+
+*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above). Amended by the coordinator, 2026-11-09 (`phdb serve` doesn't poll, and `Options::shard_spin` is public; the fourth amendment above).*
 
 <a id="d199"></a>
 ## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)
