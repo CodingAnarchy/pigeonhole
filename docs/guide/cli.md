@@ -4,7 +4,7 @@
 
 > **Status:** released in 1.0.0 ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). Every command works: `info`, `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell`. CI installs it from a checkout and runs it.
 
-**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary; from a checkout, `cargo install --path crates/cli`.
+**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary; from a checkout, `cargo install --path crates/cli`. On every platform but Windows, `phdb` uses jemalloc as its memory allocator (the default `jemalloc` feature, D322), which needs a C compiler and `make` to build; [Performance](performance.md#allocator) has the measurements and how to leave it out.
 
 ## Commands
 

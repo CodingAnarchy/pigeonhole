@@ -1,6 +1,13 @@
 //! The `phdb` command-line tool (#692).
 #![forbid(unsafe_code)]
 
+/// jemalloc for the `phdb` binary only (D322, #1558): glibc's malloc cost 9-31% of throughput
+/// on read-heavy work at 16-32 threads, mostly its cross-thread frees. The library crates
+/// choose no allocator; an application picks its own (the guide's "Allocator" section).
+#[cfg(all(feature = "jemalloc", not(windows)))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> std::process::ExitCode {
     let status = pigeonhole_cli::run(
         std::env::args_os(),
