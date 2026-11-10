@@ -149,7 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     epoch();
     let file = prepare(&args)?;
     // The server first, so it doesn't inherit the client's CPUs.
+    let opened = std::time::Instant::now();
     let server = Server::start(&args, &file)?;
+    // perf287 g66 scratch: the server's open, from its start to serving.
+    eprintln!("OPEN {:.2} s", opened.elapsed().as_secs_f64());
     // Then this process's CPUs, before the runtime starts its threads: they inherit them.
     if let Some(list) = &args.client_cpus {
         pin_self(list)?;
@@ -239,6 +242,11 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
             })
             .collect(),
     ));
+    // perf287 g66 scratch (perf2's idle arm): wait this long after the server is up.
+    if let Some(secs) = std::env::var("PH_SETTLE_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        eprintln!("SETTLE {secs} s");
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
     if args.warmup {
         let r = run(&args, &channel, server.pid(), &[]).await?;
         println!(
