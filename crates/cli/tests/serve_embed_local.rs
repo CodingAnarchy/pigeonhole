@@ -36,6 +36,8 @@ impl Serve {
             .arg("serve")
             .arg(db)
             .args(["--create", "--shards", "1", "--listen", "127.0.0.1:0"])
+            // No WAL ring written at start-up (#1681, ICR 0130): a test server takes few writes.
+            .arg("--no-wal-preallocate")
             .args([
                 "--memory",
                 "m",
