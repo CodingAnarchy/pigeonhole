@@ -489,14 +489,22 @@ impl RowShape {
     const CELLS_MAX: u32 = 64;
 
     /// An empty row for `info`'s families, with room for the largest row seen (capped). Not
-    /// the key: a point read moves the caller's key in.
+    /// the key: a point read moves the caller's key in. Its buffers are a row this thread
+    /// dropped, if one is pooled (#1558 item 2), else new.
     #[inline]
     pub(crate) fn buf(&self, info: Arc<TableInfo>) -> RowBuf {
+        let (qualifiers, cells) = (
+            self.qualifiers.load(Relaxed) as usize,
+            self.cells.load(Relaxed) as usize,
+        );
+        let (mut q, mut c) = recycled().unwrap_or_default();
+        q.reserve(qualifiers);
+        c.reserve(cells);
         RowBuf {
             info: Some(info),
             key: Vec::new(),
-            qualifiers: Vec::with_capacity(self.qualifiers.load(Relaxed) as usize),
-            cells: Vec::with_capacity(self.cells.load(Relaxed) as usize),
+            qualifiers: q,
+            cells: c,
             last_family: None,
         }
     }
@@ -512,6 +520,50 @@ impl RowShape {
         }
         grow(&self.qualifiers, buf.qualifiers.len(), Self::QUALIFIERS_MAX);
         grow(&self.cells, buf.cells.len(), Self::CELLS_MAX);
+    }
+}
+
+/// Rows' buffers a thread keeps for its next point reads (#1558 item 2): a dropped row's
+/// qualifiers and cells, emptied, so a thread reading row after row stops allocating them.
+/// Bounded in count and in each buffer's size (twice [`RowShape`]'s caps), so a thread
+/// holds at most a few tens of KiB. A row dropped on another thread feeds that thread's
+/// pool: nothing crosses threads, and no lock is taken.
+const POOLED_ROWS: usize = 4;
+
+type Pooled = (Vec<u8>, Vec<RowCell>);
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Pooled>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A pooled pair of buffers, if this thread has one.
+#[inline]
+fn recycled() -> Option<Pooled> {
+    POOL.try_with(|p| p.try_borrow_mut().ok()?.pop())
+        .ok()
+        .flatten()
+}
+
+impl Drop for RowBuf {
+    fn drop(&mut self) {
+        let (q, c) = (&mut self.qualifiers, &mut self.cells);
+        if q.capacity() == 0
+            || q.capacity() > 2 * RowShape::QUALIFIERS_MAX as usize
+            || c.capacity() > 2 * RowShape::CELLS_MAX as usize
+        {
+            return;
+        }
+        let (mut q, mut c) = (std::mem::take(q), std::mem::take(c));
+        q.clear();
+        c.clear();
+        // At thread exit the pool may be gone; the buffers are then just freed.
+        let _ = POOL.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut()
+                && p.len() < POOLED_ROWS
+            {
+                p.push((q, c));
+            }
+        });
     }
 }
 
@@ -570,8 +622,10 @@ impl RowBuf {
     pub(crate) fn new(info: Arc<TableInfo>, cells: usize) -> Self {
         Self {
             info: Some(info),
+            key: Vec::new(),
+            qualifiers: Vec::new(),
             cells: Vec::with_capacity(cells),
-            ..Self::default()
+            last_family: None,
         }
     }
 

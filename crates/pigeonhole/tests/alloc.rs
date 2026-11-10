@@ -223,7 +223,8 @@ fn row_read_allocations(t: &Table, cells: usize) -> u64 {
 /// second copy of each cell). Its allocations are a constant per read plus the row
 /// buffers' growth, which is logarithmic in the cells, and none once the table's rows have
 /// been seen (#1558 item 1: the buffers are sized from the largest row read, so the wide
-/// read after its warm-up can allocate no more than the 1-cell one).
+/// read after its warm-up can allocate no more than the 1-cell one), and item 2 hands a dropped
+/// row's buffers to the thread's next read.
 #[test]
 fn row_read_allocations_per_cell() {
     let (db, t) = open("row_read");
