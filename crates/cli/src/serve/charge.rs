@@ -189,6 +189,15 @@ fn wrap(mut resp: Response<Body>, idle: Duration) -> Response<Body> {
     else {
         return resp;
     };
+    // A reply within one slice goes to the transport whole, at its first poll, and sits in
+    // the stream's own send buffer, bounded per stream (cli692's (a)): its charge is freed
+    // here, with no body wrapper to allocate or watchdog to start (#1567).
+    // The charge is the reply's size by now: trimmed to the encoded message (gRPC), or
+    // fitted to the rendered body (HTTP/JSON).
+    if charge.bytes() <= PIECE {
+        drop(charge);
+        return resp;
+    }
     let grpc = resp
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
