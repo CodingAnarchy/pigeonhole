@@ -724,6 +724,13 @@ pub struct Stalls {
     pub unpin_flushes: u64,
     /// WAL rollovers synced on a shard thread (#19).
     pub wal_inline_syncs: u64,
+    /// Caller-runs (#1176): turns committing clients ran on their shards.
+    #[serde(default)]
+    pub caller_turns: u64,
+    /// Caller-runs: lost wakes the 100 ms park backstop recovered: a shard had work when the
+    /// park ran out and no notify had signalled it (#1502; should be 0).
+    #[serde(default)]
+    pub caller_backstop_wakes: u64,
     /// File growths, and the time they held the page allocator (#28, #182).
     pub file_growths: u64,
     /// See [`Stalls::file_growths`].
@@ -855,6 +862,8 @@ impl Stalls {
             unpin_passes: d(before.unpin_passes, after.unpin_passes),
             unpin_flushes: d(before.unpin_flushes, after.unpin_flushes),
             wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
+            caller_turns: d(before.caller_turns, after.caller_turns),
+            caller_backstop_wakes: d(before.caller_backstop_wakes, after.caller_backstop_wakes),
             file_growths: d(before.file_growths, after.file_growths),
             file_growth_nanos: d(before.file_growth_nanos, after.file_growth_nanos),
             file_growths_ahead: d(before.file_growths_ahead, after.file_growths_ahead),

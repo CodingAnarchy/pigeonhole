@@ -724,6 +724,10 @@ struct AsyncScan {
     /// cursors stood ([`Lane::block_stamp`]): a cell step probes again only once they move
     /// to another block, not per cell (perf287 on #1625).
     probed: Option<(usize, u64)>,
+    /// Where the lane stood when its last cell fetch started: once it has moved on, the
+    /// blocks pinned for it are released, for a reader stepping with `next_cell` between
+    /// [`ScanCursor::poll_cell_ready`]s, which `poll_cell`'s own release doesn't cover.
+    pinned_at: Option<(usize, u64)>,
     /// A seek's column is encoded here first, then swapped into `target` if it is the one
     /// kept: no allocation per seek (perf287 on #1625).
     scratch: Vec<u8>,
@@ -762,16 +766,8 @@ impl AsyncScan {
     /// Starts fetching the first uncached block `lane`'s sources read next (one ahead, D196):
     /// whether one was started.
     fn prefetch(&mut self, lane: &Lane) -> bool {
-        let mut upcoming = Vec::new();
-        for source in lane.resolver.cursor().sources() {
-            source.upcoming(1, &mut upcoming);
-            if let Some(fetch) = upcoming.pop() {
-                let completion = fetch.submit();
-                self.fetch = Some((completion, Box::new(fetch)));
-                return true;
-            }
-        }
-        false
+        self.fetch = submit_next_block(lane);
+        self.fetch.is_some()
     }
 
     /// Counts the file reads an attempt made synchronously.
@@ -783,6 +779,24 @@ impl AsyncScan {
                 .fetch_add(reads, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Submits the read of the first uncached block `lane`'s sources read next (one ahead,
+/// D196), if any. Every source the lane's next step moves is asked in turn, a shadowed
+/// version's older SST too (perf287 on #1652): a fetch admitted, the caller asks again and
+/// the next source's block comes up.
+fn submit_next_block(
+    lane: &Lane,
+) -> Option<(pigeonhole_io::Completion, Box<pigeonhole_sst::Fetch>)> {
+    let mut upcoming = Vec::new();
+    for source in lane.resolver.cursor().sources() {
+        source.upcoming(1, &mut upcoming);
+        if let Some(fetch) = upcoming.pop() {
+            let completion = fetch.submit();
+            return Some((completion, Box::new(fetch)));
+        }
+    }
+    None
 }
 
 impl std::fmt::Debug for AsyncScan {
@@ -1087,18 +1101,8 @@ impl ScanCursor {
             if !self.in_row {
                 return Poll::Ready(Ok(false));
             }
-            // The lane whose cell was handed out steps next: fetch what it reads first. Its
-            // next block is asked for once per block it stands in, not per cell.
-            if !nb.sync
-                && let Some(i) = self.last_lane
-            {
-                let stamp = self.lanes[i].block_stamp();
-                if nb.probed != Some((i, stamp)) {
-                    if nb.prefetch(&self.lanes[i]) {
-                        continue;
-                    }
-                    nb.probed = Some((i, stamp));
-                }
+            if self.next_block_fetching(nb) {
+                continue;
             }
             // The reads a step makes synchronously (a block not predicted, a separated
             // value): a per-thread total around it, not a counting scope (perf287 on #1625).
@@ -1111,6 +1115,88 @@ impl ScanCursor {
             }
             return Poll::Ready(stepped.map(|f| f.is_some()));
         }
+    }
+
+    /// The lane whose cell was handed out steps next: starts the fetch of the block it reads
+    /// next if the cache lacks it (whether it did). Its next block is asked for once per
+    /// block it stands in, not per cell.
+    #[inline]
+    fn next_block_fetching(&self, nb: &mut AsyncScan) -> bool {
+        if nb.sync {
+            return false;
+        }
+        let Some(i) = self.last_lane else {
+            return false;
+        };
+        let stamp = self.lanes[i].block_stamp();
+        if nb.probed == Some((i, stamp)) {
+            return false;
+        }
+        if nb.pinned_at.is_some_and(|at| at != (i, stamp)) {
+            // The lane is past the block it stood in when the fetch started: it holds what it
+            // reads now itself.
+            nb.pinned.clear();
+            nb.pinned_at = None;
+        }
+        if nb.prefetch(&self.lanes[i]) {
+            nb.pinned_at = Some((i, stamp));
+            return true;
+        }
+        nb.probed = Some((i, stamp));
+        false
+    }
+
+    /// Whether the current row's next cell step reads only cached blocks (D196 within a row,
+    /// #1652), for a reader that steps an async scan's cells with [`ScanCursor::next_cell`]
+    /// inside [`ScanCursor::counted`]: `Ready(Ok(()))` when it does, or once the block it
+    /// reads is fetched; `Pending` while that fetch is in flight (its completion wakes the
+    /// task). It never moves the cursor. On a sync cursor, or one reading synchronously, it
+    /// is `Ready` at once. Its common case, a step within a block already probed, is checked
+    /// inline, borrowing only; the rest is out of line (#1167, ai1249's N1 on #1665).
+    #[inline]
+    pub fn poll_cell_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        let Some(nb) = &self.nb else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        if nb.fetch.is_none()
+            && (!self.in_row
+                || nb.sync
+                || self
+                    .last_lane
+                    .is_none_or(|i| nb.probed == Some((i, self.lanes[i].block_stamp()))))
+        {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        self.poll_cell_ready_slow(cx)
+    }
+
+    /// [`ScanCursor::poll_cell_ready`] past its inline check: a fetch in flight, or a block
+    /// not probed yet.
+    #[cold]
+    #[inline(never)]
+    fn poll_cell_ready_slow(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        use std::task::Poll;
+        let Some(mut nb) = self.nb.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        let out = loop {
+            match nb.poll_fetch(cx) {
+                Poll::Pending => break Poll::Pending,
+                Poll::Ready(Err(e)) => break Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+            if !self.in_row || !self.next_block_fetching(&mut nb) {
+                break Poll::Ready(Ok(()));
+            }
+        };
+        self.nb = Some(nb);
+        out
     }
 
     /// Moves the lanes for the seek `nb` holds, if any, cache-only unless the scan reads
@@ -1266,6 +1352,7 @@ impl ScanCursor {
             seek: None,
             target: Vec::new(),
             probed: None,
+            pinned_at: None,
             scratch: Vec::new(),
         }));
         self

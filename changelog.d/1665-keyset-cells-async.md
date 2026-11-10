@@ -1,0 +1,2 @@
+### Fixed
+- **Async reads over a key set no longer read a long row's later blocks synchronously** (#1665, #1652, ICR 0124). The multi-get's `next_async`, `Traverse::run_async`, `Nearest::run_async` and `read_within_async`, over keys and over a scan, now fetch every block a row's cells need without blocking (D196), so a row longer than a block no longer reads on the polling thread. A sync `next` after an async fill that stopped mid-row finishes that row. `Recall::run_async` makes no synchronous reads as a result.

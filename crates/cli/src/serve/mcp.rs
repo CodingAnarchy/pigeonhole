@@ -40,9 +40,10 @@ use super::errors::ApiError;
 use super::service::Admit;
 use crate::exit::Failure;
 use crate::mcp::backend::Backend;
-use crate::mcp::memory::Memory;
+use crate::mcp::memory::{Memory, Store as MemStore};
 use crate::mcp::protocol::{self, Core, Host, Transport};
 use crate::mcp::tools::{Outcome, Tools};
+use crate::memcore::MemCore;
 use crate::open::Handle;
 
 /// The session's header (Streamable HTTP, 2025-03-26).
@@ -72,8 +73,23 @@ impl McpSession {
             writable,
             replica: service.replica.is_some(),
         };
+        // The memory tools over the served store (8c-3b), limited to the caller's namespaces
+        // (M4), as `Memory`'s RPCs are.
+        let memory = service.memory_slot().map(|slot| {
+            Memory::served(
+                slot.name(),
+                Box::new(ServeStore {
+                    shared: Arc::downgrade(shared),
+                }),
+                caller.namespaces.clone(),
+                writable,
+                slot.embeds(),
+                shared.limits.mcp.result_bytes,
+                slot.max_recall(),
+            )
+        });
         Self {
-            tools: Tools::new(Box::new(backend), writable, shared.limits.mcp, None),
+            tools: Tools::new(Box::new(backend), writable, shared.limits.mcp, memory),
             protocol: protocol::Session::default(),
             requests: Arc::new(Semaphore::new(shared.limits.mcp_session_requests)),
             catalog: AtomicU64::new(service.catalog()),
@@ -181,6 +197,36 @@ impl Backend for ServeBackend {
     }
 }
 
+/// The served memory store, as the memory tools reach it: through the service's own slot,
+/// which a catalog change or a replica's re-bootstrap opens again.
+struct ServeStore {
+    /// Weak, as [`ServeBackend`]'s.
+    shared: Weak<Shared>,
+}
+
+impl MemStore for ServeStore {
+    fn core(&self) -> Result<Arc<MemCore>, Failure> {
+        let shared = self
+            .shared
+            .upgrade()
+            .ok_or_else(|| failure(ApiError::unavailable("the server is shutting down")))?;
+        // On the request's pool thread, under the memory place `post` took first.
+        shared
+            .router
+            .service
+            .memory_core_blocking()
+            .map_err(failure)
+    }
+
+    fn cached(&self) -> Option<Arc<MemCore>> {
+        let shared = self.shared.upgrade()?;
+        match shared.router.service.memory_slot()?.cached()? {
+            super::memslot::Entry::Core(core) => Some(core),
+            _ => None,
+        }
+    }
+}
+
 /// A service refusal as a tool's failure: its code and message.
 fn failure(e: ApiError) -> Failure {
     Failure::served(&e.code, e.code_num, &e.message)
@@ -191,12 +237,13 @@ struct Gate<'a> {
     session: &'a McpSession,
     shared: &'a Shared,
     caller: &'a Caller,
+    /// Whether `post` took a memory place (M6) for this message, before its pool thread.
+    memory_place: bool,
 }
 
 impl Host for Gate<'_> {
     fn memory(&self) -> Option<&Memory> {
-        // The memory tools come to `/mcp` with 8c-3b, over the served store.
-        None
+        self.session.tools.memory()
     }
 
     fn list(&self) -> Vec<Value> {
@@ -217,6 +264,12 @@ impl Host for Gate<'_> {
             "feed_poll" => ("feed_poll", Scope::Read),
             "write" => ("write", Scope::Write),
             "create_table" => ("create_table", Scope::Write),
+            "memory_recall" => ("memory_recall", Scope::Read),
+            "memory_remember" => ("memory_remember", Scope::Write),
+            "memory_mark_used" => ("memory_mark_used", Scope::Write),
+            "memory_supersede" => ("memory_supersede", Scope::Write),
+            "memory_link" => ("memory_link", Scope::Write),
+            "memory_forget" => ("memory_forget", Scope::Write),
             // Not a tool here: the protocol answers it.
             _ => return self.session.tools.call(name, args),
         };
@@ -232,6 +285,19 @@ impl Host for Gate<'_> {
         if let Err(e) = service.check(&admit, self.caller) {
             return Some(Err(failure(e)));
         }
+        // A memory tool runs under a memory place (M6). `post` takes it before the pool
+        // thread for a message it sees calling one. One it didn't see (a tool name spelled
+        // with JSON escapes) fails closed: a place now, without waiting (a wait here, holding
+        // the pool thread, is the order the RPCs never take), else `Overloaded` (ai1249's R1
+        // on #1679).
+        let _memory = if name.starts_with("memory_") && !self.memory_place {
+            match service.memory_try_place() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(failure(e))),
+            }
+        } else {
+            None
+        };
         // A poll can wait up to 30 s: it holds a `--max-streams` place for that long, as a
         // feed stream does (ai1249's note on 8c), though it needs no hub.
         let _stream = if name == "feed_poll" {
@@ -372,6 +438,17 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     if session.catalog.swap(now, Ordering::AcqRel) != now {
         session.protocol.catalog_moved();
     }
+    // A memory tool runs under the memory sub-limit (M6), whose place is taken before the
+    // pool's, as the RPCs take it: never the other way round (see `Service::memory_place`).
+    let _memory = if calls_memory(&text) {
+        match service.memory_place().await {
+            Ok(p) => Some(p),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+    let memory_place = _memory.is_some();
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
     let answered = service
@@ -380,6 +457,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
                 session: &session,
                 shared: &shared_owned,
                 caller: &caller_owned,
+                memory_place,
             };
             let core = Core::new(Transport::Http);
             let reply = core.message(&gate, &session.protocol, &text);
@@ -463,6 +541,26 @@ pub(crate) async fn delete(State(shared): State<Arc<Shared>>, headers: HeaderMap
     match shared.router.service.sessions.end_mcp(id, caller.token) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+/// Whether `text` (a message or a batch) calls a memory tool.
+fn calls_memory(text: &str) -> bool {
+    // Most messages name no memory tool: skip the parse (ai1249's N3 on #1679). One whose
+    // name is spelled with JSON escapes gets past this; `Gate::call` catches it (R1).
+    if !text.contains("\"memory_") {
+        return false;
+    }
+    let call = |m: &Value| {
+        m.get("method").and_then(Value::as_str) == Some("tools/call")
+            && m["params"]["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("memory_"))
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(batch)) => batch.iter().any(call),
+        Ok(m) => call(&m),
+        Err(_) => false,
     }
 }
 

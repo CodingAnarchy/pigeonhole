@@ -36,7 +36,12 @@
   - **M1:** memory's `edges` already was a one-hop `Traverse` with the budget, plus a row read for the weights. So the async form is `Traverse::run_async` plus `RowRead::read_async`, with the same arithmetic, not `read_within_async`.
   - **The reads awaited together:** each namespace's vector, keyword and recency lists, by an in-crate join that adds no dependency.
   - **Reader processes:** every read a recall makes has an async form in a reader process, so `ReadStore`'s async recall refuses nothing beyond what its sync recall refuses.
-  - **Not exactly zero synchronous reads:** the engine's async key-set reads still read a row past its first block synchronously (#1652). That covers the multi-get's memory rows, the expansion's traversal and the IVF search's list rows. So the property test bounds the count rather than asserting zero: under load, 28 of 7,680 recalls counted one such read, and none counted two. #1652 then tightens the bound to 0.
+  - **Zero synchronous reads, after #1652:** at first, the engine's async key-set reads still read a row past its first block synchronously. That covered the multi-get's memory rows, the expansion's traversal and the IVF search's list rows, so the property test bounded the count (28 of 7,680 recalls under load counted one). #1652 closed it, and the test asserts 0.
+
+- **Amendment (#1652, perf287 agreed the design on #1652):** D196 within a row for every async reader that steps a row's cells.
+  - **Engine (internal 2.x API, additive):** `KeyCursor::poll_cell_ready(cx)` and `ScanCursor::poll_cell_ready(cx)`, out of line. Each fetches, before a step, the block the step reads if the cache lacks it, probing every source the step moves once per block it stands in, and returns `Pending` without moving. `ScanCursor::poll_next_cell` is now that check plus its step, so the two can't drift.
+  - **The readers:** the traversal, the nearest-neighbour search and the async reduce, over keys and over a scan, call it before each cell step. On `Pending` they stop as they do at their poll budgets, keeping the row's place, and the fetch's completion wakes the task. `KeyRows`' async fill is resumable mid-row. A sync `next` after a fill stopped mid-row finishes that row.
+  - **Still read synchronously and counted:** a separated (blob) value, and a block a step reads that the probe didn't predict.
 
 - **Amendment (#1560 PR 4):** Python, the design note's §8.
   - **The names:** `Store.recall_async` and `recall_with_stats_async`, and the same on `ReadStore`. They take `recall`'s keywords and resolve to its result. The stubs type them as `asyncio.Future`.

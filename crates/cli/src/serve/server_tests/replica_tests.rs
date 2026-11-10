@@ -795,13 +795,21 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
     let mut refused = false;
     let mut downloading = false;
     let (mut most, mut restarted) = (0u64, false);
+    // Every distinct `last_error` seen, in order, for the failure messages.
+    let mut errors: Vec<String> = Vec::new();
     let info = wait_replica(&r, "caught up", |info| {
         let error = info["last_error"].as_str().unwrap_or("");
+        if !error.is_empty() && errors.last().is_none_or(|e| e != error) {
+            errors.push(error.to_owned());
+        }
         stalled |= error.contains("no chunk of the bootstrap copy");
-        // tonic's `connect` doesn't wait for the handshake, so a connection closed at once
-        // fails the request on it ("transport error"); a refused TCP connect would fail
-        // the connect ("connecting to …"). Either is a break.
-        refused |= error.contains("transport error") || error.contains("connecting to");
+        // The reconnect closed at once is a break of its own, whatever its words: tonic
+        // reports a closed connection as "transport error", but one reset (as Windows may
+        // do to a socket closed with the request unread) as the OS's error, and a refused
+        // connect as "connecting to …". So any break but a stall or a fresh copy counts.
+        refused |= error.starts_with("downloading the bootstrap copy")
+            && !error.contains("no chunk of the bootstrap copy")
+            && !error.contains("starting a fresh copy");
         downloading |= info["bootstrap_phase"] == "downloading";
         if let Some(bytes) = info["bootstrap_bytes"].as_str() {
             let bytes: u64 = bytes.parse().unwrap();
@@ -811,14 +819,18 @@ fn a_bootstrap_download_that_stalls_resumes_on_a_new_connection() {
         caught_up(&p, None)(info)
     });
     stop.store(true, Ordering::Relaxed);
-    assert!(stalled, "the stall was recorded as a break: {info}");
+    eprintln!("bootstrap breaks seen: {errors:?}");
+    assert!(
+        stalled,
+        "the stall was recorded as a break: {info}, errors seen {errors:?}"
+    );
     assert!(
         refused,
-        "the failed reconnect was recorded as a break: {info}"
+        "the failed reconnect was recorded as a break: {info}, errors seen {errors:?}"
     );
     assert!(
         !restarted,
-        "the download resumed, never restarted from zero"
+        "the download resumed, never restarted from zero: errors seen {errors:?}"
     );
     assert!(downloading, "Info showed the download's step");
     assert!(

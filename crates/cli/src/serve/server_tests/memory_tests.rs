@@ -7,7 +7,7 @@ fn memory_server(tokens: &str) -> Server {
     memory_server_with(tokens, limits())
 }
 
-fn memory_server_with(tokens: &str, l: Limits) -> Server {
+pub(super) fn memory_server_with(tokens: &str, l: Limits) -> Server {
     Server::start_custom(tokens, l, 1, |svc| {
         let (slot, _) = crate::serve::memslot::MemSlot::start(
             &svc.part().unwrap().db,
