@@ -740,7 +740,8 @@ pub(crate) struct Service {
     /// The open connections against `--max-connections` (#1604): the listener counts them,
     /// the metrics show them.
     pub(crate) connections: Arc<super::listener::Connections>,
-    /// Set on a replica server (`--replica-of`, #1436).
+    /// Set on a replica server (`--replica-of`, #1436). A whole-node mode today, refused with
+    /// `--cluster`; a cluster's replicas are per partition, from D317 ticket 8.
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
     placement: Option<Arc<super::placement::Placement>>,
