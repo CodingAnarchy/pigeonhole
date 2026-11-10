@@ -335,3 +335,67 @@ fn a_reply_to_a_client_with_a_zero_initial_window_is_dropped_after_the_idle_limi
         1
     );
 }
+
+/// The g46 revision: a read within the default page builds first and takes its share after.
+/// With the budget held by an unread reply, one whose share isn't free goes the strict way
+/// (its reply dropped, the cap reserved, the read run again), and is counted as a re-read;
+/// at the deadline it's `Overloaded`.
+#[test]
+fn a_default_page_read_that_finds_the_budget_full_goes_the_strict_way() {
+    let s = budgeted(
+        10 << 20,
+        Duration::from_millis(400),
+        Duration::from_secs(30),
+        8,
+    );
+    let t = s
+        .shared
+        .router
+        .service
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    for i in 0..2 {
+        t.mutate(format!("mid{i}").as_bytes())
+            .put("f", b"q", &vec![b'y'; 400 << 10])
+            .commit()
+            .unwrap();
+    }
+    let _stuck = stuck_multi_get(&s, 8);
+    wait_for("the stuck reply's charge", || reply_bytes(&s) > 8 << 20);
+    let rereads = || {
+        s.shared
+            .router
+            .service
+            .replies
+            .rereads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert_eq!(rereads(), 0);
+    // Two 400 KiB rows at the default page: their JSON share (twice about 800 KiB) isn't
+    // free beside the stuck reply's (about 9.4 MiB of the 10).
+    let (status, body) = s.post(
+        "MultiGet",
+        &json!({"table": "t", "keys": [b64(b"mid0"), b64(b"mid1")]}),
+        None,
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("Overloaded")),
+        "held {}",
+        reply_bytes(&s)
+    );
+    assert_eq!(rereads(), 1, "the strict path after the build");
+    // A small reply takes no share at all, however full the budget.
+    let value = json!({"bytes": b64(b"tiny")});
+    assert_eq!(s.post("Mutate", &put("tiny", "f", "q", value), None).0, 200);
+    let (status, body) = s.post(
+        "MultiGet",
+        &json!({"table": "t", "keys": [b64(b"tiny")]}),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(rereads(), 1);
+}

@@ -2,10 +2,20 @@
 //!
 //! - **What:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` (their
 //!   `page_bytes`), `Memory.Recall` (its byte budget), and `Get` (its cell, after the read).
-//! - **When:** the reply's cap is reserved before the read, so the reply is never built
-//!   unbudgeted, then trimmed to its encoded size (twice the cap for HTTP/JSON, fitted to the
-//!   rendered body). A reservation that can't be had within the request timeout answers
-//!   `Overloaded`, as a request body's share does.
+//! - **When (revised after g46, with cli692's H1 and H2):**
+//!   - A read whose cap is within the default page (1 MiB) builds its reply first. A reply
+//!     within one slice then takes nothing: its share would be freed at the response
+//!     anyway. A larger one takes its exact size if it's free now. If it isn't, or a strict
+//!     reservation is waiting, the strict path: the reply is dropped, the cap reserved, and
+//!     the read run again.
+//!   - A read with a larger cap reserves it before reading, then trims to its size.
+//!   - `Get` (no cap) and a recall within the default page are charged once built, waiting
+//!     for their size if need be; they're never built twice.
+//!   - HTTP/JSON takes twice the protobuf's size, fitted to the rendered body.
+//!   - A reservation that can't be had within the request timeout answers `Overloaded`, as
+//!     a request body's share does.
+//!   - What's unaccounted is replies being built within the default page: at most
+//!     `--max-concurrent` × 1 MiB.
 //! - **Until:** the reply's body has been written to the connection, or dropped. The handler
 //!   puts a [`Charged`] in the response's extensions; [`attach`], a layer over the whole
 //!   router, moves it into a [`ChargedBody`] around the body.
@@ -42,6 +52,12 @@ pub(crate) struct ReplyStats {
     pub(crate) bytes: AtomicU64,
     /// Replies whose client took nothing for `--stream-idle-ms`: dropped, their charge freed.
     pub(crate) idle_drops: AtomicU64,
+    /// Reads that found the budget full once built: their reply dropped, the cap reserved,
+    /// and the read run again (the strict path).
+    pub(crate) rereads: AtomicU64,
+    /// Strict reservations waiting for the budget: while any do, built replies don't take
+    /// permits ahead of them (cli692's H2 on #1567).
+    pub(crate) waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl ReplyStats {
@@ -57,6 +73,11 @@ impl ReplyStats {
                 "pigeonhole_serve_reply_idle_drops_total",
                 "counter",
                 self.idle_drops.load(Ordering::Relaxed),
+            ),
+            (
+                "pigeonhole_serve_reply_rereads_total",
+                "counter",
+                self.rereads.load(Ordering::Relaxed),
             ),
         ] {
             let _ = writeln!(out, "# TYPE {name} {kind}");
@@ -84,9 +105,32 @@ impl Charge {
         stats: &Arc<ReplyStats>,
     ) -> Result<Self, ApiError> {
         let n = bytes.clamp(1, total.max(1));
-        let permit = acquire(inflight, n, wait).await?;
+        // Counted while it waits, so `try_charge` leaves the permits to it (cli692's H2).
+        stats.waiting.fetch_add(1, Ordering::AcqRel);
+        let permit = acquire(inflight, n, wait).await;
+        stats.waiting.fetch_sub(1, Ordering::AcqRel);
+        let permit = permit?;
         stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(Self {
+            permit,
+            inflight: Arc::clone(inflight),
+            stats: Arc::clone(stats),
+        })
+    }
+
+    /// `bytes` of the budget if they're free now (at most `total`), without waiting.
+    pub(crate) fn try_reserve(
+        inflight: &Arc<Semaphore>,
+        total: usize,
+        bytes: usize,
+        stats: &Arc<ReplyStats>,
+    ) -> Option<Self> {
+        let n = bytes.clamp(1, total.max(1));
+        let permit = Arc::clone(inflight)
+            .try_acquire_many_owned(u32::try_from(n).ok()?)
+            .ok()?;
+        stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        Some(Self {
             permit,
             inflight: Arc::clone(inflight),
             stats: Arc::clone(stats),
@@ -175,10 +219,12 @@ impl Charged {
 
 /// The layer over the router: a response with a [`Charged`] gets its body wrapped, so the
 /// charge lasts until the body has been written. Others pass through untouched.
-pub(crate) fn attach(
-    idle: Duration,
-) -> impl Fn(Response<Body>) -> std::future::Ready<Response<Body>> + Clone {
-    move |resp| std::future::ready(wrap(resp, idle))
+///
+/// A plain function for `tower`'s `MapResponseLayer`, which maps in place: axum's
+/// `map_response` middleware boxed a future for every response on every route, which cost
+/// the smallest reads a few percent (g46's readrow-small).
+pub(crate) fn attach(idle: Duration) -> impl Fn(Response<Body>) -> Response<Body> + Clone {
+    move |resp| wrap(resp, idle)
 }
 
 fn wrap(mut resp: Response<Body>, idle: Duration) -> Response<Body> {

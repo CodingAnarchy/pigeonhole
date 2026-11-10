@@ -409,8 +409,14 @@ u1   profile  name       1761030000000000  Ada
   - `--max-request-bytes` (16 MiB): the largest request.
   - `--inflight-bytes` (256 MiB): request and reply bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC. Scan pages count too (below).
     - **Unary read replies count as well** (#1567):
-      - **Which:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` reserve their `page_bytes` (1 MiB when 0, up to 8 MiB), and `Memory.Recall` its byte budget. All of them reserve before they read, and twice that for HTTP/JSON, which is larger than the protobuf. `Get` reserves its cell's size after the read.
-      - **Trimmed and held:** a built reply keeps only its own size (its encoded message, or its rendered JSON), and holds it until it has been written to the connection.
+      - **Which:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` (by their `page_bytes`, 1 MiB when 0, up to 8 MiB), `Memory.Recall` (by its byte budget) and `Get`.
+      - **Large pages reserve first:** a read asking for more than the default page (1 MiB) reserves its whole `page_bytes` before it reads, twice that for HTTP/JSON, which is larger than the protobuf. So `--inflight-bytes` ÷ `page_bytes` caps how many such reads build at once: under a 64 MiB budget, 8 MiB pages run 8 at a time, while the server's memory stays within the budget. Ask for smaller pages for more concurrency.
+      - **Default pages charge after the build:** a read within the default page builds its reply first.
+        - A reply of 64 KiB or less takes no share: it goes to the connection whole.
+        - A larger one takes exactly its size if it's free. If it isn't, the read drops its reply, reserves its page as above, and reads again. `pigeonhole_serve_reply_rereads_total` counts these.
+        - `Get` and a recall within the default page wait for their size instead of reading again.
+        - So what's built before it's counted is at most `--max-concurrent` × 1 MiB.
+      - **Trimmed and held:** a reply keeps only its own size (its encoded message, or its rendered JSON), and holds it until it has been written to the connection.
       - **Refused:** a read whose share can't be had within `--request-timeout-ms` gets `Overloaded` (503 with `Retry-After`), having read nothing. So a burst of large reads pushes back rather than growing the server's memory.
     - **A client that takes nothing of its reply** for `--stream-idle-ms` loses it: the server drops the reply's unsent part and gives its share back. The client's stream then ends with `DeadlineExceeded` (over gRPC) or a cut-off body (over HTTP/1.1) once it reads again or its connection closes. Meanwhile the server holds at most about 64 KiB of that reply.
     - **What isn't counted:** the feed streams' buffers, the shared feed ring (`--feed-ring-bytes`) and each connection's own memory (`--max-connections`). So request and reply bytes together stay within `--inflight-bytes`, and those come on top.

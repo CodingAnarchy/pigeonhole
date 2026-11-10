@@ -135,7 +135,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         .with_state(Arc::clone(&shared))
         // A read's reply holds its share of the budget until its body has been written
         // (#1567): the layer moves the response's charge into its body.
-        .layer(axum::middleware::map_response(super::charge::attach(
+        .layer(tower::util::MapResponseLayer::new(super::charge::attach(
             limits.stream_idle,
         )))
         // Overload is refused at once, never queued (perf287's R3): `ConcurrencyLimit`
