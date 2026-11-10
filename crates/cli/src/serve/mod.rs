@@ -194,6 +194,14 @@ fn memory(
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     let mut options = Options::default().create_if_missing(args.create);
+    // SCRATCH (#1644, not for merge): the shard spin window from the environment, in µs (0: no
+    // spin), for perf287's spin-off A/B of the 16x16 serve row.
+    if let Some(us) = std::env::var("PH_SHARD_SPIN_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        options = options.shard_spin(std::time::Duration::from_micros(us));
+    }
     // A database this command creates gets the server's default shard count. An existing
     // one keeps its own unless `--shards` says otherwise: an explicit count that differs
     // from the one a change feed recorded would reshard, ending the feed's history.
