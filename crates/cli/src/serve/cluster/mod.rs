@@ -179,6 +179,10 @@ impl Node {
         self.routes.load()
     }
 
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, MapState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

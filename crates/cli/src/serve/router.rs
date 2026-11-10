@@ -92,6 +92,15 @@ impl Router {
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
         owner: Target,
     ) -> Result<ServiceReply, ApiError> {
+        // One deadline for the whole forward: the budget's wait, a send, and after a
+        // WrongPartition the pull and the second send (cli692's F2).
+        let deadline = tokio::time::Instant::now() + self.service.request_timeout();
+        let left = || {
+            deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(ApiError::deadline_exceeded)
+        };
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
         let writes = op.writes();
         let req = ForwardRequest {
@@ -99,25 +108,30 @@ impl Router {
             caller: Some(forward::forwarded_caller(caller)?),
             op: Some(forward::op_to_forward(op)?),
         };
-        let timeout = self.service.request_timeout();
+        // For the rare resend. Cheap: the generated messages hold their bytes as `Bytes`
+        // (protogen's `config.bytes`), so this copies a request's structure, not its values.
         let again = req.clone();
         let reply = cluster
             .forwarder
-            .send(&owner.address, req, timeout, writes)
+            .send(&owner.address, req, left()?, writes)
             .await;
         let reply = match reply {
             Err(e) if e.code == "WrongPartition" => {
-                cluster
-                    .node
-                    .pull_now(&owner.node, &owner.address, owner.map_version)
-                    .await
-                    .map_err(|why| {
-                        ApiError::partition_unavailable(format!(
-                            "node {} has a newer cluster map, which this node couldn't take: \
+                tokio::time::timeout(
+                    left()?,
+                    cluster
+                        .node
+                        .pull_now(&owner.node, &owner.address, owner.map_version),
+                )
+                .await
+                .map_err(|_| ApiError::deadline_exceeded())?
+                .map_err(|why| {
+                    ApiError::partition_unavailable(format!(
+                        "node {} has a newer cluster map, which this node couldn't take: \
                              {why}",
-                            owner.node
-                        ))
-                    })?;
+                        owner.node
+                    ))
+                })?;
                 let op = forward::op_of(again.op.clone())?;
                 match cluster.target(&op)? {
                     // The newer map gives the key to this node.
@@ -127,7 +141,7 @@ impl Router {
                         again.map_version = next.map_version;
                         cluster
                             .forwarder
-                            .send(&next.address, again, timeout, writes)
+                            .send(&next.address, again, left()?, writes)
                             .await
                     }
                 }
@@ -158,11 +172,19 @@ impl Router {
                 ));
             };
             let p = route(routes, &op)?;
-            if cluster.local.as_deref() != Some(p.as_str()) {
+            let mine = routes
+                .owner(&p)
+                .is_some_and(|o| o.node == cluster.node.id());
+            if !mine {
+                // The map moved the partition away, or never gave it here: the sender's map
+                // is older or newer than this node's; it pulls and routes again.
                 return Err(ApiError::wrong_partition(
                     routes.map_version(),
                     format!("this node doesn't serve partition {p:?}"),
                 ));
+            }
+            if cluster.local.as_deref() != Some(p.as_str()) {
+                return Err(not_open(&p));
             }
         }
         self.service.call(op, caller, None).await
@@ -204,12 +226,19 @@ impl Cluster {
             ));
         };
         let partition = route(routes, op)?;
-        if self.local.as_deref() == Some(partition.as_str()) {
-            return Ok(None);
-        }
         let owner = routes.owner(&partition).ok_or_else(|| {
             ApiError::internal(format!("the map lists no node for partition {partition:?}"))
         })?;
+        // Served here only when the map gives this node the partition *and* this node has
+        // it open: a partition the map moved away is the new owner's, even if its file is
+        // still open here.
+        if owner.node == self.node.id() {
+            return if self.local.as_deref() == Some(partition.as_str()) {
+                Ok(None)
+            } else {
+                Err(not_open(&partition))
+            };
+        }
         Ok(Some(Target {
             node: owner.node.clone(),
             address: owner.address.clone(),
@@ -299,6 +328,15 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
             "this call isn't served by a cluster node (D317)",
         )),
     }
+}
+
+/// A partition the map gives this node that it doesn't have open: it opens partitions at
+/// start, and moving one in is D317's ticket 6.
+fn not_open(partition: &str) -> ApiError {
+    ApiError::partition_unavailable(format!(
+        "the map gives this node partition {partition:?}, but it isn't open here: a node \
+         opens its partitions at start, and relocation comes with D317's ticket 6"
+    ))
 }
 
 /// A call a later D317 ticket brings to a cluster.

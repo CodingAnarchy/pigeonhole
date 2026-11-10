@@ -656,3 +656,88 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
     let _ = db_a.close();
     let _ = db_b.close();
 }
+
+#[test]
+fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sender_catches_up() {
+    // v1: p1 on a, p2 on b, c routes. v2 moves p2 to a (epoch 2) and reaches a and b only.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::write_map(dir, &super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    let mut v2 = v1.clone();
+    v2.map_version = 2;
+    for p in &mut v2.partitions {
+        if p.id == "p2" {
+            p.node = "a".into();
+            p.epoch = 2;
+        }
+    }
+    rt.block_on(async {
+        for port in [a, b] {
+            client(port)
+                .await
+                .push_map(super::proto::PushMapRequest {
+                    map: Some(v2.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(version(c).await, 1);
+        // c routes "zed" to b by its v1. b's v2 says p2 is a's: WrongPartition, though b
+        // still has p2's file open, so b writes nothing. c pulls v2 from b and routes to a,
+        // whose v2 gives it p2, which it hasn't open (relocation is ticket 6).
+        let e = data(c)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(put_row("zed", "moved")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("ticket 6"), "{e}");
+        assert_eq!(version(c).await, 2, "c pulled the newer map");
+        // A direct call to b is refused the same way: its map moved p2 away.
+        let e = get_row(b, "zed").await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        // p1 is still served wherever the call enters.
+        data(c)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(put_row("alice", "1")),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+    let db_b = db_b.unwrap();
+    assert_eq!(
+        db_b.table("users")
+            .unwrap()
+            .open()
+            .unwrap()
+            .get(b"zed", "f", b"q")
+            .unwrap()
+            .map(|c| c.value().to_vec()),
+        None,
+        "the node p2 moved away from wrote nothing"
+    );
+    let _ = db_b.close();
+    let _ = db_a.map(pigeonhole::Pigeonhole::close);
+}

@@ -64,6 +64,10 @@ impl Forwarder {
         if let Some(p) = peers.get(address) {
             return Ok(Arc::clone(p));
         }
+        // Peers a newer map no longer lists go as a new one is added (cli692's nit).
+        if let Some(routes) = self.node.routes().as_ref() {
+            peers.retain(|a, _| routes.has_address(a));
+        }
         let endpoint = self
             .node
             .endpoint(address)

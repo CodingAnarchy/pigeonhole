@@ -95,6 +95,11 @@ impl Routes {
         self.owners.get(partition)
     }
 
+    /// Whether a node of the map is at `address`.
+    pub(crate) fn has_address(&self, address: &str) -> bool {
+        self.owners.values().any(|o| o.address == address)
+    }
+
     /// The partitions the map gives `node`.
     pub(crate) fn partitions_of<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a str> {
         self.owners
