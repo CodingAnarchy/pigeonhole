@@ -18,6 +18,29 @@ struct Placement {
     partitions: Vec<String>,
 }
 
+/// One partition's part of a table: its rows in `[start, end)` (`end` `None`: the table's
+/// end).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartRange {
+    pub partition: String,
+    pub start: Vec<u8>,
+    pub end: Option<Vec<u8>>,
+}
+
+impl PartRange {
+    /// Whether the rows in `[lo, hi)` (`hi` `None`: no end) meet this range.
+    pub(crate) fn meets(&self, lo: &[u8], hi: Option<&[u8]>) -> bool {
+        let below_end = self.end.as_deref().is_none_or(|e| lo < e);
+        let above_start = hi.is_none_or(|h| self.start.as_slice() < h);
+        below_end && above_start
+    }
+
+    /// Whether `row` is in this range.
+    pub(crate) fn holds(&self, row: &[u8]) -> bool {
+        self.start.as_slice() <= row && self.end.as_deref().is_none_or(|e| row < e)
+    }
+}
+
 /// Where a partition is served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Owner {
@@ -88,6 +111,27 @@ impl Routes {
         let p = self.tables.get(table)?;
         let i = p.splits.partition_point(|s| s.as_slice() <= row);
         p.partitions.get(i).map(String::as_str)
+    }
+
+    /// `table`'s partitions in key order, each with its half-open range (D317 ticket 4's
+    /// fan-out); `None` for a table the map doesn't place.
+    pub(crate) fn ranges(&self, table: &str) -> Option<Vec<PartRange>> {
+        let p = self.tables.get(table)?;
+        Some(
+            p.partitions
+                .iter()
+                .enumerate()
+                .map(|(i, partition)| PartRange {
+                    partition: partition.clone(),
+                    start: if i == 0 {
+                        Vec::new()
+                    } else {
+                        p.splits[i - 1].clone()
+                    },
+                    end: p.splits.get(i).cloned(),
+                })
+                .collect(),
+        )
     }
 
     /// Where `partition` is served; `None` for a partition the map doesn't list.

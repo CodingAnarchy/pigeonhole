@@ -1524,6 +1524,11 @@ pub struct MultiGetRequest {
     /// A previous page's `next`, to continue it.
     #[prost(bytes = "bytes", tag = "5")]
     pub after: ::prost::bytes::Bytes,
+    /// On a cluster node (D317 §7): skip the keys of a partition that can't be reached, and
+    /// name its range in the reply's `missing`, rather than fail with `PartitionUnavailable`.
+    /// A single node ignores it.
+    #[prost(bool, tag = "6")]
+    pub allow_partial: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiGetResponse {
@@ -1536,6 +1541,22 @@ pub struct MultiGetResponse {
     /// This page's size by D308's measure, for sizing a client's buffers.
     #[prost(uint64, tag = "3")]
     pub bytes: u64,
+    /// With `allow_partial`, on a cluster node: the partitions this page skipped (D317 §7).
+    #[prost(message, repeated, tag = "4")]
+    pub missing: ::prost::alloc::vec::Vec<MissingRange>,
+}
+/// A partition's key range a cluster read skipped with `allow_partial` (D317 §7): its keys
+/// in `[start, end)` of `table` weren't read. An empty `end` is the table's end.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MissingRange {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub start: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub end: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadRowRequest {
@@ -1609,6 +1630,11 @@ pub struct ScanRequest {
     /// A previous page's `next` (a `ScanPosition`), to continue the scan.
     #[prost(bytes = "bytes", tag = "6")]
     pub after: ::prost::bytes::Bytes,
+    /// On a cluster node (D317 §7): skip a partition that can't be reached, and name its range
+    /// in a page's `missing`, rather than end the stream with `PartitionUnavailable`. A single
+    /// node ignores it.
+    #[prost(bool, tag = "7")]
+    pub allow_partial: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScanPage {
@@ -1622,6 +1648,10 @@ pub struct ScanPage {
     /// This page's size by D308's measure, for sizing a client's buffers.
     #[prost(uint64, tag = "3")]
     pub bytes: u64,
+    /// With `allow_partial`, on a cluster node: the partitions skipped since the page before
+    /// (D317 §7).
+    #[prost(message, repeated, tag = "4")]
+    pub missing: ::prost::alloc::vec::Vec<MissingRange>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutateRequest {
@@ -3438,7 +3468,7 @@ pub struct ForwardRequest {
     /// Who the call is for, checked again here.
     #[prost(message, optional, tag = "2")]
     pub caller: ::core::option::Option<ForwardedCaller>,
-    #[prost(oneof = "forward_request::Op", tags = "3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "forward_request::Op", tags = "3, 4, 5, 6, 7, 8, 9")]
     pub op: ::core::option::Option<forward_request::Op>,
 }
 /// Nested message and enum types in `ForwardRequest`.
@@ -3458,7 +3488,25 @@ pub mod forward_request {
         /// Every row in one partition: a batch across partitions is refused before it's sent.
         #[prost(message, tag = "8")]
         Batch(super::BatchRequest),
+        /// One partition's keys of a multi-get the sending node fans out (D317 ticket 4).
+        #[prost(message, tag = "9")]
+        MultiGet(super::MultiGetRequest),
     }
+}
+/// One partition's part of a fanned-out scan (D317 ticket 4).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForwardScanRequest {
+    /// The sending node's map version, as in `ForwardRequest`.
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+    #[prost(message, optional, tag = "2")]
+    pub caller: ::core::option::Option<ForwardedCaller>,
+    /// The partition to scan: it must be this node's.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
+    /// The scan, with `after` (if any) this partition's own position and `limit` what's left.
+    #[prost(message, optional, tag = "4")]
+    pub scan: ::core::option::Option<ScanRequest>,
 }
 /// The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
 /// forwarded.
@@ -3477,7 +3525,7 @@ pub struct ForwardedCaller {
 /// call's own status.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
-    #[prost(oneof = "forward_response::Reply", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "forward_response::Reply", tags = "1, 2, 3, 4, 5, 6")]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
 /// Nested message and enum types in `ForwardResponse`.
@@ -3495,6 +3543,8 @@ pub mod forward_response {
         CheckAndMutate(super::CheckAndMutateResponse),
         #[prost(message, tag = "5")]
         MutateReturning(super::MutateReturningResponse),
+        #[prost(message, tag = "6")]
+        MultiGet(super::MultiGetResponse),
     }
 }
 /// Generated client implementations.
@@ -3708,6 +3758,34 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Forward"));
             self.inner.unary(req, path, codec).await
         }
+        /// Node to node (D317 ticket 4): one partition's part of a scan the sending node fans out,
+        /// for the caller it names, as this node's own `Data.Scan` stream of it. This node serves
+        /// it only if its map gives it `partition` and it has the partition open; otherwise
+        /// `WrongPartition` with its `map_version`. Cluster scope, gRPC only.
+        pub async fn forward_scan(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForwardScanRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ScanPage>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ForwardScan",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardScan"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -3763,6 +3841,23 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::ForwardRequest>,
         ) -> std::result::Result<tonic::Response<super::ForwardResponse>, tonic::Status>;
+        /// Server streaming response type for the ForwardScan method.
+        type ForwardScanStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ScanPage, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Node to node (D317 ticket 4): one partition's part of a scan the sending node fans out,
+        /// for the caller it names, as this node's own `Data.Scan` stream of it. This node serves
+        /// it only if its map gives it `partition` and it has the partition open; otherwise
+        /// `WrongPartition` with its `map_version`. Cluster scope, gRPC only.
+        async fn forward_scan(
+            &self,
+            request: tonic::Request<super::ForwardScanRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ForwardScanStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct ClusterServer<T> {
@@ -4051,6 +4146,52 @@ pub mod cluster_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/ForwardScan" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForwardScanSvc<T: Cluster>(pub Arc<T>);
+                    impl<
+                        T: Cluster,
+                    > tonic::server::ServerStreamingService<super::ForwardScanRequest>
+                    for ForwardScanSvc<T> {
+                        type Response = super::ScanPage;
+                        type ResponseStream = T::ForwardScanStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForwardScanRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::forward_scan(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForwardScanSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -24,8 +24,8 @@ use super::Node;
 use crate::serve::auth::{Caller, Scope};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
-    ForwardRequest, ForwardResponse, ForwardedCaller, cluster_client::ClusterClient,
-    forward_request, forward_response,
+    ForwardRequest, ForwardResponse, ForwardScanRequest, ForwardedCaller, ScanPage,
+    cluster_client::ClusterClient, forward_request, forward_response,
 };
 use crate::serve::service::{ServiceOp, ServiceReply};
 
@@ -43,6 +43,9 @@ struct Peer {
 pub(crate) struct Forwarder {
     node: Arc<Node>,
     peers: Mutex<HashMap<String, Arc<Peer>>>,
+    /// Connections for forwarded streams (`ForwardScan`), apart from the unary calls', so a
+    /// long-lived stream never holds up a forwarded get (simp724's Q2 on the 4a plan).
+    stream_peers: Mutex<HashMap<String, Arc<Peer>>>,
 }
 
 impl std::fmt::Debug for Forwarder {
@@ -56,11 +59,20 @@ impl Forwarder {
         Self {
             node,
             peers: Mutex::new(HashMap::new()),
+            stream_peers: Mutex::new(HashMap::new()),
         }
     }
 
     fn peer(&self, address: &str) -> Result<Arc<Peer>, ApiError> {
-        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        self.peer_in(&self.peers, address)
+    }
+
+    fn peer_in(
+        &self,
+        peers: &Mutex<HashMap<String, Arc<Peer>>>,
+        address: &str,
+    ) -> Result<Arc<Peer>, ApiError> {
+        let mut peers = peers.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(p) = peers.get(address) {
             return Ok(Arc::clone(p));
         }
@@ -109,6 +121,41 @@ impl Forwarder {
             Err(status) => Err(classify(&status, address, writes)),
         }
     }
+
+    /// Opens one partition's part of a fanned-out scan on the node at `address` (D317
+    /// ticket 4), on the stream connections. The stream has no deadline of its own: its
+    /// pages are paced by the client, and each side's `--stream-idle-ms` ends a stalled one.
+    /// A failure is the owner's answer, or `PartitionUnavailable` (a read).
+    pub(crate) async fn scan(
+        &self,
+        address: &str,
+        req: ForwardScanRequest,
+        open_within: Duration,
+    ) -> Result<tonic::Streaming<ScanPage>, ApiError> {
+        let peer = self.peer_in(&self.stream_peers, address)?;
+        let slot = &peer.slots[peer.next.fetch_add(1, Ordering::Relaxed) % CHANNELS];
+        let channel = slot
+            .get_or_try_init(|| peer.endpoint.connect())
+            .await
+            .map_err(|e| {
+                ApiError::partition_unavailable(format!(
+                    "the partition's node at {address} can't be reached: {e}"
+                ))
+            })?
+            .clone();
+        let request = self.node.request(req).map_err(ApiError::internal)?;
+        let mut client = ClusterClient::new(channel);
+        match tokio::time::timeout(open_within, client.forward_scan(request)).await {
+            Ok(Ok(reply)) => Ok(reply.into_inner()),
+            Ok(Err(status)) => Err(classify(&status, address, false)),
+            Err(_) => Err(ApiError::deadline_exceeded()),
+        }
+    }
+}
+
+/// A forwarded scan's failure partway (a page that didn't arrive) as the client's error.
+pub(crate) fn stream_error(status: &tonic::Status, address: &str) -> ApiError {
+    classify(status, address, false)
 }
 
 /// What a failed forward answers the client (B3).
@@ -203,6 +250,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::CheckAndMutate(r) => Op::CheckAndMutate(r),
         ServiceOp::MutateReturning(r) => Op::MutateReturning(r),
         ServiceOp::Batch(r) => Op::Batch(r),
+        ServiceOp::MultiGet(r) => Op::MultiGet(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -223,6 +271,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::CheckAndMutate(r) => ServiceOp::CheckAndMutate(r),
             Op::MutateReturning(r) => ServiceOp::MutateReturning(r),
             Op::Batch(r) => ServiceOp::Batch(r),
+            Op::MultiGet(r) => ServiceOp::MultiGet(r),
         },
     )
 }
@@ -240,6 +289,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Mutate(r) => Reply::Mutate(r),
         ServiceReply::CheckAndMutate(r) => Reply::CheckAndMutate(r),
         ServiceReply::MutateReturning(r) => Reply::MutateReturning(r),
+        ServiceReply::MultiGet(r) => Reply::MultiGet(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -262,6 +312,7 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Mutate(r) => ServiceReply::Mutate(r),
             Reply::CheckAndMutate(r) => ServiceReply::CheckAndMutate(r),
             Reply::MutateReturning(r) => ServiceReply::MutateReturning(r),
+            Reply::MultiGet(r) => ServiceReply::MultiGet(r),
         },
     )
 }
