@@ -163,11 +163,20 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                 .load_shed()
                 .concurrency_limit(limits.max_concurrent),
         );
-    axum::Router::new()
+    let app = axum::Router::new()
         .route("/v1/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(Arc::clone(&shared))
-        .merge(limited)
+        .merge(limited);
+    // A cluster node's own service, beside the data routes (D317 ticket 2).
+    let app = match shared.router.cluster_node() {
+        Some(node) => app.merge(super::cluster::routes(
+            Arc::clone(node),
+            limits.max_request_bytes,
+        )),
+        None => app,
+    };
+    app
         // Outermost, so a body is read before any early answer: health, shedding, auth.
         .layer(axum::middleware::from_fn_with_state(shared, preread))
 }

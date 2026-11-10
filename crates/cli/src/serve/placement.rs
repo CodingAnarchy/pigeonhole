@@ -68,6 +68,22 @@ impl Placement {
         }
     }
 
+    /// A cluster node that serves no partition (D317 ticket 2, cli692's (b)): no shards to
+    /// keep off, so every CPU goes to the network and blocking threads, unpinned. It has no
+    /// feeds; the feed runtime keeps one idle thread.
+    pub(crate) fn routes_only(io: Option<usize>, blocking: Option<usize>) -> Self {
+        let free = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+        Self {
+            io_threads: io.unwrap_or(free).max(1),
+            blocking_threads: blocking.unwrap_or(free.max(2)).max(1),
+            feed_threads: 1,
+            #[cfg(target_os = "linux")]
+            mask: None,
+            free_cpus: free,
+            mode: "unpinned (routes only)",
+        }
+    }
+
     /// Called on each Tokio worker and blocking thread as it starts.
     pub(crate) fn enter(&self) {
         #[cfg(target_os = "linux")]

@@ -4,15 +4,15 @@
 //! `Status` reads a partition's identity row.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::{
     ClusterMap, GetMapRequest, Node as MapNode, Partition, SetMapRequest, SplitKey, StatusRequest,
     TablePlacement, split_key,
 };
-use super::{MapState, Node, Peers, identity, read_map, router};
+use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
 
 fn test_dir() -> PathBuf {
@@ -37,20 +37,19 @@ fn node(dir: &Path, id: &str) -> Arc<Node> {
         let json = super::map::canonical_json(&m);
         state.map = Some((super::map::canonical(&m), json));
     }
-    Arc::new(Node {
-        dir: dir.to_path_buf(),
-        id: id.into(),
-        loopback_only: true,
-        tokens: Tokens::parse("", "none").unwrap(),
-        peers: Peers {
+    Node::new(
+        dir,
+        id,
+        true,
+        Tokens::parse("", "none").unwrap(),
+        Peers {
             token: None,
             scheme: "http",
             ca: None,
             push_timeout: Duration::from_millis(500),
         },
-        state: Mutex::new(state),
-        installing: Mutex::new(()),
-    })
+        state,
+    )
 }
 
 /// Serves `node` on `listener` until the sender is dropped or fired.
@@ -60,7 +59,7 @@ fn serve(
     listener: std::net::TcpListener,
 ) -> tokio::sync::oneshot::Sender<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let app = router(Arc::clone(node), 16 << 20);
+    let app = routes(Arc::clone(node), 16 << 20);
     rt.spawn(async move {
         listener.set_nonblocking(true).unwrap();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();

@@ -873,13 +873,6 @@ impl Service {
     }
 
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the router, ticket 2's next commit, starts such nodes"
-        )
-    )]
     pub(crate) fn routing_only(
         limits: Limits,
         blocking_threads: usize,

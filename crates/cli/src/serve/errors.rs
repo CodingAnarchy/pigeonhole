@@ -351,6 +351,51 @@ impl ApiError {
         )
     }
 
+    /// D317 (ICR 0117): this node's map no longer gives it the key a forwarded call names.
+    /// The sending node pulls the newer map and forwards once more; a client that routes
+    /// directly refreshes its map. `map_version` is this node's.
+    #[expect(dead_code, reason = "the Forward handler, the next commit")]
+    pub(crate) fn wrong_partition(map_version: u64, message: impl Into<String>) -> Self {
+        Self::new(
+            "WrongPartition",
+            0,
+            format!(
+                "{} (this node's map is version {map_version})",
+                message.into()
+            ),
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+        .retry(RetryFrom::Request)
+    }
+
+    /// D317 (ICR 0117): a write or batch whose rows are in more than one partition, refused
+    /// before anything is written. Not retryable as written: split it.
+    pub(crate) fn cross_partition(message: impl Into<String>) -> Self {
+        Self::new(
+            "CrossPartition",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// D317 (ICR 0117): the partition's node couldn't be reached, and nothing was sent to
+    /// it, so a write is safe to retry too (B3: a forward that failed after it was sent
+    /// answers `OutcomeUnknown` instead).
+    pub(crate) fn partition_unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            "PartitionUnavailable",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
     /// A malformed request: missing a required field, or a value out of range.
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::new(

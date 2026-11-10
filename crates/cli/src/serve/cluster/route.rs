@@ -29,6 +29,7 @@ pub(crate) struct Owner {
 /// The routing view of one map version.
 #[derive(Debug)]
 pub(crate) struct Routes {
+    #[cfg_attr(not(test), expect(dead_code, reason = "forwarding, the next commit"))]
     map_version: u64,
     tables: HashMap<String, Placement>,
     owners: HashMap<String, Owner>,
@@ -79,6 +80,7 @@ impl Routes {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "forwarding, the next commit"))]
     pub(crate) fn map_version(&self) -> u64 {
         self.map_version
     }

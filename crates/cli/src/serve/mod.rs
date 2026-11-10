@@ -345,6 +345,7 @@ pub(crate) fn run(
             serving: args.db_file().display().to_string(),
             db: Some(db),
             replica,
+            start: None,
         },
         stderr,
     )
@@ -352,15 +353,17 @@ pub(crate) fn run(
 
 /// What [`serve_shared`] serves.
 pub(crate) struct Serving<'a> {
-    pub args: &'a ServeArgs,
-    pub shared: Arc<Shared>,
-    pub placement: Arc<placement::Placement>,
-    pub tls: Option<tokio_rustls::TlsAcceptor>,
+    pub(crate) args: &'a ServeArgs,
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) placement: Arc<placement::Placement>,
+    pub(crate) tls: Option<tokio_rustls::TlsAcceptor>,
     /// What the startup line says is served: the file, or a cluster node's partition.
-    pub serving: String,
+    pub(crate) serving: String,
     /// The database to close last; `None` on a cluster node that only routes.
-    pub db: Option<Pigeonhole>,
-    pub replica: Option<Arc<replica::Replica>>,
+    pub(crate) db: Option<Pigeonhole>,
+    pub(crate) replica: Option<Arc<replica::Replica>>,
+    /// Run on the request runtime once the server listens (a cluster node's map sync).
+    pub(crate) start: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Serves `shared` until a shutdown signal, then shuts down in order: the request runtime,
@@ -376,6 +379,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         serving,
         db,
         replica,
+        start,
     } = s;
     let enter = Arc::clone(&placement);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -441,6 +445,9 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         if let Some(r) = &replica {
             let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());
             r.spawn(Arc::clone(&shared));
+        }
+        if let Some(start) = start {
+            start();
         }
         // At the signal, a running bulk load stops at its next message: it takes no more of
         // its stream, then writes and rebalances what it took (the coordinator on #1580).

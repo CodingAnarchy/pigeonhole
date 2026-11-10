@@ -11,10 +11,6 @@
 pub(crate) mod cli;
 pub(crate) mod identity;
 pub(crate) mod map;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the router, ticket 2's next commit, routes by it")
-)]
 pub(crate) mod route;
 #[cfg(test)]
 mod tests;
@@ -37,7 +33,7 @@ use super::proto::{
     self, ClusterMap, GetMapRequest, LocalPartition, NodePush, NodeStatus, PushMapRequest,
     PushMapResponse, SetMapRequest, SetMapResponse, StatusRequest,
 };
-use super::{ServeArgs, config, listener, tls};
+use super::{ServeArgs, config, tls};
 use crate::ExitStatus;
 use crate::exit::Failure;
 
@@ -143,9 +139,42 @@ pub(crate) struct Node {
     /// Serializes installs (check, persist, publish), so the file and `state` take maps in
     /// one order; held only on blocking threads (cli692's R2).
     installing: Mutex<()>,
+    /// The routes of the newest map, swapped whole with it: read on every routed call
+    /// without a lock (D317 ticket 2; `load()`'s guard, never `load_full()`, perf287).
+    routes: arc_swap::ArcSwapOption<route::Routes>,
 }
 
 impl Node {
+    fn new(
+        dir: &Path,
+        id: &str,
+        loopback_only: bool,
+        tokens: Tokens,
+        peers: Peers,
+        state: MapState,
+    ) -> Arc<Self> {
+        let routes = state
+            .map
+            .as_ref()
+            .map(|(m, _)| Arc::new(route::Routes::new(m)));
+        Arc::new(Self {
+            dir: dir.to_path_buf(),
+            id: id.to_owned(),
+            loopback_only,
+            tokens,
+            peers,
+            state: Mutex::new(state),
+            installing: Mutex::new(()),
+            routes: arc_swap::ArcSwapOption::new(routes),
+        })
+    }
+
+    /// The newest map's routes, `None` before the node has a map. A guard, not a clone of
+    /// the `Arc`: read on every routed call.
+    pub(crate) fn routes(&self) -> arc_swap::Guard<Option<Arc<route::Routes>>> {
+        self.routes.load()
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, MapState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -225,8 +254,11 @@ impl Node {
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
         let version = canonical.map_version;
+        let routes = Arc::new(route::Routes::new(&canonical));
         let mut st = self.state();
         st.map = Some((canonical, json));
+        // Under the state lock, so the routes never run behind the map `GetMap` answers.
+        self.routes.store(Some(routes));
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
@@ -728,27 +760,24 @@ async fn http_status(State(node): State<Arc<Node>>, headers: HeaderMap) -> Respo
     }
 }
 
-async fn http_health() -> Response {
-    axum::Json(proto::HealthResponse {
-        status: "ok".into(),
-    })
-    .into_response()
-}
-
-/// The node's routes: the `Cluster` service over gRPC, its HTTP/JSON forms (`PushMap` is
-/// gRPC only), and health. Peers call each other over gRPC only, so only gRPC calls carry
-/// the map-version headers that start a pull; the HTTP forms are for operators (cli692's
-/// N6).
-fn router(node: Arc<Node>, max_request_bytes: usize) -> axum::Router {
+/// The `Cluster` service's routes, gRPC and HTTP, which the data listener mounts beside the
+/// data routes (D317 ticket 2). Outside the server's load shedding, with a small limit of
+/// their own: a node busy with data must still take a map, or a re-forward's pull fails
+/// exactly when it matters (cli692's 3). `Forward` itself is a data call: an owner that
+/// sheds it answers `Overloaded`, which the forwarding node passes back.
+pub(crate) fn routes(node: Arc<Node>, max_request_bytes: usize) -> axum::Router {
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node)))
         .max_decoding_message_size(max_request_bytes);
     axum::Router::new()
-        .route("/v1/health", get(http_health))
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))
         .with_state(node)
         .route_service("/pigeonhole.v1.Cluster/{*method}", grpc)
+        .layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
 }
+
+/// `Cluster` calls a node runs at once: map reads and installs, pushes and pulls are few.
+const CLUSTER_CALLS: usize = 16;
 
 /// `phdb serve --cluster DIR`.
 pub(crate) fn run(
@@ -845,71 +874,154 @@ pub(crate) fn run(
         state.map = Some((map::canonical(&m), json));
     }
     let version = state.version();
-    let node = Arc::new(Node {
-        dir: dir.to_path_buf(),
-        id: id.clone(),
+    let node = Node::new(
+        dir,
+        &id,
         loopback_only,
         tokens,
-        peers: Peers {
+        Peers {
             token,
             scheme: if tls.is_some() { "https" } else { "http" },
             ca,
             push_timeout: Duration::from_millis(args.cluster_push_timeout_ms.max(1)),
         },
-        state: Mutex::new(state),
-        installing: Mutex::new(()),
+        state,
+    );
+    // The partition the map gives this node, opened and checked against the map; none
+    // before a first map, or when the map gives it none (the node only routes). Several
+    // per node come with D317's ticket 8.
+    let local = {
+        let routes = node.routes();
+        match routes.as_ref() {
+            None => None,
+            Some(r) => {
+                let mut mine: Vec<&str> = r.partitions_of(&id).collect();
+                mine.sort_unstable();
+                if mine.len() > 1 {
+                    return Err(Failure::usage(&format!(
+                        "the map gives node {id} {} partitions ({}): several per node come \
+                         with D317's ticket 8",
+                        mine.len(),
+                        mine.join(", ")
+                    )));
+                }
+                mine.first()
+                    .map(|p| ((*p).to_owned(), r.owner(p).map_or(0, |o| o.epoch)))
+            }
+        }
+    };
+    let cluster_id = node.state().map.as_ref().map(|(m, _)| m.cluster_id.clone());
+    let db = match (&local, &cluster_id) {
+        (Some((p, epoch)), Some(c)) => Some(open_partition(dir, c, p, *epoch)?),
+        _ => None,
+    };
+    let placement = Arc::new(match &db {
+        Some(db) => super::placement::Placement::plan(
+            db,
+            args.io_threads,
+            args.blocking_threads,
+            args.feed_threads,
+        ),
+        None => super::placement::Placement::routes_only(args.io_threads, args.blocking_threads),
     });
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.io_threads.unwrap_or(2).max(1))
-        .thread_name("phdb-cluster")
-        .enable_all()
-        .build()
-        .map_err(|e| Failure::io("start the runtime", &e))?;
-    let served = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(args.listen)
-            .await
-            .map_err(|e| Failure::io(&format!("listen on {}", args.listen), &e))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| Failure::io("listen", &e))?;
-        let _ = writeln!(
-            stderr,
-            "phdb serve: cluster node {id} of {} on {addr} ({}, {}; map version {version})",
-            dir.display(),
-            if tls.is_some() { "TLS" } else { "no TLS" },
-            if node.tokens.any() {
-                "tokens required"
-            } else {
-                "no tokens"
-            },
-        );
-        // A node that restarts with a map takes a newer one from its peers, then pushes.
-        if version > 0 {
-            let n = Arc::clone(&node);
+    let limits = args.limits();
+    let metrics = Arc::new(super::service::Metrics::default());
+    let service = match &db {
+        Some(db) => super::service::Service::new(
+            db.clone(),
+            limits,
+            placement.blocking_threads,
+            Arc::clone(&metrics),
+        )
+        .placement(&placement),
+        None => super::service::Service::routing_only(
+            limits,
+            placement.blocking_threads,
+            Arc::clone(&metrics),
+        ),
+    };
+    let serving = match &local {
+        Some((p, epoch)) => format!(
+            "partition {p} (epoch {epoch}) as cluster node {id} of {}; map version {version}",
+            dir.display()
+        ),
+        None => format!(
+            "no partition, routing only, as cluster node {id} of {}; map version {version}",
+            dir.display()
+        ),
+    };
+    let shared = Arc::new(super::Shared {
+        router: super::router::Router::cluster(service, Arc::clone(&node), local.map(|(p, _)| p)),
+        // The data calls' tokens: the same file the node's own calls read.
+        tokens: super::tokens(args)?,
+        limits,
+        metrics,
+    });
+    // A node that restarts with a map takes a newer one from its peers, then pushes.
+    let start: Option<Box<dyn FnOnce() + Send>> = (version > 0).then(|| {
+        let n = Arc::clone(&node);
+        Box::new(move || {
             tokio::spawn(async move {
                 n.sync_on_start().await;
             });
-        }
-        listener::serve(
-            listener,
-            tls,
-            router(Arc::clone(&node), args.max_request_bytes),
-            super::shutdown_signal(),
-            Duration::from_millis(args.shutdown_grace_ms),
-            args.http2_send_buffer
-                .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
-            listener::Bounds {
-                connections: listener::Connections::new(listener::default_max_connections(
-                    listener::open_file_limit(),
-                )),
-                first_byte: Duration::from_secs(30),
-            },
-        )
-        .await;
-        Ok::<_, Failure>(())
+        }) as Box<dyn FnOnce() + Send>
     });
-    runtime.shutdown_timeout(Duration::from_secs(5));
-    let _ = writeln!(stderr, "phdb serve: cluster node {id} stopped");
-    served?;
-    Ok(ExitStatus::SUCCESS)
+    super::serve_shared(
+        super::Serving {
+            args,
+            shared,
+            placement,
+            tls,
+            serving,
+            db,
+            replica: None,
+            start,
+        },
+        stderr,
+    )
+}
+
+/// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
+/// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
+/// stamped for another cluster or partition, or the map moved past it: refused, not served.
+fn open_partition(
+    dir: &Path,
+    cluster_id: &str,
+    partition: &str,
+    epoch: u64,
+) -> Result<pigeonhole::Pigeonhole, Failure> {
+    let path = dir.join(format!("{partition}.phdb"));
+    if !path.exists() {
+        return Err(Failure::usage(&format!(
+            "the map gives this node partition {partition}, but {} doesn't exist: create it \
+             with phdb cluster init-partition",
+            path.display()
+        )));
+    }
+    let db = pigeonhole::Pigeonhole::open(&path, pigeonhole::Options::default())
+        .map_err(|e| Failure::db("open the partition", &e))?;
+    let want = identity::Identity {
+        cluster_id: cluster_id.to_owned(),
+        partition_id: partition.to_owned(),
+        epoch,
+    };
+    match identity::read(&db) {
+        Ok(Some(id)) if id == want => Ok(db),
+        found => {
+            let _ = db.close();
+            let found = match found {
+                Ok(Some(id)) => format!(
+                    "partition {:?} of cluster {:?} at epoch {}",
+                    id.partition_id, id.cluster_id, id.epoch
+                ),
+                Ok(None) => "no identity row (run phdb cluster init-partition)".to_owned(),
+                Err(e) => e,
+            };
+            Err(Failure::usage(&format!(
+                "{} isn't partition {partition:?} of cluster {cluster_id:?} at the map's epoch \
+                 {epoch}: it says {found}",
+                path.display()
+            )))
+        }
+    }
 }

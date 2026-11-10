@@ -264,6 +264,12 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
+    // A cluster node's tools would see only its own partition: refused until a D317 ticket
+    // routes them (cli692's 4 on ticket 2).
+    if shared.router.cluster_node().is_some() {
+        return ApiError::unsupported("/mcp on a cluster node comes with a later D317 ticket")
+            .into_response();
+    }
     let service = &shared.router.service;
     // `/mcp` serves one database's tools: a node that only routes has none (D317 ticket 2).
     let db = match service.part() {
