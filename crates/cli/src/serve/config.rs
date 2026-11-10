@@ -114,7 +114,9 @@ pub(crate) struct ServeArgs {
     pub blocking_threads: Option<usize>,
     /// Threads that deliver the change feed to its streams, a runtime of their own so feed
     /// delivery never holds a request's worker (default: a quarter of the CPUs the shards
-    /// don't use, at least 1, taken from `--io-threads`' default).
+    /// don't use, at least 1, taken from `--io-threads`' default). The feed's shared
+    /// subscriptions (hubs) read the engine on a quarter as many threads again, at least 1,
+    /// so a hub never waits behind its streams' delivery.
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
