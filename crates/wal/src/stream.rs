@@ -957,7 +957,7 @@ pub(crate) fn open_direct(vfs: &VfsRef, path: &Path, on: bool) -> Result<Option<
         Err(e) => return Err(e.into()),
     };
     let align = file.direct_align().unwrap_or(IoBuf::ALIGN) as u64;
-    if align == 0 || align > IoBuf::ALIGN as u64 || FRAME % align != 0 {
+    if align == 0 || align > IoBuf::ALIGN as u64 || !FRAME.is_multiple_of(align) {
         return Ok(None);
     }
     Ok(Some(file))

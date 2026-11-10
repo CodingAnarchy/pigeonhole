@@ -96,7 +96,7 @@ fn a_direct_stream_writes_its_record_areas_only_in_aligned_blocks() {
                 // record write (the `write_buf` path) frames records of any length, so it shows
                 // here as misaligned.
                 assert!(
-                    offset % ALIGN == 0 && len % ALIGN == 0,
+                    offset.is_multiple_of(ALIGN) && len.is_multiple_of(ALIGN),
                     "seed {seed} deferred={deferred}: an unaligned (buffered) write at {offset} \
                      ({len} B) in a record area"
                 );
