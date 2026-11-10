@@ -35,6 +35,10 @@ jemalloc = ["dep:tikv-jemallocator"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,
 # the memory tools take client-supplied embeddings or recall by keyword.
 embed = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
+# `--embed-local` (#1345 PR 2, D318): embeddings computed in this process on the CPU with
+# `pigeonhole-embed` (candle, about 56 crates), off by default so `cargo install` doesn't
+# build candle unless asked (owner, D318 Q4).
+embed-local = ["dep:pigeonhole-embed"]
 # `phdb serve` (D313, #1397), off by default (owner, 2026-11-04). This build has only the
 # network API's generated types (ICR 0112); the server follows.
 serve = [
@@ -53,6 +57,8 @@ serve = [
 pigeonhole = { workspace = true }
 # `phdb mcp --memory` (D311 T7).
 pigeonhole-memory = { workspace = true }
+# `--embed-local` (#1345 PR 2).
+pigeonhole-embed = { workspace = true, optional = true }
 # `phdb serve`'s `Vectors` index RPCs (D313 ticket 7).
 pigeonhole-vector = { workspace = true, optional = true }
 # `phdb serve`'s `Text` RPCs (D313 ticket 7c).
