@@ -376,6 +376,16 @@ pub(crate) const SCAN: usize = 7;
 /// `Feed.Subscribe`'s index in `RPCS`: counted when its stream ends, as a scan's is.
 pub(crate) const FEED: usize = 16;
 
+/// What [`Service::admit`] checks a call against: its name (for the refusal's message), the
+/// scope it needs, whether it writes, and its request's size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Admit {
+    pub what: &'static str,
+    pub scope: Scope,
+    pub writes: bool,
+    pub size: usize,
+}
+
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
 pub(crate) const DOWNLOAD: usize = 25;
 
@@ -638,6 +648,7 @@ pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sess
         ("transaction", s.transactions),
         ("snapshot", s.snapshots),
         ("tombstone", s.tombstones),
+        ("mcp", s.mcp),
     ] {
         let _ = writeln!(out, "pigeonhole_serve_sessions{{kind=\"{kind}\"}} {n}");
     }
@@ -751,7 +762,15 @@ pub(crate) struct Service {
     memory_calls: Arc<Semaphore>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
+    ///
+    /// **Lock order: a blocking-pool place first, then this.** A `/mcp` create holds its
+    /// request's pool thread when it takes this, so an async create or drop takes its pool
+    /// place before this, never while holding it (ai1249's B2 on #1666).
     schema: tokio::sync::Mutex<()>,
+    /// The catalog's generation: bumped by a create, a drop, and a replica's catalog
+    /// change. A `/mcp` session that saw an older one checks its tool list (ai1249's M2 on
+    /// D313: `create_table` in one session can bring `nearest` to another).
+    catalog: AtomicU64,
     /// Scan page reads at once: half the blocking pool, at least 1, so scans can't take
     /// every blocking thread from the other calls (perf287's G3 on #1510).
     scan_reads: Arc<Semaphore>,
@@ -800,6 +819,7 @@ impl Service {
             memory: None,
             memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             schema: tokio::sync::Mutex::new(()),
+            catalog: AtomicU64::new(0),
             feeds: super::feed::Feeds::new(
                 db.clone(),
                 super::feed::FeedLimits {
@@ -876,6 +896,7 @@ impl Service {
     /// each name opens it again. A forgotten background index's rebalancer sees its index
     /// close and ends. An open running across this keeps nothing (#1632).
     fn handles_changed(&self) {
+        self.catalog.fetch_add(1, Ordering::Release);
         self.tables.rcu(|c| TableCache {
             generation: c.generation + 1,
             map: HashMap::new(),
@@ -986,44 +1007,75 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
-        let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes()) else {
-            return self.answer(op, caller, prepaid).await;
+        let admit = Admit {
+            what: op.name(),
+            scope: op.scope(),
+            writes: op.writes(),
+            size: op.size(),
         };
-        if op.writes() && caller.scope.allows(op.scope()) {
+        let budget = self.admit(&admit, caller, prepaid).await?;
+        let reply = self.answer(op, caller, budget).await;
+        match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
+            // A transaction's Commit with writes: the engine's gate (R6) refused it.
+            (Err(e), Some(replica)) if e.code == "ReadOnly" => {
+                Err(ApiError::replica_read_only(replica.primary()))
+            }
+            (reply, _) => reply,
+        }
+    }
+
+    /// Every call's rules, before it runs, in one place (D313 §7 as amended by ticket 8c):
+    /// gRPC and HTTP calls come through [`call`](Self::call), and `/mcp`'s tools call it
+    /// directly. In order:
+    /// - **a replica's write refusal:** a write a caller may make is refused with `ReadOnly`
+    ///   naming the primary, rather than a permission error;
+    /// - **the caller's scope:** `PermissionDenied` below it;
+    /// - **the request's size:** `--max-request-bytes`;
+    /// - **the in-flight budget** (R3): `size` bytes, held by the returned permit until the
+    ///   reply is built. Waiting for it counts against the request's deadline; nothing has
+    ///   been submitted while it waits. Both front-ends reserve it before reading the
+    ///   message (perf287's F2 on #1501): HTTP from `Content-Length`, gRPC from the message
+    ///   header (`grpc::prepay`). It's taken here only for a call that comes without one.
+    ///   Reads hold it until their reply is built; a write hands it to its detached task,
+    ///   so a client that goes away doesn't free bytes the write still holds (simp724's S1
+    ///   on #1501).
+    pub(crate) async fn admit(
+        &self,
+        call: &Admit,
+        caller: &Caller,
+        prepaid: Option<OwnedSemaphorePermit>,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.check(call, caller)?;
+        match prepaid {
+            Some(p) => Ok(p),
+            None => self.budget(call.size).await,
+        }
+    }
+
+    /// [`admit`](Self::admit)'s checks without its reservation: a `/mcp` tool call, whose
+    /// request's bytes are its POST's, already reserved (ai1249's S1 on #1666).
+    pub(crate) fn check(&self, call: &Admit, caller: &Caller) -> Result<(), ApiError> {
+        if let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes())
+            && call.writes
+            && caller.scope.allows(call.scope)
+        {
             return Err(ApiError::replica_read_only(replica.primary()));
         }
-        match self.answer(op, caller, prepaid).await {
-            // A transaction's Commit with writes: the engine's gate (R6) refused it.
-            Err(e) if e.code == "ReadOnly" => Err(ApiError::replica_read_only(replica.primary())),
-            reply => reply,
+        if !caller.scope.allows(call.scope) {
+            return Err(ApiError::permission_denied(&format!("call {}", call.what)));
         }
+        if call.size > self.limits.max_request_bytes {
+            return Err(ApiError::request_too_large(self.limits.max_request_bytes));
+        }
+        Ok(())
     }
 
     async fn answer(
         &self,
         op: ServiceOp,
         caller: &Caller,
-        prepaid: Option<OwnedSemaphorePermit>,
+        budget: OwnedSemaphorePermit,
     ) -> Result<ServiceReply, ApiError> {
-        if !caller.scope.allows(op.scope()) {
-            return Err(ApiError::permission_denied(&format!("call {}", op.name())));
-        }
-        let size = op.size();
-        if size > self.limits.max_request_bytes {
-            return Err(ApiError::request_too_large(self.limits.max_request_bytes));
-        }
-        // The budget is held until the reply is built (R3). Waiting for it counts against
-        // the request's deadline; nothing has been submitted while it waits. Both front-ends
-        // reserve it before reading the message (perf287's F2 on #1501): HTTP from
-        // `Content-Length`, gRPC from the message header (`grpc::prepay`). It's taken here
-        // only for a call that comes without one.
-        // Reads hold the budget until their reply is built; a write hands it to its
-        // detached task, so a client that goes away doesn't free bytes the write still
-        // holds (simp724's S1 on #1501).
-        let budget = match prepaid {
-            Some(p) => p,
-            None => self.budget(size).await?,
-        };
         match op {
             // A read that fails on `Io` changed nothing, so it may be sent
             // again (`retry_from` REQUEST, ICR 0112).
@@ -1091,10 +1143,7 @@ impl Service {
             }
             ServiceOp::ListTables(_) => {
                 drop(budget);
-                let mut tables = self.db.tables();
-                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
-                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
-                tables.sort();
+                let tables = self.user_tables();
                 Ok(ServiceReply::Tables(proto::ListTablesResponse { tables }))
             }
             ServiceOp::CreateTable(r) => {
@@ -1112,10 +1161,7 @@ impl Service {
                 drop(budget);
                 let db = self.db.clone();
                 let info = self.blocking(move || Ok(db.info()?)).await?;
-                let mut tables = self.db.tables();
-                // The cluster's own tables (`__phdb_cluster`) aren't the user's (ICR 0117).
-                tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
-                tables.sort();
+                let tables = self.user_tables();
                 Ok(ServiceReply::Info(proto::InfoResponse {
                     path: self.db.path().display().to_string(),
                     file_bytes: info.file_bytes,
@@ -1372,14 +1418,11 @@ impl Service {
     /// A replica's applied catalog changes don't take `schema`: there, an open that
     /// [`tables_changed`](Self::tables_changed) overtook keeps nothing and opens again,
     /// since it may have resolved the name before a drop and create (#1632).
-    async fn table(&self, name: &str) -> Result<Table, ApiError> {
+    pub(crate) async fn table(&self, name: &str) -> Result<Table, ApiError> {
         loop {
-            let generation = {
-                let cache = self.tables.load();
-                if let Some(t) = cache.map.get(name) {
-                    return Ok(t.clone());
-                }
-                cache.generation
+            let generation = match self.cached(name) {
+                Ok(t) => return Ok(t),
+                Err(generation) => generation,
             };
             reserved(name)?;
             let db = self.db.clone();
@@ -1391,6 +1434,29 @@ impl Service {
                 return Ok(t);
             }
         }
+    }
+
+    /// [`table`](Self::table) on a blocking thread the caller already holds (a `/mcp`
+    /// request's): a miss opens the table here, never on a second pool thread, which a full
+    /// pool would never give (ai1249's B1 on #1666).
+    pub(crate) fn table_blocking(&self, name: &str) -> Result<Table, ApiError> {
+        loop {
+            let generation = match self.cached(name) {
+                Ok(t) => return Ok(t),
+                Err(generation) => generation,
+            };
+            reserved(name)?;
+            let table = self.db.table(name)?.open()?;
+            if let Some(t) = self.keep_table(name, &table, generation) {
+                return Ok(t);
+            }
+        }
+    }
+
+    /// The cached handle for `name`, or the cache's generation to open it at.
+    fn cached(&self, name: &str) -> Result<Table, u64> {
+        let cache = self.tables.load();
+        cache.map.get(name).cloned().ok_or(cache.generation)
     }
 
     /// Keeps `table` under `name` unless a handle is there already (then that one is
@@ -1431,28 +1497,67 @@ impl Service {
             .iter()
             .map(|f| Ok((f.name.clone(), convert::family_in(f)?)))
             .collect::<Result<Vec<_>, ApiError>>()?;
+        let table = self.create_with(r.name, families, r.if_missing).await?;
+        Ok(describe(&table))
+    }
+
+    /// Creates table `name` with `families`, or with `if_missing` opens it with the families
+    /// it lacks added: `Schema.CreateTable`'s work, and `/mcp`'s `create_table` tool's. The
+    /// service's handle for the name is replaced, so later calls (and feed hubs, keyed by
+    /// its id) use this table.
+    pub(crate) async fn create_with(
+        &self,
+        name: String,
+        families: Vec<(String, pigeonhole::Family)>,
+        if_missing: bool,
+    ) -> Result<Table, ApiError> {
+        reserved(&name)?;
+        // The pool place before `schema` (its lock order).
+        let place = pool_place(&self.blocking).await?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let (name, if_missing) = (r.name.clone(), r.if_missing);
-        let table = self
-            .blocking(move || {
-                let mut b = db.table(&name)?;
-                for (n, f) in families {
-                    b = b.family(&n, f);
-                }
-                Ok(if if_missing {
-                    b.create_if_missing()?
-                } else {
-                    b.create()?
-                })
-            })
-            .await?;
+        let owned = name.clone();
+        let table = held(place, move || create_in(&db, &owned, families, if_missing)).await?;
+        self.created(name, &table);
+        Ok(table)
+    }
+
+    /// [`create_with`](Self::create_with) on a blocking thread the caller already holds (a
+    /// `/mcp` request's), for the reason [`table_blocking`](Self::table_blocking) gives.
+    pub(crate) fn create_blocking(
+        &self,
+        name: &str,
+        families: Vec<(String, pigeonhole::Family)>,
+        if_missing: bool,
+    ) -> Result<Table, ApiError> {
+        reserved(name)?;
+        let _schema = self.schema.blocking_lock();
+        let table = create_in(&self.db, name, families, if_missing)?;
+        self.created(name.to_owned(), &table);
+        Ok(table)
+    }
+
+    /// A created table's handle replaces the name's, and the catalog moves.
+    fn created(&self, name: String, table: &Table) {
         self.tables.rcu(|c| {
             let mut c = TableCache::clone(c);
-            c.map.insert(r.name.clone(), table.clone());
+            c.map.insert(name.clone(), table.clone());
             c
         });
-        Ok(describe(&table))
+        self.catalog.fetch_add(1, Ordering::Release);
+    }
+
+    /// The user's tables, sorted: the cluster's own (`__phdb_cluster`, ICR 0117) aren't.
+    pub(crate) fn user_tables(&self) -> Vec<String> {
+        let mut tables = self.db.tables();
+        tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
+        tables.sort();
+        tables
+    }
+
+    /// The catalog's generation: it moves with every create and drop.
+    pub(crate) fn catalog(&self) -> u64 {
+        self.catalog.load(Ordering::Acquire)
     }
 
     /// `Schema.DropTable`: the table and its data go, and so does the service's handle for
@@ -1472,9 +1577,11 @@ impl Service {
                 )));
             }
         }
+        // The pool place before `schema` (its lock order).
+        let place = pool_place(&self.blocking).await?;
         let _schema = self.schema.lock().await;
         let db = self.db.clone();
-        let dropped = self.blocking(move || Ok(db.drop_table(&name)?)).await;
+        let dropped = held(place, move || Ok(db.drop_table(&name)?)).await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
         // cached handle goes, not only the name's: drops are rare, and an open of the name
@@ -1693,6 +1800,23 @@ impl Service {
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         blocking(&self.blocking, f).await
+    }
+
+    /// Runs `f` on the blocking pool, within its limit: a `/mcp` request's messages, whose
+    /// tools make sync database calls.
+    pub(crate) async fn run_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        self.blocking(f).await
+    }
+
+    /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
+    /// `feed_poll`'s for its wait.
+    pub(crate) fn stream_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        Arc::clone(&self.streams).try_acquire_owned().map_err(|_| {
+            ApiError::overloaded("the server is at its concurrent stream limit (--max-streams)")
+        })
     }
 
     /// Runs a write as its own task and awaits its outcome (B2). If the request goes away
@@ -2893,10 +3017,22 @@ pub(crate) async fn blocking<T: Send + 'static>(
     pool: &Arc<Semaphore>,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    let _permit = Arc::clone(pool)
+    held(pool_place(pool).await?, f).await
+}
+
+/// One of `pool`'s permits: a place on the blocking pool.
+async fn pool_place(pool: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
+    Arc::clone(pool)
         .acquire_owned()
         .await
-        .map_err(|_| ApiError::internal("the blocking pool closed"))?;
+        .map_err(|_| ApiError::internal("the blocking pool closed"))
+}
+
+/// Runs a sync-only call on the blocking pool, in the place `_place` holds.
+async fn held<T: Send + 'static>(
+    _place: OwnedSemaphorePermit,
+    f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
@@ -3103,6 +3239,29 @@ async fn budget_within(
             "the server's in-flight request bytes stayed full past the deadline",
         )),
     }
+}
+
+/// Creates table `name` with `families` (with `if_missing`, opens it with the families it
+/// lacks added): a sync call, on a blocking thread. An empty name is refused here for every
+/// caller (`Schema.CreateTable` refuses it earlier, before its families are read).
+fn create_in(
+    db: &Pigeonhole,
+    name: &str,
+    families: Vec<(String, pigeonhole::Family)>,
+    if_missing: bool,
+) -> Result<Table, ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::invalid("empty table name"));
+    }
+    let mut b = db.table(name)?;
+    for (n, f) in families {
+        b = b.family(&n, f);
+    }
+    Ok(if if_missing {
+        b.create_if_missing()?
+    } else {
+        b.create()?
+    })
 }
 
 /// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables

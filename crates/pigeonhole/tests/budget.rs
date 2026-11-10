@@ -1003,11 +1003,13 @@ fn an_async_page_yields_over_filtered_separated_values() {
     db.close().unwrap();
 }
 
-/// #1286: from a cold block cache (a reopen), the async read fetches what it can predict
-/// and counts what it reads synchronously; its page is the sync one.
+/// #1286, #1652: from a cold block cache (a reopen), the async read fetches the blocks it
+/// reads, a row's later blocks too, and its page is the sync one. On real files a fetch whose
+/// read completes at submit is read in place and counted (D292, #1629), so the exact count of
+/// synchronous reads, 0, is `keyset_cells_async.rs`'s, on the simulated device.
 #[cfg(feature = "async")]
 #[test]
-fn an_async_page_from_a_cold_cache_counts_its_synchronous_reads() {
+fn an_async_page_from_a_cold_cache_fetches_its_rows_blocks() {
     let dir = std::env::temp_dir().join(format!("phdb-budget-{}-async-cold", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1033,12 +1035,13 @@ fn an_async_page_from_a_cold_cache_counts_its_synchronous_reads() {
     let db = open();
     let t = db.table("t").unwrap().open().unwrap();
     let before = db.engine_metrics();
-    let (got, _) = poll_counting(t.scan_prefix(b"r").read_within_async(1 << 30));
+    let (got, pending) = poll_counting(t.scan_prefix(b"r").read_within_async(1 << 30));
     let after = db.engine_metrics();
     let got = got.unwrap();
+    assert!(pending > 0, "nothing was fetched");
     assert!(
-        after.async_sync_reads > before.async_sync_reads,
-        "a row's later blocks, read synchronously, are counted"
+        after.block_cache_misses > before.block_cache_misses,
+        "the cache was cold"
     );
     let sync = t.scan_prefix(b"r").read_within(1 << 30).unwrap();
     assert_eq!(scan_summary(&got), scan_summary(&sync));

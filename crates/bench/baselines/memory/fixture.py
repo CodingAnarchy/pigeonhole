@@ -3,6 +3,11 @@
 embedded once with one fixed open model, for `examples/memrecall.rs`.
 
     python3 fixture.py OUT_DIR [--datasets lme_s,lme_m,locomo] [--lme-m-questions 50]
+    python3 fixture.py --reference crates/embed/tests/reference.json
+
+`--reference PATH` writes only `pigeonhole-embed`'s reference vectors (#1345, D318): the
+model's embeddings of `REFERENCE_TEXTS`, as passages and as queries, which the crate's
+`reference` test compares its own output with.
 
 Needs `sentence-transformers` (see requirements.txt next to this file). Downloads into
 OUT_DIR/raw (checked against the SHA-256 below once pinned), then writes for each dataset D:
@@ -35,6 +40,31 @@ MODEL = "BAAI/bge-small-en-v1.5"
 REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 # bge's instruction for retrieval queries; passages take none.
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+# pigeonhole-embed's reference texts (#1345): ASCII, punctuation, Unicode (accents, CJK,
+# emoji, a combining mark), empty, whitespace only, and one past 512 tokens (truncated).
+REFERENCE_TEXTS = [
+    "Dana prefers tabs over spaces.",
+    "The deploy runs on Fridays at 5pm.",
+    "what does Dana prefer?",
+    "Remember: the API key rotates every 90 days!",
+    "I moved from Berlin to Lisbon in March 2024.",
+    "Café au lait, s'il vous plaît.",
+    "naïve résumé coöperate",
+    "Cafe\u0301 (a combining acute accent)",
+    "東京で会議があります。",
+    "Ich habe einen Termin um 10 Uhr.",
+    "The meeting moved \U0001F680 to Thursday \U0001F389",
+    "a",
+    "",
+    "   ",
+    "UPPERCASE TEXT IS LOWERCASED BY THE TOKENIZER",
+    "e-mail: dana@example.com, phone +1 (555) 010-0199",
+    "fn main() { println!(\"hello\"); }",
+    "1 2 3 4 5 6 7 8 9 10",
+    " ".join(f"word{i}" for i in range(700)),
+    "The quick brown fox jumps over the lazy dog. " * 20,
+]
 
 # name -> (url, sha256 or None until pinned)
 SOURCES = {
@@ -194,12 +224,35 @@ def write_f32(path, vecs):
             f.write(struct.pack(f"<{len(v)}f", *v.tolist()))
 
 
+def reference(model, path):
+    """pigeonhole-embed's reference vectors: each text one at a time (no padding), as a
+    passage and as a query, rounded to 8 significant digits."""
+    one = lambda t: [float(f"{x:.8g}") for x in model.encode([t], normalize_embeddings=True, convert_to_numpy=True)[0].tolist()]
+    out = {
+        "model": MODEL,
+        "revision": REVISION,
+        "query_prefix": QUERY_PREFIX,
+        "texts": [{"text": t, "passage": one(t), "query": one(QUERY_PREFIX + t)} for t in REFERENCE_TEXTS],
+    }
+    with open(path, "w") as f:
+        json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+        f.write("\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("out")
+    ap.add_argument("out", nargs="?")
     ap.add_argument("--datasets", default="lme_s,lme_m,locomo")
     ap.add_argument("--lme-m-questions", type=int, default=50)
+    ap.add_argument("--reference", metavar="PATH", help="write pigeonhole-embed's reference vectors only")
     a = ap.parse_args()
+    if a.reference is None and a.out is None:
+        ap.error("OUT_DIR is required unless --reference is given")
+    if a.reference is not None:
+        from sentence_transformers import SentenceTransformer
+
+        reference(SentenceTransformer(MODEL, device="cpu", revision=REVISION), a.reference)
+        return
     raw = os.path.join(a.out, "raw")
     os.makedirs(raw, exist_ok=True)
 

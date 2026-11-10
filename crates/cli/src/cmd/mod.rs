@@ -69,6 +69,7 @@ pub(crate) fn run(
                 result_bytes: *max_result_bytes,
                 value_bytes: *max_value_bytes,
                 feed_bytes: *change_feed,
+                cache_bytes: crate::mcp::STDIO_CACHE_BYTES,
             };
             return crate::mcp::run(
                 &cli, file, *read_only, *create, limits, memory, stdout, stderr,

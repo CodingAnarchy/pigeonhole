@@ -14,6 +14,10 @@
 //!   before any `Commit` leaves a marker for one idle lease, which answers
 //!   `TransactionExpired`; after that, the id is `NotFound`.
 //! - **Caps:** sessions in total and per token, tombstones and markers counted in.
+//! - **Remote MCP sessions** (`Mcp-Session-Id`, D313 §7 and ai1249's M1) live here too, with
+//!   leases of their own: bound to their token, never expired with a request in flight
+//!   (any number at once, unlike a transaction; the session caps its own), and counted in
+//!   the caps.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
@@ -32,6 +36,10 @@ pub(crate) struct Leases {
     pub snapshot_lifetime: Duration,
     pub max_sessions: usize,
     pub max_per_token: usize,
+    /// A remote MCP session's idle lease and lifetime (`--mcp-session-idle-ms`,
+    /// `--mcp-session-lifetime-ms`).
+    pub mcp_idle: Duration,
+    pub mcp_lifetime: Duration,
 }
 
 type Id = [u8; 16];
@@ -49,6 +57,8 @@ enum State {
     /// Expired before any `Commit`: answers `TransactionExpired` until it expires itself.
     Expired,
     Snapshot(Snapshot),
+    /// A remote MCP session.
+    Mcp(Arc<super::mcp::McpSession>),
 }
 
 struct Entry {
@@ -145,6 +155,7 @@ pub(crate) struct Stats {
     pub transactions: usize,
     pub snapshots: usize,
     pub tombstones: usize,
+    pub mcp: usize,
     pub oldest: Duration,
 }
 
@@ -269,7 +280,64 @@ impl Sessions {
                 Ok(Taken::Done(outcome))
             }
             State::Expired => Err(ApiError::transaction_expired()),
-            State::Snapshot(_) => Err(gone()),
+            State::Snapshot(_) | State::Mcp(_) => Err(gone()),
+        }
+    }
+
+    /// Holds a remote MCP session for `token` and returns its id.
+    pub(crate) fn open_mcp(
+        self: &Arc<Self>,
+        token: u32,
+        session: Arc<super::mcp::McpSession>,
+    ) -> Result<String, ApiError> {
+        self.insert(
+            token,
+            State::Mcp(session),
+            None,
+            self.leases.mcp_idle,
+            self.leases.mcp_lifetime,
+        )
+    }
+
+    /// MCP session `id`, for one request by `token`: the request holds it busy (so it doesn't
+    /// expire under the request) until the guard drops. Another token's id, a malformed one
+    /// and an expired one are all `NotFound`, which `/mcp` answers 404: the client starts a
+    /// new session.
+    pub(crate) fn mcp(self: &Arc<Self>, id: &str, token: u32) -> Result<McpGuard, ApiError> {
+        let gone = || ApiError::not_found("no such MCP session (ended or expired)");
+        let key = parse_id(id).ok_or_else(gone)?;
+        let now = Instant::now();
+        let mut t = self.lock();
+        t.expire(&key, now, &self.leases);
+        let e = t
+            .map
+            .get_mut(&key)
+            .filter(|e| e.token == token)
+            .ok_or_else(gone)?;
+        let State::Mcp(session) = &e.state else {
+            return Err(gone());
+        };
+        let session = Arc::clone(session);
+        e.busy += 1;
+        e.renew(now);
+        Ok(McpGuard {
+            sessions: Arc::clone(self),
+            id: key,
+            session,
+        })
+    }
+
+    /// Ends MCP session `id` (`DELETE /mcp`). Requests already running finish.
+    pub(crate) fn end_mcp(&self, id: &str, token: u32) -> Result<(), ApiError> {
+        let gone = || ApiError::not_found("no such MCP session (ended or expired)");
+        let key = parse_id(id).ok_or_else(gone)?;
+        let mut t = self.lock();
+        match t.map.get(&key) {
+            Some(e) if e.token == token && matches!(e.state, State::Mcp(_)) => {
+                t.remove(&key);
+                Ok(())
+            }
+            _ => Err(gone()),
         }
     }
 
@@ -359,8 +427,11 @@ impl Sessions {
                 State::Txn(_) | State::Committing => s.transactions += 1,
                 State::Snapshot(_) => s.snapshots += 1,
                 State::Done(_) | State::Expired => s.tombstones += 1,
+                State::Mcp(_) => s.mcp += 1,
             }
-            if !matches!(e.state, State::Done(_) | State::Expired) {
+            // The oldest session is about what holds back version GC: an MCP session holds
+            // no snapshot, and lives for hours.
+            if !matches!(e.state, State::Done(_) | State::Expired | State::Mcp(_)) {
                 s.oldest = s.oldest.max(now.duration_since(e.opened));
             }
         }
@@ -371,8 +442,13 @@ impl Sessions {
     /// It holds the table weakly and ends with it.
     fn start_reaper(self: &Arc<Self>) {
         let weak: Weak<Self> = Arc::downgrade(self);
-        let period = (self.leases.txn_idle.min(self.leases.snapshot_idle) / 4)
-            .clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let period = (self
+            .leases
+            .txn_idle
+            .min(self.leases.snapshot_idle)
+            .min(self.leases.mcp_idle)
+            / 4)
+        .clamp(Duration::from_millis(10), Duration::from_secs(1));
         self.reaper.call_once(|| {
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
@@ -557,6 +633,25 @@ impl Drop for SnapshotGuard {
     }
 }
 
+/// A request on a remote MCP session: the session stays busy while it's held.
+pub(crate) struct McpGuard {
+    sessions: Arc<Sessions>,
+    id: Id,
+    session: Arc<super::mcp::McpSession>,
+}
+
+impl McpGuard {
+    pub(crate) fn session(&self) -> &Arc<super::mcp::McpSession> {
+        &self.session
+    }
+}
+
+impl Drop for McpGuard {
+    fn drop(&mut self) {
+        self.sessions.end_read(&self.id);
+    }
+}
+
 /// 128 random bits, as 32 hex characters: an id nobody can guess (a backup download's).
 pub(crate) fn random_hex() -> Result<String, ApiError> {
     Ok(hex(&new_id()?))
@@ -604,6 +699,8 @@ mod tests {
             snapshot_lifetime: Duration::from_secs(600),
             max_sessions: 4,
             max_per_token: 3,
+            mcp_idle: Duration::from_secs(60),
+            mcp_lifetime: Duration::from_secs(600),
         }
     }
 

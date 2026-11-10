@@ -24,21 +24,25 @@ pub(crate) trait Backend: Send + Sync {
     fn lists_feed(&self) -> bool;
     /// The tables, by name.
     fn tables(&self) -> Vec<String>;
-    /// A table's families.
-    fn families(&self, table: &str) -> pigeonhole::Result<Vec<FamilyInfo>>;
+    /// A table's families. The failures here name their table (`table <name>: ...`).
+    fn families(&self, table: &str) -> Result<Vec<FamilyInfo>, Failure>;
     /// A table to read (or follow the feed of).
     fn handle(&self, table: &str) -> Result<Handle, Failure>;
     /// The writer's database, for a write batch: `None` unless writes can succeed.
+    ///
+    /// The batch commits only to tables [`open_for_write`](Self::open_for_write) gave, so
+    /// every rule on a table is applied there. On `phdb serve`, the `write` tool has passed
+    /// `Service::admit` with the write scope before it gets here (ai1249's N2 on #1662).
     fn writer(&self) -> Option<&Pigeonhole>;
     /// A table to write, as the writer: `None` unless writes can succeed.
-    fn open_for_write(&self, table: &str) -> Option<pigeonhole::Result<Table>>;
+    fn open_for_write(&self, table: &str) -> Option<Result<Table, Failure>>;
     /// Creates `table` with `families`, or opens it if it exists: `None` unless writes can
     /// succeed.
     fn create_table(
         &self,
         table: &str,
         families: Vec<(String, Family)>,
-    ) -> Option<pigeonhole::Result<Table>>;
+    ) -> Option<Result<Table, Failure>>;
     /// Closes the database (stdio, at the end of input); a no-op where the backend doesn't
     /// own it.
     fn close(self: Box<Self>) -> Result<(), Failure>;
@@ -57,8 +61,8 @@ impl Backend for Db {
         Db::tables(self)
     }
 
-    fn families(&self, table: &str) -> pigeonhole::Result<Vec<FamilyInfo>> {
-        Db::families(self, table)
+    fn families(&self, table: &str) -> Result<Vec<FamilyInfo>, Failure> {
+        Db::families(self, table).map_err(|e| Failure::db(&format!("table {table}"), &e))
     }
 
     fn handle(&self, table: &str) -> Result<Handle, Failure> {
@@ -72,23 +76,31 @@ impl Backend for Db {
         }
     }
 
-    fn open_for_write(&self, table: &str) -> Option<pigeonhole::Result<Table>> {
+    fn open_for_write(&self, table: &str) -> Option<Result<Table, Failure>> {
         let db = Backend::writer(self)?;
-        Some(db.table(table).and_then(|b| b.open()))
+        Some(
+            db.table(table)
+                .and_then(|b| b.open())
+                .map_err(|e| Failure::db(&format!("table {table}"), &e)),
+        )
     }
 
     fn create_table(
         &self,
         table: &str,
         families: Vec<(String, Family)>,
-    ) -> Option<pigeonhole::Result<Table>> {
+    ) -> Option<Result<Table, Failure>> {
         let db = Backend::writer(self)?;
-        Some(db.table(table).and_then(|mut b| {
-            for (name, family) in families {
-                b = b.family(&name, family);
-            }
-            b.create_if_missing()
-        }))
+        Some(
+            db.table(table)
+                .and_then(|mut b| {
+                    for (name, family) in families {
+                        b = b.family(&name, family);
+                    }
+                    b.create_if_missing()
+                })
+                .map_err(|e| Failure::db(&format!("create_table {table}"), &e)),
+        )
     }
 
     fn close(self: Box<Self>) -> Result<(), Failure> {

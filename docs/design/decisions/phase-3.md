@@ -4534,6 +4534,50 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
 - **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
 
+<a id="d318"></a>
+## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
+
+**Decided:** a companion crate, `pigeonhole-embed`, gives `pigeonhole-memory` local embeddings: `LocalEmbedder` loads a pinned model once and embeds passages and queries on the CPU, with no service. `pigeonhole-memory` stays model-free and doesn't depend on it. The design note is on #1345.
+
+- **The model (owner, Q2):** `BAAI/bge-small-en-v1.5` (MIT) at revision `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. It's a 12-layer BERT, 384 dimensions, 512 tokens, CLS pooling, L2-normalised.
+  - It's the model D311 T5 measured, so the guide's recall numbers describe what this crate produces.
+  - **Its store id is `BAAI/bge-small-en-v1.5@5c38ec7c`,** naming the revision. A store refuses vectors from any other runtime of the same model. A later model or revision is a new id.
+  - **No fallback model (owner, 2026-11-09):** bge-small is the only model; MiniLM-L6 isn't added. The owner made the call on the measured numbers below. A different model later would be a new `Model` and a new store id, never a silent switch.
+- **Passages and queries are separate calls:** `embed_query` prepends bge's retrieval instruction, as the fixture did.
+- **The files:** the weights aren't bundled. The three files come from a directory (`LoadOptions::dir`), or from the cache, downloaded once from the pinned revision.
+  - **Checksums:** every file is checked against a SHA-256 pinned in the crate, wherever it came from. A download is written to a temporary file and renamed into place only once it verifies.
+  - **Redirects** are followed only to Hugging Face's hosts.
+  - **Offline:** `LoadOptions::offline` or `PIGEONHOLE_EMBED_OFFLINE=1`. Without the `download` feature, the crate has no network code.
+- **Inference:** candle 0.11 and tokenizers 0.23, CPU only, in pure Rust (no `onig`, no `cpp`, no BLAS, no GPU features). The weights are read into a buffer rather than mmapped, so the crate is `#![forbid(unsafe_code)]`.
+  - **Threads:** each embedder runs its matrix products on its own rayon pool (`LoadOptions::threads`, default `min(cores, 4)`), never the application's global pool. A server places that pool with `LoadOptions::on_thread_start`. Batches are 32 texts, padded to the longest (perf287's E3: length buckets can come later).
+  - **candle's own pool:** candle 0.11 also runs element-wise steps of 64K elements and up on a process-wide "barrier pool". It has one thread per physical core less one (`CANDLE_NUM_THREADS`), spins briefly before parking, and on Linux is pinned by `CANDLE_CPU_MASK`. The embedder's pool and `on_thread_start` don't reach it (perf287's E2).
+    - **candle 0.10.2** has no such pool and runs everything on the embedder's, but it's slower. On the laptop at 4 threads, it took 13.4 against 8.4 ms at 16 tokens, and 141 against 65 ms at 256 tokens.
+    - **Later in PR 1** (perf287's x86 profile, the AX102): two more costs, both candle's, reported upstream with the owner's approval.
+      - **Repacking (huggingface/candle#4103):** `Linear` multiplies by `weight.t()`, and gemm repacked every weight matrix on every call: a fixed 20–50 ms per call. The crate now loads each linear weight transposed, which fixes it here, with identical outputs. On the laptop at 16 tokens: 33 → 12 ms on 1 thread, 8.4 → 7.1 ms on 4.
+      - **The thread count (huggingface/candle#4070):** without `RAYON_NUM_THREADS` or `CANDLE_CPU_MASK`, candle 0.11 re-reads `/proc/cpuinfo` on every matrix product, about 47 ms per call on the AX102.
+    - **The x86 numbers after the weight fix** (ms at 16 / 64 / 256 tokens; perf287's final run on 7684b0c7 for 0.11.1):
+
+      | | 1 thread | 4 threads | 32 threads |
+      |---|---|---|---|
+      | 0.11.1, an env var set | 11 / 37 / 164 | 6.4 / 24 / 98 | 9.4 / 27–29 / 135–143 |
+      | 0.10.2, no env | 17.3 / 44.5 / 207.6 | 9.7 / 26.2 / 138.2 | |
+
+      - **Either variable alone** (`CANDLE_CPU_MASK` or `RAYON_NUM_THREADS`) is enough; the two are within noise of each other at every thread count. 0.11.1 with neither stays at 52–61 ms per short text, whatever the thread count.
+      - **More threads isn't faster for one text:** 32 (every hardware thread, SMT siblings included) is slower than 4 for single texts, and only batched long texts gain a little (10.5 against 7.8 texts/s at 256 tokens). So the default stays `min(cores, 4)`, and the guide recommends about 4 for interactive use, not all cores.
+      - **Page faults** are about 13–15M per run with the variable set: the per-op tensor allocation, the next lever (#1558, the allocator).
+    - **The choice (owner, 2026-11-09): stay on 0.11.1.** No candle release has either fix. Our weight loading covers the repacking, and the documented environment covers the thread count. Revisit once candle releases #4070's fix.
+    - **So:** 0.11 is kept, and the variables are documented. Operators set them in the environment before starting the process. `phdb serve` can't set them itself: `set_var` is `unsafe` in Rust 2024, and the shard CPUs are known only after its threads start. With local embedding and pinned shards, it warns at startup and prints the values from its placement (cli692, D313 ticket 8).
+- **Accuracy:** a reference test compares 20 texts (Unicode, empty, truncated), as a padded batch of passages and as queries, against `fixture.py --reference`'s sentence-transformers vectors at the pinned revision. Each must reach a cosine ≥ 0.9999, with every component within 1e-4. CI runs it in one job, with the files cached.
+- **Dependencies (owner, Q3):** about 56 new crates. `cargo deny` passes, with an `ignore` for RUSTSEC-2024-0436 (`paste`, unmaintained, a build-time macro via `gemm`). The crate builds on the workspace's MSRV (1.96).
+- **Versioning (owner, Q1):** its own 0.N line, as `pigeonhole-otel` has (D316), until the API has been used for a while.
+- **`phdb mcp` (owner, Q4):** `--embed-local` sits behind a cargo feature `embed-local`, off by default, so `cargo install pigeonhole-cli` doesn't build candle unless asked. Remember embeds passages and recall embeds queries. `--embed-url` behaves as before.
+- **The cost, PR 1's first numbers** (a 10-core Apple laptop):
+  - **1 thread:** 33, 41 and 138 ms (p50) at 16, 64 and 256 tokens;
+  - **4 threads:** 8.4, 18 and 65 ms;
+  - **Batched:** 375 texts/s in batches of 32 at 4 threads.
+
+  The AX102 rows are above, under candle's own pool. On them, the owner kept bge-small alone (2026-11-09).
+
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
 
@@ -4568,6 +4612,13 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
 
 Revisit PR 2 only if a profile shows the re-reads costing more than that.
+
+**Amendment, 2026-11-09: the budget counts what's allocated (#1637).** perf287's heap profile of the 16 × 16 run found the readers holding about 2.5–3× what the cap counted. A single-mutation commit was counted at about 270 B but held about 700–800 B: a `Vec` of mutations grown to four, three allocations per mutation (row, qualifier, value), and its `ready` node.
+- **Packed:** a record's followed mutations are now packed into two allocations of exactly their size. One holds the fixed fields; the other holds the rows, qualifiers and values back to back. A first pass over the batch sizes them and a second fills them, so no scratch buffer outlives a read (one would keep the largest record's size, uncounted: simp724's S1 on #1667).
+- **One entry per share:** a held PREPARE is one entry keyed by (round id, stream), with no per-round `Vec`. A round's shares therefore come out in stream order, not read order; two shares never hold the same cell, so a subscriber sees no difference.
+- **The count:** each record's map entry (with its `starts` entry, twice over for a half-full B-tree node) plus its allocations, each rounded to a 16-byte size class.
+- **Measured:** a counting-allocator test holds what's kept to within 1.25× of the count (`tests/feed_memory.rs`: 0.93×, where main was 2.6×). The same backlog takes about half the memory it did. "Allocated" here is requested bytes: the allocator's own chunk overhead (glibc adds 8 B per chunk, with a 32 B minimum) is on top, a little for a record's two small allocations.
+- **The cost:** delivery copies each change's bytes out of the pack, where it used to move the vectors. That's one copy of what's delivered; a record read is copied once, from the log into its pack. CPU per put on the 16 × 16 run isn't measured yet; perf287's re-run after this lands gives it.
 
 <a id="d321"></a>
 ## D321 — Caller-runs: an opt-in commit mode in which a committing thread runs its idle shard's turn (owner decision, 2026-11-09; simp724; runtime, engine, pigeonhole, #1176, #1502, ICR 0128) · amends D198 decision 2 and spec.md's thread-per-core rule
@@ -4616,3 +4667,24 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **A hot-shard caller cap:** a caller doesn't take the token while other clients are queued on that shard. That's the fix skewed-multi-shard would need before any default-on.
 - **`GroupSync`:** extending caller-runs to it was refused in v1.
 - **#1460** closes as "use caller-runs for this workload".
+
+## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
+
+**Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
+
+| row | glibc | jemalloc 5.3 | mimalloc 2.1 | glibc, larger tcache |
+|---|---|---|---|---|
+| ycsb-c, 32 threads | 3.36–3.38M | 4.01–4.12M (+21%) | 4.36–4.44M (+31%) | 2.89–3.09M (−10%) |
+| sparse-wide, 16 Buffered | 100–110K | 118–121K (+13%) | 98–100K (−5%) | level |
+| ycsb-a, 16 Buffered | 1.56–1.58M | 1.69–1.72M (+9%) | 1.68M (+7%) | level |
+
+jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's arena-lock waits on the read path, but they are well under 1% of thread time. Most of the cost is glibc's own fast paths and its cross-thread frees: blocks evicted, rows and batches dropped on another thread.
+
+**Decided.**
+- **The `phdb` binary** (CLI, `serve`, `mcp`) sets jemalloc (`tikv-jemallocator`) as its global allocator. It's a default feature of `pigeonhole-cli`, `jemalloc`, on every target but Windows, which keeps the system allocator. Building it needs a C compiler and `make`; `--no-default-features --features embed` leaves it out.
+- **The library crates choose no allocator.** An embedding application picks its own, and the guide's "Allocator" section (performance.md) gives the numbers and how.
+- **The gate's `phdb-bench` stays on the system allocator,** since that's what an embedding application gets by default. A jemalloc row is reported once per gate, as information.
+- **Not glibc tunables** (measured worse), and **not an allocator inside the engine** (a per-thread arena): the engine's own buffer reuse (#1558's items 1–3: presized row buffers, recycled row buffers on the reading thread, the scan's current-row buffers kept across rows) helps every application on any allocator, and comes next.
+
+**Note for the serve benches:** `serve_feed_load` and `serve_read_load` run the `phdb` binary, so from this change on their server side runs on jemalloc. Compare their results only with runs from builds on the same side of it.
+
