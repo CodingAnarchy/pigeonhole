@@ -22,7 +22,12 @@ name = "serve_feed_load"
 required-features = ["serve"]
 
 [features]
-default = ["embed"]
+default = ["embed", "jemalloc"]
+# The `phdb` binary's global allocator is jemalloc (D322, #1558): jemalloc measured 9-21% more
+# throughput than glibc's malloc on read-heavy work at high thread counts. Only the binary chooses; the library crates stay
+# allocator-agnostic. No effect on Windows, which keeps the system allocator. Building it
+# needs a C compiler and `make`; `--no-default-features --features embed` leaves it out.
+jemalloc = ["dep:tikv-jemallocator"]
 # `phdb mcp --embed-url` (D311 T7): an HTTPS client for an embedding endpoint. Without it,
 # the memory tools take client-supplied embeddings or recall by keyword.
 embed = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
@@ -79,6 +84,10 @@ sha2 = { version = "0.10", optional = true }
 arc-swap = { version = "1", optional = true }
 num_cpus = { version = "1", optional = true }
 futures-core = { workspace = true, optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+# The `jemalloc` feature (D322).
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `serve`: the Tokio threads' affinity mask (R1), through nix's safe `sched_setaffinity`.
