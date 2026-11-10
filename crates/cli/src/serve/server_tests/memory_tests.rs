@@ -10,7 +10,7 @@ fn memory_server(tokens: &str) -> Server {
 pub(super) fn memory_server_with(tokens: &str, l: Limits) -> Server {
     Server::start_custom(tokens, l, 1, |svc| {
         let (slot, _) = crate::serve::memslot::MemSlot::start(
-            &svc.db,
+            &svc.part().unwrap().db,
             "m",
             None,
             None,
@@ -405,7 +405,7 @@ fn embedding_memory_server(url: &str) -> Server {
         let endpoint =
             crate::mcp::Endpoint::new(&url, "stub", None, Duration::from_millis(300)).unwrap();
         let (slot, _) = crate::serve::memslot::MemSlot::start(
-            &svc.db,
+            &svc.part().unwrap().db,
             "m",
             Some(crate::memcore::Embedder::Remote(endpoint)),
             None,
@@ -517,7 +517,7 @@ fn memory_replica(p: &Server) -> Server {
     let options = Options::default().change_feed(pigeonhole::FeedRetention::bytes(64 << 20));
     Server::start_replica_custom(test_dir(), &p.url, None, limits(), options, |svc| {
         let (slot, created) = crate::serve::memslot::MemSlot::start(
-            &svc.db,
+            &svc.part().unwrap().db,
             "m",
             None,
             None,
@@ -660,7 +660,7 @@ fn a_replica_recalls_a_store_made_after_its_start_from_the_write_s_seqno() {
     // The primary creates the store at its first memory call, not at its start.
     let p = Server::start_custom("", limits(), 1, |svc| {
         let slot = crate::serve::memslot::MemSlot::new(
-            &svc.db,
+            &svc.part().unwrap().db,
             "m",
             None,
             None,
@@ -690,7 +690,15 @@ fn a_replica_recalls_a_store_made_after_its_start_from_the_write_s_seqno() {
 
     assert_eq!(remember(&p, "a", "made on the primary", None).0, 200);
     assert_eq!(p.rpc("Admin/Flush", &json!({}), None).0, 200);
-    let seqno = p.shared.router.service.db.visible_seqno().to_string();
+    let seqno = p
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .visible_seqno()
+        .to_string();
     let header = [(super::replica::MIN_PRIMARY_SEQNO, seqno.as_str())];
     let (status, hits) = recall_with(&r, "primary", &header);
     assert_eq!(status, 200, "{hits}");
@@ -706,7 +714,7 @@ fn a_swap_reopens_the_memory_store_from_the_new_copy_and_ends_its_watches() {
     assert_eq!(remember(&other, "a", "theirs", None).0, 200);
     let side = s.dir.join("side.phdb");
     {
-        let theirs = &other.shared.router.service.db;
+        let theirs = &other.shared.router.service.part().unwrap().db;
         let snap = theirs.durable_snapshot().unwrap();
         theirs.backup_at(&snap, &side).unwrap();
     }
@@ -726,7 +734,14 @@ fn a_swap_reopens_the_memory_store_from_the_new_copy_and_ends_its_watches() {
         Some("ours".to_owned())
     );
 
-    s.shared.router.service.db.replace_with(&side).unwrap();
+    s.shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .replace_with(&side)
+        .unwrap();
     s.shared.router.service.engine_replaced();
 
     let (status, hits) = recall_with(&s, "ours theirs", &[]);
@@ -812,7 +827,7 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
 
     let p = Server::start("", limits());
     let store = Store::create_with(
-        &p.shared.router.service.db,
+        &p.shared.router.service.part().unwrap().db,
         "m",
         options(),
         OpenOptions::new().model("m4").own_rebalancer(),
@@ -840,7 +855,7 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
         Options::default(),
         move |svc| {
             let (slot, _) = crate::serve::memslot::MemSlot::start(
-                &svc.db,
+                &svc.part().unwrap().db,
                 "m",
                 None,
                 Some("m4"),

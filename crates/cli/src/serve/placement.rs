@@ -73,6 +73,23 @@ impl Placement {
         }
     }
 
+    /// A cluster node that serves no partition (D317 ticket 2, cli692's (b)): no shards to
+    /// keep off, so every CPU goes to the network and blocking threads, unpinned. It has no
+    /// feeds; the feed and hub runtimes keep one idle thread each.
+    pub(crate) fn routes_only(io: Option<usize>, blocking: Option<usize>) -> Self {
+        let free = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+        Self {
+            io_threads: io.unwrap_or(free).max(1),
+            blocking_threads: blocking.unwrap_or(free.max(2)).max(1),
+            feed_threads: 1,
+            hub_threads: 1,
+            #[cfg(target_os = "linux")]
+            mask: None,
+            free_cpus: free,
+            mode: "unpinned (routes only)",
+        }
+    }
+
     /// The CPUs the network side may run on, as a CPU list (`2-7,10`), when the plan pins
     /// them: the value for `CANDLE_CPU_MASK`.
     pub(crate) fn cpu_list(&self) -> Option<String> {

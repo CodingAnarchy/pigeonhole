@@ -175,9 +175,9 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     // A catalog change on a replica drops the text handles with the rest (#1436); the next
     // call opens the index again by name.
     let service = &s.shared.router.service;
-    assert!(service.texts.cached("tx").is_some());
+    assert!(service.part().unwrap().texts.cached("tx").is_some());
     service.tables_changed();
-    assert!(service.texts.cached("tx").is_none());
+    assert!(service.part().unwrap().texts.cached("tx").is_none());
     let (_, r) = s.rpc(
         "Text/Search",
         &json!({"index": "tx", "syntax": "meeting", "k": 10}),
@@ -185,7 +185,7 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     );
     assert_eq!(text_hits(&r), [b64(b"doc:1")]);
     // Shutdown's close waits for a rebuild, and refuses one after it (ai1249's S1).
-    let texts = &s.shared.router.service.texts;
+    let texts = &s.shared.router.service.part().unwrap().texts;
     texts.close();
     let (_, e) = s.rpc("Text/Rebuild", &json!({"index": "tx"}), None);
     assert_eq!(e["code"].as_str(), Some("Closed"), "{e}");

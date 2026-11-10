@@ -847,7 +847,7 @@ fn a_table_open_overtaken_by_a_catalog_change_keeps_nothing() {
     let svc = &s.shared.router.service;
     // The steps of `Service::table`, with a catalog change between the open and the keep.
     let started = svc.table_generation();
-    let t = svc.db.table("t").unwrap().open().unwrap();
+    let t = svc.part().unwrap().db.table("t").unwrap().open().unwrap();
     svc.tables_changed();
     assert!(
         svc.keep_table("t", &t, started).is_none(),

@@ -201,7 +201,7 @@ fn a_table_dropped_and_created_again_is_a_new_table_to_its_feeds() {
         [second],
         "the new table's commits reach a new subscriber"
     );
-    assert!(s.shared.router.service.feeds.gauges().hubs >= 1);
+    assert!(s.shared.router.service.part().unwrap().feeds.gauges().hubs >= 1);
     // The old stream never gets the new table's commit: it follows the dropped table, and
     // ends with an error rather than go on silently.
     let rest: Vec<_> =
@@ -479,7 +479,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
             );
             let _ = b;
         });
-        if service.db.tables().iter().any(|t| t == "c") {
+        if service.part().unwrap().db.tables().iter().any(|t| t == "c") {
             let put = s.block_on(service.call(put_c(), &caller, None));
             assert!(
                 put.is_ok(),

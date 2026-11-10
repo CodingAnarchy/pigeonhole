@@ -93,5 +93,27 @@
 - `show-map (--node ADDR | --file PATH)`: reads a live node or a down node's map file.
 - `status --node ADDR`: `Status` on every node in the map, with their versions side by side.
 
+## Ticket 2: routing and forwarding
+**A cluster node serves data.**
+- It opens the one partition its map gives it, after checking the file's identity row: this cluster, this partition, the map's epoch. Several partitions per node come with ticket 8.
+- It serves that partition through the same server as a single node. The `Cluster` service is mounted on the same listener, outside the data calls' load shedding, with a small limit of its own.
+- A node the map gives no partition only routes. `/v1/health` is up, and `/metrics` has the node's counters without the engine's.
+
+**What routes:**
+- **Single-key calls** route by `(table, row)` through the map: `Get`, `ReadRow`, `Mutate`, `CheckAndMutate` and `MutateReturning`, counters included.
+- **A `Batch`** routes when all its rows are in one partition. Otherwise it's refused with `CrossPartition` before anything is written, naming each partition and the first row in it.
+- **A table the map doesn't place** answers `NotFound`.
+- **Refused with `Unsupported`, naming the ticket that adds each:** transactions and snapshots (3, including a `Get` or `ReadRow` with a `snapshot_id`), fan-out reads (4), schema calls and `/v1/tables` (5), feeds (7) and backups (8). Every other call is refused too, `Info` and `/mcp` included.
+
+**`Cluster.Forward`** (node to node, `cluster` scope, gRPC only) carries a routed call, with the sender's `map_version` and the caller it's for (`ForwardedCaller`: `read` or `write` scope, the token's namespaces). The owner checks those again.
+
+**New server codes** (`code_num` 0; each counted in `pigeonhole_serve_requests_total` under its own `outcome`):
+
+| Code | gRPC | HTTP | Retry |
+|---|---|---|---|
+| `WrongPartition` | `FAILED_PRECONDITION` | 409 | yes: this node's map no longer gives it the key. The message carries its `map_version`, and the forwarding node pulls the map and forwards once more. |
+| `CrossPartition` | `FAILED_PRECONDITION` | 409 | no: split the batch. |
+| `PartitionUnavailable` | `UNAVAILABLE` + detail | 503 | yes: nothing was sent to the partition's node (B3). A forwarded write that fails after it was sent answers `OutcomeUnknown`. |
+
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.
