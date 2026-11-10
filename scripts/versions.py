@@ -19,7 +19,8 @@
   `release-check` checks each on its own.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
-- **Publish order:** `list` prints `INTERNAL`, then `PUBLIC`, then `OWN`, and `check` fails unless each
+- **Publish order:** `list` prints `INTERNAL`, then `PUBLIC`, then `OWN`, with `pigeonhole-cli`
+  moved to the end (it depends on `pigeonhole-otel`, D323), and `check` fails unless each
   crate comes after every pigeonhole crate it depends on (normal and build dependencies, which
   must be on crates.io when it publishes).
 - **The Ruby gem:** `crates/ruby` is a workspace of its own, so it states the public line
@@ -55,6 +56,9 @@ PUBLIC = ["pigeonhole", "arrow", "vector", "text", "memory", "cli"]
 # Published crates on a version line of their own (D316), after the public line's.
 OWN = ["otel", "embed"]
 UNPUBLISHED = ["capi", "bench"]
+# The publish order: the internal line, the public line, then the own lines, except that
+# `pigeonhole-cli` goes last, since `phdb serve` depends on `pigeonhole-otel` (D323).
+PUBLISH = INTERNAL + [d for d in PUBLIC if d != "cli"] + OWN + ["cli"]
 
 
 def name(directory):
@@ -95,9 +99,9 @@ def pigeonhole_deps(m):
 def order_errors():
     """A published crate listed before a pigeonhole crate it depends on would fail to publish:
     its dependency isn't on crates.io yet."""
-    order = [name(d) for d in INTERNAL + PUBLIC + OWN]
+    order = [name(d) for d in PUBLISH]
     errors = []
-    for i, d in enumerate(INTERNAL + PUBLIC + OWN):
+    for i, d in enumerate(PUBLISH):
         for dep in sorted(pigeonhole_deps(manifest(d))):
             if dep not in order:
                 errors.append(f"{name(d)} depends on {dep}, which isn't published")
@@ -181,7 +185,7 @@ def check():
 def listing():
     root, crates = versions()
     workspace = root["workspace"]["package"]["version"]
-    for d in INTERNAL + PUBLIC + OWN:
+    for d in PUBLISH:
         print(name(d), crates[d] or workspace)
     return 0
 
