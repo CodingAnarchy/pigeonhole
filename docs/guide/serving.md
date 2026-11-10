@@ -1,6 +1,6 @@
 # Sharing a database across processes and hosts
 
-> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](cli.md#phdb-serve), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is in progress for 1.2.0, behind the `serve` feature.
+> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](serve.md), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is in progress for 1.2.0, behind the `serve` feature.
 
 Pigeonhole is embedded: one process opens the file and writes it. When several containers or hosts need the same data (a job queue, workflow state, coordination between workers), **one process owns the database and serves it over the network, and the others call it.** This page shows that pattern with a runnable example, [`examples/serving`](../../examples/serving), and covers what makes it correct under failures:
 - paging that resumes anywhere;
@@ -24,7 +24,7 @@ The example's server exposes the operations its workers need (create a job, clai
 - A rule like "a done job can't be claimed" is checked in one place.
 - Each operation is one round trip.
 
-A generic remote API is what [`phdb serve`](cli.md#phdb-serve) is. Owning your server is the better fit when your operations are few and known.
+A generic remote API is what [`phdb serve`](serve.md) is. Owning your server is the better fit when your operations are few and known.
 
 ```sh
 # One terminal: the server owns jobs.phdb and listens on loopback.
@@ -135,7 +135,7 @@ The example serves on Tokio with axum.
 - **To restore,** stop the server, put the copy in place, and start the server again. Commits after the backup's point are lost, so take backups as often as you can afford to lose work.
 
 ## The limits
-- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](cli.md#replicas)); partitioning across nodes (#1482, D317) is in progress ([Clusters](cli.md#clusters)).
+- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)); partitioning across nodes (#1482, D317) is in progress ([Clusters](serve.md#clusters)).
 - **The file is on the server's local disk.** Network filesystems are refused at open.
 - **Throughput is one machine's.**
 - **Your server is your API.** Versioning, auth beyond a token, and rate limits are yours to add, or to get from `phdb serve` once it lands.
