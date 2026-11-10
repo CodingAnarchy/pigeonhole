@@ -129,6 +129,33 @@ pub(crate) enum ServiceReply {
     MarkUsed(proto::MarkUsedResponse),
     Forget(proto::ForgetResponse),
     MemoryWatch(super::memory::MemoryEvents),
+    /// A unary read's reply with its share of `--inflight-bytes` (#1567): held until the
+    /// reply's body has been written ([`super::charge`]).
+    Charged(Box<ServiceReply>, super::charge::Charge),
+}
+
+impl ServiceReply {
+    /// The reply, and its charge if it has one.
+    pub(crate) fn uncharge(self) -> (ServiceReply, Option<super::charge::Charge>) {
+        match self {
+            ServiceReply::Charged(r, c) => (*r, Some(c)),
+            r => (r, None),
+        }
+    }
+
+    /// A charged reply's message size, encoded: what a gRPC reply is charged (#1567).
+    fn encoded_len(&self) -> usize {
+        use prost::Message;
+        match self {
+            ServiceReply::Get(r) => r.encoded_len(),
+            ServiceReply::MultiGet(r) => r.encoded_len(),
+            ServiceReply::ReadRow(r) => r.encoded_len(),
+            ServiceReply::Traverse(r) => r.encoded_len(),
+            ServiceReply::Nearest(r) => r.encoded_len(),
+            ServiceReply::Recall(r) => r.encoded_len(),
+            _ => 0,
+        }
+    }
 }
 
 /// A page waiting for its client, with its share of the in-flight budget (perf287's G1 on
@@ -773,6 +800,8 @@ pub(crate) struct Service {
     /// The open connections against `--max-connections` (#1604): the listener counts them,
     /// the metrics show them.
     pub(crate) connections: Arc<super::listener::Connections>,
+    /// The unary read replies' charges (#1567).
+    pub(crate) replies: Arc<super::charge::ReplyStats>,
     /// Set on a replica server (`--replica-of`, #1436).
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
@@ -800,6 +829,7 @@ impl Service {
     ) -> Self {
         Self {
             connections: super::listener::Connections::new(limits.max_connections),
+            replies: Arc::new(super::charge::ReplyStats::default()),
             db: db.clone(),
             tables: ArcSwap::from_pointee(TableCache::default()),
             inflight: Arc::new(Semaphore::new(
@@ -1078,20 +1108,39 @@ impl Service {
         match op {
             // A read that fails on `Io` changed nothing, so it may be sent
             // again (`retry_from` REQUEST, ICR 0112).
+            // The unary reads charge their replies to the budget (#1567, revised after g46):
+            // see `read_charged`. The request's share goes first, so a read never holds it
+            // while it waits for its reply's.
             ServiceOp::Get(r) => {
-                let reply = self.get(r, caller).await.map(ServiceReply::Get);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                // One cell, with no cap to reserve against: charged after the read, waiting
+                // for its size if the budget is full (never read twice).
+                let reply = self
+                    .get(r, caller)
+                    .await
+                    .map(ServiceReply::Get)
+                    .map_err(ApiError::for_read)?;
+                self.charge_built(caller, reply).await
             }
             ServiceOp::MultiGet(r) => {
-                let reply = self.multi_get(r, caller).await.map(ServiceReply::MultiGet);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                let cap = cap(r.page_bytes);
+                self.read_charged(caller, cap, r, |r| async move {
+                    self.multi_get(r, caller)
+                        .await
+                        .map(|(reply, r)| (ServiceReply::MultiGet(reply), r))
+                })
+                .await
             }
             ServiceOp::ReadRow(r) => {
-                let reply = self.read_row(r, caller).await.map(ServiceReply::ReadRow);
                 drop(budget);
-                reply.map_err(ApiError::for_read)
+                let cap = cap(r.page_bytes);
+                self.read_charged(caller, cap, r, |r| async move {
+                    self.read_row(r, caller)
+                        .await
+                        .map(|(reply, r)| (ServiceReply::ReadRow(reply), r))
+                })
+                .await
             }
             ServiceOp::Scan(r) => self
                 .scan(r, caller, budget)
@@ -1256,17 +1305,21 @@ impl Service {
             }
             ServiceOp::Traverse(r) => {
                 drop(budget);
-                self.traverse(r, caller)
-                    .await
-                    .map(ServiceReply::Traverse)
-                    .map_err(ApiError::for_read)
+                let cap = cap(r.page_bytes);
+                self.read_charged(caller, cap, r, |r| async move {
+                    let reply = self.traverse(&r, caller).await?;
+                    Ok((ServiceReply::Traverse(reply), r))
+                })
+                .await
             }
             ServiceOp::Nearest(r) => {
                 drop(budget);
-                self.nearest(r, caller)
-                    .await
-                    .map(ServiceReply::Nearest)
-                    .map_err(ApiError::for_read)
+                let cap = cap(r.page_bytes);
+                self.read_charged(caller, cap, r, |r| async move {
+                    let reply = self.nearest(&r, caller).await?;
+                    Ok((ServiceReply::Nearest(reply), r))
+                })
+                .await
             }
             ServiceOp::CreateIndex(r) => {
                 drop(budget);
@@ -1322,10 +1375,13 @@ impl Service {
                 .map(ServiceReply::Remember),
             ServiceOp::Recall(r) => {
                 drop(budget);
-                self.recall(r, caller)
-                    .await
-                    .map(ServiceReply::Recall)
-                    .map_err(ApiError::for_read)
+                let (reply, charge) = self.recall(r, caller).await.map_err(ApiError::for_read)?;
+                let reply = ServiceReply::Recall(reply);
+                match charge {
+                    Some(charge) => Ok(self.charged(caller, reply, charge)),
+                    // A budget within the default page: charged once built (never run twice).
+                    None => self.charge_built(caller, reply).await,
+                }
             }
             ServiceOp::MarkUsed(r) => {
                 let ids = super::memory::ids(&r.ids)?;
@@ -1400,6 +1456,128 @@ impl Service {
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
         }
+    }
+
+    /// A unary read, charged (#1567, revised after g46).
+    ///
+    /// - **A cap within the default page ([`FAST_CAP`]):** the reply is built first, then
+    ///   [`try_charge`](Self::try_charge)d. If its share isn't free now, the strict path: the
+    ///   built reply goes, the cap is reserved (waiting up to the request timeout, else
+    ///   `Overloaded`), and the read runs again under it. What's built unaccounted is at
+    ///   most `--max-concurrent` × the default page (cli692's H1).
+    /// - **A larger cap:** reserved before the read, as before g46, since its builds run on
+    ///   the Tokio workers and would otherwise be bounded only by `--max-concurrent` × 8 MiB.
+    ///
+    /// The read takes the request and gives it back with its reply, so the fast path never
+    /// copies it; only the strict path reads it a second time (perf287's g54 profile).
+    async fn read_charged<R, Fut>(
+        &self,
+        caller: &Caller,
+        cap: usize,
+        mut r: R,
+        read: impl Fn(R) -> Fut,
+    ) -> Result<ServiceReply, ApiError>
+    where
+        Fut: Future<Output = Result<(ServiceReply, R), ApiError>>,
+    {
+        if cap <= FAST_CAP {
+            let (reply, back) = read(r).await.map_err(ApiError::for_read)?;
+            let (reply, settled) = self.try_charge(caller, reply);
+            if settled {
+                return Ok(reply);
+            }
+            drop(reply);
+            r = back;
+            self.replies.rereads.fetch_add(1, Ordering::Relaxed);
+        }
+        let charge = self.reserve_reply(caller, cap).await?;
+        let (reply, _) = read(r).await.map_err(ApiError::for_read)?;
+        Ok(self.charged(caller, reply, charge))
+    }
+
+    /// A built reply with its share: taken now if it's free, else waited for (its size,
+    /// within the request timeout, else `Overloaded`). For a reply too costly to build twice
+    /// (a recall) or with no cap to reserve against (`Get`).
+    async fn charge_built(
+        &self,
+        caller: &Caller,
+        reply: ServiceReply,
+    ) -> Result<ServiceReply, ApiError> {
+        let (reply, settled) = self.try_charge(caller, reply);
+        if settled {
+            return Ok(reply);
+        }
+        let charge = self
+            .reserve_reply(caller, reply.encoded_len() + super::charge::GRPC_FRAME)
+            .await?;
+        Ok(self.charged(caller, reply, charge))
+    }
+
+    /// `reply` with its share, taken now if it's free: `(reply, true)` when it's settled
+    /// (charged, or needing no charge), `(reply, false)` when its share isn't free.
+    ///
+    /// - **A reply within one slice takes none:** it goes to the transport whole, so its
+    ///   share would be given back at the response anyway. So the hot small-read path does
+    ///   no budget work (g46's readrow-small).
+    /// - **HTTP/JSON's share** is twice the protobuf's, fitted to the rendered body later.
+    /// - **A waiting reservation keeps its place:** Tokio's semaphore gives a queued
+    ///   `acquire_many` every free permit and each release to the queue first, so this
+    ///   `try_acquire` can't overtake it.
+    fn try_charge(&self, caller: &Caller, reply: ServiceReply) -> (ServiceReply, bool) {
+        let size = reply.encoded_len() + super::charge::GRPC_FRAME;
+        let want = if caller.json {
+            size.saturating_mul(2)
+        } else {
+            size
+        };
+        if want <= super::charge::PIECE {
+            return (reply, true);
+        }
+        match super::charge::Charge::try_reserve(
+            &self.inflight,
+            self.limits.inflight_bytes,
+            want,
+            &self.replies,
+        ) {
+            Some(charge) => (ServiceReply::Charged(Box::new(reply), charge), true),
+            None => (reply, false),
+        }
+    }
+
+    /// A unary read's reply share on the strict path (#1567): `cap` bytes, twice that for
+    /// an HTTP/JSON reply (cli692's D2), within the request timeout, else `Overloaded`.
+    async fn reserve_reply(
+        &self,
+        caller: &Caller,
+        cap: usize,
+    ) -> Result<super::charge::Charge, ApiError> {
+        let want = if caller.json {
+            cap.saturating_mul(2)
+        } else {
+            cap
+        };
+        super::charge::Charge::reserve(
+            &self.inflight,
+            self.limits.inflight_bytes,
+            want,
+            self.limits.request_timeout,
+            &self.replies,
+        )
+        .await
+    }
+
+    /// `reply` with its charge: a gRPC reply's trimmed to its encoded message now; an
+    /// HTTP/JSON one's fitted to its rendered body by the front-end.
+    fn charged(
+        &self,
+        caller: &Caller,
+        reply: ServiceReply,
+        mut charge: super::charge::Charge,
+    ) -> ServiceReply {
+        if !caller.json {
+            charge.trim(reply.encoded_len() + super::charge::GRPC_FRAME);
+        }
+        ServiceReply::Charged(Box::new(reply), charge)
     }
 
     async fn budget(&self, size: usize) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -1593,6 +1771,7 @@ impl Service {
     pub(crate) fn metrics_text(&self) -> String {
         let mut text = self.metrics.render();
         self.connections.render(&mut text);
+        self.replies.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, &self.feeds);
         render_bulk(&mut text, &self.bulk.gauges);
@@ -1884,34 +2063,38 @@ impl Service {
         &self,
         r: proto::MultiGetRequest,
         caller: &Caller,
-    ) -> Result<proto::MultiGetResponse, ApiError> {
+    ) -> Result<(proto::MultiGetResponse, proto::MultiGetRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
+        // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let select = convert::Select::new(r.selection.as_ref())?.at(at);
-            let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
-            let mut read = select.keys(table.keys(&keys))?;
-            let after;
-            if !r.after.is_empty() {
-                after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
-                read = read.resume_after(&after);
-            }
-            let page = read.read_within(budget)?;
-            let q = select.aggregate();
-            Ok(proto::MultiGetResponse {
-                rows: page
-                    .rows()
-                    .iter()
-                    .map(|row| convert::row(row.view(), q))
-                    .collect(),
-                next: page
-                    .resume()
-                    .map(|p| p.to_bytes().into())
-                    .unwrap_or_default(),
-                bytes: page.bytes(),
-            })
+            let reply = (|| -> Result<proto::MultiGetResponse, ApiError> {
+                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                let select = convert::Select::new(r.selection.as_ref())?.at(at);
+                let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
+                let mut read = select.keys(table.keys(&keys))?;
+                let after;
+                if !r.after.is_empty() {
+                    after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
+                    read = read.resume_after(&after);
+                }
+                let page = read.read_within(budget)?;
+                let q = select.aggregate();
+                Ok(proto::MultiGetResponse {
+                    rows: page
+                        .rows()
+                        .iter()
+                        .map(|row| convert::row(row.view(), q))
+                        .collect(),
+                    next: page
+                        .resume()
+                        .map(|p| p.to_bytes().into())
+                        .unwrap_or_default(),
+                    bytes: page.bytes(),
+                })
+            })()?;
+            Ok((reply, r))
         })
         .await
     }
@@ -1923,7 +2106,7 @@ impl Service {
     /// it can fetch), so it holds no blocking thread.
     async fn traverse(
         &self,
-        r: proto::TraverseRequest,
+        r: &proto::TraverseRequest,
         caller: &Caller,
     ) -> Result<proto::TraverseResponse, ApiError> {
         if r.seeds.is_empty() {
@@ -1937,7 +2120,7 @@ impl Service {
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let seeds = KeySet::from_unsorted(r.seeds.iter().map(|k| &k[..]));
-        let mut t = convert::edges(table.traverse(&seeds).family(&r.family), &r)?
+        let mut t = convert::edges(table.traverse(&seeds).family(&r.family), r)?
             .hops(r.hops.max(1))
             .parents(r.parents)
             .byte_budget(page_bytes(r.page_bytes));
@@ -1981,7 +2164,7 @@ impl Service {
     /// task, as `Traverse`.
     async fn nearest(
         &self,
-        r: proto::NearestRequest,
+        r: &proto::NearestRequest,
         caller: &Caller,
     ) -> Result<proto::NearestResponse, ApiError> {
         use proto::nearest_request::Source;
@@ -2341,7 +2524,7 @@ impl Service {
         &self,
         r: proto::ReadRowRequest,
         caller: &Caller,
-    ) -> Result<proto::ReadRowResponse, ApiError> {
+    ) -> Result<(proto::ReadRowResponse, proto::ReadRowRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
         let budget = page_bytes(r.page_bytes);
@@ -2350,56 +2533,62 @@ impl Service {
         } else {
             r.page_cells as usize
         };
+        // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let select = convert::Select::new(r.selection.as_ref())?.at(at);
-            let mut read = select.row(table.row(&r.row))?;
-            let after;
-            if !r.after.is_empty() {
-                after = RowPosition::from_bytes(&r.after).map_err(ApiError::from)?;
-                read = read.resume_after(&after);
-            }
-            let q = select.aggregate();
-            // One column per engine page, so the byte budget is checked at every column
-            // boundary: a page is cut before the column that wouldn't fit, and only a
-            // single column larger than the budget goes over it (D308's rule).
-            let mut pages = read.pages(1)?;
-            let mut out: Option<proto::Row> = None;
-            let (mut bytes, mut cells) = (0u64, 0usize);
-            let mut next = Vec::new();
-            let mut more = false;
-            while let Some(page) = pages.next()? {
-                let part = convert::row(page, q);
-                let part_bytes: u64 = part.cells.iter().map(convert::cell_bytes).sum();
-                let first = out.is_none();
-                if !first && (bytes + part_bytes > budget || cells + part.cells.len() > cells_cap) {
-                    more = true;
-                    break;
+            let reply = (|| -> Result<proto::ReadRowResponse, ApiError> {
+                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                let select = convert::Select::new(r.selection.as_ref())?.at(at);
+                let mut read = select.row(table.row(&r.row))?;
+                let after;
+                if !r.after.is_empty() {
+                    after = RowPosition::from_bytes(&r.after).map_err(ApiError::from)?;
+                    read = read.resume_after(&after);
                 }
-                bytes += part_bytes;
-                cells += part.cells.len();
-                match &mut out {
-                    None => out = Some(part),
-                    Some(row) => row.cells.extend(part.cells),
+                let q = select.aggregate();
+                // One column per engine page, so the byte budget is checked at every column
+                // boundary: a page is cut before the column that wouldn't fit, and only a
+                // single column larger than the budget goes over it (D308's rule).
+                let mut pages = read.pages(1)?;
+                let mut out: Option<proto::Row> = None;
+                let (mut bytes, mut cells) = (0u64, 0usize);
+                let mut next = Vec::new();
+                let mut more = false;
+                while let Some(page) = pages.next()? {
+                    let part = convert::row(page, q);
+                    let part_bytes: u64 = part.cells.iter().map(convert::cell_bytes).sum();
+                    let first = out.is_none();
+                    if !first
+                        && (bytes + part_bytes > budget || cells + part.cells.len() > cells_cap)
+                    {
+                        more = true;
+                        break;
+                    }
+                    bytes += part_bytes;
+                    cells += part.cells.len();
+                    match &mut out {
+                        None => out = Some(part),
+                        Some(row) => row.cells.extend(part.cells),
+                    }
+                    next = pages.position().map(|p| p.to_bytes()).unwrap_or_default();
+                    if bytes >= budget || cells >= cells_cap {
+                        more = true;
+                        break;
+                    }
                 }
-                next = pages.position().map(|p| p.to_bytes()).unwrap_or_default();
-                if bytes >= budget || cells >= cells_cap {
-                    more = true;
-                    break;
+                if let Some(row) = &out {
+                    bytes += row.key.len() as u64;
                 }
-            }
-            if let Some(row) = &out {
-                bytes += row.key.len() as u64;
-            }
-            Ok(proto::ReadRowResponse {
-                row: out,
-                next: if more {
-                    next.into()
-                } else {
-                    Default::default()
-                },
-                bytes,
-            })
+                Ok(proto::ReadRowResponse {
+                    row: out,
+                    next: if more {
+                        next.into()
+                    } else {
+                        Default::default()
+                    },
+                    bytes,
+                })
+            })()?;
+            Ok((reply, r))
         })
         .await
     }
@@ -2627,17 +2816,29 @@ impl Service {
         &self,
         r: proto::RecallRequest,
         caller: &Caller,
-    ) -> Result<proto::RecallResponse, ApiError> {
+    ) -> Result<(proto::RecallResponse, Option<super::charge::Charge>), ApiError> {
         let core = self.memory_core().await?;
+        // A budget above the default page reserves its share before a memory-call slot
+        // (cli692's points on #1567): a recall waiting for budget doesn't hold one. A smaller
+        // one is charged once built.
+        let cap = usize::try_from(core.reply_cap(r.byte_budget)).unwrap_or(usize::MAX);
+        let charge = if cap > FAST_CAP {
+            Some(self.reserve_reply(caller, cap).await?)
+        } else {
+            None
+        };
         let a = super::memory::recall(r)?;
         let namespaces = caller.namespaces.clone();
-        self.memory_blocking(move || {
-            let (hits, _stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
-            Ok(proto::RecallResponse {
-                hits: hits.into_iter().map(super::memory::hit).collect(),
+        let reply = self
+            .memory_blocking(move || {
+                let (hits, _stats) =
+                    core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+                Ok(proto::RecallResponse {
+                    hits: hits.into_iter().map(super::memory::hit).collect(),
+                })
             })
-        })
-        .await
+            .await?;
+        Ok((reply, charge))
     }
 
     /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
@@ -3042,6 +3243,15 @@ impl Service {
             cells,
         })
     }
+}
+
+/// The largest reply cap a unary read builds before it reserves (#1567, cli692's H1): the
+/// default page. A larger one reserves its cap first.
+const FAST_CAP: usize = DEFAULT_PAGE_BYTES as usize;
+
+/// A page-budgeted read's reply cap, as the read applies it (#1567).
+fn cap(asked: u64) -> usize {
+    usize::try_from(page_bytes(asked)).unwrap_or(usize::MAX)
 }
 
 fn page_bytes(asked: u64) -> u64 {

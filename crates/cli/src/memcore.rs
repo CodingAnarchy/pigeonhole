@@ -421,6 +421,17 @@ impl MemCore {
         }))
     }
 
+    /// The byte budget a recall asking for `asked` runs with (0: the default; past the
+    /// server's maximum it's refused, so the maximum): what the server reserves of
+    /// `--inflight-bytes` for its reply (#1567).
+    #[cfg(feature = "serve")]
+    pub(crate) fn reply_cap(&self, asked: u64) -> u64 {
+        match asked {
+            0 => self.default_budget,
+            b => b.min(self.max_budget),
+        }
+    }
+
     /// The store's pinned model.
     pub(crate) fn model(&self) -> Option<&EmbeddingModel> {
         match &self.handle {
