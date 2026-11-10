@@ -629,6 +629,20 @@ fn a_memory_server_offers_its_guide_and_instructions_on_mcp() {
             .iter()
             .any(|n| n.starts_with("memory_"))
     );
+    // `memory_recall`'s schema states the served store's largest budget (ai1249's N1).
+    let list = mcp(&s, None, Some(&id), None, &request("tools/list", json!({})));
+    let recall = list.reply()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_recall")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        recall["inputSchema"]["properties"]["max_bytes"]["maximum"],
+        8 << 20,
+        "{recall}"
+    );
     let none = mcp(
         &plain,
         None,

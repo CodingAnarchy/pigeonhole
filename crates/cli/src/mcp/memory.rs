@@ -83,6 +83,10 @@ pub(crate) struct Memory {
     embeds: bool,
     /// The default recall budget (`--max-result-bytes`).
     result_bytes: usize,
+    /// The largest recall budget a call may ask for: none on `phdb mcp`, the served store's
+    /// on `/mcp` (8 MiB), which the tool's schema states so an agent doesn't learn it by
+    /// failing (ai1249's N1 on #1679).
+    max_recall: u64,
 }
 
 impl Memory {
@@ -173,6 +177,7 @@ impl Memory {
             writable,
             embeds,
             result_bytes,
+            max_recall: u64::MAX,
         }))
     }
 
@@ -186,6 +191,7 @@ impl Memory {
         writable: bool,
         embeds: bool,
         result_bytes: usize,
+        max_recall: u64,
     ) -> Self {
         Self {
             name: name.to_owned(),
@@ -194,7 +200,27 @@ impl Memory {
             writable,
             embeds,
             result_bytes,
+            max_recall,
         }
+    }
+
+    /// `memory_recall`'s `max_bytes`: its default, and its largest where there is one.
+    fn max_bytes_schema(&self) -> Value {
+        let mut schema = json!({
+            "type": "integer", "minimum": MIN_RECALL_BYTES,
+            "description": format!(
+                "The hits' size budget, about, in bytes ({} by default).",
+                self.result_bytes
+            ),
+        });
+        if self.max_recall < u64::MAX {
+            schema["maximum"] = json!(self.max_recall);
+            schema["description"] = json!(format!(
+                "The hits' size budget, about, in bytes ({} by default, {} at most).",
+                self.result_bytes, self.max_recall
+            ));
+        }
+        schema
     }
 
     /// The store's pinned model, if the store is open now.
@@ -461,7 +487,7 @@ impl Memory {
             "max_bytes",
             self.result_bytes as u64,
             MIN_RECALL_BYTES,
-            u64::MAX,
+            self.max_recall,
         )?;
         let (hits, stats) = self
             .core()?
@@ -640,10 +666,7 @@ impl Memory {
                     "k": {"type": "integer", "minimum": 1, "maximum": MAX_K, "description": "The most hits (10 by default)."},
                     "session": {"type": "string", "description": "Only memories of this session."},
                     "include_superseded": {"type": "boolean", "description": "Also return superseded memories, with superseded_by."},
-                    "max_bytes": {
-                        "type": "integer", "minimum": MIN_RECALL_BYTES,
-                        "description": format!("The hits' size budget, about, in bytes ({} by default).", self.result_bytes),
-                    },
+                    "max_bytes": self.max_bytes_schema(),
                 },
                 "additionalProperties": false,
             }),

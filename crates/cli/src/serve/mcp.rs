@@ -85,6 +85,7 @@ impl McpSession {
                 writable,
                 slot.embeds(),
                 shared.limits.mcp.result_bytes,
+                slot.max_recall(),
             )
         });
         Self {
@@ -514,6 +515,10 @@ pub(crate) async fn delete(State(shared): State<Arc<Shared>>, headers: HeaderMap
 
 /// Whether `text` (a message or a batch) calls a memory tool.
 fn calls_memory(text: &str) -> bool {
+    // Most messages name no memory tool: skip the parse (ai1249's N3 on #1679).
+    if !text.contains("\"memory_") {
+        return false;
+    }
     let call = |m: &Value| {
         m.get("method").and_then(Value::as_str) == Some("tools/call")
             && m["params"]["name"]
