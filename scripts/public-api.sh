@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 status=0
 for entry in pigeonhole:crates/pigeonhole pigeonhole-arrow:crates/arrow pigeonhole-cli:crates/cli \
   pigeonhole-vector:crates/vector pigeonhole-text:crates/text pigeonhole-memory:crates/memory \
-  pigeonhole-otel:crates/otel; do
+  pigeonhole-otel:crates/otel pigeonhole-embed:crates/embed; do
   pkg=${entry%%:*}
   snapshot=${entry#*:}/public-api.txt
   listing=$(cargo "+$NIGHTLY" public-api -p "$pkg" -sss --all-features)
