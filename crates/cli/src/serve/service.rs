@@ -591,9 +591,9 @@ impl Metrics {
         self.duration_sum_us[rpc].fetch_add(us, Ordering::Relaxed);
     }
 
-    /// Prometheus text: the server's counters, and the engine's `async_sync_reads`
-    /// (perf287's note 2 on D313).
-    pub(crate) fn render(&self, db: &Pigeonhole) -> String {
+    /// Prometheus text: the server's counters. The engine's metrics, `async_sync_reads`
+    /// (perf287's note 2 on D313) among them, are `Service::engine_metrics`'.
+    pub(crate) fn render(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
         let _ = writeln!(out, "# TYPE pigeonhole_serve_requests_total counter");
@@ -653,12 +653,6 @@ impl Metrics {
             out,
             "pigeonhole_serve_replies_lost_total {}",
             self.replies_lost.load(Ordering::Relaxed)
-        );
-        let _ = writeln!(out, "# TYPE pigeonhole_async_sync_reads_total counter");
-        let _ = writeln!(
-            out,
-            "pigeonhole_async_sync_reads_total {}",
-            db.engine_metrics().async_sync_reads
         );
         out
     }
@@ -812,6 +806,10 @@ pub(crate) struct Service {
     pub(crate) replica: Option<Arc<super::replica::Replica>>,
     /// Where the server's own threads run (none in tests).
     placement: Option<Arc<super::placement::Placement>>,
+    /// The engine's metrics on `/metrics`, under D316's names (D323): the same reading and
+    /// carrying as `pigeonhole-otel`'s OpenTelemetry instruments, so its counters stay
+    /// monotonic across an automatic recovery and a replica's re-bootstrap.
+    engine_metrics: pigeonhole_otel::Collector,
 }
 
 impl std::fmt::Debug for Service {
@@ -867,6 +865,7 @@ impl Service {
             metrics,
             replica: None,
             placement: None,
+            engine_metrics: pigeonhole_otel::collector(&db),
         }
     }
 
@@ -1770,7 +1769,7 @@ impl Service {
 
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
     pub(crate) fn metrics_text(&self) -> String {
-        let mut text = self.metrics.render(&self.db);
+        let mut text = self.metrics.render();
         self.connections.render(&mut text);
         self.replies.render(&mut text);
         render_sessions(&mut text, &self.sessions);
@@ -1779,6 +1778,11 @@ impl Service {
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
         }
+        // Reads the database on this thread, at most once per 100 ms: `engine_metrics` and
+        // `recovery_stats` (atomic loads), and `info`, which walks the current catalog, takes
+        // the file's length and the pager's allocation stats under its lock for an instant,
+        // with no other I/O (ai1249's question, perf287's nit 2 on #1687).
+        self.engine_metrics.render_prometheus(&mut text);
         text
     }
 
