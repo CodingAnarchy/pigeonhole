@@ -463,8 +463,22 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed runtime", &e))?;
+    // The hubs' own runtime: each reads its engine feed and fills its ring here, so it never
+    // waits behind its clients' delivery or their catch-up reads on the feed runtime (#1397:
+    // at 16 hubs × 16 they fell 20 s behind on about 5% of the CPU). A quarter of the feed
+    // threads, at least 1, placed with them. A node that only routes has no feeds, and its
+    // one hub thread stays idle, as its feed runtime's does.
+    let enter = Arc::clone(&placement);
+    let hub_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(placement.hub_threads)
+        .thread_name("phdb-serve-feed-hub")
+        .on_thread_start(move || enter.enter())
+        .enable_all()
+        .build()
+        .map_err(|e| Failure::io("start the feed hub runtime", &e))?;
     if let Some(part) = shared.router.service.part_opt() {
-        part.feeds.run_on(feed_runtime.handle().clone());
+        part.feeds
+            .run_on(feed_runtime.handle().clone(), hub_runtime.handle().clone());
     }
 
     let served = runtime.block_on(async {
@@ -491,12 +505,13 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         let addr = listener.local_addr().map_err(|e| Failure::io("listen", &e))?;
         let _ = writeln!(
             stderr,
-            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed and {} blocking threads on {} free CPUs, {})",
+            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed, {} feed hub and {} blocking threads on {} free CPUs, {})",
             serving,
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
             placement.io_threads,
             placement.feed_threads,
+            placement.hub_threads,
             placement.blocking_threads,
             placement.free_cpus,
             placement.mode,
@@ -540,6 +555,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     // The connections are gone, so every client's stream has ended; the hubs end with the
     // runtime, before the database closes under their feeds.
     feed_runtime.shutdown_timeout(Duration::from_secs(5));
+    hub_runtime.shutdown_timeout(Duration::from_secs(5));
     // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.
