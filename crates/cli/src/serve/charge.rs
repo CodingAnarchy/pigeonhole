@@ -202,10 +202,11 @@ fn wrap(mut resp: Response<Body>, idle: Duration) -> Response<Body> {
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
-    // The watchdog starts now, not at the first slice (cli692's R1 on #1661): a client whose
-    // initial window is 0 never has its body polled, so a watchdog started there would
-    // never start. It holds only a weak handle, so a body that ends or is dropped frees
-    // everything at once, and the watchdog ends at its next look.
+    // The watchdog starts now, not at the first slice (cli692's R1 on #1661): a body whose
+    // client's initial window is 0 may never be polled. Today's hyper polls it once even
+    // then (the slice waits in h2's send buffer), but this doesn't rely on that. It holds
+    // only a weak handle, so a body that ends or is dropped frees everything at once, and
+    // the watchdog ends at its next look.
     let stats = Arc::clone(&charge.stats);
     let slot = Arc::new(Mutex::new(Slot {
         rest: Bytes::new(),

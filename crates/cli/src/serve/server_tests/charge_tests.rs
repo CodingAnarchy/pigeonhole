@@ -262,9 +262,10 @@ fn a_grpc_reply_whose_window_stays_shut_is_dropped_after_the_idle_limit() {
     );
 }
 
-/// cli692's R1 on #1661: an HTTP/2 client whose initial window is 0 never has its reply's
-/// body polled at all, so no slice is ever handed out. The watchdog starts when the body is
-/// wrapped, so the share still comes back after `--stream-idle-ms`.
+/// cli692's R1 on #1661: an HTTP/2 client whose initial window is 0, which receives none of
+/// its reply. The share still comes back after `--stream-idle-ms`. The watchdog starts when
+/// the body is wrapped, so this holds even if the body is never polled. Today's hyper polls
+/// it once anyway, so this pins the outcome rather than telling the two starts apart.
 #[test]
 fn a_reply_to_a_client_with_a_zero_initial_window_is_dropped_after_the_idle_limit() {
     use prost::Message;
