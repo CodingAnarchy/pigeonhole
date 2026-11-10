@@ -1672,6 +1672,10 @@ pub(crate) enum ShardMsg {
         group: u64,
         result: std::result::Result<Lsn, pigeonhole_io::Error>,
     },
+    /// A lazy feed flush's direct write landed (D324), or failed.
+    FeedWritten {
+        ok: bool,
+    },
     /// A WAL sync covering groups up to `group` finished.
     SyncDone {
         group: u64,
@@ -5703,6 +5707,27 @@ impl ShardState {
             self.poison(crate::health::FailureCause::Io);
             return;
         }
+        if wal.is_direct() && !wal.header_held() && wal.written() < self.feed_end.get() {
+            // A direct stream's write lands later (D324): settle when it has, rather than
+            // re-arm the timer, which would poll a write only completions move.
+            match wal.submit_write() {
+                Ok(c) => {
+                    let submitter = ctx.submitter(self.id).clone();
+                    drop(c.map(move |r| {
+                        let _ = submitter.submit(ShardMsg::FeedWritten { ok: r.is_ok() });
+                        Ok(())
+                    }));
+                }
+                Err(_) => self.poison(crate::health::FailureCause::Io),
+            }
+            return;
+        }
+        self.feed_written(ctx);
+    }
+
+    /// After a lazy flush's write landed: the written hold goes, or (a record behind a held
+    /// segment header) the flush runs again after another interval.
+    fn feed_written(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         self.settle_feed_written();
         if self.feed_low.get() != u64::MAX {
             // A record behind a segment header that still waits for the previous segment's
@@ -12055,6 +12080,13 @@ impl ShardState {
             }
             ShardMsg::CounterCheckpoint(c) => self.counter_checkpoint(&c),
             ShardMsg::FeedFlush => self.feed_flush(ctx),
+            ShardMsg::FeedWritten { ok } => {
+                if ok {
+                    self.feed_written(ctx);
+                } else {
+                    self.poison(crate::health::FailureCause::Io);
+                }
+            }
             ShardMsg::FeedSync => self.feed_sync(ctx),
             ShardMsg::FeedSynced { ok } => self.on_feed_synced(ok, ctx),
             ShardMsg::Kick => {

@@ -1830,6 +1830,11 @@ impl Options {
             o.background_workers = self.background_workers;
         }
         o.durability = self.durability.engine();
+        // D324 (#1621): on Linux, a database whose writer default syncs writes its WAL
+        // records direct, so a record write never waits on a page the previous group's sync
+        // is writing back. A Buffered default keeps buffered writes: there a commit returns
+        // at its write, which direct I/O would make a device write.
+        o.wal.direct = cfg!(target_os = "linux") && self.durability >= Durability::GroupSync;
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;
         if let Some(bytes) = self.block_cache {

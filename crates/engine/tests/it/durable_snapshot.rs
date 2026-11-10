@@ -48,6 +48,9 @@ fn rig(seed: u64) -> (Arc<SimVfs>, Arc<Engine>, Vec<EngineShard>, [TableInfo; 2]
     let mut o = common::options(Arc::clone(&vfs), 2, 4 << 20);
     // Each table stays one tablet, on shard `tablet % 2`.
     o.tablet_changes = false;
+    // D227's timing with buffered WAL writes, which land as they return: on a direct stream
+    // (D324) a commit is visible once its write completes, which deferred I/O holds back.
+    o.wal.direct = false;
     let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
     let fam = || vec![("f".to_owned(), FamilyOptions::default())];
     let a = (*db.create_table("a", &fam()).unwrap()).clone();

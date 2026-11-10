@@ -42,6 +42,9 @@ impl Shards {
     fn open(seed: u64) -> Self {
         let vfs = SimVfs::new(seed);
         let mut o: EngineOptions = common::options(Arc::clone(&vfs), 3, 16 << 20);
+        // These interleavings step with deferred I/O held, counting on buffered WAL writes
+        // landing as they return: a direct stream's (D324) waits for its completion.
+        o.wal.direct = false;
         o.pin_threads = false;
         o.tablet_changes = true;
         o.balance_interval_nanos = 0;

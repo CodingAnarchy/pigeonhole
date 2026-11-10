@@ -82,23 +82,19 @@ fn a_direct_stream_writes_its_record_areas_only_in_aligned_blocks() {
             for (offset, len) in node_writes {
                 let in_slot = offset % segment;
                 slots.insert(offset / segment);
-                if in_slot < frame {
-                    // A header frame: alone in the segment's first frame.
-                    assert!(
-                        in_slot + len <= frame,
-                        "seed {seed} deferred={deferred}: a header write at {offset} ({len} B) \
-                         runs into the record area"
-                    );
-                    continue;
+                if in_slot + len <= frame {
+                    continue; // within a header frame: a held header's own write
                 }
                 if len >= segment {
                     continue; // a spare slot's zero-fill, synced before use
                 }
                 records += 1;
-                // Alignment stands in for "went through the direct handle": the simulator's
-                // recorded writes don't name their handle, and a buffered write that happened
-                // to be block-aligned would pass. A buffered record write (the `write_buf`
-                // path) frames records of any length, so it shows here as misaligned.
+                // A write reaching a record area (a segment the open started sends its header
+                // and first records as one direct write). Alignment stands in for "went through
+                // the direct handle": the simulator's recorded writes don't name their handle,
+                // and a buffered write that happened to be block-aligned would pass. A buffered
+                // record write (the `write_buf` path) frames records of any length, so it shows
+                // here as misaligned.
                 assert!(
                     offset % ALIGN == 0 && len % ALIGN == 0,
                     "seed {seed} deferred={deferred}: an unaligned (buffered) write at {offset} \
