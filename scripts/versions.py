@@ -12,9 +12,11 @@
 - **The public line:** `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli`, `pigeonhole-vector`,
   `pigeonhole-text`, `pigeonhole-memory` and the unpublished `pigeonhole-capi` and `pigeonhole-bench` take the workspace version
   (`[workspace.package] version`), under semver from 1.0.
-- **Own lines:** `pigeonhole-otel` (`OWN`) sets its own `version`, a 0.N line outside the
-  public one (D316): its API takes `opentelemetry` types, so it follows opentelemetry's minor
-  releases. `check` fails unless its pin is that version; `release-check` checks it on its own.
+- **Own lines:** `pigeonhole-otel` and `pigeonhole-embed` (`OWN`) each set their own
+  `version`, a 0.N line outside the public one: otel's API takes `opentelemetry` types, so it
+  follows opentelemetry's minor releases (D316); embed stays on 0.N until its API has been
+  used for a while (D318). `check` fails unless each one's pin is its version;
+  `release-check` checks each on its own.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
 - **Publish order:** `list` prints `INTERNAL`, then `PUBLIC`, then `OWN`, and `check` fails unless each
@@ -51,7 +53,7 @@ INTERNAL = [
 ]
 PUBLIC = ["pigeonhole", "arrow", "vector", "text", "memory", "cli"]
 # Published crates on a version line of their own (D316), after the public line's.
-OWN = ["otel"]
+OWN = ["otel", "embed"]
 UNPUBLISHED = ["capi", "bench"]
 
 
