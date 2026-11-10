@@ -3,6 +3,9 @@ writes mirror test_memory.py's cases, `Watch` and `ConsolidateLoop` mirror the R
 bindings', and the waits are cancel-safe (cli692's C1, perf287's W6)."""
 
 import asyncio
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -454,3 +457,37 @@ def test_a_reader_store_recalls_async(db, path):
         with ph.open_reader(path) as reader:
             with mem.Store.open_reader(reader, "agents", model="m") as rs:
                 run(main(rs))
+
+
+_POOL_CHILD = r"""
+import asyncio, glob, sys
+import pigeonhole as ph
+from pigeonhole import memory as mem
+
+db = ph.open(sys.argv[1], create=True, shards=1)
+with mem.Store.create(db, "agents") as s:
+    for i in range(20):
+        s.remember("ns", f"deploy note {i}")
+
+    async def main():
+        return await asyncio.gather(*[s.recall_async("ns", text="deploy") for _ in range(16)])
+
+    assert all(len(h) > 0 for h in asyncio.run(main()))
+# Linux truncates a thread's name to 15 bytes: the pool's are "pigeonhole-asyn" (the
+# bridge thread would be too, but nothing here parks a commit, so it never starts).
+names = [open(p).read().strip() for p in glob.glob("/proc/self/task/*/comm")]
+print(sum(n == "pigeonhole-asyn" for n in names))
+db.close()
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="counts threads through /proc")
+@pytest.mark.parametrize("threads", [1, 3])
+def test_the_pool_has_the_threads_its_variable_asks_for(tmp_path, threads):
+    """PIGEONHOLE_ASYNCIO_POOL_THREADS sizes the pool recalls run on (g45, ICR 0124)."""
+    env = dict(os.environ, PIGEONHOLE_ASYNCIO_POOL_THREADS=str(threads))
+    out = subprocess.run(
+        [sys.executable, "-c", _POOL_CHILD, str(tmp_path / "p.phdb")],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert int(out.stdout.split()[-1]) == threads, out

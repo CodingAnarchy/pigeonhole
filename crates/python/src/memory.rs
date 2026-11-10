@@ -978,18 +978,6 @@ impl RecallArgs {
         }
     }
 
-    /// [`run`](Self::run)'s async twin (#1560 PR 4).
-    async fn run_async(
-        self,
-        r: mem::Recall<'_>,
-    ) -> mem::Result<(Vec<mem::RecallHit>, mem::RecallStats)> {
-        let (r, snapshot) = self.configure(r);
-        match &snapshot {
-            Some(s) => r.snapshot(s).run_with_stats_async().await,
-            None => r.run_with_stats_async().await,
-        }
-    }
-
     /// `r` with every keyword but the snapshot, which it returns for the caller to lend.
     fn configure(self, r: mem::Recall<'_>) -> (mem::Recall<'_>, Option<pigeonhole::Snapshot>) {
         let mut r = r
@@ -1019,8 +1007,10 @@ enum Recaller {
 
 /// `recall_async` and `recall_with_stats_async` (#1560 PR 4, ICR 0124): the recall as an
 /// asyncio future, resolving to its hits, or with `with_stats` its hits and stats. The
-/// future owns the store handle and the arguments, and is first polled on the bridge thread
-/// (ai1249's B1): a recall's polls are CPU work, kept off the loop thread.
+/// future owns the store handle and the arguments, and runs the sync recall in its one poll,
+/// on the asyncio pool (ai1249's B1; the offload form g45 picked: a polled
+/// `run_with_stats_async` cost 1.6x a recall's time at one caller and half `to_thread`'s rate
+/// at 16, all of it the per-poll hand-offs).
 fn recall_future<'py>(
     py: Python<'py>,
     store: Recaller,
@@ -1033,11 +1023,11 @@ fn recall_future<'py>(
         let out = match &store {
             Recaller::W(s) => {
                 let r = s.recall(&ns);
-                a.run_async(r).await
+                a.run(r)
             }
             Recaller::R(s) => {
                 let r = s.recall(&ns);
-                a.run_async(r).await
+                a.run(r)
             }
         };
         Box::new(move |py: Python<'_>| {

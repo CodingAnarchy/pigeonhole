@@ -17,11 +17,13 @@
 //!   `catch_unwind` (R3, R4). Then it takes the GIL once for the whole drain, converts every
 //!   result, and hands each event loop its batch through one `call_soon_threadsafe` (B2: a
 //!   future completes on the loop it was created on).
-//! - **The poll pool** (`pigeonhole-asyncio-poll-N`, 2 to 8 threads, started on the first
-//!   call that uses it): the same loop on a second queue, each thread taking one task at a
-//!   time, for futures whose polls are CPU work. `start_on_bridge` starts them there without
-//!   the call's inline poll (a memory recall, ai1249's B1 on #1560), so they hold up neither
-//!   the event loop nor the bridge thread that commits complete on. A task stays on the queue
+//! - **The poll pool** (`pigeonhole-asyncio-poll-N`, 2 to 16 threads by the machine's
+//!   parallelism, or `PIGEONHOLE_ASYNCIO_POOL_THREADS`; started on the first call that uses
+//!   it): the same loop on a second queue, each thread taking one task at a time, for
+//!   futures whose polls are long or block. `start_on_bridge` starts them there without the
+//!   call's inline poll (a memory recall, which runs the sync recall in one poll: ai1249's B1
+//!   on #1560, and g45's offload), so they hold up neither the event loop nor the bridge
+//!   thread that commits complete on. A task stays on the queue
 //!   it started on; a task woken during a poll may be picked up by a second thread, which
 //!   waits on its lock and polls it again, or finds it done.
 //! - **Cancellation:** the asyncio future's done callback, on the loop thread, marks a
@@ -110,21 +112,31 @@ fn bridge() -> Arc<Bridge> {
 }
 
 /// The poll pool (ai1249's B1 on #1560): a bridge of [`pool_threads`] threads, each taking
-/// one task at a time, for the futures [`start_on_bridge`] starts, whose polls are CPU work
-/// (a memory recall). On the one bridge thread, 16 concurrent recalls ran at a fifth of
-/// `to_thread`'s rate and held commits' completions up behind them. Commits, gets and feed
-/// waits stay on the bridge.
+/// one task at a time, for the futures [`start_on_bridge`] starts, whose polls are long or
+/// block (a memory recall runs the sync recall in its one poll). On the one bridge thread,
+/// 16 concurrent recalls ran at a fifth of `to_thread`'s rate and held commits' completions
+/// up behind them. Commits, gets and feed waits stay on the bridge.
 fn pool() -> Arc<Bridge> {
     cached(&LOCAL_POOL, || {
         shared(&POOL, pool_threads(), 1, "pigeonhole-asyncio-poll")
     })
 }
 
-/// The pool's threads: the machine's parallelism, from 2 to 8.
+/// The pool's threads: `PIGEONHOLE_ASYNCIO_POOL_THREADS` if it's set to a whole number from
+/// 1 to 256 (read once, when the pool starts), else the machine's parallelism, from 2 to 16.
+/// A recall runs on one of them from start to finish, its reads included, so they bound how
+/// many recalls run at once: at 8 threads, 16 and 32 callers both ran at about 127
+/// recalls/s on the 16-core reference machine (g45).
 fn pool_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(2, std::num::NonZeroUsize::get)
-        .clamp(2, 8)
+    std::env::var("PIGEONHOLE_ASYNCIO_POOL_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=256).contains(n))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(2, std::num::NonZeroUsize::get)
+                .clamp(2, 16)
+        })
 }
 
 fn cached(
@@ -513,8 +525,8 @@ where
 }
 
 /// [`start`] without its inline first poll (ai1249's B1 on #1560): the future is built here
-/// and polled first on the bridge thread, so a call whose polls are mostly CPU work (a
-/// memory recall) never runs that work on the loop thread, and the call returns at once.
+/// and polled first on the poll pool, so a call whose polls are long or block (a memory
+/// recall) never runs that work on the loop thread, and the call returns at once.
 /// Commits keep `start`'s inline poll, which submits them at the call (D210's ordering).
 pub(crate) fn start_on_bridge<'py, M, F>(
     py: Python<'py>,

@@ -573,8 +573,11 @@ class Store:
         with_embeddings: bool = False,
         expand: Expand | None = None,
     ) -> asyncio.Future[list[RecallHit]]:
-        """`recall(...)` as an asyncio future: the same hits, with the recall's reads
-        asynchronous, started on the bridge thread so its work stays off the event loop."""
+        """`recall(...)` as an asyncio future: the same hits. The recall runs on a thread of
+        the binding's pool (2 to 16 threads, by the machine's parallelism, or
+        `PIGEONHOLE_ASYNCIO_POOL_THREADS`), so it stays off the event loop. Recalls beyond
+        the pool's size wait in its queue, not on the loop. A cancelled recall that already
+        started finishes on its thread, and its result is dropped."""
     def recall_with_stats_async(
         self,
         namespaces: Namespaces,
@@ -709,8 +712,11 @@ class ReadStore:
         with_embeddings: bool = False,
         expand: Expand | None = None,
     ) -> asyncio.Future[list[RecallHit]]:
-        """`recall(...)` as an asyncio future: the same hits, with the recall's reads
-        asynchronous, started on the bridge thread so its work stays off the event loop."""
+        """`recall(...)` as an asyncio future: the same hits. The recall runs on a thread of
+        the binding's pool (2 to 16 threads, by the machine's parallelism, or
+        `PIGEONHOLE_ASYNCIO_POOL_THREADS`), so it stays off the event loop. Recalls beyond
+        the pool's size wait in its queue, not on the loop. A cancelled recall that already
+        started finishes on its thread, and its result is dropped."""
     def recall_with_stats_async(
         self,
         namespaces: Namespaces,
