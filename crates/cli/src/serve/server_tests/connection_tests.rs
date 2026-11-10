@@ -146,6 +146,8 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
     let s = capped(1, timeout);
     let conns = &s.shared.router.service.connections;
 
+    // Connections this server ended before the silent one (ai1249's N2 on #1695).
+    let before = conns.ended().len();
     let mut silent = connect(&s);
     let started = std::time::Instant::now();
     let how = how_closed(&mut silent, Duration::from_secs(5));
@@ -158,7 +160,7 @@ fn a_silent_connection_is_dropped_and_an_idle_http2_one_is_kept() {
     // just after the socket closes, so it gets a moment to.
     if took < timeout / 2 {
         let t = std::time::Instant::now();
-        while conns.ended().is_empty() && t.elapsed() < Duration::from_secs(1) {
+        while conns.ended().len() == before && t.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!(
