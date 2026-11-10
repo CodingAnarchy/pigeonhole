@@ -717,16 +717,20 @@ impl<'t> KeyRows<'t> {
     }
 
     fn fill(&mut self) -> Result<Option<usize>> {
-        // An async read stopped mid-row: the sync step finishes that row, so no key is lost
-        // (perf287's point 4 on #1652).
-        if let Some(i) = self.filling.take() {
-            while self.cursor.push_next_cell(&mut self.buf)? {}
-            return Ok(Some(i));
-        }
-        let Some(i) = self.cursor.next_key()? else {
-            return Ok(None);
+        let i = match self.filling.take() {
+            // An async read stopped mid-row: the sync step finishes that row, so no key is
+            // lost (perf287's point 4 on #1652).
+            Some(i) => i,
+            None => {
+                let Some(i) = self.cursor.next_key()? else {
+                    return Ok(None);
+                };
+                self.buf.clear();
+                self.buf.key.extend_from_slice(self.cursor.row());
+                i
+            }
         };
-        fill_key(&mut self.cursor, &mut self.buf)?;
+        fill_cells(&mut self.cursor, &mut self.buf, None)?;
         Ok(Some(i))
     }
 
@@ -821,17 +825,7 @@ impl<'t> KeyRows<'t> {
         };
         // The row's cells, each step's block fetched first (D196 within the row, #1652).
         let buf = &mut self.buf;
-        let filled = self.cursor.counted(|c| -> Result<bool> {
-            loop {
-                match c.poll_cell_ready(cx) {
-                    Poll::Pending => return Ok(false),
-                    Poll::Ready(r) => r?,
-                }
-                if !c.push_next_cell(buf)? {
-                    return Ok(true);
-                }
-            }
-        });
+        let filled = self.cursor.counted(|c| fill_cells(c, buf, Some(cx)));
         match filled {
             Ok(false) => Poll::Pending,
             Ok(true) => {
@@ -1152,12 +1146,28 @@ pub struct TraverseStats {
     pub cut_by_budget: bool,
 }
 
-/// Reads the cells of the key `cursor` is on into `buf` (cleared first).
-fn fill_key(cursor: &mut KeyCursor, buf: &mut RowBuf) -> Result<()> {
-    buf.clear();
-    buf.key.extend_from_slice(cursor.row());
-    while cursor.push_next_cell(buf)? {}
-    Ok(())
+/// Reads the rest of the cells of the key `cursor` is on into `buf`: `Ok(true)` once the row
+/// is done. With `cx` (an async fill), each step's block is fetched first (D196 within the
+/// row, #1652), and `Ok(false)` means a fetch is in flight, the place kept. The sync and
+/// async fills share this one loop so `KeyCursor::push_next_cell` keeps a single call
+/// site, which LLVM inlines: with a second one the sync multi-get cost about 260
+/// instructions more per row (#1665's instructions job).
+fn fill_cells(
+    cursor: &mut KeyCursor,
+    buf: &mut RowBuf,
+    mut cx: Option<&mut std::task::Context<'_>>,
+) -> Result<bool> {
+    loop {
+        if let Some(cx) = cx.as_deref_mut() {
+            match cursor.poll_cell_ready(cx) {
+                std::task::Poll::Pending => return Ok(false),
+                std::task::Poll::Ready(r) => r?,
+            }
+        }
+        if !cursor.push_next_cell(buf)? {
+            return Ok(true);
+        }
+    }
 }
 
 /// A position within a row: the column (family and qualifier) a walk of the row handed out
