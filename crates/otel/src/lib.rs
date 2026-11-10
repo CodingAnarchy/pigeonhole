@@ -300,7 +300,9 @@ impl Collector {
                     escape_label(out, v);
                     out.push('"');
                 }
-                out.push_str("} ");
+                // `pigeonhole_db_name` is always there, but a sample without labels has no
+                // braces (ai1249's N2 on #1687).
+                out.push_str(if labels.is_empty() { " " } else { "} " });
                 match spec.value(value) {
                     PointValue::U64(v) => {
                         let _ = write!(out, "{v}");
@@ -1418,11 +1420,8 @@ impl State {
 
     fn read(&mut self, now: Instant, window: Duration, storage_by_table: bool) -> Option<Snapshot> {
         // A clone (two `Arc`s), so the reading can update the state while it holds the handle.
+        // `Shared::snapshot` checked that the database is open, under the same lock.
         let db = self.db.clone()?;
-        // A closed database reports nothing.
-        if db.is_closed() {
-            return None;
-        }
         let info = db.info().ok();
         let recovery = db.recovery_stats();
         let raw = Raw {

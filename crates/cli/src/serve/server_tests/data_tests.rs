@@ -292,6 +292,15 @@ fn tokens_and_scopes_decide_who_may_do_what() {
             "{family}:\n{text}"
         );
     }
+    // The engine's names stay out of the server's own namespaces, so they can't clash as
+    // either side grows (perf287's nit 1 on #1687).
+    for m in pigeonhole_otel::metrics() {
+        let name = m.prometheus_name();
+        assert!(
+            !name.starts_with("pigeonhole_serve_") && !name.starts_with("pigeonhole_replica_"),
+            "{name}"
+        );
+    }
     // Each family is declared once: Prometheus refuses a scrape that repeats one.
     let mut types: Vec<&str> = text.lines().filter(|l| l.starts_with("# TYPE ")).collect();
     let n = types.len();

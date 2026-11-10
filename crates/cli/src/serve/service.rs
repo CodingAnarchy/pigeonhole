@@ -1599,8 +1599,10 @@ impl Service {
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
         }
-        // Reads the database on this thread: `engine_metrics`, `recovery_stats` and `info`,
-        // all in memory, as the old `async_sync_reads` line's read was.
+        // Reads the database on this thread, at most once per 100 ms: `engine_metrics` and
+        // `recovery_stats` (atomic loads), and `info`, which walks the current catalog, takes
+        // the file's length and the pager's allocation stats under its lock for an instant,
+        // with no other I/O (ai1249's question, perf287's nit 2 on #1687).
         self.engine_metrics.render_prometheus(&mut text);
         text
     }
