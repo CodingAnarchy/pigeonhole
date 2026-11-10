@@ -230,6 +230,13 @@ pub struct Metrics {
     /// interval, divided by the interval, is how many threads' worth of polling the store
     /// did: awake time its clients caused without work behind it.
     pub shard_spin_time_nanos: u64,
+    /// Caller-runs (#1176): turns committing clients ran on the shards that handled a
+    /// message, summed over shards; 0 with it off.
+    pub caller_turns: u64,
+    /// Caller-runs (#1176): lost wakes the drivers' 100 ms park backstop recovered, summed
+    /// over shards: a shard had work when its driver's park ran out and no notify had
+    /// signalled it (#1502). Should stay 0; 0 with caller-runs off.
+    pub caller_backstop_wakes: u64,
     /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
     /// commits every shard completed (D257), plus each cross-shard commit's time from
     /// submit to the decision at every participant (D262). Its rise over an interval,
@@ -1717,6 +1724,7 @@ impl Engine {
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
         config.idle_spin_cap = std::time::Duration::from_nanos(options.shard_spin_cap_nanos);
+        config.caller_runs = options.caller_runs;
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
             b => b,
@@ -1757,6 +1765,9 @@ impl Engine {
                     .map(|i| rt.submitter(ShardId(i as u16)))
                     .collect();
                 let _ = shared.submitters.set(submitters);
+                if !rt.callers().is_empty() {
+                    let _ = shared.callers.set(rt.callers().into());
+                }
                 *inner.runtime.lock().unwrap_or_else(PoisonError::into_inner) = Some(rt);
                 None
             }
@@ -1884,6 +1895,17 @@ impl Engine {
     }
 
     // ---- catalog ----
+
+    /// Turns committing threads ran on the shards themselves, summed over shards (the
+    /// caller-runs, D321; 0 with it off). Relaxed.
+    #[doc(hidden)]
+    pub fn caller_turns(&self) -> u64 {
+        self.inner
+            .shared
+            .callers
+            .get()
+            .map_or(0, |callers| callers.iter().map(|c| c.turns()).sum())
+    }
 
     /// Creates a table with its families (a manifest commit).
     pub fn create_table(
@@ -3876,6 +3898,12 @@ impl Engine {
                 m.background_take_backs.1 += room;
             }
         }
+        if let Some(callers) = shared.callers.get() {
+            for c in callers.iter() {
+                m.caller_turns += c.turns();
+                m.caller_backstop_wakes += c.backstop_wakes();
+            }
+        }
         let w = &shared.visibility;
         m.visibility_waits = (
             w.waits.load(Ordering::Relaxed),
@@ -5407,9 +5435,15 @@ impl Inner {
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
         match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+            // Caller-runs (D321): the commit's shard, which this thread may run itself while
+            // its spinning wait goes on. A cross-shard commit's coordinator refuses it (only
+            // single-shard commits are a caller's to run).
             Routed::Sent {
-                mut waiter, spins, ..
-            } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
+                mut waiter,
+                spins,
+                target,
+                ..
+            } => crate::write::wait_blocking_on(&self.shared, &mut waiter, spins, target),
             Routed::Held(p) => self.send(p)?.wait(),
         }
     }
@@ -6777,6 +6811,21 @@ impl EngineShard {
         d.run_once(deadline_nanos)
     }
 
+    /// Caller-runs' sim seam (#1176): one committing client's turn of this shard, the same
+    /// turn an engine-owned client runs, for a seeded harness to reach that path on one
+    /// thread (`PIGEONHOLE_CALLER_TURNS`). Returns whether it handled a message (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn run_caller_turn(&mut self) -> bool {
+        if self.forked() {
+            return false;
+        }
+        let Some(d) = self.driver.as_mut() else {
+            return false;
+        };
+        d.run_caller_turn()
+    }
+
     /// Whether this shard's WAL segment header is held back behind its predecessor's sync
     /// (an inspection helper for tests, D310 PR 4: a change feed polled in that window must
     /// wait for the segment, not take the stream's readable end for its head).
@@ -7021,6 +7070,7 @@ impl Shared {
             wal_pin_bytes: 0,
             feed: None,
             submitters: std::sync::OnceLock::new(),
+            callers: std::sync::OnceLock::new(),
             wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,

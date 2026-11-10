@@ -564,7 +564,10 @@ pub(crate) struct IdlePark {
 
 impl IdlePark {
     /// Parks until `deadline` on `vfs`'s clock, an unpark (new work), or the re-check cap.
-    pub(crate) fn park(&mut self, vfs: &dyn Vfs, deadline: u64) {
+    /// Returns whether the park ran its full time, at least a millisecond: a wake delivered
+    /// before it began (the thread's unpark token) ends it at once, which a deadline already
+    /// due, or nearly, couldn't tell apart from waiting it out.
+    pub(crate) fn park(&mut self, vfs: &dyn Vfs, deadline: u64) -> bool {
         let now = vfs.monotonic_nanos();
         let cap = if self.real { MAX_PARK_REAL } else { MAX_PARK };
         let want = Duration::from_nanos(deadline.saturating_sub(now)).min(cap);
@@ -580,6 +583,7 @@ impl IdlePark {
             let moved = u128::from(vfs.monotonic_nanos().saturating_sub(now));
             self.real = moved * 2 >= slept.as_nanos();
         }
+        want >= Duration::from_millis(1) && slept >= want
     }
 }
 

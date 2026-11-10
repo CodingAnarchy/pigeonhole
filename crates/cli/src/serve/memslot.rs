@@ -116,6 +116,16 @@ impl MemSlot {
         }
     }
 
+    /// The largest recall budget a call may ask for.
+    pub(crate) fn max_recall(&self) -> u64 {
+        self.budget.1
+    }
+
+    /// Whether the server computes the embeddings (`--embed-url`, `--embed-local`).
+    pub(crate) fn embeds(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     /// The store's name.
     pub(crate) fn name(&self) -> &str {
         &self.name

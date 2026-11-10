@@ -525,3 +525,205 @@ fn a_tool_create_racing_a_drop_takes_the_pool_and_schema_in_one_order() {
         assert_eq!(dropper.join().unwrap(), 200);
     }
 }
+
+// ---- The memory tools on /mcp (8c-3b) ----
+
+fn memory_mcp(tokens: &str) -> Server {
+    super::memory_tests::memory_server_with(tokens, limits())
+}
+
+#[test]
+fn the_memory_tools_keep_to_the_tokens_namespaces() {
+    // ai1249's M4 on D313 §7: `/mcp`'s memory tools check the token's namespaces as the
+    // `Memory` RPCs do, refusing a call outside them whole.
+    let s = memory_mcp("write ns=a scoped\nread ns=a reader\n");
+    let w = session(&s, Some("scoped"));
+    let (out, err) = call(
+        &s,
+        Some("scoped"),
+        &w,
+        "memory_remember",
+        json!({"namespace": "a", "text": "the cache is warm"}),
+    );
+    assert!(!err, "{out}");
+    let (e, err) = call(
+        &s,
+        Some("scoped"),
+        &w,
+        "memory_remember",
+        json!({"namespace": "b", "text": "not mine"}),
+    );
+    assert!(err, "{e}");
+    assert_eq!(e["error"]["code"], "PermissionDenied", "{e}");
+    // A read token: recall only, within its namespaces.
+    let r = session(&s, Some("reader"));
+    let names = tool_names(&s, Some("reader"), &r);
+    assert!(names.contains(&"memory_recall".to_owned()), "{names:?}");
+    assert!(!names.contains(&"memory_remember".to_owned()), "{names:?}");
+    let (hits, err) = call(
+        &s,
+        Some("reader"),
+        &r,
+        "memory_recall",
+        json!({"namespace": "a", "text": "cache"}),
+    );
+    assert!(!err, "{hits}");
+    assert!(hits.to_string().contains("the cache is warm"), "{hits}");
+    let (e, err) = call(
+        &s,
+        Some("reader"),
+        &r,
+        "memory_recall",
+        json!({"namespaces": ["a", "b"], "text": "cache"}),
+    );
+    assert!(err, "{e}");
+    assert_eq!(e["error"]["code"], "PermissionDenied", "{e}");
+    let (e, err) = call(
+        &s,
+        Some("reader"),
+        &r,
+        "memory_remember",
+        json!({"namespace": "a", "text": "x"}),
+    );
+    assert!(err, "{e}");
+    assert_eq!(e["error"]["code"], "PermissionDenied", "{e}");
+}
+
+#[test]
+fn a_memory_server_offers_its_guide_and_instructions_on_mcp() {
+    let s = memory_mcp("");
+    let init = mcp(
+        &s,
+        None,
+        None,
+        None,
+        &json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"}}),
+    );
+    let result = &init.reply()["result"];
+    assert!(result["capabilities"]["resources"].is_object(), "{result}");
+    assert!(
+        result["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Long-term memory"),
+        "{result}"
+    );
+    let id = init.session.unwrap();
+    let list = mcp(
+        &s,
+        None,
+        Some(&id),
+        None,
+        &request("resources/list", json!({})),
+    );
+    assert_eq!(
+        list.reply()["result"]["resources"][0]["uri"],
+        "memory://guide"
+    );
+    // A server without a store has neither the tools nor the resource.
+    let plain = Server::start("", limits());
+    let p = session(&plain, None);
+    assert!(
+        !tool_names(&plain, None, &p)
+            .iter()
+            .any(|n| n.starts_with("memory_"))
+    );
+    // `memory_recall`'s schema states the served store's largest budget (ai1249's N1).
+    let list = mcp(&s, None, Some(&id), None, &request("tools/list", json!({})));
+    let recall = list.reply()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_recall")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        recall["inputSchema"]["properties"]["max_bytes"]["maximum"],
+        8 << 20,
+        "{recall}"
+    );
+    let none = mcp(
+        &plain,
+        None,
+        Some(&p),
+        None,
+        &request("resources/list", json!({})),
+    );
+    assert_eq!(none.reply()["error"]["code"], -32601);
+}
+
+#[test]
+fn a_memory_tool_racing_a_memory_rpc_takes_the_memory_place_first() {
+    // The memory sub-limit (M6) is taken before a blocking-pool place, by the RPCs and by
+    // `/mcp` alike. With a pool of one and one memory place, the other order would leave
+    // each waiting on the other for good.
+    blocking_threads(1);
+    let s = memory_mcp("");
+    let id = session(&s, None);
+    let (out, err) = call(
+        &s,
+        None,
+        &id,
+        "memory_remember",
+        json!({"namespace": "a", "text": "the race is on"}),
+    );
+    assert!(!err, "{out}");
+    for _ in 0..20 {
+        let url = s.url.clone();
+        let rpc = std::thread::spawn(move || {
+            agent()
+                .post(format!("{url}/v1/Memory/Recall"))
+                .header("content-type", "application/json")
+                .send(json!({"namespaces": ["a"], "text": "race", "k": 5}).to_string())
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+        let (hits, err) = call(
+            &s,
+            None,
+            &id,
+            "memory_recall",
+            json!({"namespace": "a", "text": "race"}),
+        );
+        assert!(!err, "{hits}");
+        assert_eq!(rpc.join().unwrap(), 200);
+    }
+}
+
+#[test]
+fn a_memory_tool_spelled_with_escapes_still_takes_a_memory_place() {
+    // ai1249's R1 on #1679: `post` spots memory tool calls cheaply, so a name spelled with
+    // JSON escapes gets past it; the call itself then takes a place without waiting, or is
+    // refused. With the one place held elsewhere, it must not run.
+    let s = memory_mcp("");
+    let id = session(&s, None);
+    let held = s.block_on(s.shared.router.service.memory_place()).unwrap();
+    let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\u006demory_recall","arguments":{"namespace":"a","text":"x"}}}"#;
+    assert!(!raw.contains("\"memory_"));
+    let mut resp = agent()
+        .post(format!("{}/mcp", s.url))
+        .header("content-type", "application/json")
+        .header("mcp-session-id", id.as_str())
+        .send(raw)
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let reply: Json = resp.body_mut().read_json().unwrap();
+    let result = &reply["result"];
+    assert_eq!(result["isError"], true, "{reply}");
+    assert_eq!(
+        result["structuredContent"]["error"]["code"], "Overloaded",
+        "{reply}"
+    );
+    // The place back, the same call runs.
+    drop(held);
+    let mut resp = agent()
+        .post(format!("{}/mcp", s.url))
+        .header("content-type", "application/json")
+        .header("mcp-session-id", id.as_str())
+        .send(raw)
+        .unwrap();
+    let reply: Json = resp.body_mut().read_json().unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
