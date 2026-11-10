@@ -9,6 +9,8 @@
   2. `default_shards`, when it's above 0;
   3. one per physical core.
 - **The bound** on `shards` (at most 65,536) applies to `default_shards` too.
+- **Compaction threads:** with `shards` unset, the CPU budget clamps them to `default_shards`, as it would an explicit count (at most one per shard; perf2 on #1699). The drivers' ceiling is unchanged, a thread per resolved shard, since a feed's recorded count can exceed the default.
+- **An existing database without a change feed, opened with neither count, takes `default_shards`.** Since the count isn't stored, that's a reshard whenever the file was last opened with another count. It's harmless without a feed, as opening with another explicit count is today.
 - **`phdb serve`** sets it to its default (half the physical cores) on every open, a cluster node's partitions included. `--shards` still sets `shards`.
 - **No format change.**
 

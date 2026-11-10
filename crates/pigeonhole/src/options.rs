@@ -348,7 +348,10 @@ impl Options {
     /// The shard count isn't stored in the file, so without this an application whose own
     /// default differs from the library's gets the library's on every reopen. A change feed's
     /// recorded count still wins, as it does for an unset `shards`, so this never reshards a
-    /// feed and ends its history. `phdb serve` sets it to half the physical cores.
+    /// feed and ends its history. An existing database without a feed, opened with neither
+    /// count, takes this one, whatever count it last ran with: the data doesn't depend on it.
+    /// Flush and compaction threads are sized against it as against an explicit count.
+    /// `phdb serve` sets it to half the physical cores.
     ///
     /// ```
     /// use pigeonhole::Options;
@@ -1841,7 +1844,23 @@ impl Options {
             Some(k) => k,
             // Application-owned mode starts no threads (D40).
             None if application_owned => 0,
-            None => budget.compaction,
+            // Clamped to the shards the open will most likely have: an unset count's default
+            // (ICR 0132) counts as given, so `default_shards(2)` gets `shards(2)`'s compaction
+            // threads (perf2's 1 on #1699). The drivers' ceiling stays the budget's: a feed's
+            // recorded count can exceed the default, and its shards keep a thread each.
+            None => match (self.shards, self.default_shards) {
+                (0, n) if n > 0 => {
+                    thread_budget(
+                        pigeonhole_io::sys::default_shards(),
+                        self.cpu_profile,
+                        Some(n),
+                        self.shard_threads,
+                        None,
+                    )
+                    .compaction
+                }
+                _ => budget.compaction,
+            },
         };
         o.pin_threads = self.pin_threads;
         o.wal_preallocate = self.wal_preallocate;
@@ -2091,6 +2110,12 @@ mod tests {
         // The engine-owned default starts a thread per shard: the controller's ceiling.
         let e = o().shards(20).to_engine_for(false).unwrap();
         assert_eq!(e.shard_threads, 20);
+        // A default shard count sizes compaction as the same explicit count does (ICR 0132,
+        // perf2's 1 on #1699): at most one compaction thread per shard.
+        let compaction = |o: Options| o.to_engine_for(false).unwrap().compaction_threads;
+        assert_eq!(compaction(o().default_shards(1)), compaction(o().shards(1)));
+        assert_eq!(compaction(o().default_shards(1)), 1);
+        assert_eq!(compaction(o().default_shards(2)), compaction(o().shards(2)));
     }
 
     /// The shard's spin window by profile (D198, amended 2026-10-30; #1176): `Embedded`
