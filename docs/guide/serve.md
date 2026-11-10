@@ -49,7 +49,7 @@ read   reporting-token
 
 - **Scopes:**
   - `read` reads, opens snapshots, and runs transactions without writes.
-  - `write` adds writes, `CreateTable` and the index writes.
+  - `write` adds writes, `CreateTable`, the index writes and the memory writes (`Remember`, `MarkUsed`, `Supersede`, `Link` and `Forget`).
   - `admin` adds `DropTable`, the maintenance calls, backups, `Promote`, and following as a replica.
   - `cluster` is only for node-to-node calls ([Clusters](#clusters)).
 - **`ns=a,b`** limits a token to those agent-memory namespaces ([Agent memory](#agent-memory)).
@@ -138,7 +138,10 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 | `retry_safe: true` with `retry_from: REQUEST` (`Busy`, `Overloaded`, `SessionBusy`, `Closed`, `ReplicaBehind`, `Unavailable`, `DeadlineExceeded`, and a read's `Io`) | not applied | send it again, after `Retry-After` where given |
 | `retry_safe: true` with `retry_from: BEGIN` (`Conflict`, `SnapshotExpired`, `TransactionExpired`) | not applied | run the transaction again from `Begin` |
 | `retry_safe: false` with a validation, schema, scope or role code (`InvalidArgument`, `TableNotFound`, `PermissionDenied`, `ReadOnly`, `FailedPrecondition`, ...) | not applied | no: fix the request |
-| A write's `OutcomeUnknown`, `Io`, `NoSpace`, `Corruption` or `Internal` | **maybe applied** | check an operation id the write committed ([Recovery](recovery.md)) |
+| `retry_safe: false` with a 503 the server can't help (`WriterLocked` and the other codes for a database it can't open) | not applied | no: the server's database needs attention |
+| `TransactionFinished` | that call did nothing | no: send `Commit` for the transaction's outcome |
+| `FeedExpired` | (a read) | no: subscribe again from now |
+| A write's `OutcomeUnknown`, `Io`, `NoSpace`, `MergeFailed`, `Corruption` or `Internal`, or `NotFound` for a `txn_id` you sent `Commit` to | **maybe applied** | check an operation id the write committed ([Recovery](recovery.md)) |
 | No `ErrorDetail` at all: a dropped connection, or a bare gRPC `UNAVAILABLE` or HTTP 502/503/504 from a proxy | **maybe applied**, for a write | as above. A read may be sent again. |
 
 **A proxy in front of the server must not retry writes.** Many retry a 503 or a reset connection by default, which replays a write whose outcome is unknown.
@@ -281,20 +284,20 @@ Serve's own metrics, before the engine's:
 
 The engine's metrics follow, under the [observability guide's](observability.md#the-metrics) names and labels, with its alerts and its Grafana dashboard.
 
-**What to alert on,** beside the engine's ([Observability](observability.md#what-to-alert-on)):
+**What to alert on,** beside the engine's ([Observability](observability.md#what-to-alert-on)). "For" is the alert rule's `for:`.
 
-| Alert | Query | Why |
-|---|---|---|
-| Requests are shed | `rate(pigeonhole_serve_shed_total[5m]) > 0` | Requests are arriving past `--max-concurrent`. Raise it if the machine has room, or add capacity. |
-| Overloaded | `sum(rate(pigeonhole_serve_requests_total{outcome="Overloaded"}[5m])) / sum(rate(pigeonhole_serve_requests_total[5m])) > 0.01` | More than 1% of requests are refused by a limit: in-flight bytes, sessions, streams or feed hubs. The [limits](#limits) say which. |
-| Connections near the cap | `pigeonhole_serve_connections > 0.9 * pigeonhole_serve_connections_max` | New connections will be closed at once. Raise `--max-connections` and `ulimit -n` together. |
-| Out of descriptors | `rate(pigeonhole_serve_accept_errors_total[5m]) > 0` | Accepting is failing, usually `EMFILE`. |
-| A feed subscription failed | `increase(pigeonhole_serve_feed_hub_failures_total[15m]) > 0` | Its subscribers' streams ended. They resubscribe from their last token. |
-| Feed streams fall behind | `rate(pigeonhole_serve_feed_fell_behind_total[5m]) > 0` | Subscribers slower than the commits read their own history. Raise `--feed-ring-bytes`, or look at the slow clients. |
-| A session held long | `pigeonhole_serve_oldest_session_seconds > 300` | A client holds a transaction or snapshot near its lifetime cap, holding back GC. |
-| A replica isn't following | `pigeonhole_replica_following == 0` | It's bootstrapping, retrying, or its primary is unreachable. `Admin.Info` says why. |
-| A replica is behind | `pigeonhole_replica_lag_seconds > 30` | Pick the threshold from how stale its reads may be. |
-| Latency | `histogram_quantile(0.99, sum by (le, rpc) (rate(pigeonhole_serve_request_duration_seconds_bucket[5m]))) > 0.05` | The server's p99 by RPC. Pick the threshold from your own baseline. |
+| Alert | Query | For | Why |
+|---|---|---|---|
+| Requests are shed | `rate(pigeonhole_serve_shed_total[5m]) / (rate(pigeonhole_serve_shed_total[5m]) + sum(rate(pigeonhole_serve_requests_total[5m]))) > 0.01` | 5m | More than 1% of requests arrive past `--max-concurrent` and are refused before they run. Shed requests aren't in `pigeonhole_serve_requests_total`, so the ratio adds them back. Raise the limit if the machine has room, or add capacity. |
+| Overloaded | `sum(rate(pigeonhole_serve_requests_total{outcome="Overloaded"}[5m])) / sum(rate(pigeonhole_serve_requests_total[5m])) > 0.01` | 5m | More than 1% of the requests that ran were refused by a limit: in-flight bytes, sessions, streams or feed hubs. The [limits](#limits) say which. |
+| Connections near the cap | `pigeonhole_serve_connections > 0.9 * pigeonhole_serve_connections_max` | 5m | New connections will be closed at once. Raise `--max-connections` and `ulimit -n` together. |
+| Out of descriptors | `rate(pigeonhole_serve_accept_errors_total[5m]) > 0` | | Accepting is failing, usually `EMFILE`. |
+| A feed subscription failed | `increase(pigeonhole_serve_feed_hub_failures_total[15m]) > 0` | | Its subscribers' streams ended. They resubscribe from their last token. |
+| Feed streams stay behind | `pigeonhole_serve_feed_catching_up > 0` | 15m | Streams reading their own history for a quarter of an hour aren't catching up: subscribers slower than the commits. Raise `--feed-ring-bytes`, or look at the slow clients. Streams falling off a ring and rejoining it (`pigeonhole_serve_feed_fell_behind_total` and `_rejoined_total`) is normal under bursts, so don't alert on those. A rising `pigeonhole_serve_feed_catch_up_waits_total` means `--max-catch-up` is the bottleneck. |
+| A snapshot held long | `pigeonhole_serve_oldest_session_seconds > 300` | | A client holds a pinned snapshot past 5 minutes, holding back GC. Transactions end at `--txn-lifetime-ms` (5 minutes), so only snapshots (up to `--snapshot-lifetime-ms`, 10 minutes) reach it. |
+| A replica isn't following | `pigeonhole_replica_following == 0` | 5m | It's retrying, or its primary is unreachable. `Admin.Info` says why. The `for:` lets a bootstrap or re-bootstrap finish. |
+| A replica is behind | `pigeonhole_replica_lag_seconds > 30` | 5m | Pick the threshold from how stale its reads may be. |
+| Latency | `histogram_quantile(0.99, sum by (le, rpc) (rate(pigeonhole_serve_request_duration_seconds_bucket{rpc!~"Data.Scan\|Feed.Subscribe\|Memory.Watch\|Admin.Backup\|Admin.BackupDownload\|Vectors.BulkLoad\|Text.Rebuild"}[5m]))) > 0.05` | 10m | The server's p99 by RPC. Streams are timed to their end, and the backup, bulk-load and rebuild calls run long by design, so they're left out. Pick the threshold from your own baseline. `histogram_quantile` interpolates within a bucket (bounds 100 µs, 250 µs, 500 µs, 1 ms, 2.5 ms, ... 10 s), so a p99 between two bounds is an estimate. |
 
 ## Replicas
 A replica server serves reads of a copy that follows a primary server's commits (#1436). Use one to move reads off the primary, to keep a warm copy on another machine, or to take backups there.
