@@ -570,6 +570,8 @@ enum KeyEnd {
     Done,
     /// The poll's budget ran out mid-key.
     Budget,
+    /// The key's next cell is in a block being fetched (#1652): the fetch wakes the task.
+    Fetch,
     /// The reducer is full: the hop is done.
     Full,
 }
@@ -746,12 +748,16 @@ impl PendingTraversal {
                     let filter = self.filter.as_ref();
                     let edges = &mut self.out.stats.edges;
                     let ended = cursor.counted(|c| {
-                        read_key(c, row, (visitor, reducer), filter, &mut budget, edges)
+                        read_key(c, row, (visitor, reducer), filter, &mut budget, edges, cx)
                     });
                     match ended {
                         Ok(KeyEnd::Done) => {
                             hop.key = None;
                             false
+                        }
+                        Ok(KeyEnd::Fetch) => {
+                            // The key's state is kept; the fetch's completion wakes the task.
+                            return Poll::Pending;
                         }
                         Ok(KeyEnd::Budget) => {
                             // Yield: the key's state is kept, and this task polled again.
@@ -790,10 +796,15 @@ fn read_key(
     filter: Option<&(ValuePredicate, Arc<crate::snapshot::SstSet>)>,
     budget: &mut u32,
     edges: &mut u64,
+    cx: &mut std::task::Context<'_>,
 ) -> Result<KeyEnd> {
     loop {
         if *budget == 0 {
             return Ok(KeyEnd::Budget);
+        }
+        // D196 within the key's row (#1652): the block the step reads, fetched first.
+        if c.poll_cell_ready(cx)?.is_pending() {
+            return Ok(KeyEnd::Fetch);
         }
         let Some(cell) = c.next_cell()? else {
             return Ok(KeyEnd::Done);

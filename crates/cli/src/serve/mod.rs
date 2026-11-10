@@ -191,6 +191,12 @@ fn memory(
         (1 << 20, 8 << 20),
         writer,
     )?;
+    // An existing store against `--memory-dim` and `--memory-normalization`, as `phdb mcp`
+    // checks it: another value fails the start (#1405). A replica that opens the store later
+    // checks only its pin, as before.
+    if let Some(memslot::Entry::Core(core)) = slot.cached() {
+        crate::memcore::check_reopened(m, name, &core)?;
+    }
     if created {
         let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
     }
@@ -240,7 +246,10 @@ fn candle_advice(
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
-    let mut options = Options::default().create_if_missing(args.create);
+    // The server's shard poll (D198 amendment 4): none by default.
+    let mut options = args
+        .shard_spin
+        .apply(Options::default().create_if_missing(args.create));
     // A database this command creates gets the server's default shard count. An existing
     // one keeps its own unless `--shards` says otherwise: an explicit count that differs
     // from the one a change feed recorded would reshard, ending the feed's history.

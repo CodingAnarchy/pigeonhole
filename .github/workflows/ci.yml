@@ -57,8 +57,10 @@ jobs:
     name: linux (fmt, clippy, docs, test, deny, semver)
     runs-on: ubuntu-latest
     # A warm run took 36 min on 2026-11-09, and a run that rebuilt more than usual hit 45
-    # while still compiling the tests (#1622), so no test ran. 60 leaves room for that.
-    timeout-minutes: 60
+    # while still compiling the tests (#1622), so no test ran. By 2026-11-10 a green run on
+    # main took 56 min and #1671 (embed-local in the workspace tests) was cancelled at 60
+    # during semver. 75 leaves room; moving semver to its own job is the follow-up.
+    timeout-minutes: 75
     env:
       RUSTFLAGS: -D warnings
     steps:

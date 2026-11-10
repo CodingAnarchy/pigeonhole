@@ -71,7 +71,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## Remote MCP (`phdb serve`)
-> **Status:** on `main` for 1.2.0 (#1397). The data tools are served; the memory tools follow.
+> **Status:** on `main` for 1.2.0 (#1397).
 
 [`phdb serve`](cli.md#phdb-serve) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
 
@@ -90,6 +90,7 @@ If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.car
 - **The token's scope decides the tools.** A read token gets the read tools only, and a write tool called anyway is refused (`PermissionDenied`). A write token gets `write` and `create_table` too. A replica offers the read tools whatever the token. Whether a session is offered the write tools is settled when it starts: after a replica's promote, start a new session to write.
 - **The server's rules apply to every call:** its in-flight and concurrency limits, the reserved `__phdb_` table prefix, and on a replica, read-your-writes with `x-pigeonhole-min-primary-seqno`.
 - **Sessions** last until the client ends them, or until idle for `--mcp-session-idle-ms` (30 min) or older than `--mcp-session-lifetime-ms` (24 h). After that the client gets 404 and starts a new one, as MCP clients do. A session answers up to `--mcp-session-requests` (8) requests at once; past that, the extra request gets `Overloaded` and is retried.
+- **The memory tools** come with `phdb serve --memory NAME` (and its `--memory-*`/`--embed-*` flags, as for `phdb mcp`), over the store the server's `Memory` service serves. A token limited to namespaces (`ns=a,b`) reaches only those: a call naming another is refused (`PermissionDenied`). A read token gets `memory_recall` only. The `memory://guide` resource and the memory paragraph of the instructions come with them.
 - **`nearest` appears for every session** once any session, or the application, creates the first vector family: each session's next request carries `notifications/tools/list_changed`.
 - **Results** are cut as with `phdb mcp`, at `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB). A session keeps up to `--mcp-session-cache-bytes` (8 MiB) of traversal results for its cursors.
 

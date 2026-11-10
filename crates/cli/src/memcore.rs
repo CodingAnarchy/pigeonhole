@@ -326,14 +326,58 @@ pub(crate) fn create_options(m: &crate::args::MemoryArgs, name: &str) -> Arc<Cre
                 options.episodic_ttl(std::time::Duration::from_secs(hours.saturating_mul(3600)));
         }
         if let Some(n) = &m.memory_normalization {
-            options = options.normalization(match n.as_str() {
-                "nfkc" => Normalization::Nfkc,
-                "none" => Normalization::None,
-                _ => Normalization::Nfc,
-            });
+            options = options.normalization(normalization(n));
         }
         Ok(options)
     })
+}
+
+/// An existing store against the flags that a create fixes (#1405): `--memory-dim` must be
+/// its model's dimension, and `--memory-normalization` its text index's. Another value
+/// fails the start, on `phdb mcp` and `phdb serve` alike, as a model that doesn't match
+/// does.
+pub(crate) fn check_reopened(
+    m: &crate::args::MemoryArgs,
+    name: &str,
+    core: &MemCore,
+) -> std::result::Result<(), Failure> {
+    if let (Some(model), Some(dim)) = (core.model(), m.memory_dim)
+        && model.dim() != dim
+    {
+        return Err(Failure::usage(&format!(
+            "memory store {name} is pinned to {} dimensions, not {dim}",
+            model.dim()
+        )));
+    }
+    if let Some(want) = &m.memory_normalization
+        && core.normalization() != normalization(want)
+    {
+        return Err(Failure::usage(&format!(
+            "--memory-normalization {want}: memory store {name}'s text index is {}, fixed when \
+             it was created",
+            normalization_name(core.normalization())
+        )));
+    }
+    Ok(())
+}
+
+/// `--memory-normalization`'s value (clap admits only these three).
+fn normalization(flag: &str) -> Normalization {
+    match flag {
+        "nfkc" => Normalization::Nfkc,
+        "none" => Normalization::None,
+        _ => Normalization::Nfc,
+    }
+}
+
+/// A normalisation as `--memory-normalization` names it.
+fn normalization_name(n: Normalization) -> &'static str {
+    match n {
+        Normalization::Nfc => "nfc",
+        Normalization::Nfkc => "nfkc",
+        Normalization::None => "none",
+        _ => "another normalisation",
+    }
 }
 
 /// Why [`MemCore::open_in`] failed.
