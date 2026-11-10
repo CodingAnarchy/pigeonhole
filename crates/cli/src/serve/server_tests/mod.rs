@@ -89,7 +89,7 @@ fn limits() -> Limits {
 enum Bind {
     /// `127.0.0.1`, as every other server and endpoint in these tests.
     Shared,
-    /// `[::1]`, which no other test dials, falling back to `127.0.0.1` where it's missing.
+    /// `[::1]`, which no other test dials, else `127.0.0.2`, else `127.0.0.1`.
     /// Tests in this process dial ports that were theirs and are free again: a replica
     /// reconnecting to a stopped primary, a cluster peer, an endpoint bound and dropped to
     /// be refused. A port the OS hands out again can bring such a connection to a new
@@ -99,10 +99,16 @@ enum Bind {
 
 impl Bind {
     async fn listener(self) -> tokio::net::TcpListener {
-        if let Bind::Apart = self
-            && let Ok(l) = tokio::net::TcpListener::bind("[::1]:0").await
-        {
-            return l;
+        if let Bind::Apart = self {
+            // `127.0.0.2` where IPv6 loopback is missing: Linux and Windows route all of
+            // 127/8 (macOS always has `::1`). Only past both is it the shared address
+            // (cli692's N1 on #1669).
+            for addr in ["[::1]:0", "127.0.0.2:0"] {
+                if let Ok(l) = tokio::net::TcpListener::bind(addr).await {
+                    return l;
+                }
+            }
+            eprintln!("no loopback address apart from 127.0.0.1: listening there (#1668)");
         }
         tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
     }
