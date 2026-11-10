@@ -350,7 +350,11 @@ scan-wide 1279 0.3
 # commit-async (#1517, D314 amendment 1): +6 per commit for RowMutation's boxed return_previous
 # request (8 bytes, moved and dropped) and its refusal test, 8710 -> 8716/8718 on runs
 # 41956036295 and 41959886002: the highest times 1.003.
-commit-async 8745 0.3
+# commit-async 8745 -> 8772 (#1681, D195): main measures exactly 8745, the ceiling with no
+# headroom left, and #1681's head read 8746 (run 42774566584) with the commit path untouched:
+# #1681 adds only an open-time branch and an Options field, so the +1 is layout. Main's 8745
+# (run 42797804090's base, after #1502) times 1.003.
+commit-async 8772 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
 commit-incr 12706 0.3

@@ -4588,6 +4588,33 @@ PR 3 adds an in-process two-database replication test with process and power-los
 
   The AX102 rows are above, under candle's own pool. On them, the owner kept bge-small alone (2026-11-09).
 
+<a id="d319"></a>
+## D319 — #1621's GroupSync commit tail: the WAL record write off the driver, and a cap on background write-back (perf2, design; coordinator, 2026-11-09; reviewed by perf287; wal, engine, #1621)
+
+**Problem (#1621).** At GroupSync, puts stalled 10–90 ms on every shard at once, every few seconds, under steady load (`serve_feed_load`, 0 subscribers, 57K puts/s on the AX102). Each durable commit rewrote its shard's WAL tail page with a buffered `pwrite` on the driver thread. While the previous group's `fdatasync` had that page under write-back, the `pwrite` waited, and flush and compaction bursts (+130–260 MB/s, queue depth 15–40) stretched that wait.
+
+**Decided (design c6737884974, revision 1; perf287 approved).**
+- **Part A:** a GroupSync record write is submitted through the I/O backend, chained before its sync, with one in flight per stream. Later commits coalesce behind it, and Buffered keeps the blocking `pwrite`. No format change.
+- **Part B:** flush and compaction output is written back behind its job under a 4 MiB in-flight budget (#1633, ICR 0127).
+
+**Amendment 1 (perf287, #1646): the spare slots' zero-fill.** perf287's probes found every WAL fsync over 16 ms was the spare slots' zero-fill. It wrote 4–128 MiB of zeros itself, or waited on another sync that did. The amendment wrote a spare back a chunk at a time (C), and left the open-time slot early (B, the early rollover).
+
+**Amendment 2 (perf2; coordinator, 2026-11-10): Part B and B are dropped, and the growth half is D157's open-time pre-size.**
+- **Measured:**
+  - g42: the WAL-only arm met #1621 but doubled group-commit's pinned p99.9 (0.87 → 1.9 ms).
+  - g47: every in-run zero-fill shape (256 KiB to 64 MiB chunks, buffered or O_DIRECT) traded #1621's Mutate tail against group-commit's p99.9. Only a ring with no prep during the run met both.
+  - g52:
+    - B was ycsb-a's cost (p99.9: pre with B 151 µs, pre without B 125, main 131).
+    - 64 MiB O_DIRECT kept main's tail.
+    - All of fsync's blocked time was `folio_wait_writeback`, with no inode lock and no log force.
+- **Decided:**
+  - #1646 (C and B) is closed as superseded.
+  - #1621's growth half is fixed by D157's amendment instead: `wal_preallocate`, on in `phdb serve` (ICR 0130).
+  - Part B (#1633) stays a draft until g58 and isn't part of this fix.
+  - The idea worth keeping is C's write-back per chunk (`File::submit_writeback`), in case in-run prep ever comes back.
+- **Still open:** g52 also found the rest of #1621's tail. With no prep in the window, Mutates over 10 ms persist, and at long retention put p99 grows with run time. g58 is tracing it. If flush and compaction bursts in the device queue are the cause, a background write cap (issue option 3; Part B's mechanism, tuned first: g40 measured ycsb-a and ycsb-f p99.9 +50–80%) comes back as its own PR.
+- **Part A** isn't built. Whether #1621 still needs it waits on g58 too.
+
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
 

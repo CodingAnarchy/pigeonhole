@@ -1084,7 +1084,7 @@ Replay applied every recovered record into the arenas and could not flush. A dat
 **Coordinator:** confirmed.
 
 <a id="d157"></a>
-## D157 — An open writes one frame per stream; spares wait for use (approved; wal, #143, #172; amends D35)
+## D157 — An open writes one frame per stream; spares wait for use (approved; wal, #143, #172; amends D35; amended 2026-11-10, ICR 0130)
 D35 zero-filled the first slot of every stream at open, and the engine prepared `spare_segments` more right away. At the defaults (64 MiB segments, two spares) every open wrote 192 MiB per shard, with one shard per CPU, and the clean close deleted it all. Measured on a 10-core Mac: 454 ms and 2.5 GiB written per open and close of a tiny database (51 ms and 256 MiB with one shard).
 
 **Decision:**
@@ -1101,6 +1101,8 @@ D35 zero-filled the first slot of every stream at open, and the engine prepared 
 **Interim behavior:** as described. Measured after (same machine, same tiny database): open 14 ms median at 1, 4 and 10 shards; 0.11–0.39 MiB written per open and close; about 1 MiB of disk held while open.
 
 **Coordinator:** confirmed.
+
+**Amendment (perf2; coordinator, 2026-11-10; #1621, ICR 0130): a WAL ring can be sized at the open, opt-in.** `Options::wal_preallocate(true)` (engine: `EngineOptions::wal_preallocate`) makes a writable open size each stream's ring before the shards take writes: the slot in use, ⌈`wal_pin_bytes` / slot⌉ for the checkpoint's lag, the spares and the change feed's retention. Every slot is zero-filled and synced, each stream on a thread of its own (`SpareSegments::prepare_ring`). A reopened stream's slots count, and blank ones are filled again as before their first use. The library default stays off, so what this decision gives a small database (it writes almost nothing at open, and is small at rest) still holds. `phdb serve` turns it on (`--no-wal-preallocate`). Why: on a busy store, growing the ring on demand puts zero-fill writes in the device queue ahead of the log's own write-back. perf287's g47 and g52 (#1621) found every in-run fill shape traded #1621's commit tail against group-commit's p99.9, while a ring sized at the open met both. The cost is disk and open time: about 5 × 64 MiB per shard at the defaults, written at the open. D319 amendment 2 records what this replaced.
 
 <a id="d158"></a>
 ## D158 — Shard and compaction threads are not pinned unless asked (approved; engine, #142; amends spec §Thread-per-core)

@@ -105,6 +105,8 @@ fn a_reply_holds_its_share_until_written_and_a_burst_past_the_budget_is_refused(
         match stuck.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => got += n,
+            // io_uring's task work can interrupt a timed read on this thread (#1688).
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => panic!("reading the reply: {e}"),
         }
     }
@@ -459,6 +461,8 @@ fn a_cancelled_waiting_reservation_changes_nothing_after() {
         match stuck.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => got += n,
+            // io_uring's task work can interrupt a timed read on this thread (#1688).
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => panic!("reading the reply: {e}"),
         }
     }

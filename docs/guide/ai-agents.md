@@ -73,7 +73,7 @@ If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.car
 ## Remote MCP (`phdb serve`)
 > **Status:** on `main` for 1.2.0 (#1397).
 
-[`phdb serve`](cli.md#phdb-serve) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
+[`phdb serve`](serve.md) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
 
 ```json
 {

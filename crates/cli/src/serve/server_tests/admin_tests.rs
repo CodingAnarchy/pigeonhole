@@ -489,3 +489,41 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
         }
     }
 }
+
+/// The serve guide's `/metrics` table names exactly the metric families serve renders itself
+/// (ticket 9c): a family added without a row, or a row for one that's gone, fails here. The
+/// engine's families are `pigeonhole-otel`'s, checked against the observability guide there.
+#[test]
+fn the_serve_guide_lists_every_metric_serve_renders() {
+    let guide = include_str!("../../../../../docs/guide/serve.md");
+    let names = |text: &str, prefix: &str| -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(prefix) {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            // A histogram's series carry suffixes; the family is the name without them.
+            let name = tail[..end]
+                .trim_end_matches("_bucket")
+                .trim_end_matches("_sum")
+                .trim_end_matches("_count");
+            out.insert(name.to_owned());
+            rest = &tail[end..];
+        }
+        out
+    };
+    // Serve's own families: a primary's, then a replica's (rendered only on a replica).
+    let p = Server::start("", limits());
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    for (server, prefix) in [(&p, "pigeonhole_serve_"), (&r, "pigeonhole_replica_")] {
+        let rendered = names(&server.shared.router.service.metrics_text(), prefix);
+        assert!(!rendered.is_empty(), "{prefix}");
+        assert_eq!(
+            names(guide, prefix),
+            rendered,
+            "{prefix}: the guide's table against /metrics"
+        );
+    }
+}
