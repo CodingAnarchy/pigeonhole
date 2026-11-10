@@ -4610,3 +4610,24 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **The memory left** isn't the readers'. 16 hubs × 64 MiB of read-ahead, the hubs' rings (`--feed-ring-bytes`, 256 MiB in all) and the h2 buffers come to about 1.4 GB of the 4.7 GB. A heap profile of a 16 × 16 run would name the rest.
 
 Revisit PR 2 only if a profile shows the re-reads costing more than that.
+
+## D322 — the `phdb` binaries use jemalloc; the library stays allocator-agnostic (perf287, design; owner, 2026-11-10; cli, #1558)
+
+**Problem.** On the AX102 (main c9e402f9, full scale, two runs per arm), swapping glibc 2.39's malloc moved throughput a long way on read-heavy rows:
+
+| row | glibc | jemalloc 5.3 | mimalloc 2.1 | glibc, larger tcache |
+|---|---|---|---|---|
+| ycsb-c, 32 threads | 3.36–3.38M | 4.01–4.12M (+21%) | 4.36–4.44M (+31%) | 2.89–3.09M (−10%) |
+| sparse-wide, 16 Buffered | 100–110K | 118–121K (+13%) | 98–100K (−5%) | level |
+| ycsb-a, 16 Buffered | 1.56–1.58M | 1.69–1.72M (+9%) | 1.68M (+7%) | level |
+
+jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's arena-lock waits on the read path, but they are well under 1% of thread time. Most of the cost is glibc's own fast paths and its cross-thread frees: blocks evicted, rows and batches dropped on another thread.
+
+**Decided.**
+- **The `phdb` binary** (CLI, `serve`, `mcp`) sets jemalloc (`tikv-jemallocator`) as its global allocator. It's a default feature of `pigeonhole-cli`, `jemalloc`, on every target but Windows, which keeps the system allocator. Building it needs a C compiler and `make`; `--no-default-features --features embed` leaves it out.
+- **The library crates choose no allocator.** An embedding application picks its own, and the guide's "Allocator" section (performance.md) gives the numbers and how.
+- **The gate's `phdb-bench` stays on the system allocator,** since that's what an embedding application gets by default. A jemalloc row is reported once per gate, as information.
+- **Not glibc tunables** (measured worse), and **not an allocator inside the engine** (a per-thread arena): the engine's own buffer reuse (#1558's items 1–3: presized row buffers, recycled row buffers on the reading thread, the scan's current-row buffers kept across rows) helps every application on any allocator, and comes next.
+
+**Note for the serve benches:** `serve_feed_load` and `serve_read_load` run the `phdb` binary, so from this change on their server side runs on jemalloc. Compare their results only with runs from builds on the same side of it.
+
