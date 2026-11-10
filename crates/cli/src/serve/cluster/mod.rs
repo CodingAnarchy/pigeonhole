@@ -662,6 +662,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(tonic::Response::new(status))
     }
+
+    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope only.
+    /// The node serves it through its router once that lands; until then it's refused.
+    async fn forward(
+        &self,
+        req: Request<proto::ForwardRequest>,
+    ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
+        self.caller(&req, &[Scope::Cluster], "forward a call")?;
+        Err(ApiError::unsupported("this node doesn't serve forwarded calls yet").into())
+    }
 }
 
 fn http_caller(
