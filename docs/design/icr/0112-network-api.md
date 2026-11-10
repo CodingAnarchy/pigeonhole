@@ -196,3 +196,27 @@ The design is on #1618 (issuecomment-6740591195), with cli692's review (D1–D6)
 
 ## Amendment: `Unavailable` (#1617)
 - **A new server code, `Unavailable`,** in the table above (the coordinator approved it on #1617, ai1249's R2): a service the server depends on failed or can't be reached, so nothing was applied and the request may be sent again. Today that's `Memory`'s embedding endpoint (`--embed-url`) refusing the connection, not connecting within half of `--embed-timeout-ms` (at most 3 s; a connect that hangs is an unreachable endpoint, not a slow one), or answering 5xx, 408 or 429. The endpoint's other failures map to existing codes: its timeout (`--embed-timeout-ms`) is `DeadlineExceeded`; a 400, 413 or 422 (the caller's text) is `InvalidArgument`; any other answer, or a reply that isn't an embedding of the store's dimension, is `Internal` (the server's configuration). Clients that don't know the code see it as an unknown server code with its HTTP status and `retry_from`.
+
+## Amendment: remote MCP at `/mcp` (#1397, D313 ticket 8c-3a)
+`phdb serve` serves `phdb mcp`'s data tools over MCP's Streamable HTTP transport at `/mcp`, on the same port. The tools, their arguments, their paging and cursors, and their answers are `phdb mcp`'s. The memory tools follow in 8c-3b.
+- **Requests:**
+  - `POST /mcp` carries one JSON-RPC message, or a batch (2025-03-26). The reply is `application/json`. It's `text/event-stream` when `notifications/tools/list_changed` rides along: the reply's event, then the notification's. A message with nothing to answer (a notification) gets 202.
+  - `GET /mcp` gets 405: the server opens no stream of its own.
+  - `DELETE /mcp` ends the session (204).
+  - The body's share of the in-flight budget is reserved from `Content-Length` before the body is read, as for `/v1`. `/mcp` is under the global concurrency shed, the deadlines and `--max-connections` as `/v1` is.
+- **Sessions:**
+  - An `initialize` without `Mcp-Session-Id` starts a session, and its answer carries the id. Any other request without one gets 400.
+  - A session is bound to the token that started it. Another token's request on it, an ended one or an expired one gets 404, which tells the client to start a new session.
+  - A session lives in the session table beside transactions and snapshots, counted in `--max-sessions` and `--max-sessions-per-token`, with leases of its own: `--mcp-session-idle-ms` (30 min) and `--mcp-session-lifetime-ms` (24 h). A session with a request in flight never expires.
+  - It answers up to `--mcp-session-requests` (8) requests at once. One more waits up to 1 s for a place, then gets `Overloaded` (503, retryable).
+  - It keeps at most `--mcp-session-cache-bytes` (8 MiB) for its cursors: a cut traversal's result. A larger one isn't kept, and its cursor runs the traversal again.
+  - `/metrics` counts sessions as `pigeonhole_serve_sessions{kind="mcp"}`.
+- **Protocol versions:** `/mcp` offers 2025-03-26 and later (2024-11-05 defined the older HTTP+SSE transport). A request whose `MCP-Protocol-Version` names a version other than the session's gets 400. A request without the header is answered as the session's.
+- **The service's rules apply to every tool call:**
+  - Each call passes the same `admit` as every RPC: the caller's scope, read or write (`write`, `create_table`), and a replica's write refusal. A refusal is the tool's result, with `isError` and the server's code (`PermissionDenied`, `ReadOnly`).
+  - A token with read scope, or a replica, isn't offered the write tools. That's settled when the session starts: a replica's sessions stay read-only after a promote.
+  - The tools reach tables through the service's own table cache and checks: the reserved `__phdb_` prefix is refused. A table `create_table` makes is the service's at once.
+  - `feed_poll` holds a `--max-streams` place while it waits.
+  - On a replica, `x-pigeonhole-min-primary-seqno` makes a request wait for the primary's seqno, as an RPC does.
+- **`list_changed` across sessions:** the service keeps a catalog generation, which a create or drop (or a replica's catalog change) moves. A session that saw an older one checks its tool list on its next request, and announces a change there, as after its own calls.
+- **Result limits:** `--mcp-max-result-bytes` (32 KiB) and `--mcp-max-value-bytes` (4 KiB), `phdb mcp`'s `--max-result-bytes` and `--max-value-bytes`.
