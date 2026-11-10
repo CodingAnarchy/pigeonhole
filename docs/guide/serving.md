@@ -1,6 +1,6 @@
 # Sharing a database across processes and hosts
 
-> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](cli.md#phdb-serve), a supported server speaking gRPC and HTTP/JSON (remote MCP follows), is in progress for 1.2.0, behind the `serve` feature.
+> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](cli.md#phdb-serve), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is in progress for 1.2.0, behind the `serve` feature.
 
 Pigeonhole is embedded: one process opens the file and writes it. When several containers or hosts need the same data (a job queue, workflow state, coordination between workers), **one process owns the database and serves it over the network, and the others call it.** This page shows that pattern with a runnable example, [`examples/serving`](../../examples/serving), and covers what makes it correct under failures:
 - paging that resumes anywhere;

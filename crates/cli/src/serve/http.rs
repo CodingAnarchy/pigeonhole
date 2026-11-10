@@ -90,6 +90,13 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
             tower::ServiceBuilder::new().layer(prepay()).service(txns),
         )
         .route("/v1/tables", get(tables))
+        // Remote MCP (D313 §7): under the shed and the concurrency limit, as `/v1` is.
+        .route(
+            "/mcp",
+            post(super::mcp::post)
+                .get(super::mcp::get)
+                .delete(super::mcp::delete),
+        )
         .route_service(
             "/pigeonhole.v1.Admin/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(admin),
@@ -278,7 +285,7 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
-fn auth_header(headers: &HeaderMap) -> Option<&str> {
+pub(super) fn auth_header(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -801,7 +808,7 @@ impl super::bulk::Source for NdjsonLines {
 }
 
 /// The body's length from `Content-Length`; 0 with neither it nor `Transfer-Encoding`.
-fn content_length(headers: &HeaderMap) -> Result<usize, ApiError> {
+pub(super) fn content_length(headers: &HeaderMap) -> Result<usize, ApiError> {
     match headers.get(header::CONTENT_LENGTH) {
         Some(v) => v
             .to_str()

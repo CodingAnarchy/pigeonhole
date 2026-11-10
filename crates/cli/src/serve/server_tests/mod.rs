@@ -25,11 +25,22 @@ mod connection_tests;
 mod data_tests;
 mod feed_tests;
 mod http1_tests;
+mod mcp_tests;
 mod memory_tests;
 mod replica_tests;
 mod session_tests;
 mod text_tests;
 mod vector_tests;
+
+thread_local! {
+    /// The blocking pool of the servers this thread starts (`--blocking-threads`).
+    static BLOCKING_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+}
+
+/// The servers this thread starts get a blocking pool of `n` threads.
+fn blocking_threads(n: usize) {
+    BLOCKING_THREADS.with(|b| b.set(n));
+}
 
 struct Server {
     url: String,
@@ -80,7 +91,16 @@ fn limits() -> Limits {
             snapshot_lifetime: Duration::from_secs(600),
             max_sessions: 64,
             max_per_token: 16,
+            mcp_idle: Duration::from_secs(60),
+            mcp_lifetime: Duration::from_secs(600),
         },
+        mcp: crate::mcp::Limits {
+            result_bytes: 32 << 10,
+            value_bytes: 4 << 10,
+            feed_bytes: None,
+            cache_bytes: 8 << 20,
+        },
+        mcp_session_requests: 8,
     }
 }
 
@@ -249,7 +269,8 @@ impl Server {
         f: impl FnOnce(Service) -> Service,
     ) -> Self {
         let metrics = Arc::new(Metrics::default());
-        let mut service = f(Service::new(db, limits, 2, Arc::clone(&metrics))
+        let threads = BLOCKING_THREADS.with(std::cell::Cell::get);
+        let mut service = f(Service::new(db, limits, threads, Arc::clone(&metrics))
             .backups(Some(&dir.join("backups")), 1)
             .unwrap());
         if let Some(r) = &replica {
