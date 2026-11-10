@@ -208,6 +208,12 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     if let Some(bytes) = args.change_feed {
         options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
     }
+    // SCRATCH (#1644's premise check, not for merge): PHDB_SHARD_SPIN_ZERO=1 turns the
+    // shard drivers' spin off.
+    if std::env::var_os("PHDB_SHARD_SPIN_ZERO").is_some_and(|v| v == "1") {
+        options = options.shard_spin(std::time::Duration::ZERO);
+        eprintln!("SCRATCH: shard_spin 0");
+    }
     if !args.create && !args.db_file().exists() {
         return Err(Failure::file_not_found(args.db_file()));
     }
