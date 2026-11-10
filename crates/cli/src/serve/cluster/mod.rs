@@ -1069,12 +1069,14 @@ pub(crate) fn run(
 }
 
 /// The options a cluster node opens its partition with: the server's shard poll (none by
-/// default, D198 amendment 4) and `--shm-dir`, as a single node's (cli692's M1 on #1686).
+/// default, D198 amendment 4), its default shard count (ICR 0132) and `--shm-dir`, as a
+/// single node's (cli692's M1 on #1686).
 pub(crate) fn partition_options(
     shard_spin: config::ShardSpin,
     shm_dir: Option<&Path>,
 ) -> pigeonhole::Options {
-    let options = shard_spin.apply(pigeonhole::Options::default());
+    let options = shard_spin
+        .apply(pigeonhole::Options::default().default_shards(super::placement::default_shards()));
     match shm_dir {
         Some(dir) => options.shm_dir(dir),
         None => options,

@@ -936,7 +936,7 @@ impl Engine {
         mode: Mode,
         held: &mut Option<Locks>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
-        if options.shards > 1 << 16 {
+        if options.shards.max(options.default_shards) > 1 << 16 {
             return Err(Error::InvalidArgument("at most 65536 shards".to_owned()));
         }
         if options.memtable_budget < 2 * ShardArena::DEFAULT_CHUNK as u64 / 4 {
@@ -1036,6 +1036,8 @@ impl Engine {
             };
         let shards = match (options.shards, &last_session) {
             (0, Some(last)) if last.streams > 0 => last.streams as usize,
+            // The application's default, else one per physical core (ICR 0132).
+            (0, _) if options.default_shards > 0 => options.default_shards,
             (0, _) => pigeonhole_io::sys::default_shards(),
             (n, _) => n,
         };

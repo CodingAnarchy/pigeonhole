@@ -41,6 +41,7 @@ pub fn days(n: u64) -> Duration {
 pub struct Options {
     durability: Durability,
     shards: usize,
+    default_shards: usize,
     compaction_cores: Option<usize>,
     pin_threads: bool,
     wal_preallocate: bool,
@@ -275,6 +276,7 @@ impl Default for Options {
         Self {
             durability: Durability::GroupSync,
             shards: 0,
+            default_shards: 0,
             compaction_cores: None,
             pin_threads: true,
             wal_preallocate: false,
@@ -332,9 +334,30 @@ impl Options {
     /// `1` is a valid configuration. **Unset, an existing database with a change feed keeps
     /// the shard count its last open recorded**, since another count ends the feed's history
     /// (D310's amendment). Set it to reshard on purpose; a feed then expires with "the shard
-    /// count changed".
+    /// count changed". Unset without a feed's count, an open takes
+    /// [`default_shards`](Options::default_shards) when that's set.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
+        self
+    }
+
+    /// The shard count to use when [`shards`](Options::shards) is unset and the database
+    /// has no count of its own: a new file, or an existing one without a change feed (ICR
+    /// 0132). `0` (the default) means one per physical core (D220).
+    ///
+    /// The shard count isn't stored in the file, so without this an application whose own
+    /// default differs from the library's gets the library's on every reopen. A change feed's
+    /// recorded count still wins, as it does for an unset `shards`, so this never reshards a
+    /// feed and ends its history. `phdb serve` sets it to half the physical cores.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A server's default: half the cores, on every open, unless the caller asked.
+    /// let options = Options::default().default_shards(4);
+    /// ```
+    pub fn default_shards(mut self, n: usize) -> Self {
+        self.default_shards = n;
         self
     }
 
@@ -1805,6 +1828,7 @@ impl Options {
         o.direct_io = direct_io;
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
+        o.default_shards = self.default_shards;
         // D289's budget, from the physical cores within the affinity mask and CPU quota.
         let budget = thread_budget(
             pigeonhole_io::sys::default_shards(),

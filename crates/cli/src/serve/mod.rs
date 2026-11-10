@@ -254,13 +254,13 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
             .create_if_missing(args.create)
             .wal_preallocate(!args.no_wal_preallocate),
     );
-    // A database this command creates gets the server's default shard count. An existing
-    // one keeps its own unless `--shards` says otherwise: an explicit count that differs
-    // from the one a change feed recorded would reshard, ending the feed's history.
-    match args.shards {
-        Some(n) => options = options.shards(n),
-        None if !args.db_file().exists() => options = options.shards(placement::default_shards()),
-        None => {}
+    // The server's default shard count on every open, a restart's too: the count isn't
+    // stored in the file, so without it a reopen took the library's one per core (perf287's
+    // g70d on #1697). As a default, not a setting: a change feed's recorded count still
+    // wins, since another count would end the feed's history (ICR 0132). `--shards` sets it.
+    options = options.default_shards(placement::default_shards());
+    if let Some(n) = args.shards {
+        options = options.shards(n);
     }
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);

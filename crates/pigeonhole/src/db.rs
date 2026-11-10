@@ -2209,10 +2209,11 @@ struct ShmFootprint {
 
 impl ShmFootprint {
     fn of(o: &pigeonhole_engine::EngineOptions) -> Self {
-        // As the engine resolves it: 0 shards means one per physical core (D220).
-        let shards = match o.shards {
-            0 => pigeonhole_io::sys::default_shards(),
-            n => n,
+        // As the engine resolves it: unset shards take the default (ICR 0132), else one per
+        // physical core (D220). A change feed's recorded count is not known here.
+        let shards = match (o.shards, o.default_shards) {
+            (0, 0) => pigeonhole_io::sys::default_shards(),
+            (0, n) | (n, _) => n,
         };
         let count = u32::try_from(shards).unwrap_or(u32::MAX);
         let config = pigeonhole_shm::ShmConfig::new(count);
