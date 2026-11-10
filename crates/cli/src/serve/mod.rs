@@ -200,10 +200,13 @@ fn memory(
 }
 
 fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
-    // The server's shard poll (D198 amendment 4): none by default.
-    let mut options = args
-        .shard_spin
-        .apply(Options::default().create_if_missing(args.create));
+    // The server's shard poll (D198 amendment 4): none by default. The logs are sized at
+    // start-up, not while commits wait on them (#1621, ICR 0130).
+    let mut options = args.shard_spin.apply(
+        Options::default()
+            .create_if_missing(args.create)
+            .wal_preallocate(!args.no_wal_preallocate),
+    );
     // A database this command creates gets the server's default shard count. An existing
     // one keeps its own unless `--shards` says otherwise: an explicit count that differs
     // from the one a change feed recorded would reshard, ending the feed's history.

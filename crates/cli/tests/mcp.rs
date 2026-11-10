@@ -127,6 +127,8 @@ impl Server {
             .arg("serve")
             .arg(path)
             .args(["--listen", "127.0.0.1:0"])
+            // Each test's server needn't size its logs at start-up (ICR 0130).
+            .arg("--no-wal-preallocate")
             .args(&flags)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
