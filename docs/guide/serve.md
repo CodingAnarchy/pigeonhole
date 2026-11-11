@@ -450,7 +450,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 
-**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
+**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. Those come with later steps; until then an upload is staged in `DIR/.phdb-incoming` and nothing installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
 
 **Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label.
 

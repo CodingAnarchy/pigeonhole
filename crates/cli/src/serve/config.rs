@@ -183,6 +183,10 @@ pub(crate) struct ServeArgs {
     /// more are refused (`Overloaded`).
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub max_backups: usize,
+    /// A cluster node's partition uploads at once (`Admin.PartitionUpload`, a restore's or a
+    /// relocation's files, D317); more are refused (`Overloaded`).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub max_uploads: usize,
     /// Turn the change feed on, keeping up to this many bytes of history: `Feed.Subscribe`
     /// and replicas (`Replication.Follow`) read it. Without it, a database whose feed is on
     /// keeps it (the open inherits it). A replica that falls further behind than this

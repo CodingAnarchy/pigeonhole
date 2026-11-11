@@ -589,6 +589,39 @@ impl proto::admin_server::Admin for AdminGrpc {
     ) -> Result<Response<proto::PromoteResponse>, Status> {
         unary!(&self.0, req, Promote, Promote)
     }
+
+    async fn partition_upload(
+        &self,
+        req: Request<tonic::Streaming<proto::PartitionUploadChunk>>,
+    ) -> Result<Response<proto::PartitionUploadReply>, Status> {
+        let header = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let caller = self.0.caller(header)?;
+        let reply = self
+            .0
+            .router
+            .partition_upload(&caller, req.into_inner())
+            .await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn partition_upload_status(
+        &self,
+        req: Request<proto::PartitionUploadStatusRequest>,
+    ) -> Result<Response<proto::PartitionUploadStatusReply>, Status> {
+        let header = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let caller = self.0.caller(header)?;
+        let reply = self
+            .0
+            .router
+            .partition_upload_status(&caller, &req.get_ref().upload_id)?;
+        Ok(Response::new(reply))
+    }
 }
 
 /// `Replication` over gRPC (#1436): a replica server follows its primary here.
