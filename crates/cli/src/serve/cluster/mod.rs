@@ -1169,7 +1169,8 @@ pub(crate) fn run(
             args.feed_threads,
             args.feed_hub_threads,
             args.affinity == super::config::Affinity::On,
-        ),
+        )
+        .feed_cpus(args.feed_cpus),
         None => super::placement::Placement::routes_only(args.io_threads, args.blocking_threads),
     });
     let limits = args.limits();

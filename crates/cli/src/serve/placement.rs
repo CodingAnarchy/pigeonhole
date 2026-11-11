@@ -9,6 +9,8 @@
 //!   waited on the free CPUs' run queues behind the feed side while the siblings sat idle:
 //!   puts were held to 33K/s at 16 hubs × 16 subscribers with 1.35 cores of network threads
 //!   waiting (#1734, perf287's g80b), and the coordinator chose the siblings over unmasking.
+//!   The hidden `--feed-cpus free` keeps the feed and hub runtimes on the free cores only,
+//!   for the box A/B that picks the default (g81's subscriber lag at 16x16 @ 20K).
 //! - **The server's own heavy threads** (bulk loads, index builds and rebalancers,
 //!   `Replication.Follow`, embedding) and the request runtime's blocking pool (scans,
 //!   `read_row`, `/mcp` and the other sync client calls) stay on the free cores only:
@@ -21,6 +23,8 @@
 //!   must open off the workers.
 
 use pigeonhole::Pigeonhole;
+
+pub(crate) use super::config::FeedCpus;
 
 /// Each runtime's CPUs, sorted; `None` runs it where the OS puts it (`--affinity off`,
 /// nothing pinned, or too few free cores). One function computes them
@@ -69,6 +73,10 @@ pub(crate) struct Placement {
     process: Vec<usize>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     affinity: bool,
+    /// `--feed-cpus`: the feed and hub runtimes on the siblings too, or on the free cores
+    /// only; a recompute keeps it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    feed_cpus: FeedCpus,
     /// For the startup line: the free cores, outside the shards' cores.
     pub free_cpus: usize,
     /// For the startup line: how many of the shards' SMT siblings the request, feed and hub
@@ -136,6 +144,7 @@ impl Placement {
             masks: RuntimeMasks::default(),
             process: process.unwrap_or_default(),
             affinity,
+            feed_cpus: FeedCpus::Siblings,
             free_cpus: free,
             sibling_cpus,
             mode,
@@ -153,10 +162,29 @@ impl Placement {
     pub(crate) fn masks(&self, pinned: &[usize]) -> RuntimeMasks {
         #[cfg(target_os = "linux")]
         if !self.process.is_empty() {
-            return layout(&self.process, pinned, siblings, self.affinity).masks;
+            return feed_masks(
+                self.feed_cpus,
+                layout(&self.process, pinned, siblings, self.affinity).masks,
+            );
         }
         let _ = pinned;
         RuntimeMasks::default()
+    }
+
+    /// `--feed-cpus`, on a plan as [`Placement::plan`] made it: `free` moves the feed and
+    /// hub runtimes to the free cores only, off the siblings the request runtime's workers
+    /// keep; [`Placement::masks`] keeps the choice for a recompute.
+    #[must_use]
+    pub(crate) fn feed_cpus(mut self, feed_cpus: FeedCpus) -> Self {
+        self.feed_cpus = feed_cpus;
+        self.masks = feed_masks(feed_cpus, std::mem::take(&mut self.masks));
+        self
+    }
+
+    /// Whether the feed and hub runtimes run on the shards' siblings, with the request
+    /// runtime's workers: for the startup line.
+    pub(crate) fn feed_on_siblings(&self) -> bool {
+        self.masks.feed == self.masks.network
     }
 
     /// A cluster node that serves no partition (D317 ticket 2, cli692's (b)): no shards to
@@ -172,6 +200,7 @@ impl Placement {
             masks: RuntimeMasks::default(),
             process: Vec::new(),
             affinity: false,
+            feed_cpus: FeedCpus::Siblings,
             free_cpus: free,
             sibling_cpus: 0,
             mode: "unpinned (routes only)",
@@ -370,6 +399,16 @@ fn layout(
         out.note = None;
     }
     out
+}
+
+/// `masks` with `--feed-cpus` applied: as computed for `siblings`, or with the feed and hub
+/// runtimes on the free cores (`blocking`'s CPUs) for `free`.
+fn feed_masks(feed_cpus: FeedCpus, mut masks: RuntimeMasks) -> RuntimeMasks {
+    if feed_cpus == FeedCpus::Free {
+        masks.feed.clone_from(&masks.blocking);
+        masks.hub.clone_from(&masks.blocking);
+    }
+    masks
 }
 
 /// The CPUs the masks leave: the free cores are the process's minus the shards' cores, each
@@ -587,6 +626,19 @@ mod tests {
             }
         );
         assert_eq!(format_cpu_list(&wide), "4-9,16-25");
+        // `--feed-cpus free`: the feed and hub runtimes on the free cores, the request
+        // runtime's workers still on the siblings too.
+        let narrow = super::feed_masks(super::FeedCpus::Free, l.masks.clone());
+        off_the_shards(&narrow, &[0, 1, 2, 3]);
+        assert_eq!(
+            narrow,
+            RuntimeMasks {
+                network: Some(wide.clone()),
+                blocking: Some(cores.clone()),
+                feed: Some(cores.clone()),
+                hub: Some(cores.clone()),
+            }
+        );
         assert_eq!(
             (l.free, l.siblings, l.mode),
             (12, 4, "off the shards' cores")
@@ -607,6 +659,10 @@ mod tests {
         // `--affinity off`: the same counts, no masks.
         let off = layout(&process, &[0, 1, 2, 3], sysfs, false);
         assert_eq!(off.masks, RuntimeMasks::default());
+        assert_eq!(
+            super::feed_masks(super::FeedCpus::Free, off.masks.clone()),
+            RuntimeMasks::default()
+        );
         assert_eq!(
             (off.free, off.siblings, off.mode),
             (12, 0, "unmasked (--affinity off)")
@@ -693,6 +749,24 @@ mod tests {
         // reapply calls it as a partition opens or closes).
         assert_eq!(plan.masks(&db.pinned_shard_cpus()), plan.masks, "{plan:?}");
         assert_eq!(off.masks(&db.pinned_shard_cpus()), off.masks, "{off:?}");
+        // `--feed-cpus free`: the feed and hub runtimes take the free cores' mask, the
+        // request runtime keeps its own, and a recompute keeps the choice.
+        assert!(plan.feed_on_siblings(), "{plan:?}");
+        let narrow = plan.clone().feed_cpus(super::FeedCpus::Free);
+        assert_eq!(
+            (&narrow.masks.network, &narrow.masks.feed, &narrow.masks.hub),
+            (
+                &plan.masks.network,
+                &plan.masks.blocking,
+                &plan.masks.blocking
+            ),
+            "{narrow:?}"
+        );
+        assert_eq!(
+            narrow.masks(&db.pinned_shard_cpus()),
+            narrow.masks,
+            "{narrow:?}"
+        );
         // On Linux, the masks a thread really gets: a request runtime thread starts on the
         // free cores (its blocking pool stays there, ai1249's S1), a worker widens to
         // `network` as it first unparks, and `apply(None)` gives back the process's CPUs.
@@ -719,6 +793,16 @@ mod tests {
             assert_eq!(network, blocking, "{plan:?}");
             assert_eq!(Some(after.0), plan.masks.network, "{plan:?}");
             assert_eq!(after.1, process, "{plan:?}");
+            let n = narrow.clone();
+            let feed = std::thread::spawn(move || {
+                n.enter_feed();
+                let feed = now();
+                n.enter_hub();
+                (feed, now())
+            })
+            .join()
+            .unwrap();
+            assert_eq!(feed, (blocking.clone(), blocking), "{narrow:?}");
         }
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         for enter in [
