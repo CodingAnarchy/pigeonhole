@@ -35,7 +35,12 @@ on:
       - 'scripts/instruction-ceilings.py'
       - 'crates/bench/baselines/instruction-ceilings.txt'
       - '.github/workflows/instructions.yml'
+      - 'scripts/install-valgrind.sh'
   workflow_dispatch:
+  # Daily on main, only the valgrind-debs job: it saves this image's valgrind .debs once per
+  # image version, in main's cache scope, which every PR can read.
+  schedule:
+    - cron: '23 5 * * *'
 
 permissions:
   contents: read
@@ -74,8 +79,50 @@ env:
   THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8
 
 jobs:
+  # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
+  # every hosted runner on 2026-11-11, #1736). Keyed on the runner image, whose package lists
+  # and libc6 fix the versions apt picks (libc6-dbg must match libc6 exactly). On a miss for
+  # this image it installs through apt and saves the .debs: once per image version on main
+  # (the daily schedule), and in a PR's own scope only when main has no entry for the image
+  # yet. A cache entry is never overwritten; `v1` is the salt to force a refresh, ahead of the
+  # image so a bump also stops the older-image fallback from matching the old entries.
+  valgrind-debs:
+    name: valgrind .debs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: scripts/install-valgrind.sh
+          sparse-checkout-cone-mode: false
+      - id: key
+        run: echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - id: have
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      # Not fatal here: with the archive down, the measuring jobs may still install from an
+      # older image's entry, and they fail on their own if they can't install at all.
+      - name: install valgrind through apt, keeping the .debs
+        id: apt
+        if: steps.have.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: scripts/install-valgrind.sh apt /tmp/valgrind-debs
+      - if: steps.apt.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.key.outputs.key }}
+
   instructions:
     name: ${{ matrix.name }}
+    # After the .debs job, but also when it failed (the archive down with no entry yet): the
+    # install step then tries apt itself, bounded, and fails the job if that fails too.
+    needs: valgrind-debs
+    if: ${{ !cancelled() && github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Two jobs in parallel (#1575): the read and write shapes, and the text-search shapes,
@@ -122,34 +169,27 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Bounded: a runner whose DNS or mirror stalls (#1735's two jobs, "Temporary failure
-      # resolving") gets three tries, then fails the job rather than hold it. Valgrind is
-      # required here, so a failure stays fatal. `--error-on=any` makes an index that can't be
-      # fetched fail `update` (it exits 0 otherwise, and `install` runs on the image's stale
-      # lists into the timeout; cli692 on #1736); the loop retries, so apt's own retries are 0.
-      # Name resolution isn't bounded by apt's timeouts (about 20 s a lookup), so a failing try
-      # costs a minute or two. When the image's first mirror, azure.archive.ubuntu.com, doesn't
-      # resolve, apt is pointed at archive.ubuntu.com first. That helps only while the
-      # runner's resolver still answers for archive.ubuntu.com: on 2026-11-11 it sometimes
-      # didn't (#1736's first run), and then only a rerun on another runner gets through.
+      # The .debs the valgrind-debs job saved for this image (or, on a new image, the newest
+      # entry for an older one), installed through dpkg with no network; apt when there are
+      # none or they don't install (scripts/install-valgrind.sh). A notice names the source.
+      # The key is computed here, not taken from that job: this runner's image can differ.
+      - id: debs-key
+        run: |
+          echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+          echo "prefix=callgrind-debs-v1-${ImageOS}-" >> "$GITHUB_OUTPUT"
+      - id: debs
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.debs-key.outputs.key }}
+          restore-keys: ${{ steps.debs-key.outputs.prefix }}
       - name: install valgrind
         timeout-minutes: 8
-        run: |
-          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=0)
-          if ! getent hosts azure.archive.ubuntu.com > /dev/null; then
-            echo "::warning::azure.archive.ubuntu.com doesn't resolve: apt falls back to archive.ubuntu.com"
-            [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
-            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-              [ -f "$f" ] && sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
-            done
-          fi
-          for try in 1 2 3; do
-            sudo apt-get "${apt_opts[@]}" update -q --error-on=any \
-              && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
-            echo "::warning::apt install of valgrind failed (try $try of 3)"
-            [ "$try" -lt 3 ] && sleep 20
-          done
-          exit 1
+        env:
+          DEBS_KEY: ${{ steps.debs-key.outputs.key }}
+          DEBS_MATCHED: ${{ steps.debs.outputs.cache-matched-key }}
+        run: scripts/install-valgrind.sh cached /tmp/valgrind-debs
       - name: build the examples (head and base)
         shell: bash
         run: |
