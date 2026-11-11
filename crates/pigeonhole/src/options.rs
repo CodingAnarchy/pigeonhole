@@ -41,6 +41,7 @@ pub fn days(n: u64) -> Duration {
 pub struct Options {
     durability: Durability,
     shards: usize,
+    default_shards: usize,
     compaction_cores: Option<usize>,
     pin_threads: bool,
     wal_preallocate: bool,
@@ -275,6 +276,7 @@ impl Default for Options {
         Self {
             durability: Durability::GroupSync,
             shards: 0,
+            default_shards: 0,
             compaction_cores: None,
             pin_threads: true,
             wal_preallocate: false,
@@ -332,9 +334,33 @@ impl Options {
     /// `1` is a valid configuration. **Unset, an existing database with a change feed keeps
     /// the shard count its last open recorded**, since another count ends the feed's history
     /// (D310's amendment). Set it to reshard on purpose; a feed then expires with "the shard
-    /// count changed".
+    /// count changed". Unset without a feed's count, an open takes
+    /// [`default_shards`](Options::default_shards) when that's set.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
+        self
+    }
+
+    /// The shard count to use when [`shards`](Options::shards) is unset and the database
+    /// has no count of its own: a new file, or an existing one without a change feed (ICR
+    /// 0132). `0` (the default) means one per physical core (D220).
+    ///
+    /// The shard count isn't stored in the file, so without this an application whose own
+    /// default differs from the library's gets the library's on every reopen. A change feed's
+    /// recorded count still wins, as it does for an unset `shards`, so this never reshards a
+    /// feed and ends its history. An existing database without a feed, opened with neither
+    /// count, takes this one, whatever count it last ran with: the data doesn't depend on it.
+    /// Flush and compaction threads are sized against it as against an explicit count.
+    /// `phdb serve` sets it to half the physical cores.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A server's default: half the cores, on every open, unless the caller asked.
+    /// let options = Options::default().default_shards(4);
+    /// ```
+    pub fn default_shards(mut self, n: usize) -> Self {
+        self.default_shards = n;
         self
     }
 
@@ -1805,6 +1831,7 @@ impl Options {
         o.direct_io = direct_io;
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
+        o.default_shards = self.default_shards;
         // D289's budget, from the physical cores within the affinity mask and CPU quota.
         let budget = thread_budget(
             pigeonhole_io::sys::default_shards(),
@@ -1817,7 +1844,23 @@ impl Options {
             Some(k) => k,
             // Application-owned mode starts no threads (D40).
             None if application_owned => 0,
-            None => budget.compaction,
+            // Clamped to the shards the open will most likely have: an unset count's default
+            // (ICR 0132) counts as given, so `default_shards(2)` gets `shards(2)`'s compaction
+            // threads (perf2's 1 on #1699). The drivers' ceiling stays the budget's: a feed's
+            // recorded count can exceed the default, and its shards keep a thread each.
+            None => match (self.shards, self.default_shards) {
+                (0, n) if n > 0 => {
+                    thread_budget(
+                        pigeonhole_io::sys::default_shards(),
+                        self.cpu_profile,
+                        Some(n),
+                        self.shard_threads,
+                        None,
+                    )
+                    .compaction
+                }
+                _ => budget.compaction,
+            },
         };
         o.pin_threads = self.pin_threads;
         o.wal_preallocate = self.wal_preallocate;
@@ -2067,6 +2110,12 @@ mod tests {
         // The engine-owned default starts a thread per shard: the controller's ceiling.
         let e = o().shards(20).to_engine_for(false).unwrap();
         assert_eq!(e.shard_threads, 20);
+        // A default shard count sizes compaction as the same explicit count does (ICR 0132,
+        // perf2's 1 on #1699): at most one compaction thread per shard.
+        let compaction = |o: Options| o.to_engine_for(false).unwrap().compaction_threads;
+        assert_eq!(compaction(o().default_shards(1)), compaction(o().shards(1)));
+        assert_eq!(compaction(o().default_shards(1)), 1);
+        assert_eq!(compaction(o().default_shards(2)), compaction(o().shards(2)));
     }
 
     /// The shard's spin window by profile (D198, amended 2026-10-30; #1176): `Embedded`

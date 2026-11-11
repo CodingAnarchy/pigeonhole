@@ -2168,6 +2168,34 @@ fn the_default_shard_count_is_one_per_physical_core() {
     closing.join().unwrap().unwrap();
 }
 
+/// ICR 0132: `default_shards` is the count of an open that sets none, on a new file and on
+/// every reopen (the count isn't stored without a change feed); an explicit count wins.
+#[test]
+fn a_default_shard_count_applies_to_every_open_that_sets_none() {
+    let vfs = SimVfs::new(5);
+    // `sim_options` sets 2 shards: unset again (0), as an open that names none.
+    let o = || sim_options(&vfs).shards(0).pin_threads(false);
+    let shards = |options: Options| {
+        let db = Pigeonhole::open("/db/defaults.phdb", options).unwrap();
+        let n = db.info().unwrap().shards;
+        db.close().unwrap();
+        n
+    };
+    // Three: unlikely to be the library's own default on the machine running this.
+    assert_eq!(shards(o().default_shards(3)), 3, "created");
+    assert_eq!(shards(o().default_shards(3)), 3, "reopened");
+    assert_eq!(
+        shards(o().default_shards(3).shards(2)),
+        2,
+        "an explicit count wins"
+    );
+    assert_eq!(
+        shards(o()),
+        pigeonhole_io::sys::default_shards(),
+        "the library's"
+    );
+}
+
 #[test]
 fn engine_owned_mode_sizes_its_threads_from_the_cpu_budget() {
     // D289 (ICR 0081): with nothing set, a thread per shard and the compaction threads from

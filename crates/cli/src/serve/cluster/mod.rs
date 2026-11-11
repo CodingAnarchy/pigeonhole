@@ -1120,14 +1120,16 @@ pub(crate) fn run(
 }
 
 /// The options a cluster node opens its partition with: the server's shard poll (none by
-/// default, D198 amendment 4), `--shm-dir` and `--change-feed`, as a single node's (cli692's
-/// M1 on #1686). A partition whose feed is on keeps it without the flag (D317 ticket 7).
+/// default, D198 amendment 4), its default shard count (ICR 0132), `--shm-dir` and
+/// `--change-feed`, as a single node's (cli692's M1 on #1686). A partition whose feed is on
+/// keeps it without the flag (D317 ticket 7), and its feed's recorded shard count.
 pub(crate) fn partition_options(
     shard_spin: config::ShardSpin,
     shm_dir: Option<&Path>,
     change_feed: Option<u64>,
 ) -> pigeonhole::Options {
-    let mut options = shard_spin.apply(pigeonhole::Options::default());
+    let mut options = shard_spin
+        .apply(pigeonhole::Options::default().default_shards(super::placement::default_shards()));
     if let Some(dir) = shm_dir {
         options = options.shm_dir(dir);
     }

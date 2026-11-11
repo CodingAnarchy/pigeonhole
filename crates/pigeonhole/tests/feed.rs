@@ -345,6 +345,37 @@ fn an_open_that_does_not_mention_the_feed_inherits_it_and_keeps_the_token() {
     db.close().unwrap();
 }
 
+/// ICR 0132: an application's default shard count (`phdb serve`'s half the cores) never
+/// overrides the count a change feed recorded, so a restart doesn't end the feed's history.
+#[test]
+fn a_default_shard_count_keeps_the_feeds_recorded_count_and_token() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    // Three shards: unlikely to be any machine's default, and not the default given below.
+    let db = Pigeonhole::open(&path, fed().shards(3)).unwrap();
+    let (a, _) = tables(&db);
+    let mut feed = a.feed().open().unwrap();
+    a.mutate(b"r1").put("f", b"q", b"1").commit().unwrap();
+    next(&mut feed);
+    let token = feed.token();
+    drop((feed, a));
+    db.close().unwrap();
+
+    // No shard count (`fed` sets 2: unset again), only a default.
+    let db = Pigeonhole::open(&path, fed().shards(0).default_shards(5)).unwrap();
+    assert_eq!(
+        db.info().unwrap().shards,
+        3,
+        "the feed's count, not the default"
+    );
+    let a = db.table("a").unwrap().open().unwrap();
+    let mut feed = a.feed().resume(&token).open().unwrap();
+    let after = a.mutate(b"r2").put("f", b"q", b"2").commit().unwrap();
+    assert_eq!(next(&mut feed).seqno(), after.seqno);
+    drop((feed, a));
+    db.close().unwrap();
+}
+
 /// Resharding on purpose (an explicit, different shard count) still ends the history, with
 /// the reason given.
 #[test]

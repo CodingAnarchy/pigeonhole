@@ -28,6 +28,10 @@ pub struct EngineOptions {
     pub create_if_missing: bool,
     /// Shard count; 0 means one per physical core (D220).
     pub shards: usize,
+    /// The shard count an open with `shards` 0 takes when no change feed recorded one (ICR
+    /// 0132); 0 (the default) means one per physical core (D220). A recorded count wins, so
+    /// an application's own default never reshards a feed and ends its history.
+    pub default_shards: usize,
     /// Pin each shard thread (and each compaction thread) to a CPU of its own (default on,
     /// D235). Engine-owned mode only; application-owned shards run on the caller's threads.
     ///
@@ -274,6 +278,7 @@ impl EngineOptions {
             vfs,
             create_if_missing: false,
             shards: 0,
+            default_shards: 0,
             pin_threads: true,
             compaction_threads: 0,
             shard_threads: 0,
