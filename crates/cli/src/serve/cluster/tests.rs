@@ -1700,6 +1700,18 @@ fn three_nodes(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    three_nodes_within(rt, 256 << 20)
+}
+
+/// [`three_nodes`] with `inflight` bytes of in-flight budget on each node.
+fn three_nodes_within(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -1721,7 +1733,7 @@ fn three_nodes(
         // one on the partition's.
         let limits = crate::serve::config::Limits {
             max_scans: 64,
-            inflight_bytes: 256 << 20,
+            inflight_bytes: inflight,
             // Longer than the stalled-stream test's bound, so a stall can't clear itself by
             // idling out.
             stream_idle: Duration::from_secs(30),
@@ -1831,15 +1843,42 @@ fn fanned_out_reads_at_seeds_that_failed() {
     fan_out_model(1794362533986056000);
 }
 
+#[test]
+fn fanned_out_reads_with_no_spare_budget_answer_as_one_database_does() {
+    // #1715: with no spare budget a multi-get reads no partition ahead, and its pages must
+    // still be a single node's, exactly. Each node's budget is below twice the smallest
+    // page budget drawn, so a read ahead (a page's share beside the request's own holding
+    // of one) can never be taken: every multi-get here reads its partitions one by one.
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!(
+        "cluster fan-out seed, no spare budget: {seed} (PHDB_CLUSTER_SEED={seed} replays it)"
+    );
+    fan_out_model_within(seed, 2199, &[1100, 1500, 2000]);
+}
+
 /// D317 §12's model test, fan-out half (ticket 4a), against one database holding every
 /// row: scans over every kind of range, with row limits and byte budgets, resumed from
 /// every page's `next` through another entry node; multi-gets of random key sets, page by
 /// page, which must match the single database's pages exactly (the budget's merge across
 /// partitions, simp724's S1 and M1).
 fn fan_out_model(seed: u64) {
+    fan_out_model_within(seed, 256 << 20, &[300, 450, 700, 1500, 0]);
+}
+
+/// [`fan_out_model`] with `inflight` bytes of in-flight budget on each node, and its reads'
+/// `page_bytes` drawn from `budgets` (0: the default page).
+fn fan_out_model_within(seed: u64, inflight: usize, budgets: &[u64]) {
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_stops, ports, dbs) = three_nodes(&rt);
+    let (_stops, ports, dbs) = three_nodes_within(&rt, inflight);
     let oracle_dir = test_dir();
     let oracle = pigeonhole::Pigeonhole::open(
         oracle_dir.join("oracle.phdb"),
@@ -1887,7 +1926,7 @@ fn fan_out_model(seed: u64) {
         }
     });
     let pick = |rng: &mut Rng| keys[rng.below(keys.len() as u64) as usize].clone();
-    let budgets = [300u64, 450, 700, 1500, 0];
+
     rt.block_on(async {
         // Scans.
         for trial in 0..60 {
@@ -2019,7 +2058,7 @@ fn fan_out_model(seed: u64) {
             .filter(|k| k.as_slice() < b"g".as_slice())
             .count() as u64;
         for &port in &ports {
-            for page_bytes in [300, 0] {
+            for page_bytes in [budgets[0], budgets[budgets.len() - 1]] {
                 let pages = scan_pages(
                     port,
                     super::proto::ScanRequest {
@@ -2496,15 +2535,6 @@ fn graph_row(row: &[u8], v: [f32; 4], edges: &[(Vec<u8>, bool)]) -> super::proto
 
 #[test]
 fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
-    // D317 §12's model test, ticket 4b, against one database holding every row: nearest
-    // searches over every source kind (vectors repeat, so distances tie and the order's
-    // row and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross
-    // the partitions, with every limit, the byte budget, parents and an edge selection,
-    // stats included.
-    use super::proto::{
-        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
-        key_range::Range, nearest_request::Source, value_filter,
-    };
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2515,6 +2545,27 @@ fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
                 .as_nanos() as u64
         });
     eprintln!("cluster 4b seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    nearest_traverse_model(seed);
+}
+
+/// Seeds that failed once, run every time.
+#[test]
+fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
+    // #1715: hop pages read at the traversal's own `page_bytes` cut a frontier row across
+    // two pages, and the second page's `column_limit` started over, past `per_node_limit`.
+    nearest_traverse_model(1794386011110329000);
+}
+
+/// D317 §12's model test, ticket 4b, against one database holding every row: nearest
+/// searches over every source kind (vectors repeat, so distances tie and the order's row
+/// and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross the
+/// partitions, with every limit, the byte budget, parents and an edge selection, stats
+/// included.
+fn nearest_traverse_model(seed: u64) {
+    use super::proto::{
+        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
+        key_range::Range, nearest_request::Source, value_filter,
+    };
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, dbs) = three_nodes(&rt);
@@ -3414,6 +3465,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
 }
 
 mod backup;
+mod charge;
 mod feed;
 mod metrics;
 mod upload;

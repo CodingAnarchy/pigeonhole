@@ -482,3 +482,47 @@ fn a_cancelled_waiting_reservation_changes_nothing_after() {
         "a read after a cancelled reservation went the strict way"
     );
 }
+
+#[test]
+fn a_fan_out_holding_waits_for_room_then_answers_overloaded_and_takes_spare_only_now() {
+    // #1715 (cli692's S1): a fanned-out read's holding waits for its share as a reply's
+    // does, and past its deadline answers `Overloaded`, the code `reserve_reply` gives; a
+    // read ahead's (`fanout_try_hold`) takes spare budget now or nothing. A holding becomes
+    // its reply's charge, fitted to the reply's size.
+    let s = budgeted(
+        100_000,
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+        0,
+    );
+    let service = &s.shared.router.service;
+    let all = s.block_on(service.reserve(100_000)).unwrap();
+    let e = s
+        .block_on(service.fanout_hold(10_000, Duration::from_millis(100)))
+        .unwrap_err();
+    assert_eq!(e.code, "Overloaded", "{}", e.message);
+    assert!(service.fanout_try_hold(10_000).is_none());
+    drop(all);
+    // More than the whole budget is clamped to it, so a lone read runs.
+    let holding = s
+        .block_on(service.fanout_hold(500_000, Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!(holding.bytes(), 100_000);
+    assert!(
+        service.fanout_try_hold(1).is_none(),
+        "the holding has it all"
+    );
+    let caller = crate::serve::auth::Caller::anonymous();
+    let reply = s
+        .block_on(service.fanout_reply(
+            &caller,
+            crate::serve::service::ServiceReply::Empty(proto::Empty {}),
+            holding,
+            Duration::from_millis(100),
+        ))
+        .unwrap();
+    // The reply's charge is its own size now, the rest back in the budget.
+    assert!(service.fanout_try_hold(90_000).is_some());
+    drop(reply);
+    assert_eq!(service.inflight_available(), 100_000);
+}

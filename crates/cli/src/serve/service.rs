@@ -1789,6 +1789,85 @@ impl Service {
         .await
     }
 
+    /// A fanned-out read's part (D317, #1715): the same `MultiGet` or `Nearest` read a call
+    /// makes (its scope check, blocking-pool slot and per-call limits included), for a
+    /// request whose entry node holds the budget for its page ([`Self::fanout_hold`]): no
+    /// budget here, neither admission nor a reply charge. The fan-out calls it for its local
+    /// part, and the router for a part a peer forwarded (`fanout_part`).
+    pub(crate) async fn fanout_part(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
+        // The caller's scope, as admission checks it; the budget is the fanning-out node's.
+        self.check(&op.admit(), caller)?;
+        match op {
+            ServiceOp::MultiGet(r) => self
+                .multi_get(r, caller)
+                .await
+                .map(|(reply, _)| ServiceReply::MultiGet(reply))
+                .map_err(ApiError::for_read),
+            ServiceOp::Nearest(r) => self
+                .nearest(&r, caller)
+                .await
+                .map(ServiceReply::Nearest)
+                .map_err(ApiError::for_read),
+            _ => Err(ApiError::internal(
+                "a fan-out's local part is a multi-get or a nearest search",
+            )),
+        }
+    }
+
+    /// A fanned-out read's holding (#1715): `bytes` of the in-flight budget (at most the
+    /// whole of it, so a lone request runs), waiting at most `wait`, else `Overloaded` as a
+    /// reply's share does.
+    pub(crate) async fn fanout_hold(
+        &self,
+        bytes: usize,
+        wait: Duration,
+    ) -> Result<super::charge::Charge, ApiError> {
+        super::charge::Charge::reserve(
+            &self.inflight,
+            self.limits.inflight_bytes,
+            bytes,
+            wait,
+            &self.replies,
+        )
+        .await
+    }
+
+    /// [`Self::fanout_hold`] only if the bytes are free now: a read ahead, or a further
+    /// concurrent part, on spare budget.
+    pub(crate) fn fanout_try_hold(&self, bytes: usize) -> Option<super::charge::Charge> {
+        super::charge::Charge::try_reserve(
+            &self.inflight,
+            self.limits.inflight_bytes,
+            bytes,
+            &self.replies,
+        )
+    }
+
+    /// A fanned-out read's reply, charged with its holding (#1715): fitted to the reply's
+    /// share as [`Self::reserve_reply`] sizes it (twice for HTTP/JSON), so the reply's
+    /// charge takes over the pages' with no gap and no second reservation. Only an
+    /// HTTP/JSON share larger than the holding waits, at most `wait`.
+    pub(crate) async fn fanout_reply(
+        &self,
+        caller: &Caller,
+        reply: ServiceReply,
+        mut holding: super::charge::Charge,
+        wait: Duration,
+    ) -> Result<ServiceReply, ApiError> {
+        let size = reply.encoded_len() + super::charge::GRPC_FRAME;
+        let want = if caller.json {
+            size.saturating_mul(2)
+        } else {
+            size
+        };
+        holding.fit(want, self.limits.inflight_bytes, wait).await?;
+        Ok(self.charged(caller, reply, holding))
+    }
+
     /// `reply` with its charge: a gRPC reply's trimmed to its encoded message now; an
     /// HTTP/JSON one's fitted to its rendered body by the front-end.
     fn charged(

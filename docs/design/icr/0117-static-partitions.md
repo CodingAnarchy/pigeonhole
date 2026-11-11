@@ -173,6 +173,22 @@
 
 **`Cluster.Forward`** gains a `nearest` arm (field 18, reply 11), after D317 ticket 3's arms. `MissingRange` moves to `common.proto`: the same package, so the wire format and the generated names are unchanged.
 
+**Charging the merge pages (#1715, 1.2.0; plan reviewed by cli692).** A fanned-out read's partition pages count against `--inflight-bytes` on its entry node, as a single node's reply does.
+- **The holding:** each read reserves its share before its first partition read. No partition read then waits for budget while the request holds some (cli692's P1):
+  - a multi-get: its `page_bytes`;
+  - a nearest search: twice that, the result's bound plus one answer;
+  - a traversal: one hop page plus the seeds' visited bytes.
+- **Concurrency on spare budget:** a multi-get's read-ahead, and a nearest search's further concurrent forwards, take spare budget with `try_reserve` or don't run.
+- **The reply** takes over the holding as its charge (`fit` to its encoded size, twice for HTTP/JSON), so there's no gap and no second reservation.
+- **Parts are charged once, at the entry** (perf287's g78 on #1730: with every node an entry, owners' admission waited on holdings that waited on them, and nothing answered).
+  - Local parts, and parts a peer forwards with `ForwardRequest.fanout_part` (field 21), are read through `Service::fanout_part`. That's the same reads, scope check included, with no admission and no reply charge, so an owner never waits on budget for one.
+  - Only peers send it: `Cluster.Forward` takes cluster scope, and a client's token is refused.
+  - An owner's memory for others' parts is bounded by the `Cluster` calls' concurrency limit (16) × a page (at most 8 MiB), not by its `--inflight-bytes`.
+- **A traversal reads each hop in pages of its own `page_bytes`,** not 8 MiB. The router keeps `per_node_limit` per source row across pages, since a resumed row's `column_limit` starts over.
+  - **The visited set's growth** takes spare budget first. Otherwise the hop holding (with the seeds' share in it) goes back while it waits. Retaking it still waits while the visited set is held. That set is the traversal's state, and has no bound worth reserving up front.
+  - **When the visited set leaves less of the budget than a hop page,** the next hop can't be read charged, so the traversal ends after the hop it has. It's marked `cut_by_budget` if a hop was left to read (cli692's N2 on #1730). A smaller page isn't read instead, since it might not hold a single edge.
+- **A forward's connect and call share one deadline** (cli692's F1 on #1730), the call's, at the sending node. A node that takes the connection and never answers can no longer hold a read, and its pages' budget, past its deadline. A read answers `PartitionUnavailable`; a write's outcome is unknown (B3).
+
 ## Ticket 7: cluster feeds
 **`Feed.Subscribe` on a cluster node** follows every partition the subscription covers, through any node. Covered means the partitions of its tables' placements, narrowed by its prefix to the ranges that can hold such rows. Each partition is followed by a single-node subscription on the node serving it, and the entry node merges them:
 - **Order:** a partition's commits keep its order, so each row's do. There's no order across partitions.

@@ -6313,6 +6313,13 @@ pub struct ForwardRequest {
     /// Who the call is for, checked again here.
     #[prost(message, optional, tag = "2")]
     pub caller: ::core::option::Option<ForwardedCaller>,
+    /// One partition's part of a read another node fans out (D317 #1715): a multi-get's keys
+    /// (a 4a multi-get's, or a traversal hop's) or a nearest search's. The sending node holds
+    /// the in-flight budget for its page, so this node serves it with no budget of its own: no
+    /// admission and no reply charge, its scope still checked. Only a peer sends it:
+    /// `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
+    #[prost(bool, tag = "21")]
+    pub fanout_part: bool,
     #[prost(
         oneof = "forward_request::Op",
         tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
