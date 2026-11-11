@@ -122,30 +122,32 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Bounded, as sweep.yml's and ci.yml's apt steps: a runner whose DNS or mirror stalls
-      # (#1735's two jobs, "Temporary failure resolving") gets three tries with apt's own
-      # timeouts and retries, then fails the job rather than hold it. Valgrind is required here,
-      # so a failure stays fatal. When the image's first mirror, azure.archive.ubuntu.com, doesn't
-      # resolve (it didn't for over an hour on 2026-11-11, while the rest of DNS worked), apt is
-      # pointed at archive.ubuntu.com before the next try.
+      # Bounded: a runner whose DNS or mirror stalls (#1735's two jobs, "Temporary failure
+      # resolving") gets three tries, then fails the job rather than hold it. Valgrind is
+      # required here, so a failure stays fatal. `--error-on=any` makes an index that can't be
+      # fetched fail `update` (it exits 0 otherwise, and `install` runs on the image's stale
+      # lists into the timeout; cli692 on #1736); the loop retries, so apt's own retries are 1.
+      # Name resolution isn't bounded by apt's timeouts (about 20 s a lookup), so a failing try
+      # costs a minute or two. When the image's first mirror, azure.archive.ubuntu.com, doesn't
+      # resolve, apt is pointed at archive.ubuntu.com first. That helps only while the
+      # runner's resolver still answers for archive.ubuntu.com: on 2026-11-11 it sometimes
+      # didn't (#1736's first run), and then only a rerun on another runner gets through.
       - name: install valgrind
         timeout-minutes: 8
         run: |
-          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
-          fallback() {
-            getent hosts azure.archive.ubuntu.com > /dev/null && return
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=1)
+          if ! getent hosts azure.archive.ubuntu.com > /dev/null; then
             echo "::warning::azure.archive.ubuntu.com doesn't resolve: apt falls back to archive.ubuntu.com"
             [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
             for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
               [ -f "$f" ] && sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
             done
-            true
-          }
+          fi
           for try in 1 2 3; do
-            fallback
-            sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
+            sudo apt-get "${apt_opts[@]}" update -q --error-on=any \
+              && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
             echo "::warning::apt install of valgrind failed (try $try of 3)"
-            sleep 20
+            [ "$try" -lt 3 ] && sleep 20
           done
           exit 1
       - name: build the examples (head and base)

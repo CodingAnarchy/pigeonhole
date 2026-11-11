@@ -92,8 +92,10 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         run: |
-          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=1)
           # The image's first mirror may not resolve (as instructions.yml's valgrind step).
+          # `--error-on=any`: an index that can't be fetched fails `update` at once, so the
+          # warning below prints rather than the step running into its timeout.
           if ! getent hosts azure.archive.ubuntu.com > /dev/null; then
             echo "::warning::azure.archive.ubuntu.com doesn't resolve: apt falls back to archive.ubuntu.com"
             [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
@@ -101,7 +103,7 @@ jobs:
               [ -f "$f" ] && sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
             done
           fi
-          sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q gdb \
+          sudo apt-get "${apt_opts[@]}" update -q --error-on=any && sudo apt-get "${apt_opts[@]}" install -y -q gdb \
             || { echo "::warning::gdb isn't installed: a hung model seed will abort without thread stacks"; exit 1; }
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --exclude pigeonhole-bench --all-targets --all-features -- -D warnings
