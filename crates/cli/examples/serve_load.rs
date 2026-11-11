@@ -53,9 +53,10 @@ struct Args {
     dir: PathBuf,
     #[arg(long, default_value_t = 7462)]
     port: u16,
-    /// The database's shard count when it's built (default: `phdb serve`'s for a database it
-    /// creates, half the physical cores, not the library's one per core). A database already
-    /// in `--dir` keeps its own.
+    /// The shard count the database is built and served at (default: `phdb serve`'s, half
+    /// the physical cores, not the library's one per core). It's passed to `phdb serve` as
+    /// `--shards`, since the count isn't stored in the file (ICR 0132); a `--shards` among
+    /// the `--serve-arg`s wins.
     #[arg(long)]
     shards: Option<usize>,
     /// Rows in the table.
@@ -262,29 +263,21 @@ fn key(i: u64) -> Vec<u8> {
     format!("u{i:08}").into_bytes()
 }
 
-/// The database in `--dir`, built if missing, and its shard count.
-fn build(args: &Args) -> Result<(PathBuf, usize), Box<dyn std::error::Error>> {
+/// The shard count to build and serve at: `--shards`, else `phdb serve`'s default
+/// (`placement::default_shards`, half the physical cores).
+fn shards(args: &Args) -> usize {
+    args.shards
+        .unwrap_or_else(|| (num_cpus::get_physical() / 2).max(1))
+}
+
+/// The database in `--dir`, built at `shards` if missing. One that exists is served as it
+/// is: the count isn't stored in the file (ICR 0132), so `phdb serve` gets it as `--shards`
+/// rather than this process opening the file to check (perf287's F1 on #1697).
+fn build(args: &Args, shards: usize) -> Result<PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.dir)?;
     let file = args.dir.join("serveload.phdb");
-    // `phdb serve`'s default (`placement::default_shards`): the library's one shard per
-    // physical core would leave the network side no cores of its own (perf287 on #1697).
-    let shards = args
-        .shards
-        .unwrap_or_else(|| (num_cpus::get_physical() / 2).max(1));
     if file.exists() {
-        // A database is reused as it was built: one of another shard count than asked for
-        // would measure another placement, so it's refused rather than served.
-        let db = Pigeonhole::open(&file, Options::default())?;
-        let built = db.info()?.shards;
-        db.close()?;
-        if args.shards.is_some_and(|n| n != built) {
-            return Err(format!(
-                "{} has {built} shards, not --shards {shards}: remove it to build it again",
-                file.display()
-            )
-            .into());
-        }
-        return Ok((file, built));
+        return Ok(file);
     }
     let db = Pigeonhole::open(
         &file,
@@ -302,13 +295,13 @@ fn build(args: &Args) -> Result<(PathBuf, usize), Box<dyn std::error::Error>> {
     batch.commit_with(Durability::None)?;
     db.flush()?;
     db.close()?;
-    Ok((file, shards))
+    Ok(file)
 }
 
 struct Server(Child);
 
 impl Server {
-    fn start(args: &Args, file: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    fn start(args: &Args, file: &Path, shards: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let mut cmd = match &args.server_cpus {
             Some(list) => {
                 let mut c = Command::new("taskset");
@@ -322,6 +315,15 @@ impl Server {
             .arg(file)
             .arg("--listen")
             .arg(format!("127.0.0.1:{}", args.port))
+            .args(
+                (!args
+                    .serve_args
+                    .iter()
+                    .any(|a| a == "--shards" || a.starts_with("--shards=")))
+                .then(|| ["--shards".to_owned(), shards.to_string()])
+                .into_iter()
+                .flatten(),
+            )
             .args(&args.serve_args)
             .spawn()?;
         Ok(Self(child))
@@ -688,9 +690,10 @@ fn pin_self(_list: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let (file, shards) = build(&args)?;
+    let shards = shards(&args);
+    let file = build(&args, shards)?;
     // The server first, so it doesn't inherit the client's CPUs.
-    let server = Server::start(&args, &file)?;
+    let server = Server::start(&args, &file, shards)?;
     if let Some(list) = &args.client_cpus {
         pin_self(list)?;
     }

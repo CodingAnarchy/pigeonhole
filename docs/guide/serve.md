@@ -254,7 +254,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
   - **`unmasked (--affinity off)`:** the shards are pinned, but the server's threads get no mask.
 - **`--affinity off`** (default `on`) keeps the same thread counts but sets no mask, so the network, feed and blocking threads run where the OS puts them. The shards stay pinned: that's `Options::pin_threads`, not this flag.
   - **Leave it on for writes:** in the measurements below, the mask raised gRPC `Mutate` throughput 25% at 21% less CPU per write, and cut `Mutate`'s p99.9 in mixed workloads by 1.5–4.5×.
-  - **Read-heavy deployments should use `--affinity off`.** With the mask, `ReadRow` ran 16% slower over gRPC and 26% slower over HTTP: with few writes, the shards' cores sit idle, and the mask keeps reads off them. Point `Get`s were level.
+  - **Deployments dominated by whole-row reads or scans should use `--affinity off`.** With the mask, `ReadRow` ran 16% slower over gRPC and 26% slower over HTTP, and HTTP `Scan` 15% slower: with few writes, the shards' cores sit idle, and the mask keeps those reads off them. Point `Get`s, and the read-only YCSB C, were level or better with the mask.
   - **Turn it off on a host shared with other work,** where the server shouldn't claim every CPU outside the shards.
 - **The server's background threads** run off the shards' cores too: an index's rebalancer (`phdb-serve-rebalance`), a bulk load (`phdb-serve-bulk-load`) and a text rebuild (`phdb-serve-text-rebuild`). So do the embedder's threads with `--embed-local` ([Agent memory](#agent-memory)).
 
@@ -286,7 +286,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 | HTTP | YCSB B | 235K → 232K | 27.1 → 27.7 | 0.92 → 4.2 |
 | HTTP | YCSB C | 242K → 251K | 24.8 → 23.7 | 0.66 → 0.63 |
 
-- **Writes gain from the mask, and reads that could use the idle shard cores lose.** `Batch` is the one write row whose p99 rose with the mask (gRPC 1.11 against 0.82 ms). The engine's compaction threads, pinned to three of the four free cores and at about 2.5 cores busy in those rows, likely contributed; p99.9 couldn't separate them.
+- **Writes gain from the mask, and reads that could use the idle shard cores lose.** `Batch` is the one write row whose p99 rose with the mask (gRPC 1.11 against 0.82 ms). The engine's compaction threads, pinned to three of the four free cores and at about 2.5 cores busy in those rows, likely contributed; p99.9 couldn't separate them (#1703).
 - **These are a fresh server's numbers.** A server restarted before #1699 reopened with one shard per core, and its mask fell back to the shards' SMT siblings, where the mask mostly hurt (section 2 of the write-up). Since #1699 a restart keeps the default, and since #1697 a host with too few free cores gets no mask rather than the siblings.
 
 ## Metrics

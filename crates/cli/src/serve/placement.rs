@@ -57,7 +57,11 @@ impl Placement {
         let (mask, free, mode, note) = match linux_mask(&pinned) {
             // The counts come from the CPUs the mask would leave, so `off` differs from `on`
             // only in the mask (R1's acceptance run compares the two).
-            (Some(_), free, _, _) if !affinity => (None, free, "unmasked (--affinity off)", None),
+            // Off, the mode says so whatever the mask would have been, with no `--shards`
+            // advice (perf287's N1 on #1697); unpinned stays unpinned.
+            (_, free, mode, _) if !affinity && mode != "unpinned" => {
+                (None, free, "unmasked (--affinity off)", None)
+            }
             planned => planned,
         };
         #[cfg(not(target_os = "linux"))]
