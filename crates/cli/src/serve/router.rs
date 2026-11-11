@@ -182,6 +182,16 @@ impl Router {
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
+            // The schema is the map's (ticket 5).
+            if matches!(
+                op,
+                ServiceOp::ListTables(_)
+                    | ServiceOp::DescribeTable(_)
+                    | ServiceOp::CreateTable(_)
+                    | ServiceOp::DropTable(_)
+            ) {
+                return self.cluster_schema(cluster, op, caller, prepaid).await;
+            }
             // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
             // subscription follows every partition it covers (ticket 7). One at a snapshot
             // reads its partition only (ticket 3): a multi-get is routed and forwarded as a
@@ -377,6 +387,9 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
+        if matches!(op, ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) {
+            return self.serve_forwarded_schema(cluster, op, caller).await;
+        }
         {
             let routes = cluster.node.routes();
             let Some(routes) = routes.as_ref() else {
