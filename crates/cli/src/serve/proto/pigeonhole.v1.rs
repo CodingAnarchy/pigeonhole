@@ -2533,6 +2533,474 @@ pub mod data_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribeRequest {
+    /// The tables to follow (at least one).
+    #[prost(string, repeated, tag = "1")]
+    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Only rows starting with this prefix.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub prefix: ::prost::bytes::Bytes,
+    /// Deliver at visibility rather than durability.
+    #[prost(bool, tag = "3")]
+    pub visible: bool,
+    /// A cluster subscription only (D317 ticket 7, ICR 0117); `InvalidArgument` on a single
+    /// node. An unreachable partition doesn't end the stream: the others continue, a
+    /// `PartitionState` event says which is missing, and it resumes where it left off when it
+    /// comes back, with nothing skipped.
+    #[prost(bool, tag = "7")]
+    pub allow_partial: bool,
+    /// A cluster subscription resumed from a token only: per partition, the seqno of the last
+    /// commit the client has already handled after that token. The server passes over those
+    /// commits rather than send them again, at most 64 per partition (more is
+    /// `InvalidArgument`); a seqno at or below the token's position changes nothing.
+    #[prost(message, repeated, tag = "8")]
+    pub skip_through: ::prost::alloc::vec::Vec<PartitionSeqno>,
+    /// A cluster subscription only: a token every this many events, from 1 (every event, as a
+    /// single node sends) to 64. Unset (0): the server's choice, about 150 bytes of token per
+    /// event on average, and every event for a one-partition subscription.
+    #[prost(uint32, tag = "9")]
+    pub checkpoint_every: u32,
+    /// Where the stream starts; unset: from now.
+    #[prost(oneof = "subscribe_request::Start", tags = "4, 5, 6")]
+    pub start: ::core::option::Option<subscribe_request::Start>,
+}
+/// Nested message and enum types in `SubscribeRequest`.
+pub mod subscribe_request {
+    /// Where the stream starts; unset: from now.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Start {
+        /// After everything a pinned snapshot sees.
+        #[prost(string, tag = "4")]
+        FromSnapshot(::prost::alloc::string::String),
+        /// From the oldest commit the history holds.
+        #[prost(bool, tag = "5")]
+        FromOldest(bool),
+        /// After an earlier event's `token`.
+        #[prost(bytes, tag = "6")]
+        Resume(::prost::bytes::Bytes),
+    }
+}
+/// A partition's own commit seqno: comparable only with other seqnos of the same partition.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionSeqno {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub seqno: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FeedEvent {
+    /// The feed's position after this event: `resume` continues exactly after it. Opaque,
+    /// and not comparable byte for byte across streams. On a cluster subscription over several
+    /// partitions only some events carry one (checkpoints): empty on the rest, and a resume
+    /// from the last one may deliver again the events after it, which the client recognises by
+    /// `(partition, commit.seqno)` (ICR 0117).
+    #[prost(bytes = "bytes", tag = "1")]
+    pub token: ::prost::bytes::Bytes,
+    /// On a cluster subscription, the partition the event came from; empty on a single node.
+    #[prost(string, tag = "5")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6")]
+    pub event: ::core::option::Option<feed_event::Event>,
+}
+/// Nested message and enum types in `FeedEvent`.
+pub mod feed_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "2")]
+        Commit(super::FeedCommit),
+        /// Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
+        /// The position moved past commits the stream's filters skipped: only `token` matters.
+        #[prost(message, tag = "4")]
+        Progress(super::Progress),
+        /// A cluster subscription's partition became unavailable or available again.
+        #[prost(message, tag = "6")]
+        PartitionState(super::PartitionState),
+    }
+}
+/// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
+/// which keeps the stream open; sent at the start for each partition unavailable then, and
+/// on each change), or available again. Its commits are delivered, in order and once each,
+/// when it comes back.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionState {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub available: bool,
+    /// Why it's unavailable: a stable code name (`PartitionUnavailable`, `WrongPartition` while
+    /// the node finds the partition's new node, ...); empty when available.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FeedCommit {
+    #[prost(uint64, tag = "1")]
+    pub seqno: u64,
+    #[prost(uint64, tag = "2")]
+    pub timestamp: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub changes: ::prost::alloc::vec::Vec<Change>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Change {
+    #[prost(string, tag = "1")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub family: ::prost::alloc::string::String,
+    #[prost(enumeration = "ChangeKind", tag = "3")]
+    pub kind: i32,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub row: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub qualifier: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "6")]
+    pub timestamp: u64,
+    /// The written value, for puts and merges.
+    #[prost(message, optional, tag = "7")]
+    pub value: ::core::option::Option<Value>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ChangeKind {
+    Unspecified = 0,
+    Put = 1,
+    /// A merge operand, a counter increment or an aggregate input.
+    Merge = 2,
+    DeleteCell = 3,
+    DeleteColumn = 4,
+    /// A row delete is one `DELETE_FAMILY` per family.
+    DeleteFamily = 5,
+}
+impl ChangeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CHANGE_KIND_UNSPECIFIED",
+            Self::Put => "CHANGE_KIND_PUT",
+            Self::Merge => "CHANGE_KIND_MERGE",
+            Self::DeleteCell => "CHANGE_KIND_DELETE_CELL",
+            Self::DeleteColumn => "CHANGE_KIND_DELETE_COLUMN",
+            Self::DeleteFamily => "CHANGE_KIND_DELETE_FAMILY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CHANGE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "CHANGE_KIND_PUT" => Some(Self::Put),
+            "CHANGE_KIND_MERGE" => Some(Self::Merge),
+            "CHANGE_KIND_DELETE_CELL" => Some(Self::DeleteCell),
+            "CHANGE_KIND_DELETE_COLUMN" => Some(Self::DeleteColumn),
+            "CHANGE_KIND_DELETE_FAMILY" => Some(Self::DeleteFamily),
+            _ => None,
+        }
+    }
+}
+/// Generated client implementations.
+pub mod feed_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// Committed changes of some tables, as whole commits in commit order, once each.
+    #[derive(Debug, Clone)]
+    pub struct FeedClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> FeedClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> FeedClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            FeedClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// A stream that doesn't end on its own: it ends with an error, such as `FeedExpired`
+        /// when the history no longer holds the requested start.
+        pub async fn subscribe(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SubscribeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FeedEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Feed/Subscribe",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Feed", "Subscribe"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod feed_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with FeedServer.
+    #[async_trait]
+    pub trait Feed: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the Subscribe method.
+        type SubscribeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FeedEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// A stream that doesn't end on its own: it ends with an error, such as `FeedExpired`
+        /// when the history no longer holds the requested start.
+        async fn subscribe(
+            &self,
+            request: tonic::Request<super::SubscribeRequest>,
+        ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status>;
+    }
+    /// Committed changes of some tables, as whole commits in commit order, once each.
+    #[derive(Debug)]
+    pub struct FeedServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> FeedServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for FeedServer<T>
+    where
+        T: Feed,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Feed/Subscribe" => {
+                    #[allow(non_camel_case_types)]
+                    struct SubscribeSvc<T: Feed>(pub Arc<T>);
+                    impl<
+                        T: Feed,
+                    > tonic::server::ServerStreamingService<super::SubscribeRequest>
+                    for SubscribeSvc<T> {
+                        type Response = super::FeedEvent;
+                        type ResponseStream = T::SubscribeStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SubscribeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Feed>::subscribe(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SubscribeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for FeedServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Feed";
+    impl<T> tonic::server::NamedService for FeedServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTablesRequest {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3547,6 +4015,26 @@ pub mod forward_response {
         MultiGet(super::MultiGetResponse),
     }
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForwardSubscribeRequest {
+    /// The sending node's map version, as for `Forward`.
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+    /// Who the subscription is for, checked again here.
+    #[prost(message, optional, tag = "2")]
+    pub caller: ::core::option::Option<ForwardedCaller>,
+    /// The partition whose part this is: every table in `request` must be placed on it.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
+    /// A single node's subscription: tables, prefix, visibility and start (`resume` is this
+    /// partition's own token). Its cluster-only fields are unset.
+    #[prost(message, optional, tag = "4")]
+    pub request: ::core::option::Option<SubscribeRequest>,
+    /// Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
+    /// most 64 of them; 0: none.
+    #[prost(uint64, tag = "5")]
+    pub skip_through: u64,
+}
 /// Generated client implementations.
 pub mod cluster_client {
     #![allow(
@@ -3786,6 +4274,35 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardScan"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Node to node (D317 ticket 7): one partition's part of a cluster subscription, which the
+        /// sending node merges with the others. Served only if this node's map gives it the
+        /// partition, and only on connections of their own (never the `Forward` pool), so a
+        /// subscriber that stops reading can't stall forwarded calls. The events are a single
+        /// node's: a token on every one, no `partition`. Cluster scope, gRPC only.
+        pub async fn forward_subscribe(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForwardSubscribeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::FeedEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ForwardSubscribe",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardSubscribe"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -3856,6 +4373,24 @@ pub mod cluster_server {
             request: tonic::Request<super::ForwardScanRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::ForwardScanStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ForwardSubscribe method.
+        type ForwardSubscribeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::FeedEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Node to node (D317 ticket 7): one partition's part of a cluster subscription, which the
+        /// sending node merges with the others. Served only if this node's map gives it the
+        /// partition, and only on connections of their own (never the `Forward` pool), so a
+        /// subscriber that stops reading can't stall forwarded calls. The events are a single
+        /// node's: a token on every one, no `partition`. Cluster scope, gRPC only.
+        async fn forward_subscribe(
+            &self,
+            request: tonic::Request<super::ForwardSubscribeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ForwardSubscribeStream>,
             tonic::Status,
         >;
     }
@@ -4196,397 +4731,27 @@ pub mod cluster_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
-            }
-        }
-    }
-    impl<T> Clone for ClusterServer<T> {
-        fn clone(&self) -> Self {
-            let inner = self.inner.clone();
-            Self {
-                inner,
-                accept_compression_encodings: self.accept_compression_encodings,
-                send_compression_encodings: self.send_compression_encodings,
-                max_decoding_message_size: self.max_decoding_message_size,
-                max_encoding_message_size: self.max_encoding_message_size,
-            }
-        }
-    }
-    /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Cluster";
-    impl<T> tonic::server::NamedService for ClusterServer<T> {
-        const NAME: &'static str = SERVICE_NAME;
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SubscribeRequest {
-    /// The tables to follow (at least one).
-    #[prost(string, repeated, tag = "1")]
-    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Only rows starting with this prefix.
-    #[prost(bytes = "bytes", tag = "2")]
-    pub prefix: ::prost::bytes::Bytes,
-    /// Deliver at visibility rather than durability.
-    #[prost(bool, tag = "3")]
-    pub visible: bool,
-    /// Where the stream starts; unset: from now.
-    #[prost(oneof = "subscribe_request::Start", tags = "4, 5, 6")]
-    pub start: ::core::option::Option<subscribe_request::Start>,
-}
-/// Nested message and enum types in `SubscribeRequest`.
-pub mod subscribe_request {
-    /// Where the stream starts; unset: from now.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Start {
-        /// After everything a pinned snapshot sees.
-        #[prost(string, tag = "4")]
-        FromSnapshot(::prost::alloc::string::String),
-        /// From the oldest commit the history holds.
-        #[prost(bool, tag = "5")]
-        FromOldest(bool),
-        /// After an earlier event's `token`.
-        #[prost(bytes, tag = "6")]
-        Resume(::prost::bytes::Bytes),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FeedEvent {
-    /// The feed's position after this event: `resume` continues exactly after it. Opaque,
-    /// and not comparable byte for byte across streams.
-    #[prost(bytes = "bytes", tag = "1")]
-    pub token: ::prost::bytes::Bytes,
-    #[prost(oneof = "feed_event::Event", tags = "2, 4")]
-    pub event: ::core::option::Option<feed_event::Event>,
-}
-/// Nested message and enum types in `FeedEvent`.
-pub mod feed_event {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Event {
-        #[prost(message, tag = "2")]
-        Commit(super::FeedCommit),
-        /// Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
-        /// The position moved past commits the stream's filters skipped: only `token` matters.
-        #[prost(message, tag = "4")]
-        Progress(super::Progress),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FeedCommit {
-    #[prost(uint64, tag = "1")]
-    pub seqno: u64,
-    #[prost(uint64, tag = "2")]
-    pub timestamp: u64,
-    #[prost(message, repeated, tag = "3")]
-    pub changes: ::prost::alloc::vec::Vec<Change>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Change {
-    #[prost(string, tag = "1")]
-    pub table: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub family: ::prost::alloc::string::String,
-    #[prost(enumeration = "ChangeKind", tag = "3")]
-    pub kind: i32,
-    #[prost(bytes = "bytes", tag = "4")]
-    pub row: ::prost::bytes::Bytes,
-    #[prost(bytes = "bytes", tag = "5")]
-    pub qualifier: ::prost::bytes::Bytes,
-    #[prost(uint64, tag = "6")]
-    pub timestamp: u64,
-    /// The written value, for puts and merges.
-    #[prost(message, optional, tag = "7")]
-    pub value: ::core::option::Option<Value>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ChangeKind {
-    Unspecified = 0,
-    Put = 1,
-    /// A merge operand, a counter increment or an aggregate input.
-    Merge = 2,
-    DeleteCell = 3,
-    DeleteColumn = 4,
-    /// A row delete is one `DELETE_FAMILY` per family.
-    DeleteFamily = 5,
-}
-impl ChangeKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "CHANGE_KIND_UNSPECIFIED",
-            Self::Put => "CHANGE_KIND_PUT",
-            Self::Merge => "CHANGE_KIND_MERGE",
-            Self::DeleteCell => "CHANGE_KIND_DELETE_CELL",
-            Self::DeleteColumn => "CHANGE_KIND_DELETE_COLUMN",
-            Self::DeleteFamily => "CHANGE_KIND_DELETE_FAMILY",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "CHANGE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "CHANGE_KIND_PUT" => Some(Self::Put),
-            "CHANGE_KIND_MERGE" => Some(Self::Merge),
-            "CHANGE_KIND_DELETE_CELL" => Some(Self::DeleteCell),
-            "CHANGE_KIND_DELETE_COLUMN" => Some(Self::DeleteColumn),
-            "CHANGE_KIND_DELETE_FAMILY" => Some(Self::DeleteFamily),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod feed_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    /// Committed changes of some tables, as whole commits in commit order, once each.
-    #[derive(Debug, Clone)]
-    pub struct FeedClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl<T> FeedClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> FeedClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            FeedClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        /// A stream that doesn't end on its own: it ends with an error, such as `FeedExpired`
-        /// when the history no longer holds the requested start.
-        pub async fn subscribe(
-            &mut self,
-            request: impl tonic::IntoRequest<super::SubscribeRequest>,
-        ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::FeedEvent>>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Feed/Subscribe",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Feed", "Subscribe"));
-            self.inner.server_streaming(req, path, codec).await
-        }
-    }
-}
-/// Generated server implementations.
-pub mod feed_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with FeedServer.
-    #[async_trait]
-    pub trait Feed: std::marker::Send + std::marker::Sync + 'static {
-        /// Server streaming response type for the Subscribe method.
-        type SubscribeStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::FeedEvent, tonic::Status>,
-            >
-            + std::marker::Send
-            + 'static;
-        /// A stream that doesn't end on its own: it ends with an error, such as `FeedExpired`
-        /// when the history no longer holds the requested start.
-        async fn subscribe(
-            &self,
-            request: tonic::Request<super::SubscribeRequest>,
-        ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status>;
-    }
-    /// Committed changes of some tables, as whole commits in commit order, once each.
-    #[derive(Debug)]
-    pub struct FeedServer<T> {
-        inner: Arc<T>,
-        accept_compression_encodings: EnabledCompressionEncodings,
-        send_compression_encodings: EnabledCompressionEncodings,
-        max_decoding_message_size: Option<usize>,
-        max_encoding_message_size: Option<usize>,
-    }
-    impl<T> FeedServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
-        }
-        pub fn from_arc(inner: Arc<T>) -> Self {
-            Self {
-                inner,
-                accept_compression_encodings: Default::default(),
-                send_compression_encodings: Default::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
-        where
-            F: tonic::service::Interceptor,
-        {
-            InterceptedService::new(Self::new(inner), interceptor)
-        }
-        /// Enable decompressing requests with the given encoding.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.accept_compression_encodings.enable(encoding);
-            self
-        }
-        /// Compress responses with the given encoding, if the client supports it.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.send_compression_encodings.enable(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.max_decoding_message_size = Some(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.max_encoding_message_size = Some(limit);
-            self
-        }
-    }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for FeedServer<T>
-    where
-        T: Feed,
-        B: Body + std::marker::Send + 'static,
-        B::Error: Into<StdError> + std::marker::Send + 'static,
-    {
-        type Response = http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            match req.uri().path() {
-                "/pigeonhole.v1.Feed/Subscribe" => {
+                "/pigeonhole.v1.Cluster/ForwardSubscribe" => {
                     #[allow(non_camel_case_types)]
-                    struct SubscribeSvc<T: Feed>(pub Arc<T>);
+                    struct ForwardSubscribeSvc<T: Cluster>(pub Arc<T>);
                     impl<
-                        T: Feed,
-                    > tonic::server::ServerStreamingService<super::SubscribeRequest>
-                    for SubscribeSvc<T> {
+                        T: Cluster,
+                    > tonic::server::ServerStreamingService<
+                        super::ForwardSubscribeRequest,
+                    > for ForwardSubscribeSvc<T> {
                         type Response = super::FeedEvent;
-                        type ResponseStream = T::SubscribeStream;
+                        type ResponseStream = T::ForwardSubscribeStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::SubscribeRequest>,
+                            request: tonic::Request<super::ForwardSubscribeRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as Feed>::subscribe(&inner, request).await
+                                <T as Cluster>::forward_subscribe(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -4597,7 +4762,7 @@ pub mod feed_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = SubscribeSvc(inner);
+                        let method = ForwardSubscribeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -4635,7 +4800,7 @@ pub mod feed_server {
             }
         }
     }
-    impl<T> Clone for FeedServer<T> {
+    impl<T> Clone for ClusterServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -4648,8 +4813,8 @@ pub mod feed_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Feed";
-    impl<T> tonic::server::NamedService for FeedServer<T> {
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Cluster";
+    impl<T> tonic::server::NamedService for ClusterServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

@@ -343,7 +343,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, serves single-row reads and writes for the whole cluster (forwarding each to the node that owns its row), and fans scans and multi-gets out across the partitions. Transactions, graph and vector reads across partitions, schema changes, feeds and backups come in the next steps, and this section grows with them.
+**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, serves single-row reads and writes for the whole cluster (forwarding each to the node that owns its row), fans scans and multi-gets out across the partitions, and serves change feeds across them. Transactions, graph and vector reads across partitions, schema changes and backups come in the next steps, and this section grows with them.
 
 - **`phdb serve --cluster DIR --node-id ID`** runs a node.
   - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
@@ -367,10 +367,42 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
     - **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
     - **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
     - **Not yet:** a scan or multi-get with a `snapshot_id`.
-  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), feeds, backups, `Info` and `/mcp`.
+  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), backups, `Info` and `/mcp`.
   - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
-  - **Flags:** a cluster node takes `--shard-spin` and `--shm-dir` as a single node does, for its partition. `--change-feed`, `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
+  - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir` and `--change-feed` as a single node does, for its partition. `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
   - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.
+- **Change feeds:** `Feed.Subscribe` through any node follows every partition that holds the subscription's tables (only those whose key ranges can hold its prefix), and merges them into one stream. Turn the feed on in each partition with `--change-feed`.
+  - **Order:** each partition's commits arrive in its commit order, so each row's do. There's no order across partitions: a commit on one can arrive after a later one on another.
+  - **Partition and seqno:** each event names its `partition`. A commit's `seqno` is that partition's own, and is comparable only with seqnos of the same partition.
+  - **Tokens are checkpoints.** A cluster token holds every partition's position, so on a subscription over several partitions only some events carry one; the others have an empty `token`. A one-partition subscription, or one with `checkpoint_every: 1`, has a token on every event, as on a single node.
+  - **Resuming:** resume from the last checkpoint you've stored. You may get again the commits that came after it, up to 64 in all (`checkpoint_every`, if you set it).
+  - **The client loop**: store the last token and, per partition, the last seqno you've handled, with the work they fed:
+
+    ```text
+    for each event:
+        if event.commit and event.commit.seqno <= last_seen[event.partition]: skip it  (a repeat)
+        handle it
+        if event.commit: last_seen[event.partition] = event.commit.seqno
+        if event.token:  token = event.token
+        store (token, last_seen) with what you handled
+    to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, seqno}] }
+    ```
+
+    With `skip_through` the server passes over the repeats itself, so nothing arrives twice. Without it, the `seqno` check drops them. Over SSE, events without a token carry no `id:`, so `Last-Event-ID` reconnects from the last checkpoint and the `seqno` check applies.
+  - **What a token costs:** a checkpoint every N commits keeps the token at about 150 bytes per event on average:
+
+    | Partitions × shards each | Checkpoint size | One every |
+    |---|---|---|
+    | 2 × 16 | about 310 B | 3 commits |
+    | 16 × 4 | about 1 KB | 7 commits |
+    | 16 × 16 | about 2.4 KB | 16 commits |
+    | 64 × 16 | about 9.5 KB | 64 commits |
+
+    Past about 64 partitions × 16 shards, a checkpoint comes every 64 commits and costs more per event.
+  - **`allow_partial: true`** keeps the stream going when a partition's node can't be reached. A `partition_state` event says which partition is missing, and again when it's back. Its commits then continue from where they left off, with none skipped. Without it, the stream ends with `PartitionUnavailable` naming the partition; resume once the node is back.
+  - **Limits:** a subscription holds a `--max-streams` place on the node it entered, and one on each partition's node. An entry node that also serves one of its partitions holds two. It buffers up to 256 KiB on its entry node and on each partition's node: (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
+  - **Expiry:** a token can't resume after its partitions' map changed under it (a new table in a subscription of every table), or after a partition was relocated: `FeedExpired`, subscribe again.
+  - A start from a snapshot isn't supported on a cluster subscription.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.

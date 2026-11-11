@@ -510,9 +510,11 @@ impl Event for proto::MemoryEvent {
 }
 
 impl Event for proto::FeedEvent {
-    /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112).
+    /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112). None
+    /// for an event without one (a cluster subscription's events between checkpoints, D317
+    /// ticket 7), so the client's `Last-Event-ID` stays at the last checkpoint.
     fn sse_id(&self) -> Option<String> {
-        Some(base64(&self.token))
+        (!self.token.is_empty()).then(|| base64(&self.token))
     }
 }
 

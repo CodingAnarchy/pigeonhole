@@ -52,6 +52,7 @@ pub(crate) struct Owner {
 /// The routing view of one map version.
 #[derive(Debug)]
 pub(crate) struct Routes {
+    cluster_id: String,
     map_version: u64,
     tables: HashMap<String, Placement>,
     owners: HashMap<String, Owner>,
@@ -96,6 +97,7 @@ impl Routes {
             })
             .collect();
         Self {
+            cluster_id: map.cluster_id.clone(),
             map_version: map.map_version,
             tables,
             owners,
@@ -104,6 +106,31 @@ impl Routes {
 
     pub(crate) fn map_version(&self) -> u64 {
         self.map_version
+    }
+
+    pub(crate) fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    /// The partitions holding rows of `table` that start with `prefix`, in key order and
+    /// without repeats (an empty prefix: all of the table's); `None` for a table the map
+    /// doesn't place. Range `i` is `[splits[i-1], splits[i])`: it holds such a row when it
+    /// ends past the prefix and starts before the first key past every row with it.
+    pub(crate) fn partitions_of_table(&self, table: &str, prefix: &[u8]) -> Option<Vec<&str>> {
+        let p = self.tables.get(table)?;
+        let end = prefix_end(prefix);
+        let mut out: Vec<&str> = Vec::new();
+        for (i, partition) in p.partitions.iter().enumerate() {
+            let starts_before_end = match (&end, i.checked_sub(1).map(|j| &p.splits[j])) {
+                (Some(end), Some(lo)) => lo < end,
+                _ => true,
+            };
+            let ends_past_prefix = p.splits.get(i).is_none_or(|hi| hi.as_slice() > prefix);
+            if starts_before_end && ends_past_prefix && !out.contains(&partition.as_str()) {
+                out.push(partition);
+            }
+        }
+        Some(out)
     }
 
     /// The partition holding `table`'s row `row`; `None` for a table the map doesn't place.
@@ -151,6 +178,19 @@ impl Routes {
             .filter(move |(_, o)| o.node == node)
             .map(|(id, _)| id.as_str())
     }
+}
+
+/// The first key after every key starting with `prefix`; `None` when there's none (an
+/// empty prefix, or one of `0xff` bytes only).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -232,6 +272,34 @@ mod tests {
         }
         assert_eq!(r.partition("orders", b"anything"), Some("p3"));
         assert_eq!(r.partition("nope", b"a"), None);
+    }
+
+    #[test]
+    fn a_prefix_narrows_a_tables_partitions_to_the_ranges_holding_its_rows() {
+        // D317 ticket 7: a feed with a prefix subscribes only where such rows can be.
+        let r = Routes::new(&map());
+        assert_eq!(r.cluster_id(), "c1");
+        for (prefix, want) in [
+            (&b""[..], &["p1", "p2", "p3"][..]),
+            (b"a", &["p1"]),
+            (b"f", &["p1"]),
+            (b"g", &["p2"]),
+            // Rows "m..." run from p2's "m" to p3's "m\xff...".
+            (b"m", &["p2", "p3"]),
+            (b"m\xfe", &["p2"]),
+            (b"m\xff", &["p3"]),
+            (b"z", &["p3"]),
+            // No key follows every row of 0xff bytes: the last range only.
+            (b"\xff\xff", &["p3"]),
+        ] {
+            assert_eq!(
+                r.partitions_of_table("users", prefix).unwrap(),
+                want,
+                "{prefix:?}"
+            );
+        }
+        assert_eq!(r.partitions_of_table("orders", b"x").unwrap(), ["p3"]);
+        assert_eq!(r.partitions_of_table("nope", b""), None);
     }
 
     #[test]

@@ -28,14 +28,16 @@ pub(crate) struct Cluster {
 /// Where a call goes.
 #[derive(Debug)]
 pub(crate) struct Router {
-    pub(crate) service: Service,
+    /// Shared with a cluster subscription's task, which reopens a part served here
+    /// (D317 ticket 7).
+    pub(crate) service: Arc<Service>,
     pub(crate) cluster: Option<Cluster>,
 }
 
 impl Router {
     pub(crate) fn single(service: Service) -> Self {
         Self {
-            service,
+            service: Arc::new(service),
             cluster: None,
         }
     }
@@ -49,7 +51,7 @@ impl Router {
     ) -> Self {
         let forwarder = Arc::new(Forwarder::new(Arc::clone(&node)));
         Self {
-            service,
+            service: Arc::new(service),
             cluster: Some(Cluster {
                 node,
                 local,
@@ -84,7 +86,8 @@ impl Router {
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
-            // A read across a table's partitions fans out (D317 ticket 4a).
+            // A read across a table's partitions fans out (D317 ticket 4a); a subscription
+            // follows every partition it covers (ticket 7).
             match op {
                 ServiceOp::MultiGet(_) => {
                     let deadline = deadline.map_or_else(
@@ -96,6 +99,9 @@ impl Router {
                         .await;
                 }
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
+                ServiceOp::Subscribe(_) => {
+                    return self.subscribe(cluster, op, caller, prepaid).await;
+                }
                 _ => {}
             }
             let target = cluster.target(&op)?;
@@ -191,6 +197,46 @@ impl Router {
             }
             reply => Ok(reply),
         }
+    }
+
+    /// `Feed.Subscribe` on a cluster node (D317 ticket 7): one stream over every partition
+    /// the subscription covers, after this node's own checks (scope and size; the in-flight
+    /// bytes are the request's, freed once it's read, as on a single node).
+    async fn subscribe(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
+        drop(budget);
+        let ServiceOp::Subscribe(r) = op else {
+            return Err(ApiError::internal("not a subscription"));
+        };
+        super::cluster::feed::subscribe(
+            Arc::clone(&cluster.node),
+            Arc::clone(&cluster.forwarder),
+            cluster.local.clone(),
+            Arc::clone(&self.service),
+            r,
+            caller,
+        )
+        .await
+        .map(ServiceReply::Feed)
+    }
+
+    /// `Cluster.ForwardSubscribe` here (D317 ticket 7): one partition's part of a cluster
+    /// subscription that another node entered.
+    pub(crate) async fn serve_forwarded_subscribe(
+        &self,
+        req: super::proto::ForwardSubscribeRequest,
+    ) -> Result<super::feed::FeedEvents, ApiError> {
+        let Some(cluster) = &self.cluster else {
+            return Err(ApiError::unsupported("this node isn't a cluster node"));
+        };
+        super::cluster::feed::serve(&cluster.node, cluster.local.as_deref(), &self.service, req)
+            .await
     }
 
     /// A call another node forwarded here (D317 ticket 2): served only if this node's map
@@ -382,7 +428,8 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
         | ServiceOp::DescribeTable(_) => Err(later("the schema", 5)),
-        ServiceOp::Subscribe(_) => Err(later("a change feed", 7)),
+        // A cluster subscription is routed before this ([`Router::subscribe`]).
+        ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
         ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => Err(later("a backup", 8)),
         _ => Err(ApiError::unsupported(
             "this call isn't served by a cluster node (D317)",
