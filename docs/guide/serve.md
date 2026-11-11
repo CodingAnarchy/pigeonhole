@@ -319,6 +319,8 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
+| `pigeonhole_serve_partition_unpinned_shard_threads{pigeonhole_partition}`, `pigeonhole_serve_partition_unpinned_compaction_threads{pigeonhole_partition}` | gauge | On a cluster node, each partition's engine threads left unpinned: shard drivers and compaction threads. Above 0 on Linux, the partition's threads can share CPUs with another's or with the network side's. |
+| `pigeonhole_serve_partition_memtable_bytes{pigeonhole_partition}`, `pigeonhole_serve_partition_block_cache_bytes{pigeonhole_partition}`, `pigeonhole_serve_partition_row_cache_bytes{pigeonhole_partition}` | gauge | On a cluster node, each partition's engine memory as resolved from `--engine-memory` and the map's `memory_bytes`. |
 | `pigeonhole_replica_following`, `pigeonhole_replica_applied_primary_seqno`, `pigeonhole_replica_lag_commits`, `pigeonhole_replica_lag_seconds` | gauge | On a replica only ([Replicas](#replicas)). |
 
 The engine's metrics follow, under the [observability guide's](observability.md#the-metrics) names and labels, with its alerts and its Grafana dashboard.
