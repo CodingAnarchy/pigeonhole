@@ -1,0 +1,2 @@
+### Added
+- `phdb serve --feed-hub-threads`: the threads that read the change feed into its shared subscriptions (default: a quarter of `--feed-threads`, at least 1, as before). Raise it on a feed-heavy server with CPUs to spare: with one such thread, 16 busy subscriptions can fall seconds behind, while each thread past the default costs writes 13–38% put p50 (#1719). `/metrics` gains `pigeonhole_serve_feed_hub_threads`, and the feed dump's header names the count.
