@@ -347,7 +347,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
   - `durable`, `replica` and `backup_id` must be unset (`InvalidArgument`);
   - a single node refuses `fenced_file` (`InvalidArgument`).
 
-**`PartitionFile`** (common.proto) is the upload's (the section above). PR 1's closed-partition status (`LocalPartition.files`) lists one per file, and `fenced_file` takes its `name`. A move sends the closed partition's whole set (main file, any WAL sidecars, the feed sidecar `-feed`), which the stamp installs only once complete. That's why feed history survives: the feed sidecar is bound to the database's id and holds the feed's sessions.
+**`PartitionFile`** (common.proto) is the upload's (the section above). PR 1's closed-partition status (`LocalPartition.files`) lists one per file, and `fenced_file` takes its `name`. A move sends the closed partition's whole set, which the stamp installs only once complete. With a change feed, as every cluster partition has, that's the main file, every `-wal-<n>` and the feed sidecar `-feed`: a clean close keeps the WAL files as the feed's retained history (D310 §2.1), so the set can be as large as the feed's retention, and the move's downtime grows with it. That's why feed history survives: the WAL holds the retained changes, and the feed sidecar, bound to the database's id, holds the feed's sessions.
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.
