@@ -13,6 +13,12 @@
 //!   `Replication.Follow`, embedding) and the request runtime's blocking pool (scans,
 //!   `read_row`, `/mcp` and the other sync client calls) stay on the free cores only:
 //!   [`Placement::enter`].
+//! - **A thread inherits its creator's mask.** A `std::thread` spawned from a request,
+//!   feed or hub worker starts on the shards' siblings too, so a heavy one calls
+//!   [`Placement::enter`] first, as the backups, bulk loads, index builds, text rebuilds and
+//!   `Replication.Follow` do (ai1249's S2 on #1738). An engine thread started from a
+//!   worker inherits the wide mask too, so a partition opened at run time (D317 ticket 6)
+//!   must open off the workers.
 
 use pigeonhole::Pigeonhole;
 
@@ -207,6 +213,12 @@ impl Placement {
     /// masks the thread to `network`, the free cores and the shards' siblings. Only workers
     /// unpark (Tokio's blocking pool never calls it), so the blocking pool stays on the free
     /// cores. After the first, it's a thread-local read.
+    ///
+    /// Nothing may call `tokio::task::block_in_place` (nothing in the workspace or its
+    /// dependencies does, ai1249 on #1738): a worker that gives up its core there goes back
+    /// to the blocking pool still widened, and a pool thread would then run heavy calls on
+    /// the siblings. A reapply (D317 ticket 6) can't re-widen workers through this hook
+    /// either, since `WIDENED` stays set: it masks workers and pool threads apart.
     pub(crate) fn unpark_network(&self) {
         thread_local! {
             static WIDENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

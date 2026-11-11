@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -108,6 +108,10 @@ pub(crate) struct Backups {
     /// Backups running at once (`--max-backups`).
     running: Arc<Semaphore>,
     reaper: Once,
+    /// Where the backup threads run: the free cores, off the shards' siblings (ai1249's S2
+    /// on #1738). They're spawned from a request worker, whose mask includes the siblings,
+    /// and a thread inherits its creator's mask.
+    placement: OnceLock<Arc<super::placement::Placement>>,
 }
 
 impl std::fmt::Debug for Backups {
@@ -139,6 +143,7 @@ impl Backups {
             kept: Mutex::new(HashMap::new()),
             running: Arc::new(Semaphore::new(max_backups.max(1))),
             reaper: Once::new(),
+            placement: OnceLock::new(),
         }))
     }
 
@@ -207,16 +212,29 @@ impl Backups {
         })
     }
 
+    /// Runs the backup threads on `placement`'s free cores ([`Placement::enter`]). The
+    /// first placement given holds.
+    ///
+    /// [`Placement::enter`]: super::placement::Placement::enter
+    pub(crate) fn place(&self, placement: &Arc<super::placement::Placement>) {
+        let _ = self.placement.set(Arc::clone(placement));
+    }
+
     /// Runs `backup` on a thread of its own, holding `permit`: never a blocking-pool thread
     /// (perf287's D1).
     fn spawn<T: Send + 'static>(
+        &self,
         permit: OwnedSemaphorePermit,
         backup: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<oneshot::Receiver<Result<T, ApiError>>, ApiError> {
         let (tx, rx) = oneshot::channel();
+        let placement = self.placement.get().cloned();
         std::thread::Builder::new()
             .name("phdb-serve-backup".into())
             .spawn(move || {
+                if let Some(p) = placement {
+                    p.enter();
+                }
                 let r = backup();
                 // The permit before the result: a requester that has its result and asks
                 // again at once must find the slot free, not `Overloaded` (#1527's H1 sent
@@ -233,7 +251,7 @@ impl Backups {
         &self,
         backup: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let rx = Self::spawn(self.permit()?, backup)?;
+        let rx = self.spawn(self.permit()?, backup)?;
         rx.await
             .unwrap_or_else(|_| Err(ApiError::internal("the backup's thread ended early")))
     }
@@ -260,9 +278,13 @@ impl Backups {
         self.start_reaper();
         let me = Arc::clone(self);
         let tid = id.clone();
+        let placement = self.placement.get().cloned();
         std::thread::Builder::new()
             .name("phdb-serve-backup".into())
             .spawn(move || {
+                if let Some(p) = placement {
+                    p.enter();
+                }
                 // Fails the copy unless it's finished: a failed backup, or a panic in one.
                 struct Pending {
                     backups: Arc<Backups>,
@@ -569,6 +591,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    /// A backup thread runs on the placement's free cores even when it's spawned from a
+    /// thread on a wider mask, as a request worker's is (ai1249's S2 on #1738): a thread
+    /// inherits its creator's mask. Linux only, where the masks are real.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_backup_thread_runs_on_the_free_cores() {
+        use pigeonhole::{Options, Pigeonhole};
+        let now = || {
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+            (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect::<Vec<usize>>()
+        };
+        let dir = fresh("backup-placement");
+        let db = Pigeonhole::open(
+            dir.join("p.phdb"),
+            Options::default().create_if_missing(true).shards(1),
+        )
+        .unwrap();
+        let placement = Arc::new(super::super::placement::Placement::plan(
+            &db, None, None, None, None, true,
+        ));
+        // No mask here (nothing pinned, or too few cores): nothing to check.
+        if let Some(free) = placement.masks.blocking.clone() {
+            let b = Backups::new(Some(&dir), 1).unwrap();
+            b.place(&placement);
+            // The spawning thread is on the process's CPUs, a shard's among them.
+            let process = now();
+            assert_ne!(process, free);
+            let rx = b.spawn(b.permit().unwrap(), move || Ok(now())).unwrap();
+            assert_eq!(rx.blocking_recv().unwrap().unwrap(), free);
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
