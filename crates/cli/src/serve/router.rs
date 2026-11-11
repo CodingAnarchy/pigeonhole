@@ -14,7 +14,7 @@ use super::cluster::route::Routes;
 use super::errors::ApiError;
 use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
-use super::service::{Service, ServiceOp, ServiceReply};
+use super::service::{Partition, Service, ServiceOp, ServiceReply};
 
 /// A cluster node's routing: the node (its map, routes and peers) and the partition it
 /// serves, if the map gives it one.
@@ -70,6 +70,97 @@ impl Router {
         self.cluster.as_ref().map(|c| &c.node)
     }
 
+    /// A cluster node's partitions open here, by id: none or one until D317's ticket 8a
+    /// gives a node several. Nothing on a single node, whose one database is the service's.
+    /// Its signature is fixed for 8a (simp724's A1 on 8b): callers iterate it, never
+    /// `Cluster::local` or `Service::part`.
+    pub(crate) fn partitions(&self) -> impl Iterator<Item = (&str, &Partition)> {
+        self.cluster
+            .as_ref()
+            .and_then(|c| c.local.as_deref())
+            .zip(self.service.part_opt())
+            .into_iter()
+    }
+
+    /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
+    /// node, ticket 2's `not_open` when the map gives it here but it isn't open, `NotFound`
+    /// when the map has no such partition.
+    pub(crate) fn partition(&self, id: &str) -> Result<&Partition, ApiError> {
+        let Some(cluster) = &self.cluster else {
+            return Err(ApiError::invalid("this server isn't a cluster node"));
+        };
+        let routes = cluster.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Err(ApiError::partition_unavailable(
+                "this cluster node has no map yet",
+            ));
+        };
+        let owner = routes.owner(id).ok_or_else(|| {
+            ApiError::not_found(format!("partition {id:?} isn't in the cluster map"))
+        })?;
+        if owner.node != cluster.node.id() {
+            return Err(ApiError::wrong_partition(
+                routes.map_version(),
+                format!("partition {id:?} is node {:?}'s", owner.node),
+            ));
+        }
+        self.partitions()
+            .find(|(p, _)| *p == id)
+            .map(|(_, part)| part)
+            .ok_or_else(|| not_open(id))
+    }
+
+    /// The metrics as Prometheus text (`/metrics`, `Admin.Metrics`): a cluster node's
+    /// partitions' each labelled by id (D317 ticket 8b), a single node's one unlabelled.
+    pub(crate) fn metrics_text(&self) -> String {
+        if self.cluster.is_none() {
+            return self.service.metrics_text(&self.service.single_parts());
+        }
+        let parts: Vec<_> = self.partitions().map(|(id, p)| (Some(id), p)).collect();
+        self.service.metrics_text(&parts)
+    }
+
+    /// A cluster node's `Admin.Backup` or `BackupDownload` (D317 ticket 8b): of a partition
+    /// this node holds, named by the request, and never forwarded. A backup's bytes don't
+    /// take a hop: `phdb cluster backup` asks each partition's owner from the map.
+    async fn backup(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        drop(self.service.admit(&op.admit(), caller, prepaid).await?);
+        let named = |partition: &str| {
+            if partition.is_empty() {
+                // Even on a node with one partition, so it stays the same under 8a.
+                return Err(ApiError::invalid(
+                    "a cluster node's backup names its partition (`partition`)",
+                ));
+            }
+            self.partition(partition)
+        };
+        let map_version = cluster
+            .node
+            .routes()
+            .as_ref()
+            .map_or(0, |r| r.map_version());
+        match op {
+            ServiceOp::Backup(r) => {
+                let part = named(&r.partition)?;
+                self.service.backup(part, r).await.map(ServiceReply::Backup)
+            }
+            ServiceOp::BackupDownload(r) => {
+                let part = named(&r.partition)?;
+                self.service
+                    .backup_download(part, r, Some(map_version))
+                    .await
+                    .map(ServiceReply::Download)
+            }
+            _ => Err(ApiError::internal("not a backup")),
+        }
+    }
+
     /// Answers `op` for `caller`, wherever its partition lives.
     pub(crate) async fn dispatch(
         &self,
@@ -108,6 +199,17 @@ impl Router {
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
                 ServiceOp::Subscribe(_) => {
                     return self.subscribe(cluster, op, caller, prepaid).await;
+                }
+                // Served where the partition is, never forwarded (D317 ticket 8b).
+                ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
+                    return self.backup(cluster, op, caller, prepaid).await;
+                }
+                // This node's own, every partition it holds labelled (D317 ticket 8b).
+                ServiceOp::Metrics(_) => {
+                    drop(self.service.admit(&op.admit(), caller, prepaid).await?);
+                    return Ok(ServiceReply::Metrics(super::proto::MetricsResponse {
+                        text: self.metrics_text(),
+                    }));
                 }
                 _ => {}
             }
@@ -512,7 +614,10 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         | ServiceOp::DescribeTable(_) => Err(later("the schema", 5)),
         // A cluster subscription is routed before this ([`Router::subscribe`]).
         ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
-        ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => Err(later("a backup", 8)),
+        // A backup is served before this ([`Router::backup`]).
+        ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
+            Err(ApiError::internal("a backup isn't routed by key"))
+        }
         _ => Err(ApiError::unsupported(
             "this call isn't served by a cluster node (D317)",
         )),

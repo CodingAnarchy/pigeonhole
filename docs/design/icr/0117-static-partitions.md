@@ -207,5 +207,25 @@
   - Digests never appear in logs or errors.
   - `--max-sessions` and `--max-sessions-per-token` count per node.
 
+## Ticket 8b: cluster backup, and metrics by partition
+**`Admin.Backup` and `Admin.BackupDownload` on a cluster node** (D317 §9) back up one partition the node holds. They're never forwarded: a backup's bytes don't take a hop.
+- **`BackupRequest.partition`** (field 3) and **`BackupDownloadRequest.partition`** (field 5) name the partition. A cluster node requires one, even when it holds just one partition (`InvalidArgument` without it). A single node refuses one (`InvalidArgument`).
+- **Refusals:** a partition the map gives another node is `WrongPartition { map_version }`. One the map gives this node but that isn't open here is ticket 2's `PartitionUnavailable`. One the map doesn't have is `NotFound`.
+- **What the last chunk says:** `BackupChunk.partition` (7), `cluster_id` (8) and `epoch` (9) come from the identity row (`__phdb_cluster`) of the same snapshot the copy is of. `map_version` (10) is the node's map version when the backup started. Earlier chunks leave them empty. A resume names the partition its copy is of; another is `InvalidArgument`.
+- **A cluster node takes `--backup-dir` and `--max-backups`** for its partition's backups, as a single node does.
+
+**`phdb cluster backup DIR --node URL [--durable] [--parallel N]`:**
+1. It reads the map from `--node` (V).
+2. It downloads every partition's copy from the node V gives it, at most N at once (default 4), resuming a broken stream, and checks each copy's SHA-256.
+3. Each copy's identity must be the map's: cluster, partition, and the partition's epoch at V. Otherwise the backup fails, naming both.
+4. It reads the map again (V′). V′ must have the same partitions, owners and epochs as V, and place every table both hold the same way. Otherwise it fails: "the map changed during the backup". Tables created or dropped in between are allowed.
+5. It writes `DIR/map.json` (V′, so a restore reconciles the copies against the map they were taken under: simp724's A2), and `DIR/manifest.json`:
+   - `cluster_id`, `map_version` (V′), `map_version_at_start` (V), `durable`, and `consistency`;
+   - and per partition: `file`, `node`, `epoch`, `bytes`, `sha256` and the node's map version.
+
+`DIR` must be new or empty. Copies are written as `<partition>.phdb.partial` and renamed once checked, and the manifest is written last, so a backup without one isn't whole. **Each partition's copy is a consistent snapshot of its own. The set is not one point in time across partitions.**
+
+**Metrics by partition:** on a cluster node, `/metrics` and `Admin.Metrics` label every per-partition series `pigeonhole_partition="<id>"`. That covers the engine's metrics (D323, through `pigeonhole-otel`'s `Config::attribute`, ICR 0133) and the serve feed fan-out's and bulk loads' gauges. Node-wide series (connections, replies, sessions) stay unlabelled. Each family's `# HELP`/`# TYPE` comes once, whatever the number of partitions. A single node's text is unchanged. On a cluster node, `Admin.Metrics` is answered by the node itself; it was `Unsupported` before.
+
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

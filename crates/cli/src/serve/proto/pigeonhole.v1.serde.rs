@@ -807,6 +807,18 @@ impl serde::Serialize for BackupChunk {
         if !self.feed_token.is_empty() {
             len += 1;
         }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        if !self.cluster_id.is_empty() {
+            len += 1;
+        }
+        if self.epoch != 0 {
+            len += 1;
+        }
+        if self.map_version != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BackupChunk", len)?;
         if !self.data.is_empty() {
             #[allow(clippy::needless_borrow)]
@@ -836,6 +848,22 @@ impl serde::Serialize for BackupChunk {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("feed_token", pbjson::private::base64::encode(&self.feed_token).as_str())?;
         }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if !self.cluster_id.is_empty() {
+            struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
+        }
+        if self.epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        if self.map_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("map_version", ToString::to_string(&self.map_version).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -854,6 +882,12 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
             "sha256",
             "feed_token",
             "feedToken",
+            "partition",
+            "cluster_id",
+            "clusterId",
+            "epoch",
+            "map_version",
+            "mapVersion",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -864,6 +898,10 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
             Offset,
             Sha256,
             FeedToken,
+            Partition,
+            ClusterId,
+            Epoch,
+            MapVersion,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -891,6 +929,10 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
                             "offset" => Ok(GeneratedField::Offset),
                             "sha256" => Ok(GeneratedField::Sha256),
                             "feedToken" | "feed_token" => Ok(GeneratedField::FeedToken),
+                            "partition" => Ok(GeneratedField::Partition),
+                            "clusterId" | "cluster_id" => Ok(GeneratedField::ClusterId),
+                            "epoch" => Ok(GeneratedField::Epoch),
+                            "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -916,6 +958,10 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
                 let mut offset__ = None;
                 let mut sha256__ = None;
                 let mut feed_token__ = None;
+                let mut partition__ = None;
+                let mut cluster_id__ = None;
+                let mut epoch__ = None;
+                let mut map_version__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Data => {
@@ -964,6 +1010,34 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ClusterId => {
+                            if cluster_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("clusterId"));
+                            }
+                            cluster_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Epoch => {
+                            if epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("epoch"));
+                            }
+                            epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MapVersion => {
+                            if map_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("mapVersion"));
+                            }
+                            map_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(BackupChunk {
@@ -973,6 +1047,10 @@ impl<'de> serde::Deserialize<'de> for BackupChunk {
                     offset: offset__.unwrap_or_default(),
                     sha256: sha256__.unwrap_or_default(),
                     feed_token: feed_token__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
+                    cluster_id: cluster_id__.unwrap_or_default(),
+                    epoch: epoch__.unwrap_or_default(),
+                    map_version: map_version__.unwrap_or_default(),
                 })
             }
         }
@@ -999,6 +1077,9 @@ impl serde::Serialize for BackupDownloadRequest {
         if self.replica {
             len += 1;
         }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BackupDownloadRequest", len)?;
         if self.durable {
             struct_ser.serialize_field("durable", &self.durable)?;
@@ -1013,6 +1094,9 @@ impl serde::Serialize for BackupDownloadRequest {
         }
         if self.replica {
             struct_ser.serialize_field("replica", &self.replica)?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
         }
         struct_ser.end()
     }
@@ -1029,6 +1113,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
             "backupId",
             "offset",
             "replica",
+            "partition",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -1037,6 +1122,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
             BackupId,
             Offset,
             Replica,
+            Partition,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1062,6 +1148,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                             "backupId" | "backup_id" => Ok(GeneratedField::BackupId),
                             "offset" => Ok(GeneratedField::Offset),
                             "replica" => Ok(GeneratedField::Replica),
+                            "partition" => Ok(GeneratedField::Partition),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1085,6 +1172,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                 let mut backup_id__ = None;
                 let mut offset__ = None;
                 let mut replica__ = None;
+                let mut partition__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Durable => {
@@ -1113,6 +1201,12 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                             }
                             replica__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(BackupDownloadRequest {
@@ -1120,6 +1214,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                     backup_id: backup_id__.unwrap_or_default(),
                     offset: offset__.unwrap_or_default(),
                     replica: replica__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
                 })
             }
         }
@@ -1140,12 +1235,18 @@ impl serde::Serialize for BackupRequest {
         if self.durable {
             len += 1;
         }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BackupRequest", len)?;
         if !self.path.is_empty() {
             struct_ser.serialize_field("path", &self.path)?;
         }
         if self.durable {
             struct_ser.serialize_field("durable", &self.durable)?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
         }
         struct_ser.end()
     }
@@ -1159,12 +1260,14 @@ impl<'de> serde::Deserialize<'de> for BackupRequest {
         const FIELDS: &[&str] = &[
             "path",
             "durable",
+            "partition",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Path,
             Durable,
+            Partition,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1188,6 +1291,7 @@ impl<'de> serde::Deserialize<'de> for BackupRequest {
                         match value {
                             "path" => Ok(GeneratedField::Path),
                             "durable" => Ok(GeneratedField::Durable),
+                            "partition" => Ok(GeneratedField::Partition),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1209,6 +1313,7 @@ impl<'de> serde::Deserialize<'de> for BackupRequest {
             {
                 let mut path__ = None;
                 let mut durable__ = None;
+                let mut partition__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Path => {
@@ -1223,11 +1328,18 @@ impl<'de> serde::Deserialize<'de> for BackupRequest {
                             }
                             durable__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(BackupRequest {
                     path: path__.unwrap_or_default(),
                     durable: durable__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
                 })
             }
         }

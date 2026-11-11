@@ -109,7 +109,7 @@ fn a_connection_past_the_cap_is_closed_and_counted() {
     );
     assert_eq!(conns.refused(), 1, "{}", counts(&s));
     assert_eq!(conns.open(), 2, "a refused connection holds no slot");
-    let text = s.shared.router.service.metrics_text();
+    let text = s.shared.router.metrics_text();
     for line in [
         "pigeonhole_serve_connections 2",
         "pigeonhole_serve_connections_max 2",

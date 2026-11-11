@@ -10,6 +10,7 @@ impl pigeonhole_otel::Collector
 pub fn pigeonhole_otel::Collector::collect(&self) -> alloc::vec::Vec<pigeonhole_otel::Point>
 pub fn pigeonhole_otel::Collector::rebind(&self, &pigeonhole::db::Pigeonhole)
 pub fn pigeonhole_otel::Collector::render_prometheus(&self, &mut alloc::string::String)
+pub fn pigeonhole_otel::Collector::render_prometheus_all(&[&pigeonhole_otel::Collector], &mut alloc::string::String)
 pub fn pigeonhole_otel::Collector::watch_feed(&self, impl core::convert::Into<alloc::string::String>, pigeonhole::feed::FeedProgress)
 impl core::fmt::Debug for pigeonhole_otel::Collector
 pub fn pigeonhole_otel::Collector::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -17,6 +18,7 @@ impl core::ops::drop::Drop for pigeonhole_otel::Collector
 pub fn pigeonhole_otel::Collector::drop(&mut self)
 pub struct pigeonhole_otel::Config
 impl pigeonhole_otel::Config
+pub fn pigeonhole_otel::Config::attribute(self, &'static str, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_otel::Config::collector(self, &pigeonhole::db::Pigeonhole) -> pigeonhole_otel::Collector
 pub fn pigeonhole_otel::Config::db_name(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn pigeonhole_otel::Config::latency_window(self, core::time::Duration) -> Self

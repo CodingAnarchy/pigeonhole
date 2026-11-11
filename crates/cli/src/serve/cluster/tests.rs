@@ -566,7 +566,20 @@ fn data_node_full(
         })
     });
     let service = match &db {
-        Some(db) => Service::new(db.clone(), limits, 2, Arc::clone(&metrics)),
+        Some(db) => {
+            // Its backups (D317 ticket 8b), beside the partition.
+            let backups = dir.join(format!("backups-{id}"));
+            std::fs::create_dir_all(&backups).unwrap();
+            Service::partition_node(
+                db.clone(),
+                local.expect("a partition's node"),
+                limits,
+                2,
+                Arc::clone(&metrics),
+            )
+            .backups(Some(&backups), 1)
+            .unwrap()
+        }
         None => Service::routing_only(limits, 2, Arc::clone(&metrics)),
     };
     let shared = Arc::new(Shared {
@@ -2285,4 +2298,6 @@ fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node()
     }
 }
 
+mod backup;
 mod feed;
+mod metrics;
