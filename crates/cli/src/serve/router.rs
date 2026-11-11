@@ -182,19 +182,37 @@ impl Router {
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
-            // A read across a table's partitions fans out (D317 ticket 4a); a subscription
-            // follows every partition it covers (ticket 7). One at a snapshot reads its
-            // partition only (ticket 3): a multi-get is routed and forwarded as a single-key
-            // call is, a scan streams that partition alone.
+            // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
+            // subscription follows every partition it covers (ticket 7). One at a snapshot
+            // reads its partition only (ticket 3): a multi-get is routed and forwarded as a
+            // single-key call is, a scan streams that partition alone, and a nearest search
+            // or traversal is refused by `route()`.
+            let fans = match &op {
+                ServiceOp::MultiGet(r) => snapshot_of(r.selection.as_ref()).is_none(),
+                ServiceOp::Nearest(r) => r.snapshot_id.is_empty(),
+                ServiceOp::Traverse(r) => r.snapshot_id.is_empty(),
+                _ => false,
+            };
             match &op {
-                ServiceOp::MultiGet(r) if snapshot_of(r.selection.as_ref()).is_none() => {
+                _ if fans => {
                     let deadline = deadline.map_or_else(
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
                     );
-                    return self
-                        .fan_multi_get(cluster, op, caller, prepaid, deadline)
-                        .await;
+                    return match op {
+                        ServiceOp::Nearest(_) => {
+                            self.fan_nearest(cluster, op, caller, prepaid, deadline)
+                                .await
+                        }
+                        ServiceOp::Traverse(_) => {
+                            self.fan_traverse(cluster, op, caller, prepaid, deadline)
+                                .await
+                        }
+                        _ => {
+                            self.fan_multi_get(cluster, op, caller, prepaid, deadline)
+                                .await
+                        }
+                    };
                 }
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
                 ServiceOp::Subscribe(_) => {
@@ -604,10 +622,15 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::Traverse(r) if !r.snapshot_id.is_empty() => Err(ApiError::unsupported(
             "a traversal at a snapshot isn't supported on a cluster",
         )),
-        ServiceOp::Nearest(_)
-        | ServiceOp::Traverse(_)
-        | ServiceOp::VectorSearch(_)
-        | ServiceOp::TextSearch(_) => Err(later("a read across partitions", 4)),
+        // One partition's part of a `Nearest` another node fans out (D317 ticket 4b): its
+        // keys, or a range clipped to the partition. A client's fans out before it gets here.
+        ServiceOp::Nearest(r) => nearest_partition(routes, r),
+        ServiceOp::Traverse(_) => Err(ApiError::internal(
+            "a fanned-out read isn't routed to one partition",
+        )),
+        // An index lives in one partition's file: searching one across a cluster waits for
+        // co-located tables (D317 §1, placement groups with ticket 5).
+        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(later("an index search", 5)),
         ServiceOp::ListTables(_)
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
@@ -620,6 +643,58 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         }
         _ => Err(ApiError::unsupported(
             "this call isn't served by a cluster node (D317)",
+        )),
+    }
+}
+
+/// The partition a forwarded `Nearest` names: all its keys', or its clipped range's, which
+/// must lie within one partition (the fanning-out node clipped it).
+fn nearest_partition(
+    routes: &Routes,
+    r: &super::proto::NearestRequest,
+) -> Result<String, ApiError> {
+    use super::proto::nearest_request::Source;
+    let one = |row: &[u8]| {
+        routes
+            .partition(&r.table, row)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ApiError::not_found(format!("table {:?} isn't in the cluster map", r.table))
+            })
+    };
+    let outside_one =
+        || ApiError::invalid("a forwarded nearest search reaches outside one partition");
+    match &r.source {
+        Some(Source::Keys(list)) => {
+            let mut parts = list.keys.iter().map(|k| one(k));
+            let first = parts
+                .next()
+                .ok_or_else(|| ApiError::invalid("a forwarded nearest search with no keys"))??;
+            for p in parts {
+                if p? != first {
+                    return Err(outside_one());
+                }
+            }
+            Ok(first)
+        }
+        Some(Source::Range(range)) => {
+            let Some(super::proto::key_range::Range::Bounds(b)) = &range.range else {
+                return Err(ApiError::invalid(
+                    "a forwarded nearest search's range is bounds",
+                ));
+            };
+            let lo = b.start.as_ref().map_or(&[][..], |s| &s.key[..]);
+            let hi = b.end.as_ref().map(|e| (&e.key[..], e.inclusive));
+            let span = routes.span(&r.table, lo, hi).ok_or_else(|| {
+                ApiError::not_found(format!("table {:?} isn't in the cluster map", r.table))
+            })?;
+            match span.as_slice() {
+                [p] => Ok((*p).to_owned()),
+                _ => Err(outside_one()),
+            }
+        }
+        None => Err(ApiError::invalid(
+            "a forwarded nearest search names no source",
         )),
     }
 }

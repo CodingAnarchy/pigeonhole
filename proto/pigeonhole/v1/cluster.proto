@@ -9,6 +9,7 @@ import "pigeonhole/v1/common.proto";
 import "pigeonhole/v1/feed.proto";
 import "pigeonhole/v1/schema.proto";
 import "pigeonhole/v1/transactions.proto";
+import "pigeonhole/v1/vector.proto";
 
 service Cluster {
   // The node's newest map. Read, admin or cluster scope.
@@ -182,6 +183,9 @@ message ForwardRequest {
     TxnAbortRequest abort = 15;
     OpenSnapshotRequest open_snapshot = 16;
     ReleaseSnapshotRequest release_snapshot = 17;
+    // One partition's part of a `Nearest` the sending node fans out (D317 ticket 4b): its
+    // keys, or the range clipped to the partition. After D317 ticket 3's arms.
+    NearestRequest nearest = 18;
   }
 }
 
@@ -226,6 +230,7 @@ message ForwardResponse {
     TxnCommitResponse commit = 8;
     OpenSnapshotResponse open_snapshot = 9;
     Empty empty = 10;
+    NearestResponse nearest = 11;
   }
 }
 

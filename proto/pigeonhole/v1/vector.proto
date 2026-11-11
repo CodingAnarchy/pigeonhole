@@ -37,6 +37,10 @@ message NearestRequest {
   // qualifier and 16 bytes): 0 is the server's default, 1 MiB, and the server caps it at
   // 8 MiB.
   uint64 page_bytes = 8;
+  // On a cluster node (D317 §7): skip a partition that can't be reached, and name its range
+  // in the reply's `missing`, rather than fail with `PartitionUnavailable`. The result is
+  // then the exact top `k` of what was reached. A single node ignores it.
+  bool allow_partial = 9;
 }
 
 message KeyList {
@@ -46,6 +50,8 @@ message KeyList {
 message NearestResponse {
   repeated Neighbour neighbours = 1;
   bool cut_by_budget = 2;
+  // With `allow_partial`, on a cluster node: the partitions skipped (D317 §7).
+  repeated MissingRange missing = 3;
 }
 
 message Neighbour {
