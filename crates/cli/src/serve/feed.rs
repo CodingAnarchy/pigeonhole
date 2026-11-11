@@ -465,6 +465,10 @@ struct Driver {
 impl Driver {
     /// Where the task should run now, if not where it is: on the hub runtime at once with two
     /// or more clients, back on the feed runtime after `solo_after` with at most one.
+    ///
+    /// Asked only after a commit, so a hub left alone on the hub runtime by a quiet table
+    /// stays there until its next commit. That's harmless: with no commits there's no
+    /// handoff to save (perf287's N1 on #1716).
     fn moves(&mut self, hub: &Hub) -> Option<Place> {
         self.runtimes.as_ref()?;
         let members = hub.members.load(Ordering::Relaxed);
@@ -520,15 +524,16 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                     {
                         d.place = to;
                         d.alone = None;
-                        hub.solo.store(to == Place::Feed, Ordering::Relaxed);
-                        hub.stats.hub_moves.fetch_add(1, Ordering::Relaxed);
                         let rt = if to == Place::Feed { feed } else { hubs };
                         // Under the task's lock and holding `hub`: the hub can't drop (and
                         // abort the old handle) before the new task's handle is in place. A
                         // hub failed meanwhile (`fail_all` aborts the handle it finds, this
-                        // one, which is past its last await) stops here instead.
+                        // one, which is past its last await) stops here instead, its place
+                        // and the count as they were (perf287's N2 on #1716).
                         let mut task = hub.task();
                         if !hub.ring().failed {
+                            hub.solo.store(to == Place::Feed, Ordering::Relaxed);
+                            hub.stats.hub_moves.fetch_add(1, Ordering::Relaxed);
                             *task = rt.spawn(drive(d)).abort_handle();
                         }
                         return;
