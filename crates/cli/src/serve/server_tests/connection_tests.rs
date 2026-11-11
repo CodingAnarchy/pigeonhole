@@ -219,3 +219,31 @@ fn an_idle_keep_alive_connection_is_closed_after_the_request_timeout() {
     let mut next = connect(&s);
     health(&mut next);
 }
+
+/// #1719: `/metrics` reports the hub runtime's threads from the server's placement, as
+/// `--feed-hub-threads` set them.
+#[test]
+fn metrics_report_the_feed_hub_threads() {
+    let dir = test_dir();
+    let db = Pigeonhole::open(
+        dir.join("p.phdb"),
+        Options::default().create_if_missing(true).shards(1),
+    )
+    .unwrap();
+    let plan = Arc::new(crate::serve::placement::Placement::plan(
+        &db,
+        None,
+        None,
+        Some(2),
+        Some(3),
+        true,
+    ));
+    let s = Server::start_custom("", limits(), 1, move |svc| svc.placement(&plan));
+    let text = s.shared.router.metrics_text();
+    assert!(
+        text.contains("pigeonhole_serve_feed_hub_threads 3\n"),
+        "{text}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
