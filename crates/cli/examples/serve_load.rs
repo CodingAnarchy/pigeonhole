@@ -917,6 +917,7 @@ async fn load(
                 ..Default::default()
             }],
             if_missing: true,
+            placement: None,
         })
         .await;
     match created {

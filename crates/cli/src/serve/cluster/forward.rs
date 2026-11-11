@@ -288,11 +288,14 @@ fn refused_unprocessed(status: &tonic::Status) -> bool {
     false
 }
 
-/// `caller` as a forward carries it: only data calls are forwarded, so a read or write scope
-/// (an admin may make any data call, so it goes as `write`; a cluster token makes none).
+/// `caller` as a forward carries it: its scope (a cluster token makes no data or schema
+/// call) and its namespaces.
 pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiError> {
     let scope = match caller.scope {
         Scope::Read => "read",
+        // An admin may make any data call a write token may. A schema change at the map's
+        // writer takes the caller's scope from the writer's own token entry (D317 amendment
+        // 1), never from the message.
         Scope::Write | Scope::Admin => "write",
         Scope::Cluster => {
             return Err(ApiError::permission_denied(
@@ -364,6 +367,39 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<C
     Ok(caller)
 }
 
+/// The caller of a schema change forwarded to the map's writer (D317 amendment 1): this
+/// node's own entry for the token's digest, uncapped, so the writer checks a drop's `admin`
+/// itself, as a single node does. [`ForwardedCaller`]'s scope stays `read` or `write`: no
+/// forward carries `admin`. Without tokens anywhere, the caller is anyone, with every scope,
+/// as on a single node without tokens. A digest this node doesn't list, a digest sent to a
+/// node without tokens, or a `cluster` token, is refused.
+pub(crate) fn schema_caller_of(
+    f: Option<ForwardedCaller>,
+    tokens: &Tokens,
+) -> Result<Caller, ApiError> {
+    let f = f.ok_or_else(|| ApiError::invalid("a forward names no caller"))?;
+    if !tokens.any() {
+        if !f.token_digest.is_empty() {
+            return Err(ApiError::unlisted_token());
+        }
+        return Ok(Caller::anonymous());
+    }
+    let digest: [u8; 32] = f
+        .token_digest
+        .as_ref()
+        .try_into()
+        .map_err(|_| ApiError::unlisted_token())?;
+    let caller = tokens
+        .caller_by_digest(&digest)
+        .ok_or_else(ApiError::unlisted_token)?;
+    if caller.scope == Scope::Cluster {
+        return Err(ApiError::permission_denied(
+            "make a schema call with a cluster token",
+        ));
+    }
+    Ok(caller)
+}
+
 /// A routed call as a forward's op. Only what [`crate::serve::router`] routes reaches here.
 pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiError> {
     use forward_request::Op;
@@ -384,6 +420,8 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::OpenSnapshot(r) => Op::OpenSnapshot(r),
         ServiceOp::ReleaseSnapshot(r) => Op::ReleaseSnapshot(r),
         ServiceOp::Nearest(r) => Op::Nearest(r),
+        ServiceOp::CreateTable(r) => Op::CreateTable(r),
+        ServiceOp::DropTable(r) => Op::DropTable(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -414,6 +452,8 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::OpenSnapshot(r) => ServiceOp::OpenSnapshot(r),
             Op::ReleaseSnapshot(r) => ServiceOp::ReleaseSnapshot(r),
             Op::Nearest(r) => ServiceOp::Nearest(r),
+            Op::CreateTable(r) => ServiceOp::CreateTable(r),
+            Op::DropTable(r) => ServiceOp::DropTable(r),
         },
     )
 }
@@ -435,6 +475,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Begin(r) => Reply::Begin(r),
         ServiceReply::Commit(r) => Reply::Commit(r),
         ServiceReply::OpenSnapshot(r) => Reply::OpenSnapshot(r),
+        ServiceReply::Table(r) => Reply::Table(r),
         ServiceReply::Empty(r) => Reply::Empty(r),
         ServiceReply::Nearest(r) => Reply::Nearest(r),
         _ => {
@@ -463,6 +504,7 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Begin(r) => ServiceReply::Begin(r),
             Reply::Commit(r) => ServiceReply::Commit(r),
             Reply::OpenSnapshot(r) => ServiceReply::OpenSnapshot(r),
+            Reply::Table(r) => ServiceReply::Table(r),
             Reply::Empty(r) => ServiceReply::Empty(r),
             Reply::Nearest(r) => ServiceReply::Nearest(r),
         },

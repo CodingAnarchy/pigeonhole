@@ -53,6 +53,13 @@ pub(crate) enum ClusterCommand {
         file: PathBuf,
         #[command(flatten)]
         node: NodeArgs,
+        /// Recovery when the map's writer (the node with the smallest id) is down: set the
+        /// map at `--node` rather than the writer. Its version is put above every reachable
+        /// node's, and it must name a reachable writer (remove the down one, or let another
+        /// id be the smallest). Only for a writer that's down: a writer that's up and cut
+        /// off can change the map meanwhile, and its change is lost (D317 amendment 1).
+        #[arg(long)]
+        force: bool,
     },
     /// Print a node's map, or a map file's (a down node's `DIR/cluster-map.json`).
     ShowMap {
@@ -97,12 +104,12 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             partition,
             epoch,
         } => init_partition(cli, file, cluster_id, partition, *epoch),
-        ClusterCommand::SetMap { file, node } => {
+        ClusterCommand::SetMap { file, node, force } => {
             let json = std::fs::read_to_string(file)
                 .map_err(|e| Failure::io(&format!("read {}", file.display()), &e))?;
             let m = map::parse_json(&json).map_err(|e| Failure::usage(&e))?;
             map::validate(&m, false).map_err(|e| Failure::usage(&e))?;
-            runtime()?.block_on(set_map(node, m))
+            runtime()?.block_on(set_map(node, m, *force))
         }
         ClusterCommand::ShowMap {
             file,
@@ -295,30 +302,106 @@ pub(super) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Reque
     Ok(req)
 }
 
-async fn set_map(args: &NodeArgs, m: ClusterMap) -> Result<Report, Failure> {
+/// A node's URL from its map address, in the scheme `--node` uses.
+fn url_of(args: &NodeArgs, address: &str) -> String {
+    let scheme = if args.node.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://{address}")
+}
+
+pub(crate) async fn set_map(
+    args: &NodeArgs,
+    mut m: ClusterMap,
+    force: bool,
+) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
-    // Compare-and-set against the node's current version: 0 when it has no map yet.
     let current = match c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
         .await
     {
-        Ok(r) => r.into_inner().map_version,
-        Err(s) if s.code() == tonic::Code::NotFound => 0,
+        Ok(r) => Some(r.into_inner()),
+        Err(s) if s.code() == tonic::Code::NotFound => None,
         Err(s) => return Err(Failure::usage(&format!("{}: {}", args.node, s.message()))),
     };
-    let reply = c
-        .set_map(request(
+    let mut at = args.node.clone();
+    let reply = if force {
+        // Above every reachable node's version, and naming a writer that's reachable.
+        let mut ids: Vec<(String, String)> = Vec::new();
+        for n in current.iter().flat_map(|c| &c.nodes).chain(&m.nodes) {
+            if !ids.iter().any(|(id, _)| *id == n.id) {
+                ids.push((n.id.clone(), n.address.clone()));
+            }
+        }
+        let mut top = current.as_ref().map_or(0, |c| c.map_version);
+        let mut live = Vec::new();
+        for (id, address) in &ids {
+            let got = async {
+                let (mut c, token) = connect(args, &url_of(args, address)).await?;
+                c.status(request(StatusRequest {}, token.as_deref())?)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|s| Failure::usage(s.message()))
+            }
+            .await;
+            if let Ok(s) = got {
+                top = top.max(s.map_version);
+                live.push(id.clone());
+            }
+        }
+        let w = super::schema::writer(&m).to_owned();
+        if !live.contains(&w) {
+            return Err(Failure::usage(&format!(
+                "the map's writer would be node {w:?} (the smallest id), which can't be \
+                 reached: a forced map must name a writer that's up (remove the down node, \
+                 or give the writer's role to another id)"
+            )));
+        }
+        m.map_version = m.map_version.max(top + 1);
+        c.set_map(request(
             SetMapRequest {
-                expected_map_version: current,
+                expected_map_version: 0,
                 map: Some(m),
+                force: true,
             },
             token.as_deref(),
         )?)
         .await
         .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
-        .into_inner();
+        .into_inner()
+    } else {
+        // Compare-and-set against the current version (0 before a first map), at the map's
+        // writer (D317 amendment 1).
+        let expected = current.as_ref().map_or(0, |c| c.map_version);
+        if let Some(cur) = &current {
+            let w = super::schema::writer(cur);
+            let address = cur
+                .nodes
+                .iter()
+                .find(|n| n.id == w)
+                .map(|n| n.address.clone())
+                .unwrap_or_default();
+            at = url_of(args, &address);
+            if at != args.node {
+                c = connect(args, &at).await?.0;
+            }
+        }
+        c.set_map(request(
+            SetMapRequest {
+                expected_map_version: expected,
+                map: Some(m),
+                force: false,
+            },
+            token.as_deref(),
+        )?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{at}: {}", s.message())))?
+        .into_inner()
+    };
     let summary = vec![
-        ("node", json!(args.node)),
+        ("node", json!(at)),
         ("map_version", json!(reply.map_version)),
         (
             "pushed",

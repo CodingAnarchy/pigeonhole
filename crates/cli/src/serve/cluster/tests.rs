@@ -122,6 +122,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             families: Vec::new(),
             splits: vec![text("m")],
             partitions: vec!["p1".into(), "p2".into()],
+            created: 0,
         }],
     }
 }
@@ -183,6 +184,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let r = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                force: false,
                 expected_map_version: 0,
                 map: Some(the_map(1, &ports)),
             })
@@ -196,9 +198,10 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert_eq!(read_map(&dirs[1]).unwrap().unwrap().map_version, 1);
 
         // A stale compare-and-set is a Conflict (ABORTED), not applied.
-        let e = client(ports[1])
+        let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                force: false,
                 expected_map_version: 0,
                 map: Some(the_map(2, &ports)),
             })
@@ -207,6 +210,20 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert_eq!(e.code(), tonic::Code::Aborted, "{e:?}");
         assert!(e.message().contains("version 1"), "{e:?}");
         assert_eq!(version(ports[1]).await, 1);
+        // Only the map's writer, a (the smallest id), sets a map (D317 amendment 1): b
+        // answers WrongPartition naming it.
+        let e = client(ports[1])
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(the_map(2, &ports)),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "WrongPartition", "{e:?}");
+        assert!(e.message().contains("node a"), "{e:?}");
+        assert_eq!(version(ports[1]).await, 1);
 
         // Reshaping a placement is refused; so is a map that goes back.
         let mut reshaped = the_map(2, &ports);
@@ -214,6 +231,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                force: false,
                 expected_map_version: 1,
                 map: Some(reshaped),
             })
@@ -245,6 +263,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         client(ports[0])
             .await
             .set_map(SetMapRequest {
+                force: false,
                 expected_map_version: 1,
                 map: Some(v2.clone()),
             })
@@ -468,7 +487,7 @@ fn data_node_with(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
-    data_node_full(rt, dir, id, local, listener, "", limits, None)
+    data_node_full(rt, dir, id, local, listener, "", limits, None, false)
 }
 
 /// [`data_node_with`], serving `db` if given (the same node's database again, after its
@@ -486,7 +505,7 @@ fn data_node_on(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
-    data_node_full(rt, dir, id, local, listener, "", limits, db)
+    data_node_full(rt, dir, id, local, listener, "", limits, db, false)
 }
 
 /// [`data_node`] with the token file `tokens` (empty: none), for its clients and its peers.
@@ -502,7 +521,7 @@ fn data_node_tokens(
     Option<pigeonhole::Pigeonhole>,
 ) {
     let limits = crate::serve::server_tests::limits();
-    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None, false)
 }
 
 /// [`data_node`] with the token file `tokens` and under `limits`.
@@ -518,7 +537,7 @@ fn data_node_limits(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
-    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None, false)
 }
 
 /// Every test data node: `tokens` (empty: none), `limits`, and `db` if given.
@@ -532,6 +551,7 @@ fn data_node_full(
     tokens: &str,
     limits: crate::serve::config::Limits,
     db: Option<pigeonhole::Pigeonhole>,
+    restart: bool,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
@@ -579,11 +599,18 @@ fn data_node_full(
         None => Service::routing_only(limits, 2, Arc::clone(&metrics)),
     };
     let shared = Arc::new(Shared {
-        router: Router::cluster(service, node, local.map(str::to_owned)),
+        router: Router::cluster(service, Arc::clone(&node), local.map(str::to_owned)),
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
     });
+    super::schema::attach(&node, &shared);
+    // A restart with a map: the node takes its peers' newer maps, as `run` has it.
+    let start = if restart {
+        super::start_sync(&node, node.get_map().map_or(0, |m| m.map_version))
+    } else {
+        None
+    };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let app = crate::serve::http::router(shared);
     rt.spawn(async move {
@@ -605,6 +632,10 @@ fn data_node_full(
         )
         .await;
     });
+    if let Some(start) = start {
+        let _in = rt.enter();
+        start();
+    }
     (stop, db)
 }
 
@@ -760,7 +791,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("ticket 5"), "{e}");
+        assert!(e.message().contains("Vectors.Nearest"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
@@ -2818,6 +2849,7 @@ fn split_nodes(
             families: Vec::new(),
             splits: splits.iter().map(|s| text(s)).collect(),
             partitions: (0..n).map(|i| format!("q{i}")).collect(),
+            created: 0,
         }],
     };
     let mut stops = Vec::new();
@@ -2934,6 +2966,449 @@ fn a_nearest_search_over_many_partitions_merges_their_answers_as_they_arrive() {
     drop(t);
     oracle.close().unwrap();
     for db in dbs {
+        let _ = db.close();
+    }
+}
+
+// ---- D317 ticket 5: schema in the map ----
+
+#[test]
+fn schema_calls_change_the_map_and_every_partition_follows_it() {
+    // D317 §5 through the nodes: a create, an added family, a drop and a create again under
+    // the same name, each through a different entry node; every node lists and describes
+    // the map's tables, and every partition's file follows the map. A hand-made table is
+    // left alone, and a create over a hand-made table of its name is reported as taken
+    // over. Two creates through two nodes at once both land (simp724's S2).
+    use super::proto::{
+        CreateTableRequest, DescribeTableRequest, DropTableRequest, FamilySpec, ListTablesRequest,
+        TablePlacementRequest, schema_client::SchemaClient,
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, dbs) = three_nodes(&rt);
+    // Made by hand in p2's file: one the map never places, one it will.
+    for name in ["manual", "collide"] {
+        dbs[1]
+            .table(name)
+            .unwrap()
+            .family("f", pigeonhole::Family::default())
+            .create()
+            .unwrap();
+    }
+    let has = |db: &pigeonhole::Pigeonhole, t: &str| db.tables().iter().any(|n| n == t);
+    let fams = |names: &[&str]| -> Vec<FamilySpec> {
+        names
+            .iter()
+            .map(|n| FamilySpec {
+                name: (*n).into(),
+                ..Default::default()
+            })
+            .collect()
+    };
+    rt.block_on(async {
+        let schema = |port: u16| async move {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            SchemaClient::new(channel)
+        };
+        let create = |name: &str,
+                      families: Vec<FamilySpec>,
+                      placement: Option<TablePlacementRequest>,
+                      if_missing| CreateTableRequest {
+            name: name.into(),
+            families,
+            if_missing,
+            placement,
+        };
+        let on = |splits: &[&[u8]], partitions: &[&str]| {
+            Some(TablePlacementRequest {
+                group: String::new(),
+                splits: splits.iter().map(|s| s.to_vec().into()).collect(),
+                partitions: partitions.iter().map(|p| (*p).into()).collect(),
+            })
+        };
+        // A create through node c: `orders` split at "k" over p1 and p3.
+        let made = schema(ports[2])
+            .await
+            .create_table(create(
+                "orders",
+                fams(&["f"]),
+                on(&[b"k"], &["p1", "p3"]),
+                false,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(made.unreconciled.is_empty(), "{made:?}");
+        assert!(has(&dbs[0], "orders") && has(&dbs[2], "orders") && !has(&dbs[1], "orders"));
+        for &port in &ports {
+            let mut s = schema(port).await;
+            let list = s
+                .list_tables(ListTablesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .tables;
+            assert_eq!(list, ["orders", "users"], "node at {port}");
+            let d = s
+                .describe_table(DescribeTableRequest {
+                    name: "orders".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(d.families.len(), 1);
+        }
+        // Rows of it, written and read through other nodes.
+        for (row, port) in [(b"a1".as_slice(), ports[1]), (b"z1".as_slice(), ports[0])] {
+            let mut w = put_row(std::str::from_utf8(row).unwrap(), "v");
+            w.row.as_mut().unwrap().table = "orders".into();
+            data(port)
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(w),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let in_file = |db: &pigeonhole::Pigeonhole, row: &[u8]| {
+            db.table("orders")
+                .unwrap()
+                .open()
+                .unwrap()
+                .get(row, "f", b"q")
+                .unwrap()
+                .is_some()
+        };
+        assert!(in_file(&dbs[0], b"a1") && in_file(&dbs[2], b"z1"));
+        // Refused: a create of an existing table, and one the map doesn't place without a
+        // placement.
+        let e = schema(ports[0])
+            .await
+            .create_table(create("orders", fams(&["f"]), None, false))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "TableExists", "{e}");
+        let e = schema(ports[0])
+            .await
+            .create_table(create("nowhere", fams(&["f"]), None, false))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        // A family added through node a.
+        schema(ports[0])
+            .await
+            .create_table(create("orders", fams(&["f", "g"]), None, true))
+            .await
+            .unwrap();
+        for db in [&dbs[0], &dbs[2]] {
+            let t = db.table("orders").unwrap().open().unwrap();
+            assert!(t.families().contains(&"g"));
+        }
+        // Dropped through node b, and made again on p2 only.
+        schema(ports[1])
+            .await
+            .drop_table(DropTableRequest {
+                name: "orders".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!has(&dbs[0], "orders") && !has(&dbs[2], "orders"));
+        schema(ports[1])
+            .await
+            .create_table(create("orders", fams(&["f"]), on(&[], &["p2"]), false))
+            .await
+            .unwrap();
+        assert!(has(&dbs[1], "orders") && !has(&dbs[0], "orders") && !has(&dbs[2], "orders"));
+        // A create over the hand-made `collide` in p2: the map takes it over, and says so.
+        schema(ports[0])
+            .await
+            .create_table(create("collide", fams(&["f"]), on(&[], &["p2"]), false))
+            .await
+            .unwrap();
+        let status = client(ports[1])
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p2 = status.partitions.iter().find(|p| p.id == "p2").unwrap();
+        assert_eq!(p2.adopted_tables, ["collide"], "{p2:?}");
+        assert_eq!(p2.unmapped_tables, ["manual"], "{p2:?}");
+        assert!(p2.reconcile_errors.is_empty(), "{p2:?}");
+        assert!(has(&dbs[1], "manual"));
+        // Concurrent schema changes through every node (D317 amendment 1): twelve creates
+        // at once, four through each node, all land, and every node ends with the same map,
+        // with no divergence. Before the single writer, two entry nodes' compare-and-sets
+        // each made the same next version, and one table was lost.
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..12usize {
+            let (port, part) = (ports[i % 3], ["p1", "p2", "p3"][i % 3]);
+            let req = create(&format!("c{i}"), fams(&["f"]), on(&[], &[part]), false);
+            tasks.spawn(async move { (i, schema(port).await.create_table(req).await) });
+        }
+        while let Some(done) = tasks.join_next().await {
+            let (i, r) = done.unwrap();
+            r.unwrap_or_else(|e| panic!("create c{i}: {e}"));
+        }
+        let mut maps = Vec::new();
+        for &port in &ports {
+            eventually("every node to take the last map", async || {
+                version(port).await == version(ports[0]).await
+            })
+            .await;
+            let m = client(port)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let s = client(port)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(s.divergent.is_empty(), "{s:?}");
+            maps.push(m);
+        }
+        assert!(maps.windows(2).all(|w| w[0] == w[1]), "{maps:?}");
+        for i in 0..12 {
+            let name = format!("c{i}");
+            assert!(maps[0].tables.iter().any(|t| t.name == name), "{name}");
+            assert!(has(&dbs[i % 3], &name), "{name} in its partition");
+        }
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn a_writer_that_restarts_with_a_map_sets_none_until_it_has_its_peers_maps() {
+    // simp724's N4 on #1720: the synced gate, held. `start_sync` gives what runs once the
+    // node serves; until that has run (here: until the test runs it), the writer refuses to
+    // set a map, as a writer back from a forced recovery must until it has the forced map.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let dir = test_dir();
+    super::write_map(&dir, &super::map::canonical_json(&the_map(1, &ports))).unwrap();
+    // a, the writer, restarts with version 1 on disk; b and c are down.
+    let a = node(&dir, "a");
+    let mut listeners = listeners.into_iter();
+    let _stop = serve(&rt, &a, listeners.next().unwrap());
+    let start = super::start_sync(&a, 1).expect("a node with a map syncs at start");
+    let set = |version: u64| SetMapRequest {
+        force: false,
+        expected_map_version: version - 1,
+        map: Some(the_map(version, &ports)),
+    };
+    rt.block_on(async {
+        let e = client(ports[0]).await.set_map(set(2)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e:?}");
+        assert!(e.message().contains("still taking"), "{e:?}");
+        assert_eq!(version(ports[0]).await, 1);
+    });
+    // The sync runs (its peers are down: each fetch times out), and the gate opens.
+    rt.block_on(async {
+        start();
+        eventually("node a to finish its start", async || {
+            client(ports[0]).await.set_map(set(2)).await.is_ok()
+        })
+        .await;
+        assert_eq!(version(ports[0]).await, 2);
+    });
+}
+
+#[test]
+fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
+    // D317 amendment 1's recovery: with the writer (a, the smallest id) down, schema calls
+    // can't be made; `set-map --force` at another node sets a map without a, above every
+    // reachable node's version, and b becomes the writer. A forced map that still names the
+    // down writer is refused. When a comes back with its old map, it takes the forced one
+    // from its peers and changes no map itself: a schema call through it reaches b.
+    use super::proto::{CreateTableRequest, FamilySpec, TablePlacementRequest};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let map = three_way(&ports);
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let limits = crate::serve::server_tests::limits();
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, p)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", "p1"), ("b", "p2"), ("c", "p3")])
+    {
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, "", limits, None, false);
+        stops.push(Some(stop));
+        dbs.push(db);
+    }
+    let create = |name: &str, partition: &str| CreateTableRequest {
+        name: name.into(),
+        families: vec![FamilySpec {
+            name: "f".into(),
+            ..Default::default()
+        }],
+        if_missing: false,
+        placement: Some(TablePlacementRequest {
+            group: String::new(),
+            splits: Vec::new(),
+            partitions: vec![partition.into()],
+        }),
+    };
+    let schema = |port: u16| async move {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        super::proto::schema_client::SchemaClient::new(channel)
+    };
+    let args = |port: u16| super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{port}"),
+        token_file: None,
+        ca: None,
+    };
+    rt.block_on(async {
+        // Through c, made by a.
+        schema(ports[2])
+            .await
+            .create_table(create("t0", "p3"))
+            .await
+            .unwrap();
+    });
+    // The writer stops.
+    let _ = stops[0].take().unwrap().send(());
+    let a_db = dbs[0].take();
+    rt.block_on(async {
+        eventually("node a to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", ports[0]))
+                .await
+                .is_err()
+        })
+        .await;
+        let e = schema(ports[2])
+            .await
+            .create_table(create("t1", "p3"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let current = client(ports[1])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        // A forced map that still names a as its writer is refused, and changes nothing.
+        let Err(e) = super::cli::set_map(&args(ports[1]), current.clone(), true).await else {
+            panic!("a forced map naming a writer that's down was set");
+        };
+        assert!(format!("{e:?}").contains("can't be"), "{e:?}");
+        // Without a: p1 moves to b at a new epoch; the version comes out above every
+        // reachable node's, whatever the file says.
+        let mut forced = current.clone();
+        forced.map_version = 1;
+        forced.nodes.retain(|n| n.id != "a");
+        for p in &mut forced.partitions {
+            if p.id == "p1" {
+                p.node = "b".into();
+                p.epoch += 1;
+            }
+        }
+        if let Err(e) = super::cli::set_map(&args(ports[1]), forced, true).await {
+            panic!("the forced map: {e:?}");
+        }
+        let v = current.map_version + 1;
+        assert_eq!((version(ports[1]).await, version(ports[2]).await), (v, v));
+        // Schema calls work again, through b, the writer now.
+        schema(ports[2])
+            .await
+            .create_table(create("t1", "p3"))
+            .await
+            .unwrap();
+        assert!(dbs[2].as_ref().unwrap().tables().iter().any(|t| t == "t1"));
+    });
+    // a comes back with its old map, takes the forced one, and follows it.
+    let l = std::net::TcpListener::bind(("127.0.0.1", ports[0])).unwrap();
+    let (stop, _) = data_node_full(&rt, &dirs[0], "a", Some("p1"), l, "", limits, a_db, true);
+    stops[0] = Some(stop);
+    rt.block_on(async {
+        let newest = version(ports[1]).await;
+        eventually("node a to take the forced map", async || {
+            version(ports[0]).await == newest
+        })
+        .await;
+        // It isn't the writer: a set-map there is refused, naming b.
+        let at_a = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let e = client(ports[0])
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: at_a.map_version,
+                map: Some(ClusterMap {
+                    map_version: at_a.map_version + 1,
+                    ..at_a.clone()
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "WrongPartition", "{e:?}");
+        assert!(e.message().contains("node b"), "{e:?}");
+        // A schema call through a reaches b. b and c end on one map, none divergent; a,
+        // no longer in the map, isn't pushed to, and stays at the forced map: it wrote none.
+        schema(ports[0])
+            .await
+            .create_table(create("t2", "p3"))
+            .await
+            .unwrap();
+        let last = version(ports[1]).await;
+        assert_eq!(last, newest + 1);
+        assert_eq!(version(ports[0]).await, newest);
+        let mut maps = Vec::new();
+        for &port in &ports[1..] {
+            eventually("every node to take the last map", async || {
+                version(port).await == last
+            })
+            .await;
+            let s = client(port)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(s.divergent.is_empty(), "{s:?}");
+            maps.push(
+                client(port)
+                    .await
+                    .get_map(GetMapRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            );
+        }
+        assert!(maps.windows(2).all(|w| w[0] == w[1]), "{maps:?}");
+        assert!(maps[0].tables.iter().any(|t| t.name == "t2"));
+        assert!(!maps[0].nodes.iter().any(|n| n.id == "a"));
+    });
+    for db in dbs.into_iter().flatten() {
         let _ = db.close();
     }
 }
