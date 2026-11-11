@@ -1316,6 +1316,9 @@ impl Service {
     ) -> Result<Self, String> {
         if let Some(part) = &mut self.part {
             part.backups = super::backup::Backups::new(dir, max_backups)?;
+            if let Some(p) = &self.placement {
+                part.backups.place(p);
+            }
         }
         Ok(self)
     }
@@ -1333,6 +1336,7 @@ impl Service {
             indexes.pause_rebalancing(paused);
             part.indexes = Arc::new(indexes);
             part.bulk.placement = Some(Arc::clone(placement));
+            part.backups.place(placement);
         }
         self.placement = Some(Arc::clone(placement));
         self

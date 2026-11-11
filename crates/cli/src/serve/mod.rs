@@ -204,6 +204,19 @@ fn memory(
     Ok(Some(slot))
 }
 
+/// The startup line's tail when the request runtime's workers also run on the shards' SMT
+/// siblings (#1734): `; network threads also on the shards' 4 SMT siblings (4-9,16-25)`,
+/// with the workers' whole CPU list.
+fn sibling_line(placement: &placement::Placement) -> String {
+    match placement.network_cpu_list() {
+        Some(cpus) if placement.sibling_cpus > 0 => format!(
+            "; network threads also on the shards' {} SMT siblings ({cpus})",
+            placement.sibling_cpus
+        ),
+        _ => String::new(),
+    }
+}
+
 /// `--embed-local`'s threads on `free` CPUs: `pigeonhole-embed`'s default bound, 4, since one
 /// text doesn't split well across more (D318: 32 threads were slower than 4).
 fn embed_threads(free: usize) -> usize {
@@ -497,13 +510,15 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         start,
     } = s;
     let enter = Arc::clone(&placement);
+    let unpark = Arc::clone(&placement);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.io_threads)
         // Tokio's own blocking threads (file I/O, `spawn_blocking`): ours are bounded by the
         // service's semaphore, below this.
         .max_blocking_threads(placement.blocking_threads + 16)
         .thread_name("phdb-serve")
-        .on_thread_start(move || enter.enter())
+        .on_thread_start(move || enter.enter_network())
+        .on_thread_unpark(move || unpark.unpark_network())
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the runtime", &e))?;
@@ -515,7 +530,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     let feed_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.feed_threads)
         .thread_name("phdb-serve-feed")
-        .on_thread_start(move || enter.enter())
+        .on_thread_start(move || enter.enter_feed())
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed runtime", &e))?;
@@ -528,7 +543,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     let hub_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.hub_threads)
         .thread_name("phdb-serve-feed-hub")
-        .on_thread_start(move || enter.enter())
+        .on_thread_start(move || enter.enter_hub())
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed hub runtime", &e))?;
@@ -572,7 +587,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         let addr = listener.local_addr().map_err(|e| Failure::io("listen", &e))?;
         let _ = writeln!(
             stderr,
-            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed, {} feed hub and {} blocking threads on {} free CPUs, {}; {} shard CPUs left out, {} compaction CPUs not)",
+            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed, {} feed hub and {} blocking threads on {} free CPUs, {}{}; {} shard CPUs left out, {} compaction CPUs not)",
             serving,
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
@@ -582,6 +597,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
             placement.blocking_threads,
             placement.free_cpus,
             placement.mode,
+            sibling_line(&placement),
             placement.shard_cpus,
             placement.compaction_cpus,
         );
