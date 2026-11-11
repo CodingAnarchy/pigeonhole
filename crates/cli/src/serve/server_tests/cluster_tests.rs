@@ -65,7 +65,7 @@ fn a_node_that_only_routes_answers_for_its_own_state_without_a_partition() {
     svc.tables_changed();
     svc.engine_replaced();
     // The node's metrics, without the engine's.
-    let text = svc.metrics_text();
+    let text = svc.metrics_text(&[]);
     assert!(text.contains("pigeonhole_serve_requests_total"), "{text}");
     assert!(
         !text.contains("pigeonhole_async_sync_reads_total"),

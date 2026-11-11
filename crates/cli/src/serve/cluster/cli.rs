@@ -71,6 +71,22 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         node: NodeArgs,
     },
+    /// Back up every partition, each through the node the map gives it, plus the map, into
+    /// DIR: `map.json`, `manifest.json` and `<partition>.phdb`. Each copy is its own
+    /// consistent snapshot; the set is not one point in time across partitions. Fails if
+    /// the map moves a partition while it runs.
+    Backup {
+        /// A new or empty directory.
+        dir: PathBuf,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Copy only what each writer holds durable at its level (`backup_durable`).
+        #[arg(long)]
+        durable: bool,
+        /// Partitions backed up at once.
+        #[arg(long, value_name = "N", default_value_t = 4)]
+        parallel: usize,
+    },
 }
 
 pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
@@ -127,6 +143,12 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             Ok(report("cluster show-map", summary, doc))
         }
         ClusterCommand::Status { node } => runtime()?.block_on(status(node)),
+        ClusterCommand::Backup {
+            dir,
+            node,
+            durable,
+            parallel,
+        } => runtime()?.block_on(super::backup::backup(node, dir, *durable, *parallel)),
     }
 }
 
@@ -137,7 +159,11 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
         .map_err(|e| Failure::io("start the runtime", &e))
 }
 
-fn report(command: &'static str, summary: Vec<(&'static str, Value)>, extra: Value) -> Report {
+pub(super) fn report(
+    command: &'static str,
+    summary: Vec<(&'static str, Value)>,
+    extra: Value,
+) -> Report {
     let mut document: serde_json::Map<String, Value> = summary
         .iter()
         .map(|(k, v)| ((*k).to_owned(), v.clone()))
@@ -204,7 +230,7 @@ fn init_partition(
     Ok(report("cluster init-partition", summary, Value::Null))
 }
 
-fn column(name: &'static str) -> Column {
+pub(super) fn column(name: &'static str) -> Column {
     Column { name, brief: true }
 }
 
@@ -212,6 +238,15 @@ type Client = proto::cluster_client::ClusterClient<tonic::transport::Channel>;
 
 /// A client for the node at `url`, and the token to present.
 async fn connect(args: &NodeArgs, url: &str) -> Result<(Client, Option<String>), Failure> {
+    let (channel, token) = channel(args, url).await?;
+    Ok((proto::cluster_client::ClusterClient::new(channel), token))
+}
+
+/// A channel to the node at `url`, and the token to present.
+pub(super) async fn channel(
+    args: &NodeArgs,
+    url: &str,
+) -> Result<(tonic::transport::Channel, Option<String>), Failure> {
     let token = match &args.token_file {
         Some(path) => Some(
             std::fs::read_to_string(path)
@@ -244,10 +279,10 @@ async fn connect(args: &NodeArgs, url: &str) -> Result<(Client, Option<String>),
         .connect()
         .await
         .map_err(|e| Failure::usage(&format!("connecting to {url}: {e}")))?;
-    Ok((proto::cluster_client::ClusterClient::new(channel), token))
+    Ok((channel, token))
 }
 
-fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Request<T>, Failure> {
+pub(super) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Request<T>, Failure> {
     let mut req = tonic::Request::new(message);
     if let Some(t) = token {
         req.metadata_mut().insert(

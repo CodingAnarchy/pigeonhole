@@ -441,6 +441,28 @@ pub(crate) const DOWNLOAD: usize = 25;
 /// inside any client's idle limit.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// The engine metrics' attribute naming a cluster node's partition (D317 ticket 8b).
+pub(crate) const PARTITION_ATTRIBUTE: &str = "pigeonhole.partition";
+
+/// A backup's partition named on a single node, which has none (D317 ticket 8b).
+fn single_node_partition() -> ApiError {
+    ApiError::invalid("this server isn't a cluster node: a backup names no partition here")
+}
+
+/// A last chunk's identity fields (D317 ticket 8b), empty on a single node.
+fn identity_fields(id: Option<&super::backup::CopyIdentity>) -> proto::BackupChunk {
+    let Some(id) = id else {
+        return proto::BackupChunk::default();
+    };
+    proto::BackupChunk {
+        partition: id.partition.clone(),
+        cluster_id: id.cluster_id.clone(),
+        epoch: id.epoch,
+        map_version: id.map_version,
+        ..Default::default()
+    }
+}
+
 /// A download's offset past its copy's end.
 fn past_the_copy(offset: u64, total: u64) -> ApiError {
     ApiError::invalid(format!(
@@ -709,58 +731,106 @@ pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sess
 
 /// `Vectors.BulkLoad`'s gauges (perf287's B3 on 7b2): the running load's phase, and the
 /// vectors and message bytes handed to it, an upper bound on what it holds.
-fn render_bulk(out: &mut String, g: &super::bulk::Gauges) {
-    use std::fmt::Write as _;
-    for (name, v) in [
-        ("pigeonhole_serve_bulk_load_phase", &g.phase),
-        ("pigeonhole_serve_bulk_load_vectors", &g.vectors),
-        ("pigeonhole_serve_bulk_load_bytes", &g.bytes),
+fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    for (name, read) in [
+        (
+            "pigeonhole_serve_bulk_load_phase",
+            (|g: &super::bulk::Gauges| g.phase.load(Ordering::Relaxed)) as fn(&_) -> u64,
+        ),
+        ("pigeonhole_serve_bulk_load_vectors", |g| {
+            g.vectors.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_bulk_load_bytes", |g| {
+            g.bytes.load(Ordering::Relaxed)
+        }),
     ] {
-        let _ = writeln!(out, "# TYPE {name} gauge");
-        let _ = writeln!(out, "{name} {}", v.load(Ordering::Relaxed));
+        render_family(
+            out,
+            name,
+            "gauge",
+            parts
+                .iter()
+                .map(|(id, part)| (*id, read(&part.bulk.gauges))),
+        );
+    }
+}
+
+/// One serve metric's `# TYPE` once (the exposition format allows it once), then a sample
+/// per partition: labelled `pigeonhole_partition` on a cluster node (D317 ticket 8b, as the
+/// engine's `pigeonhole.partition`), unlabelled on a single node. No partitions, no lines.
+fn render_family<'a>(
+    out: &mut String,
+    name: &str,
+    kind: &str,
+    samples: impl Iterator<Item = (Option<&'a str>, u64)>,
+) {
+    use std::fmt::Write as _;
+    let mut samples = samples.peekable();
+    if samples.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    for (id, v) in samples {
+        match id {
+            Some(id) => {
+                let _ = write!(out, "{name}{{pigeonhole_partition=\"");
+                escape_label(out, id);
+                let _ = writeln!(out, "\"}} {v}");
+            }
+            None => {
+                let _ = writeln!(out, "{name} {v}");
+            }
+        }
+    }
+}
+
+/// `v` as a Prometheus label value: backslash, quote and newline escaped.
+fn escape_label(out: &mut String, v: &str) {
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
     }
 }
 
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
-pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
-    use std::fmt::Write as _;
-    let g = feeds.gauges();
-    let st = &feeds.stats;
-    for (name, kind, v) in [
-        ("pigeonhole_serve_feed_hubs", "gauge", g.hubs as u64),
-        (
-            "pigeonhole_serve_feed_ring_bytes",
-            "gauge",
-            g.ring_bytes as u64,
-        ),
-        (
-            "pigeonhole_serve_feed_catching_up",
-            "gauge",
-            g.catching_up as u64,
-        ),
+pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    type Read = fn(&super::feed::Feeds) -> u64;
+    let families: [(&str, &str, Read); 7] = [
+        ("pigeonhole_serve_feed_hubs", "gauge", |f| {
+            f.gauges().hubs as u64
+        }),
+        ("pigeonhole_serve_feed_ring_bytes", "gauge", |f| {
+            f.gauges().ring_bytes as u64
+        }),
+        ("pigeonhole_serve_feed_catching_up", "gauge", |f| {
+            f.gauges().catching_up as u64
+        }),
         (
             "pigeonhole_serve_feed_catch_up_waits_total",
             "counter",
-            st.catch_up_waits.load(Ordering::Relaxed),
+            |f| f.stats.catch_up_waits.load(Ordering::Relaxed),
         ),
-        (
-            "pigeonhole_serve_feed_fell_behind_total",
-            "counter",
-            st.fell_behind.load(Ordering::Relaxed),
-        ),
-        (
-            "pigeonhole_serve_feed_rejoined_total",
-            "counter",
-            st.rejoined.load(Ordering::Relaxed),
-        ),
-        (
-            "pigeonhole_serve_feed_hub_failures_total",
-            "counter",
-            st.hub_failures.load(Ordering::Relaxed),
-        ),
-    ] {
-        let _ = writeln!(out, "# TYPE {name} {kind}");
-        let _ = writeln!(out, "{name} {v}");
+        ("pigeonhole_serve_feed_fell_behind_total", "counter", |f| {
+            f.stats.fell_behind.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_feed_rejoined_total", "counter", |f| {
+            f.stats.rejoined.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_feed_hub_failures_total", "counter", |f| {
+            f.stats.hub_failures.load(Ordering::Relaxed)
+        }),
+    ];
+    for (name, kind, read) in families {
+        render_family(
+            out,
+            name,
+            kind,
+            parts.iter().map(|(id, part)| (*id, read(&part.feeds))),
+        );
     }
 }
 
@@ -864,8 +934,13 @@ pub(crate) struct Partition {
 }
 
 impl Partition {
-    /// What a node opens on `db`, before any table is used.
-    fn new(db: Pigeonhole, limits: &Limits) -> Self {
+    /// What a node opens on `db`, before any table is used: partition `id` of a cluster
+    /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
+    fn new(db: Pigeonhole, id: Option<&str>, limits: &Limits) -> Self {
+        let metrics = match id {
+            Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
+            None => pigeonhole_otel::Config::new(),
+        };
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
@@ -875,7 +950,7 @@ impl Partition {
             memory: None,
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
-            engine_metrics: pigeonhole_otel::collector(&db),
+            engine_metrics: metrics.collector(&db),
             feeds: super::feed::Feeds::new(db.clone(), feed_limits(limits)),
             db,
         }
@@ -937,7 +1012,20 @@ impl Service {
         blocking_threads: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let part = Partition::new(db, &limits);
+        let part = Partition::new(db, None, &limits);
+        Self::node(Some(part), limits, blocking_threads, metrics)
+    }
+
+    /// A cluster node serving partition `id` on `db` (D317): its per-partition metrics are
+    /// labelled with the id.
+    pub(crate) fn partition_node(
+        db: Pigeonhole,
+        id: &str,
+        limits: Limits,
+        blocking_threads: usize,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        let part = Partition::new(db, Some(id), &limits);
         Self::node(Some(part), limits, blocking_threads, metrics)
     }
 
@@ -1348,27 +1436,19 @@ impl Service {
             }
             ServiceOp::Backup(r) => {
                 drop(budget);
-                let (db, backups) = (self.part()?.db.clone(), Arc::clone(&self.part()?.backups));
-                // On a thread of its own, one backup at a time (perf287's D1 on #1527).
-                let bytes = self
-                    .part()?
-                    .backups
-                    .on_backup_thread(move || {
-                        let path = backups.prepare_target(&r.path)?;
-                        if r.durable {
-                            db.backup_durable(&path)?;
-                        } else {
-                            db.backup(&path)?;
-                        }
-                        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
-                        Ok(len)
-                    })
-                    .await?;
-                Ok(ServiceReply::Backup(proto::BackupResponse { bytes }))
+                if !r.partition.is_empty() {
+                    return Err(single_node_partition());
+                }
+                self.backup(self.part()?, r).await.map(ServiceReply::Backup)
             }
             ServiceOp::BackupDownload(r) => {
                 drop(budget);
-                self.backup_download(r).await.map(ServiceReply::Download)
+                if !r.partition.is_empty() {
+                    return Err(single_node_partition());
+                }
+                self.backup_download(self.part()?, r, None)
+                    .await
+                    .map(ServiceReply::Download)
             }
             ServiceOp::Promote(_) => {
                 drop(budget);
@@ -1412,8 +1492,9 @@ impl Service {
             }
             ServiceOp::Metrics(_) => {
                 drop(budget);
+                // A single node: a cluster node answers it in the router (D317 ticket 8b).
                 Ok(ServiceReply::Metrics(proto::MetricsResponse {
-                    text: self.metrics_text(),
+                    text: self.metrics_text(&self.single_parts()),
                 }))
             }
             ServiceOp::DescribeTable(r) => {
@@ -1896,29 +1977,33 @@ impl Service {
         dropped
     }
 
-    /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike.
-    pub(crate) fn metrics_text(&self) -> String {
-        // A node that only routes has no engine, feeds or loads to report (D317).
-        let part = self.part.as_ref();
+    /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike, for `parts`,
+    /// the partitions served here. A single node passes its one, unlabelled; a cluster node
+    /// passes the router's ([`Router::metrics_text`](super::router::Router::metrics_text)),
+    /// each labelled by its id (D317 ticket 8b); a node that only routes, none.
+    pub(crate) fn metrics_text(&self, parts: &[(Option<&str>, &Partition)]) -> String {
         let mut text = self.metrics.render();
         self.connections.render(&mut text);
         self.replies.render(&mut text);
         render_sessions(&mut text, &self.sessions);
-        if let Some(part) = part {
-            render_feeds(&mut text, &part.feeds);
-            render_bulk(&mut text, &part.bulk.gauges);
-        }
+        render_feeds(&mut text, parts);
+        render_bulk(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
         }
-        // Reads the database on this thread, at most once per 100 ms: `engine_metrics` and
+        // Reads each database on this thread, at most once per 100 ms: `engine_metrics` and
         // `recovery_stats` (atomic loads), and `info`, which walks the current catalog, takes
         // the file's length and the pager's allocation stats under its lock for an instant,
-        // with no other I/O (ai1249's question, perf287's nit 2 on #1687).
-        if let Some(part) = part {
-            part.engine_metrics.render_prometheus(&mut text);
-        }
+        // with no other I/O (ai1249's question, perf287's nit 2 on #1687). Every partition's
+        // under one `# HELP`/`# TYPE` per metric (ICR 0133).
+        let collectors: Vec<_> = parts.iter().map(|(_, p)| &p.engine_metrics).collect();
+        pigeonhole_otel::Collector::render_prometheus_all(&collectors, &mut text);
         text
+    }
+
+    /// A single node's partition for [`metrics_text`](Self::metrics_text), unlabelled.
+    pub(crate) fn single_parts(&self) -> Vec<(Option<&str>, &Partition)> {
+        self.part.iter().map(|p| (None, p)).collect()
     }
 
     /// `Replication.Follow` (#1436): under a `--max-streams` slot, on a thread of its own.
@@ -1944,6 +2029,30 @@ impl Service {
         )
     }
 
+    /// `Admin.Backup` of `part`: on a thread of its own, one backup at a time (perf287's D1
+    /// on #1527).
+    pub(crate) async fn backup(
+        &self,
+        part: &Partition,
+        r: proto::BackupRequest,
+    ) -> Result<proto::BackupResponse, ApiError> {
+        let (db, backups) = (part.db.clone(), Arc::clone(&part.backups));
+        let bytes = part
+            .backups
+            .on_backup_thread(move || {
+                let path = backups.prepare_target(&r.path)?;
+                if r.durable {
+                    db.backup_durable(&path)?;
+                } else {
+                    db.backup(&path)?;
+                }
+                let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+                Ok(len)
+            })
+            .await?;
+        Ok(proto::BackupResponse { bytes })
+    }
+
     /// `Admin.BackupDownload`: a fresh backup (hashed, then kept for resumes), or a kept one
     /// from an offset, streamed in chunks of up to 1 MiB on its own task. It holds a
     /// `--max-streams` slot until it ends, and each send waits at most `--stream-idle-ms`.
@@ -1954,11 +2063,16 @@ impl Service {
     /// at once and then every `HEARTBEAT`, so a client bounds every wait by its idle
     /// limit and resumes a break during the copy with the id. HTTP waits for the copy
     /// instead: it sends the size and hash as headers.
-    async fn backup_download(
+    ///
+    /// `map_version` is a cluster node's (D317 ticket 8b): the copy is of one snapshot, whose
+    /// identity row it reads and sends in the last chunk, with the map version.
+    pub(crate) async fn backup_download(
         &self,
+        part: &Partition,
         r: proto::BackupDownloadRequest,
+        map_version: Option<u64>,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup::{self, Copy};
+        use super::backup::{self, Copy, CopyIdentity, Taken};
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -1972,10 +2086,34 @@ impl Service {
             ));
         }
         let (id, copy) = if r.backup_id.is_empty() {
-            let (db, durable, replica) = (self.part()?.db.clone(), r.durable, r.replica);
+            let (db, durable, replica) = (part.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
             // (perf287's D1), and the copy is the table's from the start (E1).
-            self.part()?.backups.fresh_download(move |p, started| {
+            part.backups.fresh_download(move |p, started| {
+                if let Some(map_version) = map_version {
+                    // A cluster node's copy: one snapshot for the copy and the identity it
+                    // names, so the last chunk says exactly what the file holds.
+                    let snap = if durable {
+                        db.durable_snapshot()?
+                    } else {
+                        db.snapshot()?
+                    };
+                    let id = super::cluster::identity::read_at(&db, &snap)
+                        .map_err(ApiError::internal)?
+                        .ok_or_else(|| {
+                            ApiError::internal("the partition's file has no identity row")
+                        })?;
+                    db.backup_at(&snap, p)?;
+                    return Ok(Taken {
+                        feed_token: Vec::new(),
+                        identity: Some(CopyIdentity {
+                            partition: id.partition_id,
+                            cluster_id: id.cluster_id,
+                            epoch: id.epoch,
+                            map_version,
+                        }),
+                    });
+                }
                 if replica {
                     // A replica's bootstrap (#1436): a durable snapshot's copy, and the
                     // token of a feed of every table from that same snapshot, sent with the
@@ -1985,38 +2123,39 @@ impl Service {
                     let token = token.as_bytes().to_vec();
                     started(token.clone());
                     db.backup_at(&snap, p)?;
-                    return Ok(token);
+                    return Ok(Taken {
+                        feed_token: token,
+                        identity: None,
+                    });
                 }
                 if durable {
                     db.backup_durable(p)?;
                 } else {
                     db.backup(p)?;
                 }
-                Ok(Vec::new())
+                Ok(Taken::default())
             })?
         } else {
-            (
-                r.backup_id.clone(),
-                self.part()?.backups.open(&r.backup_id)?,
-            )
+            (r.backup_id.clone(), part.backups.open(&r.backup_id)?)
         };
         // A kept copy: an offset past it is refused now. One still being written is checked
         // once it's ready.
         if let Copy::Ready(kept) = &*copy.borrow()
             && r.offset > kept.total
         {
-            self.part()?.backups.release(&id);
+            part.backups.release(&id);
             return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
         let (backups, pool, idle) = (
-            Arc::clone(&self.part()?.backups),
+            Arc::clone(&part.backups),
             Arc::clone(&self.blocking),
             self.limits.stream_idle,
         );
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
+        let want = r.partition;
         tokio::spawn(async move {
             // Sends `chunk` within the idle limit; `false` once the client went away (it
             // resumes with the id).
@@ -2049,6 +2188,7 @@ impl Service {
                         offset: start,
                         sha256: Default::default(),
                         feed_token: feed_token.into(),
+                        ..Default::default()
                     };
                     if !send(beat).await? {
                         return Ok(());
@@ -2069,6 +2209,13 @@ impl Service {
                 if start > kept.total {
                     return Err(past_the_copy(start, kept.total));
                 }
+                // A resume names the partition its copy is of (D317 ticket 8b).
+                let of = kept.identity.as_ref().map_or("", |i| i.partition.as_str());
+                if of != want {
+                    return Err(ApiError::invalid(format!(
+                        "backup {task_id} is of partition {of:?}, not {want:?}"
+                    )));
+                }
                 let mut at = start;
                 loop {
                     let path = kept.path.clone();
@@ -2086,6 +2233,7 @@ impl Service {
                             Default::default()
                         },
                         feed_token: kept.feed_token.clone().into(),
+                        ..identity_fields(last.then_some(kept.identity.as_ref()).flatten())
                     };
                     if !send(chunk).await? || last {
                         return Ok(());

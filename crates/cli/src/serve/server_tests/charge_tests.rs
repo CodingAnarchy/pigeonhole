@@ -147,7 +147,6 @@ fn a_reply_its_client_never_reads_is_dropped_after_the_idle_limit() {
     assert!(
         s.shared
             .router
-            .service
             .metrics_text()
             .contains("pigeonhole_serve_reply_idle_drops_total 1")
     );

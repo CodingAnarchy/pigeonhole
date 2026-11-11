@@ -357,6 +357,13 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - A map may add tables, partitions and nodes, and move a partition to another node with a higher epoch. A table's split keys and partitions are fixed once set.
 - **`phdb cluster status --node URL`** shows every node's map version side by side.
 - **`phdb cluster show-map (--node URL | --file DIR/cluster-map.json)`** prints a map.
+- **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json` (D317 ticket 8b).
+  - **Each copy is a consistent snapshot of its own partition. The set is not one point in time across partitions.** A commit on one partition can be in the backup while an earlier one on another isn't.
+  - Each node needs `--backup-dir` (admin scope, as for `Admin.Backup`). `--durable` copies only what each writer holds durable. `--parallel N` (4) copies that many partitions at once. A broken download resumes.
+  - The backup checks each copy against the map: its cluster, partition and epoch. A copy that differs fails it with a message naming both, for example `the copy is partition "p2" of cluster "c1" at epoch 2, but the map says partition "p2" of cluster "c1" at epoch 1`. That means the map changed during the backup, or the node holds another file. Run it again once the map is settled.
+  - A partition added, moved or relocated while it runs also fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't. `map.json` is the map at the end, which places them as the copies hold them.
+  - The backup is complete only with its `manifest.json`, which is written last.
+  - Restoring comes with a later step.
 - **Choosing ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
 - **Serving data:** any node takes any call. It serves the call if its partition holds the row, and otherwise forwards it to the node that does. A client needs no map; one that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
   - **What's served:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters, by their row. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
@@ -367,9 +374,10 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
     - **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
     - **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
     - **Not yet:** a scan or multi-get with a `snapshot_id`.
-  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), backups, `Info` and `/mcp`.
+  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), `Info` and `/mcp`. `Admin.Backup` and `BackupDownload` back up one partition the node holds, named by `partition`, and aren't forwarded: another node's is `WrongPartition`.
   - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
-  - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir` and `--change-feed` as a single node does, for its partition. `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
+  - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
+  - **Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label.
   - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.
 - **Change feeds:** `Feed.Subscribe` through any node follows every partition that holds the subscription's tables (only those whose key ranges can hold its prefix), and merges them into one stream. Turn the feed on in each partition with `--change-feed`.
   - **Order:** each partition's commits arrive in its commit order, so each row's do. There's no order across partitions: a commit on one can arrive after a later one on another.

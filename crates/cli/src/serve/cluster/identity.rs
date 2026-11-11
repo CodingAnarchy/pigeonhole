@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use pigeonhole::{ErrorCode, Family, Options, Pigeonhole};
+use pigeonhole::{ErrorCode, Family, Options, Pigeonhole, Snapshot};
 
 /// The reserved table holding the identity row.
 pub(crate) const TABLE: &str = "__phdb_cluster";
@@ -21,16 +21,27 @@ pub(crate) struct Identity {
 
 /// The identity row of `db`, or `None` for a file `init-partition` never stamped.
 pub(crate) fn read(db: &Pigeonhole) -> Result<Option<Identity>, String> {
+    read_as_of(db, None)
+}
+
+/// [`read`] as of `snapshot`: what a backup of that snapshot holds (D317 ticket 8b).
+pub(crate) fn read_at(db: &Pigeonhole, snapshot: &Snapshot) -> Result<Option<Identity>, String> {
+    read_as_of(db, Some(snapshot))
+}
+
+fn read_as_of(db: &Pigeonhole, snapshot: Option<&Snapshot>) -> Result<Option<Identity>, String> {
     let table = match db.table(TABLE).and_then(|t| t.open()) {
         Ok(t) => t,
         Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(None),
         Err(e) => return Err(format!("read {TABLE}: {e}")),
     };
     let cell = |q: &str| -> Result<String, String> {
-        let c = table
-            .get(ROW, FAMILY, q.as_bytes())
-            .map_err(|e| format!("read {TABLE}: {e}"))?
-            .ok_or_else(|| format!("{TABLE} has no {q}"))?;
+        let c = match snapshot {
+            Some(snap) => table.get_at(snap, ROW, FAMILY, q.as_bytes()),
+            None => table.get(ROW, FAMILY, q.as_bytes()),
+        }
+        .map_err(|e| format!("read {TABLE}: {e}"))?
+        .ok_or_else(|| format!("{TABLE} has no {q}"))?;
         String::from_utf8(c.value().to_vec()).map_err(|_| format!("{TABLE}'s {q} isn't UTF-8"))
     };
     let epoch = cell("epoch")?;
