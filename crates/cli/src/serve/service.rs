@@ -531,7 +531,7 @@ pub(crate) const RPCS: [&str; 50] = [
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 49] = [
+pub(crate) const OUTCOMES: [&str; 50] = [
     "ok",
     "Io",
     "Corruption",
@@ -582,6 +582,7 @@ pub(crate) const OUTCOMES: [&str; 49] = [
     "WrongPartition",
     "CrossPartition",
     "PartitionUnavailable",
+    "Fenced",
     "other",
 ];
 

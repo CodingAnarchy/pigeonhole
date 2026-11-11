@@ -48,6 +48,68 @@ service Cluster {
   // subscriber that stops reading can't stall forwarded calls. The events are a single
   // node's: a token on every one, no `partition`. Cluster scope, gRPC only.
   rpc ForwardSubscribe(ForwardSubscribeRequest) returns (stream FeedEvent);
+  // D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
+  // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
+  // unfenced, or at its new node); its reads go on. Answers once every write admitted before
+  // the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
+  // Admin scope.
+  rpc Fence(PartitionRequest) returns (LocalPartition);
+  // Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
+  // unless this node's map names it as the partition's node at the epoch in its file.
+  // Admin scope.
+  rpc Unfence(PartitionRequest) returns (LocalPartition);
+  // D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
+  // and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
+  // `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
+  // unless it's fenced. Admin scope.
+  rpc Close(PartitionRequest) returns (LocalPartition);
+  // Moves a partition's files left on this node, after it moved away, into
+  // `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
+  // node's map names it as the partition's node, or while it's open. Admin scope.
+  rpc DropPartition(PartitionRequest) returns (LocalPartition);
+  // `phdb cluster relocate`'s first step, on the partition's new node: installs a complete
+  // staged file set (`Admin.PartitionUpload`), if one is staged, then rewrites the file's
+  // identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
+  // rerun resumes. The reply's `files` is the set this call installed (none: empty).
+  // `FailedPrecondition` while the partition is open here, or for a file of another
+  // cluster, partition or epoch. Admin scope.
+  rpc Stamp(StampRequest) returns (LocalPartition);
+}
+
+// One partition on the node a `Cluster` call is sent to (D317 ticket 6).
+message PartitionRequest {
+  string partition = 1;
+}
+
+// `Cluster.Stamp` (D317 ticket 6).
+message StampRequest {
+  // This cluster's id, which the file must record (or, with `restore_from_cluster_id`, which
+  // it's rewritten to).
+  string cluster_id = 1;
+  string partition = 2;
+  // The map's epoch for the partition, and that epoch + 1.
+  uint64 from_epoch = 3;
+  uint64 to_epoch = 4;
+  // A restore (D317 ticket 8b): the file may be at any epoch up to `from_epoch`, since a
+  // backup records the epoch it was taken at. Without it a file below `from_epoch` is
+  // refused.
+  bool restore = 5;
+  // With `restore`: the cluster the file records, restored into this one as a new cluster.
+  string restore_from_cluster_id = 6;
+}
+
+// A partition's state on its node (D317 ticket 6).
+enum LocalPartitionState {
+  LOCAL_PARTITION_STATE_UNSPECIFIED = 0;
+  // Open, reads and writes served.
+  LOCAL_PARTITION_STATE_SERVING = 1;
+  // Open, reads served, writes answer `Fenced`. Its files still change (flushes and
+  // compactions).
+  LOCAL_PARTITION_STATE_FENCED = 2;
+  // Fenced and closed: its files are final, and its calls answer `PartitionUnavailable`.
+  LOCAL_PARTITION_STATE_CLOSED = 3;
+  // Being opened: its calls answer `PartitionUnavailable` until it's open.
+  LOCAL_PARTITION_STATE_OPENING = 4;
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -176,6 +238,12 @@ message LocalPartition {
   repeated string reconcile_errors = 7;
   repeated string unmapped_tables = 8;
   repeated string adopted_tables = 9;
+  // D317 ticket 6: its state here, for a partition this node holds.
+  LocalPartitionState state = 10;
+  // A closed partition's files once hashed: each one's name (its suffix after the
+  // partition's path), size and SHA-256. Empty while they're being hashed; a failed hash
+  // sets `error`, and `Close` again retries it. `Stamp`'s reply: the set it installed.
+  repeated PartitionFile files = 11;
 }
 
 // A forwarded single-key call (D317 ticket 2).

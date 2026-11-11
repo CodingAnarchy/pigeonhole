@@ -813,6 +813,46 @@ const READERS: &[Scope] = &[Scope::Read, Scope::Cluster];
 
 #[tonic::async_trait]
 impl proto::cluster_server::Cluster for ClusterGrpc {
+    async fn fence(
+        &self,
+        _req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
+        Err(ApiError::unsupported("not yet").into())
+    }
+
+    async fn unfence(
+        &self,
+        _req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
+        Err(ApiError::unsupported("not yet").into())
+    }
+
+    async fn close(
+        &self,
+        _req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
+        Err(ApiError::unsupported("not yet").into())
+    }
+
+    async fn drop_partition(
+        &self,
+        _req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
+        Err(ApiError::unsupported("not yet").into())
+    }
+
+    async fn stamp(
+        &self,
+        _req: Request<proto::StampRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
+        Err(ApiError::unsupported("not yet").into())
+    }
+
     async fn get_map(
         &self,
         req: Request<GetMapRequest>,

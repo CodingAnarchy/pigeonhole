@@ -6132,6 +6132,35 @@ pub mod vectors_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// One partition on the node a `Cluster` call is sent to (D317 ticket 6).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+}
+/// `Cluster.Stamp` (D317 ticket 6).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StampRequest {
+    /// This cluster's id, which the file must record (or, with `restore_from_cluster_id`, which
+    /// it's rewritten to).
+    #[prost(string, tag = "1")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// The map's epoch for the partition, and that epoch + 1.
+    #[prost(uint64, tag = "3")]
+    pub from_epoch: u64,
+    #[prost(uint64, tag = "4")]
+    pub to_epoch: u64,
+    /// A restore (D317 ticket 8b): the file may be at any epoch up to `from_epoch`, since a
+    /// backup records the epoch it was taken at. Without it a file below `from_epoch` is
+    /// refused.
+    #[prost(bool, tag = "5")]
+    pub restore: bool,
+    /// With `restore`: the cluster the file records, restored into this one as a new cluster.
+    #[prost(string, tag = "6")]
+    pub restore_from_cluster_id: ::prost::alloc::string::String,
+}
 /// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
 /// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6282,7 +6311,7 @@ pub struct NodeStatus {
     pub divergent: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A partition file in the node's directory, as its identity row says.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LocalPartition {
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
@@ -6308,6 +6337,14 @@ pub struct LocalPartition {
     pub unmapped_tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "9")]
     pub adopted_tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D317 ticket 6: its state here, for a partition this node holds.
+    #[prost(enumeration = "LocalPartitionState", tag = "10")]
+    pub state: i32,
+    /// A closed partition's files once hashed: each one's name (its suffix after the
+    /// partition's path), size and SHA-256. Empty while they're being hashed; a failed hash
+    /// sets `error`, and `Close` again retries it. `Stamp`'s reply: the set it installed.
+    #[prost(message, repeated, tag = "11")]
+    pub files: ::prost::alloc::vec::Vec<PartitionFile>,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6478,6 +6515,47 @@ pub struct ForwardSubscribeRequest {
     /// most 64 of them; 0: none.
     #[prost(uint64, tag = "5")]
     pub skip_through: u64,
+}
+/// A partition's state on its node (D317 ticket 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LocalPartitionState {
+    Unspecified = 0,
+    /// Open, reads and writes served.
+    Serving = 1,
+    /// Open, reads served, writes answer `Fenced`. Its files still change (flushes and
+    /// compactions).
+    Fenced = 2,
+    /// Fenced and closed: its files are final, and its calls answer `PartitionUnavailable`.
+    Closed = 3,
+    /// Being opened: its calls answer `PartitionUnavailable` until it's open.
+    Opening = 4,
+}
+impl LocalPartitionState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOCAL_PARTITION_STATE_UNSPECIFIED",
+            Self::Serving => "LOCAL_PARTITION_STATE_SERVING",
+            Self::Fenced => "LOCAL_PARTITION_STATE_FENCED",
+            Self::Closed => "LOCAL_PARTITION_STATE_CLOSED",
+            Self::Opening => "LOCAL_PARTITION_STATE_OPENING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOCAL_PARTITION_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOCAL_PARTITION_STATE_SERVING" => Some(Self::Serving),
+            "LOCAL_PARTITION_STATE_FENCED" => Some(Self::Fenced),
+            "LOCAL_PARTITION_STATE_CLOSED" => Some(Self::Closed),
+            "LOCAL_PARTITION_STATE_OPENING" => Some(Self::Opening),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod cluster_client {
@@ -6747,6 +6825,132 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardSubscribe"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
+        /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
+        /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
+        /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
+        /// Admin scope.
+        pub async fn fence(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Fence",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Fence"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
+        /// unless this node's map names it as the partition's node at the epoch in its file.
+        /// Admin scope.
+        pub async fn unfence(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Unfence",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Unfence"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
+        /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
+        /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
+        /// unless it's fenced. Admin scope.
+        pub async fn close(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Close",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Close"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Moves a partition's files left on this node, after it moved away, into
+        /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
+        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        pub async fn drop_partition(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/DropPartition",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "DropPartition"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `phdb cluster relocate`'s first step, on the partition's new node: installs a complete
+        /// staged file set (`Admin.PartitionUpload`), if one is staged, then rewrites the file's
+        /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
+        /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
+        /// `FailedPrecondition` while the partition is open here, or for a file of another
+        /// cluster, partition or epoch. Admin scope.
+        pub async fn stamp(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StampRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Stamp",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Stamp"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -6837,6 +7041,47 @@ pub mod cluster_server {
             tonic::Response<Self::ForwardSubscribeStream>,
             tonic::Status,
         >;
+        /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
+        /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
+        /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
+        /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
+        /// Admin scope.
+        async fn fence(
+            &self,
+            request: tonic::Request<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
+        /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
+        /// unless this node's map names it as the partition's node at the epoch in its file.
+        /// Admin scope.
+        async fn unfence(
+            &self,
+            request: tonic::Request<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
+        /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
+        /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
+        /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
+        /// unless it's fenced. Admin scope.
+        async fn close(
+            &self,
+            request: tonic::Request<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
+        /// Moves a partition's files left on this node, after it moved away, into
+        /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
+        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        async fn drop_partition(
+            &self,
+            request: tonic::Request<super::PartitionRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
+        /// `phdb cluster relocate`'s first step, on the partition's new node: installs a complete
+        /// staged file set (`Admin.PartitionUpload`), if one is staged, then rewrites the file's
+        /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
+        /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
+        /// `FailedPrecondition` while the partition is open here, or for a file of another
+        /// cluster, partition or epoch. Admin scope.
+        async fn stamp(
+            &self,
+            request: tonic::Request<super::StampRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClusterServer<T> {
@@ -7218,6 +7463,221 @@ pub mod cluster_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Fence" => {
+                    #[allow(non_camel_case_types)]
+                    struct FenceSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::PartitionRequest>
+                    for FenceSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::fence(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FenceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Unfence" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnfenceSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::PartitionRequest>
+                    for UnfenceSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::unfence(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnfenceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Close" => {
+                    #[allow(non_camel_case_types)]
+                    struct CloseSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::PartitionRequest>
+                    for CloseSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::close(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CloseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/DropPartition" => {
+                    #[allow(non_camel_case_types)]
+                    struct DropPartitionSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::PartitionRequest>
+                    for DropPartitionSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::drop_partition(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DropPartitionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Stamp" => {
+                    #[allow(non_camel_case_types)]
+                    struct StampSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::StampRequest>
+                    for StampSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StampRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::stamp(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StampSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
