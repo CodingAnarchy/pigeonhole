@@ -84,7 +84,8 @@ jobs:
   # and libc6 fix the versions apt picks (libc6-dbg must match libc6 exactly). On a miss for
   # this image it installs through apt and saves the .debs: once per image version on main
   # (the daily schedule), and in a PR's own scope only when main has no entry for the image
-  # yet. A cache entry is never overwritten; `-v1` is the salt to force a refresh.
+  # yet. A cache entry is never overwritten; `v1` is the salt to force a refresh, ahead of the
+  # image so a bump also stops the older-image fallback from matching the old entries.
   valgrind-debs:
     name: valgrind .debs
     runs-on: ubuntu-latest
@@ -95,7 +96,7 @@ jobs:
           sparse-checkout: scripts/install-valgrind.sh
           sparse-checkout-cone-mode: false
       - id: key
-        run: echo "key=callgrind-debs-${ImageOS}-${ImageVersion}-v1" >> "$GITHUB_OUTPUT"
+        run: echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - id: have
         uses: actions/cache/restore@v4
         with:
@@ -174,8 +175,8 @@ jobs:
       # The key is computed here, not taken from that job: this runner's image can differ.
       - id: debs-key
         run: |
-          echo "key=callgrind-debs-${ImageOS}-${ImageVersion}-v1" >> "$GITHUB_OUTPUT"
-          echo "prefix=callgrind-debs-${ImageOS}-" >> "$GITHUB_OUTPUT"
+          echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+          echo "prefix=callgrind-debs-v1-${ImageOS}-" >> "$GITHUB_OUTPUT"
       - id: debs
         uses: actions/cache/restore@v4
         continue-on-error: true

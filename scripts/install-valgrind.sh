@@ -69,7 +69,23 @@ apt_install() {
 # The manifest lists the files to install, so a stray file in DIR is never installed, and a
 # corrupt or partial entry fails the check and falls back to apt. It is saved with the .debs,
 # so it catches corruption, not a hostile writer: only workflows on main write the cache that
-# other refs read.
+# other refs read. dpkg refuses to downgrade a package the image already has newer (an older
+# image's entry). It skips that package and still exits 0, so every listed package is then
+# checked at its cached version: a refusal, or any other difference, falls back to apt.
+installed_as_cached() {
+  local dir=$1 deb name want have
+  shift
+  for deb in "$@"; do
+    name=$(dpkg-deb -f "$dir/$deb" Package):$(dpkg-deb -f "$dir/$deb" Architecture)
+    want=$(dpkg-deb -f "$dir/$deb" Version)
+    have=$(dpkg-query -W -f '${Version} ${Status}' "$name" 2>/dev/null || true)
+    if [ "$have" != "$want install ok installed" ]; then
+      echo "::warning::$name is ${have:-not installed}, not the cached $want"
+      return 1
+    fi
+  done
+}
+
 cached_install() {
   local dir=$1
   if [ ! -s "$dir/SHA256SUMS" ]; then
@@ -82,7 +98,8 @@ cached_install() {
   local debs=()
   mapfile -t debs < <(awk '{ print $2 }' "$dir/SHA256SUMS")
   if (cd "$dir" && sha256sum --quiet --strict -c SHA256SUMS) \
-    && (cd "$dir" && sudo dpkg -i -- "${debs[@]}") \
+    && (cd "$dir" && sudo dpkg -i --refuse-downgrade -- "${debs[@]}") \
+    && installed_as_cached "$dir" "${debs[@]}" \
     && valgrind --version; then
     echo "::notice::valgrind from the .deb cache ($source, ${#debs[@]} packages)"
     return
