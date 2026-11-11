@@ -3538,6 +3538,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
 
 mod backup;
 mod charge;
+mod close;
 mod feed;
 mod fence;
 mod metrics;

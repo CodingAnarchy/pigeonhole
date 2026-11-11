@@ -89,8 +89,10 @@ pub(crate) struct Fences {
     served: Mutex<BTreeMap<String, Served>>,
     /// The operator's fences as `fenced.json` has them, partitions not open here included.
     operator: Mutex<BTreeSet<String>>,
-    /// One fence or unfence at a time, so the file follows the flags in order.
-    changing: tokio::sync::Mutex<()>,
+    /// One fence, unfence or close at a time, so the file follows the flags in order.
+    pub(super) changing: tokio::sync::Mutex<()>,
+    /// Partitions closed here ([`Node::close`]), with their files once hashed.
+    pub(super) closed: Mutex<BTreeMap<String, super::close::Closed>>,
 }
 
 impl Fences {
@@ -102,7 +104,18 @@ impl Fences {
         self.operator.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn gate(&self, id: &str) -> Option<(Arc<WriteGate>, u64)> {
+    pub(super) fn closed(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, super::close::Closed>> {
+        self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Partition `id` no longer served here: its gate goes with it.
+    pub(super) fn forget(&self, id: &str) {
+        self.served().remove(id);
+    }
+
+    pub(super) fn gate(&self, id: &str) -> Option<(Arc<WriteGate>, u64)> {
         self.served()
             .get(id)
             .map(|s| (Arc::clone(&s.gate), s.epoch))
@@ -194,6 +207,10 @@ impl Node {
     /// map's schema it skipped while fenced.
     pub(crate) async fn unfence(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
         let _one = self.fences.changing.lock().await;
+        // A closed partition reopens first, still fenced (D317 amendment 2).
+        if self.fences.closed().contains_key(id) {
+            self.open_part(id).await?;
+        }
         let (gate, epoch) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         let map = self.get_map()?;
         if !names(&map, &self.id, id, epoch) {
@@ -295,7 +312,7 @@ impl Node {
     }
 }
 
-fn not_here(id: &str) -> ApiError {
+pub(super) fn not_here(id: &str) -> ApiError {
     ApiError::partition_unavailable(format!("partition {id:?} isn't open on this node"))
 }
 

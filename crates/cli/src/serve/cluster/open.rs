@@ -193,6 +193,8 @@ impl Node {
                 opened.pinning.shards_unpinned(),
             )));
         }
+        // Reopened: its files change from here, so the hashes a close kept go (feed1248).
+        self.fences.closed().remove(id);
         let gate = self.open_gate(id, epoch);
         let service = shared
             .router
@@ -239,7 +241,8 @@ impl Node {
             .map(|p| p.id.clone())
             .collect();
         for id in mine {
-            if self.part_state(&id).is_some() {
+            // Open, or closed by the operator: a close holds until `unfence`.
+            if self.part_state(&id).is_some() || self.fences.closed().contains_key(&id) {
                 continue;
             }
             match self.open_part(&id).await {

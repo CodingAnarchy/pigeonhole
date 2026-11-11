@@ -10,6 +10,7 @@
 
 mod backup;
 pub(crate) mod cli;
+pub(crate) mod close;
 pub(crate) mod fanout;
 pub(crate) mod feed;
 pub(crate) mod fence;
@@ -661,11 +662,13 @@ impl Node {
                 }
             }
         }
-        // Each open partition's state (D317 ticket 6).
+        // Each open partition's state, and a closed one's files (D317 ticket 6).
         for lp in &mut partitions {
             if let Some((state, reason)) = self.part_state(&lp.id) {
                 lp.set_state(state);
                 lp.set_fence_reason(reason);
+            } else if let Some(closed) = self.fences.closed().get(&lp.id) {
+                closed.describe(lp);
             }
         }
         NodeStatus {
@@ -898,12 +901,15 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
+    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
     async fn close(
         &self,
-        _req: Request<proto::PartitionRequest>,
+        req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
-        Err(ApiError::unsupported("not yet").into())
+        self.caller(&req, &[Scope::Admin], "close a partition")?;
+        let id = req.into_inner().partition;
+        self.0.close(&id).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
     }
 
     async fn drop_partition(
