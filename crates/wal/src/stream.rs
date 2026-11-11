@@ -77,13 +77,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The segment header in `probe`, or `None` where there is none (a blank or torn slot). A
-/// header whose checksum passed but whose version is newer was written by a newer build:
-/// refused, never read as a blank or torn slot with its records skipped, nor the stream as
-/// empty (#496, the #774 hazard).
+/// header whose checksum passed but whose version is newer, or which carries a `features`
+/// bit this build doesn't know, was written by a newer build: refused, never read as a blank
+/// or torn slot with its records skipped, nor the stream as empty (#496, the #774 hazard).
+/// The checksum is verified before the features are read, so a torn header stays blank. As
+/// `phdb check` reads them (`check.rs`).
 fn decode_header(probe: &[u8]) -> Result<Option<SegmentHeader>> {
     match SegmentHeader::decode(probe) {
         Ok(h) => Ok(Some(h)),
-        Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => Err(e.into()),
+        Err(
+            e @ (pigeonhole_format::Error::UnsupportedVersion { .. }
+            | pigeonhole_format::Error::UnsupportedFeature { .. }),
+        ) => Err(e.into()),
         Err(_) => Ok(None),
     }
 }

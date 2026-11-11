@@ -122,8 +122,34 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Bounded: a runner whose DNS or mirror stalls (#1735's two jobs, "Temporary failure
+      # resolving") gets three tries, then fails the job rather than hold it. Valgrind is
+      # required here, so a failure stays fatal. `--error-on=any` makes an index that can't be
+      # fetched fail `update` (it exits 0 otherwise, and `install` runs on the image's stale
+      # lists into the timeout; cli692 on #1736); the loop retries, so apt's own retries are 0.
+      # Name resolution isn't bounded by apt's timeouts (about 20 s a lookup), so a failing try
+      # costs a minute or two. When the image's first mirror, azure.archive.ubuntu.com, doesn't
+      # resolve, apt is pointed at archive.ubuntu.com first. That helps only while the
+      # runner's resolver still answers for archive.ubuntu.com: on 2026-11-11 it sometimes
+      # didn't (#1736's first run), and then only a rerun on another runner gets through.
       - name: install valgrind
-        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+        timeout-minutes: 8
+        run: |
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=0)
+          if ! getent hosts azure.archive.ubuntu.com > /dev/null; then
+            echo "::warning::azure.archive.ubuntu.com doesn't resolve: apt falls back to archive.ubuntu.com"
+            [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              [ -f "$f" ] && sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
+            done
+          fi
+          for try in 1 2 3; do
+            sudo apt-get "${apt_opts[@]}" update -q --error-on=any \
+              && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
+            echo "::warning::apt install of valgrind failed (try $try of 3)"
+            [ "$try" -lt 3 ] && sleep 20
+          done
+          exit 1
       - name: build the examples (head and base)
         shell: bash
         run: |
