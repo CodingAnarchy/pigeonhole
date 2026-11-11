@@ -125,12 +125,24 @@ jobs:
       # Bounded, as sweep.yml's and ci.yml's apt steps: a runner whose DNS or mirror stalls
       # (#1735's two jobs, "Temporary failure resolving") gets three tries with apt's own
       # timeouts and retries, then fails the job rather than hold it. Valgrind is required here,
-      # so a failure stays fatal.
+      # so a failure stays fatal. When the image's first mirror, azure.archive.ubuntu.com, doesn't
+      # resolve (it didn't for over an hour on 2026-11-11, while the rest of DNS worked), apt is
+      # pointed at archive.ubuntu.com before the next try.
       - name: install valgrind
         timeout-minutes: 8
         run: |
           apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          fallback() {
+            getent hosts azure.archive.ubuntu.com > /dev/null && return
+            echo "::warning::azure.archive.ubuntu.com doesn't resolve: apt falls back to archive.ubuntu.com"
+            [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              [ -f "$f" ] && sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"
+            done
+            true
+          }
           for try in 1 2 3; do
+            fallback
             sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
             echo "::warning::apt install of valgrind failed (try $try of 3)"
             sleep 20
