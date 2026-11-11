@@ -51,7 +51,7 @@ impl Several {
             let dir = test_dir();
             super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
             let locals = locals.into_iter().map(|p| (p, None)).collect();
-            let (stop, opened) = data_node_many(&rt, &dir, id, locals, l, "", limits);
+            let (stop, opened) = data_node_many(&rt, &dir, id, locals, l, "", limits, false);
             stops.push(stop);
             dbs.extend(opened);
         }
@@ -523,4 +523,73 @@ fn a_nodes_shards_pin_together_before_its_compaction_threads() {
     for o in opened {
         o.db.close().unwrap();
     }
+}
+
+/// A schema change through the map reaches every partition a node holds, each through its
+/// own service (simp724's N1 on #1720): a table placed over a's p1 and p3 is made in both
+/// files, and dropped from both, and a's `Status` reports each one's reconcile.
+#[test]
+fn a_schema_change_reconciles_every_partition_on_a_node() {
+    use crate::serve::proto::{
+        CreateTableRequest, DropTableRequest, FamilySpec, TablePlacementRequest,
+        schema_client::SchemaClient,
+    };
+    let several = Several::start(crate::serve::server_tests::limits());
+    let (ports, dbs) = (several.ports, &several.dbs);
+    let has = |db: &pigeonhole::Pigeonhole, t: &str| db.tables().iter().any(|n| n == t);
+    several.rt.block_on(async {
+        let schema = |port: u16| async move {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            SchemaClient::new(channel)
+        };
+        // Through b, which holds neither: `orders` split at "k" over a's p1 and p3.
+        let made = schema(ports[1])
+            .await
+            .create_table(CreateTableRequest {
+                name: "orders".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                if_missing: false,
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: vec![b"k".to_vec().into()],
+                    partitions: vec!["p1".into(), "p3".into()],
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(made.unreconciled.is_empty(), "{made:?}");
+        // dbs: a's p1 and p3, then b's p2.
+        assert!(has(&dbs[0], "orders"), "p1 on a");
+        assert!(has(&dbs[1], "orders"), "p3 on a");
+        assert!(!has(&dbs[2], "orders"), "p2 on b");
+        let status = client(ports[0])
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        for p in ["p1", "p3"] {
+            let lp = status.partitions.iter().find(|lp| lp.id == p).unwrap();
+            assert_eq!(lp.reconciled_version, status.map_version, "{lp:?}");
+            assert!(lp.reconcile_errors.is_empty(), "{lp:?}");
+        }
+        // Dropped through c, which only routes: gone from both of a's files.
+        schema(ports[2])
+            .await
+            .drop_table(DropTableRequest {
+                name: "orders".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!has(&dbs[0], "orders") && !has(&dbs[1], "orders"));
+    });
 }

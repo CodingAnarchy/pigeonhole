@@ -25,6 +25,18 @@ message CreateTableRequest {
   string name = 1;
   repeated FamilySpec families = 2;
   bool if_missing = 3;
+  // On a cluster node (D317 ticket 5): where the new table's rows live, as the partition map
+  // places it. Needed to create a table the map doesn't place yet; a single node refuses it.
+  TablePlacementRequest placement = 4;
+}
+
+// A new table's placement in a cluster's map (D317 §1): its split keys, sorted and distinct,
+// and `splits.len() + 1` partitions, range i being `[splits[i-1], splits[i])`; or a
+// co-location group, whose tables are unsplit on one partition.
+message TablePlacementRequest {
+  string group = 1;
+  repeated bytes splits = 2;
+  repeated string partitions = 3;
 }
 
 message DropTableRequest {
@@ -39,6 +51,10 @@ message TableResponse {
   string name = 1;
   // Each family's stored options.
   repeated FamilySpec families = 2;
+  // On a cluster node, after a create (D317 ticket 5): the table's partitions whose node
+  // hadn't confirmed the change when the call answered. They catch up when their node next
+  // takes the map; `Cluster.Status` shows each partition's state.
+  repeated string unreconciled = 3;
 }
 
 // A family and its options (`Family`, read back as `FamilyInfo`). Unset options take the

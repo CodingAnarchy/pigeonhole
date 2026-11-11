@@ -3692,6 +3692,9 @@ impl serde::Serialize for CreateTableRequest {
         if self.if_missing {
             len += 1;
         }
+        if self.placement.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.CreateTableRequest", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -3701,6 +3704,9 @@ impl serde::Serialize for CreateTableRequest {
         }
         if self.if_missing {
             struct_ser.serialize_field("if_missing", &self.if_missing)?;
+        }
+        if let Some(v) = self.placement.as_ref() {
+            struct_ser.serialize_field("placement", v)?;
         }
         struct_ser.end()
     }
@@ -3716,6 +3722,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
             "families",
             "if_missing",
             "ifMissing",
+            "placement",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3723,6 +3730,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
             Name,
             Families,
             IfMissing,
+            Placement,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3747,6 +3755,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                             "name" => Ok(GeneratedField::Name),
                             "families" => Ok(GeneratedField::Families),
                             "ifMissing" | "if_missing" => Ok(GeneratedField::IfMissing),
+                            "placement" => Ok(GeneratedField::Placement),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3769,6 +3778,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                 let mut name__ = None;
                 let mut families__ = None;
                 let mut if_missing__ = None;
+                let mut placement__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -3789,12 +3799,19 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                             }
                             if_missing__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Placement => {
+                            if placement__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("placement"));
+                            }
+                            placement__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(CreateTableRequest {
                     name: name__.unwrap_or_default(),
                     families: families__.unwrap_or_default(),
                     if_missing: if_missing__.unwrap_or_default(),
+                    placement: placement__,
                 })
             }
         }
@@ -6264,6 +6281,12 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::Nearest(v) => {
                     struct_ser.serialize_field("nearest", v)?;
                 }
+                forward_request::Op::CreateTable(v) => {
+                    struct_ser.serialize_field("create_table", v)?;
+                }
+                forward_request::Op::DropTable(v) => {
+                    struct_ser.serialize_field("drop_table", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6304,6 +6327,10 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "release_snapshot",
             "releaseSnapshot",
             "nearest",
+            "create_table",
+            "createTable",
+            "drop_table",
+            "dropTable",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6326,6 +6353,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             OpenSnapshot,
             ReleaseSnapshot,
             Nearest,
+            CreateTable,
+            DropTable,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6365,6 +6394,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "releaseSnapshot" | "release_snapshot" => Ok(GeneratedField::ReleaseSnapshot),
                             "nearest" => Ok(GeneratedField::Nearest),
+                            "createTable" | "create_table" => Ok(GeneratedField::CreateTable),
+                            "dropTable" | "drop_table" => Ok(GeneratedField::DropTable),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6515,6 +6546,20 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Nearest)
 ;
                         }
+                        GeneratedField::CreateTable => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createTable"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::CreateTable)
+;
+                        }
+                        GeneratedField::DropTable => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dropTable"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::DropTable)
+;
+                        }
                     }
                 }
                 Ok(ForwardRequest {
@@ -6574,6 +6619,9 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::Nearest(v) => {
                     struct_ser.serialize_field("nearest", v)?;
                 }
+                forward_response::Reply::Table(v) => {
+                    struct_ser.serialize_field("table", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6602,6 +6650,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "openSnapshot",
             "empty",
             "nearest",
+            "table",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6617,6 +6666,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             OpenSnapshot,
             Empty,
             Nearest,
+            Table,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6649,6 +6699,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "empty" => Ok(GeneratedField::Empty),
                             "nearest" => Ok(GeneratedField::Nearest),
+                            "table" => Ok(GeneratedField::Table),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6746,6 +6797,13 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("nearest"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Nearest)
+;
+                        }
+                        GeneratedField::Table => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("table"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Table)
 ;
                         }
                     }
@@ -9066,6 +9124,18 @@ impl serde::Serialize for LocalPartition {
         if !self.error.is_empty() {
             len += 1;
         }
+        if self.reconciled_version != 0 {
+            len += 1;
+        }
+        if !self.reconcile_errors.is_empty() {
+            len += 1;
+        }
+        if !self.unmapped_tables.is_empty() {
+            len += 1;
+        }
+        if !self.adopted_tables.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -9084,6 +9154,20 @@ impl serde::Serialize for LocalPartition {
         if !self.error.is_empty() {
             struct_ser.serialize_field("error", &self.error)?;
         }
+        if self.reconciled_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("reconciled_version", ToString::to_string(&self.reconciled_version).as_str())?;
+        }
+        if !self.reconcile_errors.is_empty() {
+            struct_ser.serialize_field("reconcile_errors", &self.reconcile_errors)?;
+        }
+        if !self.unmapped_tables.is_empty() {
+            struct_ser.serialize_field("unmapped_tables", &self.unmapped_tables)?;
+        }
+        if !self.adopted_tables.is_empty() {
+            struct_ser.serialize_field("adopted_tables", &self.adopted_tables)?;
+        }
         struct_ser.end()
     }
 }
@@ -9099,6 +9183,14 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "file",
             "ok",
             "error",
+            "reconciled_version",
+            "reconciledVersion",
+            "reconcile_errors",
+            "reconcileErrors",
+            "unmapped_tables",
+            "unmappedTables",
+            "adopted_tables",
+            "adoptedTables",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -9108,6 +9200,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             File,
             Ok,
             Error,
+            ReconciledVersion,
+            ReconcileErrors,
+            UnmappedTables,
+            AdoptedTables,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -9134,6 +9230,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "file" => Ok(GeneratedField::File),
                             "ok" => Ok(GeneratedField::Ok),
                             "error" => Ok(GeneratedField::Error),
+                            "reconciledVersion" | "reconciled_version" => Ok(GeneratedField::ReconciledVersion),
+                            "reconcileErrors" | "reconcile_errors" => Ok(GeneratedField::ReconcileErrors),
+                            "unmappedTables" | "unmapped_tables" => Ok(GeneratedField::UnmappedTables),
+                            "adoptedTables" | "adopted_tables" => Ok(GeneratedField::AdoptedTables),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -9158,6 +9258,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut file__ = None;
                 let mut ok__ = None;
                 let mut error__ = None;
+                let mut reconciled_version__ = None;
+                let mut reconcile_errors__ = None;
+                let mut unmapped_tables__ = None;
+                let mut adopted_tables__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -9192,6 +9296,32 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             error__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ReconciledVersion => {
+                            if reconciled_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("reconciledVersion"));
+                            }
+                            reconciled_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReconcileErrors => {
+                            if reconcile_errors__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("reconcileErrors"));
+                            }
+                            reconcile_errors__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::UnmappedTables => {
+                            if unmapped_tables__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("unmappedTables"));
+                            }
+                            unmapped_tables__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::AdoptedTables => {
+                            if adopted_tables__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("adoptedTables"));
+                            }
+                            adopted_tables__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -9200,6 +9330,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     file: file__.unwrap_or_default(),
                     ok: ok__.unwrap_or_default(),
                     error: error__.unwrap_or_default(),
+                    reconciled_version: reconciled_version__.unwrap_or_default(),
+                    reconcile_errors: reconcile_errors__.unwrap_or_default(),
+                    unmapped_tables: unmapped_tables__.unwrap_or_default(),
+                    adopted_tables: adopted_tables__.unwrap_or_default(),
                 })
             }
         }
@@ -16930,6 +17064,9 @@ impl serde::Serialize for SetMapRequest {
         if self.map.is_some() {
             len += 1;
         }
+        if self.force {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.SetMapRequest", len)?;
         if self.expected_map_version != 0 {
             #[allow(clippy::needless_borrow)]
@@ -16938,6 +17075,9 @@ impl serde::Serialize for SetMapRequest {
         }
         if let Some(v) = self.map.as_ref() {
             struct_ser.serialize_field("map", v)?;
+        }
+        if self.force {
+            struct_ser.serialize_field("force", &self.force)?;
         }
         struct_ser.end()
     }
@@ -16952,12 +17092,14 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             "expected_map_version",
             "expectedMapVersion",
             "map",
+            "force",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             ExpectedMapVersion,
             Map,
+            Force,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16981,6 +17123,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                         match value {
                             "expectedMapVersion" | "expected_map_version" => Ok(GeneratedField::ExpectedMapVersion),
                             "map" => Ok(GeneratedField::Map),
+                            "force" => Ok(GeneratedField::Force),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17002,6 +17145,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             {
                 let mut expected_map_version__ = None;
                 let mut map__ = None;
+                let mut force__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ExpectedMapVersion => {
@@ -17018,11 +17162,18 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                             }
                             map__ = map_.next_value()?;
                         }
+                        GeneratedField::Force => {
+                            if force__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("force"));
+                            }
+                            force__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(SetMapRequest {
                     expected_map_version: expected_map_version__.unwrap_or_default(),
                     map: map__,
+                    force: force__.unwrap_or_default(),
                 })
             }
         }
@@ -17695,6 +17846,9 @@ impl serde::Serialize for TablePlacement {
         if !self.partitions.is_empty() {
             len += 1;
         }
+        if self.created != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TablePlacement", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -17711,6 +17865,11 @@ impl serde::Serialize for TablePlacement {
         if !self.partitions.is_empty() {
             struct_ser.serialize_field("partitions", &self.partitions)?;
         }
+        if self.created != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("created", ToString::to_string(&self.created).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -17726,6 +17885,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
             "families",
             "splits",
             "partitions",
+            "created",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17735,6 +17895,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
             Families,
             Splits,
             Partitions,
+            Created,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17761,6 +17922,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                             "families" => Ok(GeneratedField::Families),
                             "splits" => Ok(GeneratedField::Splits),
                             "partitions" => Ok(GeneratedField::Partitions),
+                            "created" => Ok(GeneratedField::Created),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17785,6 +17947,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                 let mut families__ = None;
                 let mut splits__ = None;
                 let mut partitions__ = None;
+                let mut created__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -17817,6 +17980,14 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                             }
                             partitions__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Created => {
+                            if created__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("created"));
+                            }
+                            created__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(TablePlacement {
@@ -17825,10 +17996,139 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                     families: families__.unwrap_or_default(),
                     splits: splits__.unwrap_or_default(),
                     partitions: partitions__.unwrap_or_default(),
+                    created: created__.unwrap_or_default(),
                 })
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.TablePlacement", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TablePlacementRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.group.is_empty() {
+            len += 1;
+        }
+        if !self.splits.is_empty() {
+            len += 1;
+        }
+        if !self.partitions.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TablePlacementRequest", len)?;
+        if !self.group.is_empty() {
+            struct_ser.serialize_field("group", &self.group)?;
+        }
+        if !self.splits.is_empty() {
+            struct_ser.serialize_field("splits", &self.splits.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
+        }
+        if !self.partitions.is_empty() {
+            struct_ser.serialize_field("partitions", &self.partitions)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TablePlacementRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "group",
+            "splits",
+            "partitions",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Group,
+            Splits,
+            Partitions,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "group" => Ok(GeneratedField::Group),
+                            "splits" => Ok(GeneratedField::Splits),
+                            "partitions" => Ok(GeneratedField::Partitions),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TablePlacementRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TablePlacementRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TablePlacementRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut group__ = None;
+                let mut splits__ = None;
+                let mut partitions__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Group => {
+                            if group__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("group"));
+                            }
+                            group__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Splits => {
+                            if splits__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("splits"));
+                            }
+                            splits__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
+                        GeneratedField::Partitions => {
+                            if partitions__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitions"));
+                            }
+                            partitions__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(TablePlacementRequest {
+                    group: group__.unwrap_or_default(),
+                    splits: splits__.unwrap_or_default(),
+                    partitions: partitions__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TablePlacementRequest", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for TableResponse {
@@ -17845,12 +18145,18 @@ impl serde::Serialize for TableResponse {
         if !self.families.is_empty() {
             len += 1;
         }
+        if !self.unreconciled.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TableResponse", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
         }
         if !self.families.is_empty() {
             struct_ser.serialize_field("families", &self.families)?;
+        }
+        if !self.unreconciled.is_empty() {
+            struct_ser.serialize_field("unreconciled", &self.unreconciled)?;
         }
         struct_ser.end()
     }
@@ -17864,12 +18170,14 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
         const FIELDS: &[&str] = &[
             "name",
             "families",
+            "unreconciled",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Name,
             Families,
+            Unreconciled,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17893,6 +18201,7 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
                         match value {
                             "name" => Ok(GeneratedField::Name),
                             "families" => Ok(GeneratedField::Families),
+                            "unreconciled" => Ok(GeneratedField::Unreconciled),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17914,6 +18223,7 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
             {
                 let mut name__ = None;
                 let mut families__ = None;
+                let mut unreconciled__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -17928,11 +18238,18 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
                             }
                             families__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Unreconciled => {
+                            if unreconciled__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("unreconciled"));
+                            }
+                            unreconciled__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(TableResponse {
                     name: name__.unwrap_or_default(),
                     families: families__.unwrap_or_default(),
+                    unreconciled: unreconciled__.unwrap_or_default(),
                 })
             }
         }

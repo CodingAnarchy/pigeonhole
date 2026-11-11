@@ -149,7 +149,7 @@
 **Budgets:** a fanned-out scan holds one `--max-scans` slot on its entry node for its life, and counts as one `Data.Scan`. Each page it hasn't handed to the client counts against `--inflight-bytes`, as a single node's scan pages do.
 
 ## Ticket 4b: fan-out nearest searches and traversals
-**`Vectors.Nearest` and `Graph.Traverse` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. A `snapshot_id` on either is `Unsupported` on a cluster for good, since a snapshot is one partition's. The index searches (`Vectors.Search`, `Text.Search`) stay refused until co-located tables (placement groups) say which partition holds an index.
+**`Vectors.Nearest` and `Graph.Traverse` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. A `snapshot_id` on either is `Unsupported` on a cluster for good, since a snapshot is one partition's. The index searches (`Vectors.Search`, `Text.Search`) stay refused on a cluster: no D317 ticket routes them (the coordinator, 2026-11-11), and the refusal names no ticket. It points at `Nearest`, which fans out. Index search across partitions is #1722 (1.3.0).
 
 **`Nearest`**, the exact top `k`:
 - **Fan-out:** every partition the source meets answers its own exact top `k` under the same `page_bytes`. A `range` source is clipped to each partition's range, and a `keys` source sends each partition its keys. At most `--fanout-forwards` (8, a new flag) of these run at once.
@@ -232,6 +232,49 @@
   - Digests never appear in logs or errors.
   - `--max-sessions` and `--max-sessions-per-token` count per node.
 
+## Ticket 5: schema in the map
+**A cluster's tables and families live in the partition map.** `Schema.CreateTable`, `DropTable`, `ListTables` and `DescribeTable` (and `GET /v1/tables`) work on any cluster node, and each node reconciles its partitions' files to the map.
+- **`CreateTable`** is a map change. `CreateTableRequest.placement` (field 4, a new `TablePlacementRequest { group, splits, partitions }`) gives the table's ranges as `set-map` would. A cluster refuses a create without one, unless the map already places the table (an operator can place a table with `set-map` first). A single node refuses a request that has one (`InvalidArgument`).
+  - **`if_missing`** adds the families an existing table lacks. A family that exists keeps the map's options even when the request gives others: it's neither refused nor changed, as a single node's `if_missing` keeps the file's (simp724's N3 on #1720; the plan had said refused).
+  - The map's validation applies as it does to `SetMap`. `validate_change` also refuses a family removed or changed, and a changed `created`.
+- **`DropTable`** removes the table's placement from the map. Its partitions stay.
+- **`ListTables`, `DescribeTable` and `GET /v1/tables`** answer from the map, with no fan-out. Tables the map doesn't place, a partition's own `__phdb_` tables included, aren't listed.
+- **The scope** is a single node's: `write` for a create (`if_missing` included), `admin` for a drop, `read` for list and describe. It's checked at the entry node, and again at the writer (amendment 1).
+- **The reply** comes once the map is set, persisted and pushed. `TableResponse.unreconciled` (field 3) lists the partitions whose node the push missed. A drop answers `Empty`, as on a single node. `Cluster.Status` shows each partition's reconcile: `LocalPartition.reconciled_version`, `reconcile_errors`, `unmapped_tables` and `adopted_tables` (fields 6–9).
+
+**`TablePlacement.created`** (field 6) is the map version that created the table. It tells a table from one dropped and created again under its name. It's fixed for the table's life; 0 for a placement made by hand with `set-map`.
+
+**Reconcile** runs on every map a node takes, before the map's routes serve, and at start. Each partition records each table the map made in its `__phdb_cluster` table (row `schema/<table>`, family `schema`, qualifier `created`), so reconcile needs only the map and the file (simp724's S1):
+- **Placed here with `created` c:**
+  - The file has no such table: it's created with the map's families, and c recorded.
+  - The table is recorded with c: any missing families are added. An option mismatch is reported in `Status`, not changed.
+  - The table is recorded with another c′: the map dropped it and created it again, so the old table is dropped and the new one created.
+  - The table isn't recorded: it was made by hand before the map managed it. It's adopted, with missing families added, and c recorded.
+- **Recorded, and not placed here:** the map dropped it. The table is dropped, then its record.
+- **Neither recorded nor placed:** a hand-made table, left alone and listed in `Status` (`unmapped_tables`).
+- **A crash** between a table and its record redoes the step on the next reconcile. `__phdb_` tables are never touched.
+- **The window:** the map is set, pushed, and each node reconciles before its routes serve. A call routed by the new map finds its table, or answers `TableNotFound` while a node that hasn't taken the map yet catches up. That `TableNotFound` is safe to retry: nothing was applied.
+
+**D317 amendment 1: one map writer.** Two schema changes through two entry nodes diverged in the model test: each compare-and-set ran against its own node's map, both made the same next version, and one table was lost. The coordinator approved the fix with simp724's conditions:
+- **The writer** is the node with the smallest id in the current map. It alone changes the map.
+- **Schema changes go to it.** Another node forwards `CreateTable` and `DropTable` to it on `Cluster.Forward` (request arms `create_table` 19 and `drop_table` 20; reply `table` 12, and `empty` for a drop). A writer whose map names another writer answers `WrongPartition`. The entry node pulls the newer map and sends once more. A writer never forwards a change on. At the writer, changes queue one at a time, so a compare-and-set conflicts only with an operator's `set-map` at the same moment, and is retried against the re-read map (S2).
+- **`SetMap`** is refused at a node that isn't the writer, with `WrongPartition` naming the writer and its address. `phdb cluster set-map` reads the map from `--node` and sends the map to its writer.
+- **Scope at the writer:** a forward's `ForwardedCaller` scope stays `read` or `write`. The writer resolves `token_digest` against its own token file, uncapped (`schema_caller_of`), and checks a drop's `admin` itself. A `cluster` token, or a digest it doesn't list, is refused. Without tokens anywhere, the caller is anyone, as on a single node.
+- **B3:** a forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`. A create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
+- **Divergence:** a same-version map with other contents is refused and reported, as in ticket 1.
+- **Recovery when the writer is down:** `phdb cluster set-map --force` (`SetMapRequest.force`, field 3) at any node.
+  - The CLI reads `Status` from every node it can reach and puts the map's version above all of them.
+  - The map must name a writer that answered: remove the down node, or let another id be the smallest.
+  - The node takes it without the writer check or the compare-and-set: it need only be the cluster's, at a version above the node's own.
+  - A node that starts with a map changes none as the writer until it has taken its peers' newer maps. So a writer back after a forced recovery takes the forced map first, which no longer names it, and follows it.
+  - Force is for a writer that's down. A writer that's up but cut off can still make a change, which the forced map then loses.
+
+**Tests:**
+- **Through the nodes:** a create, an added family, a drop and a create again under the same name, each through a different node. A hand-made table survives, and one the map takes over is reported as adopted.
+- **Concurrency:** twelve creates at once through three nodes all land, and every node ends with the same map and no divergence. With every node writing, as before amendment 1, the test fails.
+- **Recovery:** the writer stops; a forced map that still names it is refused; one without it is set above every version, and schema calls work through the new writer. The old writer restarts with its old map, takes the forced one, refuses a `set-map` naming the new writer, and forwards a schema call to it.
+- **Reconcile unit tests:** a crash between a map and its reconcile; a drop and re-create while a node was away. Mutation-checked: dropping unmapped tables, or ignoring `created`, fails them.
+
 ## Ticket 8b: cluster backup, and metrics by partition
 **`Admin.Backup` and `Admin.BackupDownload` on a cluster node** (D317 §9) back up one partition the node holds. They're never forwarded: a backup's bytes don't take a hop.
 - **`BackupRequest.partition`** (field 3) and **`BackupDownloadRequest.partition`** (field 5) name the partition. A cluster node requires one, even when it holds just one partition (`InvalidArgument` without it). A single node refuses one (`InvalidArgument`).
@@ -258,6 +301,7 @@
   - **Node-wide:** the budgets and pools (`--inflight-bytes`, `--max-concurrent`, `--max-scans`, `--max-streams`, the blocking pool), connections, metrics, limits, `--max-sessions` and `--max-sessions-per-token`, and `--backup-dir`'s one `Backups`.
   - A call is admitted once, by whichever service takes it.
   - Bulk loads, text rebuilds and the SIGUSR1 dump cover every partition; shutdown closes each.
+- **Schema (ticket 5):** every map a node takes reconciles each of its partitions, each through its own service and under its own schema lock, and `Cluster.Status` reports each partition's reconcile (simp724's N1 on #1720).
 - **Calls** route to the partition's own service here, or to its node, as before. Two partitions on one node are still two partitions: a batch across them is `CrossPartition`, and a session id names its own.
 - **Opening:** the partitions open in id order before the network side starts, each checked against the map as in ticket 2. One that fails to open (a missing file, a wrong identity) fails the node's start, naming it, after closing those already open.
 

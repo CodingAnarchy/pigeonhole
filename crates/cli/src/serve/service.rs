@@ -1034,7 +1034,7 @@ pub(crate) struct Partition {
     /// **Lock order: a blocking-pool place first, then this.** A `/mcp` create holds its
     /// request's pool thread when it takes this, so an async create or drop takes its pool
     /// place before this, never while holding it (ai1249's B2 on #1666).
-    schema: tokio::sync::Mutex<()>,
+    pub(crate) schema: tokio::sync::Mutex<()>,
     /// The engine's metrics on `/metrics`, under D316's names (D323): the same reading and
     /// carrying as `pigeonhole-otel`'s OpenTelemetry instruments, so its counters stay
     /// monotonic across an automatic recovery and a replica's re-bootstrap. A node that only
@@ -2031,6 +2031,11 @@ impl Service {
         reserved(&r.name)?;
         if r.name.is_empty() {
             return Err(ApiError::invalid("a table needs a name"));
+        }
+        if r.placement.is_some() {
+            return Err(ApiError::invalid(
+                "a placement is for a cluster node's map (D317): a single node holds every row",
+            ));
         }
         let families = r
             .families
@@ -3994,6 +3999,7 @@ fn describe(t: &Table) -> proto::TableResponse {
             .filter_map(|f| t.family_info(f))
             .map(|i| convert::family_out(&i))
             .collect(),
+        unreconciled: Vec::new(),
     }
 }
 
