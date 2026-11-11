@@ -13882,6 +13882,9 @@ impl serde::Serialize for PartitionUploadStatusReply {
         if self.complete {
             len += 1;
         }
+        if self.max_chunk != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadStatusReply", len)?;
         if self.received != 0 {
             #[allow(clippy::needless_borrow)]
@@ -13890,6 +13893,11 @@ impl serde::Serialize for PartitionUploadStatusReply {
         }
         if self.complete {
             struct_ser.serialize_field("complete", &self.complete)?;
+        }
+        if self.max_chunk != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("max_chunk", ToString::to_string(&self.max_chunk).as_str())?;
         }
         struct_ser.end()
     }
@@ -13903,12 +13911,15 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
         const FIELDS: &[&str] = &[
             "received",
             "complete",
+            "max_chunk",
+            "maxChunk",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Received,
             Complete,
+            MaxChunk,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -13932,6 +13943,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
                         match value {
                             "received" => Ok(GeneratedField::Received),
                             "complete" => Ok(GeneratedField::Complete),
+                            "maxChunk" | "max_chunk" => Ok(GeneratedField::MaxChunk),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -13953,6 +13965,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
             {
                 let mut received__ = None;
                 let mut complete__ = None;
+                let mut max_chunk__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Received => {
@@ -13969,11 +13982,20 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
                             }
                             complete__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::MaxChunk => {
+                            if max_chunk__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("maxChunk"));
+                            }
+                            max_chunk__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(PartitionUploadStatusReply {
                     received: received__.unwrap_or_default(),
                     complete: complete__.unwrap_or_default(),
+                    max_chunk: max_chunk__.unwrap_or_default(),
                 })
             }
         }

@@ -44,8 +44,57 @@ pub(crate) const INCOMING: &str = ".phdb-incoming";
 pub(crate) const KEEP: Duration = Duration::from_secs(300);
 
 /// The most one chunk carries: half of `--max-request-bytes`' default (1 MiB), so a chunk
-/// and its framing fit a request under it.
+/// and its framing fit a request under it. A node whose `--max-request-bytes` is lower
+/// takes less ([`max_chunk`]), and says so in `PartitionUploadStatus`.
 pub(crate) const CHUNK: usize = 512 << 10;
+
+/// Room for a chunk's framing and the first chunk's header under `--max-request-bytes`.
+const FRAMING: usize = 16 << 10;
+
+/// The most a chunk may carry on a node with `--max-request-bytes` `max_request_bytes`
+/// (cli692's F3 on #1728): at most [`CHUNK`], at least 1 KiB.
+pub(crate) fn max_chunk(max_request_bytes: usize) -> usize {
+    CHUNK
+        .min(max_request_bytes.saturating_sub(FRAMING))
+        .max(1 << 10)
+}
+
+/// A failed write or rename as an error: a full disk or quota is `NoSpace`
+/// (`ResourceExhausted`), resumable once there's room (cli692's F2 on #1728); anything else
+/// is `Internal`.
+fn io_error(what: &str, path: &Path, e: &std::io::Error) -> ApiError {
+    use std::io::ErrorKind;
+    if matches!(e.kind(), ErrorKind::StorageFull | ErrorKind::QuotaExceeded) {
+        return ApiError::from_code(
+            pigeonhole::ErrorCode::NoSpace,
+            &format!(
+                "{what} {}: {e}: free space, then resume from PartitionUploadStatus",
+                path.display()
+            ),
+        );
+    }
+    ApiError::internal(format!("{what} {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's fault seam: the next this many writes (a chunk's, a header's) fail with a
+    /// full disk.
+    static FULL_DISK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The fault seam's check before a write: `Ok` outside tests.
+fn disk_fault() -> std::io::Result<()> {
+    #[cfg(test)]
+    if FULL_DISK.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(std::io::ErrorKind::StorageFull.into());
+    }
+    Ok(())
+}
 
 /// An incomplete upload.
 struct Entry {
@@ -61,6 +110,8 @@ struct Entry {
 pub(crate) struct Uploads {
     dir: PathBuf,
     permits: Arc<Semaphore>,
+    /// [`max_chunk`] of the node's `--max-request-bytes`.
+    max_chunk: usize,
     entries: Mutex<HashMap<String, Entry>>,
 }
 
@@ -75,13 +126,17 @@ impl std::fmt::Debug for Entry {
 
 impl Uploads {
     /// The uploads of the node whose cluster directory is `cluster_dir`, at most `max` at
-    /// once. Incomplete uploads a previous run left are deleted; ready files are kept.
-    pub(crate) fn new(cluster_dir: &Path, max: usize) -> Self {
+    /// once, chunks of at most `max_chunk` bytes. Incomplete uploads a previous run left are
+    /// deleted, and so are half-written headers; ready files are kept.
+    pub(crate) fn new(cluster_dir: &Path, max: usize, max_chunk: usize) -> Self {
         let dir = cluster_dir.join(INCOMING);
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".part") || name.ends_with(".part.header") {
+                if name.ends_with(".part")
+                    || name.ends_with(".part.header")
+                    || name.ends_with(".tmp")
+                {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -89,8 +144,14 @@ impl Uploads {
         Self {
             dir,
             permits: Arc::new(Semaphore::new(max.max(1))),
+            max_chunk,
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `--max-uploads`, set before the node serves (no upload can be running).
+    pub(crate) fn set_max(&mut self, max: usize) {
+        self.permits = Arc::new(Semaphore::new(max.max(1)));
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
@@ -108,12 +169,15 @@ impl Uploads {
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut b = std::fs::DirBuilder::new();
                 #[cfg(unix)]
-                {
+                let b = {
                     use std::os::unix::fs::DirBuilderExt as _;
+                    let mut b = std::fs::DirBuilder::new();
                     b.mode(0o700);
-                }
+                    b
+                };
+                #[cfg(not(unix))]
+                let b = std::fs::DirBuilder::new();
                 b.create(&self.dir).map_err(|e| {
                     ApiError::internal(format!("create {}: {e}", self.dir.display()))
                 })?;
@@ -133,6 +197,7 @@ impl Uploads {
             return Ok(PartitionUploadStatusReply {
                 received: e.received,
                 complete: false,
+                max_chunk: self.max_chunk as u64,
             });
         }
         // Complete: a ready file whose header names it.
@@ -145,9 +210,13 @@ impl Uploads {
             return Ok(PartitionUploadStatusReply {
                 received: bytes,
                 complete: true,
+                max_chunk: self.max_chunk as u64,
             });
         }
-        Ok(PartitionUploadStatusReply::default())
+        Ok(PartitionUploadStatusReply {
+            max_chunk: self.max_chunk as u64,
+            ..Default::default()
+        })
     }
 
     /// The headers of every ready file.
@@ -285,9 +354,10 @@ impl Writing {
     /// Writes `chunk`'s bytes, which must start where the node's end.
     pub(crate) fn write(&mut self, chunk: &PartitionUploadChunk) -> Result<(), ApiError> {
         let total = self.header.file.as_ref().map_or(0, |f| f.bytes);
-        if chunk.data.len() > CHUNK {
+        let max = self.uploads.max_chunk;
+        if chunk.data.len() > max {
             return Err(ApiError::invalid(format!(
-                "a chunk carries at most {CHUNK} bytes"
+                "a chunk carries at most {max} bytes here (PartitionUploadStatus's max_chunk)"
             )));
         }
         if chunk.offset != self.received {
@@ -302,10 +372,10 @@ impl Writing {
                 "more bytes than the file's {total}"
             )));
         }
-        self.file
-            .seek(SeekFrom::Start(self.received))
+        disk_fault()
+            .and_then(|()| self.file.seek(SeekFrom::Start(self.received)))
             .and_then(|_| self.file.write_all(&chunk.data))
-            .map_err(|e| ApiError::internal(format!("write {}: {e}", self.part.display())))?;
+            .map_err(|e| io_error("write", &self.part, &e))?;
         self.received += chunk.data.len() as u64;
         if let Some(e) = self.uploads.lock().get_mut(&self.header.upload_id) {
             e.received = self.received;
@@ -326,7 +396,7 @@ impl Writing {
         }
         self.file
             .sync_all()
-            .map_err(|e| ApiError::internal(format!("sync {}: {e}", self.part.display())))?;
+            .map_err(|e| io_error("sync", &self.part, &e))?;
         let sha = digest(&self.part)?;
         if sha[..] != file.sha256[..] {
             // The bytes aren't the file the header names: start over.
@@ -338,9 +408,27 @@ impl Writing {
         }
         let dir = &self.uploads.dir;
         let ready = dir.join(ready_name(&self.header.partition, &file.name));
-        write_header(&path_with(&ready, ".header"), &self.header)?;
-        std::fs::rename(&self.part, &ready)
-            .map_err(|e| ApiError::internal(format!("stage {}: {e}", ready.display())))?;
+        let ready_header = path_with(&ready, ".header");
+        // The header is the commit marker, written last (feed1248's F1 on #1728): an older
+        // ready file's header goes first, so a crash or a failed step in between leaves a
+        // ready file with no header, which `ready_set` never reports, rather than this
+        // header over the older bytes.
+        match std::fs::remove_file(&ready_header) {
+            Ok(()) => sync_dir(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "remove {}: {e}",
+                    ready_header.display()
+                )));
+            }
+        }
+        std::fs::rename(&self.part, &ready).map_err(|e| io_error("stage", &ready, &e))?;
+        if let Err(e) = write_header(&ready_header, &self.header) {
+            // Back where it was, so a resume (with nothing left to send) finishes it again.
+            let _ = std::fs::rename(&ready, &self.part);
+            return Err(e);
+        }
         sync_dir(dir);
         let _ = std::fs::remove_file(dir.join(format!("{}.part.header", self.header.upload_id)));
         self.uploads.lock().remove(&self.header.upload_id);
@@ -511,10 +599,14 @@ fn check_file(f: &PartitionFile) -> Result<(), ApiError> {
 fn write_header(path: &Path, h: &PartitionUploadHeader) -> Result<(), ApiError> {
     let json = serde_json::to_vec(h).expect("a header serializes");
     let tmp = path_with(path, ".tmp");
-    std::fs::write(&tmp, &json)
+    disk_fault()
+        .and_then(|()| std::fs::write(&tmp, &json))
         .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
         .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io_error("write", path, &e)
+        })
 }
 
 fn read_header(path: &Path) -> Result<PartitionUploadHeader, String> {
@@ -608,7 +700,7 @@ mod tests {
     #[test]
     fn an_upload_resumes_and_a_set_is_ready_once_every_file_is() {
         let d = dir();
-        let up = Arc::new(Uploads::new(&d, 1));
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
         let (main, wal) = (b"the main file".as_slice(), b"a wal sidecar".as_slice());
         let manifest = [file("", main), file("-wal-0", wal)];
         let h = header('a', &manifest[0], &manifest);
@@ -651,9 +743,89 @@ mod tests {
     }
 
     #[test]
+    fn a_ready_file_counts_only_with_its_header_written_last() {
+        // feed1248's F1 on #1728: a newer upload of a file replaces an older ready one, and a
+        // crash between its rename and its header leaves a ready file with no header, which
+        // the set never counts.
+        let d = dir();
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
+        let (old, new) = (b"old bytes".as_slice(), b"new bytes!".as_slice());
+        for (id, data) in [('a', old), ('b', new)] {
+            let f = file("", data);
+            let mut w = up
+                .begin(header(id, &f, std::slice::from_ref(&f)), CLOSED)
+                .unwrap();
+            w.write(&chunk(0, data)).unwrap();
+            assert!(w.finish().unwrap().complete);
+        }
+        let (h, files) = ready_set(&d, "p2").unwrap();
+        assert_eq!(h.upload_id, "b".repeat(32), "the newer upload's header");
+        assert_eq!(
+            std::fs::read(&files[0].1).unwrap(),
+            new,
+            "over the newer bytes"
+        );
+        // The crash: bytes in place, header not yet written.
+        std::fs::remove_file(path_with(&files[0].1, ".header")).unwrap();
+        assert!(ready_set(&d, "p2").is_none());
+    }
+
+    #[test]
+    fn a_full_disk_answers_no_space_and_the_upload_resumes() {
+        // cli692's F2 on #1728: a full disk, on a chunk's write or on the ready header's, is
+        // `NoSpace` (ResourceExhausted), and the upload resumes once there's room.
+        let d = dir();
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
+        let data = b"a partition file".as_slice();
+        let f = file("", data);
+        let h = header('a', &f, std::slice::from_ref(&f));
+        let mut w = up.begin(h.clone(), CLOSED).unwrap();
+        w.write(&chunk(0, &data[..4])).unwrap();
+        FULL_DISK.with(|n| n.set(1));
+        let e = w.write(&chunk(4, &data[4..])).unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.grpc),
+            ("NoSpace", tonic::Code::ResourceExhausted),
+            "{e:?}"
+        );
+        assert_eq!(up.status(&h.upload_id).unwrap().received, 4, "nothing lost");
+        w.write(&chunk(4, &data[4..])).unwrap();
+        // The ready header's write fails: the bytes go back, and a resume finishes it.
+        FULL_DISK.with(|n| n.set(1));
+        let e = w.finish().unwrap_err();
+        assert_eq!(e.code, "NoSpace", "{e:?}");
+        assert!(ready_set(&d, "p2").is_none());
+        let st = up.status(&h.upload_id).unwrap();
+        assert_eq!((st.received, st.complete), (data.len() as u64, false));
+        let w = up.begin(h, CLOSED).unwrap();
+        assert!(w.finish().unwrap().complete);
+        assert!(ready_set(&d, "p2").is_some());
+    }
+
+    #[test]
+    fn a_node_with_a_small_request_limit_takes_smaller_chunks() {
+        // cli692's F3 on #1728.
+        assert_eq!(max_chunk(1 << 20), CHUNK);
+        assert_eq!(max_chunk(256 << 10), (256 << 10) - FRAMING);
+        assert_eq!(max_chunk(4 << 10), 1 << 10);
+        let d = dir();
+        let up = Arc::new(Uploads::new(&d, 1, 4));
+        assert_eq!(up.status(&"0".repeat(32)).unwrap().max_chunk, 4);
+        let f = file("", b"12345");
+        let mut w = up
+            .begin(header('a', &f, std::slice::from_ref(&f)), CLOSED)
+            .unwrap();
+        assert_eq!(
+            w.write(&chunk(0, b"12345")).unwrap_err().code,
+            "InvalidArgument"
+        );
+        w.write(&chunk(0, b"1234")).unwrap();
+    }
+
+    #[test]
     fn bytes_that_dont_match_the_sha_are_dropped() {
         let d = dir();
-        let up = Arc::new(Uploads::new(&d, 1));
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
         let f = file("", b"what the header says");
         let h = header('a', &f, std::slice::from_ref(&f));
         let mut w = up.begin(h.clone(), CLOSED).unwrap();
@@ -667,7 +839,7 @@ mod tests {
     #[test]
     fn uploads_are_refused_for_an_open_partition_past_the_limit_or_beside_another() {
         let d = dir();
-        let up = Arc::new(Uploads::new(&d, 1));
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
         let f = file("", b"x");
         let h = header('a', &f, std::slice::from_ref(&f));
         let e = up.begin(h.clone(), |p| p == "p2").err().unwrap();
@@ -679,7 +851,7 @@ mod tests {
         assert_eq!(e.code, "Overloaded", "{e:?}");
         drop(held);
         // With room, another upload of the same file of P while one is active.
-        let up2 = Arc::new(Uploads::new(&dir(), 2));
+        let up2 = Arc::new(Uploads::new(&dir(), 2, CHUNK));
         let _a = up2.begin(h.clone(), CLOSED).unwrap();
         let e = up2.begin(g, CLOSED).err().unwrap();
         assert_eq!(e.code, "FailedPrecondition", "{e:?}");
@@ -715,7 +887,7 @@ mod tests {
     #[test]
     fn a_restart_drops_incomplete_uploads_and_keeps_ready_ones() {
         let d = dir();
-        let up = Arc::new(Uploads::new(&d, 2));
+        let up = Arc::new(Uploads::new(&d, 2, CHUNK));
         let (a, b) = (file("", b"done"), file("-feed", b"partial!"));
         let manifest = [a.clone(), b.clone()];
         let ha = header('a', &a, &manifest);
@@ -726,7 +898,7 @@ mod tests {
         let mut w = up.begin(hb.clone(), CLOSED).unwrap();
         w.write(&chunk(0, b"part")).unwrap();
         drop(w);
-        let up = Uploads::new(&d, 2);
+        let up = Uploads::new(&d, 2, CHUNK);
         assert!(
             up.status(&ha.upload_id).unwrap().complete,
             "a ready file survives"

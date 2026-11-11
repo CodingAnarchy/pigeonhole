@@ -58,7 +58,11 @@ impl Router {
             Some(p) => service.sessions_on(p),
             None => service,
         };
-        let uploads = Arc::new(super::cluster::upload::Uploads::new(node.dir(), 1));
+        let uploads = Arc::new(super::cluster::upload::Uploads::new(
+            node.dir(),
+            1,
+            super::cluster::upload::max_chunk(service.limits().max_request_bytes),
+        ));
         Self {
             service: Arc::new(service),
             cluster: Some(Cluster {
@@ -72,8 +76,12 @@ impl Router {
 
     /// `--max-uploads`: a cluster node's partition uploads at once.
     pub(crate) fn max_uploads(mut self, max: usize) -> Self {
-        if let Some(c) = &mut self.cluster {
-            c.uploads = Arc::new(super::cluster::upload::Uploads::new(c.node.dir(), max));
+        if let Some(u) = self
+            .cluster
+            .as_mut()
+            .and_then(|c| Arc::get_mut(&mut c.uploads))
+        {
+            u.set_max(max);
         }
         self
     }
@@ -86,11 +94,16 @@ impl Router {
         mut stream: tonic::Streaming<super::proto::PartitionUploadChunk>,
     ) -> Result<super::proto::PartitionUploadReply, ApiError> {
         let uploads = self.uploads_for(caller)?;
-        let mut next = async || {
-            stream
-                .message()
-                .await
-                .map_err(|s| ApiError::invalid(format!("the upload's stream: {}", s.message())))
+        // Each message within `--stream-idle-ms` (cli692's F1 on #1728): a stalled stream
+        // ends, so its upload goes back to resumable and its `--max-uploads` place is free.
+        let idle = self.service.limits().stream_idle;
+        let mut next = async || match tokio::time::timeout(idle, stream.message()).await {
+            Ok(m) => {
+                m.map_err(|s| ApiError::invalid(format!("the upload's stream: {}", s.message())))
+            }
+            Err(_) => Err(ApiError::deadline(
+                "no upload message for --stream-idle-ms: resume from PartitionUploadStatus",
+            )),
         };
         let Some(first) = next().await? else {
             return Err(ApiError::invalid("an upload sends its header first"));

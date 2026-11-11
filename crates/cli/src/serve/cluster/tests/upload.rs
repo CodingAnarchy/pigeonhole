@@ -121,3 +121,55 @@ fn a_node_stages_a_partition_it_doesnt_hold_open_and_resumes_it() {
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
     });
 }
+
+#[test]
+fn a_stalled_upload_ends_after_the_idle_bound_and_resumes() {
+    // cli692's F1 on #1728: a stream that stops sending (a half-open connection) mustn't keep
+    // its upload active or hold the `--max-uploads` place.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = test_dir();
+    super::super::write_map(
+        &dir,
+        &super::super::map::canonical_json(&the_map(1, &[port, 1, 2])),
+    )
+    .unwrap();
+    let limits = crate::serve::config::Limits {
+        stream_idle: Duration::from_millis(300),
+        ..crate::serve::server_tests::limits()
+    };
+    let (_stop, _db) = data_node_with(&rt, &dir, "a", Some("p1"), listener, limits);
+    let data = vec![3u8; 4096];
+    let h = header("p2", &data);
+    rt.block_on(async {
+        // A header and the first 1 KiB, then nothing, with the stream left open.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(PartitionUploadChunk {
+            header: Some(h.clone()),
+            offset: 0,
+            data: data[..1024].to_vec().into(),
+        })
+        .await
+        .unwrap();
+        let e = admin(port)
+            .await
+            .partition_upload(Chunks(rx))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::DeadlineExceeded, "{e:?}");
+        drop(tx);
+        // Free again: resumed from a second stream.
+        let st = admin(port)
+            .await
+            .partition_upload_status(PartitionUploadStatusRequest {
+                upload_id: h.upload_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((st.received, st.max_chunk), (1024, 512 << 10));
+        let r = upload(port, &h, &[(1024, &data[1024..])]).await.unwrap();
+        assert!(r.complete, "{r:?}");
+    });
+}

@@ -768,8 +768,9 @@ pub struct PartitionUploadHeader {
     pub manifest: ::prost::alloc::vec::Vec<PartitionFile>,
 }
 /// The first message of an upload carries `header`, and each its next bytes from `offset`
-/// (up to 512 KiB, so a message fits the server's default request size), contiguous from
-/// what the node holds.
+/// (up to `PartitionUploadStatusReply.max_chunk`, 512 KiB by default), contiguous from what
+/// the node holds. A message that doesn't come within `--stream-idle-ms` ends the upload,
+/// which then resumes.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionUploadChunk {
     #[prost(message, optional, tag = "1")]
@@ -800,6 +801,10 @@ pub struct PartitionUploadStatusReply {
     pub received: u64,
     #[prost(bool, tag = "2")]
     pub complete: bool,
+    /// The most one chunk may carry on this node (512 KiB, or less under a lower
+    /// `--max-request-bytes`): send chunks of at most this many bytes.
+    #[prost(uint64, tag = "3")]
+    pub max_chunk: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
