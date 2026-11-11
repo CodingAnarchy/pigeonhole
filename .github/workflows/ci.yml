@@ -92,7 +92,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         run: |
-          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=1)
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=0)
           # The image's first mirror may not resolve (as instructions.yml's valgrind step).
           # `--error-on=any`: an index that can't be fetched fails `update` at once, so the
           # warning below prints rather than the step running into its timeout.
