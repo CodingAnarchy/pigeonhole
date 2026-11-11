@@ -275,12 +275,13 @@ impl Router {
         loop {
             let routes = reach.routes()?;
             let reply = match reach.place(&routes, partition)? {
+                // The request's holding covers this page (#1715): no charge of its own.
                 Place::Here => {
-                    let reply = self
+                    return match self
                         .service
-                        .call(ServiceOp::MultiGet(r), caller, None)
-                        .await?;
-                    return match reply.uncharge().0 {
+                        .fanout_part(ServiceOp::MultiGet(r), caller)
+                        .await?
+                    {
                         ServiceReply::MultiGet(m) => Ok(m),
                         _ => Err(ApiError::internal("a multi-get answered another reply")),
                     };
@@ -323,9 +324,10 @@ impl Router {
         prepaid: Option<OwnedSemaphorePermit>,
         deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
-        // The caller's scope and the request's size, as for any call (its bytes are held to
-        // the end).
-        let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        // The caller's scope and the request's size, as for any call. Its bytes go before
+        // the read, as a single node's multi-get gives them back (cli692 on #1715's plan).
+        let request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        drop(request);
         let ServiceOp::MultiGet(r) = op else {
             return Err(ApiError::internal("fan_multi_get takes a multi-get"));
         };
@@ -341,9 +343,22 @@ impl Router {
             deadline: Some(deadline),
             ..Reach::of(self, cluster)
         };
+        // The request's holding (#1715): its whole budget, taken before any read, so the
+        // rows merged so far and the current read's share (what's left of the budget)
+        // always fit in it, and no read waits for budget while the request holds some. It
+        // becomes the reply's charge.
+        let holding = self
+            .service
+            .fanout_hold(cap_of(r.page_bytes), reach.within()?)
+            .await?;
         let reply = self.merge_keys(&reach, r, caller).await?;
         self.service
-            .charge_built(caller, ServiceReply::MultiGet(reply))
+            .fanout_reply(
+                caller,
+                ServiceReply::MultiGet(reply),
+                holding,
+                reach.within()?,
+            )
             .await
     }
 
@@ -403,6 +418,8 @@ impl Router {
         let mut next: Option<Position> = None;
         let mut ahead: Option<Read<'_>> = None;
         let mut ahead_done = None;
+        // The read ahead's share of the budget, held while its page is out or waiting.
+        let mut ahead_share: Option<super::super::charge::Charge> = None;
         for (i, (range, mine)) in groups.iter().enumerate() {
             if left == 0 {
                 // The budget ended exactly at a partition's end (simp724's M1). A single
@@ -438,7 +455,16 @@ impl Router {
                     caller,
                 )),
             };
-            if let Some((next_range, next_keys)) = groups.get(i + 1) {
+            // A page read ahead becomes the current one. It was read with the whole budget,
+            // more than what's left of the holding may cover, so its share stays until it's
+            // merged or read again (this iteration's end).
+            let _cur_share = ahead_share.take();
+            // The next partition is read ahead only on spare budget (#1715): its whole page,
+            // taken now or not at all, so a read ahead never waits for budget.
+            if let Some((next_range, next_keys)) = groups.get(i + 1)
+                && let Some(share) = self.service.fanout_try_hold(cap_of(budget))
+            {
+                ahead_share = Some(share);
                 ahead = Some(Box::pin(self.multi_get_part(
                     reach,
                     &next_range.partition,
@@ -637,20 +663,35 @@ type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Runs `futs`, at most `n` at once (`--fanout-forwards`), handing each result to `each`
 /// with its index as it arrives, so a merge holds only what it keeps (simp724's S1 on
 /// #1713). An error from `each` ends the run, dropping the reads still going.
-async fn bounded<'a, T>(
+///
+/// One read always runs: its share is the request's own (#1715). Each further concurrent
+/// read needs a share `spare` gives on spare budget, without waiting; when there's none,
+/// the queued reads wait for a running one to finish. Shares go back once the queue is
+/// empty and fewer reads are running. So the reads never wait for budget while the request
+/// holds some (cli692 on #1715's plan).
+async fn bounded<'a, T, S>(
     futs: Vec<Boxed<'a, T>>,
     n: usize,
+    mut spare: impl FnMut() -> Option<S>,
     mut each: impl FnMut(usize, T) -> Result<(), ApiError>,
 ) -> Result<(), ApiError> {
-    let mut queue = futs.into_iter().enumerate();
+    let mut queue = futs.into_iter().enumerate().peekable();
     let mut running: Vec<(usize, Boxed<'a, T>)> = Vec::new();
+    let mut shares: Vec<S> = Vec::new();
     std::future::poll_fn(|cx| {
         loop {
-            while running.len() < n.max(1) {
-                match queue.next() {
-                    Some(f) => running.push(f),
-                    None => break,
+            while running.len() < n.max(1) && queue.peek().is_some() {
+                // The first read runs on the request's share; each other needs one more.
+                if running.len() > shares.len() {
+                    match spare() {
+                        Some(share) => shares.push(share),
+                        None => break,
+                    }
                 }
+                running.extend(queue.next());
+            }
+            if queue.peek().is_none() {
+                shares.truncate(running.len().saturating_sub(1));
             }
             // Done only once every read has run: the queue too, not just this batch.
             if running.is_empty() {
@@ -724,6 +765,11 @@ fn clipped(range: Option<&proto::KeyRange>, p: &PartRange) -> proto::KeyRange {
     }
 }
 
+/// A read's budget as bytes of the in-flight budget: `page_bytes` as a read applies it.
+fn cap_of(page: u64) -> usize {
+    usize::try_from(page_bytes(page)).unwrap_or(usize::MAX)
+}
+
 /// A neighbour's size by D308's measure: its row, its qualifier and 16 bytes.
 fn neighbour_bytes(n: &proto::Neighbour) -> u64 {
     (n.row.len() + n.qualifier.len()) as u64 + 16
@@ -785,9 +831,10 @@ impl Router {
         loop {
             let routes = reach.routes()?;
             let reply = match reach.place(&routes, partition)? {
+                // The request's holding covers this answer (#1715): no charge of its own.
                 Place::Here => {
                     self.service
-                        .call(ServiceOp::Nearest(r), caller, None)
+                        .fanout_part(ServiceOp::Nearest(r), caller)
                         .await?
                 }
                 Place::There(address, map_version) => {
@@ -810,7 +857,7 @@ impl Router {
                     }
                 }
             };
-            return match reply.uncharge().0 {
+            return match reply {
                 ServiceReply::Nearest(n) => Ok(n),
                 _ => Err(ApiError::internal(
                     "a nearest search answered another reply",
@@ -834,7 +881,8 @@ impl Router {
         deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
         use proto::nearest_request::Source;
-        let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        let request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        drop(request);
         let ServiceOp::Nearest(r) = op else {
             return Err(ApiError::internal("fan_nearest takes a nearest search"));
         };
@@ -905,9 +953,19 @@ impl Router {
         let mut kept: Vec<proto::Neighbour> = Vec::new();
         let mut some_cut = false;
         let mut missed = Vec::new();
+        // The request's holding (#1715), taken before any read: the result's bound (one
+        // budget, the merge keeping at most it and one neighbour) and one read's answer
+        // (another). Further concurrent reads run only on spare budget (`bounded`), so no
+        // read waits for budget while the request holds some. It becomes the reply's charge.
+        let page = cap_of(r.page_bytes);
+        let holding = self
+            .service
+            .fanout_hold(page.saturating_mul(2), reach.within()?)
+            .await?;
         bounded(
             reads,
             self.service.limits().fanout_forwards,
+            || self.service.fanout_try_hold(page),
             |i, answer| match answer {
                 Ok(a) => {
                     some_cut |= a.cut_by_budget;
@@ -949,7 +1007,12 @@ impl Router {
             missing: missed,
         };
         self.service
-            .charge_built(caller, ServiceReply::Nearest(reply))
+            .fanout_reply(
+                caller,
+                ServiceReply::Nearest(reply),
+                holding,
+                reach.within()?,
+            )
             .await
     }
 
@@ -970,7 +1033,8 @@ impl Router {
         prepaid: Option<OwnedSemaphorePermit>,
         deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
-        let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        let request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        drop(request);
         let ServiceOp::Traverse(r) = op else {
             return Err(ApiError::internal("fan_traverse takes a traversal"));
         };
@@ -1025,15 +1089,21 @@ impl Router {
                 .map(|k| k.len() + VISITED_NODE_BYTES)
                 .sum::<usize>()
         };
-        held.push(
-            budget_within(
-                self.service.inflight(),
-                hold(&frontier),
-                // What's left of the arrival deadline (simp724's N2 on #1713).
-                reach.within()?,
-            )
-            .await?,
+        // The traversal's holding (#1715): one hop page's share, held for the whole
+        // traversal and reading every hop's pages, which are read at the traversal's own
+        // `page_bytes` (cli692's Q1). It's taken with the seeds' visited share in one wait,
+        // holding nothing. It becomes the reply's charge.
+        let page = page_bytes(r.page_bytes);
+        let mut holding = Some(
+            self.service
+                .fanout_hold(
+                    cap_of(r.page_bytes).saturating_add(hold(&frontier)),
+                    reach.within()?,
+                )
+                .await?,
         );
+        // The visited set's bytes held apart from the holding (the seeds' are in it).
+        let mut held_bytes = 0usize;
         let mut stats = proto::TraverseStats::default();
         let mut hops = Vec::new();
         let mut missed: Vec<MissingRange> = Vec::new();
@@ -1050,6 +1120,8 @@ impl Router {
             let (mut full, mut cut_by_bytes, mut used) = (false, false, 0u64);
             let mut after = prost::bytes::Bytes::new();
             let mut last_row: Option<prost::bytes::Bytes> = None;
+            // The current row's edges read so far, across pages.
+            let mut row_edges = 0u64;
             'pages: loop {
                 let page = self
                     .merge_keys(
@@ -1058,7 +1130,7 @@ impl Router {
                             table: r.table.clone(),
                             keys: frontier.clone(),
                             selection: Some(selection.clone()),
-                            page_bytes: crate::serve::service::MAX_PAGE_BYTES,
+                            page_bytes: page,
                             after: after.clone(),
                             allow_partial: r.allow_partial,
                         },
@@ -1077,8 +1149,15 @@ impl Router {
                     if last_row.as_ref() != Some(&row.key) {
                         stats.rows += 1;
                         last_row = Some(row.key.clone());
+                        row_edges = 0;
                     }
                     for cell in row.cells {
+                        // A row a page cut and the next resumed starts its `column_limit`
+                        // over, so the limit is kept here across pages, as one read keeps it.
+                        if r.per_node_limit > 0 && row_edges >= u64::from(r.per_node_limit) {
+                            break;
+                        }
+                        row_edges += 1;
                         stats.edges += 1;
                         let dest = cell.qualifier;
                         if visited.contains(&dest[..]) || seen.contains(&dest) {
@@ -1131,15 +1210,39 @@ impl Router {
             if nodes.is_empty() {
                 break;
             }
-            held.push(
-                budget_within(
-                    self.service.inflight(),
-                    hold(&nodes),
-                    // What's left of the arrival deadline (simp724's N2 on #1713).
-                    reach.within()?,
-                )
-                .await?,
-            );
+            // The new nodes' visited share: on spare budget if it's there. Otherwise the
+            // hop holding goes back while it waits, and is taken again after, so the
+            // traversal never waits for budget while it holds a page's (cli692's P1 on
+            // #1715). Retaking it still waits while the visited set is held: that set is
+            // the traversal's state, with no bound worth reserving up front.
+            let want = hold(&nodes);
+            let share = match u32::try_from(want.max(1)).ok().and_then(|n| {
+                Arc::clone(self.service.inflight())
+                    .try_acquire_many_owned(n)
+                    .ok()
+            }) {
+                Some(share) => share,
+                None => {
+                    drop(holding.take());
+                    let share =
+                        budget_within(self.service.inflight(), want, reach.within()?).await?;
+                    // A page's share again, at most what the visited set leaves of the
+                    // budget, so a budget smaller than a page can't hold it up for ever.
+                    let room = self
+                        .service
+                        .limits()
+                        .inflight_bytes
+                        .saturating_sub(held_bytes + want);
+                    holding = Some(
+                        self.service
+                            .fanout_hold(cap_of(r.page_bytes).min(room), reach.within()?)
+                            .await?,
+                    );
+                    share
+                }
+            };
+            held_bytes += want;
+            held.push(share);
             visited.extend(nodes.iter().map(|k| k.to_vec()));
             frontier = nodes;
             hops.push(hop);
@@ -1150,8 +1253,15 @@ impl Router {
             stats: Some(stats),
             missing: missed,
         };
+        let holding =
+            holding.ok_or_else(|| ApiError::internal("a traversal ended without its holding"))?;
         self.service
-            .charge_built(caller, ServiceReply::Traverse(reply))
+            .fanout_reply(
+                caller,
+                ServiceReply::Traverse(reply),
+                holding,
+                reach.within()?,
+            )
             .await
     }
 }

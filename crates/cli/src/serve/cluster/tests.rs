@@ -2496,15 +2496,6 @@ fn graph_row(row: &[u8], v: [f32; 4], edges: &[(Vec<u8>, bool)]) -> super::proto
 
 #[test]
 fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
-    // D317 §12's model test, ticket 4b, against one database holding every row: nearest
-    // searches over every source kind (vectors repeat, so distances tie and the order's
-    // row and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross
-    // the partitions, with every limit, the byte budget, parents and an edge selection,
-    // stats included.
-    use super::proto::{
-        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
-        key_range::Range, nearest_request::Source, value_filter,
-    };
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2515,6 +2506,27 @@ fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
                 .as_nanos() as u64
         });
     eprintln!("cluster 4b seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    nearest_traverse_model(seed);
+}
+
+/// Seeds that failed once, run every time.
+#[test]
+fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
+    // #1715: hop pages read at the traversal's own `page_bytes` cut a frontier row across
+    // two pages, and the second page's `column_limit` started over, past `per_node_limit`.
+    nearest_traverse_model(1794386011110329000);
+}
+
+/// D317 §12's model test, ticket 4b, against one database holding every row: nearest
+/// searches over every source kind (vectors repeat, so distances tie and the order's row
+/// and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross the
+/// partitions, with every limit, the byte budget, parents and an edge selection, stats
+/// included.
+fn nearest_traverse_model(seed: u64) {
+    use super::proto::{
+        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
+        key_range::Range, nearest_request::Source, value_filter,
+    };
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, dbs) = three_nodes(&rt);
@@ -3414,5 +3426,6 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
 }
 
 mod backup;
+mod charge;
 mod feed;
 mod metrics;

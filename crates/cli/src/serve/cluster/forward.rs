@@ -146,21 +146,37 @@ impl Forwarder {
     ) -> Result<ForwardResponse, ApiError> {
         let peer = self.peer(address)?;
         let slot = &peer.slots[peer.next.fetch_add(1, Ordering::Relaxed) % CHANNELS];
-        // Before the send: a connection that can't be made sent nothing.
-        let channel = slot
-            .get_or_try_init(|| peer.endpoint.connect())
-            .await
-            .map_err(|e| {
-                ApiError::partition_unavailable(format!(
-                    "the partition's node at {address} can't be reached: {e}"
-                ))
-            })?
-            .clone();
+        // Before the send: a connection that can't be made sent nothing. Its making counts
+        // against the call's `timeout` too, so a node that takes connections and never
+        // answers can't hold a call past its deadline (#1715: a fanned-out read holds its
+        // pages' budget that long).
+        let channel =
+            tokio::time::timeout(timeout, slot.get_or_try_init(|| peer.endpoint.connect()))
+                .await
+                .map_err(|_| {
+                    ApiError::partition_unavailable(format!(
+                        "the partition's node at {address} didn't take a connection in time"
+                    ))
+                })?
+                .map_err(|e| {
+                    ApiError::partition_unavailable(format!(
+                        "the partition's node at {address} can't be reached: {e}"
+                    ))
+                })?
+                .clone();
         let mut request = self.node.request(req).map_err(ApiError::internal)?;
         request.set_timeout(timeout);
-        match ClusterClient::new(channel).forward(request).await {
-            Ok(reply) => Ok(reply.into_inner()),
-            Err(status) => Err(classify(&status, address, writes)),
+        // `grpc-timeout` tells the owner; the wait here is bounded too, so an owner that
+        // took the call and never answers ends it at the deadline (#1715). That's after the
+        // send: a write's outcome is unknown (B3), a read's node unavailable.
+        match tokio::time::timeout(timeout, ClusterClient::new(channel).forward(request)).await {
+            Ok(Ok(reply)) => Ok(reply.into_inner()),
+            Ok(Err(status)) => Err(classify(&status, address, writes)),
+            Err(_) => Err(classify(
+                &tonic::Status::deadline_exceeded("no answer within the call's deadline"),
+                address,
+                writes,
+            )),
         }
     }
 
