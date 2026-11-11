@@ -1770,11 +1770,6 @@ async fn scan_pages(
 
 #[test]
 fn fanned_out_scans_and_multi_gets_answer_as_one_database_does() {
-    // D317 §12's model test, fan-out half (ticket 4a), against one database holding every
-    // row: scans over every kind of range, with row limits and byte budgets, resumed from
-    // every page's `next` through another entry node; multi-gets of random key sets, page by
-    // page, which must match the single database's pages exactly (the budget's merge across
-    // partitions, simp724's S1 and M1).
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1785,6 +1780,23 @@ fn fanned_out_scans_and_multi_gets_answer_as_one_database_does() {
                 .as_nanos() as u64
         });
     eprintln!("cluster fan-out seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    fan_out_model(seed);
+}
+
+/// Seeds that failed once, run every time.
+#[test]
+fn fanned_out_reads_at_seeds_that_failed() {
+    // #1698's multi-get page that used its whole budget at a partition's end, with only
+    // keys that have no cells left after it: a `next` where a single node gives none.
+    fan_out_model(1794362533986056000);
+}
+
+/// D317 §12's model test, fan-out half (ticket 4a), against one database holding every
+/// row: scans over every kind of range, with row limits and byte budgets, resumed from
+/// every page's `next` through another entry node; multi-gets of random key sets, page by
+/// page, which must match the single database's pages exactly (the budget's merge across
+/// partitions, simp724's S1 and M1).
+fn fan_out_model(seed: u64) {
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, dbs) = three_nodes(&rt);
@@ -2054,6 +2066,54 @@ fn fanned_out_scans_and_multi_gets_answer_as_one_database_does() {
                     "{at}, page {i}'s next"
                 );
                 after = got.next.to_vec();
+            }
+        }
+        // A budget that ends exactly at p1's end: a `next` only when a later key has a
+        // cell, past partitions whose keys have none (p2's "h" and p3's "nope" have none).
+        let fill = t
+            .keys(&pigeonhole::KeySet::from_unsorted([&b"a0"[..], b"f1"]))
+            .read_within(1 << 20)
+            .unwrap()
+            .bytes();
+        for (after_p1, rest) in [
+            (vec![&b"nope"[..]], &[][..]),
+            (vec![&b"h"[..], b"nope"], &[][..]),
+            (vec![&b"h"[..], b"s0"], &[&b"s0"[..]][..]),
+        ] {
+            use super::proto::MultiGetRequest;
+            let at = format!("seed {seed}, a budget ending at p1's end, then {after_p1:?}");
+            let mut asked: Vec<&[u8]> = vec![b"a0", b"f1"];
+            asked.extend(after_p1);
+            let req = |after: Vec<u8>, page_bytes| MultiGetRequest {
+                table: "users".into(),
+                keys: asked.iter().map(|k| k.to_vec().into()).collect(),
+                page_bytes,
+                after: after.into(),
+                ..Default::default()
+            };
+            for &entry in &ports {
+                let page = data(entry)
+                    .await
+                    .multi_get(req(Vec::new(), fill))
+                    .await
+                    .unwrap();
+                let page = page.into_inner();
+                let got: Vec<&[u8]> = page.rows.iter().map(|r| &r.key[..]).collect();
+                assert_eq!((got, page.bytes), (vec![&b"a0"[..], b"f1"], fill), "{at}");
+                assert_eq!(page.next.is_empty(), rest.is_empty(), "{at}");
+                if !rest.is_empty() {
+                    // The rest at the default page, which holds it: at `fill`, a longer
+                    // row than a0 and f1 together would be cut.
+                    let more = data(entry)
+                        .await
+                        .multi_get(req(page.next.to_vec(), 0))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let got: Vec<&[u8]> = more.rows.iter().map(|r| &r.key[..]).collect();
+                    assert_eq!(got, rest, "{at}: resumed");
+                    assert!(more.next.is_empty(), "{at}: resumed");
+                }
             }
         }
         // A single node's position is refused by name on a cluster.
