@@ -23,6 +23,9 @@ pub(crate) struct Cluster {
     pub(crate) node: Arc<super::cluster::Node>,
     pub(crate) local: Option<String>,
     pub(crate) forwarder: Arc<Forwarder>,
+    /// Partition files streamed in for a restore or a relocation (D317), staged in the
+    /// node's cluster directory.
+    pub(crate) uploads: Arc<super::cluster::upload::Uploads>,
 }
 
 impl Cluster {
@@ -73,13 +76,100 @@ impl Router {
             Some(p) => service.sessions_on(p),
             None => service,
         };
+        let uploads = Arc::new(super::cluster::upload::Uploads::new(
+            node.dir(),
+            1,
+            super::cluster::upload::max_chunk(service.limits().max_request_bytes),
+        ));
         Self {
             service: Arc::new(service),
             cluster: Some(Cluster {
                 node,
                 local,
                 forwarder,
+                uploads,
             }),
+        }
+    }
+
+    /// `--max-uploads`: a cluster node's partition uploads at once.
+    pub(crate) fn max_uploads(mut self, max: usize) -> Self {
+        if let Some(u) = self
+            .cluster
+            .as_mut()
+            .and_then(|c| Arc::get_mut(&mut c.uploads))
+        {
+            u.set_max(max);
+        }
+        self
+    }
+
+    /// `Admin.PartitionUpload` (D317): `stream`'s file of a partition this node doesn't
+    /// have open, staged for the stamp that installs it. Admin scope; a cluster node only.
+    pub(crate) async fn partition_upload(
+        &self,
+        caller: &Caller,
+        mut stream: tonic::Streaming<super::proto::PartitionUploadChunk>,
+    ) -> Result<super::proto::PartitionUploadReply, ApiError> {
+        let uploads = self.uploads_for(caller)?;
+        // Each message within `--stream-idle-ms` (cli692's F1 on #1728): a stalled stream
+        // ends, so its upload goes back to resumable and its `--max-uploads` place is free.
+        let idle = self.service.limits().stream_idle;
+        let mut next = async || match tokio::time::timeout(idle, stream.message()).await {
+            Ok(m) => {
+                m.map_err(|s| ApiError::invalid(format!("the upload's stream: {}", s.message())))
+            }
+            Err(_) => Err(ApiError::deadline(
+                "no upload message for --stream-idle-ms: resume from PartitionUploadStatus",
+            )),
+        };
+        let Some(first) = next().await? else {
+            return Err(ApiError::invalid("an upload sends its header first"));
+        };
+        let Some(header) = first.header.clone() else {
+            return Err(ApiError::invalid(
+                "an upload's first message carries its header",
+            ));
+        };
+        let open = |p: &str| self.partitions().any(|(id, _)| id == p);
+        let mut writing = uploads.begin(header, open)?;
+        let mut chunk = Some(first);
+        while let Some(c) = chunk.take() {
+            if !c.data.is_empty() {
+                // One chunk's write (at most 1 MiB), off the async threads.
+                writing = tokio::task::spawn_blocking(move || writing.write(&c).map(|()| writing))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("an upload's write: {e}")))??;
+            }
+            chunk = next().await?;
+        }
+        // The SHA-256 of the whole file and its sync, likewise.
+        tokio::task::spawn_blocking(move || writing.finish())
+            .await
+            .map_err(|e| ApiError::internal(format!("an upload's finish: {e}")))?
+    }
+
+    /// `Admin.PartitionUploadStatus` (D317).
+    pub(crate) fn partition_upload_status(
+        &self,
+        caller: &Caller,
+        upload_id: &str,
+    ) -> Result<super::proto::PartitionUploadStatusReply, ApiError> {
+        self.uploads_for(caller)?.status(upload_id)
+    }
+
+    fn uploads_for(
+        &self,
+        caller: &Caller,
+    ) -> Result<&Arc<super::cluster::upload::Uploads>, ApiError> {
+        if !caller.scope.allows(super::auth::Scope::Admin) {
+            return Err(ApiError::permission_denied("call PartitionUpload"));
+        }
+        match &self.cluster {
+            Some(c) => Ok(&c.uploads),
+            None => Err(ApiError::unsupported(
+                "a partition upload is for a cluster node (phdb serve --cluster)",
+            )),
         }
     }
 
@@ -213,6 +303,22 @@ impl Router {
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
+            // The schema is the map's (ticket 5).
+            if matches!(
+                op,
+                ServiceOp::ListTables(_)
+                    | ServiceOp::DescribeTable(_)
+                    | ServiceOp::CreateTable(_)
+                    | ServiceOp::DropTable(_)
+            ) {
+                let deadline = deadline.map_or_else(
+                    || tokio::time::Instant::now() + self.service.request_timeout(),
+                    tokio::time::Instant::from_std,
+                );
+                return self
+                    .cluster_schema(cluster, op, caller, prepaid, deadline)
+                    .await;
+            }
             // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
             // subscription follows every partition it covers (ticket 7). One at a snapshot
             // reads its partition only (ticket 3): a multi-get is routed and forwarded as a
@@ -408,6 +514,9 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
+        if matches!(op, ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) {
+            return self.serve_forwarded_schema(cluster, op, caller).await;
+        }
         {
             let routes = cluster.node.routes();
             let Some(routes) = routes.as_ref() else {
@@ -659,13 +768,18 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::Traverse(_) => Err(ApiError::internal(
             "a fanned-out read isn't routed to one partition",
         )),
-        // An index lives in one partition's file: searching one across a cluster waits for
-        // co-located tables (D317 §1, placement groups with ticket 5).
-        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(later("an index search", 5)),
+        // An index lives in one partition's file, and no D317 ticket routes a search to it
+        // (#1722, 1.3.0).
+        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
+            "indexed vector and text search isn't supported on a cluster in this release: use \
+             Vectors.Nearest, which fans out across the partitions",
+        )),
         ServiceOp::ListTables(_)
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
-        | ServiceOp::DescribeTable(_) => Err(later("the schema", 5)),
+        | ServiceOp::DescribeTable(_) => Err(ApiError::internal(
+            "a schema call is answered from the cluster map, not routed to a partition",
+        )),
         // A cluster subscription is routed before this ([`Router::subscribe`]).
         ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
         // A backup is served before this ([`Router::backup`]).

@@ -4544,6 +4544,14 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **`phdb cluster`:** `init-partition`, `set-map`, `show-map` and `status`.
 - **The reserved prefix:** user calls refuse `__phdb_` names and `ListTables` hides them.
 
+**D317 amendment 1 (coordinator, 2026-11-10, with simp724's conditions; ticket 5, ICR 0117's ticket 5 section): one map writer.** Ticket 5's model test found two schema changes through two entry nodes diverging: each node's compare-and-set ran against its own map, both made the next version, and one table was lost.
+- **The writer** is the node with the smallest id in the current map. It alone changes the map.
+- **Every map change goes through it,** the operator's `set-map` included. Another node forwards a schema change to it (`Cluster.Forward`'s `create_table` and `drop_table` arms), or answers a `SetMap` with `WrongPartition` naming it, which `phdb cluster set-map` follows. A writer reached by a forward never forwards it on. At the writer, schema changes queue one at a time.
+- **A same-version map with other contents** is refused and reported as divergent, as ticket 1 has it.
+- **No `admin` in `ForwardedCaller`.** The writer takes the caller's scope from its own token entry for the token's digest (D317 ticket 3), uncapped, and checks a drop's `admin` itself.
+- **B3 across the hop:** a forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`.
+- **Recovery when the writer is down:** `phdb cluster set-map --force` at any node, refused without the flag. Its version goes above every reachable node's, and it must name a reachable writer: remove the down node, or let another id be the smallest. A node that restarts with a map changes none as the writer until it has taken its peers' newer maps, so a writer back after a forced recovery follows the forced map. Force is for a writer that's down: one that's up but cut off can make a change the forced map then loses, and the guide says so.
+
 <a id="d318"></a>
 ## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
 

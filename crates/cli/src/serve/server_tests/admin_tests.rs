@@ -536,6 +536,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
                 ..Default::default()
             }],
             if_missing: true,
+            placement: None,
         })
     };
     let drop_c = || ServiceOp::DropTable(proto::DropTableRequest { name: "c".into() });
@@ -598,8 +599,20 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         }
         out
     };
-    // Serve's own families: a primary's, then a replica's (rendered only on a replica).
-    let p = Server::start("", limits());
+    // Serve's own families: a primary's, then a replica's (rendered only on a replica). The
+    // primary has a placement, as every `phdb serve` does: the hub thread gauge is its
+    // (#1719).
+    let dir = test_dir();
+    let placed = Pigeonhole::open(
+        dir.join("p.phdb"),
+        Options::default().create_if_missing(true).shards(1),
+    )
+    .unwrap();
+    let plan = Arc::new(crate::serve::placement::Placement::plan(
+        &placed, None, None, None, None, true,
+    ));
+    placed.close().unwrap();
+    let p = Server::start_custom("", limits(), 1, move |svc| svc.placement(&plan));
     let r = Server::start_replica(test_dir(), &p.url, None);
     for (server, prefix) in [(&p, "pigeonhole_serve_"), (&r, "pigeonhole_replica_")] {
         let rendered = names(&server.shared.router.metrics_text(), prefix);

@@ -328,13 +328,12 @@ message MissingRange {
   bytes end = 4;
 }
 
-// One file of a partition's database (D317 ticket 6, ICR 0135): a closed partition's files
-// in `Cluster.Status`, and an upload's manifest.
+// One file of a partition's set (D317: a restore's or a move's upload, a node's partition
+// files): its name is a suffix of the partition's database path ("" for the main file,
+// "-wal-<n>", "-feed"), so each node maps it onto its own path.
 message PartitionFile {
-  // The suffix after the partition's database path: "" for the main file, "-wal-<n>",
-  // "-feed". Each node maps it onto its own path.
   string name = 1;
   uint64 bytes = 2;
-  // The file's SHA-256 (32 bytes).
   bytes sha256 = 3;
 }
+

@@ -26,6 +26,12 @@ service Admin {
   // it stops following, takes writes, and returns the primary's token it stopped at (#1436).
   // Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
   rpc Promote(Empty) returns (PromoteResponse);
+  // On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
+  // relocation by file copy. It's staged aside, never served; the stamp that relocates or
+  // restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+  rpc PartitionUpload(stream PartitionUploadChunk) returns (PartitionUploadReply);
+  // How many bytes of an upload the node holds, to resume it.
+  rpc PartitionUploadStatus(PartitionUploadStatusRequest) returns (PartitionUploadStatusReply);
 }
 
 message PromoteResponse {
@@ -138,4 +144,62 @@ message BackupChunk {
 
 message MetricsResponse {
   string text = 1;
+}
+
+// What a partition upload carries (D317, restore and relocation by file copy). An upload
+// carries one file of a partition's set; the set is installed once every file its
+// manifest names has arrived.
+message PartitionUploadHeader {
+  // The partition the files are.
+  string partition = 1;
+  // The identity the main file says it is (its `__phdb_cluster` row): the cluster, and the
+  // epoch the copy is of. The install checks the staged set against them; the stamp that
+  // relocates or restores the partition raises the epoch afterwards (D317 ticket 6).
+  string cluster_id = 2;
+  uint64 epoch = 3;
+  // The client's id for this file's upload, 32 lower-case hex: sending it again resumes it.
+  string upload_id = 4;
+  PartitionUploadPurpose purpose = 5;
+  // The file this upload carries: its name (a suffix of the partition's database path: ""
+  // for the main file, "-wal-<n>", "-feed"), size and SHA-256.
+  PartitionFile file = 6;
+  // Every file of the set, `file` among them. The set installs only once each has arrived,
+  // and replaces the partition's whole file set.
+  repeated PartitionFile manifest = 7;
+}
+
+enum PartitionUploadPurpose {
+  PARTITION_UPLOAD_PURPOSE_UNSPECIFIED = 0;
+  PARTITION_UPLOAD_PURPOSE_RESTORE = 1;
+  PARTITION_UPLOAD_PURPOSE_RELOCATE = 2;
+}
+
+// The first message of an upload carries `header`, and each its next bytes from `offset`
+// (up to `PartitionUploadStatusReply.max_chunk`, 512 KiB by default), contiguous from what
+// the node holds. A message that doesn't come within `--stream-idle-ms` ends the upload,
+// which then resumes.
+message PartitionUploadChunk {
+  PartitionUploadHeader header = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message PartitionUploadReply {
+  // The bytes the node holds of the file now.
+  uint64 received = 1;
+  // Every byte arrived, the SHA-256 matched and the file is synced, ready to install.
+  bool complete = 2;
+}
+
+message PartitionUploadStatusRequest {
+  string upload_id = 1;
+}
+
+message PartitionUploadStatusReply {
+  // The bytes the node holds of the upload; 0 for one it doesn't know.
+  uint64 received = 1;
+  bool complete = 2;
+  // The most one chunk may carry on this node (512 KiB, or less under a lower
+  // `--max-request-bytes`): send chunks of at most this many bytes.
+  uint64 max_chunk = 3;
 }

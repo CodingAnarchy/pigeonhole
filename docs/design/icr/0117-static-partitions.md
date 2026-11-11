@@ -149,7 +149,7 @@
 **Budgets:** a fanned-out scan holds one `--max-scans` slot on its entry node for its life, and counts as one `Data.Scan`. Each page it hasn't handed to the client counts against `--inflight-bytes`, as a single node's scan pages do.
 
 ## Ticket 4b: fan-out nearest searches and traversals
-**`Vectors.Nearest` and `Graph.Traverse` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. A `snapshot_id` on either is `Unsupported` on a cluster for good, since a snapshot is one partition's. The index searches (`Vectors.Search`, `Text.Search`) stay refused until co-located tables (placement groups) say which partition holds an index.
+**`Vectors.Nearest` and `Graph.Traverse` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. A `snapshot_id` on either is `Unsupported` on a cluster for good, since a snapshot is one partition's. The index searches (`Vectors.Search`, `Text.Search`) stay refused on a cluster: no D317 ticket routes them (the coordinator, 2026-11-11), and the refusal names no ticket. It points at `Nearest`, which fans out. Index search across partitions is #1722 (1.3.0).
 
 **`Nearest`**, the exact top `k`:
 - **Fan-out:** every partition the source meets answers its own exact top `k` under the same `page_bytes`. A `range` source is clipped to each partition's range, and a `keys` source sends each partition its keys. At most `--fanout-forwards` (8, a new flag) of these run at once.
@@ -232,6 +232,49 @@
   - Digests never appear in logs or errors.
   - `--max-sessions` and `--max-sessions-per-token` count per node.
 
+## Ticket 5: schema in the map
+**A cluster's tables and families live in the partition map.** `Schema.CreateTable`, `DropTable`, `ListTables` and `DescribeTable` (and `GET /v1/tables`) work on any cluster node, and each node reconciles its partitions' files to the map.
+- **`CreateTable`** is a map change. `CreateTableRequest.placement` (field 4, a new `TablePlacementRequest { group, splits, partitions }`) gives the table's ranges as `set-map` would. A cluster refuses a create without one, unless the map already places the table (an operator can place a table with `set-map` first). A single node refuses a request that has one (`InvalidArgument`).
+  - **`if_missing`** adds the families an existing table lacks. A family that exists keeps the map's options even when the request gives others: it's neither refused nor changed, as a single node's `if_missing` keeps the file's (simp724's N3 on #1720; the plan had said refused).
+  - The map's validation applies as it does to `SetMap`. `validate_change` also refuses a family removed or changed, and a changed `created`.
+- **`DropTable`** removes the table's placement from the map. Its partitions stay.
+- **`ListTables`, `DescribeTable` and `GET /v1/tables`** answer from the map, with no fan-out. Tables the map doesn't place, a partition's own `__phdb_` tables included, aren't listed.
+- **The scope** is a single node's: `write` for a create (`if_missing` included), `admin` for a drop, `read` for list and describe. It's checked at the entry node, and again at the writer (amendment 1).
+- **The reply** comes once the map is set, persisted and pushed. `TableResponse.unreconciled` (field 3) lists the partitions whose node the push missed. A drop answers `Empty`, as on a single node. `Cluster.Status` shows each partition's reconcile: `LocalPartition.reconciled_version`, `reconcile_errors`, `unmapped_tables` and `adopted_tables` (fields 6–9).
+
+**`TablePlacement.created`** (field 6) is the map version that created the table. It tells a table from one dropped and created again under its name. It's fixed for the table's life; 0 for a placement made by hand with `set-map`.
+
+**Reconcile** runs on every map a node takes, before the map's routes serve, and at start. Each partition records each table the map made in its `__phdb_cluster` table (row `schema/<table>`, family `schema`, qualifier `created`), so reconcile needs only the map and the file (simp724's S1):
+- **Placed here with `created` c:**
+  - The file has no such table: it's created with the map's families, and c recorded.
+  - The table is recorded with c: any missing families are added. An option mismatch is reported in `Status`, not changed.
+  - The table is recorded with another c′: the map dropped it and created it again, so the old table is dropped and the new one created.
+  - The table isn't recorded: it was made by hand before the map managed it. It's adopted, with missing families added, and c recorded.
+- **Recorded, and not placed here:** the map dropped it. The table is dropped, then its record.
+- **Neither recorded nor placed:** a hand-made table, left alone and listed in `Status` (`unmapped_tables`).
+- **A crash** between a table and its record redoes the step on the next reconcile. `__phdb_` tables are never touched.
+- **The window:** the map is set, pushed, and each node reconciles before its routes serve. A call routed by the new map finds its table, or answers `TableNotFound` while a node that hasn't taken the map yet catches up. That `TableNotFound` is safe to retry: nothing was applied.
+
+**D317 amendment 1: one map writer.** Two schema changes through two entry nodes diverged in the model test: each compare-and-set ran against its own node's map, both made the same next version, and one table was lost. The coordinator approved the fix with simp724's conditions:
+- **The writer** is the node with the smallest id in the current map. It alone changes the map.
+- **Schema changes go to it.** Another node forwards `CreateTable` and `DropTable` to it on `Cluster.Forward` (request arms `create_table` 19 and `drop_table` 20; reply `table` 12, and `empty` for a drop). A writer whose map names another writer answers `WrongPartition`. The entry node pulls the newer map and sends once more. A writer never forwards a change on. At the writer, changes queue one at a time, so a compare-and-set conflicts only with an operator's `set-map` at the same moment, and is retried against the re-read map (S2).
+- **`SetMap`** is refused at a node that isn't the writer, with `WrongPartition` naming the writer and its address. `phdb cluster set-map` reads the map from `--node` and sends the map to its writer.
+- **Scope at the writer:** a forward's `ForwardedCaller` scope stays `read` or `write`. The writer resolves `token_digest` against its own token file, uncapped (`schema_caller_of`), and checks a drop's `admin` itself. A `cluster` token, or a digest it doesn't list, is refused. Without tokens anywhere, the caller is anyone, as on a single node.
+- **B3:** a forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`. A create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
+- **Divergence:** a same-version map with other contents is refused and reported, as in ticket 1.
+- **Recovery when the writer is down:** `phdb cluster set-map --force` (`SetMapRequest.force`, field 3) at any node.
+  - The CLI reads `Status` from every node it can reach and puts the map's version above all of them.
+  - The map must name a writer that answered: remove the down node, or let another id be the smallest.
+  - The node takes it without the writer check or the compare-and-set: it need only be the cluster's, at a version above the node's own.
+  - A node that starts with a map changes none as the writer until it has taken its peers' newer maps. So a writer back after a forced recovery takes the forced map first, which no longer names it, and follows it.
+  - Force is for a writer that's down. A writer that's up but cut off can still make a change, which the forced map then loses.
+
+**Tests:**
+- **Through the nodes:** a create, an added family, a drop and a create again under the same name, each through a different node. A hand-made table survives, and one the map takes over is reported as adopted.
+- **Concurrency:** twelve creates at once through three nodes all land, and every node ends with the same map and no divergence. With every node writing, as before amendment 1, the test fails.
+- **Recovery:** the writer stops; a forced map that still names it is refused; one without it is set above every version, and schema calls work through the new writer. The old writer restarts with its old map, takes the forced one, refuses a `set-map` naming the new writer, and forwards a schema call to it.
+- **Reconcile unit tests:** a crash between a map and its reconcile; a drop and re-create while a node was away. Mutation-checked: dropping unmapped tables, or ignoring `created`, fails them.
+
 ## Ticket 8b: cluster backup, and metrics by partition
 **`Admin.Backup` and `Admin.BackupDownload` on a cluster node** (D317 §9) back up one partition the node holds. They're never forwarded: a backup's bytes don't take a hop.
 - **`BackupRequest.partition`** (field 3) and **`BackupDownloadRequest.partition`** (field 5) name the partition. A cluster node requires one, even when it holds just one partition (`InvalidArgument` without it). A single node refuses one (`InvalidArgument`).
@@ -252,6 +295,26 @@
 
 **Metrics by partition:** on a cluster node, `/metrics` and `Admin.Metrics` label every per-partition series `pigeonhole_partition="<id>"`. That covers the engine's metrics (D323, through `pigeonhole-otel`'s `Config::attribute`, ICR 0133) and the serve feed fan-out's and bulk loads' gauges. Node-wide series (connections, replies, sessions) stay unlabelled. Each family's `# HELP`/`# TYPE` comes once, whatever the number of partitions. A single node's text is unchanged. On a cluster node, `Admin.Metrics` is answered by the node itself; it was `Unsupported` before.
 
+## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
+**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
+- **A partition is a set of files,** named by their suffix of the partition's database path: `""` for the main file, `-wal-<n>` for a WAL sidecar, `-feed` for the change feed's sidecar. Each node maps a name onto its own path. **`PartitionFile { name = 1; bytes = 2; sha256 = 3 }`** (common.proto) describes one.
+- **`PartitionUploadHeader`:**
+  - `partition` (1), and `cluster_id` (2) and `epoch` (3): what the main file says it is, so the epoch the copy is *of*;
+  - `upload_id` (4): 32 lower-case hex, chosen by the client;
+  - `purpose` (5): `RESTORE` or `RELOCATE`;
+  - `file` (6): the file this upload carries;
+  - `manifest` (7): every file of the set, `file` among them, with the main file required.
+- **`PartitionUploadChunk { header = 1; offset = 2; data = 3 }`:** the first message carries the header. Each message's data starts where the node's bytes end, and is at most the node's `max_chunk`. That's 512 KiB, or less on a node whose `--max-request-bytes` is lower: min(512 KiB, the limit − 16 KiB), at least 1 KiB (cli692's F3 on #1728). A message that doesn't come within `--stream-idle-ms` ends the upload with `DeadlineExceeded`, which frees its place; it then resumes (cli692's F1).
+- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2; max_chunk = 3 }`. A client asks the status first, for `max_chunk`.
+- **A full disk or quota** answers `NoSpace` (`ResourceExhausted`, 507): free space, then resume from the status. Nothing written is lost (cli692's F2).
+- **Accepted only while the partition isn't open on the node,** with one upload of a given file of it at a time, and at most `--max-uploads` (default 1) at once; more are `Overloaded`. A resume must send the same header (`InvalidArgument` otherwise).
+- **Staged, never served:**
+  - Bytes go to `<cluster DIR>/.phdb-incoming/<upload_id>.part` (the directory mode 0700, never a link).
+  - When every byte has arrived and the SHA-256 matches, the file is synced and renamed `<partition>.phdb<name>.ready`. Then its header is written beside it (`….ready.header`). The header is the commit marker, written last after any older one is removed, so a crash between the steps leaves a ready file with no header, which the install never takes (feed1248's F1 on #1728).
+  - A file whose bytes don't match is dropped (`InvalidArgument`): upload it again.
+  - Incomplete uploads untouched for 5 minutes are deleted, and so is every incomplete one when the node starts. Ready files are kept.
+- **Installed by ticket 6's stamp,** not by the upload. Relocate's first step on the new node (copy, promotion and restore alike) installs the set once every manifest file is ready with one header. It checks the header against the stamp's partition and epoch (a restore may name an older epoch, and with `restore_from_cluster_id`, another cluster), replaces the partition's whole file set, then raises the epoch. The map change opens the partition. This upload section ships the staging; the install comes with ticket 6 PR 1.
+
 ## Ticket 6 PR 2: relocation by file copy
 A partition moved by copying its closed files keeps its history, so feed tokens resume across the move. Fencing, closing, `relocate` and the stamp are PR 1's (its own section). PR 2 adds:
 
@@ -261,6 +324,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
   - an epoch raised by a relocation by copy keeps it;
   - any other raise (a promotion, a restore) sets it to the new epoch;
   - a new partition's is its epoch.
+  - **A forced map** (`SetMapRequest.force`, amendment 1) is derived the same way against the receiving node's map, as a change that copied nothing, and can't list `copies` (`InvalidArgument`): a copy is a planned move, made through the writer. Against a node behind the cluster that's conservative: an epoch raise it hasn't seen restarts that partition's history, so a token can expire but never resumes across a history it doesn't share.
 - **Checked:** a map whose `history_epoch` is past its `epoch` is invalid.
 - **Maps from before ticket 6** have 0. No epoch had moved then, so it reads as "never broken".
 - **Peers take it as set:** a pushed or pulled map arrives derived.
@@ -280,13 +344,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
   - `durable`, `replica` and `backup_id` must be unset (`InvalidArgument`);
   - a single node refuses `fenced_file` (`InvalidArgument`).
 
-**`PartitionFile`** (common.proto, a new message): `{ string name = 1; uint64 bytes = 2; bytes sha256 = 3; }`. One file of a partition's database, named by its suffix. It's shared by PR 1's closed-partition status (`LocalPartition.files`) and the upload's manifest.
-
-**Agreed with 8b's restore** (perf2's PR; recorded here so the numbers are in one place):
-- `Admin.PartitionUpload` (client streaming): `PartitionUploadChunk { header = 1; offset = 2; data = 3; }` → `PartitionUploadReply { received = 1; complete = 2; }`.
-- `PartitionUploadHeader { partition = 1; cluster_id = 2; epoch = 3; upload_id = 4; purpose = 5; file = 6 (PartitionFile); repeated PartitionFile manifest = 7; }`, with `enum PartitionUploadPurpose { UNSPECIFIED = 0; RESTORE = 1; RELOCATE = 2; }`.
-- `Admin.PartitionUploadStatus`: `PartitionUploadStatusRequest { upload_id = 1; }` → `PartitionUploadStatusReply { received = 1; complete = 2; }`.
-- A move sends the closed partition's whole file set (main file, any WAL sidecars, the feed sidecar `-feed`), which the installer installs only once complete. That's why feed history survives: the feed sidecar is bound to the database's id and holds the feed's sessions.
+**`PartitionFile`** (common.proto) is the upload's (the section above). PR 1's closed-partition status (`LocalPartition.files`) lists one per file, and `fenced_file` takes its `name`. A move sends the closed partition's whole set (main file, any WAL sidecars, the feed sidecar `-feed`), which the stamp installs only once complete. That's why feed history survives: the feed sidecar is bound to the database's id and holds the feed's sessions.
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

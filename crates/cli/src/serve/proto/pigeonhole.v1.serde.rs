@@ -3710,6 +3710,9 @@ impl serde::Serialize for CreateTableRequest {
         if self.if_missing {
             len += 1;
         }
+        if self.placement.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.CreateTableRequest", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -3719,6 +3722,9 @@ impl serde::Serialize for CreateTableRequest {
         }
         if self.if_missing {
             struct_ser.serialize_field("if_missing", &self.if_missing)?;
+        }
+        if let Some(v) = self.placement.as_ref() {
+            struct_ser.serialize_field("placement", v)?;
         }
         struct_ser.end()
     }
@@ -3734,6 +3740,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
             "families",
             "if_missing",
             "ifMissing",
+            "placement",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3741,6 +3748,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
             Name,
             Families,
             IfMissing,
+            Placement,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3765,6 +3773,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                             "name" => Ok(GeneratedField::Name),
                             "families" => Ok(GeneratedField::Families),
                             "ifMissing" | "if_missing" => Ok(GeneratedField::IfMissing),
+                            "placement" => Ok(GeneratedField::Placement),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3787,6 +3796,7 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                 let mut name__ = None;
                 let mut families__ = None;
                 let mut if_missing__ = None;
+                let mut placement__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -3807,12 +3817,19 @@ impl<'de> serde::Deserialize<'de> for CreateTableRequest {
                             }
                             if_missing__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Placement => {
+                            if placement__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("placement"));
+                            }
+                            placement__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(CreateTableRequest {
                     name: name__.unwrap_or_default(),
                     families: families__.unwrap_or_default(),
                     if_missing: if_missing__.unwrap_or_default(),
+                    placement: placement__,
                 })
             }
         }
@@ -6282,6 +6299,12 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::Nearest(v) => {
                     struct_ser.serialize_field("nearest", v)?;
                 }
+                forward_request::Op::CreateTable(v) => {
+                    struct_ser.serialize_field("create_table", v)?;
+                }
+                forward_request::Op::DropTable(v) => {
+                    struct_ser.serialize_field("drop_table", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6322,6 +6345,10 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "release_snapshot",
             "releaseSnapshot",
             "nearest",
+            "create_table",
+            "createTable",
+            "drop_table",
+            "dropTable",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6344,6 +6371,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             OpenSnapshot,
             ReleaseSnapshot,
             Nearest,
+            CreateTable,
+            DropTable,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6383,6 +6412,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "releaseSnapshot" | "release_snapshot" => Ok(GeneratedField::ReleaseSnapshot),
                             "nearest" => Ok(GeneratedField::Nearest),
+                            "createTable" | "create_table" => Ok(GeneratedField::CreateTable),
+                            "dropTable" | "drop_table" => Ok(GeneratedField::DropTable),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6533,6 +6564,20 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Nearest)
 ;
                         }
+                        GeneratedField::CreateTable => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createTable"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::CreateTable)
+;
+                        }
+                        GeneratedField::DropTable => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dropTable"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::DropTable)
+;
+                        }
                     }
                 }
                 Ok(ForwardRequest {
@@ -6592,6 +6637,9 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::Nearest(v) => {
                     struct_ser.serialize_field("nearest", v)?;
                 }
+                forward_response::Reply::Table(v) => {
+                    struct_ser.serialize_field("table", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6620,6 +6668,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "openSnapshot",
             "empty",
             "nearest",
+            "table",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6635,6 +6684,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             OpenSnapshot,
             Empty,
             Nearest,
+            Table,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6667,6 +6717,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "empty" => Ok(GeneratedField::Empty),
                             "nearest" => Ok(GeneratedField::Nearest),
+                            "table" => Ok(GeneratedField::Table),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6764,6 +6815,13 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("nearest"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Nearest)
+;
+                        }
+                        GeneratedField::Table => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("table"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Table)
 ;
                         }
                     }
@@ -9084,6 +9142,18 @@ impl serde::Serialize for LocalPartition {
         if !self.error.is_empty() {
             len += 1;
         }
+        if self.reconciled_version != 0 {
+            len += 1;
+        }
+        if !self.reconcile_errors.is_empty() {
+            len += 1;
+        }
+        if !self.unmapped_tables.is_empty() {
+            len += 1;
+        }
+        if !self.adopted_tables.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -9102,6 +9172,20 @@ impl serde::Serialize for LocalPartition {
         if !self.error.is_empty() {
             struct_ser.serialize_field("error", &self.error)?;
         }
+        if self.reconciled_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("reconciled_version", ToString::to_string(&self.reconciled_version).as_str())?;
+        }
+        if !self.reconcile_errors.is_empty() {
+            struct_ser.serialize_field("reconcile_errors", &self.reconcile_errors)?;
+        }
+        if !self.unmapped_tables.is_empty() {
+            struct_ser.serialize_field("unmapped_tables", &self.unmapped_tables)?;
+        }
+        if !self.adopted_tables.is_empty() {
+            struct_ser.serialize_field("adopted_tables", &self.adopted_tables)?;
+        }
         struct_ser.end()
     }
 }
@@ -9117,6 +9201,14 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "file",
             "ok",
             "error",
+            "reconciled_version",
+            "reconciledVersion",
+            "reconcile_errors",
+            "reconcileErrors",
+            "unmapped_tables",
+            "unmappedTables",
+            "adopted_tables",
+            "adoptedTables",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -9126,6 +9218,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             File,
             Ok,
             Error,
+            ReconciledVersion,
+            ReconcileErrors,
+            UnmappedTables,
+            AdoptedTables,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -9152,6 +9248,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "file" => Ok(GeneratedField::File),
                             "ok" => Ok(GeneratedField::Ok),
                             "error" => Ok(GeneratedField::Error),
+                            "reconciledVersion" | "reconciled_version" => Ok(GeneratedField::ReconciledVersion),
+                            "reconcileErrors" | "reconcile_errors" => Ok(GeneratedField::ReconcileErrors),
+                            "unmappedTables" | "unmapped_tables" => Ok(GeneratedField::UnmappedTables),
+                            "adoptedTables" | "adopted_tables" => Ok(GeneratedField::AdoptedTables),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -9176,6 +9276,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut file__ = None;
                 let mut ok__ = None;
                 let mut error__ = None;
+                let mut reconciled_version__ = None;
+                let mut reconcile_errors__ = None;
+                let mut unmapped_tables__ = None;
+                let mut adopted_tables__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -9210,6 +9314,32 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             error__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ReconciledVersion => {
+                            if reconciled_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("reconciledVersion"));
+                            }
+                            reconciled_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReconcileErrors => {
+                            if reconcile_errors__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("reconcileErrors"));
+                            }
+                            reconcile_errors__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::UnmappedTables => {
+                            if unmapped_tables__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("unmappedTables"));
+                            }
+                            unmapped_tables__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::AdoptedTables => {
+                            if adopted_tables__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("adoptedTables"));
+                            }
+                            adopted_tables__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -9218,6 +9348,10 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     file: file__.unwrap_or_default(),
                     ok: ok__.unwrap_or_default(),
                     error: error__.unwrap_or_default(),
+                    reconciled_version: reconciled_version__.unwrap_or_default(),
+                    reconcile_errors: reconcile_errors__.unwrap_or_default(),
+                    unmapped_tables: unmapped_tables__.unwrap_or_default(),
+                    adopted_tables: adopted_tables__.unwrap_or_default(),
                 })
             }
         }
@@ -13388,6 +13522,752 @@ impl<'de> serde::Deserialize<'de> for PartitionState {
         deserializer.deserialize_struct("pigeonhole.v1.PartitionState", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for PartitionUploadChunk {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.header.is_some() {
+            len += 1;
+        }
+        if self.offset != 0 {
+            len += 1;
+        }
+        if !self.data.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadChunk", len)?;
+        if let Some(v) = self.header.as_ref() {
+            struct_ser.serialize_field("header", v)?;
+        }
+        if self.offset != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("offset", ToString::to_string(&self.offset).as_str())?;
+        }
+        if !self.data.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("data", pbjson::private::base64::encode(&self.data).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadChunk {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "header",
+            "offset",
+            "data",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Header,
+            Offset,
+            Data,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "header" => Ok(GeneratedField::Header),
+                            "offset" => Ok(GeneratedField::Offset),
+                            "data" => Ok(GeneratedField::Data),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PartitionUploadChunk;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.PartitionUploadChunk")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionUploadChunk, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut header__ = None;
+                let mut offset__ = None;
+                let mut data__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Header => {
+                            if header__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("header"));
+                            }
+                            header__ = map_.next_value()?;
+                        }
+                        GeneratedField::Offset => {
+                            if offset__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("offset"));
+                            }
+                            offset__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Data => {
+                            if data__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("data"));
+                            }
+                            data__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(PartitionUploadChunk {
+                    header: header__,
+                    offset: offset__.unwrap_or_default(),
+                    data: data__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.PartitionUploadChunk", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionUploadHeader {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        if !self.cluster_id.is_empty() {
+            len += 1;
+        }
+        if self.epoch != 0 {
+            len += 1;
+        }
+        if !self.upload_id.is_empty() {
+            len += 1;
+        }
+        if self.purpose != 0 {
+            len += 1;
+        }
+        if self.file.is_some() {
+            len += 1;
+        }
+        if !self.manifest.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadHeader", len)?;
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if !self.cluster_id.is_empty() {
+            struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
+        }
+        if self.epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        if !self.upload_id.is_empty() {
+            struct_ser.serialize_field("upload_id", &self.upload_id)?;
+        }
+        if self.purpose != 0 {
+            let v = PartitionUploadPurpose::try_from(self.purpose)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.purpose)))?;
+            struct_ser.serialize_field("purpose", &v)?;
+        }
+        if let Some(v) = self.file.as_ref() {
+            struct_ser.serialize_field("file", v)?;
+        }
+        if !self.manifest.is_empty() {
+            struct_ser.serialize_field("manifest", &self.manifest)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadHeader {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "partition",
+            "cluster_id",
+            "clusterId",
+            "epoch",
+            "upload_id",
+            "uploadId",
+            "purpose",
+            "file",
+            "manifest",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Partition,
+            ClusterId,
+            Epoch,
+            UploadId,
+            Purpose,
+            File,
+            Manifest,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "partition" => Ok(GeneratedField::Partition),
+                            "clusterId" | "cluster_id" => Ok(GeneratedField::ClusterId),
+                            "epoch" => Ok(GeneratedField::Epoch),
+                            "uploadId" | "upload_id" => Ok(GeneratedField::UploadId),
+                            "purpose" => Ok(GeneratedField::Purpose),
+                            "file" => Ok(GeneratedField::File),
+                            "manifest" => Ok(GeneratedField::Manifest),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PartitionUploadHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.PartitionUploadHeader")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionUploadHeader, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut partition__ = None;
+                let mut cluster_id__ = None;
+                let mut epoch__ = None;
+                let mut upload_id__ = None;
+                let mut purpose__ = None;
+                let mut file__ = None;
+                let mut manifest__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ClusterId => {
+                            if cluster_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("clusterId"));
+                            }
+                            cluster_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Epoch => {
+                            if epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("epoch"));
+                            }
+                            epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::UploadId => {
+                            if upload_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("uploadId"));
+                            }
+                            upload_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Purpose => {
+                            if purpose__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("purpose"));
+                            }
+                            purpose__ = Some(map_.next_value::<PartitionUploadPurpose>()? as i32);
+                        }
+                        GeneratedField::File => {
+                            if file__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("file"));
+                            }
+                            file__ = map_.next_value()?;
+                        }
+                        GeneratedField::Manifest => {
+                            if manifest__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("manifest"));
+                            }
+                            manifest__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(PartitionUploadHeader {
+                    partition: partition__.unwrap_or_default(),
+                    cluster_id: cluster_id__.unwrap_or_default(),
+                    epoch: epoch__.unwrap_or_default(),
+                    upload_id: upload_id__.unwrap_or_default(),
+                    purpose: purpose__.unwrap_or_default(),
+                    file: file__,
+                    manifest: manifest__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.PartitionUploadHeader", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionUploadPurpose {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED",
+            Self::Restore => "PARTITION_UPLOAD_PURPOSE_RESTORE",
+            Self::Relocate => "PARTITION_UPLOAD_PURPOSE_RELOCATE",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadPurpose {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED",
+            "PARTITION_UPLOAD_PURPOSE_RESTORE",
+            "PARTITION_UPLOAD_PURPOSE_RELOCATE",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = PartitionUploadPurpose;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED" => Ok(PartitionUploadPurpose::Unspecified),
+                    "PARTITION_UPLOAD_PURPOSE_RESTORE" => Ok(PartitionUploadPurpose::Restore),
+                    "PARTITION_UPLOAD_PURPOSE_RELOCATE" => Ok(PartitionUploadPurpose::Relocate),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionUploadReply {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.received != 0 {
+            len += 1;
+        }
+        if self.complete {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadReply", len)?;
+        if self.received != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("received", ToString::to_string(&self.received).as_str())?;
+        }
+        if self.complete {
+            struct_ser.serialize_field("complete", &self.complete)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadReply {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "received",
+            "complete",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Received,
+            Complete,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "received" => Ok(GeneratedField::Received),
+                            "complete" => Ok(GeneratedField::Complete),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PartitionUploadReply;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.PartitionUploadReply")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionUploadReply, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut received__ = None;
+                let mut complete__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Received => {
+                            if received__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("received"));
+                            }
+                            received__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Complete => {
+                            if complete__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("complete"));
+                            }
+                            complete__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(PartitionUploadReply {
+                    received: received__.unwrap_or_default(),
+                    complete: complete__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.PartitionUploadReply", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionUploadStatusReply {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.received != 0 {
+            len += 1;
+        }
+        if self.complete {
+            len += 1;
+        }
+        if self.max_chunk != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadStatusReply", len)?;
+        if self.received != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("received", ToString::to_string(&self.received).as_str())?;
+        }
+        if self.complete {
+            struct_ser.serialize_field("complete", &self.complete)?;
+        }
+        if self.max_chunk != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("max_chunk", ToString::to_string(&self.max_chunk).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "received",
+            "complete",
+            "max_chunk",
+            "maxChunk",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Received,
+            Complete,
+            MaxChunk,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "received" => Ok(GeneratedField::Received),
+                            "complete" => Ok(GeneratedField::Complete),
+                            "maxChunk" | "max_chunk" => Ok(GeneratedField::MaxChunk),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PartitionUploadStatusReply;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.PartitionUploadStatusReply")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionUploadStatusReply, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut received__ = None;
+                let mut complete__ = None;
+                let mut max_chunk__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Received => {
+                            if received__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("received"));
+                            }
+                            received__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Complete => {
+                            if complete__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("complete"));
+                            }
+                            complete__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::MaxChunk => {
+                            if max_chunk__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("maxChunk"));
+                            }
+                            max_chunk__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(PartitionUploadStatusReply {
+                    received: received__.unwrap_or_default(),
+                    complete: complete__.unwrap_or_default(),
+                    max_chunk: max_chunk__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.PartitionUploadStatusReply", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionUploadStatusRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.upload_id.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadStatusRequest", len)?;
+        if !self.upload_id.is_empty() {
+            struct_ser.serialize_field("upload_id", &self.upload_id)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionUploadStatusRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "upload_id",
+            "uploadId",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            UploadId,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "uploadId" | "upload_id" => Ok(GeneratedField::UploadId),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PartitionUploadStatusRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.PartitionUploadStatusRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionUploadStatusRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut upload_id__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::UploadId => {
+                            if upload_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("uploadId"));
+                            }
+                            upload_id__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(PartitionUploadStatusRequest {
+                    upload_id: upload_id__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.PartitionUploadStatusRequest", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for Phrase {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -17081,6 +17961,9 @@ impl serde::Serialize for SetMapRequest {
         if self.map.is_some() {
             len += 1;
         }
+        if self.force {
+            len += 1;
+        }
         if !self.copies.is_empty() {
             len += 1;
         }
@@ -17092,6 +17975,9 @@ impl serde::Serialize for SetMapRequest {
         }
         if let Some(v) = self.map.as_ref() {
             struct_ser.serialize_field("map", v)?;
+        }
+        if self.force {
+            struct_ser.serialize_field("force", &self.force)?;
         }
         if !self.copies.is_empty() {
             struct_ser.serialize_field("copies", &self.copies)?;
@@ -17109,6 +17995,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             "expected_map_version",
             "expectedMapVersion",
             "map",
+            "force",
             "copies",
         ];
 
@@ -17116,6 +18003,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
         enum GeneratedField {
             ExpectedMapVersion,
             Map,
+            Force,
             Copies,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
@@ -17140,6 +18028,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                         match value {
                             "expectedMapVersion" | "expected_map_version" => Ok(GeneratedField::ExpectedMapVersion),
                             "map" => Ok(GeneratedField::Map),
+                            "force" => Ok(GeneratedField::Force),
                             "copies" => Ok(GeneratedField::Copies),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
@@ -17162,6 +18051,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             {
                 let mut expected_map_version__ = None;
                 let mut map__ = None;
+                let mut force__ = None;
                 let mut copies__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -17179,6 +18069,12 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                             }
                             map__ = map_.next_value()?;
                         }
+                        GeneratedField::Force => {
+                            if force__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("force"));
+                            }
+                            force__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::Copies => {
                             if copies__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("copies"));
@@ -17190,6 +18086,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                 Ok(SetMapRequest {
                     expected_map_version: expected_map_version__.unwrap_or_default(),
                     map: map__,
+                    force: force__.unwrap_or_default(),
                     copies: copies__.unwrap_or_default(),
                 })
             }
@@ -17863,6 +18760,9 @@ impl serde::Serialize for TablePlacement {
         if !self.partitions.is_empty() {
             len += 1;
         }
+        if self.created != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TablePlacement", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -17879,6 +18779,11 @@ impl serde::Serialize for TablePlacement {
         if !self.partitions.is_empty() {
             struct_ser.serialize_field("partitions", &self.partitions)?;
         }
+        if self.created != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("created", ToString::to_string(&self.created).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -17894,6 +18799,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
             "families",
             "splits",
             "partitions",
+            "created",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17903,6 +18809,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
             Families,
             Splits,
             Partitions,
+            Created,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17929,6 +18836,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                             "families" => Ok(GeneratedField::Families),
                             "splits" => Ok(GeneratedField::Splits),
                             "partitions" => Ok(GeneratedField::Partitions),
+                            "created" => Ok(GeneratedField::Created),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17953,6 +18861,7 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                 let mut families__ = None;
                 let mut splits__ = None;
                 let mut partitions__ = None;
+                let mut created__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -17985,6 +18894,14 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                             }
                             partitions__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Created => {
+                            if created__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("created"));
+                            }
+                            created__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(TablePlacement {
@@ -17993,10 +18910,139 @@ impl<'de> serde::Deserialize<'de> for TablePlacement {
                     families: families__.unwrap_or_default(),
                     splits: splits__.unwrap_or_default(),
                     partitions: partitions__.unwrap_or_default(),
+                    created: created__.unwrap_or_default(),
                 })
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.TablePlacement", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TablePlacementRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.group.is_empty() {
+            len += 1;
+        }
+        if !self.splits.is_empty() {
+            len += 1;
+        }
+        if !self.partitions.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TablePlacementRequest", len)?;
+        if !self.group.is_empty() {
+            struct_ser.serialize_field("group", &self.group)?;
+        }
+        if !self.splits.is_empty() {
+            struct_ser.serialize_field("splits", &self.splits.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
+        }
+        if !self.partitions.is_empty() {
+            struct_ser.serialize_field("partitions", &self.partitions)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TablePlacementRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "group",
+            "splits",
+            "partitions",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Group,
+            Splits,
+            Partitions,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "group" => Ok(GeneratedField::Group),
+                            "splits" => Ok(GeneratedField::Splits),
+                            "partitions" => Ok(GeneratedField::Partitions),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TablePlacementRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TablePlacementRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TablePlacementRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut group__ = None;
+                let mut splits__ = None;
+                let mut partitions__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Group => {
+                            if group__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("group"));
+                            }
+                            group__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Splits => {
+                            if splits__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("splits"));
+                            }
+                            splits__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
+                        GeneratedField::Partitions => {
+                            if partitions__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitions"));
+                            }
+                            partitions__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(TablePlacementRequest {
+                    group: group__.unwrap_or_default(),
+                    splits: splits__.unwrap_or_default(),
+                    partitions: partitions__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TablePlacementRequest", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for TableResponse {
@@ -18013,12 +19059,18 @@ impl serde::Serialize for TableResponse {
         if !self.families.is_empty() {
             len += 1;
         }
+        if !self.unreconciled.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TableResponse", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
         }
         if !self.families.is_empty() {
             struct_ser.serialize_field("families", &self.families)?;
+        }
+        if !self.unreconciled.is_empty() {
+            struct_ser.serialize_field("unreconciled", &self.unreconciled)?;
         }
         struct_ser.end()
     }
@@ -18032,12 +19084,14 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
         const FIELDS: &[&str] = &[
             "name",
             "families",
+            "unreconciled",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Name,
             Families,
+            Unreconciled,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18061,6 +19115,7 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
                         match value {
                             "name" => Ok(GeneratedField::Name),
                             "families" => Ok(GeneratedField::Families),
+                            "unreconciled" => Ok(GeneratedField::Unreconciled),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18082,6 +19137,7 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
             {
                 let mut name__ = None;
                 let mut families__ = None;
+                let mut unreconciled__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -18096,11 +19152,18 @@ impl<'de> serde::Deserialize<'de> for TableResponse {
                             }
                             families__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Unreconciled => {
+                            if unreconciled__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("unreconciled"));
+                            }
+                            unreconciled__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(TableResponse {
                     name: name__.unwrap_or_default(),
                     families: families__.unwrap_or_default(),
+                    unreconciled: unreconciled__.unwrap_or_default(),
                 })
             }
         }

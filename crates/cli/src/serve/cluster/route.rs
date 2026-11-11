@@ -273,6 +273,7 @@ mod tests {
                     families: Vec::new(),
                     splits: vec![text("g"), raw(b"m\xff")],
                     partitions: vec!["p1".into(), "p2".into(), "p3".into()],
+                    created: 0,
                 },
                 TablePlacement {
                     name: "orders".into(),
@@ -280,6 +281,7 @@ mod tests {
                     families: Vec::new(),
                     splits: Vec::new(),
                     partitions: vec!["p3".into()],
+                    created: 0,
                 },
             ],
         }
