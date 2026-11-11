@@ -1228,7 +1228,6 @@ pub(crate) fn run(
             args.feed_hub_threads,
             args.affinity == super::config::Affinity::On,
         )
-        .feed_cpus(args.feed_cpus)
     });
     let limits = args.limits();
     let metrics = Arc::new(super::service::Metrics::default());

@@ -16,19 +16,6 @@ pub(crate) enum Affinity {
     Off,
 }
 
-/// `--feed-cpus`: where the feed and hub runtimes run when the threads are masked. Hidden
-/// while #1734's box A/B (g82) picks the default: g81 had subscriber lag p99 rise at 16x16
-/// @ 20K with the feed threads on the shards' SMT siblings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum FeedCpus {
-    /// The free cores and the shards' SMT siblings, as the request runtime's workers (the
-    /// default).
-    #[default]
-    Siblings,
-    /// The free cores only, as the blocking and background threads.
-    Free,
-}
-
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -167,24 +154,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
     /// Whether the server's threads get a CPU mask off the shards' CPUs (Linux, where the
-    /// engine pinned its shards): the network, feed and hub workers on the free cores and the
-    /// shards' SMT siblings, the blocking and background threads on the free cores only.
+    /// engine pinned its shards): the network workers on the free cores and the shards' SMT
+    /// siblings, the feed, hub, blocking and background threads on the free cores only.
     /// `off` keeps the same thread counts but leaves the threads where the OS puts them: for
     /// a host shared with other work, where the server shouldn't claim the CPUs (D313's R1,
     /// ICR 0131).
     #[arg(long, value_enum, value_name = "on|off", default_value_t = Affinity::On)]
     pub affinity: Affinity,
-    /// Where the feed and hub runtimes run when masked: `siblings` (the default), with the
-    /// request runtime's workers on the free cores and the shards' SMT siblings, or `free`,
-    /// on the free cores only. Hidden until #1734's box A/B picks the default.
-    #[arg(
-        long,
-        value_enum,
-        value_name = "siblings|free",
-        default_value_t = FeedCpus::Siblings,
-        hide = true
-    )]
-    pub feed_cpus: FeedCpus,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
     /// (default: hyper's 400 KiB; at least 16 KiB, one frame). Smaller bounds a feed
     /// stream's queued delivery.

@@ -204,18 +204,13 @@ fn memory(
     Ok(Some(slot))
 }
 
-/// The startup line's tail when the request, feed and hub runtimes also run on the shards'
-/// SMT siblings (#1734): `; network and feed threads also on the shards' 4 SMT siblings
-/// (4-9,16-25)`, with the runtimes' whole CPU list.
+/// The startup line's tail when the request runtime's workers also run on the shards' SMT
+/// siblings (#1734): `; network threads also on the shards' 4 SMT siblings (4-9,16-25)`,
+/// with the workers' whole CPU list.
 fn sibling_line(placement: &placement::Placement) -> String {
     match placement.network_cpu_list() {
-        Some(cpus) if placement.sibling_cpus > 0 && placement.feed_on_siblings() => format!(
-            "; network and feed threads also on the shards' {} SMT siblings ({cpus})",
-            placement.sibling_cpus
-        ),
         Some(cpus) if placement.sibling_cpus > 0 => format!(
-            "; network threads also on the shards' {} SMT siblings ({cpus}), feed and hub \
-             threads on the free cores only",
+            "; network threads also on the shards' {} SMT siblings ({cpus})",
             placement.sibling_cpus
         ),
         _ => String::new(),
@@ -423,17 +418,14 @@ pub(crate) fn run(
             )));
         }
     }
-    let placement = Arc::new(
-        placement::Placement::plan(
-            &[&db],
-            args.io_threads,
-            args.blocking_threads,
-            args.feed_threads,
-            args.feed_hub_threads,
-            args.affinity == config::Affinity::On,
-        )
-        .feed_cpus(args.feed_cpus),
-    );
+    let placement = Arc::new(placement::Placement::plan(
+        &[&db],
+        args.io_threads,
+        args.blocking_threads,
+        args.feed_threads,
+        args.feed_hub_threads,
+        args.affinity == config::Affinity::On,
+    ));
     let limits = args.limits();
     // A cap above half the open-file limit leaves the database too few descriptors: said,
     // not refused (cli692 on #1604).
