@@ -599,21 +599,21 @@ Until then, keep each partition on the node it started on. A node checks its par
 - **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, fenced so that the old cluster, if it still runs, can't write into the restored one ([Fencing and relocation](#fencing-and-relocation) will say how).
 
 ### Partitions per node
-A node serves every partition its map gives it (D317 ticket 8a). **Several partitions on one node cost nothing measurable, and don't change its capacity, as long as the node's totals are set.** Capacity follows the node's totals and its network threads, not the number of partitions.
+A node serves every partition its map gives it (D317 ticket 8a). **In the runs below, several partitions on one node cost nothing measurable (up to 8 partitions) and didn't change its capacity (up to 4), as long as the node's totals were set.** Capacity follows the node's totals and its network threads, not the number of partitions.
 
 **Measured** (perf287's box runs, #1482), with 20M rows of 100 B split evenly by key range and two rounds at each N:
-- **At a fixed load:** one node on 12 cores, `--shards 8 --compaction-threads 4 --engine-memory 1073741824` (1 GiB), with 1, 2, 4 and 8 partitions and 64 callers.
+- **At a fixed load** (set by the client, so not capacity): one node on 12 cores, `--shards 8 --compaction-threads 4 --engine-memory 1073741824` (1 GiB), with 1, 2, 4 and 8 partitions and 64 callers.
   - ycsb-a at Buffered, ycsb-a at GroupSync and zipf ycsb-c: throughput and p99 at every N fell within the run-to-run noise at N=1. That noise was 4% in throughput for ycsb-a at Buffered.
   - The worst cell against one partition in the same round was 2 partitions at GroupSync: 2% fewer ops/s, and 4% more p99 on Mutate.
 - **At saturation:** one node on 8 cores, `--shards 4 --compaction-threads 2 --engine-memory 1073741824`, with 1, 2 and 4 partitions and 512 callers.
   - Capacity was the same at every N: about 270–280K ops/s for ycsb-a at Buffered (p99 about 4.4–5.2 ms) and about 305–333K ops/s for ycsb-c.
   - Rounds differed by up to 8%, more than any N did.
-  - What saturated was the node's network threads (6 on that node, each at 100% of a CPU), not its shards. The network side is node-wide, so splitting the node doesn't change it.
+  - What saturated was the node's network threads (6 on that node, each close to 100% of a CPU), not its shards. The network side is node-wide, so splitting the node doesn't change it.
 
 **To get that:**
 - **Set `--engine-memory`,** or each partition takes the library's full caches.
 - **Keep `--shards` a multiple of the partition count.** A remainder gives the first partitions one shard more than the rest.
-- **Partitions past `--compaction-threads` share the node's compaction CPUs.** The run measured 8 partitions on 4.
+- **Past `--compaction-threads` partitions, the compaction CPUs are oversubscribed.** With several partitions, every partition's compaction threads run on the node's compaction CPUs, and each partition keeps at least one thread. The run measured 8 partitions on 4.
 
 **A node's budget is shared by its partitions:**
 - **`--shards` and `--compaction-threads` are the node's totals,** split across its partitions in id order, at least one shard each. A partition whose change feed recorded a shard count keeps it.
