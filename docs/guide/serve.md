@@ -377,99 +377,221 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map. It serves single-row reads and writes, transactions and snapshots for the whole cluster, forwarding each to the node that owns its row or partition. It fans scans, multi-gets, nearest searches and traversals out across the partitions, serves change feeds across them, and keeps the schema in the map. It backs up every partition through its node. Index searches and restore come in the next steps, and this section grows with them.
+**In progress (D317, ICR 0117).** A cluster splits one database across several `phdb serve` nodes by key range. Each partition is a whole database file, served by one node.
+- **What works now:**
+  - any node takes any call and forwards what it doesn't hold;
+  - single-row reads and writes, and batches within one partition;
+  - transactions and snapshots in one partition;
+  - scans, multi-gets, nearest searches and traversals across partitions;
+  - change feeds across partitions;
+  - schema through the cluster: tables and families live in the map, made and dropped through any node;
+  - backups.
+- **Still to come:** moving a partition between nodes, several partitions per node, and restore. The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
 
-- **`phdb serve --cluster DIR --node-id ID`** runs a node.
-  - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
-  - One server per `DIR`.
-  - `--cluster-token-file` is the token the node presents to the others. List it as `cluster <token>` in every node's `--token-file`; the `cluster` scope is only for node-to-node calls.
-  - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
-- **`phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`** stamps a partition file with who it is. Run it before the node starts.
-- **`phdb cluster set-map MAP.json --node URL`** sets the map: a compare-and-set against the current version, at the map's writer.
-  - **The writer** is the node with the smallest id in the map. It alone changes the map, so two changes can't make two different maps of one version. `set-map` reads the map from `--node` and sends yours to the writer. A `SetMap` sent straight to another node answers `WrongPartition`, naming the writer.
-  - The writer validates the map, keeps it, and pushes it to the others.
-  - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
-  - A map may add tables, partitions and nodes, and move a partition to another node with a higher epoch. A table's split keys and partitions are fixed once set.
-  - **When the writer is down,** no map changes and no schema calls can be made. `set-map --force` at another node sets a map anyway:
-    - Its version goes above every node `phdb cluster` can reach.
-    - The map must name a writer that's up: remove the down node from it, or let another id be the smallest. Move the down node's partitions to other nodes with a higher epoch, as for a relocation.
-    - When the old writer comes back, it takes the forced map from the others before it changes anything, and follows it.
-    - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
-- **`phdb cluster status --node URL`** shows every node's map version side by side.
-- **`phdb cluster show-map (--node URL | --file DIR/cluster-map.json)`** prints a map.
-- **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json` (D317 ticket 8b).
-  - **Each copy is a consistent snapshot of its own partition. The set is not one point in time across partitions.** A commit on one partition can be in the backup while an earlier one on another isn't.
-  - Each node needs `--backup-dir` (admin scope, as for `Admin.Backup`). `--durable` copies only what each writer holds durable. `--parallel N` (4) copies that many partitions at once. A broken download resumes.
-  - The backup checks each copy against the map: its cluster, partition and epoch. A copy that differs fails it with a message naming both, for example `the copy is partition "p2" of cluster "c1" at epoch 2, but the map says partition "p2" of cluster "c1" at epoch 1`. That means the map changed during the backup, or the node holds another file. Run it again once the map is settled.
-  - A partition added, moved or relocated while it runs also fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't. `map.json` is the map at the end, which places them as the copies hold them.
-  - The backup is complete only with its `manifest.json`, which is written last.
-  - Restoring comes with a later step.
-- **Choosing ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
-- **Serving data:** any node takes any call. It serves the call if its partition holds the row, and otherwise forwards it to the node that does. A client needs no map; one that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
-  - **What's served:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters, by their row. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
-  - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
-  - **Scans and multi-gets** read across the partitions, in key order, and return what one database holding all of them would (D317 ticket 4a):
-    - **Scans:** each page holds one partition's rows, and each partition reads at its own snapshot, so rows in different partitions aren't from one point in time. A row is never torn.
-    - **Multi-gets:** a page is exactly what a single node would return for the same keys and `page_bytes`.
-    - **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
-    - **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
-    - **At a snapshot** (`Selection.snapshot_id`), a scan or multi-get reads the snapshot's partition only. Its range or keys must stay within that partition, otherwise `CrossPartition`. A multi-get at a snapshot pages as its partition's node does.
-  - **`Nearest` and `Traverse`** read across the partitions too, and return a single node's answer (D317 ticket 4b):
-    - **`Nearest`:** the exact top `k` over every partition its source meets. Up to `--fanout-forwards` (8) partitions answer at once.
-    - **`Traverse`:** each hop's edges are read from every partition its frontier reaches, then ranked by the same rules a single node uses. So hops, `parents` and `stats` are the same.
-    - **Snapshots:** a traversal reads each hop at its own time, and each partition at its own snapshot, rather than at one snapshot for the whole traversal.
-    - **Latency:** each hop is a round trip to the partitions' nodes, so a deep traversal of a graph spread across nodes costs hops × that round trip. Keep a graph's tables in one partition where you can.
-    - **With `allow_partial`:** a `Nearest` result is exact over the partitions reached. A traversal skips an unreachable partition's frontier nodes, so it doesn't follow their edges, and the later hops and the ranking are exact only over what was reached. `missing` names what was skipped.
-  - **Transactions and pinned snapshots** run in one partition, on its node. `Begin` and `Snapshots.Open` must name it in `route`, as a row (`table`, `row`) or a partition id, on every cluster, even one with a single partition. The ids they answer name the partition (`p2:...`), so any node routes the calls on them, and none of them are held by the node you called.
-    - **A row outside the partition** (a transaction's read or write, or a read at the snapshot) is refused with `CrossPartition` before anything is written.
-    - **`Traverse` and `Nearest` at a snapshot** aren't supported on a cluster.
-    - **Tokens:** a session belongs to the token that opened it, on every node. So every node must list the same tokens; a call for a token the partition's node doesn't list is refused with `PermissionDenied`. `--max-sessions` and `--max-sessions-per-token` count on each node separately.
-  - **Refused with `Unsupported`:** the index searches (`Vectors.Search`, `Text.Search`), which aren't supported on a cluster in this release (use `Vectors.Nearest`, which fans out), and, naming the step that brings each, `Info` and `/mcp`. `Admin.Backup` and `BackupDownload` back up one partition the node holds, named by `partition`, and aren't forwarded: another node's is `WrongPartition`.
-  - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
-  - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
-  - **Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label.
-  - **Schema through the map** (D317 ticket 5): `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes. The map holds each table's families, and every node makes its partitions' files follow it.
-    - **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as a map would. Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
-    - **A drop** removes the table from the map, and each partition drops it. Sessions and feeds on the table end as they do on a single node.
-    - **The window:** the writer sets the map and pushes it, and each node brings its partition's file up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. The reply's `unreconciled` lists partitions whose node the push missed; `phdb cluster status` shows each partition's state.
-    - **Tables made by hand** in a partition's file (with `phdb` against the file, before ticket 5) stay. One the map doesn't place is left alone, and `Status` lists it as unmapped. A create through the map under its name takes it over, data included.
-    - **A forwarded create or drop** whose answer is lost after it was sent answers `OutcomeUnknown`. A create with `if_missing` is safe to send again; a drop that went through answers `TableNotFound` the second time.
-- **Change feeds:** `Feed.Subscribe` through any node follows every partition that holds the subscription's tables (only those whose key ranges can hold its prefix), and merges them into one stream. Turn the feed on in each partition with `--change-feed`.
-  - **Order:** each partition's commits arrive in its commit order, so each row's do. There's no order across partitions: a commit on one can arrive after a later one on another.
-  - **Partition and seqno:** each event names its `partition`. A commit's `seqno` is that partition's own, and is comparable only with seqnos of the same partition.
-  - **Tokens are checkpoints.** A cluster token holds every partition's position, so on a subscription over several partitions only some events carry one; the others have an empty `token`. A one-partition subscription, or one with `checkpoint_every: 1`, has a token on every event, as on a single node.
-  - **Resuming:** resume from the last checkpoint you've stored. You may get again the commits that came after it, up to 64 in all (`checkpoint_every`, if you set it).
-  - **The client loop**: store the last token and, per partition, the last seqno you've handled, with the work they fed:
+### How a cluster is laid out
+- **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
+- **The map** says, in two layers:
+  - which partition holds each key range of each table, given as sorted *split keys*. Range *i* is `[split i-1, split i)`, the first starting at the empty key and the last open-ended. **This layer is fixed once a range holds data.** Moving a range between partitions comes in 1.3.0 (#1499), so choose split keys up front ([Choosing split keys](#choosing-split-keys-and-hot-ranges)).
+  - which node serves each partition. This changes when a partition is moved to another node, with a higher epoch.
+- **The map has a version,** raised by every change. A node refuses a map no newer than its own, and every node keeps a copy (`DIR/cluster-map.json`).
+- **Ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
 
-    ```text
-    for each event:
-        if event.commit and event.commit.seqno <= last_seen[event.partition]: skip it  (a repeat)
-        handle it
-        if event.commit: last_seen[event.partition] = event.commit.seqno
-        if event.token:  token = event.token
-        store (token, last_seen) with what you handled
-    to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, seqno}] }
-    ```
+### Running a cluster
+1. **Stamp each partition's file** before its node starts: `phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`. `DIR` is the node's cluster directory, and the file must be named `<partition>.phdb`.
+2. **Tables** are made through the cluster once it runs (see [Schema through the cluster](#schema-through-the-cluster)): `Schema.CreateTable` with a `placement`. You can also place a table in the first map below and create its families through the cluster afterwards. Tables made by hand in a partition's file (`phdb shell DIR/P.phdb -c "create users profile"`), as before schema came to the cluster, still work: the map takes one over when it places a table of that name.
+3. **Write the map** as JSON (`ClusterMap`):
 
-    With `skip_through` the server passes over the repeats itself, so nothing arrives twice. Without it, the `seqno` check drops them. Over SSE, events without a token carry no `id:`, so `Last-Event-ID` reconnects from the last checkpoint and the `seqno` check applies.
-  - **What a token costs:** a checkpoint every N commits keeps the token at about 150 bytes per event on average:
+   ```json
+   {
+     "cluster_id": "c1",
+     "map_version": 1,
+     "nodes": [
+       {"id": "a", "address": "10.0.0.1:7448"},
+       {"id": "b", "address": "10.0.0.2:7448"}
+     ],
+     "partitions": [
+       {"id": "p1", "node": "a", "epoch": 1},
+       {"id": "p2", "node": "b", "epoch": 1}
+     ],
+     "tables": [
+       {"name": "users", "splits": [{"text": "m"}], "partitions": ["p1", "p2"]}
+     ]
+   }
+   ```
 
-    | Partitions × shards each | Checkpoint size | One every |
-    |---|---|---|
-    | 2 × 16 | about 310 B | 3 commits |
-    | 16 × 4 | about 1 KB | 7 commits |
-    | 16 × 16 | about 2.4 KB | 16 commits |
-    | 64 × 16 | about 9.5 KB | 64 commits |
+   `users` rows below `m` are in `p1`, and the rest in `p2`. A split key that isn't UTF-8 is written `{"raw": "<base64>"}`. A table with no `splits` is one range, in one partition.
 
-    Past about 64 partitions × 16 shards, a checkpoint comes every 64 commits and costs more per event.
-  - **`allow_partial: true`** keeps the stream going when a partition's node can't be reached. A `partition_state` event says which partition is missing, and again when it's back. Its commits then continue from where they left off, with none skipped. Without it, the stream ends with `PartitionUnavailable` naming the partition; resume once the node is back.
-  - **Limits:** a subscription holds a `--max-streams` place on the node it entered, and one on each partition's node. An entry node that also serves one of its partitions holds two. It buffers up to 256 KiB on its entry node and on each partition's node: (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
-  - **Expiry:** a token can't resume after its partitions' map changed under it (a new table in a subscription of every table), or after a partition was relocated: `FeedExpired`, subscribe again.
-  - A start from a snapshot isn't supported on a cluster subscription.
+   Put the first map in every node's `DIR` as `cluster-map.json` before the nodes start: a node opens the partition its map gives it only at start. `phdb cluster show-map --file MAP.json` checks that it parses.
+4. **Start each node:** `phdb serve --cluster DIR --node-id ID`. One server runs per `DIR`.
+   - `--cluster-token-file` is the token a node presents to the others. List it as `cluster <token>` in every node's `--token-file`. The `cluster` scope is only for node-to-node calls.
+   - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
+   - **Every node lists the same tokens** (`--token-file`). A call forwarded to another node runs as your token there, with the scope and namespaces that node lists for it, and sessions and feeds are bound to it.
+5. **Change the map** on a running cluster with `phdb cluster set-map MAP.json --node URL`, a compare-and-set against the current version. Raise `map_version` in the file.
+   - **The map's writer** is the node with the smallest id in the map, and it alone changes the map, so two changes can't make two different maps of one version (D317 amendment 1). `set-map` reads the map from `--node` and sends yours to the writer. A `SetMap` sent straight to another node answers `WrongPartition`, naming the writer.
+   - The writer validates the map, keeps it, and pushes it to the others.
+   - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
+   - A map may add tables, partitions and nodes, and give a partition another node with a higher epoch. A table's split keys and partitions are fixed once set.
+   - A partition added to a running node's map, or given to it, isn't opened there until the node restarts: nodes open their partitions at start, for now. Until then the node answers calls for it with `PartitionUnavailable` ("isn't open here").
+   - **When the writer is down,** no map change and no schema call can be made. `phdb cluster set-map MAP.json --node URL --force` sets a map at another node:
+     - Its version goes above every node `phdb cluster` can reach.
+     - The map must name a writer that's up: remove the down node from it, or let another id be the smallest. Give the down node's partitions to other nodes with a higher epoch.
+     - When the old writer comes back, it takes the forced map from the others before it changes anything, and follows it.
+     - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
+6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
+
+**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
+
+**Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label.
+
+### How calls are routed
+- **Any node takes any call.** It serves the call if it holds the row's partition, and otherwise forwards it to the node that does. A client needs no map. One that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
+- **Served by row:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
+- **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
+- **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
+- **Refused with `Unsupported`:** the index searches (`Vectors.Search`, `Text.Search`), which aren't supported on a cluster in this release (for vectors, use `Vectors.Nearest`, which fans out), and, naming the step that brings each, `Info` and `/mcp`.
+- **A node holds one partition** for now, the one its map gives it, opened at start after checking the file's identity row against the map. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.
-  - `WrongPartition` is handled between nodes: a node with an older map pulls the newer one and forwards again.
+  - `CrossPartition` (409): the request can't succeed as written. Split it.
+
+### Schema through the cluster
+Tables and their families live in the cluster map (D317 ticket 5). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
+- **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as the map would. Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
+- **A drop** removes the table from the map, and each partition drops it. Sessions and feeds on the table end as they do on a single node.
+- **The map's writer makes every change.** A create or drop through another node is forwarded to it ([Running a cluster](#running-a-cluster)). Concurrent changes through different nodes all land, one after another. A forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`: a create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
+- **The window:** the writer sets the map and pushes it, and each node brings its partition's file up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. The reply's `unreconciled` lists partitions whose node the push missed. `phdb cluster status` shows each partition's state.
+- **Tables made by hand** in a partition's file stay. One the map doesn't place is left alone, and `Cluster.Status` lists it as unmapped. A create through the map under its name takes it over, data included.
+- **Listing:** `ListTables` and `DescribeTable` answer from the map, so they show every table of the cluster and never a partition's own `__phdb_` tables.
+
+### Transactions and snapshots
+Transactions and pinned snapshots run in one partition, on its node.
+- **`Begin` and `Snapshots.Open` must name the partition** in `route`, as a row (`table`, `row`) or a partition id. That holds on every cluster, even one with a single partition, so a client keeps working when the map gains one.
+- **The ids they answer name the partition** (`p2:...`). Any node routes the calls on them, and none of them are held by the node you called.
+- **A row outside the partition** (a transaction's read or write, or a read at the snapshot) is refused with `CrossPartition` before anything is written.
+- **A `Commit` whose answer was lost** answers `OutcomeUnknown`. Send the same `Commit` again, through any node: it answers the first outcome.
+- **`Traverse` and `Nearest` at a snapshot** aren't supported on a cluster.
+- **Tokens:** a session belongs to the token that opened it, on every node. A call for a token the partition's node doesn't list is refused with `PermissionDenied`. `--max-sessions` and `--max-sessions-per-token` count on each node separately.
+
+### Reads across partitions
+Scans and multi-gets read across the partitions, in key order, and return what one database holding all of them would. So do nearest searches and traversals.
+- **Scans:** each page holds one partition's rows, and each partition reads at its own snapshot, so rows in different partitions aren't from one point in time. A row is never torn.
+- **Multi-gets:** a page is exactly what a single node would return for the same keys and `page_bytes`.
+- **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
+- **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
+- **At a snapshot** (`Selection.snapshot_id`), a scan or multi-get reads the snapshot's partition only. Its range or keys must stay within that partition, otherwise `CrossPartition`. A multi-get at a snapshot pages as its partition's node does.
+- **`Nearest` and `Traverse`** return a single node's answer (D317 ticket 4b):
+  - **`Nearest`:** the exact top `k` over every partition its source meets. Up to `--fanout-forwards` (8) partitions answer at once.
+  - **`Traverse`:** each hop's edges are read from every partition its frontier reaches, then ranked by the same rules a single node uses. So hops, `parents` and `stats` are the same.
+  - **Snapshots:** a traversal reads each hop at its own time, and each partition at its own snapshot, rather than at one snapshot for the whole traversal.
+  - **Latency:** each hop is a round trip to the partitions' nodes, so a deep traversal of a graph spread across nodes costs hops × that round trip. Keep a graph's tables in one partition where you can.
+  - **With `allow_partial`:** a `Nearest` result is exact over the partitions reached. A traversal skips an unreachable partition's frontier nodes, so it doesn't follow their edges, and the later hops and the ranking are exact only over what was reached. `missing` names what was skipped.
+- **The index searches** (`Vectors.Search`, `Text.Search`) aren't supported on a cluster in this release (#1722, 1.3.0). For vectors, `Nearest` fans out.
+
+### Feeds
+`Feed.Subscribe` works the same through any node. The node you call follows every partition that holds the subscription's tables, opening a single-node subscription on each partition's node, and merges them into one stream. With a `prefix`, only the partitions whose key ranges can hold such rows are followed.
+
+#### Setup
+- Turn the feed on in every partition with `--change-feed BYTES` on its node, as on a single node. A partition whose feed was on keeps it without the flag.
+- Every node lists the same tokens (`--token-file`), as [Running a cluster](#running-a-cluster) says. A subscription's part on another node is opened for your token there, and a node that doesn't list it refuses the part with `PermissionDenied`.
+
+#### What arrives
+- **Order:** each partition's commits arrive in its commit order, so each row's do. There's no order across partitions: a commit on one partition can arrive after a later one on another.
+- **`partition`** on each event names where it came from. A commit's `seqno` is its partition's own, comparable only with seqnos of the same partition.
+- **`partition_state`** events report a partition that went away or came back (see [When a partition's node is down](#when-a-partitions-node-is-down)).
+- **Progress events** keep a quiet stream's position fresh, as on a single node.
+
+#### Tokens and resuming
+
+A cluster token holds every followed partition's position, so it's bigger than a single node's: about 150 bytes for each partition's shards. So on a subscription over several partitions, only checkpoints carry a token. A checkpoint is a commit every N commits, a progress event after a quiet interval, or a last progress event before the stream ends with an error. The other events have an empty `token`.
+
+| Partitions × shards each | Checkpoint size | One every |
+|---|---|---|
+| 2 × 16 | about 310 B | 3 commits |
+| 16 × 4 | about 1 KB | 7 commits |
+| 16 × 16 | about 2.4 KB | 16 commits |
+| 64 × 16 | about 9.5 KB | 64 commits |
+
+That keeps the token at about 150 bytes per event on average. Past about 64 partitions × 16 shards a checkpoint comes every 64 commits, and costs more per event. A one-partition subscription has a token on every event, as a single node does. `checkpoint_every: N` (1–64) sets the spacing yourself; 1 gives every event a token, at the full size.
+
+Resume from the last token you stored. The commits after that checkpoint may arrive again, at most N in all. The loop that drops them is: store the token and, per partition, the last seqno you handled, together with the work they fed.
+
+```text
+for each event:
+    if event.commit and event.commit.seqno <= last_seen[event.partition]: skip it  (a repeat)
+    handle it
+    if event.commit: last_seen[event.partition] = event.commit.seqno
+    if event.token:  token = event.token
+    store (token, last_seen) with what you handled
+to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, seqno}] }
+```
+
+- **With `skip_through`,** the server passes over the commits you already handled, so nothing arrives twice. It refuses a skip past what a checkpoint can leave behind (more than 64 commits in a partition) with `InvalidArgument`, rather than skip commits you never saw.
+- **Without it,** the `seqno` check drops the repeats.
+- **Over SSE,** events without a token carry no `id:`. So `Last-Event-ID` reconnects from the last checkpoint, and the `seqno` check applies.
+- **Through any node:** a token resumes through any node of the cluster. It doesn't resume on a single node, and a single node's token doesn't resume here (`InvalidArgument`).
+
+#### When a partition's node is down
+- **By default:**
+  - a subscription that can't open one of its partitions fails with `PartitionUnavailable` naming it;
+  - a stream whose partition goes away ends with `PartitionUnavailable`, after a last checkpoint. Resume once the node is back.
+- **With `allow_partial: true`,** the stream carries on with the other partitions:
+  - A `partition_state` event (`available: false`, with the error's code in `reason`) says which partition is missing. It's sent at the start for one unavailable then, and once when it goes.
+  - The node tries the partition again every second, each try bounded by `--request-timeout-ms`, without holding up the others. When it's back, a `partition_state` event says so, and its commits continue from where they stopped, with none skipped.
+  - A partition that was down since a subscription "from now" began starts at its own "now" when it comes back. One subscribed "from the oldest" starts at its oldest commit.
+  - An expired position, or a refusal such as a revoked token, still ends the stream.
+- **A partition moved to another node** (a newer map, once moves come with D317's ticket 6) is opened again where the map then puts it, through any node, with nothing skipped.
+
+#### Limits
+- **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
+- **Memory:** it buffers up to 256 KiB on its entry node and on each partition's node, so (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
+- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use.
+
+#### Expiry and what isn't supported
+- **Expired tokens:**
+  - A token can't resume after a partition it follows was relocated onto a copy with another history. [Fencing and relocation](#fencing-and-relocation) will say which moves those are.
+  - It can't resume after the map changed which partitions the subscription covers either. That happens only when a new table joins a subscription of every table.
+  - Both answer `FeedExpired`: subscribe again.
+- **After a restore:** restore comes with a later step, and [Backup and restore](#backup-and-restore) will say what a restored partition does to older tokens.
+- **Not supported:** a start from a snapshot isn't supported on a cluster subscription. A one-partition version is #1701.
+- **Positions:** a token's `seqno`s are partition-local. There's no cluster-wide position, so compare progress per partition.
+
+### Fencing and relocation
+**Comes with D317's ticket 6.** Moving a partition to another node, fencing a partition's old node so it can't write, and dropping a partition are being built. This section will describe them, including which kinds of move keep a feed's tokens.
+
+Until then, keep each partition on the node it started on. A node checks its partition file's epoch against the map at start, and nothing yet stops an old node from writing while a new one takes over.
+
+### Backup and restore
+- **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json`.
+  - Each node needs `--backup-dir`, and the token admin scope, as for `Admin.Backup`.
+  - `--durable` copies only what each writer holds durable.
+  - `--parallel N` (4) copies that many partitions at once.
+  - A broken download resumes.
+- **Not one point in time.** Each copy is a consistent snapshot of its own partition, and the set is not one point in time across partitions. A commit on one partition can be in the backup while an earlier one on another isn't. A table created during the backup can have rows in one partition's copy and none in another's.
+- **Checked against the map.** The backup checks each copy's cluster, partition and epoch against the map. A copy that differs fails it, naming both, for example `the copy is partition "p2" of cluster "c1" at epoch 2, but the map says partition "p2" of cluster "c1" at epoch 1`. That means the map changed during the backup, or the node holds another file. Run it again once the map is settled.
+- **A map that moves meanwhile:** a partition added, moved or relocated during the backup fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't. `map.json` is the map at the end, which places them as the copies hold them.
+- **A backup is complete only with its `manifest.json`,** which is written last. Copies are `<partition>.phdb.partial` until checked.
+- **One partition's backup:** a node's `Admin.Backup` and `BackupDownload` back up one partition it holds, named by `partition`, and aren't forwarded. Another node's partition is `WrongPartition`.
+- **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, fenced so that the old cluster, if it still runs, can't write into the restored one ([Fencing and relocation](#fencing-and-relocation) will say how).
+
+### Partitions per node
+Each node holds one partition for now. Several partitions per node come with D317's ticket 8a. The recommendation for how many comes from a box run at the same node totals with 1, 2, 4 and 8 partitions.
+
+**Plan for one partition per node until then.** An early box run (perf287's g74) points the same way: at the same totals, four partitions on one node gave 25–34% less throughput and 30–75% higher p99 than one. Each partition is a whole database engine, with costs that don't shrink with its share of the load:
+- at least one shard's memtable arena (64 MiB by default);
+- its own WAL, so its own group syncs: the same load over more partitions means more syncs, each covering fewer commits;
+- its own block and row caches, so a busy partition can't use an idle one's;
+- its own flush and compaction.
+
+A few partitions per node leave room to move one to another node later.
+
+### Choosing split keys and hot ranges
+A table's split keys are fixed once its ranges hold data, until range moves in 1.3.0 (#1499). Choose them from how your keys are shaped:
+- **Tenant prefixes** (`tenant/…`): split at tenant boundaries. A tenant's rows stay in one partition, so its batches and transactions stay in one, and a scan of one tenant reads one partition. A big tenant can be given a partition of its own.
+- **Hashed prefixes** (a byte or two of a hash in front of the natural key): split evenly over the prefix space for an even spread of rows and load. The cost is key order: a scan in natural order reads every partition.
+- **Time-bucketed keys:** don't lead with the time. With fixed split keys every new write lands in the last range, so one partition takes all the writes. Put a tenant or hashed prefix first and the time after it.
+
+**A range that turns out hot:** until ranges can move, give its partition a node of its own or a bigger one, by moving the partition ([Fencing and relocation](#fencing-and-relocation)).
 
 ## Performance
 > **Coming with D313 ticket 9b:** the serve bench's numbers on the reference machine: puts, gets and scans over gRPC and HTTP/JSON, and the change feed's delivery at many subscribers, with and without the placement mask.
