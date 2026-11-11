@@ -137,17 +137,18 @@ impl Memory {
 /// each partition's shard count and the map's `memory_bytes` override (0: none), in order
 /// (D317 ticket 8a). Overrides are taken first, and the rest of `total` split equally
 /// across the others; unset, the others take the library's defaults. `Err` names the
-/// partition (by index) that can't be covered and the least it would need.
+/// partition (by index) that can't be covered and the least it would need, or no partition
+/// when the overrides together exceed the total (cli692's N1 on #1718).
 pub(crate) fn memory(
     total: Option<u64>,
     parts: &[(usize, u64)],
-) -> Result<Vec<Memory>, (usize, String)> {
+) -> Result<Vec<Memory>, (Option<usize>, String)> {
     let overridden: u64 = parts.iter().map(|(_, m)| *m).sum();
     let rest = parts.iter().filter(|(_, m)| *m == 0).count() as u64;
     let equal = match total {
         Some(t) if t < overridden => {
             return Err((
-                0,
+                None,
                 format!(
                     "--engine-memory {t} is less than the map's memory_bytes for this node's \
                      partitions ({overridden})"
@@ -168,7 +169,7 @@ pub(crate) fn memory(
             };
             Memory::of(share, shards).map_err(|least| {
                 (
-                    i,
+                    Some(i),
                     format!(
                         "{share} bytes of engine memory can't cover {shards} shards' memtables \
                          at {MEMTABLE_FLOOR} bytes each: it needs at least {least}"
@@ -552,7 +553,9 @@ mod tests {
         // Overrides beyond the node's total, or a share below the floor, name the cause.
         assert!(memory(Some(mib), &[(1, 2 * mib)]).is_err());
         let (i, why) = memory(Some(mib), &[(1, 0), (64, 0)]).unwrap_err();
-        assert_eq!(i, 1, "{why}");
+        assert_eq!(i, Some(1), "{why}");
+        // Overrides beyond the total are no one partition's.
+        assert_eq!(memory(Some(mib), &[(1, 2 * mib)]).unwrap_err().0, None);
     }
 
     /// D317 ticket 8a: a node's budget splits into equal shares, the remainder to the first

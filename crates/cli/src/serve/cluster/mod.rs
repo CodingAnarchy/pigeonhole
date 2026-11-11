@@ -1064,11 +1064,9 @@ pub(crate) fn run(
             .map(|(s, &m)| (s.shards, m))
             .collect::<Vec<_>>(),
     )
-    .map_err(|(i, why)| {
-        Failure::usage(&format!(
-            "partition {}'s engine memory: {why}",
-            mine.get(i).map_or("?", |(p, _)| p.as_str())
-        ))
+    .map_err(|(i, why)| match i.and_then(|i| mine.get(i)) {
+        Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
+        None => Failure::usage(&format!("--engine-memory: {why}")),
     })?;
     let opened = open_partitions(
         dir,

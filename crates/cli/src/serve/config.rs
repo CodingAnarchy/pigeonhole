@@ -52,7 +52,8 @@ pub(crate) struct ServeArgs {
     /// Threads dedicated to flush and compaction, pinned (default: a quarter of the physical
     /// cores, at least 1, at most one per shard). On a cluster node, `--shards` and this are
     /// the node's totals, split across its partitions (D317 ticket 8a): pinned compaction
-    /// threads never exceed it, and partitions past it share the pinned ones' CPUs.
+    /// threads never exceed it, and partitions past it share the pinned ones' CPUs. A count
+    /// given here is taken as given, even above the shard count (cli692's N3 on #1718).
     #[arg(long, value_name = "N")]
     pub compaction_threads: Option<usize>,
     /// The engine's memory, in bytes: its memtables, block cache and row cache (default: the
