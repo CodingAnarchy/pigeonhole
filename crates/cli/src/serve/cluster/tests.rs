@@ -566,9 +566,19 @@ fn data_node_full(
 /// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
 /// epoch 1, with a change feed and the `users` table.
 fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
+    test_partition_with(dir, p, pigeonhole::Options::default())
+}
+
+/// [`test_partition`], created with `options` (a shard count, say). Its change feed records
+/// the shard count, which every later open keeps (ICR 0132).
+fn test_partition_with(
+    dir: &Path,
+    p: &str,
+    options: pigeonhole::Options,
+) -> pigeonhole::Pigeonhole {
     let db = pigeonhole::Pigeonhole::open(
         dir.join(format!("{p}.phdb")),
-        pigeonhole::Options::default()
+        options
             .create_if_missing(true)
             .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
     )

@@ -473,55 +473,90 @@ fn a_nodes_feed_limits_are_the_nodes_across_its_partitions() {
 /// threads, confined. Opened one after another without the reservation, the second
 /// partition's shard would pin after the first's compaction thread. Linux only: elsewhere
 /// nothing pins.
+///
+/// Pin plans are claimed process-wide, and other tests' engines claim CPUs while this one
+/// runs, which moves the pin order under it. So an attempt whose planned order another
+/// test's claims moved is tried again; the reservation's own failure would fail every
+/// attempt.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_nodes_shards_pin_together_before_its_compaction_threads() {
     let dir = test_dir();
+    // One shard each, as their shares plan: a change feed keeps the count it was made with.
     for p in ["p1", "p3"] {
-        test_partition(&dir, p).close().unwrap();
+        test_partition_with(&dir, p, pigeonhole::Options::default().shards(1))
+            .close()
+            .unwrap();
     }
-    // The pin order's first three free CPUs, as the node would plan them.
-    let Ok(order) = pigeonhole_io::sys::pin_plan(3) else {
-        return; // no hard affinity, a quota, or too few CPUs: nothing pins
-    };
-    let order: Vec<usize> = (0..3).filter_map(|i| order.cpu(i)).collect();
-    // Two partitions of one shard each, and the node's one compaction thread.
-    let shares = crate::serve::placement::split(2, 1, 2);
-    let reserved = crate::serve::placement::compaction_reserve(2, 1).unwrap();
-    assert_eq!(reserved, [order[2]]);
-    let mine = [("p1".to_owned(), 1), ("p3".to_owned(), 1)];
-    let mut log = Vec::new();
-    let opened = super::super::open_partitions(
-        &dir,
-        Some("c1"),
-        &mine,
-        super::super::Budget {
-            shares: &shares,
-            reserved: Some(&reserved),
-            memories: None,
-        },
-        |share, _| {
-            pigeonhole::Options::default()
-                .default_shards(share.shards)
-                .compaction_cores(share.compaction)
-        },
-        &mut log,
-    )
-    .unwrap();
-    let mut shards: Vec<usize> = opened
-        .iter()
-        .flat_map(|o| o.db.pinned_shard_cpus())
-        .collect();
-    shards.sort_unstable();
-    let mut first_two = order[..2].to_vec();
-    first_two.sort_unstable();
-    assert_eq!(shards, first_two, "{}", String::from_utf8_lossy(&log));
-    for o in &opened {
-        assert!(o.db.pinned_compaction_cpus().is_empty());
-        assert_eq!(o.db.engine_metrics().threads_confined, 1);
+    // The last attempt whose shards pinned elsewhere than planned, if any.
+    let mut apart = None;
+    for _ in 0..20 {
+        // The pin order's first three free CPUs, as the node would plan them, released
+        // before the node plans: a plan holds its CPUs until it's dropped.
+        let order: Vec<usize> = match pigeonhole_io::sys::pin_plan(3) {
+            Ok(plan) => (0..3).filter_map(|i| plan.cpu(i)).collect(),
+            // No hard affinity, a quota, or too few CPUs: nothing pins.
+            Err(pigeonhole_io::sys::Unpinned::TooFewCpus) => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(_) => return,
+        };
+        // Two partitions of one shard each, and the node's one compaction thread.
+        let shares = crate::serve::placement::split(2, 1, 2);
+        let Some(reserved) = crate::serve::placement::compaction_reserve(2, 1) else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        if reserved != [order[2]] {
+            // Another test's claims moved the order between the two plans.
+            continue;
+        }
+        let mine = [("p1".to_owned(), 1), ("p3".to_owned(), 1)];
+        let mut log = Vec::new();
+        let opened = super::super::open_partitions(
+            &dir,
+            Some("c1"),
+            &mine,
+            super::super::Budget {
+                shares: &shares,
+                reserved: Some(&reserved),
+                memories: None,
+            },
+            |share, _| {
+                pigeonhole::Options::default()
+                    .default_shards(share.shards)
+                    .compaction_cores(share.compaction)
+            },
+            &mut log,
+        )
+        .unwrap();
+        let mut shards: Vec<usize> = opened
+            .iter()
+            .flat_map(|o| o.db.pinned_shard_cpus())
+            .collect();
+        shards.sort_unstable();
+        let mut first_two = order[..2].to_vec();
+        first_two.sort_unstable();
+        for o in &opened {
+            assert!(o.db.pinned_compaction_cpus().is_empty());
+            assert_eq!(o.db.engine_metrics().threads_confined, 1);
+        }
+        for o in opened {
+            o.db.close().unwrap();
+        }
+        if shards == first_two {
+            return;
+        }
+        apart = Some(format!(
+            "shards on {shards:?}, planned {first_two:?}: {}",
+            String::from_utf8_lossy(&log)
+        ));
     }
-    for o in opened {
-        o.db.close().unwrap();
+    // No attempt pinned the shards together. Attempts that found the CPUs taken, or their
+    // order moved, prove nothing either way; one that opened and pinned them apart fails.
+    if let Some(apart) = apart {
+        panic!("the shards never pinned together: {apart}");
     }
 }
 
