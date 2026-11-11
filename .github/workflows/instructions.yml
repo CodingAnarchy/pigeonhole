@@ -98,7 +98,7 @@ jobs:
       - id: key
         run: echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
       - id: have
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /tmp/valgrind-debs
           key: ${{ steps.key.outputs.key }}
@@ -112,7 +112,7 @@ jobs:
         timeout-minutes: 8
         run: scripts/install-valgrind.sh apt /tmp/valgrind-debs
       - if: steps.apt.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: /tmp/valgrind-debs
           key: ${{ steps.key.outputs.key }}
@@ -178,7 +178,7 @@ jobs:
           echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
           echo "prefix=callgrind-debs-v1-${ImageOS}-" >> "$GITHUB_OUTPUT"
       - id: debs
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: /tmp/valgrind-debs
