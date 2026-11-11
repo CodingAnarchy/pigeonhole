@@ -1445,23 +1445,29 @@ fn fan_out_model(seed: u64) {
             let at = format!("seed {seed}, a budget ending at p1's end, then {after_p1:?}");
             let mut asked: Vec<&[u8]> = vec![b"a0", b"f1"];
             asked.extend(after_p1);
-            let req = |after: Vec<u8>| MultiGetRequest {
+            let req = |after: Vec<u8>, page_bytes| MultiGetRequest {
                 table: "users".into(),
                 keys: asked.iter().map(|k| k.to_vec().into()).collect(),
-                page_bytes: fill,
+                page_bytes,
                 after: after.into(),
                 ..Default::default()
             };
             for &entry in &ports {
-                let page = data(entry).await.multi_get(req(Vec::new())).await.unwrap();
+                let page = data(entry)
+                    .await
+                    .multi_get(req(Vec::new(), fill))
+                    .await
+                    .unwrap();
                 let page = page.into_inner();
                 let got: Vec<&[u8]> = page.rows.iter().map(|r| &r.key[..]).collect();
                 assert_eq!((got, page.bytes), (vec![&b"a0"[..], b"f1"], fill), "{at}");
                 assert_eq!(page.next.is_empty(), rest.is_empty(), "{at}");
                 if !rest.is_empty() {
+                    // The rest at the default page, which holds it: at `fill`, a longer
+                    // row than a0 and f1 together would be cut.
                     let more = data(entry)
                         .await
-                        .multi_get(req(page.next.to_vec()))
+                        .multi_get(req(page.next.to_vec(), 0))
                         .await
                         .unwrap()
                         .into_inner();
