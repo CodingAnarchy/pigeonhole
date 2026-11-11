@@ -422,7 +422,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 4. **Start each node:** `phdb serve --cluster DIR --node-id ID`. One server runs per `DIR`.
    - `--cluster-token-file` is the token a node presents to the others. List it as `cluster <token>` in every node's `--token-file`. The `cluster` scope is only for node-to-node calls.
    - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
-   - **Every node lists the same tokens** (`--token-file`). A call forwarded to another node runs as your token there: sessions and feeds are bound to it.
+   - **Every node lists the same tokens** (`--token-file`). A call forwarded to another node runs as your token there, with the scope and namespaces that node lists for it, and sessions and feeds are bound to it.
 5. **Change the map** on a running cluster with `phdb cluster set-map MAP.json --node URL`, a compare-and-set against that node's version. Raise `map_version` in the file.
    - The node validates the map, keeps it, and pushes it to the others.
    - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
@@ -451,6 +451,7 @@ Transactions and pinned snapshots run in one partition, on its node.
 - **`Begin` and `Snapshots.Open` must name the partition** in `route`, as a row (`table`, `row`) or a partition id. That holds on every cluster, even one with a single partition, so a client keeps working when the map gains one.
 - **The ids they answer name the partition** (`p2:...`). Any node routes the calls on them, and none of them are held by the node you called.
 - **A row outside the partition** (a transaction's read or write, or a read at the snapshot) is refused with `CrossPartition` before anything is written.
+- **A `Commit` whose answer was lost** answers `OutcomeUnknown`. Send the same `Commit` again, through any node: it answers the first outcome.
 - **`Traverse` and `Nearest` at a snapshot** aren't supported on a cluster.
 - **Tokens:** a session belongs to the token that opened it, on every node. A call for a token the partition's node doesn't list is refused with `PermissionDenied`. `--max-sessions` and `--max-sessions-per-token` count on each node separately.
 
@@ -553,12 +554,12 @@ Until then, keep each partition on the node it started on. A node checks its par
 - **A map that moves meanwhile:** a partition added, moved or relocated during the backup fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't. `map.json` is the map at the end, which places them as the copies hold them.
 - **A backup is complete only with its `manifest.json`,** which is written last. Copies are `<partition>.phdb.partial` until checked.
 - **One partition's backup:** a node's `Admin.Backup` and `BackupDownload` back up one partition it holds, named by `partition`, and aren't forwarded. Another node's partition is `WrongPartition`.
-- **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, with a higher epoch, so the old cluster, if it still runs, can't write into the restored one.
+- **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, fenced so that the old cluster, if it still runs, can't write into the restored one ([Fencing and relocation](#fencing-and-relocation) will say how).
 
 ### Partitions per node
 Each node holds one partition for now. Several partitions per node come with D317's ticket 8a. The recommendation for how many comes from a box run at the same node totals with 1, 2, 4 and 8 partitions.
 
-**Plan for one partition per node until then.** An early measurement points the same way: at the same totals, four partitions on one node gave 25–34% less throughput and 30–75% higher p99 than one. Each partition is a whole database engine, with costs that don't shrink with its share of the load:
+**Plan for one partition per node until then.** An early box run (perf287's g74) points the same way: at the same totals, four partitions on one node gave 25–34% less throughput and 30–75% higher p99 than one. Each partition is a whole database engine, with costs that don't shrink with its share of the load:
 - at least one shard's memtable arena (64 MiB by default);
 - its own WAL, so its own group syncs: the same load over more partitions means more syncs, each covering fewer commits;
 - its own block and row caches, so a busy partition can't use an idle one's;
