@@ -91,7 +91,21 @@ pub(crate) struct Spec {
     pub prefix: Vec<u8>,
     pub visible: bool,
     pub start: Start,
+    /// A cluster component resumed with `skip_through` (D317 ticket 7): commits after the
+    /// start up to this seqno are passed over, as already handled, at most [`SKIP_LIMIT`] of
+    /// them that would have been sent; 0: none.
+    pub skip: u64,
+    /// Send the start's position as a first progress event, before any commit: a cluster
+    /// subscription's part (D317 ticket 7) then knows where it is from the start, so it can
+    /// resume after a break that came before any event, with nothing skipped.
+    pub announce: bool,
 }
+
+/// At most this many commits a client would have been sent are passed over for `skip`: a
+/// cluster subscription's checkpoints are at most this many events apart, so a client can't
+/// have handled more after one (perf287's cap on ticket 7). More is `InvalidArgument`, never
+/// a silent gap.
+pub(crate) const SKIP_LIMIT: u64 = 64;
 
 /// Where a client is, for the feed dump ([`Feeds::dump`], `phdb serve` on SIGUSR1): two
 /// relaxed stores per batch, read only by the dump.
@@ -244,6 +258,7 @@ fn commit_event(token: Bytes, c: proto::FeedCommit) -> proto::FeedEvent {
     proto::FeedEvent {
         token,
         event: Some(proto::feed_event::Event::Commit(c)),
+        partition: String::new(),
     }
 }
 
@@ -705,24 +720,20 @@ impl Feeds {
             Start::Now => self.db.durable_snapshot()?.seqno(),
             _ => 0,
         };
-        let (tx, rx) = mpsc::channel(self.limits.client_events.max(1));
-        let budget = Arc::new(Semaphore::new(
-            self.limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS),
-        ));
-        let taken = Arc::new(TakeClock::new());
-        let (end_tx, end_rx) = oneshot::channel();
+        let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());
         hub.track(&tracker);
         let client = Client {
             feeds: Arc::clone(self),
             hub: Mutex::new(hub),
             after,
+            skip: spec.skip,
+            skipped: AtomicU64::new(0),
+            announce: spec.announce,
             tables: spec.tables,
             prefix: spec.prefix,
             visible: spec.visible,
-            tx,
-            budget,
-            taken: Arc::clone(&taken),
+            sink,
             tracker,
         };
         // The first own stream opens here, so a bad token or snapshot fails the call rather
@@ -741,7 +752,7 @@ impl Feeds {
         self.spawn(async move {
             let outcome = match client.run(begin).await {
                 // The client went away: not a failure.
-                Err(_) if client.tx.is_closed() => Ok(()),
+                Err(_) if client.sink.is_closed() => Ok(()),
                 r => r,
             };
             on_end(outcome.as_ref().err());
@@ -750,11 +761,7 @@ impl Feeds {
                 let _ = end_tx.send(e);
             }
         });
-        Ok(FeedEvents {
-            events: rx,
-            taken,
-            end: Some(end_rx),
-        })
+        Ok(events)
     }
 }
 
@@ -821,17 +828,32 @@ struct Client {
     /// are passed over, as an in-process feed opened then would never deliver them, even
     /// when the hub hadn't read them yet.
     after: u64,
+    /// Commits up to this seqno are passed over as already handled ([`Spec::skip`]).
+    skip: u64,
+    /// How many of those would have been sent: at most [`SKIP_LIMIT`].
+    skipped: AtomicU64,
+    /// [`Spec::announce`].
+    announce: bool,
     tables: Vec<Table>,
     prefix: Vec<u8>,
     visible: bool,
-    tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
-    /// The client's buffer's free bytes: each event in its channel holds its encoded size.
-    budget: Arc<Semaphore>,
-    /// When the client last took an event: a send waiting for room counts its
-    /// `--stream-idle-ms` from it (simp724's I1 on #1536).
-    taken: Arc<TakeClock>,
+    sink: Sink,
     /// Where it is, for the dump.
     tracker: Arc<Tracker>,
+}
+
+/// Where a stream's events go: its connection's buffered channel, bounded by events and by
+/// bytes, and ended by the idle limit when the connection stops taking. A single node's
+/// client and a cluster subscription's merge (D317 ticket 7) both send through one.
+pub(crate) struct Sink {
+    tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
+    /// The buffer's free bytes: each event in the channel holds its encoded size.
+    budget: Arc<Semaphore>,
+    /// When the connection last took an event: a send waiting for room counts its
+    /// `--stream-idle-ms` from it (simp724's I1 on #1536).
+    taken: Arc<TakeClock>,
+    client_bytes: usize,
+    stream_idle: Duration,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -888,6 +910,14 @@ impl Client {
                 Source::Ring(at)
             }
         };
+        if self.announce {
+            let event = proto::FeedEvent {
+                token: pos.token.clone(),
+                event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
+                partition: String::new(),
+            };
+            self.send(Out::Event(event), &mut pos).await?;
+        }
         loop {
             source = match source {
                 Source::Ring(at) => self.read_ring(at, &mut pos).await?,
@@ -908,7 +938,7 @@ impl Client {
         self.tracker.set(WAITING, 0);
         tokio::select! {
             // A client that leaves while queued gives up its place.
-            () = self.tx.closed() => Err(ApiError::internal("the client went away")),
+            () = self.sink.closed() => Err(ApiError::internal("the client went away")),
             slot = sem.acquire_owned() => {
                 slot.map_err(|_| ApiError::internal("the catch-up slots closed"))
             }
@@ -955,7 +985,7 @@ impl Client {
                 tokio::select! {
                     // A client that went away ends here, even one whose prefix never
                     // matches (it would otherwise hold its stream slot until a send failed).
-                    () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
+                    () = self.sink.closed() => return Err(ApiError::internal("the client went away")),
                     changed = head.changed() => {
                         if changed.is_err() {
                             return Err(ApiError::internal("the feed's hub ended"));
@@ -1019,7 +1049,7 @@ impl Client {
             // client gives its catch-up slot back as soon as it can rejoin.
             let tick = tokio::time::sleep(REJOIN_TICK.min(self.feeds.limits.quiet));
             tokio::select! {
-                () = self.tx.closed() => return Err(ApiError::internal("the client went away")),
+                () = self.sink.closed() => return Err(ApiError::internal("the client went away")),
                 item = next(&mut stream) => match item {
                     Some(Ok(commit)) => {
                         let token = token_of(&stream);
@@ -1059,10 +1089,29 @@ impl Client {
             return Ok(());
         }
         if let Some(c) = filtered(commit, &self.prefix) {
+            if self.skipping(commit.seqno())? {
+                return Ok(());
+            }
             self.send(Out::Event(commit_event(token.clone(), c)), pos)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether the commit at `seqno`, which would be sent, is passed over as one the client
+    /// already handled ([`Spec::skip`]); `InvalidArgument` past [`SKIP_LIMIT`] of them.
+    fn skipping(&self, seqno: u64) -> Result<bool, ApiError> {
+        if seqno > self.skip {
+            return Ok(false);
+        }
+        if self.skipped.fetch_add(1, Ordering::Relaxed) >= SKIP_LIMIT {
+            return Err(ApiError::invalid(format!(
+                "skip_through passes over more than {SKIP_LIMIT} commits after the token \
+                 (through seqno {}): a client can't have handled more after a checkpoint",
+                self.skip
+            )));
+        }
+        Ok(true)
     }
 
     /// Covers one entry of the ring. A client with no prefix sends the entry itself: its
@@ -1075,11 +1124,15 @@ impl Client {
             return Ok(());
         }
         if self.prefix.is_empty() {
+            if self.skipping(e.seqno)? {
+                return Ok(());
+            }
             return self.send(Out::Shared(Arc::clone(e)), pos).await;
         }
         // A prefix: the entry's changes to matching rows, if any (a later progress event
         // carries the position past one with none).
         match e.for_prefix(&self.prefix) {
+            Some(_) if self.skipping(e.seqno)? => Ok(()),
             Some(event) => self.send(Out::Event(event), pos).await,
             None => Ok(()),
         }
@@ -1096,6 +1149,7 @@ impl Client {
             Out::Event(proto::FeedEvent {
                 token: pos.token.clone(),
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
+                partition: String::new(),
             }),
             pos,
         )
@@ -1104,15 +1158,50 @@ impl Client {
 
     async fn send(&self, event: Out, pos: &mut Position) -> Result<(), ApiError> {
         let token = event.token().clone();
-        // Room in the client's buffer, then a place in its channel, both inside the idle
-        // limit: a client that takes nothing fills its buffer and then times out.
-        let bytes = event.encoded_len().clamp(
-            1,
-            self.feeds
-                .limits
-                .client_bytes
-                .clamp(1, Semaphore::MAX_PERMITS),
-        );
+        self.sink.put(event).await?;
+        pos.sent = token;
+        pos.last_event = Instant::now();
+        Ok(())
+    }
+}
+
+impl Sink {
+    /// A stream's sink, the events its connection takes, and where its task's error goes.
+    pub(crate) fn new(limits: &FeedLimits) -> (Self, FeedEvents, oneshot::Sender<ApiError>) {
+        let (tx, rx) = mpsc::channel(limits.client_events.max(1));
+        let client_bytes = limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS);
+        let taken = Arc::new(TakeClock::new());
+        let (end_tx, end_rx) = oneshot::channel();
+        let sink = Sink {
+            tx,
+            budget: Arc::new(Semaphore::new(client_bytes)),
+            taken: Arc::clone(&taken),
+            client_bytes,
+            stream_idle: limits.stream_idle,
+        };
+        let events = FeedEvents {
+            events: rx,
+            taken,
+            end: Some(end_rx),
+        };
+        (sink, events, end_tx)
+    }
+
+    /// Whether the connection went away.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Resolves once the connection has gone away.
+    pub(crate) async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
+    /// Queues `event` for the connection: room in its buffer, then a place in its channel,
+    /// both inside the idle limit, so a connection that takes nothing fills its buffer and
+    /// then times out.
+    pub(crate) async fn put(&self, event: Out) -> Result<(), ApiError> {
+        let bytes = event.encoded_len().clamp(1, self.client_bytes);
         let n = u32::try_from(bytes).unwrap_or(u32::MAX);
         let gone = || ApiError::internal("the client went away");
         // The fast path: room in the buffer and a place in the channel at once, with no
@@ -1120,11 +1209,7 @@ impl Client {
         // futex calls at 256 subscribers (perf287's profile on #1397).
         let (event, held) = match Arc::clone(&self.budget).try_acquire_many_owned(n) {
             Ok(room) => match self.tx.try_send((event, room)) {
-                Ok(()) => {
-                    pos.sent = token;
-                    pos.last_event = Instant::now();
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full((event, room))) => (event, Some(room)),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
             },
@@ -1145,7 +1230,7 @@ impl Client {
         // a large event may wait for most of the buffer to drain, and a client taking events
         // all along is slow, not idle (simp724's I1 on #1536). One timer: when it fires, a
         // take since the wait began moves the deadline on, and it waits again.
-        let idle = self.feeds.limits.stream_idle;
+        let idle = self.stream_idle;
         let began = tokio::time::Instant::now();
         let timer = tokio::time::sleep_until(began + idle);
         tokio::pin!(timer);
@@ -1154,15 +1239,8 @@ impl Client {
                 // The send first: room that is there wins over a timer that fired meanwhile.
                 biased;
                 sent = &mut queued => {
-                    return match sent {
-                        Ok(()) => {
-                            pos.sent = token;
-                            pos.last_event = Instant::now();
-                            Ok(())
-                        }
-                        // The client went away: end quietly.
-                        Err(()) => Err(gone()),
-                    };
+                    // The client went away: end quietly.
+                    return sent.map_err(|()| gone());
                 }
                 () = self.tx.closed() => return Err(gone()),
                 () = &mut timer => {
@@ -1233,21 +1311,41 @@ pub(crate) enum Out {
     Event(proto::FeedEvent),
     /// An entry whose `encoded()` is `Some`.
     Shared(Arc<Entry>),
+    /// A cluster subscription's event (D317 ticket 7): a component's event without its
+    /// token (`body`), then the fields the merge adds (`tail`: the partition, and on a
+    /// checkpoint the cluster token). A protobuf message is the concatenation of its fields,
+    /// so the component's encoding is sent as it is, not decoded and built again.
+    Spliced {
+        body: Bytes,
+        tail: Bytes,
+    },
 }
 
 impl Out {
     fn token(&self) -> &Bytes {
+        static NONE: Bytes = Bytes::new();
         match self {
             Out::Event(e) => &e.token,
             Out::Shared(e) => &e.token,
+            Out::Spliced { .. } => &NONE,
         }
     }
 
     /// Its size on the wire, for the client's buffer.
-    fn encoded_len(&self) -> usize {
+    pub(crate) fn encoded_len(&self) -> usize {
         match self {
             Out::Event(e) => prost::Message::encoded_len(e),
             Out::Shared(e) => e.encoded().map_or(0, Bytes::len),
+            Out::Spliced { body, tail } => body.len() + tail.len(),
+        }
+    }
+
+    /// The event's encoding, as one buffer (a cluster component's event, to splice).
+    pub(crate) fn to_bytes(&self) -> Bytes {
+        match self {
+            Out::Event(e) => Bytes::from(prost::Message::encode_to_vec(e)),
+            Out::Shared(e) => e.encoded().cloned().unwrap_or_default(),
+            Out::Spliced { body, tail } => [body.as_ref(), tail.as_ref()].concat().into(),
         }
     }
 
@@ -1259,6 +1357,9 @@ impl Out {
                 .encoded()
                 .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
                 .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
+            Out::Spliced { .. } => {
+                <proto::FeedEvent as prost::Message>::decode(self.to_bytes()).unwrap_or_default()
+            }
         }
     }
 
@@ -1273,6 +1374,11 @@ impl Out {
                 if let Some(b) = e.encoded() {
                     buf.put_slice(b);
                 }
+                Ok(())
+            }
+            Out::Spliced { body, tail } => {
+                buf.put_slice(body);
+                buf.put_slice(tail);
                 Ok(())
             }
         }
@@ -1464,6 +1570,8 @@ mod tests {
             prefix: Vec::new(),
             visible: false,
             start: Start::Now,
+            skip: 0,
+            announce: false,
         };
         rt.block_on(async {
             let slot = || Arc::clone(&slots).try_acquire_owned().unwrap();
@@ -1552,6 +1660,8 @@ mod tests {
                 prefix: Vec::new(),
                 visible: false,
                 start: Start::Now,
+                skip: 0,
+                announce: false,
             };
             let mut events = feeds.subscribe(spec, slot, |_| {}).unwrap();
             assert_eq!(
@@ -1621,6 +1731,8 @@ mod tests {
                 prefix: Vec::new(),
                 visible: false,
                 start: Start::Now,
+                skip: 0,
+                announce: false,
             };
             let _events = feeds.subscribe(spec, slot, |_| {}).unwrap();
             // Park the feed runtime's one worker while the backlog is written, so the hub
@@ -1704,6 +1816,8 @@ mod tests {
                         prefix: Vec::new(),
                         visible: false,
                         start: Start::Now,
+                        skip: 0,
+                        announce: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     |_| {},
@@ -1794,6 +1908,8 @@ mod tests {
                         prefix: Vec::new(),
                         visible: false,
                         start: Start::Now,
+                        skip: 0,
+                        announce: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     move |e| {
@@ -1888,6 +2004,8 @@ mod tests {
                         prefix: Vec::new(),
                         visible: false,
                         start: Start::Now,
+                        skip: 0,
+                        announce: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     |_| {},
@@ -1937,6 +2055,7 @@ mod tests {
                         })
                         .collect(),
                 })),
+                partition: String::new(),
             });
             assert_eq!(e.encoded().map(|b| &b[..]), Some(&want[..]));
             let mut wire = Vec::new();

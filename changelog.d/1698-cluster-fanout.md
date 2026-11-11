@@ -1,0 +1,2 @@
+### Added
+- `phdb serve --cluster` nodes fan scans and multi-gets out across a table's partitions (D317 ticket 4a, ICR 0117), returning what one database holding every partition would. A page's `next` resumes through any node. `allow_partial` skips a partition that can't be reached and names its key range in the new `missing` field; without it the read fails with `PartitionUnavailable`. Nodes forward a partition's part of a scan over the new node-to-node `Cluster.ForwardScan`.

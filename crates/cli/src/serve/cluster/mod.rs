@@ -9,12 +9,16 @@
 //! partition's identity under it.
 
 pub(crate) mod cli;
+pub(crate) mod fanout;
+pub(crate) mod feed;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
+pub(crate) mod position;
 pub(crate) mod route;
 #[cfg(test)]
 mod tests;
+pub(crate) mod token;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -755,8 +759,6 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(status))
     }
 
-    /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope only.
-    /// The node serves it through its router once that lands; until then it's refused.
     /// Node to node: a call another node routed here (D317 ticket 2). Cluster scope; the
     /// call is then checked for the caller it names, and served only if this node's map
     /// gives it the key.
@@ -779,6 +781,48 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             resp.extensions_mut().insert(super::charge::Charged::new(c));
         }
         Ok(resp)
+    }
+
+    type ForwardSubscribeStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<proto::FeedEvent, Status>> + Send>,
+    >;
+
+    /// Served by a route of its own ([`feed::ForwardSubscribeGrpc`]), ahead of this one.
+    async fn forward_subscribe(
+        &self,
+        _req: Request<proto::ForwardSubscribeRequest>,
+    ) -> Result<tonic::Response<Self::ForwardSubscribeStream>, Status> {
+        Err(Status::unimplemented(
+            "this node doesn't serve data, so it has no partition to subscribe to",
+        ))
+    }
+
+    type ForwardScanStream =
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<proto::ScanPage, Status>> + Send>>;
+
+    /// Node to node: one partition's part of a scan another node fans out (D317 ticket 4a).
+    /// Cluster scope; served for the caller it names, as this node's own scan of the
+    /// partition, if this node's map gives it the partition.
+    async fn forward_scan(
+        &self,
+        req: Request<proto::ForwardScanRequest>,
+    ) -> Result<tonic::Response<Self::ForwardScanStream>, Status> {
+        self.caller(&req, &[Scope::Cluster], "forward a scan")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let msg = req.into_inner();
+        let caller = forward::caller_of(msg.caller)?;
+        let scan = msg
+            .scan
+            .ok_or_else(|| ApiError::invalid("a forwarded scan carries no scan"))?;
+        let pages = shared
+            .router
+            .serve_forwarded_scan(&msg.partition, scan, &caller)
+            .await?;
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+            pages,
+        ))))
     }
 }
 
@@ -842,6 +886,13 @@ pub(crate) fn routes(
     max_request_bytes: usize,
 ) -> axum::Router {
     let idle = shared.as_ref().map(|s| s.limits.stream_idle);
+    // A cluster subscription's parts last as long as it does: outside the limit below, each
+    // holding a `--max-streams` place instead (D317 ticket 7).
+    let streams = shared.as_ref().map(|shared| feed::ForwardSubscribeGrpc {
+        node: Arc::clone(&node),
+        shared: Arc::clone(shared),
+        max_request_bytes,
+    });
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
         .max_decoding_message_size(max_request_bytes);
     let mut app = axum::Router::new()
@@ -856,7 +907,11 @@ pub(crate) fn routes(
             move |resp: axum::response::Response| async move { super::charge::hold(resp, idle) },
         ));
     }
-    app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS))
+    let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
+    match streams {
+        Some(svc) => app.route_service(feed::FORWARD_SUBSCRIBE, svc),
+        None => app,
+    }
 }
 
 /// `Cluster` calls a node runs at once: map reads and installs, pushes and pulls are few.
@@ -891,11 +946,6 @@ pub(crate) fn run(
             args.create,
             "--create",
             "D317's ticket 2 (partitions are created by phdb cluster init-partition)",
-        ),
-        (
-            args.change_feed.is_some(),
-            "--change-feed",
-            "D317's ticket 7 (cluster feeds)",
         ),
     ];
     if let Some((_, flag, ticket)) = refused.iter().find(|(set, _, _)| *set) {
@@ -997,7 +1047,8 @@ pub(crate) fn run(
     let cluster_id = node.state().map.as_ref().map(|(m, _)| m.cluster_id.clone());
     let db = match (&local, &cluster_id) {
         (Some((p, epoch)), Some(c)) => {
-            let options = partition_options(args.shard_spin, cli.shm_dir.as_deref());
+            let options =
+                partition_options(args.shard_spin, cli.shm_dir.as_deref(), args.change_feed);
             Some(open_partition(dir, c, p, *epoch, options)?)
         }
         _ => None,
@@ -1069,18 +1120,23 @@ pub(crate) fn run(
 }
 
 /// The options a cluster node opens its partition with: the server's shard poll (none by
-/// default, D198 amendment 4), its default shard count (ICR 0132) and `--shm-dir`, as a
-/// single node's (cli692's M1 on #1686).
+/// default, D198 amendment 4), its default shard count (ICR 0132), `--shm-dir` and
+/// `--change-feed`, as a single node's (cli692's M1 on #1686). A partition whose feed is on
+/// keeps it without the flag (D317 ticket 7), and its feed's recorded shard count.
 pub(crate) fn partition_options(
     shard_spin: config::ShardSpin,
     shm_dir: Option<&Path>,
+    change_feed: Option<u64>,
 ) -> pigeonhole::Options {
-    let options = shard_spin
+    let mut options = shard_spin
         .apply(pigeonhole::Options::default().default_shards(super::placement::default_shards()));
-    match shm_dir {
-        Some(dir) => options.shm_dir(dir),
-        None => options,
+    if let Some(dir) = shm_dir {
+        options = options.shm_dir(dir);
     }
+    if let Some(bytes) = change_feed {
+        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
+    }
+    options
 }
 
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:

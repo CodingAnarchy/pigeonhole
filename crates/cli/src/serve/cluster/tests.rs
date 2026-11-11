@@ -437,31 +437,74 @@ fn data_node(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    data_node_with(
+        rt,
+        dir,
+        id,
+        local,
+        listener,
+        crate::serve::server_tests::limits(),
+    )
+}
+
+/// [`data_node`] with its own limits.
+fn data_node_with(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    limits: crate::serve::config::Limits,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
+    data_node_on(rt, dir, id, local, listener, limits, None)
+}
+
+/// [`data_node_with`], serving `db` if given (the same node's database again, after its
+/// server stopped: a restart as the network sees it) rather than opening one. Partitions
+/// keep a change feed (D317 ticket 7).
+fn data_node_on(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    limits: crate::serve::config::Limits,
+    db: Option<pigeonhole::Pigeonhole>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node(dir, id);
-    let limits = crate::serve::server_tests::limits();
     let metrics = Arc::new(Metrics::default());
-    let db = local.map(|p| {
-        let db = pigeonhole::Pigeonhole::open(
-            dir.join(format!("{p}.phdb")),
-            pigeonhole::Options::default().create_if_missing(true),
-        )
-        .unwrap();
-        identity::write(
-            &db,
-            &identity::Identity {
-                cluster_id: "c1".into(),
-                partition_id: p.into(),
-                epoch: 1,
-            },
-        )
-        .unwrap();
-        db.table("users")
-            .unwrap()
-            .family("f", pigeonhole::Family::default())
-            .create_if_missing()
+    let db = db.or_else(|| {
+        local.map(|p| {
+            let db = pigeonhole::Pigeonhole::open(
+                dir.join(format!("{p}.phdb")),
+                pigeonhole::Options::default()
+                    .create_if_missing(true)
+                    .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+            )
             .unwrap();
-        db
+            identity::write(
+                &db,
+                &identity::Identity {
+                    cluster_id: "c1".into(),
+                    partition_id: p.into(),
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+            db.table("users")
+                .unwrap()
+                .family("f", pigeonhole::Family::default())
+                .create_if_missing()
+                .unwrap();
+            db
+        })
     });
     let service = match &db {
         Some(db) => Service::new(db.clone(), limits, 2, Arc::clone(&metrics)),
@@ -606,10 +649,30 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .await
             .unwrap();
         assert_eq!(get_row(b, "yan").await.unwrap(), Some(b"5".to_vec()));
+        // A scan fans out across the partitions (ticket 4a), even from a node with none.
+        let pages = scan_pages(
+            c,
+            super::proto::ScanRequest {
+                table: "users".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let keys: Vec<_> = pages
+            .iter()
+            .flat_map(|p| p.rows.iter().map(|r| r.key.to_vec()))
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        assert!(keys.contains(&b"alice".to_vec()) && keys.contains(&b"zed".to_vec()));
         // Calls a later ticket brings are refused, naming it.
-        let e = data(c)
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
             .await
-            .scan(super::proto::ScanRequest {
+            .unwrap();
+        let e = super::proto::graph_client::GraphClient::new(channel)
+            .traverse(super::proto::TraverseRequest {
                 table: "users".into(),
                 ..Default::default()
             })
@@ -914,7 +977,7 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
     // database does, so its default runs no poll (D198 amendment 4).
     let dir = test_dir();
-    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None)
+    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None, None)
         .create_if_missing(true);
     let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
     let t = db
@@ -938,3 +1001,602 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     drop(t);
     db.close().unwrap();
 }
+
+// ---- D317 ticket 4a: fan-out scans and multi-gets ----
+
+/// The three-way map: `users` split at "g" and "m" over p1 (a), p2 (b) and p3 (c).
+fn three_way(ports: &[u16; 3]) -> ClusterMap {
+    let mut m = the_map(1, ports);
+    m.tables[0].splits = vec![text("g"), text("m")];
+    m.tables[0].partitions = vec!["p1".into(), "p2".into(), "p3".into()];
+    m
+}
+
+/// Three data nodes over [`three_way`], each serving its partition; their stop handles,
+/// ports and partition databases.
+fn three_nodes(
+    rt: &tokio::runtime::Runtime,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let map = three_way(&[ports[0], ports[1], ports[2]]);
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, id), p) in listeners
+        .into_iter()
+        .zip(["a", "b", "c"])
+        .zip(["p1", "p2", "p3"])
+    {
+        let dir = test_dir();
+        super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+        // Room for the stalled-stream test's scans: each holds a slot on its entry node and
+        // one on the partition's.
+        let limits = crate::serve::config::Limits {
+            max_scans: 64,
+            inflight_bytes: 256 << 20,
+            // Longer than the stalled-stream test's bound, so a stall can't clear itself by
+            // idling out.
+            stream_idle: Duration::from_secs(30),
+            ..crate::serve::server_tests::limits()
+        };
+        let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
+        stops.push(stop);
+        dbs.push(db.unwrap());
+    }
+    (stops, ports, dbs)
+}
+
+/// A row's cells as a test compares them: qualifier and value, in the API's order.
+type Cells = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A multi-get page as a test compares it: its rows, and its `bytes`.
+type Page = (Vec<(Vec<u8>, Cells)>, u64);
+
+/// Rows (`key`, cells) from a reply's rows, a row a page cut joined with its rest.
+fn joined(rows: impl IntoIterator<Item = super::proto::Row>) -> Vec<(Vec<u8>, Cells)> {
+    let mut out: Vec<(Vec<u8>, Cells)> = Vec::new();
+    for r in rows {
+        let cells: Cells = r
+            .cells
+            .iter()
+            .map(|c| (c.qualifier.to_vec(), c.value.to_vec()))
+            .collect();
+        match out.last_mut() {
+            Some((k, have)) if *k == r.key[..] => have.extend(cells),
+            _ => out.push((r.key.to_vec(), cells)),
+        }
+    }
+    out
+}
+
+/// A library row as a test compares it.
+fn lib_row(row: &pigeonhole::Row) -> (Vec<u8>, Cells) {
+    (
+        row.key().to_vec(),
+        row.view()
+            .iter()
+            .map(|e| (e.qualifier.to_vec(), e.cell.value().to_vec()))
+            .collect(),
+    )
+}
+
+/// `row`'s writes: `n` cells `q0`.. with values of the given lengths.
+fn cells_row(row: &[u8], values: &[usize], tag: u64) -> super::proto::RowWrites {
+    use super::proto::{Put, RowKey, Value, Write, value, write};
+    super::proto::RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.to_vec().into(),
+        }),
+        writes: values
+            .iter()
+            .enumerate()
+            .map(|(i, len)| Write {
+                op: Some(write::Op::Put(Put {
+                    family: "f".into(),
+                    qualifier: format!("q{i}").into_bytes().into(),
+                    timestamp: None,
+                    value: Some(Value {
+                        kind: Some(value::Kind::Bytes(
+                            format!("{tag}:{}", "v".repeat(*len)).into_bytes().into(),
+                        )),
+                    }),
+                })),
+            })
+            .collect(),
+    }
+}
+
+/// A scan's pages from `port`, all of them.
+async fn scan_pages(
+    port: u16,
+    r: super::proto::ScanRequest,
+) -> Result<Vec<super::proto::ScanPage>, tonic::Status> {
+    let mut stream = data(port).await.scan(r).await?.into_inner();
+    let mut pages = Vec::new();
+    while let Some(p) = stream.message().await? {
+        pages.push(p);
+    }
+    Ok(pages)
+}
+
+#[test]
+fn fanned_out_scans_and_multi_gets_answer_as_one_database_does() {
+    // D317 §12's model test, fan-out half (ticket 4a), against one database holding every
+    // row: scans over every kind of range, with row limits and byte budgets, resumed from
+    // every page's `next` through another entry node; multi-gets of random key sets, page by
+    // page, which must match the single database's pages exactly (the budget's merge across
+    // partitions, simp724's S1 and M1).
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("cluster fan-out seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    let mut rng = Rng(seed);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, dbs) = three_nodes(&rt);
+    let oracle_dir = test_dir();
+    let oracle = pigeonhole::Pigeonhole::open(
+        oracle_dir.join("oracle.phdb"),
+        pigeonhole::Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let t = oracle
+        .table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    // Rows on every side of both splits, the split keys themselves among them.
+    let mut keys: Vec<Vec<u8>> = ["a", "c", "f", "g", "g0", "k", "lz", "m", "m0", "s", "z"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}").into_bytes()))
+        .collect();
+    keys.extend([b"g".to_vec(), b"m".to_vec(), b"".to_vec()]);
+    keys.sort();
+    keys.dedup();
+    rt.block_on(async {
+        for (i, key) in keys.iter().enumerate() {
+            let values: Vec<usize> = (0..1 + rng.below(4))
+                .map(|_| 1 + rng.below(120) as usize)
+                .collect();
+            let w = cells_row(key, &values, i as u64);
+            let entry = ports[rng.below(3) as usize];
+            data(entry)
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(w.clone()),
+                    durability: 0,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: put {key:?}: {e}"));
+            let mut m = t.mutate(key);
+            for (q, len) in values.iter().enumerate() {
+                m = m.put(
+                    "f",
+                    format!("q{q}").as_bytes(),
+                    format!("{i}:{}", "v".repeat(*len)).as_bytes(),
+                );
+            }
+            m.commit().unwrap();
+        }
+    });
+    let pick = |rng: &mut Rng| keys[rng.below(keys.len() as u64) as usize].clone();
+    let budgets = [300u64, 450, 700, 1500, 0];
+    rt.block_on(async {
+        // Scans.
+        for trial in 0..60 {
+            use super::proto::{Bound, Bounds, KeyRange, ScanRequest, key_range::Range};
+            use std::ops::Bound as B;
+            let at = format!("seed {seed}, scan {trial}");
+            let (range, lo, hi): (Option<KeyRange>, B<Vec<u8>>, B<Vec<u8>>) = match rng.below(3) {
+                0 => (None, B::Unbounded, B::Unbounded),
+                1 => {
+                    let p: &[u8] =
+                        [&b""[..], b"f", b"g", b"l", b"m", b"z", b"q"][rng.below(7) as usize];
+                    (
+                        Some(KeyRange {
+                            range: Some(Range::Prefix(p.to_vec().into())),
+                        }),
+                        B::Included(p.to_vec()),
+                        B::Excluded(p.to_vec()),
+                    )
+                }
+                _ => {
+                    let (mut a, mut b) = (pick(&mut rng), pick(&mut rng));
+                    if a > b {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let (ai, bi) = (rng.below(2) == 0, rng.below(2) == 0);
+                    (
+                        Some(KeyRange {
+                            range: Some(Range::Bounds(Bounds {
+                                start: Some(Bound {
+                                    key: a.clone().into(),
+                                    inclusive: ai,
+                                }),
+                                end: Some(Bound {
+                                    key: b.clone().into(),
+                                    inclusive: bi,
+                                }),
+                            })),
+                        }),
+                        if ai { B::Included(a) } else { B::Excluded(a) },
+                        if bi { B::Included(b) } else { B::Excluded(b) },
+                    )
+                }
+            };
+            let page_bytes = budgets[rng.below(budgets.len() as u64) as usize];
+            let limit = [0u64, 0, 1, 3, 5, 9, 20][rng.below(7) as usize];
+            // The oracle's rows.
+            let scan = match (&range, &lo) {
+                (
+                    Some(KeyRange {
+                        range: Some(Range::Prefix(p)),
+                    }),
+                    _,
+                ) => t.scan_prefix(p),
+                _ => t.scan_bounds(
+                    match &lo {
+                        B::Included(k) => B::Included(&k[..]),
+                        B::Excluded(k) => B::Excluded(&k[..]),
+                        B::Unbounded => B::Unbounded,
+                    },
+                    match &hi {
+                        B::Included(k) => B::Included(&k[..]),
+                        B::Excluded(k) => B::Excluded(&k[..]),
+                        B::Unbounded => B::Unbounded,
+                    },
+                ),
+            };
+            let scan = if limit > 0 { scan.limit(limit) } else { scan };
+            let want: Vec<(Vec<u8>, Cells)> =
+                scan.iter().unwrap().map(|r| lib_row(&r.unwrap())).collect();
+            let req = |after: Vec<u8>| ScanRequest {
+                table: "users".into(),
+                range: range.clone(),
+                limit,
+                page_bytes,
+                after: after.into(),
+                ..Default::default()
+            };
+            // The whole stream from one entry node.
+            let entry = ports[rng.below(3) as usize];
+            let pages = scan_pages(entry, req(Vec::new()))
+                .await
+                .unwrap_or_else(|e| panic!("{at}: {e}"));
+            let last = pages.last().unwrap_or_else(|| panic!("{at}: no pages"));
+            assert!(
+                last.next.is_empty(),
+                "{at}: the stream ended with a position"
+            );
+            // An empty `next` means only the scan's end, never a partition's (simp724's M1).
+            for (i, p) in pages[..pages.len() - 1].iter().enumerate() {
+                assert!(
+                    !p.next.is_empty(),
+                    "{at}: page {i} of {} says the scan ended",
+                    pages.len()
+                );
+            }
+            for p in &pages {
+                assert!(
+                    page_bytes == 0 || p.bytes <= page_bytes,
+                    "{at}: page over budget"
+                );
+            }
+            assert_eq!(
+                joined(pages.iter().flat_map(|p| p.rows.clone())),
+                want,
+                "{at}: range {range:?}, limit {limit}, page_bytes {page_bytes}"
+            );
+            // Without a limit, a resume from every page's `next`, through another node,
+            // reads exactly the rest (simp724's M1).
+            if limit == 0 {
+                for (i, p) in pages.iter().enumerate() {
+                    if p.next.is_empty() {
+                        continue;
+                    }
+                    let other = ports[rng.below(3) as usize];
+                    let rest = scan_pages(other, req(p.next.to_vec()))
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: resume after page {i}: {e}"));
+                    let mut from_here: Vec<_> =
+                        pages[..=i].iter().flat_map(|p| p.rows.clone()).collect();
+                    from_here.extend(rest.iter().flat_map(|p| p.rows.clone()));
+                    assert_eq!(joined(from_here), want, "{at}: resumed after page {i}");
+                }
+            }
+        }
+        // A limit that ends exactly at a partition's end (simp724's N2): the scan ends there,
+        // with an empty `next`, from every entry node and at every budget.
+        let in_p1 = keys
+            .iter()
+            .filter(|k| k.as_slice() < b"g".as_slice())
+            .count() as u64;
+        for &port in &ports {
+            for page_bytes in [300, 0] {
+                let pages = scan_pages(
+                    port,
+                    super::proto::ScanRequest {
+                        table: "users".into(),
+                        limit: in_p1,
+                        page_bytes,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let got = joined(pages.iter().flat_map(|p| p.rows.clone()));
+                assert_eq!(got.len() as u64, in_p1, "seed {seed}: limit {in_p1}");
+                assert!(got.iter().all(|(k, _)| k.as_slice() < b"g".as_slice()));
+                assert!(
+                    pages.last().unwrap().next.is_empty(),
+                    "seed {seed}: limit at the boundary"
+                );
+            }
+        }
+        // Multi-gets: the single database's pages, exactly.
+        for trial in 0..60 {
+            use super::proto::MultiGetRequest;
+            let at = format!("seed {seed}, multi-get {trial}");
+            let n = 1 + rng.below(12);
+            let mut asked: Vec<Vec<u8>> = (0..n).map(|_| pick(&mut rng)).collect();
+            if rng.below(3) == 0 {
+                asked.push(b"nope".to_vec());
+            }
+            let page_bytes = budgets[rng.below(budgets.len() as u64) as usize];
+            let set = pigeonhole::KeySet::from_unsorted(asked.iter().map(|k| &k[..]));
+            let mut want: Vec<Page> = Vec::new();
+            let mut pos: Option<pigeonhole::KeysPosition> = None;
+            loop {
+                let mut read = t.keys(&set);
+                if let Some(p) = &pos {
+                    read = read.resume_after(p);
+                }
+                let page = read
+                    .read_within(if page_bytes == 0 { 1 << 20 } else { page_bytes })
+                    .unwrap();
+                want.push((page.rows().iter().map(lib_row).collect(), page.bytes()));
+                match page.resume() {
+                    Some(p) => pos = Some(p.clone()),
+                    None => break,
+                }
+            }
+            let mut after = Vec::new();
+            for (i, (rows, bytes)) in want.iter().enumerate() {
+                let entry = ports[rng.below(3) as usize];
+                let got = data(entry)
+                    .await
+                    .multi_get(MultiGetRequest {
+                        table: "users".into(),
+                        keys: asked.iter().map(|k| k.clone().into()).collect(),
+                        page_bytes,
+                        after: after.clone().into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}, page {i}: {e}"))
+                    .into_inner();
+                let got_rows: Vec<_> = got
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.key.to_vec(),
+                            r.cells
+                                .iter()
+                                .map(|c| (c.qualifier.to_vec(), c.value.to_vec()))
+                                .collect::<Cells>(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    (&got_rows, got.bytes),
+                    (rows, *bytes),
+                    "{at}, page {i} of {asked:?} at {page_bytes}"
+                );
+                assert_eq!(
+                    got.next.is_empty(),
+                    i + 1 == want.len(),
+                    "{at}, page {i}'s next"
+                );
+                after = got.next.to_vec();
+            }
+        }
+        // A single node's position is refused by name on a cluster.
+        let node_pos = t
+            .scan_prefix(b"")
+            .read_within(300)
+            .unwrap()
+            .resume()
+            .unwrap()
+            .to_bytes();
+        let e = scan_pages(
+            ports[0],
+            super::proto::ScanRequest {
+                table: "users".into(),
+                after: node_pos.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        assert!(e.message().contains("single node"), "{e}");
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+    drop(t);
+    let _ = oracle.close();
+}
+
+#[test]
+fn a_partition_that_cant_be_reached_fails_a_fan_out_read_unless_it_may_be_skipped() {
+    // D317 §7's owner decision: a missing partition fails the read with
+    // PartitionUnavailable; with allow_partial it's skipped and named in `missing`.
+    use super::proto::{MultiGetRequest, ScanRequest};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, ports, dbs) = three_nodes(&rt);
+    let rows: [&[u8]; 3] = [b"a1", b"h1", b"x1"];
+    rt.block_on(async {
+        for (i, r) in rows.iter().enumerate() {
+            data(ports[0])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(cells_row(r, &[5], i as u64)),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+        }
+    });
+    // Node b, holding p2 (["g", "m")), stops.
+    let _ = stops.remove(1).send(());
+    rt.block_on(async {
+        eventually("node b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", ports[1]))
+                .await
+                .is_err()
+        })
+        .await;
+        let scan = |allow_partial| ScanRequest {
+            table: "users".into(),
+            allow_partial,
+            ..Default::default()
+        };
+        // By default: the stream fails with the partition's error (its first page may come
+        // first: p1's row).
+        let mut stream = data(ports[0])
+            .await
+            .scan(scan(false))
+            .await
+            .unwrap()
+            .into_inner();
+        let e = loop {
+            match stream.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the scan ended without p2"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        // With allow_partial: p1's and p3's rows, and p2's range in `missing`, once.
+        let pages = scan_pages(ports[2], scan(true)).await.unwrap();
+        let keys: Vec<Vec<u8>> = pages
+            .iter()
+            .flat_map(|p| p.rows.iter().map(|r| r.key.to_vec()))
+            .collect();
+        assert_eq!(keys, [b"a1".to_vec(), b"x1".to_vec()]);
+        let missing: Vec<_> = pages.iter().flat_map(|p| p.missing.clone()).collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(
+            (
+                missing[0].partition.as_str(),
+                &missing[0].start[..],
+                &missing[0].end[..]
+            ),
+            ("p2", &b"g"[..], &b"m"[..])
+        );
+        assert!(pages.last().unwrap().next.is_empty());
+        // A multi-get the same way.
+        let mg = |allow_partial| MultiGetRequest {
+            table: "users".into(),
+            keys: rows.iter().map(|r| r.to_vec().into()).collect(),
+            allow_partial,
+            ..Default::default()
+        };
+        let e = data(ports[0]).await.multi_get(mg(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = data(ports[2])
+            .await
+            .multi_get(mg(true))
+            .await
+            .unwrap()
+            .into_inner();
+        let keys: Vec<Vec<u8>> = got.rows.iter().map(|r| r.key.to_vec()).collect();
+        assert_eq!(keys, [b"a1".to_vec(), b"x1".to_vec()]);
+        assert_eq!(got.missing.len(), 1);
+        assert_eq!(got.missing[0].partition, "p2");
+        assert!(got.next.is_empty());
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node() {
+    // simp724's S1 on #1698: a forwarded scan's unread pages count against its HTTP/2
+    // connection's window too, so streams sharing a connection stall one another once a
+    // few stop reading. Each forwarded stream has a connection of its own: sixteen scans
+    // from node a over p2 (on node b) whose clients read nothing, and another scan from a
+    // over p2 still reads to its end.
+    use super::proto::{KeyRange, ScanRequest, key_range::Range};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, dbs) = three_nodes(&rt);
+    rt.block_on(async {
+        // About 12 MiB in p2 (["g", "m")): more than a connection's window, many times over.
+        let mut c = data(ports[1]).await;
+        for i in 0..192 {
+            c.mutate(super::proto::MutateRequest {
+                writes: Some(cells_row(format!("h{i:03}").as_bytes(), &[64 << 10], i)),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        }
+        let scan = || ScanRequest {
+            table: "users".into(),
+            range: Some(KeyRange {
+                range: Some(Range::Prefix(b"h".to_vec().into())),
+            }),
+            page_bytes: 1 << 20,
+            ..Default::default()
+        };
+        // The stalled clients (each opens its scan, takes its first page, and stops), then
+        // another scan to its end, all well within --stream-idle-ms (30 s here): on a shared
+        // connection the stalled streams would hold up the others until they idled out.
+        let stalled = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stalled = Vec::new();
+            for _ in 0..16 {
+                let mut s = data(ports[0])
+                    .await
+                    .scan(scan())
+                    .await
+                    .unwrap()
+                    .into_inner();
+                s.message().await.unwrap().unwrap();
+                stalled.push(s);
+            }
+            // Their streams fill what windows they can.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let pages = scan_pages(ports[0], scan()).await.unwrap();
+            let rows: usize = pages.iter().map(|p| p.rows.len()).sum();
+            assert!(rows >= 192, "{rows}");
+            stalled
+        })
+        .await
+        .expect("a scan stalled behind scans whose clients stopped reading");
+        drop(stalled);
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+mod feed;
