@@ -6345,6 +6345,9 @@ pub struct LocalPartition {
     /// sets `error`, and `Close` again retries it. `Stamp`'s reply: the set it installed.
     #[prost(message, repeated, tag = "11")]
     pub files: ::prost::alloc::vec::Vec<PartitionFile>,
+    /// Why it's fenced: set only when `state` is FENCED.
+    #[prost(enumeration = "FenceReason", tag = "12")]
+    pub fence_reason: i32,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6553,6 +6556,40 @@ impl LocalPartitionState {
             "LOCAL_PARTITION_STATE_FENCED" => Some(Self::Fenced),
             "LOCAL_PARTITION_STATE_CLOSED" => Some(Self::Closed),
             "LOCAL_PARTITION_STATE_OPENING" => Some(Self::Opening),
+            _ => None,
+        }
+    }
+}
+/// Why a partition is fenced (D317 ticket 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FenceReason {
+    Unspecified = 0,
+    /// `phdb cluster fence`: kept in the node's `fenced.json` across a restart, lifted only by
+    /// `phdb cluster unfence`.
+    Operator = 1,
+    /// Fenced since the node started, until a peer's map at least as new as the node's names
+    /// it for the partition at the file's epoch (or `phdb cluster unfence`).
+    AwaitingPeerMap = 2,
+}
+impl FenceReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FENCE_REASON_UNSPECIFIED",
+            Self::Operator => "FENCE_REASON_OPERATOR",
+            Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FENCE_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "FENCE_REASON_OPERATOR" => Some(Self::Operator),
+            "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             _ => None,
         }
     }

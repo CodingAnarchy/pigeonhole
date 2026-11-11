@@ -5,7 +5,7 @@
 //! fence stays.
 
 use super::*;
-use crate::serve::proto::{LocalPartition, LocalPartitionState, PartitionRequest};
+use crate::serve::proto::{FenceReason, LocalPartition, LocalPartitionState, PartitionRequest};
 
 async fn try_put(port: u16, row: &str, value: &str) -> Result<(), tonic::Status> {
     data(port)
@@ -38,8 +38,8 @@ async fn unfence(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
         .map(tonic::Response::into_inner)
 }
 
-/// Partition `p`'s state in node `port`'s Status.
-async fn state(port: u16, p: &str) -> LocalPartitionState {
+/// Partition `p`'s line in node `port`'s Status.
+async fn local(port: u16, p: &str) -> LocalPartition {
     let s = client(port)
         .await
         .status(StatusRequest {})
@@ -50,7 +50,15 @@ async fn state(port: u16, p: &str) -> LocalPartitionState {
         .iter()
         .find(|lp| lp.id == p)
         .unwrap_or_else(|| panic!("no {p} in {s:?}"))
-        .state()
+        .clone()
+}
+
+async fn state(port: u16, p: &str) -> LocalPartitionState {
+    local(port, p).await.state()
+}
+
+async fn reason(port: u16, p: &str) -> FenceReason {
+    local(port, p).await.fence_reason()
 }
 
 #[test]
@@ -63,6 +71,7 @@ fn a_fenced_partition_refuses_writes_through_every_node_and_unfence_lifts_it() {
         assert_eq!(state(a, "p1").await, LocalPartitionState::Serving);
         let lp = fence(a, "p1").await.unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
         // Its node, and a forward from another: refused, nothing written.
         for entry in [a, b, c] {
             let e = try_put(entry, "alice", "2").await.unwrap_err();
@@ -81,6 +90,7 @@ fn a_fenced_partition_refuses_writes_through_every_node_and_unfence_lifts_it() {
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
         let lp = unfence(a, "p1").await.unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Unspecified, "{lp:?}");
         put(b, "alice", "3").await;
         assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"3".to_vec()));
     });
@@ -210,6 +220,7 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
     stops.push(stop);
     rt.block_on(async {
         assert_eq!(state(ports[0], "p1").await, LocalPartitionState::Fenced);
+        assert_eq!(reason(ports[0], "p1").await, FenceReason::AwaitingPeerMap);
         let e = try_put(ports[0], "alice", "1").await.unwrap_err();
         assert_eq!(code(&e), "Fenced", "{e}");
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -243,6 +254,7 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         // The operator's fence outlived the restart.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(state(ports[2], "p3").await, LocalPartitionState::Fenced);
+        assert_eq!(reason(ports[2], "p3").await, FenceReason::Operator);
         unfence(ports[2], "p3").await.unwrap();
         assert_eq!(state(ports[2], "p3").await, LocalPartitionState::Serving);
         put(ports[0], "zed", "1").await;

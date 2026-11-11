@@ -649,8 +649,9 @@ impl Node {
         }
         // Each open partition's state (D317 ticket 6).
         for lp in &mut partitions {
-            if let Some(state) = self.part_state(&lp.id) {
+            if let Some((state, reason)) = self.part_state(&lp.id) {
                 lp.set_state(state);
+                lp.set_fence_reason(reason);
             }
         }
         NodeStatus {

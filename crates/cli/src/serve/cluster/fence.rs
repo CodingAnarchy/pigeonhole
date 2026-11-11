@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::Node;
-use super::proto::{ClusterMap, LocalPartitionState};
+use super::proto::{ClusterMap, FenceReason, LocalPartitionState};
 use crate::serve::errors::ApiError;
 use crate::serve::gate::{Fence, WriteGate};
 
@@ -152,12 +152,14 @@ impl Node {
         gate
     }
 
-    /// Partition `id`'s state here, for `Status`: `None` when it isn't open here.
-    pub(crate) fn part_state(&self, id: &str) -> Option<LocalPartitionState> {
+    /// Partition `id`'s state here, and why it's fenced when it is, for `Status`: `None`
+    /// when it isn't open here.
+    pub(crate) fn part_state(&self, id: &str) -> Option<(LocalPartitionState, FenceReason)> {
         let (gate, _) = self.fences.gate(id)?;
         Some(match gate.fenced() {
-            Some(_) => LocalPartitionState::Fenced,
-            None => LocalPartitionState::Serving,
+            Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
+            Some(Fence::Start) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
+            None => (LocalPartitionState::Serving, FenceReason::Unspecified),
         })
     }
 
