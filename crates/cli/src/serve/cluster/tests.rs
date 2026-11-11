@@ -2762,4 +2762,167 @@ fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
     let _ = oracle.close();
 }
 
+/// Data nodes `n0`, `n1`, … each serving one partition (`q0`, `q1`, …) of `users`, split at
+/// `splits`, under `limits`; their stop handles, ports and partition databases.
+fn split_nodes(
+    rt: &tokio::runtime::Runtime,
+    splits: &[&str],
+    limits: crate::serve::config::Limits,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    let n = splits.len() + 1;
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| MapNode {
+                id: format!("n{i}"),
+                address: format!("127.0.0.1:{port}"),
+            })
+            .collect(),
+        partitions: (0..n)
+            .map(|i| Partition {
+                id: format!("q{i}"),
+                node: format!("n{i}"),
+                epoch: 1,
+            })
+            .collect(),
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: splits.iter().map(|s| text(s)).collect(),
+            partitions: (0..n).map(|i| format!("q{i}")).collect(),
+        }],
+    };
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for (i, l) in listeners.into_iter().enumerate() {
+        let dir = test_dir();
+        super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+        let (id, p) = (format!("n{i}"), format!("q{i}"));
+        let (stop, db) = data_node_with(rt, &dir, &id, Some(&p), l, limits);
+        stops.push(stop);
+        dbs.push(db.unwrap());
+    }
+    (stops, ports, dbs)
+}
+
+#[test]
+fn a_nearest_search_over_many_partitions_merges_their_answers_as_they_arrive() {
+    // simp724's S1 on #1713: the merge keeps a running top `k` within the budget as each
+    // partition answers, rather than every answer at once. Five partitions, at most two
+    // read at once (so answers arrive in varied orders), and `k` past any one partition's
+    // answer, against one database's `nearest_f32`, cut by budgets and not.
+    use super::proto::{NearestRequest, Vector};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let limits = crate::serve::config::Limits {
+        fanout_forwards: 2,
+        ..crate::serve::server_tests::limits()
+    };
+    let (_stops, ports, dbs) = split_nodes(&rt, &["c", "f", "j", "p"], limits);
+    let oracle_dir = test_dir();
+    let oracle = pigeonhole::Pigeonhole::open(
+        oracle_dir.join("oracle.phdb"),
+        pigeonhole::Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let t = users(&oracle);
+    // Three rows in each partition, with vectors that tie across them.
+    let keys: Vec<String> = ["a", "d", "g", "k", "s"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}")))
+        .collect();
+    rt.block_on(async {
+        for (i, key) in keys.iter().enumerate() {
+            let v = [(i % 4) as f32, (i % 3) as f32, 0.0, 0.0];
+            data(ports[i % ports.len()])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(graph_row(key.as_bytes(), v, &[])),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+            t.mutate(key.as_bytes())
+                .put_vector_f32("emb", b"", &v)
+                .commit()
+                .unwrap();
+        }
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", ports[2]))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+        let mut vectors = super::proto::vectors_client::VectorsClient::new(channel);
+        for q in [[0.0f32, 0.0, 0.0, 0.0], [2.5, 1.0, 0.0, 0.0]] {
+            for k in [1u32, 3, 4, 7, 12, 15, 20] {
+                for page_bytes in [40u64, 100, 200, 0] {
+                    let budget = if page_bytes == 0 { 1 << 20 } else { page_bytes };
+                    let want = t
+                        .scan_prefix(b"")
+                        .family("emb")
+                        .nearest_f32(&q, k as usize)
+                        .run_within(budget)
+                        .unwrap();
+                    let got = vectors
+                        .nearest(NearestRequest {
+                            table: "users".into(),
+                            family: "emb".into(),
+                            query: Some(Vector {
+                                element: super::proto::Element::F32 as i32,
+                                dim: 4,
+                                data: q
+                                    .iter()
+                                    .flat_map(|x| x.to_le_bytes())
+                                    .collect::<Vec<u8>>()
+                                    .into(),
+                            }),
+                            k,
+                            page_bytes,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let got_n: Vec<(Vec<u8>, f64)> = got
+                        .neighbours
+                        .iter()
+                        .map(|n| (n.row.to_vec(), n.distance))
+                        .collect();
+                    let cut = want.cut_by_budget();
+                    let want_n: Vec<(Vec<u8>, f64)> = want
+                        .into_neighbours()
+                        .into_iter()
+                        .map(|n| (n.row, n.distance))
+                        .collect();
+                    assert_eq!(
+                        (&got_n, got.cut_by_budget),
+                        (&want_n, cut),
+                        "q {q:?}, k {k}, page_bytes {page_bytes}"
+                    );
+                }
+            }
+        }
+    });
+    drop(t);
+    oracle.close().unwrap();
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
 mod feed;

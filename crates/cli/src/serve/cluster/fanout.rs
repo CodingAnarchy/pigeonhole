@@ -634,10 +634,14 @@ impl Router {
 /// A boxed future of a fan-out's.
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Runs `futs`, at most `n` at once (`--fanout-forwards`), and gives their results in order.
-async fn bounded<'a, T>(futs: Vec<Boxed<'a, T>>, n: usize) -> Vec<T> {
-    let total = futs.len();
-    let mut out: Vec<Option<T>> = (0..total).map(|_| None).collect();
+/// Runs `futs`, at most `n` at once (`--fanout-forwards`), handing each result to `each`
+/// with its index as it arrives, so a merge holds only what it keeps (simp724's S1 on
+/// #1713). An error from `each` ends the run, dropping the reads still going.
+async fn bounded<'a, T>(
+    futs: Vec<Boxed<'a, T>>,
+    n: usize,
+    mut each: impl FnMut(usize, T) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
     let mut queue = futs.into_iter().enumerate();
     let mut running: Vec<(usize, Boxed<'a, T>)> = Vec::new();
     std::future::poll_fn(|cx| {
@@ -648,29 +652,27 @@ async fn bounded<'a, T>(futs: Vec<Boxed<'a, T>>, n: usize) -> Vec<T> {
                     None => break,
                 }
             }
+            // Done only once every read has run: the queue too, not just this batch.
+            if running.is_empty() {
+                return std::task::Poll::Ready(Ok(()));
+            }
             let mut done = false;
             let mut i = 0;
             while i < running.len() {
                 if let std::task::Poll::Ready(v) = running[i].1.as_mut().poll(cx) {
                     let (at, _) = running.swap_remove(i);
-                    out[at] = Some(v);
+                    each(at, v)?;
                     done = true;
                 } else {
                     i += 1;
                 }
-            }
-            if running.is_empty() {
-                return std::task::Poll::Ready(());
             }
             if !done {
                 return std::task::Poll::Pending;
             }
         }
     })
-    .await;
-    out.into_iter()
-        .map(|v| v.expect("every future ran"))
-        .collect()
+    .await
 }
 
 /// A scan range's bounds as `Bound`s (a prefix as `[prefix, successor)`), `None` for no
@@ -725,6 +727,40 @@ fn clipped(range: Option<&proto::KeyRange>, p: &PartRange) -> proto::KeyRange {
 /// A neighbour's size by D308's measure: its row, its qualifier and 16 bytes.
 fn neighbour_bytes(n: &proto::Neighbour) -> u64 {
     (n.row.len() + n.qualifier.len()) as u64 + 16
+}
+
+/// `kept` and `more` merged by the library's total order (distance, then row, then
+/// qualifier), cut to the first `k` that fit `budget` plus the one after them that didn't,
+/// if any. Distances are never NaN (the query is checked, stored vectors are finite), and
+/// every node computes them with the same code.
+fn merge_nearest(
+    mut kept: Vec<proto::Neighbour>,
+    more: Vec<proto::Neighbour>,
+    k: usize,
+    budget: u64,
+) -> Vec<proto::Neighbour> {
+    kept.extend(more);
+    kept.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.row.cmp(&b.row))
+            .then_with(|| a.qualifier.cmp(&b.qualifier))
+    });
+    let mut used = 0;
+    let mut keep = 0;
+    for n in &kept {
+        if keep == k {
+            break;
+        }
+        keep += 1;
+        used += neighbour_bytes(n);
+        if used > budget {
+            // This one didn't fit: kept as the one after the prefix.
+            break;
+        }
+    }
+    kept.truncate(keep);
+    kept
 }
 
 /// A traversal's `max_nodes` when the request sets none: the library's default
@@ -861,35 +897,37 @@ impl Router {
                     as Pin<Box<dyn Future<Output = Answer> + Send + '_>>
             })
             .collect();
-        let answers = bounded(reads, self.service.limits().fanout_forwards).await;
-        let mut all = Vec::new();
-        let mut some_cut = false;
-        let mut missed = Vec::new();
-        for ((p, _), answer) in parts.iter().zip(answers) {
-            match answer {
-                Ok(a) => {
-                    some_cut |= a.cut_by_budget;
-                    all.extend(a.neighbours);
-                }
-                Err(e) if r.allow_partial && skippable(&e) => missed.push(missing(&r.table, p)),
-                Err(e) => return Err(e),
-            }
-        }
-        // The library's total order: distance, then row, then qualifier. Distances are
-        // never NaN (the query is checked, stored vectors are finite), and every node
-        // computes them with the same code.
-        all.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.row.cmp(&b.row))
-                .then_with(|| a.qualifier.cmp(&b.qualifier))
-        });
+        // The running merge: the first `k` so far that fit the budget, and the next one,
+        // which didn't (it decides `cut_by_budget`). A neighbour past that next one can
+        // never come back into the prefix, since more answers only push it further down.
         let k = r.k as usize;
         let budget = page_bytes(r.page_bytes);
+        let mut kept: Vec<proto::Neighbour> = Vec::new();
+        let mut some_cut = false;
+        let mut missed = Vec::new();
+        bounded(
+            reads,
+            self.service.limits().fanout_forwards,
+            |i, answer| match answer {
+                Ok(a) => {
+                    some_cut |= a.cut_by_budget;
+                    kept = merge_nearest(std::mem::take(&mut kept), a.neighbours, k, budget);
+                    Ok(())
+                }
+                Err(e) if r.allow_partial && skippable(&e) => {
+                    missed.push(missing(&r.table, &parts[i].0));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+        )
+        .await?;
+        // `kept` is the prefix plus, when the budget stopped it short of `k`, the neighbour
+        // that didn't fit.
         let mut used = 0;
         let mut neighbours = Vec::new();
         let mut cut = false;
-        for n in all {
+        for n in kept {
             if neighbours.len() == k {
                 break;
             }
@@ -901,6 +939,8 @@ impl Router {
             used += size;
             neighbours.push(n);
         }
+        // `missing` in partition order, whatever order the answers came in.
+        missed.sort_by(|a: &MissingRange, b: &MissingRange| a.start.cmp(&b.start));
         let reply = NearestResponse {
             // A partition cut short held more within its top `k`: the merge would have
             // stopped for the budget at or before them.
@@ -951,7 +991,6 @@ impl Router {
             deadline: Some(deadline),
             ..Reach::of(self, cluster)
         };
-        let limits = *self.service.limits();
         let by_hop = if r.hop_limit == 0 {
             u64::MAX
         } else {
@@ -990,7 +1029,8 @@ impl Router {
             budget_within(
                 self.service.inflight(),
                 hold(&frontier),
-                limits.request_timeout,
+                // What's left of the arrival deadline (simp724's N2 on #1713).
+                reach.within()?,
             )
             .await?,
         );
@@ -1095,7 +1135,8 @@ impl Router {
                 budget_within(
                     self.service.inflight(),
                     hold(&nodes),
-                    limits.request_timeout,
+                    // What's left of the arrival deadline (simp724's N2 on #1713).
+                    reach.within()?,
                 )
                 .await?,
             );
