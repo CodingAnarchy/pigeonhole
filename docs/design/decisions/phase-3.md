@@ -4615,6 +4615,8 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **Still open:** g52 also found the rest of #1621's tail. With no prep in the window, Mutates over 10 ms persist, and at long retention put p99 grows with run time. g58 is tracing it. If flush and compaction bursts in the device queue are the cause, a background write cap (issue option 3; Part B's mechanism, tuned first: g40 measured ycsb-a and ycsb-f p99.9 +50–80%) comes back as its own PR.
 - **Part A** isn't built. Whether #1621 still needs it waits on g58 too.
 
+**Amendment 3 (coordinator, 2026-11-10): Part A was built as [D324](#d324), with direct (`O_DIRECT`) record writes, and isn't shipped.** It removed the tail-page waits, but making each commit wait for its direct write before becoming visible cost more. #1621's remaining tail goes to 1.3.0 (#1708).
+
 <a id="d320"></a>
 ## D320 — a change-feed reader's read-ahead is capped by a key cutoff, not by stopping streams (feed1248, design; coordinator, 2026-11-09; engine, #1598)
 
@@ -4742,3 +4744,35 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 - **(C) hand-rendering the engine's metrics in serve:** a second copy of D316's mapping and carry logic, which would drift.
 
 **Also under ICR 0131 (ticket 9b):** `phdb serve --affinity on|off`, documented, default `on`. It's for operators on shared hosts, and for R1's acceptance run (the serve bench's p99 and p99.9 with and without the mask).
+
+<a id="d324"></a>
+## D324 — GroupSync WAL record writes through direct I/O: built and measured, not shipped (perf2, design; coordinator, 2026-11-10; reviewed by perf287; wal, engine, pigeonhole, #1621, #1705) · D319 Part A
+
+**Status: not shipped.** #1705 built it, g71a and g71c measured it, and the coordinator closed it unmerged on 2026-11-10. This record keeps the design and the reason, so it isn't rebuilt as it was.
+
+**Problem (#1621's second cause, g66).** A GroupSync commit's record write was a buffered `pwrite` on the shard's driver. The previous group's `fdatasync`, run by an io_uring worker, holds the WAL's last page's folio lock while `iomap_writepage_map` submits its bio into a deep device queue. The next group's `pwrite` rewrites that page, so it waited in `iomap_write_begin → __filemap_get_folio`. That came to 350–390 ms of driver time a minute, and about 200 driver `pwrite`s ≥ 5 ms a session. Their count correlated with slow puts at r = +0.71/+0.65. With #1681's open-time ring (g69), 104/94 remained.
+
+**What was built (#1705).**
+- On Linux, with a `GroupSync` or `Sync` writer default, a stream wrote its records through an `O_DIRECT` handle. Each write was whole aligned blocks from an in-memory image of the tail, padded with zeros.
+- One write was in flight per stream, with later bytes coalesced. `Wal::written` moved when a write completed. Syncs were chained after the writes.
+- The 32 KiB header frame stayed a buffered write.
+- In the engine, a group stayed unwritten until `ShardMsg::WriteDone`, which made it visible (D227) and resolved it if it needed no sync. A Buffered PREPARE voted then, not at its append (D279).
+- There was no format change and no public option.
+
+**Measured (perf287's box, g69's session, base d12e10537).**
+- g71a, the functional check: 4 `O_DIRECT` `-wal-` fds against 0 on base. Driver `pwrite`s ≥ 5 ms went from 119/105 to **0/0**. CPU per Mutate was level, and dmesg showed no invalidation failures.
+- But serve Mutate p50 went from 150–156 to 178–186 µs, and p99 was worse in every row. Rows 1–10 went from 0.23–5.6 ms to 1.8–17.8 ms, and rows 11–16 from 5–19 ms to 12–41 ms.
+- g71c (#1621, comment 6783827432) showed the I/O itself was fast:
+  - writes took 16–32 µs (87%);
+  - fsync took 4–16 µs (base 16–64);
+  - unwritten-extent conversions were 26 in 60 s, since only a fresh store's open-time slot is fallocated;
+  - the dio completion's kworker hop cost 1–8 µs;
+  - commit resolution was faster at p50 (66 against 98 µs).
+
+**Why not shipped.** The cost is visibility. A buffered `pwrite` counts as written when it returns. A direct write counts only once it completes and the shard has handled `WriteDone`. Visibility is global, so every commit waits for the slowest shard's write plus its next driver loop. That's #717's cross-shard tail on every commit.
+
+**Rejected follow-ups.**
+- *Counting a write as done at submission.* Not crash-safe. Commits share the last block, so overlapping direct writes to it can land in either order, and io_uring's teardown can cancel queued writes when the process dies. Padding each group to a block would be a format change with large WAL space costs.
+- *Per-shard visibility.* That's #717 (b2), which is shelved.
+
+**Instead.** #1681's preallocation stays for 1.2.0. #1621's remaining stall goes to 1.3.0 as #1708: stay buffered, and start a fresh page while a sync is in flight. That's a design note first, since it raises format, space and replay questions.

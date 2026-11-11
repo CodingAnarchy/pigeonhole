@@ -171,6 +171,20 @@ impl ApiError {
         )
     }
 
+    /// A forwarded call whose token the node it's sent to doesn't list (D317 ticket 3). The
+    /// digest is never in it (cli692's S1 on ticket 3).
+    pub(crate) fn unlisted_token() -> Self {
+        Self::new(
+            "PermissionDenied",
+            0,
+            "the call was forwarded for a token this node doesn't list: a cluster's nodes \
+             list the same tokens"
+                .to_owned(),
+            tonic::Code::PermissionDenied,
+            StatusCode::FORBIDDEN,
+        )
+    }
+
     pub(crate) fn permission_denied(what: &str) -> Self {
         Self::new(
             "PermissionDenied",

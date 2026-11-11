@@ -368,12 +368,12 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         // No session yet: only an `initialize` starts one.
         None if is_initialize(&text) => {
             let session = Arc::new(McpSession::new(&shared, &caller, db.clone()));
-            match service.sessions.open_mcp(caller.token, session) {
+            match service.sessions.open_mcp(caller.principal, session) {
                 Ok(id) => {
                     started = Some(Started {
                         sessions: Arc::clone(&service.sessions),
                         id: id.clone(),
-                        token: caller.token,
+                        principal: caller.principal,
                         keep: false,
                     });
                     id
@@ -388,7 +388,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
             .into_response();
         }
     };
-    let guard = match service.sessions.mcp(&id, caller.token) {
+    let guard = match service.sessions.mcp(&id, caller.principal) {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
@@ -508,14 +508,14 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
 struct Started {
     sessions: Arc<super::sessions::Sessions>,
     id: String,
-    token: u32,
+    principal: crate::serve::auth::Principal,
     keep: bool,
 }
 
 impl Drop for Started {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = self.sessions.end_mcp(&self.id, self.token);
+            let _ = self.sessions.end_mcp(&self.id, self.principal);
         }
     }
 }
@@ -538,7 +538,7 @@ pub(crate) async fn delete(State(shared): State<Arc<Shared>>, headers: HeaderMap
     let Some(id) = headers.get(SESSION).and_then(|v| v.to_str().ok()) else {
         return ApiError::invalid("DELETE /mcp needs the Mcp-Session-Id to end").into_response();
     };
-    match shared.router.service.sessions.end_mcp(id, caller.token) {
+    match shared.router.service.sessions.end_mcp(id, caller.principal) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
     }

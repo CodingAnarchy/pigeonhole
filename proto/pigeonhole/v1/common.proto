@@ -29,7 +29,7 @@ message RowKey {
 
 // Where a stateful call (a transaction, a pinned snapshot) runs once the database is split
 // into partitions (D317): the partition owning `row`, or a named partition. A single-node
-// server ignores it; a cluster with more than one partition requires it.
+// server ignores it; every cluster requires it, even one with a single partition.
 message RoutingKey {
   oneof key {
     RowKey row = 1;
