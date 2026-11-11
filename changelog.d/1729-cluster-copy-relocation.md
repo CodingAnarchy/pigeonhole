@@ -1,0 +1,3 @@
+### Added
+- `phdb serve --cluster`: a partition relocated by copying its files keeps its history, so change-feed tokens from before the move still resume after it (D317 ticket 6, ICR 0117). The map records each partition's `history_epoch`, derived when the map is set: a relocation by copy (`SetMapRequest.copies`) keeps it, and a promotion or a restore starts a new one, whose earlier tokens answer `FeedExpired`.
+- `Admin.BackupDownload`'s `fenced_file`: on a cluster node, one file of a partition closed there after a fence, sent as it lies with its SHA-256, for a relocation by copy.
