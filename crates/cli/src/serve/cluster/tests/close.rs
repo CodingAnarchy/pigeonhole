@@ -111,3 +111,41 @@ fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
         let _ = db.close();
     }
 }
+
+/// A call already running on a partition when it closes ends with `PartitionUnavailable`,
+/// which a client routes again on, not the engine's `Closed` (S5): here, a cluster
+/// partition's service whose database closed under it.
+#[test]
+fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
+    use crate::serve::service::{Service, ServiceOp};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = test_dir();
+    let db = test_partition(&dir, "p1");
+    let service = Service::routing_only(
+        crate::serve::server_tests::limits(),
+        2,
+        Arc::new(crate::serve::service::Metrics::default()),
+    );
+    let backups = crate::serve::backup::Backups::new(None, 1).unwrap();
+    let part = service.for_partition(
+        db.clone(),
+        "p1",
+        &backups,
+        crate::serve::service::Pinning::default(),
+        crate::serve::placement::Memory::defaults(1),
+        crate::serve::gate::WriteGate::new("p1", None),
+    );
+    db.close().unwrap();
+    let get = ServiceOp::Get(super::super::proto::GetRequest {
+        table: "users".into(),
+        row: b"alice".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    });
+    let e = rt
+        .block_on(part.call(get, &crate::serve::auth::Caller::anonymous(), None))
+        .unwrap_err();
+    assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+    assert!(e.message.contains("closed on this node"), "{}", e.message);
+}

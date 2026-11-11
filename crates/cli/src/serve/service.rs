@@ -1437,6 +1437,18 @@ impl Service {
             (Err(e), Some(replica)) if e.code == "ReadOnly" => {
                 Err(ApiError::replica_read_only(replica.primary()))
             }
+            // A cluster partition closed under the call (D317 ticket 6's close, S5): the
+            // partition is unavailable here, and the client routes again.
+            (Err(e), _)
+                if e.code == "Closed"
+                    && let Some(gate) = &self.gate =>
+            {
+                Err(ApiError::partition_unavailable(format!(
+                    "partition {:?} closed on this node while the call ran: {}",
+                    gate.partition(),
+                    e.message
+                )))
+            }
             (reply, _) => reply,
         }
     }

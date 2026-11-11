@@ -72,6 +72,11 @@ impl WriteGate {
         }
     }
 
+    /// The partition's id.
+    pub(crate) fn partition(&self) -> &str {
+        &self.partition
+    }
+
     /// Why the partition is fenced, `None` when it isn't.
     pub(crate) fn fenced(&self) -> Option<Fence> {
         decode(self.fence.load(Ordering::SeqCst))
