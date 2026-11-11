@@ -69,6 +69,9 @@ pub(crate) struct Shared {
     tokens: auth::Tokens,
     limits: config::Limits,
     metrics: Arc<service::Metrics>,
+    /// The feed and feed hub runtimes, once the server has started them: a partition opened
+    /// while the node serves runs its feeds there (D317 ticket 6).
+    feed_runtimes: std::sync::OnceLock<(tokio::runtime::Handle, tokio::runtime::Handle)>,
 }
 
 impl Shared {
@@ -449,6 +452,7 @@ pub(crate) fn run(
         tokens,
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
 
     serve_shared(
@@ -533,6 +537,9 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed hub runtime", &e))?;
+    let _ = shared
+        .feed_runtimes
+        .set((feed_runtime.handle().clone(), hub_runtime.handle().clone()));
     for part in shared.router.parts() {
         part.feeds
             .run_on(feed_runtime.handle().clone(), hub_runtime.handle().clone());
@@ -638,6 +645,13 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         part.texts.close();
         part.indexes.close();
     }
+    // A cluster node closes the partitions open now: those it opened while serving too, and
+    // not those it closed (D317 ticket 6).
+    let dbs: Vec<Pigeonhole> = if shared.router.cluster.is_some() {
+        shared.router.parts().iter().map(|p| p.db.clone()).collect()
+    } else {
+        dbs
+    };
     let closed = match dbs.len() {
         0 => {
             let _ = writeln!(stderr, "phdb serve: stopped");

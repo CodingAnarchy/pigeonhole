@@ -16,6 +16,7 @@ pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
+pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -171,6 +172,13 @@ pub(crate) struct Node {
     /// The partitions served here: their write gates, and the operator's fences (D317
     /// ticket 6).
     fences: fence::Fences,
+    /// How the node opens a partition while it serves ([`open::attach_opener`]).
+    opener: std::sync::OnceLock<open::Opener>,
+    /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
+    /// it. Taken after `fences.changing` where both are.
+    opening: tokio::sync::Mutex<()>,
+    /// This node, for the tasks an install starts.
+    me: std::sync::Weak<Node>,
 }
 
 /// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
@@ -200,7 +208,7 @@ impl Node {
             .map
             .as_ref()
             .map(|(m, _)| Arc::new(route::Routes::new(m)));
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -215,6 +223,9 @@ impl Node {
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
             fences: fence::Fences::default(),
+            opener: std::sync::OnceLock::new(),
+            opening: tokio::sync::Mutex::new(()),
+            me: me.clone(),
         })
     }
 
@@ -324,6 +335,9 @@ impl Node {
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
+        drop(st);
+        // A partition the map now gives this node opens (D317 ticket 6, §3).
+        self.open_missing_soon();
         Ok(version)
     }
 
@@ -1382,7 +1396,30 @@ pub(crate) fn run(
         tokens: super::tokens(args)?,
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
+    // A partition a map gives the node while it serves opens as the start's do (D317
+    // ticket 6), with its share of the same totals.
+    let (shard_spin, shm_dir, change_feed) =
+        (args.shard_spin, cli.shm_dir.clone(), args.change_feed);
+    open::attach_opener(
+        &node,
+        open::Opener {
+            shared: Arc::downgrade(&shared),
+            placement: Arc::clone(&placement),
+            backups: Arc::clone(&backups),
+            options: Box::new(move |share, memory| {
+                let options = partition_options(shard_spin, shm_dir.as_deref(), change_feed, share);
+                match memory {
+                    Some(m) => m.apply(options),
+                    None => options,
+                }
+            }),
+            shards: total_shards,
+            compaction: total_compaction,
+            engine_memory: args.engine_memory,
+        },
+    );
     // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
     // map it takes.
     schema::attach(&node, &shared);

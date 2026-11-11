@@ -647,7 +647,28 @@ fn data_node_many(
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
+    // Partitions a map gives it while it serves open as `run` has them, unpinned here.
+    super::open::attach_opener(
+        &node,
+        super::open::Opener {
+            shared: Arc::downgrade(&shared),
+            placement: Arc::new(crate::serve::placement::Placement::routes_only(
+                Some(2),
+                Some(2),
+            )),
+            backups: Arc::clone(&backups),
+            options: Box::new(|share, _| {
+                pigeonhole::Options::default()
+                    .default_shards(share.shards)
+                    .compaction_cores(share.compaction)
+            }),
+            shards: 1,
+            compaction: 0,
+            engine_memory: None,
+        },
+    );
     super::schema::attach(&node, &shared);
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
     let start = if restart {
@@ -3520,5 +3541,6 @@ mod charge;
 mod feed;
 mod fence;
 mod metrics;
+mod open;
 mod several;
 mod upload;

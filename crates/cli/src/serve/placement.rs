@@ -337,6 +337,19 @@ impl Placement {
         }
     }
 
+    /// Whether the server's threads are masked off the shards' cores: pinning works here,
+    /// and the shards are pinned.
+    pub(crate) fn masked(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.mask.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Called on each Tokio worker and blocking thread as it starts.
     pub(crate) fn enter(&self) {
         #[cfg(target_os = "linux")]

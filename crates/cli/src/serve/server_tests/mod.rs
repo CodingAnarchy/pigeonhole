@@ -283,6 +283,7 @@ impl Server {
             tokens: Tokens::parse(tokens, "test").unwrap(),
             limits,
             metrics,
+            feed_runtimes: std::sync::OnceLock::new(),
         });
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
