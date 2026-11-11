@@ -405,6 +405,18 @@ pub struct MissingRange {
     #[prost(bytes = "bytes", tag = "4")]
     pub end: ::prost::bytes::Bytes,
 }
+/// One file of a partition's set (D317: a restore's or a move's upload, a node's partition
+/// files): its name is a suffix of the partition's database path ("" for the main file,
+/// "-wal-<n>", "-feed"), so each node maps it onto its own path.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionFile {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub bytes: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub sha256: ::prost::bytes::Bytes,
+}
 /// How durable a commit is before it returns (the Rust API's `Durability`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -726,6 +738,98 @@ pub struct MetricsResponse {
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
 }
+/// What a partition upload carries (D317, restore and relocation by file copy). An upload
+/// carries one file of a partition's set; the set is installed once every file its
+/// manifest names has arrived.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionUploadHeader {
+    /// The partition the files are.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The identity the main file says it is (its `__phdb_cluster` row): the cluster, and the
+    /// epoch the copy is of. The install checks the staged set against them; the stamp that
+    /// relocates or restores the partition raises the epoch afterwards (D317 ticket 6).
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// The client's id for this file's upload, 32 lower-case hex: sending it again resumes it.
+    #[prost(string, tag = "4")]
+    pub upload_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "PartitionUploadPurpose", tag = "5")]
+    pub purpose: i32,
+    /// The file this upload carries: its name (a suffix of the partition's database path: ""
+    /// for the main file, "-wal-<n>", "-feed"), size and SHA-256.
+    #[prost(message, optional, tag = "6")]
+    pub file: ::core::option::Option<PartitionFile>,
+    /// Every file of the set, `file` among them. The set installs only once each has arrived,
+    /// and replaces the partition's whole file set.
+    #[prost(message, repeated, tag = "7")]
+    pub manifest: ::prost::alloc::vec::Vec<PartitionFile>,
+}
+/// The first message of an upload carries `header`, and each its next bytes from `offset`
+/// (up to 512 KiB, so a message fits the server's default request size), contiguous from
+/// what the node holds.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionUploadChunk {
+    #[prost(message, optional, tag = "1")]
+    pub header: ::core::option::Option<PartitionUploadHeader>,
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadReply {
+    /// The bytes the node holds of the file now.
+    #[prost(uint64, tag = "1")]
+    pub received: u64,
+    /// Every byte arrived, the SHA-256 matched and the file is synced, ready to install.
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadStatusRequest {
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadStatusReply {
+    /// The bytes the node holds of the upload; 0 for one it doesn't know.
+    #[prost(uint64, tag = "1")]
+    pub received: u64,
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PartitionUploadPurpose {
+    Unspecified = 0,
+    Restore = 1,
+    Relocate = 2,
+}
+impl PartitionUploadPurpose {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED",
+            Self::Restore => "PARTITION_UPLOAD_PURPOSE_RESTORE",
+            Self::Relocate => "PARTITION_UPLOAD_PURPOSE_RELOCATE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARTITION_UPLOAD_PURPOSE_RESTORE" => Some(Self::Restore),
+            "PARTITION_UPLOAD_PURPOSE_RELOCATE" => Some(Self::Relocate),
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 pub mod admin_client {
     #![allow(
@@ -990,6 +1094,60 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Promote"));
             self.inner.unary(req, path, codec).await
         }
+        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
+        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        pub async fn partition_upload(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::PartitionUploadChunk,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadReply>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/PartitionUpload",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUpload"));
+            self.inner.client_streaming(req, path, codec).await
+        }
+        /// How many bytes of an upload the node holds, to resume it.
+        pub async fn partition_upload_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionUploadStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadStatusReply>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/PartitionUploadStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUploadStatus"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1057,6 +1215,24 @@ pub mod admin_server {
             &self,
             request: tonic::Request<super::Empty>,
         ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
+        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
+        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        async fn partition_upload(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::PartitionUploadChunk>>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadReply>,
+            tonic::Status,
+        >;
+        /// How many bytes of an upload the node holds, to resume it.
+        async fn partition_upload_status(
+            &self,
+            request: tonic::Request<super::PartitionUploadStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadStatusReply>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct AdminServer<T> {
@@ -1466,6 +1642,98 @@ pub mod admin_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = PromoteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/PartitionUpload" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionUploadSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::ClientStreamingService<super::PartitionUploadChunk>
+                    for PartitionUploadSvc<T> {
+                        type Response = super::PartitionUploadReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::PartitionUploadChunk>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::partition_upload(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionUploadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/PartitionUploadStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionUploadStatusSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::UnaryService<super::PartitionUploadStatusRequest>
+                    for PartitionUploadStatusSvc<T> {
+                        type Response = super::PartitionUploadStatusReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionUploadStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::partition_upload_status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionUploadStatusSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

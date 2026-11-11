@@ -327,3 +327,13 @@ message MissingRange {
   bytes start = 3;
   bytes end = 4;
 }
+
+// One file of a partition's set (D317: a restore's or a move's upload, a node's partition
+// files): its name is a suffix of the partition's database path ("" for the main file,
+// "-wal-<n>", "-feed"), so each node maps it onto its own path.
+message PartitionFile {
+  string name = 1;
+  uint64 bytes = 2;
+  bytes sha256 = 3;
+}
+

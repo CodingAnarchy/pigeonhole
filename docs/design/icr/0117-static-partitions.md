@@ -252,5 +252,24 @@
 
 **Metrics by partition:** on a cluster node, `/metrics` and `Admin.Metrics` label every per-partition series `pigeonhole_partition="<id>"`. That covers the engine's metrics (D323, through `pigeonhole-otel`'s `Config::attribute`, ICR 0133) and the serve feed fan-out's and bulk loads' gauges. Node-wide series (connections, replies, sessions) stay unlabelled. Each family's `# HELP`/`# TYPE` comes once, whatever the number of partitions. A single node's text is unchanged. On a cluster node, `Admin.Metrics` is answered by the node itself; it was `Unsupported` before.
 
+## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
+**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
+- **A partition is a set of files,** named by their suffix of the partition's database path: `""` for the main file, `-wal-<n>` for a WAL sidecar, `-feed` for the change feed's sidecar. Each node maps a name onto its own path. **`PartitionFile { name = 1; bytes = 2; sha256 = 3 }`** (common.proto) describes one.
+- **`PartitionUploadHeader`:**
+  - `partition` (1), and `cluster_id` (2) and `epoch` (3): what the main file says it is, so the epoch the copy is *of*;
+  - `upload_id` (4): 32 lower-case hex, chosen by the client;
+  - `purpose` (5): `RESTORE` or `RELOCATE`;
+  - `file` (6): the file this upload carries;
+  - `manifest` (7): every file of the set, `file` among them, with the main file required.
+- **`PartitionUploadChunk { header = 1; offset = 2; data = 3 }`:** the first message carries the header. Each message's data, up to 512 KiB (so a message with its framing fits `--max-request-bytes`' 1 MiB default), starts where the node's bytes end.
+- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2 }`.
+- **Accepted only while the partition isn't open on the node,** with one upload of a given file of it at a time, and at most `--max-uploads` (default 1) at once; more are `Overloaded`. A resume must send the same header (`InvalidArgument` otherwise).
+- **Staged, never served:**
+  - Bytes go to `<cluster DIR>/.phdb-incoming/<upload_id>.part` (the directory mode 0700, never a link).
+  - When every byte has arrived and the SHA-256 matches, the file is synced and renamed `<partition>.phdb<name>.ready`, beside its header (`….ready.header`).
+  - A file whose bytes don't match is dropped (`InvalidArgument`): upload it again.
+  - Incomplete uploads untouched for 5 minutes are deleted, and so is every incomplete one when the node starts. Ready files are kept.
+- **Installed by ticket 6's stamp,** not by the upload. Relocate's first step on the new node (copy, promotion and restore alike) installs the set once every manifest file is ready with one header. It checks the header against the stamp's partition and epoch (a restore may name an older epoch, and with `restore_from_cluster_id`, another cluster), replaces the partition's whole file set, then raises the epoch. The map change opens the partition. This upload section ships the staging; the install comes with ticket 6 PR 1.
+
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

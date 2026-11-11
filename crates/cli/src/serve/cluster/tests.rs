@@ -2941,3 +2941,4 @@ fn a_nearest_search_over_many_partitions_merges_their_answers_as_they_arrive() {
 mod backup;
 mod feed;
 mod metrics;
+mod upload;

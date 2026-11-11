@@ -20,6 +20,7 @@ pub(crate) mod route;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
+pub(crate) mod upload;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -186,6 +187,11 @@ impl Node {
 
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The node's cluster directory (`--cluster`).
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, MapState> {
@@ -1090,7 +1096,8 @@ pub(crate) fn run(
         ),
     };
     let shared = Arc::new(super::Shared {
-        router: super::router::Router::cluster(service, Arc::clone(&node), local.map(|(p, _)| p)),
+        router: super::router::Router::cluster(service, Arc::clone(&node), local.map(|(p, _)| p))
+            .max_uploads(args.max_uploads),
         // The data calls' tokens: the same file the node's own calls read.
         tokens: super::tokens(args)?,
         limits,
