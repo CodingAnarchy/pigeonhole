@@ -866,6 +866,7 @@ impl Replica {
         let mut breaks = Breaks::default();
         loop {
             let req = self.request(proto::BackupDownloadRequest {
+                fenced_file: String::new(),
                 durable: true,
                 backup_id: backup_id.clone(),
                 offset,

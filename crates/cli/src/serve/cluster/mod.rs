@@ -222,10 +222,11 @@ impl Node {
     }
 
     /// Validates and persists `map` as the node's newest; `check` decides, under the state
-    /// lock, whether it may replace the current one. `step`: a map being set here, which must
-    /// be a valid change from the current one; otherwise a peer's, which only has to be the
-    /// same cluster's and newer (`map::validate_catch_up`, cli692's R1). Returns the new
-    /// version.
+    /// lock, whether it may replace the current one. `step`: `Some(copies)` for a map being
+    /// set here, which must be a valid change from the current one and has its partitions'
+    /// `history_epoch` derived (`map::with_history`, `copies` from `SetMapRequest`); `None`
+    /// for a peer's, which only has to be the same cluster's and newer
+    /// (`map::validate_catch_up`, cli692's R1). Returns the new version.
     ///
     /// **Blocking** (address resolution, an fsync): run it on a blocking thread
     /// ([`Node::install_async`]). The state lock is held only to check and to publish; the
@@ -233,10 +234,13 @@ impl Node {
     fn install(
         &self,
         map: &ClusterMap,
-        step: bool,
+        step: Option<&[String]>,
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError>,
     ) -> Result<u64, ApiError> {
         map::validate(map, self.loopback_only).map_err(ApiError::invalid)?;
+        // A map set here gets its partitions' `history_epoch` derived from the current one
+        // (D317 ticket 6); a peer's arrives derived.
+        let mut derived = None;
         let _one = self
             .installing
             .lock()
@@ -253,16 +257,22 @@ impl Node {
                         self.id
                     )));
                 }
+                None if step.is_some_and(|c| !c.is_empty()) => {
+                    return Err(ApiError::invalid(
+                        "a first map can't mark a partition as copied: it relocates nothing",
+                    ));
+                }
                 None => {}
-                Some((old, _)) if step => {
+                Some((old, _)) if let Some(copies) = step => {
                     map::validate_change(old, map).map_err(ApiError::invalid)?;
+                    derived = Some(map::with_history(old, map, copies).map_err(ApiError::invalid)?);
                 }
                 Some((old, _)) => {
                     map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
                 }
             }
         }
-        let canonical = map::canonical(map);
+        let canonical = map::canonical(derived.as_ref().unwrap_or(map));
         let json = map::canonical_json(&canonical);
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
@@ -282,11 +292,11 @@ impl Node {
     async fn install_async(
         self: &Arc<Self>,
         map: ClusterMap,
-        step: bool,
+        step: Option<Vec<String>>,
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError> + Send + 'static,
     ) -> Result<u64, ApiError> {
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || node.install(&map, step, check))
+        tokio::task::spawn_blocking(move || node.install(&map, step.as_deref(), check))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
     }
@@ -298,7 +308,7 @@ impl Node {
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
         let expected = req.expected_map_version;
         let version = self
-            .install_async(map, true, move |st| {
+            .install_async(map, Some(req.copies), move |st| {
                 let current = st.version();
                 if expected != current {
                     return Err(ApiError::from_code(
@@ -406,7 +416,7 @@ impl Node {
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
     /// Blocking ([`Node::install`]).
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
-        let version = self.install(&map, false, |st| {
+        let version = self.install(&map, None, |st| {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
             };

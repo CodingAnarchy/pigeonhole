@@ -688,6 +688,13 @@ pub struct BackupDownloadRequest {
     /// A resume names the same partition its download was taken of.
     #[prost(string, tag = "5")]
     pub partition: ::prost::alloc::string::String,
+    /// On a cluster node (D317 ticket 6): one file of `partition` as it lies on disk, closed
+    /// after a fence, for a relocation by copy, named by its suffix after the partition's
+    /// database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
+    /// are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
+    /// state `closed`; `durable` and `replica` must be unset.
+    #[prost(string, tag = "6")]
+    pub fenced_file: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupChunk {
@@ -5877,6 +5884,13 @@ pub struct Partition {
     /// the epoch in P's file (D317 §2).
     #[prost(uint64, tag = "3")]
     pub epoch: u64,
+    /// The epoch P's current history began at (D317 ticket 6): kept by a relocation that copied
+    /// P's files (`SetMapRequest.copies`), and set to the new epoch by every other one (a
+    /// promotion, a restore), which gives P another history. A feed token taken at epoch `e`
+    /// resumes only while `history_epoch <= e`. Derived where a map is set; 0 in maps from
+    /// before ticket 6, when no epoch had moved.
+    #[prost(uint64, tag = "5")]
+    pub history_epoch: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -5922,6 +5936,10 @@ pub struct SetMapRequest {
     pub expected_map_version: u64,
     #[prost(message, optional, tag = "2")]
     pub map: ::core::option::Option<ClusterMap>,
+    /// The partitions this change relocates by copying their files (D317 ticket 6, `phdb  cluster relocate --copy`): each keeps its `history_epoch`. Each must move to another
+    /// node at exactly its epoch + 1. Not part of the map: it marks this change only.
+    #[prost(string, repeated, tag = "4")]
+    pub copies: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetMapResponse {

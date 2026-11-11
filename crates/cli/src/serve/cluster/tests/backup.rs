@@ -211,6 +211,7 @@ fn a_table_created_during_a_backup_is_in_the_map_it_keeps() {
             client(ports[0])
                 .await
                 .set_map(SetMapRequest {
+                    copies: Vec::new(),
                     expected_map_version: 1,
                     map: Some(m),
                 })

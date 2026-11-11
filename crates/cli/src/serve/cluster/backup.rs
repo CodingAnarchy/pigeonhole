@@ -219,6 +219,7 @@ impl Job {
         let last = loop {
             let req = request(
                 BackupDownloadRequest {
+                    fenced_file: String::new(),
                     durable,
                     backup_id: backup_id.clone(),
                     offset,
@@ -451,11 +452,13 @@ mod tests {
             }],
             partitions: vec![
                 Partition {
+                    history_epoch: 0,
                     id: "p1".into(),
                     node: "n1".into(),
                     epoch,
                 },
                 Partition {
+                    history_epoch: 0,
                     id: "p2".into(),
                     node: "n1".into(),
                     epoch: 1,
@@ -496,6 +499,7 @@ mod tests {
         assert!(moved(&a, &map(9, 2, &["m"])).is_some_and(|w| w.contains("epoch")));
         let mut added = map(9, 1, &["m"]);
         added.partitions.push(Partition {
+            history_epoch: 0,
             id: "p3".into(),
             node: "n1".into(),
             epoch: 1,

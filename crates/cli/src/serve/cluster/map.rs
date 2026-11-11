@@ -87,6 +87,12 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
         if p.epoch == 0 {
             return Err(format!("partition {:?}'s epoch must be at least 1", p.id));
         }
+        if p.history_epoch > p.epoch {
+            return Err(format!(
+                "partition {:?}'s history_epoch {} is past its epoch {}",
+                p.id, p.history_epoch, p.epoch
+            ));
+        }
         if partitions.insert(p.id.as_str(), p).is_some() {
             return Err(format!("partition {:?} is listed twice", p.id));
         }
@@ -255,6 +261,45 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     Ok(())
 }
 
+/// `new`, a map being set over `old`, with each partition's `history_epoch` derived (D317
+/// ticket 6): the one place it's decided, so a map built by hand or from an older one can't
+/// carry a history across a relocation that broke it.
+/// - **An epoch kept:** `old`'s, whatever `new` says.
+/// - **An epoch raised:** the new epoch (a promotion or a restore starts another history),
+///   unless `copies` names the partition (`relocate --copy`): then `old`'s, since its files
+///   were copied whole. A copy must move to another node at exactly `old`'s epoch + 1.
+/// - **A new partition:** its epoch.
+///
+/// Run after [`validate_change`] has passed the step.
+pub(crate) fn with_history(
+    old: &ClusterMap,
+    new: &ClusterMap,
+    copies: &[String],
+) -> Result<ClusterMap, Refusal> {
+    let before: HashMap<&str, _> = old.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
+    for c in copies {
+        let moved = new.partitions.iter().find(|p| &p.id == c);
+        match (before.get(c.as_str()), moved) {
+            (Some(o), Some(n)) if n.epoch == o.epoch + 1 && n.node != o.node => {}
+            _ => {
+                return Err(format!(
+                    "partition {c:?} is marked as copied, but this change doesn't move it to \
+                     another node at its epoch + 1"
+                ));
+            }
+        }
+    }
+    let mut out = new.clone();
+    for p in &mut out.partitions {
+        p.history_epoch = match before.get(p.id.as_str()) {
+            Some(o) if p.epoch == o.epoch => o.history_epoch,
+            Some(o) if copies.contains(&p.id) => o.history_epoch,
+            _ => p.epoch,
+        };
+    }
+    Ok(out)
+}
+
 /// The map with each split key in its canonical form: `text` when the bytes are UTF-8,
 /// else `raw`. Two maps that say the same thing are equal after it.
 pub(crate) fn canonical(map: &ClusterMap) -> ClusterMap {
@@ -321,6 +366,7 @@ mod tests {
             address: format!("127.0.0.1:{port}"),
         };
         let part = |id: &str, node: &str| Partition {
+            history_epoch: 0,
             id: id.into(),
             node: node.into(),
             epoch: 1,
@@ -473,6 +519,7 @@ mod tests {
             address: "127.0.0.1:7003".into(),
         });
         ok.partitions.push(Partition {
+            history_epoch: 0,
             id: "p4".into(),
             node: "c".into(),
             epoch: 1,
@@ -536,6 +583,77 @@ mod tests {
         let mut other = v3.clone();
         other.cluster_id = "c2".into();
         refused(validate_catch_up(&old, &other), "cluster");
+    }
+
+    #[test]
+    fn a_partitions_history_is_kept_by_a_copy_and_restarted_by_any_other_relocation() {
+        // D317 ticket 6: `history_epoch` is derived where a map is set, never taken from it.
+        let mut old = map();
+        old.partitions[0].epoch = 3;
+        old.partitions[0].history_epoch = 2;
+        let history = |m: &ClusterMap, id: &str| {
+            m.partitions
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| (p.epoch, p.history_epoch))
+                .unwrap()
+        };
+        let mut next = old.clone();
+        next.map_version = 2;
+        // Whatever the new map says, an unchanged epoch keeps the old history.
+        next.partitions[0].history_epoch = 0;
+        next.partitions[1].history_epoch = 1;
+        let kept = with_history(&old, &next, &[]).unwrap();
+        assert_eq!(history(&kept, "p1"), (3, 2));
+        assert_eq!(history(&kept, "p2"), (1, 0));
+
+        // A relocation by copy to another node at epoch + 1 keeps it.
+        let mut moved = next.clone();
+        moved.partitions[0].node = "b".into();
+        moved.partitions[0].epoch = 4;
+        let copied = with_history(&old, &moved, &["p1".to_owned()]).unwrap();
+        assert_eq!(history(&copied, "p1"), (4, 2));
+        // The same move unmarked (a promotion, a restore) starts another history, even if
+        // the map it came from claims the old one.
+        moved.partitions[0].history_epoch = 2;
+        let promoted = with_history(&old, &moved, &[]).unwrap();
+        assert_eq!(history(&promoted, "p1"), (4, 4));
+        // A new partition's history starts at its epoch.
+        moved.partitions.push(Partition {
+            id: "p4".into(),
+            node: "a".into(),
+            epoch: 5,
+            history_epoch: 0,
+        });
+        assert_eq!(
+            history(&with_history(&old, &moved, &[]).unwrap(), "p4"),
+            (5, 5)
+        );
+
+        // The copy mark applies only to a move to another node at exactly epoch + 1.
+        let mut far = next.clone();
+        far.partitions[0].node = "b".into();
+        far.partitions[0].epoch = 5;
+        let mut same_node = next.clone();
+        same_node.partitions[0].epoch = 4;
+        for (bad, id) in [
+            (&far, "p1"),
+            (&same_node, "p1"),
+            (&next, "p1"),
+            (&next, "p9"),
+        ] {
+            let e = with_history(&old, bad, &[id.to_owned()]).unwrap_err();
+            assert!(e.contains("marked as copied"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_history_can_t_begin_after_its_epoch() {
+        let mut m = map();
+        m.partitions[0].history_epoch = 2;
+        refused(validate(&m, true), "past its epoch");
+        m.partitions[0].epoch = 2;
+        validate(&m, true).unwrap();
     }
 
     #[test]

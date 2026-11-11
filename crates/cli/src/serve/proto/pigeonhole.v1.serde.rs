@@ -1080,6 +1080,9 @@ impl serde::Serialize for BackupDownloadRequest {
         if !self.partition.is_empty() {
             len += 1;
         }
+        if !self.fenced_file.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BackupDownloadRequest", len)?;
         if self.durable {
             struct_ser.serialize_field("durable", &self.durable)?;
@@ -1098,6 +1101,9 @@ impl serde::Serialize for BackupDownloadRequest {
         if !self.partition.is_empty() {
             struct_ser.serialize_field("partition", &self.partition)?;
         }
+        if !self.fenced_file.is_empty() {
+            struct_ser.serialize_field("fenced_file", &self.fenced_file)?;
+        }
         struct_ser.end()
     }
 }
@@ -1114,6 +1120,8 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
             "offset",
             "replica",
             "partition",
+            "fenced_file",
+            "fencedFile",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -1123,6 +1131,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
             Offset,
             Replica,
             Partition,
+            FencedFile,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1149,6 +1158,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                             "offset" => Ok(GeneratedField::Offset),
                             "replica" => Ok(GeneratedField::Replica),
                             "partition" => Ok(GeneratedField::Partition),
+                            "fencedFile" | "fenced_file" => Ok(GeneratedField::FencedFile),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1173,6 +1183,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                 let mut offset__ = None;
                 let mut replica__ = None;
                 let mut partition__ = None;
+                let mut fenced_file__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Durable => {
@@ -1207,6 +1218,12 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                             }
                             partition__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::FencedFile => {
+                            if fenced_file__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fencedFile"));
+                            }
+                            fenced_file__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(BackupDownloadRequest {
@@ -1215,6 +1232,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                     offset: offset__.unwrap_or_default(),
                     replica: replica__.unwrap_or_default(),
                     partition: partition__.unwrap_or_default(),
+                    fenced_file: fenced_file__.unwrap_or_default(),
                 })
             }
         }
@@ -12849,6 +12867,9 @@ impl serde::Serialize for Partition {
         if self.epoch != 0 {
             len += 1;
         }
+        if self.history_epoch != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Partition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -12860,6 +12881,11 @@ impl serde::Serialize for Partition {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        if self.history_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("history_epoch", ToString::to_string(&self.history_epoch).as_str())?;
         }
         struct_ser.end()
     }
@@ -12874,6 +12900,8 @@ impl<'de> serde::Deserialize<'de> for Partition {
             "id",
             "node",
             "epoch",
+            "history_epoch",
+            "historyEpoch",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -12881,6 +12909,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
             Id,
             Node,
             Epoch,
+            HistoryEpoch,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -12905,6 +12934,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                             "id" => Ok(GeneratedField::Id),
                             "node" => Ok(GeneratedField::Node),
                             "epoch" => Ok(GeneratedField::Epoch),
+                            "historyEpoch" | "history_epoch" => Ok(GeneratedField::HistoryEpoch),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -12927,6 +12957,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                 let mut id__ = None;
                 let mut node__ = None;
                 let mut epoch__ = None;
+                let mut history_epoch__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -12949,12 +12980,21 @@ impl<'de> serde::Deserialize<'de> for Partition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::HistoryEpoch => {
+                            if history_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("historyEpoch"));
+                            }
+                            history_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(Partition {
                     id: id__.unwrap_or_default(),
                     node: node__.unwrap_or_default(),
                     epoch: epoch__.unwrap_or_default(),
+                    history_epoch: history_epoch__.unwrap_or_default(),
                 })
             }
         }
@@ -16908,6 +16948,9 @@ impl serde::Serialize for SetMapRequest {
         if self.map.is_some() {
             len += 1;
         }
+        if !self.copies.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.SetMapRequest", len)?;
         if self.expected_map_version != 0 {
             #[allow(clippy::needless_borrow)]
@@ -16916,6 +16959,9 @@ impl serde::Serialize for SetMapRequest {
         }
         if let Some(v) = self.map.as_ref() {
             struct_ser.serialize_field("map", v)?;
+        }
+        if !self.copies.is_empty() {
+            struct_ser.serialize_field("copies", &self.copies)?;
         }
         struct_ser.end()
     }
@@ -16930,12 +16976,14 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             "expected_map_version",
             "expectedMapVersion",
             "map",
+            "copies",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             ExpectedMapVersion,
             Map,
+            Copies,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16959,6 +17007,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                         match value {
                             "expectedMapVersion" | "expected_map_version" => Ok(GeneratedField::ExpectedMapVersion),
                             "map" => Ok(GeneratedField::Map),
+                            "copies" => Ok(GeneratedField::Copies),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16980,6 +17029,7 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
             {
                 let mut expected_map_version__ = None;
                 let mut map__ = None;
+                let mut copies__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ExpectedMapVersion => {
@@ -16996,11 +17046,18 @@ impl<'de> serde::Deserialize<'de> for SetMapRequest {
                             }
                             map__ = map_.next_value()?;
                         }
+                        GeneratedField::Copies => {
+                            if copies__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("copies"));
+                            }
+                            copies__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(SetMapRequest {
                     expected_map_version: expected_map_version__.unwrap_or_default(),
                     map: map__,
+                    copies: copies__.unwrap_or_default(),
                 })
             }
         }

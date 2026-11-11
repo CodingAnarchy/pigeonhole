@@ -111,6 +111,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                history_epoch: 0,
                 id: (*id).into(),
                 node: (*node).into(),
                 epoch: 1,
@@ -159,6 +160,86 @@ async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
 }
 
 #[test]
+fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
+    // D317 ticket 6: `history_epoch` is derived where a map is set (`SetMapRequest.copies`
+    // marks a relocation by copy), and peers take it as set.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let nodes = [
+        node(&dirs[0], "a"),
+        node(&dirs[1], "b"),
+        node(&dirs[2], "c"),
+    ];
+    let _stops: Vec<_> = nodes
+        .iter()
+        .zip(listeners)
+        .map(|(n, l)| serve(&rt, n, l))
+        .collect();
+    rt.block_on(async {
+        let set = async |expected: u64, map: ClusterMap, copies: &[&str]| {
+            client(ports[0])
+                .await
+                .set_map(SetMapRequest {
+                    expected_map_version: expected,
+                    map: Some(map),
+                    copies: copies.iter().map(|c| (*c).to_owned()).collect(),
+                })
+                .await
+        };
+        let p3 = async |port: u16| {
+            let m = client(port)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let p = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+            (p.node.clone(), p.epoch, p.history_epoch)
+        };
+        // A first map relocates nothing, so it can't mark a copy.
+        let e = set(0, the_map(1, &ports), &["p3"]).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        set(0, the_map(1, &ports), &[]).await.unwrap();
+        assert_eq!(p3(ports[0]).await, ("c".into(), 1, 0));
+
+        // p3 copied from c to b at epoch 2: its history is kept, on every node.
+        let mut v2 = the_map(2, &ports);
+        v2.partitions[2].node = "b".into();
+        v2.partitions[2].epoch = 2;
+        set(1, v2.clone(), &["p3"]).await.unwrap();
+        for port in ports {
+            assert_eq!(p3(port).await, ("b".into(), 2, 0), "node at {port}");
+        }
+
+        // A mark on a change that isn't a move by one epoch is refused, and nothing changes.
+        let mut v3 = v2.clone();
+        v3.map_version = 3;
+        v3.partitions[2].node = "a".into();
+        v3.partitions[2].epoch = 4;
+        let e = set(2, v3.clone(), &["p3"]).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        assert!(e.message().contains("marked as copied"), "{e:?}");
+        assert_eq!(p3(ports[0]).await, ("b".into(), 2, 0));
+
+        // Unmarked (a promotion or a restore), the move starts another history, whatever
+        // the map sent says.
+        v3.partitions[2].history_epoch = 0;
+        set(2, v3, &[]).await.unwrap();
+        for port in ports {
+            assert_eq!(p3(port).await, ("a".into(), 4, 4), "node at {port}");
+        }
+    });
+}
+
+#[test]
 fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -183,6 +264,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let r = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 expected_map_version: 0,
                 map: Some(the_map(1, &ports)),
             })
@@ -199,6 +281,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[1])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 expected_map_version: 0,
                 map: Some(the_map(2, &ports)),
             })
@@ -214,6 +297,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 expected_map_version: 1,
                 map: Some(reshaped),
             })
@@ -245,6 +329,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 expected_map_version: 1,
                 map: Some(v2.clone()),
             })
@@ -2807,6 +2892,7 @@ fn split_nodes(
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                history_epoch: 0,
                 id: format!("q{i}"),
                 node: format!("n{i}"),
                 epoch: 1,

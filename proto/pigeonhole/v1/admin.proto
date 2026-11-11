@@ -106,6 +106,12 @@ message BackupDownloadRequest {
   // (`WrongPartition` for one another node holds). Required there; empty on a single node.
   // A resume names the same partition its download was taken of.
   string partition = 5;
+  // On a cluster node (D317 ticket 6): one file of `partition` as it lies on disk, closed
+  // after a fence, for a relocation by copy, named by its suffix after the partition's
+  // database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
+  // are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
+  // state `closed`; `durable` and `replica` must be unset.
+  string fenced_file = 6;
 }
 
 message BackupChunk {

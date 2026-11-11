@@ -309,6 +309,7 @@ async fn set_map(args: &NodeArgs, m: ClusterMap) -> Result<Report, Failure> {
     let reply = c
         .set_map(request(
             SetMapRequest {
+                copies: Vec::new(),
                 expected_map_version: current,
                 map: Some(m),
             },
