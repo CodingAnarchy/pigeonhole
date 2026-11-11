@@ -146,12 +146,13 @@ impl Forwarder {
     ) -> Result<ForwardResponse, ApiError> {
         let peer = self.peer(address)?;
         let slot = &peer.slots[peer.next.fetch_add(1, Ordering::Relaxed) % CHANNELS];
-        // Before the send: a connection that can't be made sent nothing. Its making counts
-        // against the call's `timeout` too, so a node that takes connections and never
-        // answers can't hold a call past its deadline (#1715: a fanned-out read holds its
-        // pages' budget that long).
+        // One deadline for the connect and the call (cli692's F1 on #1730): a node that
+        // takes connections and never answers can't hold a call, or a fanned-out read's
+        // pages' budget, past it (#1715).
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Before the send: a connection that can't be made sent nothing.
         let channel =
-            tokio::time::timeout(timeout, slot.get_or_try_init(|| peer.endpoint.connect()))
+            tokio::time::timeout_at(deadline, slot.get_or_try_init(|| peer.endpoint.connect()))
                 .await
                 .map_err(|_| {
                     ApiError::partition_unavailable(format!(
@@ -165,11 +166,12 @@ impl Forwarder {
                 })?
                 .clone();
         let mut request = self.node.request(req).map_err(ApiError::internal)?;
-        request.set_timeout(timeout);
-        // `grpc-timeout` tells the owner; the wait here is bounded too, so an owner that
-        // took the call and never answers ends it at the deadline (#1715). That's after the
-        // send: a write's outcome is unknown (B3), a read's node unavailable.
-        match tokio::time::timeout(timeout, ClusterClient::new(channel).forward(request)).await {
+        // `grpc-timeout` tells the owner what's left; the wait here ends at the same
+        // deadline. That's after the send: a write's outcome is unknown (B3), a read's node
+        // unavailable.
+        request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        match tokio::time::timeout_at(deadline, ClusterClient::new(channel).forward(request)).await
+        {
             Ok(Ok(reply)) => Ok(reply.into_inner()),
             Ok(Err(status)) => Err(classify(&status, address, writes)),
             Err(_) => Err(classify(

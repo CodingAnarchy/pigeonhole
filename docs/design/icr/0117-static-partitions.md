@@ -182,8 +182,9 @@
 - **The reply** takes over the holding as its charge (`fit` to its encoded size, twice for HTTP/JSON), so there's no gap and no second reservation.
 - **Local parts** are read through `Service::fanout_part`: the same reads, with no second admission and no reply charge.
 - **A traversal reads each hop in pages of its own `page_bytes`,** not 8 MiB. The router keeps `per_node_limit` per source row across pages, since a resumed row's `column_limit` starts over.
-  - **The visited set's growth** takes spare budget first. Otherwise the hop holding goes back while it waits. Retaking it still waits while the visited set is held. That set is the traversal's state, and has no bound worth reserving up front.
-- **A forward's connect and call are bounded by the call's deadline** at the sending node. A node that takes the connection and never answers can no longer hold a read, and its pages' budget, past its deadline. A read answers `PartitionUnavailable`; a write's outcome is unknown (B3).
+  - **The visited set's growth** takes spare budget first. Otherwise the hop holding (with the seeds' share in it) goes back while it waits. Retaking it still waits while the visited set is held. That set is the traversal's state, and has no bound worth reserving up front.
+  - **When the visited set leaves less of the budget than a hop page,** the next hop can't be read charged, so the traversal ends after the hop it has. It's marked `cut_by_budget` if a hop was left to read (cli692's N2 on #1730). A smaller page isn't read instead, since it might not hold a single edge.
+- **A forward's connect and call share one deadline** (cli692's F1 on #1730), the call's, at the sending node. A node that takes the connection and never answers can no longer hold a read, and its pages' budget, past its deadline. A read answers `PartitionUnavailable`; a write's outcome is unknown (B3).
 
 ## Ticket 7: cluster feeds
 **`Feed.Subscribe` on a cluster node** follows every partition the subscription covers, through any node. Covered means the partitions of its tables' placements, narrowed by its prefix to the ranges that can hold such rows. Each partition is followed by a single-node subscription on the node serving it, and the entry node merges them:

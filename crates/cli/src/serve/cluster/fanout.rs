@@ -1102,12 +1102,15 @@ impl Router {
                 )
                 .await?,
         );
-        // The visited set's bytes held apart from the holding (the seeds' are in it).
+        // The visited set's bytes held apart from the holding, and the seeds', which are in
+        // the holding until it's first given back.
         let mut held_bytes = 0usize;
+        let mut seeds_in_holding = hold(&frontier);
         let mut stats = proto::TraverseStats::default();
         let mut hops = Vec::new();
         let mut missed: Vec<MissingRange> = Vec::new();
-        for _ in 0..r.hops.max(1) {
+        let hops_asked = r.hops.max(1);
+        for at_hop in 0..hops_asked {
             let room = max_nodes.saturating_sub(visited.len() as u64);
             if room == 0 {
                 stats.cut_by_max_nodes = true;
@@ -1223,26 +1226,41 @@ impl Router {
             }) {
                 Some(share) => share,
                 None => {
+                    // The seeds' share goes with the holding, so it's waited for here too.
                     drop(holding.take());
+                    let want_now = want + std::mem::take(&mut seeds_in_holding);
                     let share =
-                        budget_within(self.service.inflight(), want, reach.within()?).await?;
-                    // A page's share again, at most what the visited set leaves of the
-                    // budget, so a budget smaller than a page can't hold it up for ever.
+                        budget_within(self.service.inflight(), want_now, reach.within()?).await?;
+                    held_bytes += want_now - want;
                     let room = self
                         .service
                         .limits()
                         .inflight_bytes
                         .saturating_sub(held_bytes + want);
-                    holding = Some(
-                        self.service
-                            .fanout_hold(cap_of(r.page_bytes).min(room), reach.within()?)
-                            .await?,
-                    );
+                    // A hop page's share again if the visited set leaves room for one
+                    // (cli692's N2 on #1730): otherwise none, and the traversal ends below,
+                    // since a page read without its share is what #1715 prevents (and a
+                    // smaller page might not hold a single edge).
+                    if cap_of(r.page_bytes) <= room {
+                        holding = Some(
+                            self.service
+                                .fanout_hold(cap_of(r.page_bytes), reach.within()?)
+                                .await?,
+                        );
+                    }
                     share
                 }
             };
             held_bytes += want;
             held.push(share);
+            if holding.is_none() {
+                // The visited set leaves less of the budget than a hop page: the next hop
+                // can't be read charged, so the traversal ends here, cut as a byte budget
+                // cuts it if there was a next hop to read.
+                hops.push(hop);
+                stats.cut_by_budget |= at_hop + 1 < hops_asked;
+                break;
+            }
             visited.extend(nodes.iter().map(|k| k.to_vec()));
             frontier = nodes;
             hops.push(hop);
@@ -1253,8 +1271,12 @@ impl Router {
             stats: Some(stats),
             missing: missed,
         };
-        let holding =
-            holding.ok_or_else(|| ApiError::internal("a traversal ended without its holding"))?;
+        // With the visited set given back, a traversal cut for room takes its reply's
+        // share now.
+        let holding = match holding {
+            Some(h) => h,
+            None => self.service.fanout_hold(1, reach.within()?).await?,
+        };
         self.service
             .fanout_reply(
                 caller,
