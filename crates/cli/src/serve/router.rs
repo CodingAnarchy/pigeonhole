@@ -190,7 +190,13 @@ impl Router {
                     | ServiceOp::CreateTable(_)
                     | ServiceOp::DropTable(_)
             ) {
-                return self.cluster_schema(cluster, op, caller, prepaid).await;
+                let deadline = deadline.map_or_else(
+                    || tokio::time::Instant::now() + self.service.request_timeout(),
+                    tokio::time::Instant::from_std,
+                );
+                return self
+                    .cluster_schema(cluster, op, caller, prepaid, deadline)
+                    .await;
             }
             // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
             // subscription follows every partition it covers (ticket 7). One at a snapshot
@@ -641,13 +647,18 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::Traverse(_) => Err(ApiError::internal(
             "a fanned-out read isn't routed to one partition",
         )),
-        // An index lives in one partition's file: searching one across a cluster waits for
-        // co-located tables (D317 §1, placement groups with ticket 5).
-        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(later("an index search", 5)),
+        // An index lives in one partition's file, and no D317 ticket routes a search to it
+        // (#1722, 1.3.0).
+        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
+            "indexed vector and text search isn't supported on a cluster in this release: use \
+             Vectors.Nearest, which fans out across the partitions",
+        )),
         ServiceOp::ListTables(_)
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
-        | ServiceOp::DescribeTable(_) => Err(later("the schema", 5)),
+        | ServiceOp::DescribeTable(_) => Err(ApiError::internal(
+            "a schema call is answered from the cluster map, not routed to a partition",
+        )),
         // A cluster subscription is routed before this ([`Router::subscribe`]).
         ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
         // A backup is served before this ([`Router::backup`]).

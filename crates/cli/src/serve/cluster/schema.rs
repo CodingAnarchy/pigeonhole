@@ -330,6 +330,7 @@ impl Router {
         op: ServiceOp,
         caller: &Caller,
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
         let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
         let node = &cluster.node;
@@ -359,7 +360,7 @@ impl Router {
                 }))
             }
             op @ (ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) => {
-                self.at_writer(cluster, op, caller).await
+                self.at_writer(cluster, op, caller, deadline).await
             }
             _ => Err(ApiError::internal("cluster_schema takes a schema call")),
         }
@@ -376,9 +377,11 @@ impl Router {
         cluster: &Cluster,
         op: ServiceOp,
         caller: &Caller,
+        // From the request's arrival, as a data call's forward has it (simp724's N2 on
+        // #1720): the send, and after a `WrongPartition` the pull and the second send.
+        deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
         let node = &cluster.node;
-        let deadline = tokio::time::Instant::now() + self.service.request_timeout();
         let left = || {
             deadline
                 .checked_duration_since(tokio::time::Instant::now())

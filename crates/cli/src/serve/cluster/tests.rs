@@ -791,7 +791,7 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("ticket 5"), "{e}");
+        assert!(e.message().contains("Vectors.Nearest"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
@@ -3186,6 +3186,45 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
     for db in dbs {
         let _ = db.close();
     }
+}
+
+#[test]
+fn a_writer_that_restarts_with_a_map_sets_none_until_it_has_its_peers_maps() {
+    // simp724's N4 on #1720: the synced gate, held. `start_sync` gives what runs once the
+    // node serves; until that has run (here: until the test runs it), the writer refuses to
+    // set a map, as a writer back from a forced recovery must until it has the forced map.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let dir = test_dir();
+    super::write_map(&dir, &super::map::canonical_json(&the_map(1, &ports))).unwrap();
+    // a, the writer, restarts with version 1 on disk; b and c are down.
+    let a = node(&dir, "a");
+    let mut listeners = listeners.into_iter();
+    let _stop = serve(&rt, &a, listeners.next().unwrap());
+    let start = super::start_sync(&a, 1).expect("a node with a map syncs at start");
+    let set = |version: u64| SetMapRequest {
+        force: false,
+        expected_map_version: version - 1,
+        map: Some(the_map(version, &ports)),
+    };
+    rt.block_on(async {
+        let e = client(ports[0]).await.set_map(set(2)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e:?}");
+        assert!(e.message().contains("still taking"), "{e:?}");
+        assert_eq!(version(ports[0]).await, 1);
+    });
+    // The sync runs (its peers are down: each fetch times out), and the gate opens.
+    rt.block_on(async {
+        start();
+        eventually("node a to finish its start", async || {
+            client(ports[0]).await.set_map(set(2)).await.is_ok()
+        })
+        .await;
+        assert_eq!(version(ports[0]).await, 2);
+    });
 }
 
 #[test]
