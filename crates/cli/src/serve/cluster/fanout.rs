@@ -14,7 +14,8 @@
 //! - **A partition that can't be reached** fails the read with `PartitionUnavailable`, or,
 //!   with `allow_partial`, is skipped and named in `missing`.
 //!
-//! A read with a `snapshot_id` waits for D317's ticket 3: a snapshot is one partition's.
+//! A read with a `snapshot_id` reads its snapshot's partition only (D317 ticket 3): a
+//! multi-get is routed as a single-key call, a scan streams that one partition.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,7 +33,7 @@ use crate::serve::proto::{
     self, ForwardRequest, ForwardScanRequest, MissingRange, MultiGetRequest, MultiGetResponse,
     ScanPage, ScanRequest, forward_request,
 };
-use crate::serve::router::{Cluster, Router, later, not_open};
+use crate::serve::router::{Cluster, Router, not_open};
 use crate::serve::service::{
     PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, page_bytes, room,
 };
@@ -327,7 +328,9 @@ impl Router {
             .as_ref()
             .is_some_and(|s| !s.snapshot_id.is_empty())
         {
-            return Err(later("a snapshot", 3));
+            return Err(ApiError::internal(
+                "a multi-get at a snapshot is routed to its partition, not fanned out",
+            ));
         }
         let reach = Reach {
             deadline: Some(deadline),
@@ -487,15 +490,18 @@ impl Router {
         let ServiceOp::Scan(r) = op else {
             return Err(ApiError::internal("fan_scan takes a scan"));
         };
-        if r.selection
-            .as_ref()
-            .is_some_and(|s| !s.snapshot_id.is_empty())
-        {
-            return Err(later("a snapshot", 3));
-        }
         crate::serve::convert::Select::new(r.selection.as_ref())?;
         let reach = Reach::of(self, cluster);
         let routes = reach.routes()?;
+        // A scan at a snapshot reads the snapshot's partition only (D317 ticket 3):
+        // `CrossPartition` if its range reaches another.
+        let only = match crate::serve::router::snapshot_of(r.selection.as_ref()) {
+            Some(_) => Some(crate::serve::router::route(
+                &routes,
+                &ServiceOp::Scan(r.clone()),
+            )?),
+            None => None,
+        };
         let ranges = ranges_of(&routes, &r.table)?;
         let after = Position::from_bytes(&r.after, Kind::Scan)?;
         let start = start_of(&ranges, after.as_ref(), &r.table)?;
@@ -503,8 +509,17 @@ impl Router {
         let parts: Vec<PartRange> = ranges[start..]
             .iter()
             .filter(|p| p.meets(&lo, hi.as_deref()))
+            .filter(|p| only.as_ref().is_none_or(|o| *o == p.partition))
             .cloned()
             .collect();
+        // Here, the snapshot is pinned for the stream's life, as on a single node; on its
+        // node, the forwarded scan pins it there.
+        let pinned = match &only {
+            Some(p) if reach.local.as_deref() == Some(p.as_str()) => self
+                .service
+                .pinned_selection(r.selection.as_ref(), caller)?,
+            _ => None,
+        };
         // The local partition's table, resolved now: its reading starts when the scan gets
         // there.
         let here = match parts
@@ -521,6 +536,7 @@ impl Router {
         let job = ScanJob {
             reach,
             here,
+            pinned: std::sync::Mutex::new(pinned),
             caller: caller.clone(),
             r,
             after,
@@ -580,6 +596,16 @@ impl Router {
             if cluster.local.as_deref() != Some(partition) {
                 return Err(not_open(partition));
             }
+            // At a snapshot, checked again here: its range stays in its partition, and that's
+            // this one (D317 ticket 3).
+            if crate::serve::router::snapshot_of(r.selection.as_ref()).is_some() {
+                let p = crate::serve::router::route(routes, &ServiceOp::Scan(r.clone()))?;
+                if p != partition {
+                    return Err(ApiError::cross_partition(format!(
+                        "the scan's snapshot is partition {p}'s, not {partition}'s"
+                    )));
+                }
+            }
         }
         match self.service.call(ServiceOp::Scan(r), caller, None).await? {
             ServiceReply::Scan(pages) => Ok(pages),
@@ -623,6 +649,9 @@ impl PartPages {
 /// A fanned-out scan's reading side, run as its own task.
 struct ScanJob {
     reach: Reach,
+    /// A scan at a snapshot whose partition is here: the snapshot, held for its stream
+    /// (D317 ticket 3).
+    pinned: std::sync::Mutex<Option<crate::serve::sessions::SnapshotGuard>>,
     /// The local partition's scan, if the range meets it.
     here: Option<ScanOpener>,
     caller: Caller,
@@ -646,7 +675,12 @@ impl ScanJob {
                     let here = self.here.as_ref().ok_or_else(|| {
                         ApiError::internal("no local scan for the local partition")
                     })?;
-                    return here.open(r, None, None, None).map(PartPages::Here);
+                    let pinned = self
+                        .pinned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    return here.open(r, None, pinned, None).map(PartPages::Here);
                 }
                 Place::There(address, map_version) => {
                     let req = ForwardScanRequest {

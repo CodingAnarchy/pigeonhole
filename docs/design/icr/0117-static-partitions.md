@@ -103,7 +103,7 @@
 - **Single-key calls** route by `(table, row)` through the map: `Get`, `ReadRow`, `Mutate`, `CheckAndMutate` and `MutateReturning`, counters included.
 - **A `Batch`** routes when all its rows are in one partition. Otherwise it's refused with `CrossPartition` before anything is written, naming each partition and the first row in it.
 - **A table the map doesn't place** answers `NotFound`.
-- **Refused with `Unsupported`, naming the ticket that adds each:** transactions and snapshots (3, including a `Get` or `ReadRow` with a `snapshot_id`), fan-out reads (4), schema calls and `/v1/tables` (5), and backups (8). Feeds (7) are served since ticket 7, below. Every other call is refused too, `Info` and `/mcp` included.
+- **Refused with `Unsupported`, naming the ticket that adds each:** transactions and snapshots (3, including a `Get` or `ReadRow` with a `snapshot_id`; served since ticket 3, below), fan-out reads (4), schema calls and `/v1/tables` (5), and backups (8). Feeds (7) are served since ticket 7, below. Every other call is refused too, `Info` and `/mcp` included.
 
 **`Cluster.Forward`** (node to node, `cluster` scope, gRPC only) carries a routed call, with the sender's `map_version` and the caller it's for (`ForwardedCaller`: `read` or `write` scope, the token's namespaces). The owner checks those again.
 
@@ -116,7 +116,7 @@
 | `PartitionUnavailable` | `UNAVAILABLE` + detail | 503 | yes: nothing was sent to the partition's node (B3). A forwarded write that fails after it was sent answers `OutcomeUnknown`. |
 
 ## Ticket 4a: fan-out scans and multi-gets
-**`Data.Scan` and `Data.MultiGet` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. They're no longer refused on a cluster node. A read with a `snapshot_id` is still refused until ticket 3, and `Nearest` and `Traverse` until ticket 4b.
+**`Data.Scan` and `Data.MultiGet` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. They're no longer refused on a cluster node. A read with a `snapshot_id` reads its snapshot's partition only (ticket 3, below), and `Nearest` and `Traverse` are refused until ticket 4b.
 - **A scan** reads the partitions its range meets, one at a time, in key order. It passes each partition's pages through: their rows and `bytes`, with `next` rewritten. There's no next-partition prefetch (§7). `limit` counts rows, as on a single node, and what's left of it goes on to the next partition. Each partition's part reads at its own snapshot, as each page does on a single node.
 - **A multi-get** sorts and dedupes its keys, splits them by partition, and merges the partitions' pages in key order under the one `page_bytes`. Its pages are exactly a single node's:
   - a partition reads with what's left of the budget;
@@ -191,6 +191,21 @@
 - **Connections (simp724's S1):** a subscription's parts on one peer share a connection of the subscription's own: a lease from the stream connections (ticket 4a's `stream_channel`), never given back, so it closes with the subscription. A subscriber that stops reading holds only its own connections' HTTP/2 windows, never a forwarded call's or another stream's. One stalled stream can't fill a connection (hyper's 2 MiB stream window against 5 MiB a connection), but three or four on one connection did in a test.
 
 **Memory:** a subscription buffers up to the feed's client limits (64 events, 256 KiB) at its entry node, plus as much on each part's node. That's `(partitions + 1) × 256 KiB` at most, outside `--inflight-bytes`, as a single node's feed buffers are.
+
+## Ticket 3: transactions and snapshots in one partition
+**A transaction or pinned snapshot lives on the node serving its partition.** Any node routes the calls on it there, and the entry node holds no session state.
+- **Where it begins:** `BeginRequest.route` and `OpenSnapshotRequest.route` (a row or a partition id) are required on every cluster, a one-partition map included, so a client keeps working when the map gains a partition. A missing `route` is `InvalidArgument`; a table or partition the map doesn't have is `NotFound`.
+- **Ids name their partition** on a cluster: `<partition>:<32 hex>`. They're split at the last `:` (partition ids are `[a-z0-9_-]`). A single node's ids stay 32 hex. An id of the wrong form, or of a partition the map doesn't list, is `NotFound`, on a single node and on a cluster alike.
+- **Routed by the id:** `TxnGet`, `TxnGetRow`, `TxnWrite`, `Commit`, `Abort` and `Snapshots.Release`. Also routed by the id are `Get` and `ReadRow` at a snapshot, and a `MultiGet` or `Scan` at one whose keys or range lie in its partition.
+  - **A `MultiGet` at a snapshot** is routed and forwarded as a single-key call is (`Forward`'s `multi_get` arm). It pages as its partition's node does, with that node's own positions.
+  - **A `Scan` at a snapshot** runs through the fan-out with the snapshot's partition alone, with cluster positions: it's served here with the snapshot pinned for the stream, or on its node through `ForwardScan`, whose owner checks the range again.
+  - `Traverse` and `Nearest` at a snapshot are `Unsupported`.
+- **`CrossPartition`:** any row outside the session's partition is refused before anything is buffered or written, at the entry node and again at the owner. That covers a transaction's read or write, a `Commit`'s rows, a read at the snapshot, and a scan range that reaches another partition. The message names both partitions.
+- **`Cluster.Forward`'s new arms:** `begin`, `txn_get`, `txn_get_row`, `txn_write`, `commit`, `abort`, `open_snapshot` and `release_snapshot`, with the replies `begin`, `commit`, `open_snapshot` and `empty` (the reads answer `get` and `read_row`). For B3, a `Commit` or `Abort` that fails after it was sent answers `OutcomeUnknown`, as a write does. Sending `Commit` again, through any node, answers the first outcome (B1). A `Begin` or `Snapshots.Open` cut after it was sent is retry-safe, but it can leave a session on the owner until its idle lease ends, counted against the per-token cap there.
+- **Sessions are bound to the token's SHA-256 digest** (its principal), on a single node too, so a reordered or reloaded token file keeps them.
+  - `ForwardedCaller.token_digest` carries the digest; it's empty on a cluster without tokens. The owner resolves it against its own token file. Its own entry decides the scope (capped at `write`, as in ticket 2) and the namespaces. A digest it doesn't list, or any digest sent to a node without tokens, is `PermissionDenied`, so a cluster's nodes list the same tokens.
+  - Digests never appear in logs or errors.
+  - `--max-sessions` and `--max-sessions-per-token` count per node.
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

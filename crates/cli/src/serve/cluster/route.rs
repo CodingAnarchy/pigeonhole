@@ -140,6 +140,35 @@ impl Routes {
         p.partitions.get(i).map(String::as_str)
     }
 
+    /// The partitions holding `table`'s rows from `lo` up to `hi` (inclusive when its flag
+    /// says so; `None`: to the end), in key order; `None` for a table the map doesn't place.
+    /// An empty range reaches `lo`'s partition only.
+    pub(crate) fn span(
+        &self,
+        table: &str,
+        lo: &[u8],
+        hi: Option<(&[u8], bool)>,
+    ) -> Option<Vec<&str>> {
+        let p = self.tables.get(table)?;
+        let first = p.splits.partition_point(|s| s.as_slice() <= lo);
+        let last = match hi {
+            None => p.partitions.len().saturating_sub(1),
+            // The last row is `hi` itself: its partition.
+            Some((hi, true)) => p.splits.partition_point(|s| s.as_slice() <= hi),
+            // Every row is below `hi`: a range starting at `hi` isn't reached.
+            Some((hi, false)) => p.splits.partition_point(|s| s.as_slice() < hi),
+        };
+        let mut out: Vec<&str> = Vec::new();
+        for q in &p.partitions[first.min(p.partitions.len())
+            ..=last.max(first).min(p.partitions.len().saturating_sub(1))]
+        {
+            if !out.contains(&q.as_str()) {
+                out.push(q);
+            }
+        }
+        Some(out)
+    }
+
     /// `table`'s partitions in key order, each with its half-open range (D317 ticket 4's
     /// fan-out); `None` for a table the map doesn't place.
     pub(crate) fn ranges(&self, table: &str) -> Option<Vec<PartRange>> {
@@ -272,6 +301,24 @@ mod tests {
         }
         assert_eq!(r.partition("orders", b"anything"), Some("p3"));
         assert_eq!(r.partition("nope", b"a"), None);
+    }
+
+    /// A range's partitions: an exclusive end at a split key stops before its range, an
+    /// inclusive one reaches it (D317 ticket 3's snapshot scans).
+    #[test]
+    fn a_range_spans_the_partitions_its_rows_can_be_in() {
+        let r = Routes::new(&map());
+        let span = |lo: &[u8], hi: Option<(&[u8], bool)>| r.span("users", lo, hi).unwrap();
+        assert_eq!(span(b"", None), ["p1", "p2", "p3"]);
+        assert_eq!(span(b"a", Some((b"g", false))), ["p1"]);
+        assert_eq!(span(b"a", Some((b"g", true))), ["p1", "p2"]);
+        assert_eq!(span(b"g", Some((b"m\xff", false))), ["p2"]);
+        assert_eq!(span(b"h", Some((b"z", false))), ["p2", "p3"]);
+        assert_eq!(span(b"z", None), ["p3"]);
+        // Empty: the start's partition only.
+        assert_eq!(span(b"z", Some((b"a", false))), ["p3"]);
+        assert_eq!(r.span("orders", b"", None).unwrap(), ["p3"]);
+        assert!(r.span("nope", b"", None).is_none());
     }
 
     #[test]
