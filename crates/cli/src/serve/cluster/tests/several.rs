@@ -307,8 +307,11 @@ fn a_partition_that_fails_to_open_fails_the_node_and_closes_the_others() {
         &dir,
         Some("c1"),
         &mine,
-        &shares,
-        None,
+        super::super::Budget {
+            shares: &shares,
+            reserved: None,
+            memories: None,
+        },
         |_, _| pigeonhole::Options::default(),
         &mut log,
     ) else {
@@ -353,9 +356,12 @@ fn a_partitions_share_of_the_budget_keeps_its_feeds_shard_count() {
         &dir,
         Some("c1"),
         &mine,
-        &[share],
-        // 1 GiB planned for the share's 1 shard (cli692's F2 on #1718).
-        Some(&[crate::serve::placement::Memory::of(1 << 30, 1).unwrap()]),
+        super::super::Budget {
+            shares: &[share],
+            reserved: None,
+            // 1 GiB planned for the share's 1 shard (cli692's F2 on #1718).
+            memories: Some(&[crate::serve::placement::Memory::of(1 << 30, 1).unwrap()]),
+        },
         |share, memory| {
             let o = super::super::partition_options(
                 crate::serve::config::ShardSpin::Micros(0),
@@ -459,4 +465,62 @@ fn a_nodes_feed_limits_are_the_nodes_across_its_partitions() {
         }
     });
     assert!(refused.message().contains("--max-feed-hubs"), "{refused}");
+}
+
+/// perf287's g75 on #1482: with several partitions, every partition's shards are pinned
+/// before any compaction thread, so they take the first CPUs of the pin order together, and
+/// the node's compaction CPUs (reserved after them) hold every partition's compaction
+/// threads, confined. Opened one after another without the reservation, the second
+/// partition's shard would pin after the first's compaction thread. Linux only: elsewhere
+/// nothing pins.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_nodes_shards_pin_together_before_its_compaction_threads() {
+    let dir = test_dir();
+    for p in ["p1", "p3"] {
+        test_partition(&dir, p).close().unwrap();
+    }
+    // The pin order's first three free CPUs, as the node would plan them.
+    let Ok(order) = pigeonhole_io::sys::pin_plan(3) else {
+        return; // no hard affinity, a quota, or too few CPUs: nothing pins
+    };
+    let order: Vec<usize> = (0..3).filter_map(|i| order.cpu(i)).collect();
+    // Two partitions of one shard each, and the node's one compaction thread.
+    let shares = crate::serve::placement::split(2, 1, 2);
+    let reserved = crate::serve::placement::compaction_reserve(2, 1).unwrap();
+    assert_eq!(reserved, [order[2]]);
+    let mine = [("p1".to_owned(), 1), ("p3".to_owned(), 1)];
+    let mut log = Vec::new();
+    let opened = super::super::open_partitions(
+        &dir,
+        Some("c1"),
+        &mine,
+        super::super::Budget {
+            shares: &shares,
+            reserved: Some(&reserved),
+            memories: None,
+        },
+        |share, _| {
+            pigeonhole::Options::default()
+                .default_shards(share.shards)
+                .compaction_cores(share.compaction)
+        },
+        &mut log,
+    )
+    .unwrap();
+    let mut shards: Vec<usize> = opened
+        .iter()
+        .flat_map(|o| o.db.pinned_shard_cpus())
+        .collect();
+    shards.sort_unstable();
+    let mut first_two = order[..2].to_vec();
+    first_two.sort_unstable();
+    assert_eq!(shards, first_two, "{}", String::from_utf8_lossy(&log));
+    for o in &opened {
+        assert!(o.db.pinned_compaction_cpus().is_empty());
+        assert_eq!(o.db.engine_metrics().threads_confined, 1);
+    }
+    for o in opened {
+        o.db.close().unwrap();
+    }
 }

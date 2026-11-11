@@ -180,6 +180,28 @@ pub(crate) fn memory(
         .collect()
 }
 
+/// The CPUs a node with several partitions reserves for its compaction threads (D317
+/// ticket 8a, perf287's g75): the `compaction` CPUs that come after `shards` of them in the
+/// engine's pin order (one per physical core first, then their SMT siblings), so that every
+/// partition's shards, pinned next, take the first ones contiguously and the network side's
+/// mask stays in one place (one L3 domain on the AX102), as with one partition. The plan is
+/// released at once: the engines claim their shards' CPUs themselves as they open. `None`
+/// where pinning is refused (no hard affinity, a CPU quota, too few CPUs).
+///
+/// A partition whose change feed keeps more shards than its share pins the extra ones past
+/// the planned shards, onto the reserved CPUs: rare, and the startup line shows it.
+pub(crate) fn compaction_reserve(shards: usize, compaction: usize) -> Option<Vec<usize>> {
+    if compaction == 0 {
+        return None;
+    }
+    let plan = pigeonhole_io::sys::pin_plan(shards + compaction).ok()?;
+    let reserved: Vec<usize> = (shards..shards + compaction)
+        .filter_map(|i| plan.cpu(i))
+        .collect();
+    drop(plan);
+    (reserved.len() == compaction).then_some(reserved)
+}
+
 /// The network side's threads and where they may run.
 #[derive(Debug, Clone)]
 pub(crate) struct Placement {

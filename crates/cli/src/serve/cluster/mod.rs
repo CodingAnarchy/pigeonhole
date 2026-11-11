@@ -1068,13 +1068,25 @@ pub(crate) fn run(
         Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
         None => Failure::usage(&format!("--engine-memory: {why}")),
     })?;
+    // With several partitions, the node's compaction CPUs are reserved before any engine
+    // opens: the CPUs right after all the partitions' shards in the pin order, and every
+    // partition's compaction threads are confined to them (ICR 0134). Engines opened one
+    // after another would otherwise pin shard, shard, compaction for each, interleaving the
+    // shards' cores, so the network side's mask spanned both L3 domains of the AX102 and
+    // its threads ran at 0.70 IPC against 0.91 with one partition (perf287's g75 on #1482).
+    let reserved = (mine.len() > 1)
+        .then(|| super::placement::compaction_reserve(total_shards, total_compaction))
+        .flatten();
     let opened = open_partitions(
         dir,
         cluster_id.as_deref(),
         &mine,
-        &shares,
-        // Unset, the library's own defaults, exactly as before.
-        set_memory.then_some(&memories[..]),
+        Budget {
+            shares: &shares,
+            reserved: reserved.as_deref(),
+            // Unset, the library's own defaults, exactly as before.
+            memories: set_memory.then_some(&memories[..]),
+        },
         |share, memory| {
             let options = partition_options(
                 args.shard_spin,
@@ -1171,6 +1183,17 @@ pub(crate) fn run(
     )
 }
 
+/// How a node's partitions share its budget as they open (D317 ticket 8a).
+#[derive(Clone, Copy)]
+struct Budget<'a> {
+    /// Each partition's threads, in the partitions' order.
+    shares: &'a [super::placement::Share],
+    /// The node's reserved compaction CPUs, with several partitions and pinning.
+    reserved: Option<&'a [usize]>,
+    /// Each partition's memory, when `--engine-memory` or the map sets any.
+    memories: Option<&'a [super::placement::Memory]>,
+}
+
 /// One partition opened on this node (D317 ticket 8a).
 struct Opened {
     id: String,
@@ -1189,8 +1212,7 @@ fn open_partitions(
     dir: &Path,
     cluster_id: Option<&str>,
     mine: &[(String, u64)],
-    shares: &[super::placement::Share],
-    memories: Option<&[super::placement::Memory]>,
+    budget: Budget<'_>,
     options: impl Fn(super::placement::Share, Option<super::placement::Memory>) -> pigeonhole::Options,
     stderr: &mut dyn std::io::Write,
 ) -> Result<Vec<Opened>, Failure> {
@@ -1206,12 +1228,25 @@ fn open_partitions(
         Err(e)
     };
     let mut compaction_cpus: Vec<usize> = Vec::new();
+    let Budget {
+        shares,
+        reserved,
+        memories,
+    } = budget;
     for (i, ((id, epoch), share)) in mine.iter().zip(shares).enumerate() {
         let planned = memories.map(|m| m[i]);
         let open = |memory: Option<super::placement::Memory>, set: &[usize]| {
             let mut o = options(*share, memory);
-            if share.confined && !set.is_empty() {
-                o = o.compaction_cpu_set(set.to_vec());
+            // The node's reserved compaction CPUs, for every partition; without them (one
+            // partition, or no pinning), only the partitions past the node's compaction total
+            // share the earlier ones' (perf287's A1).
+            match reserved {
+                Some(r) if share.compaction > 0 => o = o.compaction_cpu_set(r.to_vec()),
+                Some(_) => {}
+                None if share.confined && !set.is_empty() => {
+                    o = o.compaction_cpu_set(set.to_vec());
+                }
+                None => {}
             }
             open_partition(dir, cluster_id, id, *epoch, o)
         };
