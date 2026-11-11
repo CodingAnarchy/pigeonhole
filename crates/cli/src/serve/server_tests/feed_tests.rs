@@ -559,3 +559,37 @@ fn a_now_subscriber_gets_a_write_made_right_after_it_subscribed() {
         assert_eq!(commit_of(&e).map(|(s, _)| s), Some(n), "round {i}");
     }
 }
+
+#[test]
+fn a_single_node_refuses_a_cluster_subscriptions_fields() {
+    // D317 ticket 7: allow_partial, skip_through and checkpoint_every mean something only
+    // across partitions; a single node says so rather than ignore them.
+    let s = Server::start("", limits());
+    for r in [
+        proto::SubscribeRequest {
+            allow_partial: true,
+            ..subscribe(&["t"], b"")
+        },
+        proto::SubscribeRequest {
+            skip_through: vec![proto::PartitionSeqno {
+                partition: "p1".into(),
+                seqno: 1,
+            }],
+            ..subscribe(&["t"], b"")
+        },
+        proto::SubscribeRequest {
+            checkpoint_every: 4,
+            ..subscribe(&["t"], b"")
+        },
+    ] {
+        let e = s
+            .block_on(s.shared.router.service.call(
+                ServiceOp::Subscribe(r.clone()),
+                &Caller::anonymous(),
+                None,
+            ))
+            .unwrap_err();
+        assert_eq!(e.code, "InvalidArgument", "{r:?}: {e:?}");
+        assert!(e.message.contains("cluster"), "{e:?}");
+    }
+}

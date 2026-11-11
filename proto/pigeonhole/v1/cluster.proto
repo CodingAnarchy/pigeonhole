@@ -6,6 +6,7 @@ package pigeonhole.v1;
 
 import "pigeonhole/v1/data.proto";
 import "pigeonhole/v1/common.proto";
+import "pigeonhole/v1/feed.proto";
 import "pigeonhole/v1/schema.proto";
 import "pigeonhole/v1/transactions.proto";
 
@@ -40,6 +41,12 @@ service Cluster {
   // it only if its map gives it `partition` and it has the partition open; otherwise
   // `WrongPartition` with its `map_version`. Cluster scope, gRPC only.
   rpc ForwardScan(ForwardScanRequest) returns (stream ScanPage);
+  // Node to node (D317 ticket 7): one partition's part of a cluster subscription, which the
+  // sending node merges with the others. Served only if this node's map gives it the
+  // partition, and only on connections of their own (never the `Forward` pool), so a
+  // subscriber that stops reading can't stall forwarded calls. The events are a single
+  // node's: a token on every one, no `partition`. Cluster scope, gRPC only.
+  rpc ForwardSubscribe(ForwardSubscribeRequest) returns (stream FeedEvent);
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -220,4 +227,19 @@ message ForwardResponse {
     OpenSnapshotResponse open_snapshot = 9;
     Empty empty = 10;
   }
+}
+
+message ForwardSubscribeRequest {
+  // The sending node's map version, as for `Forward`.
+  uint64 map_version = 1;
+  // Who the subscription is for, checked again here.
+  ForwardedCaller caller = 2;
+  // The partition whose part this is: every table in `request` must be placed on it.
+  string partition = 3;
+  // A single node's subscription: tables, prefix, visibility and start (`resume` is this
+  // partition's own token). Its cluster-only fields are unset.
+  SubscribeRequest request = 4;
+  // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
+  // most 64 of them; 0: none.
+  uint64 skip_through = 5;
 }

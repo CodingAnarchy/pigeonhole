@@ -468,7 +468,25 @@ fn data_node_with(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
-    data_node_limits(rt, dir, id, local, listener, "", limits)
+    data_node_full(rt, dir, id, local, listener, "", limits, None)
+}
+
+/// [`data_node_with`], serving `db` if given (the same node's database again, after its
+/// server stopped: a restart as the network sees it) rather than opening one. Partitions
+/// keep a change feed (D317 ticket 7).
+fn data_node_on(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    limits: crate::serve::config::Limits,
+    db: Option<pigeonhole::Pigeonhole>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
+    data_node_full(rt, dir, id, local, listener, "", limits, db)
 }
 
 /// [`data_node`] with the token file `tokens` (empty: none), for its clients and its peers.
@@ -484,7 +502,7 @@ fn data_node_tokens(
     Option<pigeonhole::Pigeonhole>,
 ) {
     let limits = crate::serve::server_tests::limits();
-    data_node_limits(rt, dir, id, local, listener, tokens, limits)
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
 }
 
 /// [`data_node`] with the token file `tokens` and under `limits`.
@@ -500,30 +518,52 @@ fn data_node_limits(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
+}
+
+/// Every test data node: `tokens` (empty: none), `limits`, and `db` if given.
+#[allow(clippy::too_many_arguments)]
+fn data_node_full(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    db: Option<pigeonhole::Pigeonhole>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
     let metrics = Arc::new(Metrics::default());
-    let db = local.map(|p| {
-        let db = pigeonhole::Pigeonhole::open(
-            dir.join(format!("{p}.phdb")),
-            pigeonhole::Options::default().create_if_missing(true),
-        )
-        .unwrap();
-        identity::write(
-            &db,
-            &identity::Identity {
-                cluster_id: "c1".into(),
-                partition_id: p.into(),
-                epoch: 1,
-            },
-        )
-        .unwrap();
-        db.table("users")
-            .unwrap()
-            .family("f", pigeonhole::Family::default())
-            .create_if_missing()
+    let db = db.or_else(|| {
+        local.map(|p| {
+            let db = pigeonhole::Pigeonhole::open(
+                dir.join(format!("{p}.phdb")),
+                pigeonhole::Options::default()
+                    .create_if_missing(true)
+                    .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+            )
             .unwrap();
-        db
+            identity::write(
+                &db,
+                &identity::Identity {
+                    cluster_id: "c1".into(),
+                    partition_id: p.into(),
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+            db.table("users")
+                .unwrap()
+                .family("f", pigeonhole::Family::default())
+                .create_if_missing()
+                .unwrap();
+            db
+        })
     });
     let service = match &db {
         Some(db) => Service::new(db.clone(), limits, 2, Arc::clone(&metrics)),
@@ -1164,7 +1204,7 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
     // database does, so its default runs no poll (D198 amendment 4).
     let dir = test_dir();
-    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None)
+    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None, None)
         .create_if_missing(true);
     let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
     let t = db
@@ -2184,3 +2224,5 @@ fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node()
         let _ = db.close();
     }
 }
+
+mod feed;

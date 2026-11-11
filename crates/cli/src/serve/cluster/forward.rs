@@ -249,7 +249,7 @@ pub(crate) fn stream_error(status: &tonic::Status, address: &str) -> ApiError {
 }
 
 /// What a failed forward answers the client (B3).
-fn classify(status: &tonic::Status, address: &str, writes: bool) -> ApiError {
+pub(crate) fn classify(status: &tonic::Status, address: &str, writes: bool) -> ApiError {
     // The owner answered: its error, as it gave it.
     if let Some(e) = ApiError::from_status(status) {
         return e;
