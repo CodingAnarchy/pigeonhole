@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -64,7 +64,14 @@ pub(crate) struct FeedLimits {
     /// bytes ([`CLIENT_BYTES`]): the per-client buffer.
     pub client_events: usize,
     pub client_bytes: usize,
+    /// How long a hub on the hub runtime must have had at most one client before it moves
+    /// back to the feed runtime ([`SOLO_AFTER`]; #1689).
+    pub solo_after: Duration,
 }
+
+/// How long a hub must have had at most one client before its task moves back to the feed
+/// runtime (#1689): a client that joins and leaves doesn't bounce it on every join.
+pub(crate) const SOLO_AFTER: Duration = Duration::from_secs(1);
 
 /// Events buffered per client. More than one lets the gRPC encoder pack every event that is
 /// ready into one HTTP/2 frame: with one, each event cost every subscriber its own stream
@@ -309,7 +316,17 @@ struct Hub {
     ring: Mutex<Ring>,
     /// The ring's head index, bumped by each commit and by a failure.
     head: watch::Sender<u64>,
-    task: tokio::task::AbortHandle,
+    /// Its task: replaced each time the task moves between runtimes ([`drive`]).
+    task: Mutex<tokio::task::AbortHandle>,
+    /// Its clients, on its ring or on their own streams until they rejoin it: a [`Joined`]
+    /// each. At most one, its task runs on the feed runtime (#1689).
+    members: AtomicUsize,
+    /// Bumped by each join, so the task sees a client that joined and left between two of
+    /// its looks at `members`.
+    joins: AtomicU64,
+    /// Whether its task runs on the feed runtime beside its one client (#1689), for the
+    /// gauge and the dump.
+    solo: AtomicBool,
     stats: Arc<FeedStats>,
     /// Live hubs, shared: each ring's cap is the total over it.
     live: Arc<AtomicU64>,
@@ -320,6 +337,18 @@ struct Hub {
 impl Hub {
     fn ring(&self) -> MutexGuard<'_, Ring> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn task(&self) -> MutexGuard<'_, tokio::task::AbortHandle> {
+        self.task.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Makes `tracker`'s client one of this hub's members until the [`Joined`] drops.
+    fn join(self: &Arc<Self>, tracker: &Arc<Tracker>) -> Joined {
+        self.track(tracker);
+        self.members.fetch_add(1, Ordering::Relaxed);
+        self.joins.fetch_add(1, Ordering::Relaxed);
+        Joined(Arc::clone(self))
     }
 
     /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
@@ -391,9 +420,135 @@ impl Hub {
 impl Drop for Hub {
     fn drop(&mut self) {
         // The last client left: the engine subscription (and its shard wakers) goes.
-        self.task.abort();
+        self.task
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .abort();
         self.live.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// A client's membership of its hub, counted in the hub's `members` while held.
+struct Joined(Arc<Hub>);
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        self.0.members.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Where a hub's task runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The feed runtime, beside its one client's task: a commit wakes the client without a
+    /// cross-runtime handoff (#1689, g64's +6.4% CPU per put at one subscriber).
+    Feed,
+    /// The hub runtime, apart from its clients' delivery, so a hub never queues behind its
+    /// clients' tasks (#1397's fan-out wedge).
+    Hubs,
+}
+
+/// A hub's task: its engine stream, read into its ring.
+struct Driver {
+    stream: FeedStream,
+    hub: Weak<Hub>,
+    /// `--feed-ring-bytes`, shared by the live hubs.
+    ring_bytes: usize,
+    /// The server's feed and hub runtimes, when it has both: the task moves between them.
+    runtimes: Option<(tokio::runtime::Handle, tokio::runtime::Handle)>,
+    solo_after: Duration,
+    place: Place,
+    /// When the task first saw its hub alone on the hub runtime, and the joins then.
+    alone: Option<(Instant, u64)>,
+}
+
+impl Driver {
+    /// Where the task should run now, if not where it is: on the hub runtime at once with two
+    /// or more clients, back on the feed runtime after `solo_after` with at most one.
+    fn moves(&mut self, hub: &Hub) -> Option<Place> {
+        self.runtimes.as_ref()?;
+        let members = hub.members.load(Ordering::Relaxed);
+        match self.place {
+            Place::Feed => (members >= 2).then_some(Place::Hubs),
+            Place::Hubs if members >= 2 => {
+                self.alone = None;
+                None
+            }
+            Place::Hubs => {
+                let joins = hub.joins.load(Ordering::Relaxed);
+                match self.alone {
+                    Some((since, j)) if j == joins => {
+                        (since.elapsed() >= self.solo_after).then_some(Place::Feed)
+                    }
+                    _ => {
+                        self.alone = Some((Instant::now(), joins));
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Runs a hub's task: reads its engine stream into its ring until the hub goes or the stream
+/// fails. When the hub's client count calls for the other runtime (#1689), it spawns itself
+/// there between two commits, handing over the stream itself, so the ring sees one unbroken
+/// sequence of pushes. Boxed: the task spawns its own kind.
+fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        loop {
+            // A poll that finds nothing records how far the feed got, so the ring's `passed`
+            // follows other tables' writes (the engine wakes the hub on each frontier move).
+            let item = std::future::poll_fn(|cx| {
+                let polled = Pin::new(&mut d.stream).poll_next(cx);
+                if polled.is_pending()
+                    && let Some(hub) = d.hub.upgrade()
+                {
+                    let at = d.stream.position().seqno();
+                    hub.note_passed(at, || token_of(&d.stream));
+                }
+                polled
+            })
+            .await;
+            let Some(hub) = d.hub.upgrade() else { return };
+            match item {
+                Some(Ok(commit)) => {
+                    let at = d.stream.position().seqno();
+                    hub.push(commit, token_of(&d.stream), at, d.ring_bytes);
+                    if let Some(to) = d.moves(&hub)
+                        && let Some((feed, hubs)) = d.runtimes.clone()
+                    {
+                        d.place = to;
+                        d.alone = None;
+                        hub.solo.store(to == Place::Feed, Ordering::Relaxed);
+                        hub.stats.hub_moves.fetch_add(1, Ordering::Relaxed);
+                        let rt = if to == Place::Feed { feed } else { hubs };
+                        // Under the task's lock and holding `hub`: the hub can't drop (and
+                        // abort the old handle) before the new task's handle is in place. A
+                        // hub failed meanwhile (`fail_all` aborts the handle it finds, this
+                        // one, which is past its last await) stops here instead.
+                        let mut task = hub.task();
+                        if !hub.ring().failed {
+                            *task = rt.spawn(drive(d)).abort_handle();
+                        }
+                        return;
+                    }
+                    drop(hub);
+                    // A feed with a backlog is always ready, and it isn't part of Tokio's
+                    // budget: without this, a hub that fell behind keeps its worker, and the
+                    // other hubs on its runtime starve (#1397's fan-out wedge; perf287's N1
+                    // on #1696).
+                    tokio::task::coop::consume_budget().await;
+                }
+                // An expiry, `Closed`, damage: each client goes on from its own token on its
+                // own stream, and the engine decides each (feed1248's (5)).
+                _ => {
+                    hub.fail();
+                    return;
+                }
+            }
+        }
+    })
 }
 
 /// The fan-out's counters, for `/metrics`.
@@ -406,6 +561,8 @@ pub(crate) struct FeedStats {
     pub rejoined: AtomicU64,
     /// Own streams that waited for a `--max-catch-up` slot.
     pub catch_up_waits: AtomicU64,
+    /// Hub tasks that moved between the feed and hub runtimes (#1689).
+    pub hub_moves: AtomicU64,
 }
 
 /// The hubs, by table set.
@@ -437,6 +594,8 @@ pub(crate) struct FeedGauges {
     pub hubs: usize,
     pub ring_bytes: usize,
     pub catching_up: usize,
+    /// Hubs whose task runs on the feed runtime beside their one client (#1689).
+    pub solo_hubs: usize,
 }
 
 impl Feeds {
@@ -495,6 +654,10 @@ impl Feeds {
             hubs: live.len(),
             ring_bytes: live.iter().map(|h| h.ring().bytes).sum(),
             catching_up: self.limits.max_catch_up.max(1) - self.catch_up.available_permits(),
+            solo_hubs: live
+                .iter()
+                .filter(|h| h.solo.load(Ordering::Relaxed))
+                .count(),
         }
     }
 
@@ -569,13 +732,18 @@ impl Feeds {
             }
             let _ = writeln!(
                 out,
-                "  hub {i} (feeds {:?}, {}{}): engine feed {} seqnos behind (at {passed}); ring {entries} \
+                "  hub {i} (feeds {:?}, {}{}, {}): engine feed {} seqnos behind (at {passed}); ring {entries} \
                  entries [{base}, {head}), {bytes}/{limit} bytes; clients: {} on the ring (entries \
                  behind its head, min/p50/max {}), {} on their own streams (seqnos behind the hub {}), \
                  {waiting} waiting for a catch-up slot",
                 key.tables,
                 if key.visible { "visible" } else { "durable" },
                 if failed { ", FAILED" } else { "" },
+                if hub.solo.load(Ordering::Relaxed) {
+                    "solo on the feed threads"
+                } else {
+                    "on the hub threads"
+                },
                 db_seqno.map_or_else(|| "?".into(), |s| s.saturating_sub(passed).to_string()),
                 on_ring.len(),
                 spread(on_ring.clone()),
@@ -595,8 +763,12 @@ impl Feeds {
         let live: Vec<Arc<Hub>> = hubs.drain().filter_map(|(_, w)| w.upgrade()).collect();
         drop(hubs);
         for hub in live {
-            hub.task.abort();
+            // Under the task's lock, so a task moving runtimes (#1689) either is aborted
+            // here or sees the hub failed and stops.
+            let task = hub.task();
+            task.abort();
             hub.fail();
+            drop(task);
         }
     }
 
@@ -629,56 +801,34 @@ impl Feeds {
         } else {
             self.db.durable_snapshot()?
         };
-        let mut stream = FeedStream::new(open(tables, visible, &Start::Snapshot(snapshot))?);
+        let stream = FeedStream::new(open(tables, visible, &Start::Snapshot(snapshot))?);
         let start_seqno = stream.position().seqno();
         let start_token = token_of(&stream);
         let (head, _) = watch::channel(0);
-        let limit = self.limits.ring_bytes;
         let stats = Arc::clone(&self.stats);
         let live = Arc::clone(&self.live);
         live.fetch_add(1, Ordering::Relaxed);
+        // A new hub has one client coming: it starts beside it on the feed runtime (#1689),
+        // when the server has both runtimes.
+        let runtimes = self
+            .runtime
+            .get()
+            .cloned()
+            .zip(self.hub_runtime.get().cloned());
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
-            let weak = weak.clone();
-            let task = self
-                .spawn_hub(async move {
-                    loop {
-                        // A poll that finds nothing records how far the feed got, so the ring's
-                        // `passed` follows other tables' writes (the engine wakes the hub on each
-                        // frontier move).
-                        let item = std::future::poll_fn(|cx| {
-                            let polled = Pin::new(&mut stream).poll_next(cx);
-                            if polled.is_pending()
-                                && let Some(hub) = weak.upgrade()
-                            {
-                                let at = stream.position().seqno();
-                                hub.note_passed(at, || token_of(&stream));
-                            }
-                            polled
-                        })
-                        .await;
-                        let Some(hub) = weak.upgrade() else { return };
-                        match item {
-                            Some(Ok(commit)) => {
-                                let at = stream.position().seqno();
-                                hub.push(commit, token_of(&stream), at, limit);
-                                drop(hub);
-                                // A feed with a backlog is always ready, and it isn't part of
-                                // Tokio's budget: without this, a hub that fell behind keeps its
-                                // worker, and the other hubs on the hub runtime starve (#1397's
-                                // fan-out wedge; perf287's N1 on #1696).
-                                tokio::task::coop::consume_budget().await;
-                            }
-                            // An expiry, `Closed`, damage: each client goes on from its own
-                            // token on its own stream, and the engine decides each (feed1248's
-                            // (5)).
-                            _ => {
-                                hub.fail();
-                                return;
-                            }
-                        }
-                    }
-                })
-                .abort_handle();
+            let driver = Driver {
+                stream,
+                hub: weak.clone(),
+                ring_bytes: self.limits.ring_bytes,
+                runtimes: runtimes.clone(),
+                solo_after: self.limits.solo_after,
+                place: Place::Feed,
+                alone: None,
+            };
+            let task = match &runtimes {
+                Some((feed, _)) => feed.spawn(drive(driver)),
+                None => self.spawn_hub(drive(driver)),
+            };
             Hub {
                 ring: Mutex::new(Ring {
                     start_seqno,
@@ -687,7 +837,10 @@ impl Feeds {
                     ..Ring::default()
                 }),
                 head,
-                task,
+                task: Mutex::new(task.abort_handle()),
+                members: AtomicUsize::new(0),
+                joins: AtomicU64::new(0),
+                solo: AtomicBool::new(runtimes.is_some()),
                 stats,
                 live,
                 clients: Mutex::default(),
@@ -722,10 +875,11 @@ impl Feeds {
         };
         let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());
-        hub.track(&tracker);
+        let joined = hub.join(&tracker);
+        drop(hub);
         let client = Client {
             feeds: Arc::clone(self),
-            hub: Mutex::new(hub),
+            hub: Mutex::new(joined),
             after,
             skip: spec.skip,
             skipped: AtomicU64::new(0),
@@ -823,7 +977,7 @@ enum Source {
 struct Client {
     feeds: Arc<Feeds>,
     /// Its hub: replaced by the key's current one when it fails (F2).
-    hub: Mutex<Arc<Hub>>,
+    hub: Mutex<Joined>,
     /// For a `Now` start, the database's seqno when it subscribed: commits at or below it
     /// are passed over, as an in-process feed opened then would never deliver them, even
     /// when the hub hadn't read them yet.
@@ -867,7 +1021,7 @@ struct Position {
 
 impl Client {
     fn hub(&self) -> Arc<Hub> {
-        Arc::clone(&self.hub.lock().unwrap_or_else(PoisonError::into_inner))
+        Arc::clone(&self.hub.lock().unwrap_or_else(PoisonError::into_inner).0)
     }
 
     async fn run(&self, begin: Begin) -> Result<(), ApiError> {
@@ -1028,8 +1182,8 @@ impl Client {
             if hub.ring().failed && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
                 hub_retry = Some(Instant::now());
                 if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
-                    new.track(&self.tracker);
-                    *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&new);
+                    let joined = new.join(&self.tracker);
+                    *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = joined;
                     hub = new;
                 }
             }
@@ -1468,11 +1622,16 @@ mod tests {
         let hub = |head: watch::Sender<u64>| Hub {
             ring: Mutex::default(),
             head,
-            task: tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .spawn(async {})
-                .abort_handle(),
+            task: Mutex::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .spawn(async {})
+                    .abort_handle(),
+            ),
+            members: AtomicUsize::new(0),
+            joins: AtomicU64::new(0),
+            solo: AtomicBool::new(false),
             stats: Arc::default(),
             live: Arc::new(AtomicU64::new(1)),
             clients: Mutex::default(),
@@ -1562,6 +1721,7 @@ mod tests {
                 stream_idle: Duration::from_secs(5),
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
+                solo_after: SOLO_AFTER,
             },
         );
         let slots = Arc::new(Semaphore::new(8));
@@ -1587,7 +1747,7 @@ mod tests {
             let mut want = vec![w("a1")];
             assert_eq!(seqnos(&mut a, Duration::from_secs(1)).await, want);
             // The shared feed fails (an expiry, say): its engine task ends.
-            first.task.abort();
+            first.task().abort();
             first.fail();
             want.push(w("a2"));
             // A new subscriber gets a fresh hub, and starts now, not from the failed one.
@@ -1612,68 +1772,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A server's three runtimes, as `phdb serve` names them: requests, feed delivery and
+    /// hubs, one worker each but `delivery_threads` for delivery.
+    fn server_runtimes(
+        delivery_threads: usize,
+    ) -> (
+        tokio::runtime::Runtime,
+        tokio::runtime::Runtime,
+        tokio::runtime::Runtime,
+    ) {
+        let rt = |threads: usize, name: Option<&str>| {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(threads).enable_all();
+            if let Some(name) = name {
+                b.thread_name(name);
+            }
+            b.build().unwrap()
+        };
+        (
+            rt(1, None),
+            rt(delivery_threads, Some("phdb-serve-feed")),
+            rt(1, Some("phdb-serve-feed-hub")),
+        )
+    }
+
+    fn limits_solo_after(solo_after: Duration) -> FeedLimits {
+        FeedLimits {
+            ring_bytes: 16 << 20,
+            max_hubs: 4,
+            max_catch_up: 1,
+            quiet: Duration::from_secs(10),
+            stream_idle: Duration::from_secs(5),
+            client_events: CLIENT_EVENTS,
+            client_bytes: CLIENT_BYTES,
+            solo_after,
+        }
+    }
+
+    fn now_spec(t: &Table) -> Spec {
+        Spec {
+            tables: vec![t.clone()],
+            prefix: Vec::new(),
+            visible: false,
+            start: Start::Now,
+            skip: 0,
+            announce: false,
+        }
+    }
+
+    /// Waits up to a second for `rt` to have `n` live tasks: a task that moved away is
+    /// released once its runtime gets to it.
+    async fn tasks_on(rt: &tokio::runtime::Runtime, n: usize) -> usize {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let alive = rt.metrics().num_alive_tasks();
+            if alive == n || tokio::time::Instant::now() >= deadline {
+                return alive;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[test]
     fn hubs_and_clients_run_on_their_own_runtimes() {
-        // Ticket 5's (A) and (C): with a server's runtimes, a subscription's client task runs
-        // on the feed runtime and its hub on the hub runtime, neither on the request's, and
-        // its events still reach the stream the request side reads (perf287's T1 on #1696:
-        // a hub spawned back onto the feed runtime fails here).
+        // Ticket 5's (A) and (C), with #1689's fast path: with a server's runtimes, a
+        // subscription's client task runs on the feed runtime, and so does its hub while it
+        // has that one client. A second client moves the hub to the hub runtime; alone again
+        // for `solo_after`, it moves back. Nothing of the feed runs on the request's runtime,
+        // and events still reach the stream the request side reads (perf287's T1 on #1696).
         let (_, db, dir) = commits("feedrt", 0);
-        let requests = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let delivery = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("phdb-serve-feed")
-            .enable_all()
-            .build()
-            .unwrap();
-        let hubs = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("phdb-serve-feed-hub")
-            .enable_all()
-            .build()
-            .unwrap();
+        let (requests, delivery, hubs) = server_runtimes(1);
         let t = db.table("t").unwrap().open().unwrap();
-        let feeds = Feeds::new(
-            db.clone(),
-            FeedLimits {
-                ring_bytes: 1 << 20,
-                max_hubs: 4,
-                max_catch_up: 1,
-                quiet: Duration::from_secs(10),
-                stream_idle: Duration::from_secs(5),
-                client_events: CLIENT_EVENTS,
-                client_bytes: CLIENT_BYTES,
-            },
-        );
+        let feeds = Feeds::new(db.clone(), limits_solo_after(Duration::from_millis(50)));
         feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         let before = delivery.metrics().num_alive_tasks();
         let hubs_before = hubs.metrics().num_alive_tasks();
         requests.block_on(async {
+            let put = |row: &[u8]| t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno;
             let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
-            let spec = Spec {
-                tables: vec![t.clone()],
-                prefix: Vec::new(),
-                visible: false,
-                start: Start::Now,
-                skip: 0,
-                announce: false,
-            };
-            let mut events = feeds.subscribe(spec, slot, |_| {}).unwrap();
+            let mut a = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
             assert_eq!(
                 delivery.metrics().num_alive_tasks(),
-                before + 1,
-                "the client, on the feed runtime"
+                before + 2,
+                "the client and its hub, on the feed runtime"
             );
-            assert_eq!(
-                hubs.metrics().num_alive_tasks(),
-                hubs_before + 1,
-                "the hub, on the hub runtime"
-            );
+            assert_eq!(hubs.metrics().num_alive_tasks(), hubs_before);
+            assert_eq!(feeds.gauges().solo_hubs, 1);
             assert_eq!(
                 tokio::runtime::Handle::current()
                     .metrics()
@@ -1681,8 +1866,123 @@ mod tests {
                 0,
                 "nothing of the feed on the request side"
             );
-            let seqno = t.mutate(b"r").put("f", b"q", b"v").commit().unwrap().seqno;
-            assert_eq!(seqnos(&mut events, Duration::from_secs(1)).await, [seqno]);
+            let s1 = put(b"r1");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(300)).await, [s1]);
+
+            // A second client: the next commit moves the hub to the hub runtime.
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut b = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+            let s2 = put(b"r2");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(300)).await, [s2]);
+            assert_eq!(seqnos(&mut b, Duration::from_millis(300)).await, [s2]);
+            assert_eq!(
+                tasks_on(&hubs, hubs_before + 1).await,
+                hubs_before + 1,
+                "the hub"
+            );
+            assert_eq!(
+                tasks_on(&delivery, before + 2).await,
+                before + 2,
+                "two clients"
+            );
+            assert_eq!(feeds.gauges().solo_hubs, 0);
+
+            // Alone again once B's task has ended: it stays on the hub runtime for
+            // `solo_after`, then moves back.
+            drop(b);
+            assert_eq!(
+                tasks_on(&delivery, before + 1).await,
+                before + 1,
+                "B's task ended"
+            );
+            let s3 = put(b"r3");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(100)).await, [s3]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let s4 = put(b"r4");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(300)).await, [s4]);
+            assert_eq!(tasks_on(&hubs, hubs_before).await, hubs_before);
+            assert_eq!(tasks_on(&delivery, before + 2).await, before + 2);
+            assert_eq!(feeds.gauges().solo_hubs, 1);
+            assert_eq!(feeds.stats.hub_moves.load(Ordering::Relaxed), 2);
+            drop(a);
+        });
+        drop(t);
+        drop(requests);
+        drop(delivery);
+        drop(hubs);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hub_moving_between_runtimes_mid_stream_delivers_every_event_once_in_order() {
+        // #1689: a hub's task moves between the feed and hub runtimes as a second client
+        // comes and goes, while commits keep coming. The stream moves with it between two
+        // polls, so a client there throughout gets every commit once, in order, and each
+        // passing client a gapless run of them. No hysteresis, so it moves as often as it can.
+        const COMMITS: usize = 1000;
+        let (_, db, dir) = commits("feedmove", 0);
+        let (requests, delivery, hubs) = server_runtimes(2);
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(db.clone(), limits_solo_after(Duration::ZERO));
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        requests.block_on(async {
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut a = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+            let writer = {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    (0..COMMITS)
+                        .map(|i| {
+                            if i % 5 == 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            t.mutate(format!("r{i}").as_bytes())
+                                .put("f", b"q", b"v")
+                                .commit()
+                                .unwrap()
+                                .seqno
+                        })
+                        .collect::<Vec<u64>>()
+                })
+            };
+            // A reads all along, on its own task, while B comes and goes.
+            let reader = tokio::spawn(async move {
+                let got = seqnos(&mut a, Duration::from_secs(2)).await;
+                drop(a);
+                got
+            });
+            let mut passing = Vec::new();
+            while !writer.is_finished() {
+                let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+                let mut b = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+                let mut run = Vec::new();
+                while run.len() < 20
+                    && let Ok(Some(e)) = tokio::time::timeout(
+                        Duration::from_millis(5),
+                        std::future::poll_fn(|cx| Pin::new(&mut b).poll_next(cx)),
+                    )
+                    .await
+                {
+                    if let Some(proto::feed_event::Event::Commit(c)) = e.unwrap().event {
+                        run.push(c.seqno);
+                    }
+                }
+                passing.push(run);
+                drop(b);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let want = writer.join().unwrap();
+            let got = reader.await.unwrap();
+            assert_eq!(got.len(), want.len(), "every commit once");
+            assert_eq!(got, want, "in order");
+            for run in passing.iter().filter(|r| !r.is_empty()) {
+                let from = want.iter().position(|s| *s == run[0]).unwrap();
+                assert_eq!(run[..], want[from..from + run.len()], "a gapless run");
+            }
+            let moves = feeds.stats.hub_moves.load(Ordering::Relaxed);
+            assert!(moves >= 6, "the hub moved back and forth ({moves} moves)");
         });
         drop(t);
         drop(requests);
@@ -1720,6 +2020,7 @@ mod tests {
                 stream_idle: Duration::from_secs(30),
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
+                solo_after: SOLO_AFTER,
             },
         );
         feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
@@ -1801,6 +2102,7 @@ mod tests {
                 stream_idle: Duration::from_millis(250),
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
+                solo_after: SOLO_AFTER,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
@@ -1808,7 +2110,7 @@ mod tests {
         let mut want = Vec::new();
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
-            hub.task.abort();
+            hub.task().abort();
             let mut c = feeds
                 .subscribe(
                     Spec {
@@ -1892,6 +2194,7 @@ mod tests {
                 stream_idle: idle,
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
+                solo_after: SOLO_AFTER,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
@@ -1899,7 +2202,7 @@ mod tests {
         let ended: Arc<Mutex<Option<(tokio::time::Instant, String)>>> = Arc::default();
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
-            hub.task.abort();
+            hub.task().abort();
             let end = Arc::clone(&ended);
             let mut c = feeds
                 .subscribe(
@@ -1989,13 +2292,14 @@ mod tests {
                 stream_idle: Duration::from_secs(5),
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
+                solo_after: SOLO_AFTER,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
             // The hub's own task stops; the test pushes for it.
-            hub.task.abort();
+            hub.task().abort();
             let mut direct = t.feed().open().unwrap();
             let mut c = feeds
                 .subscribe(

@@ -754,6 +754,16 @@ pub(crate) fn render_feeds(out: &mut String, feeds: &super::feed::Feeds) {
             st.rejoined.load(Ordering::Relaxed),
         ),
         (
+            "pigeonhole_serve_feed_solo_hubs",
+            "gauge",
+            g.solo_hubs as u64,
+        ),
+        (
+            "pigeonhole_serve_feed_hub_moves_total",
+            "counter",
+            st.hub_moves.load(Ordering::Relaxed),
+        ),
+        (
             "pigeonhole_serve_feed_hub_failures_total",
             "counter",
             st.hub_failures.load(Ordering::Relaxed),
@@ -782,6 +792,7 @@ fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
         stream_idle: limits.stream_idle,
         client_events: limits.feed_client_events,
         client_bytes: limits.feed_client_bytes,
+        solo_after: super::feed::SOLO_AFTER,
     }
 }
 
