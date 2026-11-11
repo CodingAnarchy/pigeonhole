@@ -28,11 +28,11 @@ use super::sessions::{SnapshotGuard, Taken};
 /// A page's size when a request leaves it at 0 (D313 §4: 1 MiB), and the cap on a request's
 /// own.
 const DEFAULT_PAGE_BYTES: u64 = 1 << 20;
-const MAX_PAGE_BYTES: u64 = 8 << 20;
+pub(crate) const MAX_PAGE_BYTES: u64 = 8 << 20;
 
 /// `Vectors.Nearest`'s largest `k`: the engine keeps `k` candidates while it ranks, before
 /// the reply's byte budget cuts it (simp724's L1 on #1565).
-const MAX_NEAREST_K: u32 = 10_000;
+pub(crate) const MAX_NEAREST_K: u32 = 10_000;
 
 /// One call, decoded. It holds its request by value: routing moves it, never copies it
 /// (perf287 on D317's seam).
@@ -2302,6 +2302,7 @@ impl Service {
                 cut_by_max_nodes: stats.cut_by_max_nodes,
                 cut_by_budget: stats.cut_by_budget,
             }),
+            missing: Vec::new(),
         })
     }
 
@@ -2354,6 +2355,7 @@ impl Service {
                 })
                 .collect(),
             cut_by_budget,
+            missing: Vec::new(),
         })
     }
 

@@ -79,6 +79,7 @@ pub(super) fn limits() -> Limits {
         max_streams: 16,
         max_feed_hubs: 8,
         max_catch_up: 4,
+        fanout_forwards: 8,
         feed_ring_bytes: 1 << 20,
         feed_quiet: Duration::from_secs(10),
         feed_client_events: super::feed::CLIENT_EVENTS,

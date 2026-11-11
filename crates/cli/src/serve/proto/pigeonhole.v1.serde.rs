@@ -6149,6 +6149,9 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::ReleaseSnapshot(v) => {
                     struct_ser.serialize_field("release_snapshot", v)?;
                 }
+                forward_request::Op::Nearest(v) => {
+                    struct_ser.serialize_field("nearest", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6188,6 +6191,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "openSnapshot",
             "release_snapshot",
             "releaseSnapshot",
+            "nearest",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6209,6 +6213,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             Abort,
             OpenSnapshot,
             ReleaseSnapshot,
+            Nearest,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6247,6 +6252,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "abort" => Ok(GeneratedField::Abort),
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "releaseSnapshot" | "release_snapshot" => Ok(GeneratedField::ReleaseSnapshot),
+                            "nearest" => Ok(GeneratedField::Nearest),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6390,6 +6396,13 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::ReleaseSnapshot)
 ;
                         }
+                        GeneratedField::Nearest => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nearest"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Nearest)
+;
+                        }
                     }
                 }
                 Ok(ForwardRequest {
@@ -6446,6 +6459,9 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::Empty(v) => {
                     struct_ser.serialize_field("empty", v)?;
                 }
+                forward_response::Reply::Nearest(v) => {
+                    struct_ser.serialize_field("nearest", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6473,6 +6489,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "open_snapshot",
             "openSnapshot",
             "empty",
+            "nearest",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6487,6 +6504,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             Commit,
             OpenSnapshot,
             Empty,
+            Nearest,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6518,6 +6536,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "commit" => Ok(GeneratedField::Commit),
                             "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
                             "empty" => Ok(GeneratedField::Empty),
+                            "nearest" => Ok(GeneratedField::Nearest),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6608,6 +6627,13 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("empty"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Empty)
+;
+                        }
+                        GeneratedField::Nearest => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nearest"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Nearest)
 ;
                         }
                     }
@@ -11213,6 +11239,9 @@ impl serde::Serialize for NearestRequest {
         if self.page_bytes != 0 {
             len += 1;
         }
+        if self.allow_partial {
+            len += 1;
+        }
         if self.source.is_some() {
             len += 1;
         }
@@ -11236,6 +11265,9 @@ impl serde::Serialize for NearestRequest {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("page_bytes", ToString::to_string(&self.page_bytes).as_str())?;
+        }
+        if self.allow_partial {
+            struct_ser.serialize_field("allow_partial", &self.allow_partial)?;
         }
         if let Some(v) = self.source.as_ref() {
             match v {
@@ -11265,6 +11297,8 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
             "snapshotId",
             "page_bytes",
             "pageBytes",
+            "allow_partial",
+            "allowPartial",
             "range",
             "keys",
         ];
@@ -11277,6 +11311,7 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
             K,
             SnapshotId,
             PageBytes,
+            AllowPartial,
             Range,
             Keys,
         }
@@ -11306,6 +11341,7 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
                             "k" => Ok(GeneratedField::K),
                             "snapshotId" | "snapshot_id" => Ok(GeneratedField::SnapshotId),
                             "pageBytes" | "page_bytes" => Ok(GeneratedField::PageBytes),
+                            "allowPartial" | "allow_partial" => Ok(GeneratedField::AllowPartial),
                             "range" => Ok(GeneratedField::Range),
                             "keys" => Ok(GeneratedField::Keys),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
@@ -11333,6 +11369,7 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
                 let mut k__ = None;
                 let mut snapshot_id__ = None;
                 let mut page_bytes__ = None;
+                let mut allow_partial__ = None;
                 let mut source__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -11376,6 +11413,12 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::AllowPartial => {
+                            if allow_partial__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("allowPartial"));
+                            }
+                            allow_partial__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::Range => {
                             if source__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("range"));
@@ -11399,6 +11442,7 @@ impl<'de> serde::Deserialize<'de> for NearestRequest {
                     k: k__.unwrap_or_default(),
                     snapshot_id: snapshot_id__.unwrap_or_default(),
                     page_bytes: page_bytes__.unwrap_or_default(),
+                    allow_partial: allow_partial__.unwrap_or_default(),
                     source: source__,
                 })
             }
@@ -11420,12 +11464,18 @@ impl serde::Serialize for NearestResponse {
         if self.cut_by_budget {
             len += 1;
         }
+        if !self.missing.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.NearestResponse", len)?;
         if !self.neighbours.is_empty() {
             struct_ser.serialize_field("neighbours", &self.neighbours)?;
         }
         if self.cut_by_budget {
             struct_ser.serialize_field("cut_by_budget", &self.cut_by_budget)?;
+        }
+        if !self.missing.is_empty() {
+            struct_ser.serialize_field("missing", &self.missing)?;
         }
         struct_ser.end()
     }
@@ -11440,12 +11490,14 @@ impl<'de> serde::Deserialize<'de> for NearestResponse {
             "neighbours",
             "cut_by_budget",
             "cutByBudget",
+            "missing",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Neighbours,
             CutByBudget,
+            Missing,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -11469,6 +11521,7 @@ impl<'de> serde::Deserialize<'de> for NearestResponse {
                         match value {
                             "neighbours" => Ok(GeneratedField::Neighbours),
                             "cutByBudget" | "cut_by_budget" => Ok(GeneratedField::CutByBudget),
+                            "missing" => Ok(GeneratedField::Missing),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -11490,6 +11543,7 @@ impl<'de> serde::Deserialize<'de> for NearestResponse {
             {
                 let mut neighbours__ = None;
                 let mut cut_by_budget__ = None;
+                let mut missing__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Neighbours => {
@@ -11504,11 +11558,18 @@ impl<'de> serde::Deserialize<'de> for NearestResponse {
                             }
                             cut_by_budget__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Missing => {
+                            if missing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("missing"));
+                            }
+                            missing__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(NearestResponse {
                     neighbours: neighbours__.unwrap_or_default(),
                     cut_by_budget: cut_by_budget__.unwrap_or_default(),
+                    missing: missing__.unwrap_or_default(),
                 })
             }
         }
@@ -19364,6 +19425,9 @@ impl serde::Serialize for TraverseRequest {
         if self.page_bytes != 0 {
             len += 1;
         }
+        if self.allow_partial {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TraverseRequest", len)?;
         if !self.table.is_empty() {
             struct_ser.serialize_field("table", &self.table)?;
@@ -19418,6 +19482,9 @@ impl serde::Serialize for TraverseRequest {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("page_bytes", ToString::to_string(&self.page_bytes).as_str())?;
         }
+        if self.allow_partial {
+            struct_ser.serialize_field("allow_partial", &self.allow_partial)?;
+        }
         struct_ser.end()
     }
 }
@@ -19453,6 +19520,8 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
             "snapshotId",
             "page_bytes",
             "pageBytes",
+            "allow_partial",
+            "allowPartial",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -19472,6 +19541,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
             ValueFilter,
             SnapshotId,
             PageBytes,
+            AllowPartial,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -19508,6 +19578,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                             "valueFilter" | "value_filter" => Ok(GeneratedField::ValueFilter),
                             "snapshotId" | "snapshot_id" => Ok(GeneratedField::SnapshotId),
                             "pageBytes" | "page_bytes" => Ok(GeneratedField::PageBytes),
+                            "allowPartial" | "allow_partial" => Ok(GeneratedField::AllowPartial),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -19542,6 +19613,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                 let mut value_filter__ = None;
                 let mut snapshot_id__ = None;
                 let mut page_bytes__ = None;
+                let mut allow_partial__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Table => {
@@ -19649,6 +19721,12 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::AllowPartial => {
+                            if allow_partial__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("allowPartial"));
+                            }
+                            allow_partial__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(TraverseRequest {
@@ -19667,6 +19745,7 @@ impl<'de> serde::Deserialize<'de> for TraverseRequest {
                     value_filter: value_filter__,
                     snapshot_id: snapshot_id__.unwrap_or_default(),
                     page_bytes: page_bytes__.unwrap_or_default(),
+                    allow_partial: allow_partial__.unwrap_or_default(),
                 })
             }
         }
@@ -19687,12 +19766,18 @@ impl serde::Serialize for TraverseResponse {
         if self.stats.is_some() {
             len += 1;
         }
+        if !self.missing.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TraverseResponse", len)?;
         if !self.hops.is_empty() {
             struct_ser.serialize_field("hops", &self.hops)?;
         }
         if let Some(v) = self.stats.as_ref() {
             struct_ser.serialize_field("stats", v)?;
+        }
+        if !self.missing.is_empty() {
+            struct_ser.serialize_field("missing", &self.missing)?;
         }
         struct_ser.end()
     }
@@ -19706,12 +19791,14 @@ impl<'de> serde::Deserialize<'de> for TraverseResponse {
         const FIELDS: &[&str] = &[
             "hops",
             "stats",
+            "missing",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Hops,
             Stats,
+            Missing,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -19735,6 +19822,7 @@ impl<'de> serde::Deserialize<'de> for TraverseResponse {
                         match value {
                             "hops" => Ok(GeneratedField::Hops),
                             "stats" => Ok(GeneratedField::Stats),
+                            "missing" => Ok(GeneratedField::Missing),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -19756,6 +19844,7 @@ impl<'de> serde::Deserialize<'de> for TraverseResponse {
             {
                 let mut hops__ = None;
                 let mut stats__ = None;
+                let mut missing__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Hops => {
@@ -19770,11 +19859,18 @@ impl<'de> serde::Deserialize<'de> for TraverseResponse {
                             }
                             stats__ = map_.next_value()?;
                         }
+                        GeneratedField::Missing => {
+                            if missing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("missing"));
+                            }
+                            missing__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(TraverseResponse {
                     hops: hops__.unwrap_or_default(),
                     stats: stats__,
+                    missing: missing__.unwrap_or_default(),
                 })
             }
         }

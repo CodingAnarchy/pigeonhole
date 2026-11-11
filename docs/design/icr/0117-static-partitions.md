@@ -148,6 +148,31 @@
 
 **Budgets:** a fanned-out scan holds one `--max-scans` slot on its entry node for its life, and counts as one `Data.Scan`. Each page it hasn't handed to the client counts against `--inflight-bytes`, as a single node's scan pages do.
 
+## Ticket 4b: fan-out nearest searches and traversals
+**`Vectors.Nearest` and `Graph.Traverse` read across a table's partitions** (D317 §7), and answer what one database holding every partition would. A `snapshot_id` on either is `Unsupported` on a cluster for good, since a snapshot is one partition's. The index searches (`Vectors.Search`, `Text.Search`) stay refused until co-located tables (placement groups) say which partition holds an index.
+
+**`Nearest`**, the exact top `k`:
+- **Fan-out:** every partition the source meets answers its own exact top `k` under the same `page_bytes`. A `range` source is clipped to each partition's range, and a `keys` source sends each partition its keys. At most `--fanout-forwards` (8, a new flag) of these run at once.
+- **The merge** keeps the first `k` by the library's total order (distance, then row key, then qualifier), then cuts the result to `page_bytes`. A distance is never NaN, and every node computes distances with the same code, so ties break the same way everywhere.
+- **Exact:** a partition's answer is a prefix of its own ranking, and nothing the global prefix keeps needs more than the budget's bytes of its partition's. `cut_by_budget` is set when the merge stopped for the budget, or came up short of `k` because some partition did.
+- **A forwarded `Nearest`** carries the partition's keys, or its range clipped to bounds, and its owner refuses one that reaches outside its partition.
+
+**`Traverse`** runs every hop at the router, by the library's rules exactly (`pigeonhole::Traverse`):
+- **A hop's edges** come from one fanned-out multi-get of the frontier: the edge family, the edge selection, and `column_limit` = `per_node_limit`. The traversal's limit counts the edges the selection keeps, as `column_limit` counts selected columns.
+- **Ranking:** the edges arrive in (source, qualifier) order. A destination not visited before is new once, ranked by its first edge.
+- **Limits:** `hop_limit`, `max_nodes` and the byte budget cut that ranking. The reading stops where a single node's would, so `stats` (`rows`, `edges`, `hops_cut`, `cut_by_max_nodes`, `cut_by_budget`) match too. A hop's nodes are sorted, and `parents` index the previous hop's.
+- **One deadline** (from the request's arrival) covers the whole traversal. The visited set counts against `--inflight-bytes` (its key and 48 bytes a node).
+- **Snapshots:** each hop reads at its own time, and each partition at its own snapshot, unlike a single node, whose one snapshot covers every hop.
+- **Cost:** one fan-out round per hop, so a deep traversal of a graph split across nodes costs hops × the slowest partition's round trip.
+- **`hop_limit` saves less here:** the router reads a hop's edges until its limit or budget stops it. A single node stops at the same point, but a hub's edges past it still cross the network in the page that held them. A dedicated expand call that returns only new destinations is a perf follow-up.
+
+**`allow_partial`** (new on `NearestRequest` and `TraverseRequest`; `missing` on both replies):
+- **`Nearest`** skips a partition that can't be reached, and its result is the exact top `k` of the partitions reached.
+- **A traversal's hop** skips the frontier nodes of an unreachable partition. Their edges aren't followed, so later hops and the ranking are exact only over what was reached.
+- **Without it,** either read fails with `PartitionUnavailable`.
+
+**`Cluster.Forward`** gains a `nearest` arm (field 18, reply 11), after D317 ticket 3's arms. `MissingRange` moves to `common.proto`: the same package, so the wire format and the generated names are unchanged.
+
 ## Ticket 7: cluster feeds
 **`Feed.Subscribe` on a cluster node** follows every partition the subscription covers, through any node. Covered means the partitions of its tables' placements, narrowed by its prefix to the ranges that can hold such rows. Each partition is followed by a single-node subscription on the node serving it, and the entry node merges them:
 - **Order:** a partition's commits keep its order, so each row's do. There's no order across partitions.
