@@ -288,6 +288,7 @@ impl Router {
                 }
                 Place::There(address, map_version) => {
                     let req = ForwardRequest {
+                        fanout_part: true,
                         map_version,
                         caller: Some(forward::forwarded_caller(caller)?),
                         op: Some(forward_request::Op::MultiGet(r.clone())),
@@ -839,6 +840,7 @@ impl Router {
                 }
                 Place::There(address, map_version) => {
                     let req = ForwardRequest {
+                        fanout_part: true,
                         map_version,
                         caller: Some(forward::forwarded_caller(caller)?),
                         op: Some(forward_request::Op::Nearest(r.clone())),

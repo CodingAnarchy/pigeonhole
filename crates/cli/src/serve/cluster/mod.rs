@@ -877,7 +877,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             }
             _ => forward::caller_of(msg.caller, &self.0.tokens)?,
         };
-        let reply = shared.router.serve_forwarded(op, &caller).await?;
+        let reply = shared
+            .router
+            .serve_forwarded(op, &caller, msg.fanout_part)
+            .await?;
         let (reply, charge) = forward::reply_to_forward(reply)?;
         let mut resp = tonic::Response::new(reply);
         // A read's charge lasts until the reply's body is written: `routes` holds it there.

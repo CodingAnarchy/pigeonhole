@@ -405,6 +405,7 @@ impl Router {
                 .map(|n| n.address.clone())
                 .unwrap_or_default();
             let req = ForwardRequest {
+                fanout_part: false,
                 map_version: map.map_version,
                 caller: Some(super::forward::forwarded_caller(caller)?),
                 op: Some(op.clone()),

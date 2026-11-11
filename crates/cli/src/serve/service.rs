@@ -1789,15 +1789,18 @@ impl Service {
         .await
     }
 
-    /// A fanned-out read's local part (D317, #1715): the same `MultiGet` or `Nearest` read
-    /// a call makes (its blocking-pool slot and per-call limits included), for a request
-    /// the entry node has admitted and whose fan-out charges its pages ([`Self::fanout_hold`]):
-    /// no second admission and no reply charge of its own. Only the fan-out calls it.
+    /// A fanned-out read's part (D317, #1715): the same `MultiGet` or `Nearest` read a call
+    /// makes (its scope check, blocking-pool slot and per-call limits included), for a
+    /// request whose entry node holds the budget for its page ([`Self::fanout_hold`]): no
+    /// budget here, neither admission nor a reply charge. The fan-out calls it for its local
+    /// part, and the router for a part a peer forwarded (`fanout_part`).
     pub(crate) async fn fanout_part(
         &self,
         op: ServiceOp,
         caller: &Caller,
     ) -> Result<ServiceReply, ApiError> {
+        // The caller's scope, as admission checks it; the budget is the fanning-out node's.
+        self.check(&op.admit(), caller)?;
         match op {
             ServiceOp::MultiGet(r) => self
                 .multi_get(r, caller)

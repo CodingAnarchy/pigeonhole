@@ -286,6 +286,7 @@ impl Router {
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
         let writes = forward_writes(&op);
         let req = ForwardRequest {
+            fanout_part: false,
             map_version: owner.map_version,
             caller: Some(forward::forwarded_caller(caller)?),
             op: Some(forward::op_to_forward(op)?),
@@ -385,10 +386,17 @@ impl Router {
     /// A call another node forwarded here (D317 ticket 2): served only if this node's map
     /// gives it the key, otherwise `WrongPartition` with this node's map version. Never
     /// forwarded on, so a split view of the map can't bounce a call between nodes.
+    /// `fanout_part`: one partition's part of a read the sending node fans out (#1715). That
+    /// node holds the budget for its page, so a multi-get's or nearest search's part is
+    /// served here with none ([`Service::fanout_part`]): an owner never waits on budget
+    /// another node's holdings could fill, so fan-outs through several nodes can't wait on
+    /// one another (perf287's g78). Only peers call this (`Cluster.Forward` takes cluster
+    /// scope), and the `Cluster` calls' concurrency limit bounds how many run at once.
     pub(crate) async fn serve_forwarded(
         &self,
         op: ServiceOp,
         caller: &Caller,
+        fanout_part: bool,
     ) -> Result<ServiceReply, ApiError> {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
@@ -420,7 +428,12 @@ impl Router {
                 return Err(not_open(&p));
             }
         }
-        self.service.call(op, caller, None).await
+        match op {
+            ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
+                self.service.fanout_part(op, caller).await
+            }
+            op => self.service.call(op, caller, None).await,
+        }
     }
 
     /// [`dispatch`](Self::dispatch) once a replica has applied the client's

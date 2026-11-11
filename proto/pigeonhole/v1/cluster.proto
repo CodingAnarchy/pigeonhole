@@ -180,6 +180,12 @@ message ForwardRequest {
   uint64 map_version = 1;
   // Who the call is for, checked again here.
   ForwardedCaller caller = 2;
+  // One partition's part of a read another node fans out (D317 #1715): a multi-get's keys
+  // (a 4a multi-get's, or a traversal hop's) or a nearest search's. The sending node holds
+  // the in-flight budget for its page, so this node serves it with no budget of its own: no
+  // admission and no reply charge, its scope still checked. Only a peer sends it:
+  // `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
+  bool fanout_part = 21;
   oneof op {
     GetRequest get = 3;
     ReadRowRequest read_row = 4;

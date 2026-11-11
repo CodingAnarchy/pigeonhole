@@ -409,3 +409,83 @@ fn a_traversal_whose_visited_set_leaves_no_room_for_a_page_ends_cut() {
         }
     }
 }
+
+#[test]
+fn fanned_out_reads_through_every_node_under_a_small_budget_all_answer() {
+    // perf287's g78 on #1730: with every node an entry and the budget filled by entry
+    // holdings, a forwarded partition read that needed budget on its owner waited on
+    // holdings that waited on it, and nothing answered. A fan-out part is charged once, at
+    // its entry: the owner serves it with no budget, so every read here answers.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let page = 80_000u64;
+    let limits = crate::serve::config::Limits {
+        // Two holdings fill a node.
+        inflight_bytes: 160_000,
+        request_timeout: Duration::from_secs(5),
+        ..crate::serve::server_tests::limits()
+    };
+    let (_stops, ports, dbs) = live_nodes(&rt, limits);
+    rt.block_on(async {
+        for (row, port, edges) in [
+            (&b"a1"[..], ports[0], vec![(b"x1".to_vec(), true)]),
+            (&b"x1"[..], ports[1], vec![(b"a1".to_vec(), true)]),
+        ] {
+            data(port)
+                .await
+                .mutate(super::super::super::proto::MutateRequest {
+                    writes: Some(graph_row(row, [0.0; 4], &edges)),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let mut reads = tokio::task::JoinSet::new();
+        for &port in &ports {
+            for kind in 0..3 {
+                for _ in 0..6 {
+                    reads.spawn(async move { (port, kind, read(port, kind, page, false).await) });
+                }
+            }
+        }
+        while let Some(done) = reads.join_next().await {
+            let (port, kind, r) = done.unwrap();
+            r.unwrap_or_else(|e| panic!("kind {kind} through {port}: {e}"));
+        }
+        for &port in &ports {
+            eventually("every holding back", async || reply_bytes(port).await == 0).await;
+        }
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn a_client_token_cant_send_a_fan_out_part_past_the_budget() {
+    // The coordinator's condition on #1730's fix: `fanout_part` skips the owner's budget, so
+    // only a peer may send it. `Cluster.Forward` takes cluster scope: a client's token is
+    // refused before the flag is read.
+    use super::super::super::proto::{
+        ForwardRequest, cluster_client::ClusterClient, forward_request,
+    };
+    let all = format!("write t0ken-a\ncluster {NODE_TOKEN}\n");
+    let t = Three::start([&all, &all, &all]);
+    t.rt.block_on(async {
+        let req = ForwardRequest {
+            map_version: 1,
+            caller: None,
+            fanout_part: true,
+            op: Some(forward_request::Op::MultiGet(MultiGetRequest {
+                table: "users".into(),
+                keys: vec![b"a1".to_vec().into()],
+                page_bytes: 8 << 20,
+                ..Default::default()
+            })),
+        };
+        let e = ClusterClient::new(channel(t.ports[0]).await)
+            .forward(with(req, Some("t0ken-a")))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
+    });
+}

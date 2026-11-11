@@ -6219,6 +6219,9 @@ impl serde::Serialize for ForwardRequest {
         if self.caller.is_some() {
             len += 1;
         }
+        if self.fanout_part {
+            len += 1;
+        }
         if self.op.is_some() {
             len += 1;
         }
@@ -6230,6 +6233,9 @@ impl serde::Serialize for ForwardRequest {
         }
         if let Some(v) = self.caller.as_ref() {
             struct_ser.serialize_field("caller", v)?;
+        }
+        if self.fanout_part {
+            struct_ser.serialize_field("fanout_part", &self.fanout_part)?;
         }
         if let Some(v) = self.op.as_ref() {
             match v {
@@ -6302,6 +6308,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "map_version",
             "mapVersion",
             "caller",
+            "fanout_part",
+            "fanoutPart",
             "get",
             "read_row",
             "readRow",
@@ -6337,6 +6345,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
         enum GeneratedField {
             MapVersion,
             Caller,
+            FanoutPart,
             Get,
             ReadRow,
             Mutate,
@@ -6378,6 +6387,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                         match value {
                             "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
                             "caller" => Ok(GeneratedField::Caller),
+                            "fanoutPart" | "fanout_part" => Ok(GeneratedField::FanoutPart),
                             "get" => Ok(GeneratedField::Get),
                             "readRow" | "read_row" => Ok(GeneratedField::ReadRow),
                             "mutate" => Ok(GeneratedField::Mutate),
@@ -6417,6 +6427,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             {
                 let mut map_version__ = None;
                 let mut caller__ = None;
+                let mut fanout_part__ = None;
                 let mut op__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -6433,6 +6444,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                                 return Err(serde::de::Error::duplicate_field("caller"));
                             }
                             caller__ = map_.next_value()?;
+                        }
+                        GeneratedField::FanoutPart => {
+                            if fanout_part__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fanoutPart"));
+                            }
+                            fanout_part__ = Some(map_.next_value()?);
                         }
                         GeneratedField::Get => {
                             if op__.is_some() {
@@ -6565,6 +6582,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                 Ok(ForwardRequest {
                     map_version: map_version__.unwrap_or_default(),
                     caller: caller__,
+                    fanout_part: fanout_part__.unwrap_or_default(),
                     op: op__,
                 })
             }
