@@ -2010,6 +2010,12 @@ impl Service {
         self.replies.render(&mut text);
         render_sessions(&mut text, &self.sessions);
         render_feeds(&mut text, parts);
+        // The hub runtime's threads, the node's (#1719): every partition's hubs share it.
+        if let Some(p) = &self.placement {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "# TYPE pigeonhole_serve_feed_hub_threads gauge");
+            let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
+        }
         render_bulk(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);

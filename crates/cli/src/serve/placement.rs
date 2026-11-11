@@ -19,9 +19,11 @@ pub(crate) struct Placement {
     pub blocking_threads: usize,
     /// The feed delivery runtime's workers (ticket 5's (A)).
     pub feed_threads: usize,
-    /// The feed hubs' runtime's workers: a quarter of the feed threads, at least 1 (#1397's
-    /// 16 hubs × 16, where the hubs fell behind their engine feeds queued behind the
-    /// clients' tasks on the feed runtime). Placed on the same CPUs, so the OS shares them.
+    /// The feed hubs' runtime's workers: as many as the feed threads by default, or
+    /// `--feed-hub-threads` (#1719). A runtime of their own, so a hub never queues behind its
+    /// clients' tasks (#1397's 16 hubs × 16), placed on the same CPUs, so the OS shares them.
+    /// A quarter of the feed threads (C, #1696) was one thread at the default on the AX102,
+    /// and 16 busy hubs fell 13.8 s behind on it (g73); an idle worker parks at no cost.
     pub hub_threads: usize,
     /// The CPUs outside the shards' (Linux, when the engine pinned any).
     #[cfg(target_os = "linux")]
@@ -50,6 +52,7 @@ impl Placement {
         io: Option<usize>,
         blocking: Option<usize>,
         feed: Option<usize>,
+        hubs: Option<usize>,
         affinity: bool,
     ) -> Self {
         let pinned = db.pinned_shard_cpus();
@@ -79,7 +82,7 @@ impl Placement {
         // left the network side short and every split run fell behind; 9 + 3 kept up.
         let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
-            hub_threads: feed_threads.div_ceil(4).max(1),
+            hub_threads: hubs.unwrap_or(feed_threads).max(1),
             io_threads: io
                 .unwrap_or(free.saturating_sub(feed_threads).max(2))
                 .max(1),
@@ -344,7 +347,7 @@ mod tests {
             Options::default().create_if_missing(true).shards(1),
         )
         .unwrap();
-        let plan = Placement::plan(&db, None, None, None, true);
+        let plan = Placement::plan(&db, None, None, None, None, true);
         assert!(
             plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
@@ -357,10 +360,13 @@ mod tests {
                 "{plan:?}"
             );
         }
-        let given = Placement::plan(&db, Some(3), Some(5), Some(2), true);
-        assert_eq!((given.io_threads, given.feed_threads), (3, 2));
+        let given = Placement::plan(&db, Some(3), Some(5), Some(2), Some(7), true);
+        assert_eq!(
+            (given.io_threads, given.feed_threads, given.hub_threads),
+            (3, 2, 7)
+        );
         // `--affinity off`: the same threads, with no mask (ICR 0131).
-        let off = Placement::plan(&db, None, None, None, false);
+        let off = Placement::plan(&db, None, None, None, None, false);
         assert_eq!(
             (
                 off.io_threads,
@@ -383,13 +389,23 @@ mod tests {
             ["unpinned", "unmasked (--affinity off)"].contains(&off.mode),
             "{off:?}"
         );
-        // The hubs' threads: a quarter of the feed threads, rounded up, at least 1.
-        for (feed, hubs) in [(1, 1), (2, 1), (3, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
+        // The hubs' threads (#1719): as many as the feed threads by default, at least 1, and
+        // `--feed-hub-threads` as given.
+        for feed in [1, 2, 3, 5, 9] {
             assert_eq!(
-                Placement::plan(&db, None, None, Some(feed), true).hub_threads,
-                hubs
+                Placement::plan(&db, None, None, Some(feed), None, true).hub_threads,
+                feed
             );
         }
+        assert_eq!(plan.hub_threads, plan.feed_threads, "{plan:?}");
+        assert_eq!(
+            Placement::plan(&db, None, None, Some(4), Some(1), true).hub_threads,
+            1
+        );
+        assert_eq!(
+            Placement::plan(&db, None, None, Some(4), Some(0), true).hub_threads,
+            1
+        );
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();
