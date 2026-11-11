@@ -207,10 +207,12 @@ fn a_table_created_during_a_backup_is_in_the_map_it_keeps() {
                 families: Vec::new(),
                 splits: Vec::new(),
                 partitions: vec!["p1".into()],
+                created: 0,
             });
             client(ports[0])
                 .await
                 .set_map(SetMapRequest {
+                    force: false,
                     expected_map_version: 1,
                     map: Some(m),
                 })

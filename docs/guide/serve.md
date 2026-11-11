@@ -395,8 +395,9 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - transactions and snapshots in one partition;
   - scans, multi-gets, nearest searches and traversals across partitions;
   - change feeds across partitions;
+  - schema through the cluster: tables and families live in the map, made and dropped through any node;
   - backups.
-- **Still to come:** schema changes through the cluster, moving a partition between nodes, several partitions per node, restore, and the index searches across partitions. Each section below says which of its parts are still to come.
+- **Still to come:** moving a partition between nodes, several partitions per node, and restore. The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -408,7 +409,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 
 ### Running a cluster
 1. **Stamp each partition's file** before its node starts: `phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`. `DIR` is the node's cluster directory, and the file must be named `<partition>.phdb`.
-2. **Create the tables in each partition's file,** for now, before its node starts: `phdb shell DIR/P.phdb -c "create users profile"`. Schema through the cluster comes with a later step.
+2. **Tables** are made through the cluster once it runs (see [Schema through the cluster](#schema-through-the-cluster)): `Schema.CreateTable` with a `placement`. You can also place a table in the first map below and create its families through the cluster afterwards. Tables made by hand in a partition's file (`phdb shell DIR/P.phdb -c "create users profile"`), as before schema came to the cluster, still work: the map takes one over when it places a table of that name.
 3. **Write the map** as JSON (`ClusterMap`):
 
    ```json
@@ -436,11 +437,17 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
    - `--cluster-token-file` is the token a node presents to the others. List it as `cluster <token>` in every node's `--token-file`. The `cluster` scope is only for node-to-node calls.
    - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
    - **Every node lists the same tokens** (`--token-file`). A call forwarded to another node runs as your token there, with the scope and namespaces that node lists for it, and sessions and feeds are bound to it.
-5. **Change the map** on a running cluster with `phdb cluster set-map MAP.json --node URL`, a compare-and-set against that node's version. Raise `map_version` in the file.
-   - The node validates the map, keeps it, and pushes it to the others.
+5. **Change the map** on a running cluster with `phdb cluster set-map MAP.json --node URL`, a compare-and-set against the current version. Raise `map_version` in the file.
+   - **The map's writer** is the node with the smallest id in the map, and it alone changes the map, so two changes can't make two different maps of one version (D317 amendment 1). `set-map` reads the map from `--node` and sends yours to the writer. A `SetMap` sent straight to another node answers `WrongPartition`, naming the writer.
+   - The writer validates the map, keeps it, and pushes it to the others.
    - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
    - A map may add tables, partitions and nodes, and give a partition another node with a higher epoch. A table's split keys and partitions are fixed once set.
    - A partition added to a running node's map, or given to it, isn't opened there until the node restarts: nodes open their partitions at start, for now. Until then the node answers calls for it with `PartitionUnavailable` ("isn't open here").
+   - **When the writer is down,** no map change and no schema call can be made. `phdb cluster set-map MAP.json --node URL --force` sets a map at another node:
+     - Its version goes above every node `phdb cluster` can reach.
+     - The map must name a writer that's up: remove the down node from it, or let another id be the smallest. Give the down node's partitions to other nodes with a higher epoch.
+     - When the old writer comes back, it takes the forced map from the others before it changes anything, and follows it.
+     - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 
 **Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
@@ -452,12 +459,21 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Served by row:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
-- **Refused with `Unsupported`,** naming the step that brings each: the index searches (`Vectors.Search`, `Text.Search`), schema calls (`ListTables` included), `Info` and `/mcp`.
+- **Refused with `Unsupported`:** the index searches (`Vectors.Search`, `Text.Search`), which aren't supported on a cluster in this release (for vectors, use `Vectors.Nearest`, which fans out), and, naming the step that brings each, `Info` and `/mcp`.
 - **A node holds one partition** for now, the one its map gives it, opened at start after checking the file's identity row against the map. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.
   - `CrossPartition` (409): the request can't succeed as written. Split it.
+
+### Schema through the cluster
+Tables and their families live in the cluster map (D317 ticket 5). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
+- **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as the map would. Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
+- **A drop** removes the table from the map, and each partition drops it. Sessions and feeds on the table end as they do on a single node.
+- **The map's writer makes every change.** A create or drop through another node is forwarded to it ([Running a cluster](#running-a-cluster)). Concurrent changes through different nodes all land, one after another. A forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`: a create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
+- **The window:** the writer sets the map and pushes it, and each node brings its partition's file up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. The reply's `unreconciled` lists partitions whose node the push missed. `phdb cluster status` shows each partition's state.
+- **Tables made by hand** in a partition's file stay. One the map doesn't place is left alone, and `Cluster.Status` lists it as unmapped. A create through the map under its name takes it over, data included.
+- **Listing:** `ListTables` and `DescribeTable` answer from the map, so they show every table of the cluster and never a partition's own `__phdb_` tables.
 
 ### Transactions and snapshots
 Transactions and pinned snapshots run in one partition, on its node.
@@ -481,7 +497,7 @@ Scans and multi-gets read across the partitions, in key order, and return what o
   - **Snapshots:** a traversal reads each hop at its own time, and each partition at its own snapshot, rather than at one snapshot for the whole traversal.
   - **Latency:** each hop is a round trip to the partitions' nodes, so a deep traversal of a graph spread across nodes costs hops × that round trip. Keep a graph's tables in one partition where you can.
   - **With `allow_partial`:** a `Nearest` result is exact over the partitions reached. A traversal skips an unreachable partition's frontier nodes, so it doesn't follow their edges, and the later hops and the ranking are exact only over what was reached. `missing` names what was skipped.
-- **The index searches across partitions** (`Vectors.Search`, `Text.Search`) come with a later step.
+- **The index searches** (`Vectors.Search`, `Text.Search`) aren't supported on a cluster in this release (#1722, 1.3.0). For vectors, `Nearest` fans out.
 
 ### Feeds
 `Feed.Subscribe` works the same through any node. The node you call follows every partition that holds the subscription's tables, opening a single-node subscription on each partition's node, and merges them into one stream. With a `prefix`, only the partitions whose key ranges can hold such rows are followed.

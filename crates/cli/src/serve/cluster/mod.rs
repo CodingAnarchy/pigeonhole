@@ -17,6 +17,7 @@ pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod position;
 pub(crate) mod route;
+pub(crate) mod schema;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
@@ -150,6 +151,32 @@ pub(crate) struct Node {
     routes: arc_swap::ArcSwapOption<route::Routes>,
     /// One awaited map pull at a time ([`Node::pull_now`]).
     pulling: tokio::sync::Mutex<()>,
+    /// A serving node's schema reconcile (D317 ticket 5), run on every install before the
+    /// map's routes serve: [`schema::attach`] sets it.
+    reconciler: std::sync::OnceLock<Reconciler>,
+    /// The last reconcile: the map version, and its outcome, for `Status`.
+    reconciled: Mutex<Option<(u64, schema::Outcome)>>,
+    /// Whether this node has taken its peers' newer maps since it started (cleared by
+    /// [`run`] for a node that restarts with a map, set by [`Node::sync_on_start`]). The
+    /// map's writer changes the map only once it has (D317 amendment 1): a writer back from
+    /// a forced recovery finds the forced map first, which no longer names it.
+    synced: std::sync::atomic::AtomicBool,
+    /// One schema change at a time at the map's writer ([`schema`]'s `change_map`), so
+    /// concurrent ones queue rather than retry each other's compare-and-set (D317
+    /// amendment 1). Held across the set and its push, never inside an install.
+    pub(crate) schema_changes: tokio::sync::Mutex<()>,
+}
+
+/// A partition's reconcile to a map; `None` once the server is gone.
+pub(crate) type Reconcile = dyn Fn(&ClusterMap) -> Option<schema::Outcome> + Send + Sync;
+
+/// [`Reconcile`], boxed for [`Node::reconciler`].
+pub(crate) struct Reconciler(pub(crate) Box<Reconcile>);
+
+impl std::fmt::Debug for Reconciler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reconciler")
+    }
 }
 
 impl Node {
@@ -175,6 +202,10 @@ impl Node {
             installing: Mutex::new(()),
             routes: arc_swap::ArcSwapOption::new(routes),
             pulling: tokio::sync::Mutex::new(()),
+            reconciler: std::sync::OnceLock::new(),
+            reconciled: Mutex::new(None),
+            synced: std::sync::atomic::AtomicBool::new(true),
+            schema_changes: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -267,6 +298,10 @@ impl Node {
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
         let version = canonical.map_version;
+        // The partition's files take the map's schema before its routes serve (D317 ticket
+        // 5): a call routed by this map finds its table, or `TableNotFound` while a node
+        // that hasn't taken it yet catches up.
+        self.reconcile(&canonical);
         let routes = Arc::new(route::Routes::new(&canonical));
         let mut st = self.state();
         st.map = Some((canonical, json));
@@ -291,11 +326,47 @@ impl Node {
             .map_err(|e| ApiError::internal(e.to_string()))?
     }
 
-    /// `Cluster.SetMap`: compare-and-set on the version, then push to the others.
+    /// `Cluster.SetMap`: compare-and-set on the version, then push to the others. Only the
+    /// map's writer, the node with the smallest id in its current map, sets a map (D317
+    /// amendment 1); another answers `WrongPartition` naming it, and `phdb cluster set-map`
+    /// follows. `force` (the forced recovery, for a writer that's down) skips the writer and
+    /// the compare-and-set: the map need only be the same cluster's, at a version above this
+    /// node's.
     async fn set_map(self: &Arc<Self>, req: SetMapRequest) -> Result<SetMapResponse, ApiError> {
         let map = req
             .map
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
+        if req.force {
+            let version = self.install_async(map, false, |_| Ok(None)).await?;
+            let pushed = self.push_all().await;
+            return Ok(SetMapResponse {
+                map_version: version,
+                pushed,
+            });
+        }
+        if let Ok(current) = self.get_map() {
+            let w = schema::writer(&current);
+            if w != self.id {
+                let address = current
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == w)
+                    .map(|n| n.address.as_str())
+                    .unwrap_or_default();
+                return Err(ApiError::wrong_partition(
+                    current.map_version,
+                    format!(
+                        "node {w} (at {address}) is the cluster map's writer: set the map \
+                         there, or with --force if it's down"
+                    ),
+                ));
+            }
+            if !self.synced.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ApiError::partition_unavailable(
+                    "this node is still taking its peers' maps after starting: try again",
+                ));
+            }
+        }
         let expected = req.expected_map_version;
         let version = self
             .install_async(map, true, move |st| {
@@ -389,6 +460,8 @@ impl Node {
             }
         }
         self.push_all().await;
+        self.synced
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// [`Node::push_map`] on a blocking thread.
@@ -467,6 +540,7 @@ impl Node {
                 file,
                 ok: false,
                 error: String::new(),
+                ..Default::default()
             };
             match identity::read_file(&path) {
                 Ok(None) => lp.error = "no identity row: run phdb cluster init-partition".into(),
@@ -512,7 +586,28 @@ impl Node {
                             "the map places it here, but the directory has no {}.phdb",
                             p.id
                         ),
+                        ..Default::default()
                     });
+                }
+            }
+        }
+        // The open partition's reconcile (D317 ticket 5).
+        if let Some((v, o)) = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            for lp in &mut partitions {
+                if map.as_ref().is_some_and(|m| {
+                    m.partitions
+                        .iter()
+                        .any(|p| p.id == lp.id && p.node == self.id)
+                }) {
+                    lp.reconciled_version = v;
+                    lp.reconcile_errors = o.errors.clone();
+                    lp.unmapped_tables = o.unmapped.clone();
+                    lp.adopted_tables = o.adopted.clone();
                 }
             }
         }
@@ -772,8 +867,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
         let msg = req.into_inner();
-        let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
         let op = forward::op_of(msg.op)?;
+        // A schema change at the map's writer takes its caller's scope uncapped, from this
+        // node's own token entry (D317 amendment 1).
+        let caller = match op {
+            crate::serve::service::ServiceOp::CreateTable(_)
+            | crate::serve::service::ServiceOp::DropTable(_) => {
+                forward::schema_caller_of(msg.caller, &self.0.tokens)?
+            }
+            _ => forward::caller_of(msg.caller, &self.0.tokens)?,
+        };
         let reply = shared.router.serve_forwarded(op, &caller).await?;
         let (reply, charge) = forward::reply_to_forward(reply)?;
         let mut resp = tonic::Response::new(reply);
@@ -1097,15 +1200,11 @@ pub(crate) fn run(
         limits,
         metrics,
     });
+    // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
+    // map it takes.
+    schema::attach(&node, &shared);
     // A node that restarts with a map takes a newer one from its peers, then pushes.
-    let start: Option<Box<dyn FnOnce() + Send>> = (version > 0).then(|| {
-        let n = Arc::clone(&node);
-        Box::new(move || {
-            tokio::spawn(async move {
-                n.sync_on_start().await;
-            });
-        }) as Box<dyn FnOnce() + Send>
-    });
+    let start = start_sync(&node, version);
     super::serve_shared(
         super::Serving {
             args,
@@ -1119,6 +1218,24 @@ pub(crate) fn run(
         },
         stderr,
     )
+}
+
+/// For a node that starts with a map at `version`: what runs once it serves, taking its
+/// peers' newer maps ([`Node::sync_on_start`]). Until that's done, the node changes no map
+/// as the writer (D317 amendment 1), so a writer back after a forced recovery takes the
+/// forced map, which no longer names it, before anything else. `None` for a node without a
+/// map yet.
+pub(crate) fn start_sync(node: &Arc<Node>, version: u64) -> Option<Box<dyn FnOnce() + Send>> {
+    (version > 0).then(|| {
+        node.synced
+            .store(false, std::sync::atomic::Ordering::Release);
+        let n = Arc::clone(node);
+        Box::new(move || {
+            tokio::spawn(async move {
+                n.sync_on_start().await;
+            });
+        }) as Box<dyn FnOnce() + Send>
+    })
 }
 
 /// The options a cluster node opens its partition with: the server's shard poll (none by

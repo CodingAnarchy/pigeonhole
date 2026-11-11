@@ -222,6 +222,31 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         if t.group != n.group {
             return Err(format!("table {:?}'s co-location group changed", t.name));
         }
+        // D317 ticket 5: a table's incarnation and its families are fixed; families may only
+        // be added (options are fixed at creation).
+        if t.created != n.created {
+            return Err(format!(
+                "table {:?}'s created version changed: drop the table, then create it again",
+                t.name
+            ));
+        }
+        for f in &t.families {
+            match n.families.iter().find(|g| g.name == f.name) {
+                None => {
+                    return Err(format!(
+                        "table {:?}'s family {:?} went away: families are only added",
+                        t.name, f.name
+                    ));
+                }
+                Some(g) if g != f => {
+                    return Err(format!(
+                        "table {:?}'s family {:?} changed: a family's options are fixed at creation",
+                        t.name, f.name
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         used.extend(t.partitions.iter().map(String::as_str));
     }
     let new_partitions: HashMap<&str, _> =
@@ -332,6 +357,7 @@ mod tests {
                 families: Vec::new(),
                 splits,
                 partitions: parts.iter().map(|p| (*p).into()).collect(),
+                created: 0,
             };
         ClusterMap {
             cluster_id: "c1".into(),
@@ -485,6 +511,7 @@ mod tests {
             families: Vec::new(),
             splits: Vec::new(),
             partitions: vec!["p4".into()],
+            created: 0,
         });
         validate(&ok, true).unwrap();
         validate_change(&old, &ok).unwrap();

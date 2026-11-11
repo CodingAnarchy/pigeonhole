@@ -4,8 +4,8 @@ syntax = "proto3";
 
 package pigeonhole.v1;
 
-import "pigeonhole/v1/data.proto";
 import "pigeonhole/v1/common.proto";
+import "pigeonhole/v1/data.proto";
 import "pigeonhole/v1/feed.proto";
 import "pigeonhole/v1/schema.proto";
 import "pigeonhole/v1/transactions.proto";
@@ -91,6 +91,11 @@ message TablePlacement {
   // `splits.len() + 1` partition ids: range i is `[splits[i-1], splits[i])`, the first
   // starting at the empty key and the last open-ended.
   repeated string partitions = 5;
+  // The map version that created the table through `Schema.CreateTable` (D317 ticket 5), or
+  // 0 for a placement set by hand. Fixed for the table's life: a table dropped and created
+  // again under its name gets a new one, which tells a node that missed both to drop the
+  // old table and create the new.
+  uint64 created = 6;
 }
 
 // A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
@@ -108,6 +113,11 @@ message SetMapRequest {
   // The map version the caller replaces: 0 for a node's first map.
   uint64 expected_map_version = 1;
   ClusterMap map = 2;
+  // The forced recovery for a map writer that's down (D317 amendment 1): set the map at
+  // this node, which needn't be the writer, without the compare-and-set. The map must be
+  // the cluster's, at a version above this node's. `phdb cluster set-map --force` sets it at
+  // a version above every reachable node's, naming a live writer.
+  bool force = 3;
 }
 
 message SetMapResponse {
@@ -154,6 +164,14 @@ message LocalPartition {
   // False when the file couldn't be read, or its row doesn't match the map: `error` says why.
   bool ok = 4;
   string error = 5;
+  // The partition's schema reconcile (D317 ticket 5), on the node serving it: the map version
+  // it last reconciled to, what failed, the tables in the file the map doesn't place (made
+  // by hand: left alone), and the tables a create through the map took over from a hand-made
+  // one of the same name.
+  uint64 reconciled_version = 6;
+  repeated string reconcile_errors = 7;
+  repeated string unmapped_tables = 8;
+  repeated string adopted_tables = 9;
 }
 
 // A forwarded single-key call (D317 ticket 2).
@@ -186,6 +204,11 @@ message ForwardRequest {
     // One partition's part of a `Nearest` the sending node fans out (D317 ticket 4b): its
     // keys, or the range clipped to the partition. After D317 ticket 3's arms.
     NearestRequest nearest = 18;
+    // A schema change, sent to the map's writer: the node with the smallest id in the map,
+    // which alone changes the map for schema calls, so two entry nodes' changes can't
+    // diverge (D317 ticket 5). Another node answers `WrongPartition`.
+    CreateTableRequest create_table = 19;
+    DropTableRequest drop_table = 20;
   }
 }
 
@@ -231,6 +254,8 @@ message ForwardResponse {
     OpenSnapshotResponse open_snapshot = 9;
     Empty empty = 10;
     NearestResponse nearest = 11;
+    // `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
+    TableResponse table = 12;
   }
 }
 

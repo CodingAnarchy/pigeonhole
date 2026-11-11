@@ -452,6 +452,7 @@ fn racing_creates_and_drops_leave_the_cache_on_the_live_table() {
                 ..Default::default()
             }],
             if_missing: true,
+            placement: None,
         })
     };
     let drop_c = || ServiceOp::DropTable(proto::DropTableRequest { name: "c".into() });
