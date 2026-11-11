@@ -357,6 +357,7 @@ pub(crate) fn run(
         args.io_threads,
         args.blocking_threads,
         args.feed_threads,
+        args.affinity == config::Affinity::On,
     ));
     let limits = args.limits();
     // A cap above half the open-file limit leaves the database too few descriptors: said,
@@ -516,6 +517,9 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
             placement.free_cpus,
             placement.mode,
         );
+        if let Some(note) = &placement.note {
+            let _ = writeln!(stderr, "phdb serve: {note}");
+        }
         if args.memory.embed_local
             && let Some(line) = candle_advice(
                 placement.cpu_list(),

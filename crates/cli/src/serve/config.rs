@@ -7,6 +7,15 @@ use std::time::Duration;
 
 pub(crate) use super::sessions::Leases;
 
+/// `--affinity`: whether the server's own threads are masked off the shards' cores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Affinity {
+    /// Masked off the shards' cores (the default).
+    On,
+    /// No mask: the same threads, where the OS puts them.
+    Off,
+}
+
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -120,6 +129,12 @@ pub(crate) struct ServeArgs {
     /// so a hub never waits behind its streams' delivery.
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
+    /// Whether the network, feed and blocking threads get a CPU mask off the shards' cores
+    /// (Linux, where the engine pinned its shards). `off` keeps the same thread counts but
+    /// leaves the threads where the OS puts them: for a host shared with other work, where
+    /// the server shouldn't claim the CPUs (D313's R1, ICR 0131).
+    #[arg(long, value_enum, value_name = "on|off", default_value_t = Affinity::On)]
+    pub affinity: Affinity,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
     /// (default: hyper's 400 KiB; at least 16 KiB, one frame). Smaller bounds a feed
     /// stream's queued delivery.
