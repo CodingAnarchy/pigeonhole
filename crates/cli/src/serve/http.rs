@@ -163,11 +163,21 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                 .load_shed()
                 .concurrency_limit(limits.max_concurrent),
         );
-    axum::Router::new()
+    let app = axum::Router::new()
         .route("/v1/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(Arc::clone(&shared))
-        .merge(limited)
+        .merge(limited);
+    // A cluster node's own service, beside the data routes (D317 ticket 2).
+    let app = match shared.router.cluster_node() {
+        Some(node) => app.merge(super::cluster::routes(
+            Arc::clone(node),
+            Some(Arc::clone(&shared)),
+            limits.max_request_bytes,
+        )),
+        None => app,
+    };
+    app
         // Outermost, so a body is read before any early answer: health, shedding, auth.
         .layer(axum::middleware::from_fn_with_state(shared, preread))
 }
@@ -261,8 +271,13 @@ async fn tables(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
 }
 
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
-    // Liveness only, with no token: whether the database is open and not failed.
-    let ok = !shared.router.service.db.is_failed();
+    // Liveness only, with no token: whether the database is open and not failed. A node that
+    // only routes has none, and is up while it runs (D317 ticket 2).
+    let ok = shared
+        .router
+        .service
+        .part_opt()
+        .is_none_or(|p| !p.db.is_failed());
     let reply = proto::HealthResponse {
         status: if ok { "ok" } else { "failed" }.into(),
     };
@@ -495,9 +510,11 @@ impl Event for proto::MemoryEvent {
 }
 
 impl Event for proto::FeedEvent {
-    /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112).
+    /// The event's token, as its JSON gives it, so `Last-Event-ID` resumes (ICR 0112). None
+    /// for an event without one (a cluster subscription's events between checkpoints, D317
+    /// ticket 7), so the client's `Last-Event-ID` stays at the last checkpoint.
     fn sse_id(&self) -> Option<String> {
-        Some(base64(&self.token))
+        (!self.token.is_empty()).then(|| base64(&self.token))
     }
 }
 

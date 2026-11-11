@@ -18,7 +18,7 @@ cargo install pigeonhole-cli --features serve
 cargo install pigeonhole-cli --features serve,embed-local
 ```
 
-**Start** it on a database file. `--create` makes the file if it's missing. For a quick try, add `--no-wal-preallocate`, so the start doesn't write each shard's log in full first ([below](#running-it)):
+**Start** it on a database file. `--create` makes the file if it's missing. For a quick try, add `--no-wal-preallocate`, so the start doesn't write each shard's log in full first (see "Start-up writes the logs in full" below):
 
 ```sh
 phdb serve app.phdb --create
@@ -31,7 +31,7 @@ phdb serve: serving app.phdb on 127.0.0.1:7448 (no TLS, no tokens; 8 network, 2 
 - **The address:** by default `127.0.0.1:7448`; `--listen ADDR:PORT` sets another. gRPC (`/pigeonhole.v1.Data/Get`) and HTTP/JSON (`POST /v1/Data/Get`) share the port.
 - **The startup line** says what the server runs with: TLS, tokens, its threads, and where they run ([Threads and placement](#threads-and-placement)).
 - **Stopping:** Ctrl-C or SIGTERM. In-flight requests get `--shutdown-grace-ms` to finish, and then the server closes the database cleanly.
-- **A new database's shards:** `--shards` sets the count. The default is half the physical cores, which leaves the other half for the network side. An existing database keeps its own count.
+- **The shards:** `--shards` sets the count. The default is half the physical cores, which leaves the other half for the network side. It applies on every start, a restart included, since the count isn't stored in the file. A database with a change feed is the exception: it keeps the count its feed recorded, because another count ends the feed's history (`--shards` with another count reshards it on purpose).
 - **Start-up writes the logs in full** (#1621, ICR 0130). Before it accepts connections, `serve` gives each shard's write-ahead log every slot it holds when busy, zero-filled and synced. That's 5 slots of 64 MiB a shard at the defaults (two for unflushed writes, two spares and the slot in use), plus the change feed's retention spread over the shards (at least 2 slots a shard with the feed on). Otherwise each log grows while the server runs, and its zero-fill lengthens commits' tail latency for as long as it grows.
   - **Disk:** slots × 64 MiB per shard, from the start. At the defaults that's 320 MiB a shard: about 1.25 GiB on 4 shards and 5 GiB on 16. With the feed on, a shard holds at least 7 slots (about 1.75 GiB on 4 shards, 7 GiB on 16). With `--change-feed 4294967296` (4 GiB) on 16 shards, it's 9 slots a shard, about 9 GiB.
   - **Time:** the open writes and syncs all of it, every shard's log in parallel, which takes a few seconds on NVMe before `serving ... on` appears. A database whose feed is on keeps its logs across a clean stop, so a restart adds no slot and only zero-fills again the ones the last run never used. Without the feed the logs are removed at a clean stop, and the next start writes them again.
@@ -246,7 +246,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 - A write the server has submitted always answers its real outcome.
 
 ## Threads and placement
-- **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. Each stream's framing still runs on its connection's network thread.
+- **Threads:** `--shards` sets the shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. The shared subscriptions (hubs) that read the engine's feed run on threads of their own (`phdb-serve-feed-hub`), a quarter as many as `--feed-threads`, at least 1, on the same CPUs, so a hub never waits behind its streams' delivery and falls behind the database (#1397). Each stream's framing still runs on its connection's network thread.
 - **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the network, feed and blocking threads get an affinity mask of the other CPUs. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206), and one on a shard's SMT sibling doubled p99 (#1244). The startup line's last part says which mask the server built:
   - **`off the shards' cores`:** every CPU but the shards' and their SMT siblings;
   - **`unmasked (too few free cores)`:** fewer than two CPUs are left once the shards' cores and their SMT siblings are taken out: a small host, or a `--shards` near the core count. Each shard's driver thread takes a core, so at one shard per core none is left. The threads then get no mask, and the server says why on a line of its own. On the shards' SMT siblings they cost the shards more than they do left to the OS (g70d). Lower `--shards` to get the mask back;
@@ -375,7 +375,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. So far a node keeps and distributes the partition map. Serving the partitions' data comes in the next steps, and this section grows with them.
+**In progress (D317, ICR 0117).** One database split across several nodes by key range: each partition is a whole database file on a node. A node keeps and distributes the partition map, serves single-row reads and writes for the whole cluster (forwarding each to the node that owns its row), fans scans and multi-gets out across the partitions, and serves change feeds across them. Transactions, graph and vector reads across partitions, schema changes and backups come in the next steps, and this section grows with them.
 
 - **`phdb serve --cluster DIR --node-id ID`** runs a node.
   - `DIR` holds the node's map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`).
@@ -390,6 +390,55 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **`phdb cluster status --node URL`** shows every node's map version side by side.
 - **`phdb cluster show-map (--node URL | --file DIR/cluster-map.json)`** prints a map.
 - **Choosing ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
+- **Serving data:** any node takes any call. It serves the call if its partition holds the row, and otherwise forwards it to the node that does. A client needs no map; one that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
+  - **What's served:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters, by their row. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
+  - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
+  - **Scans and multi-gets** read across the partitions, in key order, and return what one database holding all of them would (D317 ticket 4a):
+    - **Scans:** each page holds one partition's rows, and each partition reads at its own snapshot, so rows in different partitions aren't from one point in time. A row is never torn.
+    - **Multi-gets:** a page is exactly what a single node would return for the same keys and `page_bytes`.
+    - **Resume** from a page's `next` through any node. A cluster's positions are its own: one from a single node, or one sent to a single node, is refused with `InvalidArgument`.
+    - **A partition that can't be reached** fails the read with `PartitionUnavailable`. With `allow_partial: true`, the read skips it and names its key range in `missing`: a scan on its next page (or a last, empty one), a multi-get on its reply.
+    - **Not yet:** a scan or multi-get with a `snapshot_id`.
+  - **Refused with `Unsupported`,** naming the step that brings each: transactions and snapshots, `Nearest`, `Traverse` and the index searches across partitions, schema calls (`ListTables` included), backups, `Info` and `/mcp`.
+  - **A node with one partition per node:** a node opens the partition its map gives it at start, and checks the file's identity row against the map. Several partitions per node, and moving a partition, come later. A node the map gives no partition only routes.
+  - **Flags:** a cluster node takes `--shard-spin`, `--shm-dir` and `--change-feed` as a single node does, for its partition. `--memory`, `--backup-dir`, `--create` and `--replica-of` are refused until the steps that bring them.
+  - **Tables are created in each partition's file** before its node starts, for now: `phdb` against the file, after `init-partition`. Schema through the cluster comes later.
+- **Change feeds:** `Feed.Subscribe` through any node follows every partition that holds the subscription's tables (only those whose key ranges can hold its prefix), and merges them into one stream. Turn the feed on in each partition with `--change-feed`.
+  - **Order:** each partition's commits arrive in its commit order, so each row's do. There's no order across partitions: a commit on one can arrive after a later one on another.
+  - **Partition and seqno:** each event names its `partition`. A commit's `seqno` is that partition's own, and is comparable only with seqnos of the same partition.
+  - **Tokens are checkpoints.** A cluster token holds every partition's position, so on a subscription over several partitions only some events carry one; the others have an empty `token`. A one-partition subscription, or one with `checkpoint_every: 1`, has a token on every event, as on a single node.
+  - **Resuming:** resume from the last checkpoint you've stored. You may get again the commits that came after it, up to 64 in all (`checkpoint_every`, if you set it).
+  - **The client loop**: store the last token and, per partition, the last seqno you've handled, with the work they fed:
+
+    ```text
+    for each event:
+        if event.commit and event.commit.seqno <= last_seen[event.partition]: skip it  (a repeat)
+        handle it
+        if event.commit: last_seen[event.partition] = event.commit.seqno
+        if event.token:  token = event.token
+        store (token, last_seen) with what you handled
+    to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, seqno}] }
+    ```
+
+    With `skip_through` the server passes over the repeats itself, so nothing arrives twice. Without it, the `seqno` check drops them. Over SSE, events without a token carry no `id:`, so `Last-Event-ID` reconnects from the last checkpoint and the `seqno` check applies.
+  - **What a token costs:** a checkpoint every N commits keeps the token at about 150 bytes per event on average:
+
+    | Partitions × shards each | Checkpoint size | One every |
+    |---|---|---|
+    | 2 × 16 | about 310 B | 3 commits |
+    | 16 × 4 | about 1 KB | 7 commits |
+    | 16 × 16 | about 2.4 KB | 16 commits |
+    | 64 × 16 | about 9.5 KB | 64 commits |
+
+    Past about 64 partitions × 16 shards, a checkpoint comes every 64 commits and costs more per event.
+  - **`allow_partial: true`** keeps the stream going when a partition's node can't be reached. A `partition_state` event says which partition is missing, and again when it's back. Its commits then continue from where they left off, with none skipped. Without it, the stream ends with `PartitionUnavailable` naming the partition; resume once the node is back.
+  - **Limits:** a subscription holds a `--max-streams` place on the node it entered, and one on each partition's node. An entry node that also serves one of its partitions holds two. It buffers up to 256 KiB on its entry node and on each partition's node: (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
+  - **Expiry:** a token can't resume after its partitions' map changed under it (a new table in a subscription of every table), or after a partition was relocated: `FeedExpired`, subscribe again.
+  - A start from a snapshot isn't supported on a cluster subscription.
+- **Errors a cluster adds:**
+  - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
+  - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.
+  - `WrongPartition` is handled between nodes: a node with an older map pulls the newer one and forwards again.
 
 ## Performance
 > **Coming with D313 ticket 9b:** the serve bench's numbers on the reference machine: puts, gets and scans over gRPC and HTTP/JSON, and the change feed's delivery at many subscribers, with and without the placement mask.

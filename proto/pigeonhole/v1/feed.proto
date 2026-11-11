@@ -28,18 +28,58 @@ message SubscribeRequest {
     // After an earlier event's `token`.
     bytes resume = 6;
   }
+  // A cluster subscription only (D317 ticket 7, ICR 0117); `InvalidArgument` on a single
+  // node. An unreachable partition doesn't end the stream: the others continue, a
+  // `PartitionState` event says which is missing, and it resumes where it left off when it
+  // comes back, with nothing skipped.
+  bool allow_partial = 7;
+  // A cluster subscription resumed from a token only: per partition, the seqno of the last
+  // commit the client has already handled after that token. The server passes over those
+  // commits rather than send them again, at most 64 per partition (more is
+  // `InvalidArgument`); a seqno at or below the token's position changes nothing.
+  repeated PartitionSeqno skip_through = 8;
+  // A cluster subscription only: a token every this many events, from 1 (every event, as a
+  // single node sends) to 64. Unset (0): the server's choice, about 150 bytes of token per
+  // event on average, and every event for a one-partition subscription.
+  uint32 checkpoint_every = 9;
+}
+
+// A partition's own commit seqno: comparable only with other seqnos of the same partition.
+message PartitionSeqno {
+  string partition = 1;
+  uint64 seqno = 2;
 }
 
 message FeedEvent {
   // The feed's position after this event: `resume` continues exactly after it. Opaque,
-  // and not comparable byte for byte across streams.
+  // and not comparable byte for byte across streams. On a cluster subscription over several
+  // partitions only some events carry one (checkpoints): empty on the rest, and a resume
+  // from the last one may deliver again the events after it, which the client recognises by
+  // `(partition, commit.seqno)` (ICR 0117).
   bytes token = 1;
   oneof event {
     FeedCommit commit = 2;
     // Field 3 is planned for a whole-database feed's catalog events (D315, #1436).
     // The position moved past commits the stream's filters skipped: only `token` matters.
     Progress progress = 4;
+    // A cluster subscription's partition became unavailable or available again.
+    PartitionState partition_state = 6;
   }
+  // On a cluster subscription, the partition the event came from; empty on a single node.
+  string partition = 5;
+}
+
+// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
+// which keeps the stream open; sent at the start for each partition unavailable then, and
+// on each change), or available again. Its commits are delivered, in order and once each,
+// when it comes back.
+message PartitionState {
+  string partition = 1;
+  bool available = 2;
+  // Why it's unavailable: a stable code name (`PartitionUnavailable`, `WrongPartition` while
+  // the node finds the partition's new node, ...); empty when available.
+  string reason = 3;
+  string message = 4;
 }
 
 message FeedCommit {

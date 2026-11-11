@@ -5,7 +5,7 @@ use super::*;
 /// `g`, an edge family `e`: a -> b, a -> c, b -> d, and c -> x:skip (an edge `qualifier_prefix`
 /// b"x" alone keeps).
 fn graph(s: &Server) -> pigeonhole::Table {
-    let db = &s.shared.router.service.db;
+    let db = &s.shared.router.service.part().unwrap().db;
     let g = db
         .table("g")
         .unwrap()
@@ -141,7 +141,7 @@ fn traverse_refuses_what_it_cannot_walk() {
 
 /// `v`, an `f32` L2 vector family `emb` of dim 2: rows a [0, 1], b [0, 2] and c [0, 3].
 fn vectors(s: &Server) -> pigeonhole::Table {
-    let db = &s.shared.router.service.db;
+    let db = &s.shared.router.service.part().unwrap().db;
     let spec =
         pigeonhole::VectorSpec::new(2, pigeonhole::Element::F32, pigeonhole::Metric::L2).unwrap();
     let v = db
@@ -360,7 +360,7 @@ fn a_background_index_rebalances_on_a_server_thread_that_close_ends() {
     // The coordinator on 7b1: the server runs a background index's rebalancer itself, so
     // its shutdown can wait for the thread before it closes the database.
     let s = Server::start("", limits());
-    let indexes = &s.shared.router.service.indexes;
+    let indexes = &s.shared.router.service.part().unwrap().indexes;
     assert_eq!(
         s.rpc(
             "Vectors/CreateIndex",
@@ -613,7 +613,7 @@ fn a_slow_loader_holds_back_a_fast_client() {
     let s = Server::start_custom("", limits(), 1, move |mut svc| {
         // Only the first load is held.
         let held = std::sync::atomic::AtomicBool::new(false);
-        svc.bulk.loader = Arc::new(move |index, expected, input| {
+        svc.part_mut().bulk.loader = Arc::new(move |index, expected, input| {
             if held.swap(true, Ordering::Relaxed) {
                 return super::bulk::load(index, expected, input);
             }
@@ -670,7 +670,7 @@ fn a_slow_loader_holds_back_a_fast_client() {
         reserved <= 2 * message_bytes + 64,
         "the server holds two messages' budget at most: {reserved} bytes, {message_bytes} each"
     );
-    let g = &service.bulk.gauges;
+    let g = &service.part().unwrap().bulk.gauges;
     assert_eq!(g.phase.load(Ordering::Relaxed), 1, "receiving");
     assert!(g.vectors.load(Ordering::Relaxed) >= EACH as u64);
     // A second load waits for the one-load slot, here past its client's deadline.
@@ -724,7 +724,7 @@ fn a_shutdown_stops_a_running_load_between_messages() {
         .as_ref()
         .unwrap()
         .spawn(async move { client.bulk_load(messages).await });
-    let bulk = &s.shared.router.service.bulk;
+    let bulk = &s.shared.router.service.part().unwrap().bulk;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while bulk.gauges.vectors.load(Ordering::Relaxed) < 10 {
         assert!(
@@ -765,7 +765,7 @@ fn a_shutdown_stops_a_running_load_between_messages() {
 #[test]
 fn dropping_an_index_s_table_evicts_its_handle_and_its_rebalancer() {
     let s = Server::start("", limits());
-    let indexes = &s.shared.router.service.indexes;
+    let indexes = &s.shared.router.service.part().unwrap().indexes;
     let insert = |id: &[u8], y: f32| {
         let (status, e) = s.rpc(
             "Vectors/Insert",

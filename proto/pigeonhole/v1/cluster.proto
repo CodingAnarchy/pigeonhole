@@ -4,6 +4,8 @@ syntax = "proto3";
 
 package pigeonhole.v1;
 
+import "pigeonhole/v1/data.proto";
+import "pigeonhole/v1/feed.proto";
 import "pigeonhole/v1/schema.proto";
 
 service Cluster {
@@ -25,6 +27,24 @@ service Cluster {
   // This node: its id, its map version and the partitions in its directory. Read, admin or
   // cluster scope.
   rpc Status(StatusRequest) returns (NodeStatus);
+  // Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
+  // the caller it names, whose scope and namespaces this node checks again. This node
+  // serves it only if its own map gives it the key; otherwise `WrongPartition` with its
+  // `map_version`, and it never forwards it on (the sending node pulls the map and forwards
+  // once more). Every other answer is the call's own, as a single node gives it. Cluster
+  // scope, gRPC only.
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  // Node to node (D317 ticket 4): one partition's part of a scan the sending node fans out,
+  // for the caller it names, as this node's own `Data.Scan` stream of it. This node serves
+  // it only if its map gives it `partition` and it has the partition open; otherwise
+  // `WrongPartition` with its `map_version`. Cluster scope, gRPC only.
+  rpc ForwardScan(ForwardScanRequest) returns (stream ScanPage);
+  // Node to node (D317 ticket 7): one partition's part of a cluster subscription, which the
+  // sending node merges with the others. Served only if this node's map gives it the
+  // partition, and only on connections of their own (never the `Forward` pool), so a
+  // subscriber that stops reading can't stall forwarded calls. The events are a single
+  // node's: a token on every one, no `partition`. Cluster scope, gRPC only.
+  rpc ForwardSubscribe(ForwardSubscribeRequest) returns (stream FeedEvent);
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -131,4 +151,73 @@ message LocalPartition {
   // False when the file couldn't be read, or its row doesn't match the map: `error` says why.
   bool ok = 4;
   string error = 5;
+}
+
+// A forwarded single-key call (D317 ticket 2).
+message ForwardRequest {
+  // The sending node's map version. Only older isn't a reason to refuse (D132).
+  uint64 map_version = 1;
+  // Who the call is for, checked again here.
+  ForwardedCaller caller = 2;
+  oneof op {
+    GetRequest get = 3;
+    ReadRowRequest read_row = 4;
+    MutateRequest mutate = 5;
+    CheckAndMutateRequest check_and_mutate = 6;
+    MutateRequest mutate_returning = 7;
+    // Every row in one partition: a batch across partitions is refused before it's sent.
+    BatchRequest batch = 8;
+    // One partition's keys of a multi-get the sending node fans out (D317 ticket 4).
+    MultiGetRequest multi_get = 9;
+  }
+}
+
+// One partition's part of a fanned-out scan (D317 ticket 4).
+message ForwardScanRequest {
+  // The sending node's map version, as in `ForwardRequest`.
+  uint64 map_version = 1;
+  ForwardedCaller caller = 2;
+  // The partition to scan: it must be this node's.
+  string partition = 3;
+  // The scan, with `after` (if any) this partition's own position and `limit` what's left.
+  ScanRequest scan = 4;
+}
+
+// The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
+// forwarded.
+message ForwardedCaller {
+  // `read` or `write`.
+  string scope = 1;
+  // The namespaces the caller's token is limited to. Empty with `all_namespaces`.
+  repeated string namespaces = 2;
+  bool all_namespaces = 3;
+}
+
+// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
+// call's own status.
+message ForwardResponse {
+  oneof reply {
+    GetResponse get = 1;
+    ReadRowResponse read_row = 2;
+    // `mutate` and `batch`.
+    MutateResponse mutate = 3;
+    CheckAndMutateResponse check_and_mutate = 4;
+    MutateReturningResponse mutate_returning = 5;
+    MultiGetResponse multi_get = 6;
+  }
+}
+
+message ForwardSubscribeRequest {
+  // The sending node's map version, as for `Forward`.
+  uint64 map_version = 1;
+  // Who the subscription is for, checked again here.
+  ForwardedCaller caller = 2;
+  // The partition whose part this is: every table in `request` must be placed on it.
+  string partition = 3;
+  // A single node's subscription: tables, prefix, visibility and start (`resume` is this
+  // partition's own token). Its cluster-only fields are unset.
+  SubscribeRequest request = 4;
+  // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
+  // most 64 of them; 0: none.
+  uint64 skip_through = 5;
 }

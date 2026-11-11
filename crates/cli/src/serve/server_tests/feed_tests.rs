@@ -38,6 +38,8 @@ fn a_feed_streams_commits_under_its_prefix_and_resumes_from_a_token() {
         s.shared
             .router
             .service
+            .part()
+            .unwrap()
             .feeds
             .stats
             .rejoined
@@ -46,7 +48,7 @@ fn a_feed_streams_commits_under_its_prefix_and_resumes_from_a_token() {
     );
     let text = s.shared.metrics.render();
     let mut text = text;
-    super::service::render_feeds(&mut text, &s.shared.router.service.feeds);
+    super::service::render_feeds(&mut text, &s.shared.router.service.part().unwrap().feeds);
     assert!(text.contains("pigeonhole_serve_feed_hubs 1"), "{text}");
 }
 
@@ -115,7 +117,7 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
         want[1..],
         "every commit under the prefix, once, in order"
     );
-    let stats = &s.shared.router.service.feeds.stats;
+    let stats = &s.shared.router.service.part().unwrap().feeds.stats;
     assert!(
         stats.fell_behind.load(Ordering::Relaxed) >= 1,
         "it fell off the ring"
@@ -272,6 +274,8 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
         .shared
         .router
         .service
+        .part()
+        .unwrap()
         .db
         .table("t")
         .unwrap()
@@ -316,7 +320,7 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
         }
         assert_eq!(got[i], want, "prefix {:?}, seed {seed}", prefixes[i]);
     }
-    let stats = &s.shared.router.service.feeds.stats;
+    let stats = &s.shared.router.service.part().unwrap().feeds.stats;
     let (fell, rejoined, waits) = (
         stats.fell_behind.load(Ordering::Relaxed),
         stats.rejoined.load(Ordering::Relaxed),
@@ -395,6 +399,8 @@ fn feed_streams_and_hubs_are_capped() {
     s.shared
         .router
         .service
+        .part()
+        .unwrap()
         .db
         .table("u")
         .unwrap()
@@ -451,7 +457,7 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     };
     let mut first = direct_feed(&s, oldest());
     let mut second = direct_feed(&s, oldest());
-    let feeds = &s.shared.router.service.feeds;
+    let feeds = &s.shared.router.service.part().unwrap().feeds;
     wait_for("the second waits for the one slot", || {
         feeds.stats.catch_up_waits.load(Ordering::Relaxed) == 1
     });
@@ -484,7 +490,7 @@ fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
     let mut l = limits();
     l.max_catch_up = 1;
     let s = Server::start("", l);
-    let db = &s.shared.router.service.db;
+    let db = &s.shared.router.service.part().unwrap().db;
     db.table("u")
         .unwrap()
         .family("f", Family::default())
@@ -519,7 +525,7 @@ fn caught_up_clients_rejoin_a_quiet_table_set_while_other_tables_write() {
             .commit()
             .unwrap();
     }
-    let feeds = &s.shared.router.service.feeds;
+    let feeds = &s.shared.router.service.part().unwrap().feeds;
     // The Oldest client delivers r1 first; then all three are on the ring.
     let got_c = drain(&s, &mut c, Duration::from_millis(300));
     assert_eq!(got_c.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), [r1]);
@@ -551,5 +557,39 @@ fn a_now_subscriber_gets_a_write_made_right_after_it_subscribed() {
             .unwrap_or_else(|| panic!("round {i}: the write never arrived"))
             .unwrap();
         assert_eq!(commit_of(&e).map(|(s, _)| s), Some(n), "round {i}");
+    }
+}
+
+#[test]
+fn a_single_node_refuses_a_cluster_subscriptions_fields() {
+    // D317 ticket 7: allow_partial, skip_through and checkpoint_every mean something only
+    // across partitions; a single node says so rather than ignore them.
+    let s = Server::start("", limits());
+    for r in [
+        proto::SubscribeRequest {
+            allow_partial: true,
+            ..subscribe(&["t"], b"")
+        },
+        proto::SubscribeRequest {
+            skip_through: vec![proto::PartitionSeqno {
+                partition: "p1".into(),
+                seqno: 1,
+            }],
+            ..subscribe(&["t"], b"")
+        },
+        proto::SubscribeRequest {
+            checkpoint_every: 4,
+            ..subscribe(&["t"], b"")
+        },
+    ] {
+        let e = s
+            .block_on(s.shared.router.service.call(
+                ServiceOp::Subscribe(r.clone()),
+                &Caller::anonymous(),
+                None,
+            ))
+            .unwrap_err();
+        assert_eq!(e.code, "InvalidArgument", "{r:?}: {e:?}");
+        assert!(e.message.contains("cluster"), "{e:?}");
     }
 }

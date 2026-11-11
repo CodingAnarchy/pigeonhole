@@ -248,7 +248,7 @@ enum Ended {
     /// The TLS handshake failed or timed out.
     Handshake,
     /// hyper's connection ended, with its result.
-    Served(Result<(), String>),
+    Served(Result<(), Box<dyn std::error::Error + Send + Sync>>),
 }
 
 /// Serves one connection: dropped if no byte arrives within `first_byte` (the deadline ends
@@ -275,11 +275,8 @@ where
             .into_owned(),
     );
     tokio::pin!(conn);
-    let served = |r: Result<(), Box<dyn std::error::Error + Send + Sync>>| {
-        Ended::Served(r.map_err(|e| e.to_string()))
-    };
     tokio::select! {
-        r = &mut conn => return served(r),
+        r = &mut conn => return Ended::Served(r),
         () = tokio::time::sleep(first_byte) => {}
     }
     if !got.load(Ordering::Relaxed) {
@@ -287,7 +284,7 @@ where
         // closes; the task's end frees the slot (cli692's N2 on #1653).
         return Ended::Silent;
     }
-    served(conn.await)
+    Ended::Served(conn.await)
 }
 
 pub(crate) async fn serve(

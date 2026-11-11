@@ -163,6 +163,7 @@ fn a_quiet_stream_still_moves_its_token() {
     let event = proto::FeedEvent {
         token: b"\x01\x02".to_vec().into(),
         event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
+        partition: String::new(),
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["token"], "AQI=");
@@ -203,4 +204,48 @@ fn embed_local_advice_names_the_placements_cpus_until_both_are_set() {
     assert_eq!(super::embed_threads(0), 1);
     assert_eq!(super::embed_threads(3), 3);
     assert_eq!(super::embed_threads(30), 4);
+}
+
+/// `phdb serve`'s open with these arguments (`--create`, and `--shards` when given): the
+/// shard count it opened with.
+fn served_shards(file: &std::path::Path, shards: Option<usize>) -> usize {
+    use clap::Parser;
+    let mut argv = vec![
+        "phdb".to_owned(),
+        "serve".to_owned(),
+        file.display().to_string(),
+        "--create".to_owned(),
+    ];
+    if let Some(n) = shards {
+        argv.extend(["--shards".to_owned(), n.to_string()]);
+    }
+    let cli = crate::args::Cli::try_parse_from(argv).unwrap();
+    let crate::args::Command::Serve(args) = &cli.command else {
+        unreachable!("parsed as serve")
+    };
+    let db = super::open(&cli, args).unwrap();
+    let n = db.info().unwrap().shards;
+    db.close().unwrap();
+    n
+}
+
+/// perf287's g70d on #1697: a restarted server without `--shards` keeps the server's default
+/// shard count (half the physical cores), rather than taking the library's one per core,
+/// since the count isn't stored in the file (ICR 0132).
+#[test]
+fn a_restart_without_shards_keeps_the_servers_default_count() {
+    let dir = std::env::temp_dir().join(format!(
+        "phdb-serve-shards-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("s.phdb");
+    let default = super::placement::default_shards();
+    assert_eq!(served_shards(&file, None), default, "created");
+    assert_eq!(served_shards(&file, None), default, "restarted");
+    // `--shards` reshards on purpose, and a restart without it goes back to the default.
+    assert_eq!(served_shards(&file, Some(default + 1)), default + 1);
+    assert_eq!(served_shards(&file, None), default);
+    let _ = std::fs::remove_dir_all(&dir);
 }
