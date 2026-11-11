@@ -3036,6 +3036,22 @@ pub struct CreateTableRequest {
     pub families: ::prost::alloc::vec::Vec<FamilySpec>,
     #[prost(bool, tag = "3")]
     pub if_missing: bool,
+    /// On a cluster node (D317 ticket 5): where the new table's rows live, as the partition map
+    /// places it. Needed to create a table the map doesn't place yet; a single node refuses it.
+    #[prost(message, optional, tag = "4")]
+    pub placement: ::core::option::Option<TablePlacementRequest>,
+}
+/// A new table's placement in a cluster's map (D317 §1): its split keys, sorted and distinct,
+/// and `splits.len() + 1` partitions, range i being `\[splits[i-1\], splits\[i\])`; or a
+/// co-location group, whose tables are unsplit on one partition.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TablePlacementRequest {
+    #[prost(string, tag = "1")]
+    pub group: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    pub splits: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    #[prost(string, repeated, tag = "3")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DropTableRequest {
@@ -3054,6 +3070,11 @@ pub struct TableResponse {
     /// Each family's stored options.
     #[prost(message, repeated, tag = "2")]
     pub families: ::prost::alloc::vec::Vec<FamilySpec>,
+    /// On a cluster node, after a create (D317 ticket 5): the table's partitions whose node
+    /// hadn't confirmed the change when the call answered. They catch up when their node next
+    /// takes the map; `Cluster.Status` shows each partition's state.
+    #[prost(string, repeated, tag = "3")]
+    pub unreconciled: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A family and its options (`Family`, read back as `FamilyInfo`). Unset options take the
 /// library's defaults when creating, and are always set when the server describes a family.
@@ -5895,6 +5916,12 @@ pub struct TablePlacement {
     /// starting at the empty key and the last open-ended.
     #[prost(string, repeated, tag = "5")]
     pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The map version that created the table through `Schema.CreateTable` (D317 ticket 5), or
+    /// 0 for a placement set by hand. Fixed for the table's life: a table dropped and created
+    /// again under its name gets a new one, which tells a node that missed both to drop the
+    /// old table and create the new.
+    #[prost(uint64, tag = "6")]
+    pub created: u64,
 }
 /// A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
 /// for any bytes. Both forms of one key are the same key.
@@ -5922,6 +5949,12 @@ pub struct SetMapRequest {
     pub expected_map_version: u64,
     #[prost(message, optional, tag = "2")]
     pub map: ::core::option::Option<ClusterMap>,
+    /// The forced recovery for a map writer that's down (D317 amendment 1): set the map at
+    /// this node, which needn't be the writer, without the compare-and-set. The map must be
+    /// the cluster's, at a version above this node's. `phdb cluster set-map --force` sets it at
+    /// a version above every reachable node's, naming a live writer.
+    #[prost(bool, tag = "3")]
+    pub force: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetMapResponse {
@@ -5985,6 +6018,18 @@ pub struct LocalPartition {
     pub ok: bool,
     #[prost(string, tag = "5")]
     pub error: ::prost::alloc::string::String,
+    /// The partition's schema reconcile (D317 ticket 5), on the node serving it: the map version
+    /// it last reconciled to, what failed, the tables in the file the map doesn't place (made
+    /// by hand: left alone), and the tables a create through the map took over from a hand-made
+    /// one of the same name.
+    #[prost(uint64, tag = "6")]
+    pub reconciled_version: u64,
+    #[prost(string, repeated, tag = "7")]
+    pub reconcile_errors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub unmapped_tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "9")]
+    pub adopted_tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5997,7 +6042,7 @@ pub struct ForwardRequest {
     pub caller: ::core::option::Option<ForwardedCaller>,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -6044,6 +6089,13 @@ pub mod forward_request {
         /// keys, or the range clipped to the partition. After D317 ticket 3's arms.
         #[prost(message, tag = "18")]
         Nearest(super::NearestRequest),
+        /// A schema change, sent to the map's writer: the node with the smallest id in the map,
+        /// which alone changes the map for schema calls, so two entry nodes' changes can't
+        /// diverge (D317 ticket 5). Another node answers `WrongPartition`.
+        #[prost(message, tag = "19")]
+        CreateTable(super::CreateTableRequest),
+        #[prost(message, tag = "20")]
+        DropTable(super::DropTableRequest),
     }
 }
 /// One partition's part of a fanned-out scan (D317 ticket 4).
@@ -6084,7 +6136,7 @@ pub struct ForwardedCaller {
 pub struct ForwardResponse {
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -6117,6 +6169,9 @@ pub mod forward_response {
         Empty(super::Empty),
         #[prost(message, tag = "11")]
         Nearest(super::NearestResponse),
+        /// `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
+        #[prost(message, tag = "12")]
+        Table(super::TableResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
