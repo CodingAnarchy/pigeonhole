@@ -547,6 +547,7 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
             &backups,
             crate::serve::service::Pinning::default(),
             crate::serve::placement::Memory::defaults(1),
+            crate::serve::gate::WriteGate::new("p1", None),
         );
         service.metrics_text(&[(Some("p1"), part.part().unwrap())], &[&service.sessions])
     };

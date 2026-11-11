@@ -12,6 +12,7 @@ mod backup;
 pub(crate) mod cli;
 pub(crate) mod fanout;
 pub(crate) mod feed;
+pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
@@ -167,6 +168,9 @@ pub(crate) struct Node {
     /// concurrent ones queue rather than retry each other's compare-and-set (D317
     /// amendment 1). Held across the set and its push, never inside an install.
     pub(crate) schema_changes: tokio::sync::Mutex<()>,
+    /// The partitions served here: their write gates, and the operator's fences (D317
+    /// ticket 6).
+    fences: fence::Fences,
 }
 
 /// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
@@ -210,6 +214,7 @@ impl Node {
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
+            fences: fence::Fences::default(),
         })
     }
 
@@ -448,29 +453,40 @@ impl Node {
             return;
         };
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let fetched = tokio::time::timeout(self.peers.push_timeout, async {
-                let mut client = self.client(&n.address).await?;
-                let req = self.request(GetMapRequest {})?;
-                client
-                    .get_map(req)
+            let fetched =
+                tokio::time::timeout(self.peers.push_timeout, self.fetch_map(&n.address)).await;
+            let Ok(Ok(theirs)) = fetched else {
+                continue;
+            };
+            if theirs.map_version > self.state().version()
+                && let Err(e) = self
+                    .push_map_async(theirs.clone(), Some(n.id.clone()))
                     .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            })
-            .await;
-            if let Ok(Ok(theirs)) = fetched
-                && theirs.map_version > self.state().version()
-                && let Err(e) = self.push_map_async(theirs, Some(n.id.clone())).await
             {
                 eprintln!(
                     "phdb serve: node {}'s newer cluster map: {}",
                     n.id, e.message
                 );
             }
+            // Its partitions' start fences (D317 ticket 6).
+            self.confirm(&theirs);
         }
         self.push_all().await;
         self.synced
             .store(true, std::sync::atomic::Ordering::Release);
+        // Partitions no peer has confirmed yet: asked again until one does (cli692's S3).
+        self.confirm_after_start().await;
+    }
+
+    /// Peer `address`'s map.
+    async fn fetch_map(&self, address: &str) -> Result<ClusterMap, String> {
+        let mut client = self.client(address).await?;
+        let req = self.request(GetMapRequest {})?;
+        client
+            .get_map(req)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|s| s.message().to_owned())
     }
 
     /// [`Node::push_map`] on a blocking thread.
@@ -488,6 +504,19 @@ impl Node {
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
     /// Blocking ([`Node::install`]).
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
+        let pushed = from.is_some().then(|| map.clone());
+        let version = self.push_map_install(map, from)?;
+        // A peer's map, taken or the same as this node's: its partitions' start fences
+        // (D317 ticket 6).
+        if let Some(theirs) = pushed {
+            self.confirm(&theirs);
+        }
+        Ok(PushMapResponse {
+            map_version: version,
+        })
+    }
+
+    fn push_map_install(&self, map: ClusterMap, from: Option<&str>) -> Result<u64, ApiError> {
         let version = self.install(&map, false, |st| {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
@@ -506,9 +535,7 @@ impl Node {
                 old.map_version
             )))
         })?;
-        Ok(PushMapResponse {
-            map_version: version,
-        })
+        Ok(version)
     }
 
     /// `Cluster.Status`: the node, its map version, and its directory's partition files.
@@ -618,6 +645,12 @@ impl Node {
                     lp.unmapped_tables = o.unmapped.clone();
                     lp.adopted_tables = o.adopted.clone();
                 }
+            }
+        }
+        // Each open partition's state (D317 ticket 6).
+        for lp in &mut partitions {
+            if let Some(state) = self.part_state(&lp.id) {
+                lp.set_state(state);
             }
         }
         NodeStatus {
@@ -811,22 +844,43 @@ impl ClusterGrpc {
 
 const READERS: &[Scope] = &[Scope::Read, Scope::Cluster];
 
+impl ClusterGrpc {
+    /// Partition `id`'s line of `Status`.
+    async fn local(&self, id: &str) -> Result<LocalPartition, ApiError> {
+        let node = Arc::clone(&self.0);
+        let status = tokio::task::spawn_blocking(move || node.status())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        status
+            .partitions
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| ApiError::not_found(format!("no partition {id:?} on this node")))
+    }
+}
+
 #[tonic::async_trait]
 impl proto::cluster_server::Cluster for ClusterGrpc {
+    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope.
     async fn fence(
         &self,
-        _req: Request<proto::PartitionRequest>,
+        req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
-        Err(ApiError::unsupported("not yet").into())
+        self.caller(&req, &[Scope::Admin], "fence a partition")?;
+        let id = req.into_inner().partition;
+        self.0.fence(&id).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
     }
 
+    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope.
     async fn unfence(
         &self,
-        _req: Request<proto::PartitionRequest>,
+        req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
-        Err(ApiError::unsupported("not yet").into())
+        self.caller(&req, &[Scope::Admin], "unfence a partition")?;
+        let id = req.into_inner().partition;
+        self.0.unfence(&id).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
     }
 
     async fn close(
@@ -1172,6 +1226,7 @@ pub(crate) fn run(
         },
         state,
     );
+    node.load_fences().map_err(|e| Failure::usage(&e))?;
     // The partitions the map gives this node, in id order, with their epochs: none before
     // a first map, or when the map gives none (the node only routes).
     let mine: Vec<(String, u64)> = {
@@ -1285,8 +1340,11 @@ pub(crate) fn run(
     let parts: Vec<(String, super::service::Service)> = opened
         .iter()
         .map(|o| {
+            // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
+            let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
+            let gate = node.open_gate(&o.id, epoch);
             let part = service
-                .for_partition(o.db.clone(), &o.id, &backups, o.pinning, o.memory)
+                .for_partition(o.db.clone(), &o.id, &backups, o.pinning, o.memory, gate)
                 .placement(&placement);
             (o.id.clone(), part)
         })
@@ -1299,7 +1357,15 @@ pub(crate) fn run(
     } else {
         let list: Vec<String> = mine
             .iter()
-            .map(|(p, epoch)| format!("{p} (epoch {epoch})"))
+            .map(|(p, epoch)| match node.fence_of(p) {
+                Some(crate::serve::gate::Fence::Operator) => {
+                    format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
+                }
+                Some(crate::serve::gate::Fence::Start) => {
+                    format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
+                }
+                None => format!("{p} (epoch {epoch})"),
+            })
             .collect();
         format!(
             "partition{} {} as cluster node {id} of {}; map version {version}",

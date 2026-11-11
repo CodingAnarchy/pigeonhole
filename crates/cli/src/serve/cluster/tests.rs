@@ -617,6 +617,8 @@ fn data_node_many(
 ) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
+    // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
+    node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
     let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
     let backup_dir = dir.join(format!("backups-{id}"));
@@ -628,9 +630,15 @@ fn data_node_many(
         let db = db.unwrap_or_else(|| test_partition(dir, p));
         let pinning = crate::serve::service::Pinning::default();
         let memory = crate::serve::placement::Memory::defaults(1);
+        // Fenced as `run` opens it (D317 ticket 6). A restarted node waits for its peers'
+        // maps to unfence it; a fresh one stands for a node already serving.
+        let gate = node.open_gate(p, 1);
+        if !restart {
+            gate.unfence();
+        }
         parts.push((
             p.to_owned(),
-            service.for_partition(db.clone(), p, &backups, pinning, memory),
+            service.for_partition(db.clone(), p, &backups, pinning, memory, gate),
         ));
         dbs.push(db);
     }
@@ -3510,6 +3518,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
 mod backup;
 mod charge;
 mod feed;
+mod fence;
 mod metrics;
 mod several;
 mod upload;

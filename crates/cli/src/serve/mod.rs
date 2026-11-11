@@ -27,6 +27,7 @@ mod config;
 mod convert;
 mod errors;
 mod feed;
+mod gate;
 mod grpc;
 mod handles;
 mod http;
