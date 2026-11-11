@@ -23,6 +23,9 @@ pub(crate) struct Cluster {
     pub(crate) node: Arc<super::cluster::Node>,
     pub(crate) local: Option<String>,
     pub(crate) forwarder: Arc<Forwarder>,
+    /// Partition files streamed in for a restore or a relocation (D317), staged in the
+    /// node's cluster directory.
+    pub(crate) uploads: Arc<super::cluster::upload::Uploads>,
 }
 
 /// Where a call goes.
@@ -55,13 +58,100 @@ impl Router {
             Some(p) => service.sessions_on(p),
             None => service,
         };
+        let uploads = Arc::new(super::cluster::upload::Uploads::new(
+            node.dir(),
+            1,
+            super::cluster::upload::max_chunk(service.limits().max_request_bytes),
+        ));
         Self {
             service: Arc::new(service),
             cluster: Some(Cluster {
                 node,
                 local,
                 forwarder,
+                uploads,
             }),
+        }
+    }
+
+    /// `--max-uploads`: a cluster node's partition uploads at once.
+    pub(crate) fn max_uploads(mut self, max: usize) -> Self {
+        if let Some(u) = self
+            .cluster
+            .as_mut()
+            .and_then(|c| Arc::get_mut(&mut c.uploads))
+        {
+            u.set_max(max);
+        }
+        self
+    }
+
+    /// `Admin.PartitionUpload` (D317): `stream`'s file of a partition this node doesn't
+    /// have open, staged for the stamp that installs it. Admin scope; a cluster node only.
+    pub(crate) async fn partition_upload(
+        &self,
+        caller: &Caller,
+        mut stream: tonic::Streaming<super::proto::PartitionUploadChunk>,
+    ) -> Result<super::proto::PartitionUploadReply, ApiError> {
+        let uploads = self.uploads_for(caller)?;
+        // Each message within `--stream-idle-ms` (cli692's F1 on #1728): a stalled stream
+        // ends, so its upload goes back to resumable and its `--max-uploads` place is free.
+        let idle = self.service.limits().stream_idle;
+        let mut next = async || match tokio::time::timeout(idle, stream.message()).await {
+            Ok(m) => {
+                m.map_err(|s| ApiError::invalid(format!("the upload's stream: {}", s.message())))
+            }
+            Err(_) => Err(ApiError::deadline(
+                "no upload message for --stream-idle-ms: resume from PartitionUploadStatus",
+            )),
+        };
+        let Some(first) = next().await? else {
+            return Err(ApiError::invalid("an upload sends its header first"));
+        };
+        let Some(header) = first.header.clone() else {
+            return Err(ApiError::invalid(
+                "an upload's first message carries its header",
+            ));
+        };
+        let open = |p: &str| self.partitions().any(|(id, _)| id == p);
+        let mut writing = uploads.begin(header, open)?;
+        let mut chunk = Some(first);
+        while let Some(c) = chunk.take() {
+            if !c.data.is_empty() {
+                // One chunk's write (at most 1 MiB), off the async threads.
+                writing = tokio::task::spawn_blocking(move || writing.write(&c).map(|()| writing))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("an upload's write: {e}")))??;
+            }
+            chunk = next().await?;
+        }
+        // The SHA-256 of the whole file and its sync, likewise.
+        tokio::task::spawn_blocking(move || writing.finish())
+            .await
+            .map_err(|e| ApiError::internal(format!("an upload's finish: {e}")))?
+    }
+
+    /// `Admin.PartitionUploadStatus` (D317).
+    pub(crate) fn partition_upload_status(
+        &self,
+        caller: &Caller,
+        upload_id: &str,
+    ) -> Result<super::proto::PartitionUploadStatusReply, ApiError> {
+        self.uploads_for(caller)?.status(upload_id)
+    }
+
+    fn uploads_for(
+        &self,
+        caller: &Caller,
+    ) -> Result<&Arc<super::cluster::upload::Uploads>, ApiError> {
+        if !caller.scope.allows(super::auth::Scope::Admin) {
+            return Err(ApiError::permission_denied("call PartitionUpload"));
+        }
+        match &self.cluster {
+            Some(c) => Ok(&c.uploads),
+            None => Err(ApiError::unsupported(
+                "a partition upload is for a cluster node (phdb serve --cluster)",
+            )),
         }
     }
 
