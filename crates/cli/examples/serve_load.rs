@@ -23,7 +23,13 @@
 //! the spawn, and `--server-pid` names the process whose CPU to read. `--load` writes the
 //! rows through the server first (`Mutate`s from `--clients` callers), so a cluster's router
 //! places each by its split keys. The table `t` (family `f`) is created if it's missing and
-//! the server serves `Schema.CreateTable`; otherwise it must exist.
+//! the server serves `Schema.CreateTable`; otherwise it must exist. The load visits the rows
+//! in a scattered order, so a cluster's partitions fill together, at `--load-durability`
+//! (`Buffered` by default). A row refused (`Overloaded`) or left unknown for 30 s stops it,
+//! and so does any other error, with the server's message.
+//!
+//! On a cluster, a `Batch` whose rows straddle a split key is refused as `CrossPartition`;
+//! such calls are counted on the row's line (`cross-partition N`), not timed.
 //!
 //! **Large stores:** row keys are 8 digits, so up to 100M rows. About 20M of 100 B load in a
 //! few minutes either way. The Zipfian setup sums 20M terms once, about a second.
@@ -77,6 +83,11 @@ struct Args {
     /// the server's writer default.
     #[arg(long, value_enum, default_value_t = WriteDurability::Default)]
     durability: WriteDurability,
+    /// `--load`'s writes' durability. What it loads doesn't depend on it, so the default is
+    /// the fastest that still lands (perf2's N1 on #1712).
+    #[arg(long, value_enum, default_value_t = WriteDurability::Buffered)]
+    load_durability: WriteDurability,
+    /// The port of the server this process starts (ignored with `--server`).
     #[arg(long, default_value_t = 7462)]
     port: u16,
     /// The shard count the database is built and served at (default: `phdb serve`'s, half
@@ -408,6 +419,9 @@ impl Drop for Server {
 struct Tally {
     lat: [Vec<Duration>; OPS.len()],
     refused: u64,
+    /// Calls a cluster refused as `CrossPartition`: a `Batch` whose rows straddle a split
+    /// key (or wrap past the last row). Counted, not timed (#1712's F2).
+    cross: u64,
 }
 
 impl Tally {
@@ -416,6 +430,7 @@ impl Tally {
             a.extend(b);
         }
         self.refused += other.refused;
+        self.cross += other.cross;
     }
 
     fn ops(&self) -> usize {
@@ -462,7 +477,48 @@ fn row_writes(row: u64, value: &[u8]) -> proto::RowWrites {
     }
 }
 
-/// One gRPC call: `Ok(true)` served, `Ok(false)` refused (`Overloaded`).
+/// How a call ended, short of an error that stops the run.
+#[derive(Debug)]
+enum Outcome {
+    Served,
+    /// `Overloaded`: shed by the server, nothing done.
+    Refused,
+    /// `CrossPartition`: a cluster's batch across partitions, nothing done.
+    Cross,
+}
+
+/// The stable code (ICR 0112) a gRPC status carries in its `ErrorDetail`, or "".
+fn api_code(status: &tonic::Status) -> String {
+    use prost::Message;
+    #[derive(Clone, PartialEq, Message)]
+    struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+        #[prost(message, repeated, tag = "3")]
+        details: Vec<AnyMsg>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct AnyMsg {
+        #[prost(string, tag = "1")]
+        type_url: String,
+        #[prost(bytes = "vec", tag = "2")]
+        value: Vec<u8>,
+    }
+    RpcStatus::decode(status.details())
+        .ok()
+        .and_then(|s| {
+            s.details
+                .iter()
+                .find(|d| d.type_url.ends_with("pigeonhole.v1.ErrorDetail"))
+                .and_then(|d| proto::ErrorDetail::decode(d.value.as_slice()).ok())
+        })
+        .map_or_else(String::new, |d| d.code)
+}
+
+/// One gRPC call: served, refused (`Overloaded`), across partitions (`CrossPartition`), or
+/// an error (anything else, `PartitionUnavailable` included).
 async fn grpc_call(
     c: &mut DataClient<tonic::transport::Channel>,
     op: Op,
@@ -470,7 +526,7 @@ async fn grpc_call(
     rows: u64,
     value: &[u8],
     durability: proto::Durability,
-) -> Result<bool, tonic::Status> {
+) -> Result<Outcome, tonic::Status> {
     let r = match op {
         Op::Get => c
             .get(proto::GetRequest {
@@ -529,9 +585,12 @@ async fn grpc_call(
         },
     };
     match r {
-        Ok(()) => Ok(true),
-        Err(s) if s.code() == tonic::Code::Unavailable => Ok(false),
-        Err(s) => Err(s),
+        Ok(()) => Ok(Outcome::Served),
+        Err(s) => match api_code(&s).as_str() {
+            "Overloaded" => Ok(Outcome::Refused),
+            "CrossPartition" => Ok(Outcome::Cross),
+            _ => Err(s),
+        },
     }
 }
 
@@ -640,9 +699,16 @@ fn http_caller(
             .body_mut()
             .read_to_string()
             .unwrap_or_else(|e| panic!("{rpc}: {e}"));
-        match status {
-            200 => tally.lat[op as usize].push(t.elapsed()),
-            503 => tally.refused += 1,
+        // The JSON body's stable code tells `Overloaded` (503) from another 503, such as a
+        // cluster's `PartitionUnavailable`, which stops the run.
+        let code = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        match (status, code.as_str()) {
+            (200, _) => tally.lat[op as usize].push(t.elapsed()),
+            (503, "Overloaded") => tally.refused += 1,
+            (409, "CrossPartition") => tally.cross += 1,
             _ => panic!("{rpc}: {status} {text}"),
         }
     }
@@ -686,8 +752,9 @@ async fn run(
                         let (op, row) = caller.next();
                         let t = Instant::now();
                         match grpc_call(&mut c, op, row, rows, &caller.value, durability).await {
-                            Ok(true) => tally.lat[op as usize].push(t.elapsed()),
-                            Ok(false) => tally.refused += 1,
+                            Ok(Outcome::Served) => tally.lat[op as usize].push(t.elapsed()),
+                            Ok(Outcome::Refused) => tally.refused += 1,
+                            Ok(Outcome::Cross) => tally.cross += 1,
                             Err(s) => panic!("{}: {s}", op.name()),
                         }
                     }
@@ -777,6 +844,63 @@ fn base_url(args: &Args) -> String {
     }
 }
 
+/// How long one row's write may be refused (`Overloaded`) or left unknown before the load
+/// stops (#1712's F1).
+const LOAD_ROW_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One row of `--load`: sent again while it's `Overloaded`, or its outcome is unknown
+/// (`OutcomeUnknown`, `Unknown`: a cluster forward cut after the send; a put of the same row
+/// is idempotent), for at most [`LOAD_ROW_DEADLINE`]. Anything else, `PartitionUnavailable`
+/// from a down node included, stops the load at once with the server's message, which
+/// names the partition.
+async fn load_row(
+    c: &mut DataClient<tonic::transport::Channel>,
+    row: u64,
+    rows: u64,
+    value: &[u8],
+    durability: proto::Durability,
+) -> Result<(), String> {
+    let deadline = Instant::now() + LOAD_ROW_DEADLINE;
+    loop {
+        let last = match grpc_call(c, Op::Mutate, row, rows, value, durability).await {
+            Ok(Outcome::Served) => return Ok(()),
+            Ok(Outcome::Refused) => "Overloaded".to_owned(),
+            Ok(Outcome::Cross) => unreachable!("a one-row write is in one partition"),
+            Err(s) if api_code(&s) == "OutcomeUnknown" => {
+                format!("OutcomeUnknown: {}", s.message())
+            }
+            Err(s) => {
+                return Err(format!(
+                    "row {}: {} ({:?})",
+                    String::from_utf8_lossy(&key(row)),
+                    s.message(),
+                    s.code()
+                ));
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "row {} still refused after {} s: {last}",
+                String::from_utf8_lossy(&key(row)),
+                LOAD_ROW_DEADLINE.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A step coprime with `rows`, so `k * step % rows` visits every row once, scattered.
+fn scatter_step(rows: u64) -> u64 {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    // Primes near 2^32 / φ; the first not dividing `rows` is coprime with it.
+    [2_654_435_761u64, 2_654_435_789, 2_654_435_801]
+        .into_iter()
+        .find(|&p| gcd(p, rows.max(1)) == 1)
+        .unwrap_or(1)
+}
+
 /// `--load`: the rows through the running server, `Mutate`s from `--clients` callers, so a
 /// cluster places each by its split keys. The table is created first where the server
 /// serves `Schema.CreateTable` (a single node); elsewhere it must exist already.
@@ -797,9 +921,9 @@ async fn load(
         .await;
     match created {
         Ok(_) => {}
-        Err(s)
-            if s.code() == tonic::Code::Unimplemented || s.code() == tonic::Code::Unavailable =>
-        {
+        // A cluster serves no schema calls yet (D317's ticket 5): `Unimplemented`. Anything
+        // else, `Overloaded` included, stops the load (feed1248's N2 on #1712).
+        Err(s) if s.code() == tonic::Code::Unimplemented => {
             println!(
                 "load: the server doesn't create tables ({}): using table t as it is",
                 s.message()
@@ -810,25 +934,27 @@ async fn load(
     let started = Instant::now();
     let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let value = Arc::new(vec![b'v'; args.value_bytes]);
-    let durability = args.durability.proto();
+    let durability = args.load_durability.proto();
+    let step = scatter_step(args.rows);
     let mut tasks = Vec::new();
     for i in 0..args.clients.max(1) {
         let mut c = DataClient::new(channels[i % channels.len()].clone());
         let (next, value, rows) = (Arc::clone(&next), Arc::clone(&value), args.rows);
         tasks.push(tokio::spawn(async move {
             loop {
-                let row = next.fetch_add(1, Ordering::Relaxed);
-                if row >= rows {
-                    return Ok::<(), tonic::Status>(());
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= rows {
+                    return Ok::<(), String>(());
                 }
-                // A refused write (`Overloaded`) is sent again: the load must be complete.
-                while !grpc_call(&mut c, Op::Mutate, row, rows, &value, durability).await? {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                if (row + 1) % 1_000_000 == 0 {
+                // Rows in a scattered order, every one once, so a cluster's partitions load
+                // together rather than one key range at a time (feed1248's N1 on #1712).
+                let row = u64::try_from(u128::from(k) * u128::from(step) % u128::from(rows))
+                    .expect("below rows");
+                load_row(&mut c, row, rows, &value, durability).await?;
+                if (k + 1) % 1_000_000 == 0 {
                     println!(
                         "load: {} rows, {:.0} s",
-                        row + 1,
+                        k + 1,
                         started.elapsed().as_secs_f64()
                     );
                 }
@@ -836,7 +962,7 @@ async fn load(
         }));
     }
     for t in tasks {
-        t.await??;
+        t.await?.map_err(|e| format!("load: {e}"))?;
     }
     println!(
         "load: {} rows in {:.0} s",
@@ -938,6 +1064,9 @@ async fn run_all(
                     .map_or("-".into(), |c| format!("{:.1}", c * 1e6 / ops as f64)),
                 tally.refused,
             );
+            if tally.cross > 0 {
+                line.push_str(&format!(" cross-partition {}", tally.cross));
+            }
             for op in OPS {
                 let mut lat = tally.lat[op as usize].clone();
                 if lat.is_empty() {
