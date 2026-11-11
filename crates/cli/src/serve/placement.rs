@@ -119,6 +119,11 @@ impl Memory {
         self.memtable_per_shard * self.shards as u64
     }
 
+    /// All of it: the memtables and both caches.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.memtables() + self.block_cache + self.row_cache
+    }
+
     /// `options` with this memory.
     pub(crate) fn apply(&self, options: pigeonhole::Options) -> pigeonhole::Options {
         options
@@ -518,7 +523,6 @@ mod tests {
     fn engine_memory_splits_memtables_first_then_the_caches() {
         use super::{MEMTABLE_FLOOR, MEMTABLE_PER_SHARD, Memory, memory};
         let mib = 1u64 << 20;
-        let total = |m: &Memory| m.memtables() + m.block_cache + m.row_cache;
         // Plenty: the arena per shard, and the rest 4:1.
         let m = Memory::of(2048 * mib, 4).unwrap();
         assert_eq!(m.memtable_per_shard, MEMTABLE_PER_SHARD);
@@ -527,7 +531,7 @@ mod tests {
             (m.block_cache, m.row_cache),
             (rest * 4 / 5, rest - rest * 4 / 5)
         );
-        assert_eq!(total(&m), 2048 * mib);
+        assert_eq!(m.bytes(), 2048 * mib);
         // Tight: the memtables take it all, smaller per shard.
         let m = Memory::of(4 * mib, 8).unwrap();
         assert_eq!(
@@ -539,12 +543,12 @@ mod tests {
         // A node's: unset, the defaults; set, equal shares after the map's overrides.
         assert_eq!(memory(None, &[(2, 0)]).unwrap(), [Memory::defaults(2)]);
         let parts = memory(Some(3072 * mib), &[(2, 0), (2, 1024 * mib), (2, 0)]).unwrap();
-        assert_eq!(total(&parts[1]), 1024 * mib);
+        assert_eq!(parts[1].bytes(), 1024 * mib);
         assert_eq!(
-            (total(&parts[0]), total(&parts[2])),
+            (parts[0].bytes(), parts[2].bytes()),
             (1024 * mib, 1024 * mib)
         );
-        assert_eq!(parts.iter().map(total).sum::<u64>(), 3072 * mib);
+        assert_eq!(parts.iter().map(Memory::bytes).sum::<u64>(), 3072 * mib);
         // Overrides beyond the node's total, or a share below the floor, name the cause.
         assert!(memory(Some(mib), &[(1, 2 * mib)]).is_err());
         let (i, why) = memory(Some(mib), &[(1, 0), (64, 0)]).unwrap_err();

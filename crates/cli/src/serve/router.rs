@@ -132,11 +132,18 @@ impl Router {
     /// The metrics as Prometheus text (`/metrics`, `Admin.Metrics`): a cluster node's
     /// partitions' each labelled by id (D317 ticket 8b), a single node's one unlabelled.
     pub(crate) fn metrics_text(&self) -> String {
-        if self.cluster.is_none() {
-            return self.service.metrics_text(&self.service.single_parts());
-        }
+        let Some(cluster) = &self.cluster else {
+            return self
+                .service
+                .metrics_text(&self.service.single_parts(), &[&self.service.sessions]);
+        };
         let parts: Vec<_> = self.partitions().map(|(id, p)| (Some(id), p)).collect();
-        self.service.metrics_text(&parts)
+        // The node's table and every partition's (cli692's F1 on #1718).
+        let sessions: Vec<&super::sessions::Sessions> = std::iter::once(&self.service.sessions)
+            .chain(cluster.parts.values().map(|s| &s.sessions))
+            .map(|s| &**s)
+            .collect();
+        self.service.metrics_text(&parts, &sessions)
     }
 
     /// A cluster node's `Admin.Backup` or `BackupDownload` (D317 ticket 8b): of a partition

@@ -308,7 +308,7 @@ fn a_partition_that_fails_to_open_fails_the_node_and_closes_the_others() {
         Some("c1"),
         &mine,
         &shares,
-        &[crate::serve::placement::Memory::defaults(1); 2],
+        None,
         |_, _| pigeonhole::Options::default(),
         &mut log,
     ) else {
@@ -354,23 +354,109 @@ fn a_partitions_share_of_the_budget_keeps_its_feeds_shard_count() {
         Some("c1"),
         &mine,
         &[share],
-        &[crate::serve::placement::Memory::defaults(1)],
-        |share, _| {
-            super::super::partition_options(
+        // 1 GiB planned for the share's 1 shard (cli692's F2 on #1718).
+        Some(&[crate::serve::placement::Memory::of(1 << 30, 1).unwrap()]),
+        |share, memory| {
+            let o = super::super::partition_options(
                 crate::serve::config::ShardSpin::Micros(0),
                 None,
                 None,
                 share,
-            )
+            );
+            memory.map_or(o.clone(), |m| m.apply(o))
         },
         &mut log,
     )
     .unwrap();
     assert_eq!(opened[0].db.info().unwrap().shards, 3);
+    // Its memory was resized for the 3 shards it kept, within the same 1 GiB: the memtables
+    // at 64 MiB for each of the 3, not for 1 (cli692's F2 on #1718).
+    let m = opened[0].memory;
+    assert_eq!(m.shards, 3);
+    assert_eq!(m.bytes(), 1 << 30);
+    assert_eq!(
+        m.memtables(),
+        3 * crate::serve::placement::MEMTABLE_PER_SHARD
+    );
     // The startup line reports its threads.
     let log = String::from_utf8(log).unwrap();
     assert!(log.contains("phdb serve: partition p1: "), "{log}");
+    assert!(log.contains("201326592 bytes of memtables"), "{log}");
     for o in opened {
         o.db.close().unwrap();
     }
+}
+
+#[test]
+fn a_nodes_session_gauges_count_every_partitions_sessions() {
+    // cli692's F1 on #1718: a's sessions live in its partitions' tables, and its gauges
+    // count them all.
+    let t = Several::start(crate::serve::server_tests::limits());
+    let [a, b, c] = t.ports;
+    let text = t.rt.block_on(async {
+        // A transaction on p3 and one on p1, both a's; one on p2, b's.
+        begin(c, "zed", None).await.unwrap();
+        begin(b, "alice", None).await.unwrap();
+        begin(a, "hank", None).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        crate::serve::proto::admin_client::AdminClient::new(channel)
+            .metrics(crate::serve::proto::Empty {})
+            .await
+            .unwrap()
+            .into_inner()
+            .text
+    });
+    assert!(
+        text.lines()
+            .any(|l| l == "pigeonhole_serve_sessions{kind=\"transaction\"} 2"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_nodes_feed_limits_are_the_nodes_across_its_partitions() {
+    // The coordinator's call on cli692's S1 on #1718: --max-feed-hubs (like
+    // --feed-ring-bytes and --max-catch-up) is the node's. A feed through c needs a hub on
+    // each of a's two partitions; with one hub allowed per node, the second is refused,
+    // where per-partition limits would have let both open.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.max_feed_hubs = 1;
+    let t = Several::start(limits);
+    let c = t.ports[2];
+    let refused = t.rt.block_on(async {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        // The refusal comes at the call, or (a part joining its hub in its own task) as the
+        // stream's end: either way, never a working stream.
+        match FeedClient::new(channel)
+            .subscribe(SubscribeRequest {
+                tables: vec!["users".into()],
+                ..Default::default()
+            })
+            .await
+        {
+            Err(e) => e,
+            Ok(stream) => {
+                let mut stream = stream.into_inner();
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), stream.message())
+                        .await
+                        .expect("the stream ends within 10 s")
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => panic!("the stream ended without an error"),
+                        Err(e) => break e,
+                    }
+                }
+            }
+        }
+    });
+    assert!(refused.message().contains("--max-feed-hubs"), "{refused}");
 }

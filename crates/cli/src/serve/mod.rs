@@ -246,7 +246,8 @@ fn candle_advice(
     ))
 }
 
-fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
+/// Opens the served database, with its engine memory as resolved if `--engine-memory` is set.
+fn open(cli: &Cli, args: &ServeArgs) -> Result<(Pigeonhole, Option<placement::Memory>), Failure> {
     // The server's shard poll (D198 amendment 4): none by default. The logs are sized at
     // start-up, not while commits wait on them (#1621, ICR 0130).
     let mut options = args.shard_spin.apply(
@@ -266,12 +267,18 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     if let Some(n) = args.compaction_threads {
         options = options.compaction_cores(n);
     }
-    if let Some(total) = args.engine_memory {
-        let shards = args.shards.unwrap_or_else(placement::default_shards);
-        let memory = placement::memory(Some(total), &[(shards, 0)])
-            .map_err(|(_, why)| Failure::usage(&format!("--engine-memory: {why}")))?;
-        options = memory[0].apply(options);
-    }
+    // `--engine-memory`, for the shard count asked; a database whose change feed recorded
+    // another keeps it (ICR 0132), and is reopened with the memory resized for that count
+    // (cli692's F2 on #1718).
+    let planned = match args.engine_memory {
+        Some(total) => {
+            let shards = args.shards.unwrap_or_else(placement::default_shards);
+            let memory = placement::memory(Some(total), &[(shards, 0)])
+                .map_err(|(_, why)| Failure::usage(&format!("--engine-memory: {why}")))?;
+            Some(memory[0])
+        }
+        None => None,
+    };
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
     }
@@ -281,7 +288,31 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     if !args.create && !args.db_file().exists() {
         return Err(Failure::file_not_found(args.db_file()));
     }
-    Pigeonhole::open(args.db_file(), options).map_err(|e| Failure::db("open", &e))
+    let open = |memory: Option<placement::Memory>| {
+        let o = match memory {
+            Some(m) => m.apply(options.clone()),
+            None => options.clone(),
+        };
+        Pigeonhole::open(args.db_file(), o).map_err(|e| Failure::db("open", &e))
+    };
+    let db = open(planned)?;
+    let Some(m) = planned else {
+        return Ok((db, None));
+    };
+    let actual = db.info().map_or(m.shards, |i| i.shards);
+    if actual == m.shards {
+        return Ok((db, Some(m)));
+    }
+    let resized = placement::Memory::of(m.bytes(), actual).map_err(|least| {
+        Failure::usage(&format!(
+            "--engine-memory: the database's change feed keeps {actual} shards, and {} bytes \
+             can't cover their memtables: it needs at least {least}",
+            m.bytes()
+        ))
+    })?;
+    db.close()
+        .map_err(|e| Failure::db("close the database to resize its memory", &e))?;
+    Ok((open(Some(resized))?, Some(resized)))
 }
 
 async fn shutdown_signal() {
@@ -345,7 +376,19 @@ pub(crate) fn run(
     }
 
     let replica = replica(args)?;
-    let db = open(cli, args)?;
+    let (db, engine_memory) = open(cli, args)?;
+    if let Some(m) = engine_memory {
+        let _ = writeln!(
+            stderr,
+            "phdb serve: engine memory: {} bytes of memtables ({} per shard, {} shards), a \
+             {}-byte block cache and a {}-byte row cache",
+            m.memtables(),
+            m.memtable_per_shard,
+            m.shards,
+            m.block_cache,
+            m.row_cache
+        );
+    }
     if replica.is_some() {
         // A bootstrap replaces the file: only a replica's, or an empty one, never a
         // database of its own (a promoted replica restarted with `--replica-of` still set).

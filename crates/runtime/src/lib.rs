@@ -1209,6 +1209,10 @@ impl<H: ShardHandler> Runtime<H> {
         } else {
             (None, None)
         };
+        // Confined only where the shards' plan holds: where pinning was refused (no hard
+        // affinity, a CPU quota, too few CPUs for the shards alone), the compaction threads
+        // run unpinned like the rest (cli692's F3 on #1718).
+        let confine = confine.filter(|_| plan.is_some());
         let cpu = |k: usize| plan.as_ref().and_then(|p| p.cpu(k));
         let mut rt = Runtime {
             submitters,

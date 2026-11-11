@@ -1075,7 +1075,8 @@ pub(crate) fn run(
         cluster_id.as_deref(),
         &mine,
         &shares,
-        &memories,
+        // Unset, the library's own defaults, exactly as before.
+        set_memory.then_some(&memories[..]),
         |share, memory| {
             let options = partition_options(
                 args.shard_spin,
@@ -1083,11 +1084,9 @@ pub(crate) fn run(
                 args.change_feed,
                 share,
             );
-            // Unset, the library's own defaults, exactly as before.
-            if set_memory {
-                memory.apply(options)
-            } else {
-                options
+            match memory {
+                Some(m) => m.apply(options),
+                None => options,
             }
         },
         stderr,
@@ -1193,28 +1192,67 @@ fn open_partitions(
     cluster_id: Option<&str>,
     mine: &[(String, u64)],
     shares: &[super::placement::Share],
-    memories: &[super::placement::Memory],
-    options: impl Fn(super::placement::Share, super::placement::Memory) -> pigeonhole::Options,
+    memories: Option<&[super::placement::Memory]>,
+    options: impl Fn(super::placement::Share, Option<super::placement::Memory>) -> pigeonhole::Options,
     stderr: &mut dyn std::io::Write,
 ) -> Result<Vec<Opened>, Failure> {
     let Some(cluster_id) = cluster_id else {
         return Ok(Vec::new());
     };
     let mut opened: Vec<Opened> = Vec::new();
-    let mut compaction_cpus: Vec<usize> = Vec::new();
-    for (((id, epoch), share), memory) in mine.iter().zip(shares).zip(memories) {
-        let mut o = options(*share, *memory);
-        if share.confined && !compaction_cpus.is_empty() {
-            o = o.compaction_cpu_set(compaction_cpus.clone());
+    // A partition that fails to open fails the node, closing those already open (M2).
+    let fail = |opened: Vec<Opened>, e: Failure| {
+        for o in opened {
+            let _ = o.db.close();
         }
-        let db = match open_partition(dir, cluster_id, id, *epoch, o) {
-            Ok(db) => db,
-            Err(e) => {
-                for o in opened {
-                    let _ = o.db.close();
-                }
-                return Err(e);
+        Err(e)
+    };
+    let mut compaction_cpus: Vec<usize> = Vec::new();
+    for (i, ((id, epoch), share)) in mine.iter().zip(shares).enumerate() {
+        let planned = memories.map(|m| m[i]);
+        let open = |memory: Option<super::placement::Memory>, set: &[usize]| {
+            let mut o = options(*share, memory);
+            if share.confined && !set.is_empty() {
+                o = o.compaction_cpu_set(set.to_vec());
             }
+            open_partition(dir, cluster_id, id, *epoch, o)
+        };
+        let mut db = match open(planned, &compaction_cpus) {
+            Ok(db) => db,
+            Err(e) => return fail(opened, e),
+        };
+        // A partition whose change feed recorded a shard count keeps it, whatever its share
+        // (ICR 0132): its memory is then resized for the count it has, and reopened with it
+        // (cli692's F2 on #1718), so its memtables stay within its share.
+        let actual = db.info().map_or(share.shards, |i| i.shards);
+        let memory = match planned {
+            Some(m) if m.shards != actual => {
+                let bytes = m.bytes();
+                let resized = match super::placement::Memory::of(bytes, actual) {
+                    Ok(r) => r,
+                    Err(least) => {
+                        let _ = db.close();
+                        return fail(
+                            opened,
+                            Failure::usage(&format!(
+                                "partition {id}: its change feed keeps {actual} shards, and its \
+                                 {bytes} bytes of engine memory can't cover their memtables: it \
+                                 needs at least {least}"
+                            )),
+                        );
+                    }
+                };
+                if let Err(e) = db.close() {
+                    return fail(opened, Failure::db("close the partition to resize it", &e));
+                }
+                db = match open(Some(resized), &compaction_cpus) {
+                    Ok(db) => db,
+                    Err(e) => return fail(opened, e),
+                };
+                resized
+            }
+            Some(m) => m,
+            None => super::placement::Memory::defaults(actual),
         };
         compaction_cpus.extend(db.pinned_compaction_cpus());
         let pinning = super::service::Pinning::of(&db, share.compaction);
@@ -1254,7 +1292,7 @@ fn open_partitions(
             id: id.clone(),
             db,
             pinning,
-            memory: *memory,
+            memory,
         });
     }
     Ok(opened)

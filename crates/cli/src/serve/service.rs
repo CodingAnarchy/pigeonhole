@@ -709,9 +709,20 @@ impl Metrics {
 /// The session table's gauges (D313 §3): open sessions by kind, and the oldest open one's age,
 /// since a held transaction or snapshot holds back compaction's version GC and blob GC. A
 /// client that leaks sessions shows up here. Ticket 9 moves these onto D316's names.
-pub(crate) fn render_sessions(out: &mut String, sessions: &super::sessions::Sessions) {
+pub(crate) fn render_sessions(out: &mut String, tables: &[&super::sessions::Sessions]) {
     use std::fmt::Write as _;
-    let s = sessions.stats(Instant::now());
+    // Every table on the node: a cluster node's partitions each have their own (D317 ticket
+    // 8a), counted together as the caps count them (cli692's F1 on #1718).
+    let now = Instant::now();
+    let mut s = super::sessions::Stats::default();
+    for t in tables {
+        let one = t.stats(now);
+        s.transactions += one.transactions;
+        s.snapshots += one.snapshots;
+        s.tombstones += one.tombstones;
+        s.mcp += one.mcp;
+        s.oldest = s.oldest.max(one.oldest);
+    }
     let _ = writeln!(out, "# TYPE pigeonhole_serve_sessions gauge");
     for (kind, n) in [
         ("transaction", s.transactions),
@@ -907,6 +918,8 @@ pub(crate) struct Service {
     pub(crate) sessions: Arc<super::sessions::Sessions>,
     /// The node's session counts, shared by its partitions' tables (D317 ticket 8a).
     session_caps: Arc<super::sessions::Caps>,
+    /// The node's feed limits' shared state, every partition's feeds' (D317 ticket 8a).
+    feed_shared: super::feed::FeedShared,
     /// Feed and watch streams at once (`--max-streams`): a stream outlives its request's
     /// `--max-concurrent` slot, as a scan does.
     streams: Arc<Semaphore>,
@@ -1028,7 +1041,12 @@ pub(crate) struct Partition {
 impl Partition {
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
     /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
-    fn new(db: Pigeonhole, id: Option<&str>, limits: &Limits) -> Self {
+    fn new(
+        db: Pigeonhole,
+        id: Option<&str>,
+        limits: &Limits,
+        feeds: &super::feed::FeedShared,
+    ) -> Self {
         let metrics = match id {
             Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
             None => pigeonhole_otel::Config::new(),
@@ -1045,7 +1063,7 @@ impl Partition {
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
             engine_metrics: metrics.collector(&db),
-            feeds: super::feed::Feeds::new(db.clone(), feed_limits(limits)),
+            feeds: super::feed::Feeds::new(db.clone(), feed_limits(limits), feeds),
             db,
         }
     }
@@ -1106,8 +1124,9 @@ impl Service {
         blocking_threads: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let part = Partition::new(db, None, &limits);
-        Self::node(Some(part), limits, blocking_threads, metrics)
+        let feeds = super::feed::FeedShared::new(limits.max_catch_up);
+        let part = Partition::new(db, None, &limits, &feeds);
+        Self::node(Some(part), limits, blocking_threads, metrics, feeds)
     }
 
     /// Partition `id` on `db`, one of this cluster node's (D317 ticket 8a): its own database,
@@ -1123,7 +1142,7 @@ impl Service {
         pinning: Pinning,
         memory: super::placement::Memory,
     ) -> Self {
-        let mut part = Partition::new(db, Some(id), &self.limits);
+        let mut part = Partition::new(db, Some(id), &self.limits, &self.feed_shared);
         part.backups = Arc::clone(backups);
         part.pinning = pinning;
         part.engine_memory = Some(memory);
@@ -1137,6 +1156,7 @@ impl Service {
                 Arc::clone(&self.session_caps),
             ),
             session_caps: Arc::clone(&self.session_caps),
+            feed_shared: self.feed_shared.clone(),
             streams: Arc::clone(&self.streams),
             text_rebuilds: Arc::clone(&self.text_rebuilds),
             memory_calls: Arc::clone(&self.memory_calls),
@@ -1157,7 +1177,8 @@ impl Service {
         blocking_threads: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
-        Self::node(None, limits, blocking_threads, metrics)
+        let feeds = super::feed::FeedShared::new(limits.max_catch_up);
+        Self::node(None, limits, blocking_threads, metrics, feeds)
     }
 
     fn node(
@@ -1165,9 +1186,11 @@ impl Service {
         limits: Limits,
         blocking_threads: usize,
         metrics: Arc<Metrics>,
+        feed_shared: super::feed::FeedShared,
     ) -> Self {
         let session_caps = Arc::new(super::sessions::Caps::default());
         Self {
+            feed_shared,
             connections: super::listener::Connections::new(limits.max_connections),
             replies: Arc::new(super::charge::ReplyStats::default()),
             inflight: Arc::new(Semaphore::new(
@@ -1622,7 +1645,7 @@ impl Service {
                 drop(budget);
                 // A single node: a cluster node answers it in the router (D317 ticket 8b).
                 Ok(ServiceReply::Metrics(proto::MetricsResponse {
-                    text: self.metrics_text(&self.single_parts()),
+                    text: self.metrics_text(&self.single_parts(), &[&self.sessions]),
                 }))
             }
             ServiceOp::DescribeTable(r) => {
@@ -2109,11 +2132,18 @@ impl Service {
     /// the partitions served here. A single node passes its one, unlabelled; a cluster node
     /// passes the router's ([`Router::metrics_text`](super::router::Router::metrics_text)),
     /// each labelled by its id (D317 ticket 8b); a node that only routes, none.
-    pub(crate) fn metrics_text(&self, parts: &[(Option<&str>, &Partition)]) -> String {
+    ///
+    /// `sessions` are the node's session tables: its own, and each partition's on a cluster
+    /// node (D317 ticket 8a).
+    pub(crate) fn metrics_text(
+        &self,
+        parts: &[(Option<&str>, &Partition)],
+        sessions: &[&super::sessions::Sessions],
+    ) -> String {
         let mut text = self.metrics.render();
         self.connections.render(&mut text);
         self.replies.render(&mut text);
-        render_sessions(&mut text, &self.sessions);
+        render_sessions(&mut text, sessions);
         render_feeds(&mut text, parts);
         render_bulk(&mut text, parts);
         render_pinning(&mut text, parts);
