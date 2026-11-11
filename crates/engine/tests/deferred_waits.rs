@@ -8,7 +8,15 @@
 //! an in-flight root commit, a dropped shard's final sync), another thread completes it,
 //! as today's completion pool does; with the blocked thread as the only reaper these hang
 //! (#207). Helper threads submit only while the shards are idle and wait for it, so a seed
-//! replays the same I/O trace, which every case checks by running each seed twice.
+//! replays the same I/O trace, which every replayed case checks by running each seed twice
+//! ([`each_seed`]).
+//!
+//! **Replay needs one completer.** A case run by [`each_seed`] completes I/O on its own
+//! thread only: `SimVfs` draws a seeded choice per completion from the operations in flight
+//! at that moment, so a second thread completing I/O makes the trace follow the OS
+//! scheduler (#1704: Windows CI diverged). A case that needs another thread to complete I/O
+//! runs each seed once, without the comparison ([`each_seed_once`]), and
+//! [`complete_root_commit`] refuses such a thread inside a replayed run.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,14 +47,15 @@ fn seeds() -> Vec<u64> {
     (base..base + n).collect()
 }
 
-/// Runs `case` twice for every seed, each on a thread of its own (it drives the shards), and
-/// checks that both runs did the same I/O. A run that has not finished within 60 s is a
-/// hang.
+/// Runs `case` twice for every seed, each on a thread of its own (it drives the shards and
+/// is the only one completing I/O), and checks that both runs did the same I/O. A run that
+/// has not finished within 60 s is a hang.
 fn each_seed(case: fn(u64)) {
     for seed in seeds() {
         let run = || {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
+                REPLAYED.with(|r| r.set(true));
                 case(seed);
                 let trace = CASE_VFS.with(|v| v.borrow().as_ref().map(|v| v.recorded_ops()));
                 let _ = tx.send(trace.expect("the case opened a rig"));
@@ -63,10 +72,27 @@ fn each_seed(case: fn(u64)) {
     }
 }
 
+/// Runs `case` once for every seed, on a thread of its own, without comparing traces: for a
+/// case where another thread completes I/O too, whose trace follows the scheduler. Its own
+/// assertions are the check.
+fn each_seed_once(case: fn(u64)) {
+    for seed in seeds() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            case(seed);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("seed {seed}: hung or failed (see above)"));
+    }
+}
+
 thread_local! {
     /// The `SimVfs` of the rig the case on this thread opened (for `each_seed`'s check).
     static CASE_VFS: std::cell::RefCell<Option<Arc<SimVfs>>> =
         const { std::cell::RefCell::new(None) };
+    /// This thread runs a replayed case ([`each_seed`]): it must be the only completer.
+    static REPLAYED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ---- the device: SimVfs with deferred I/O, per-file in-flight counts and sync failures ----
@@ -651,18 +677,29 @@ fn pump_commit_in_flight(
     flushed
 }
 
-/// Completes the pump's root commit while the shard is not run: on this thread before
-/// the catalog change (`now`), or on a completion thread while the change is blocked on
-/// the manifest writer. Either way the driving thread finishes the pump's commit itself
-/// (`manifest::Flight`), so the change does not wait for a shard only it can run.
-fn complete_root_commit(rig: &Rig, now: bool) -> Option<thread::JoinHandle<()>> {
+/// Who completes a manifest pump's root commit that a catalog change or `shrink` is about
+/// to block behind.
+#[derive(Debug, Clone, Copy)]
+enum Completer {
+    /// This thread, before the change.
+    Now,
+    /// Nobody beforehand: the change's own blocked manifest wait on this thread completes it
+    /// (`manifest::Flight`, and the orphan device of ICR 0028).
+    Driver,
+    /// A completion thread, while the change is blocked on the manifest writer, as today's
+    /// completion pool would. Two completers: never in a replayed case (#1704).
+    Thread,
+}
+
+/// Completes the pump's root commit while the shard is not run, as `by` says. Returns the
+/// completion thread to join after the change, for [`Completer::Thread`].
+fn complete_root_commit(rig: &Rig, by: Completer) -> Option<thread::JoinHandle<()>> {
     let dev = Arc::clone(&rig.dev);
     let device = move || {
         // The count drops in an op's completion, after `SimVfs` has taken the op off its
         // list: while another thread completes it (a thread blocked on it runs it itself),
         // the count still shows it and there is nothing left to complete. Wait for the count
-        // then, bounded (about 1 s) so a root commit nobody completes still fails. A
-        // `complete_io` that finds nothing draws no seeded choice, so a seed still replays.
+        // then, bounded (about 1 s) so a root commit nobody completes still fails.
         let mut idle = 0;
         while dev.in_flight(Path::new(DB)) > 0 {
             if dev.sim.complete_io() {
@@ -677,67 +714,100 @@ fn complete_root_commit(rig: &Rig, now: bool) -> Option<thread::JoinHandle<()>> 
             thread::sleep(Duration::from_micros(100));
         }
     };
-    if now {
-        device();
-        None
-    } else {
-        Some(thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
+    match by {
+        Completer::Now => {
             device();
-        }))
+            None
+        }
+        Completer::Driver => None,
+        Completer::Thread => {
+            assert!(
+                !REPLAYED.with(std::cell::Cell::get),
+                "seed {}: a completion thread in a replayed case makes its trace follow the \
+                 scheduler (#1704); run it with each_seed_once",
+                rig.seed
+            );
+            Some(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(5));
+                device();
+            }))
+        }
     }
 }
 
 /// Catalog changes (`create_table`, `drop_table`) and `shrink` on the thread that drives
 /// the only shard, while that shard's manifest pump holds the writer with its root commit
 /// in flight: none waits for the shard (D150 (a)), and the flush the pump commits
-/// completes.
+/// completes. `by` picks who completes each root commit, from the seed's draws.
+fn changes_behind_an_in_flight_pump_commit(seed: u64, by: fn(&mut Rig) -> Completer) {
+    let mut rig = Rig::open(seed, 1);
+    let t = rig.table("t");
+
+    let mut flushed = vec![pump_commit_in_flight(&mut rig, &t, 0)];
+    let completer = by(&mut rig);
+    let device = complete_root_commit(&rig, completer);
+    let u = rig
+        .db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    if let Some(d) = device {
+        d.join().unwrap();
+    }
+
+    flushed.push(pump_commit_in_flight(&mut rig, &t, 1));
+    let completer = by(&mut rig);
+    let device = complete_root_commit(&rig, completer);
+    rig.db.drop_table(u.id).unwrap();
+    if let Some(d) = device {
+        d.join().unwrap();
+    }
+    assert!(rig.db.table("u").is_none());
+
+    flushed.push(pump_commit_in_flight(&mut rig, &t, 2));
+    let completer = by(&mut rig);
+    let device = complete_root_commit(&rig, completer);
+    rig.db.shrink().unwrap();
+    if let Some(d) = device {
+        d.join().unwrap();
+    }
+
+    rig.settle();
+    for mut f in flushed {
+        assert!(
+            matches!(poll(&mut f), Poll::Ready(Ok(()))),
+            "seed {seed}: a flush did not complete"
+        );
+    }
+    assert!(has(&rig.db, &t, "r2-049"));
+    rig.db.close().unwrap();
+    rig.close_loop().unwrap();
+    let vfs = rig.vfs();
+    drop(rig);
+    assert!(Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap().clean);
+}
+
+/// [`changes_behind_an_in_flight_pump_commit`] with this thread the only completer: each
+/// root commit completed before the change, or by the change's own blocked manifest wait,
+/// as the seed draws. Replayed.
 #[test]
 fn catalog_changes_and_shrink_on_the_driver_finish_an_in_flight_pump_commit() {
     each_seed(|seed| {
-        let mut rig = Rig::open(seed, 1);
-        let t = rig.table("t");
-        let pool = rig.draw(2) == 0;
-
-        let mut flushed = vec![pump_commit_in_flight(&mut rig, &t, 0)];
-        let device = complete_root_commit(&rig, !pool);
-        let u = rig
-            .db
-            .create_table("u", &[("f".into(), FamilyOptions::default())])
-            .unwrap();
-        if let Some(d) = device {
-            d.join().unwrap();
-        }
-
-        flushed.push(pump_commit_in_flight(&mut rig, &t, 1));
-        let device = complete_root_commit(&rig, pool);
-        rig.db.drop_table(u.id).unwrap();
-        if let Some(d) = device {
-            d.join().unwrap();
-        }
-        assert!(rig.db.table("u").is_none());
-
-        flushed.push(pump_commit_in_flight(&mut rig, &t, 2));
-        let device = complete_root_commit(&rig, rig.seed.is_multiple_of(2));
-        rig.db.shrink().unwrap();
-        if let Some(d) = device {
-            d.join().unwrap();
-        }
-
-        rig.settle();
-        for mut f in flushed {
-            assert!(
-                matches!(poll(&mut f), Poll::Ready(Ok(()))),
-                "seed {seed}: a flush did not complete"
-            );
-        }
-        assert!(has(&rig.db, &t, "r2-049"));
-        rig.db.close().unwrap();
-        rig.close_loop().unwrap();
-        let vfs = rig.vfs();
-        drop(rig);
-        assert!(Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap().clean);
+        changes_behind_an_in_flight_pump_commit(seed, |rig| {
+            if rig.draw(2) == 0 {
+                Completer::Now
+            } else {
+                Completer::Driver
+            }
+        });
     });
+}
+
+/// As above, with a completion thread completing each root commit while the change waits
+/// on the manifest writer, as today's completion pool does. Two threads complete I/O, so
+/// the trace follows the scheduler and isn't replayed (#1704); the outcome is checked.
+#[test]
+fn catalog_changes_and_shrink_on_the_driver_finish_a_pump_commit_a_completion_thread_completes() {
+    each_seed_once(|seed| changes_behind_an_in_flight_pump_commit(seed, |_| Completer::Thread));
 }
 
 /// #207 (1): as above, but the driving thread is the only one that completes I/O, as with
