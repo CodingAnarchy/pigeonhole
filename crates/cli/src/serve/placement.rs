@@ -51,6 +51,196 @@ pub(crate) fn default_shards() -> usize {
     (num_cpus::get_physical() / 2).max(1)
 }
 
+/// A node's compaction threads when `--compaction-threads` isn't given: the library's
+/// per-database default (D289: a quarter of the physical cores, at least 1, at most one per
+/// shard), computed once for the whole node rather than once per partition (perf287's P1 on
+/// D317: N partitions at their defaults would ask for N times it).
+pub(crate) fn default_compaction_threads(shards: usize) -> usize {
+    // The physical cores this process may run on (its affinity mask and CPU quota), as the
+    // library counts them for its own default, not the host's (g72 on #1703: under a
+    // 12-core taskset on a 16-core box, the host's count gave 4).
+    (pigeonhole_io::sys::default_shards() / 4).clamp(1, shards.max(1))
+}
+
+/// One partition's share of a node's thread budget (D317 ticket 8a, §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Share {
+    /// Its shard count, given as `default_shards`, so a partition whose change feed recorded
+    /// a count keeps it (ICR 0132).
+    pub shards: usize,
+    /// Its compaction threads.
+    pub compaction: usize,
+    /// Whether they're confined to the node's compaction CPUs rather than pinned one each
+    /// (ICR 0134): partitions past the node's compaction total (perf287's A1).
+    pub confined: bool,
+}
+
+/// Splits a node's `shards` and `compaction` threads across `partitions` partitions, in
+/// their id order: equal shares, the remainder one each to the first, at least one shard
+/// each.
+///
+/// Pinned compaction threads never exceed `compaction` (perf287's A1): with fewer than one
+/// each, the first `compaction` partitions get one pinned thread each and the rest one
+/// confined to the node's compaction CPUs. `compaction` 0 runs every partition's flushes and
+/// compactions on its shard threads, as `compaction_cores(0)` does.
+pub(crate) fn split(shards: usize, compaction: usize, partitions: usize) -> Vec<Share> {
+    let share = |total: usize, i: usize| total / partitions + usize::from(i < total % partitions);
+    (0..partitions)
+        .map(|i| {
+            let (compaction, confined) = match compaction {
+                0 => (0, false),
+                c if c >= partitions => (share(c, i), false),
+                c => (1, i >= c),
+            };
+            Share {
+                shards: share(shards, i).max(1),
+                compaction,
+                confined,
+            }
+        })
+        .collect()
+}
+
+/// The library's memory per database, by default: a 64 MiB memtable arena per shard, a
+/// 256 MiB block cache and a 64 MiB row cache. `--engine-memory` keeps the caches' ratio.
+pub(crate) const MEMTABLE_PER_SHARD: u64 = 64 << 20;
+const BLOCK_CACHE: u64 = 256 << 20;
+const ROW_CACHE: u64 = 64 << 20;
+
+/// The least memtable arena per shard `--engine-memory` gives a partition (cli692's M3 on
+/// D317 8a): a share that can't cover it for every shard is refused.
+pub(crate) const MEMTABLE_FLOOR: u64 = 128 << 10;
+
+/// A database's engine memory (D317 ticket 8a): its memtable arena per shard, block cache
+/// and row cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Memory {
+    pub shards: usize,
+    pub memtable_per_shard: u64,
+    pub block_cache: u64,
+    pub row_cache: u64,
+}
+
+impl Memory {
+    /// The library's defaults for `shards` shards.
+    pub(crate) fn defaults(shards: usize) -> Self {
+        Self {
+            shards,
+            memtable_per_shard: MEMTABLE_PER_SHARD,
+            block_cache: BLOCK_CACHE,
+            row_cache: ROW_CACHE,
+        }
+    }
+
+    /// `share` bytes for `shards` shards (cli692's M3): the memtables first, at most the
+    /// library's arena per shard and at least [`MEMTABLE_FLOOR`]; then the rest split
+    /// between the block cache and the row cache in the library's ratio (4:1). `Err` with
+    /// the least share that would do.
+    pub(crate) fn of(share: u64, shards: usize) -> Result<Self, u64> {
+        let shards = shards.max(1);
+        let n = shards as u64;
+        let per_shard = (share / n).min(MEMTABLE_PER_SHARD);
+        if per_shard < MEMTABLE_FLOOR {
+            return Err(MEMTABLE_FLOOR * n);
+        }
+        let rest = share - per_shard * n;
+        let block_cache = rest / (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE
+            + rest % (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE / (BLOCK_CACHE + ROW_CACHE);
+        Ok(Self {
+            shards,
+            memtable_per_shard: per_shard,
+            block_cache,
+            row_cache: rest - block_cache,
+        })
+    }
+
+    pub(crate) fn memtables(&self) -> u64 {
+        self.memtable_per_shard * self.shards as u64
+    }
+
+    /// All of it: the memtables and both caches.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.memtables() + self.block_cache + self.row_cache
+    }
+
+    /// `options` with this memory.
+    pub(crate) fn apply(&self, options: pigeonhole::Options) -> pigeonhole::Options {
+        options
+            .memtable_budget(self.memtable_per_shard)
+            .block_cache(usize::try_from(self.block_cache).unwrap_or(usize::MAX))
+            .row_cache(usize::try_from(self.row_cache).unwrap_or(usize::MAX))
+    }
+}
+
+/// Each partition's memory from a node's `--engine-memory` (`total`; `None`: unset), given
+/// each partition's shard count and the map's `memory_bytes` override (0: none), in order
+/// (D317 ticket 8a). Overrides are taken first, and the rest of `total` split equally
+/// across the others; unset, the others take the library's defaults. `Err` names the
+/// partition (by index) that can't be covered and the least it would need, or no partition
+/// when the overrides together exceed the total (cli692's N1 on #1718).
+pub(crate) fn memory(
+    total: Option<u64>,
+    parts: &[(usize, u64)],
+) -> Result<Vec<Memory>, (Option<usize>, String)> {
+    let overridden: u64 = parts.iter().map(|(_, m)| *m).sum();
+    let rest = parts.iter().filter(|(_, m)| *m == 0).count() as u64;
+    let equal = match total {
+        Some(t) if t < overridden => {
+            return Err((
+                None,
+                format!(
+                    "--engine-memory {t} is less than the map's memory_bytes for this node's \
+                     partitions ({overridden})"
+                ),
+            ));
+        }
+        Some(t) => Some((t - overridden) / rest.max(1)),
+        None => None,
+    };
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, &(shards, over))| {
+            let share = match (over, equal) {
+                (0, None) => return Ok(Memory::defaults(shards)),
+                (0, Some(e)) => e,
+                (m, _) => m,
+            };
+            Memory::of(share, shards).map_err(|least| {
+                (
+                    Some(i),
+                    format!(
+                        "{share} bytes of engine memory can't cover {shards} shards' memtables \
+                         at {MEMTABLE_FLOOR} bytes each: it needs at least {least}"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The CPUs a node with several partitions reserves for its compaction threads (D317
+/// ticket 8a, perf287's g75): the `compaction` CPUs that come after `shards` of them in the
+/// engine's pin order (one per physical core first, then their SMT siblings), so that every
+/// partition's shards, pinned next, take the first ones contiguously and the network side's
+/// mask stays in one place (one L3 domain on the AX102), as with one partition. The plan is
+/// released at once: the engines claim their shards' CPUs themselves as they open. `None`
+/// where pinning is refused (no hard affinity, a CPU quota, too few CPUs).
+///
+/// A partition whose change feed keeps more shards than its share pins the extra ones past
+/// the planned shards, onto the reserved CPUs: rare, and the startup line shows it.
+pub(crate) fn compaction_reserve(shards: usize, compaction: usize) -> Option<Vec<usize>> {
+    if compaction == 0 {
+        return None;
+    }
+    let plan = pigeonhole_io::sys::pin_plan(shards + compaction).ok()?;
+    let reserved: Vec<usize> = (shards..shards + compaction)
+        .filter_map(|i| plan.cpu(i))
+        .collect();
+    drop(plan);
+    (reserved.len() == compaction).then_some(reserved)
+}
+
 /// The network side's threads and where they may run.
 #[derive(Debug, Clone)]
 pub(crate) struct Placement {
@@ -89,6 +279,11 @@ pub(crate) struct Placement {
     /// Why the server's threads run unmasked though the shards are pinned, for a line of its
     /// own at startup.
     pub note: Option<String>,
+    /// The shard CPUs the mask leaves out, every partition's (D317 ticket 8a), and the
+    /// compaction CPUs the engines pinned (ICR 0134), which it doesn't: on one node g72 cost
+    /// the network side 3x its throughput for them (#1703). For the startup line.
+    pub shard_cpus: usize,
+    pub compaction_cpus: usize,
 }
 
 impl Placement {
@@ -100,14 +295,19 @@ impl Placement {
     /// Without `affinity` (`--affinity off`), the counts are the same but no mask is set: the
     /// threads run where the OS puts them (ICR 0131).
     pub(crate) fn plan(
-        db: &Pigeonhole,
+        dbs: &[&Pigeonhole],
         io: Option<usize>,
         blocking: Option<usize>,
         feed: Option<usize>,
         hubs: Option<usize>,
         affinity: bool,
     ) -> Self {
-        let pinned = db.pinned_shard_cpus();
+        // Every engine's pinned shard threads: the union across a node's partitions (D317
+        // ticket 8a). Their compaction threads' CPUs are counted, not left out (g72, #1703).
+        let mut pinned: Vec<usize> = dbs.iter().flat_map(|db| db.pinned_shard_cpus()).collect();
+        pinned.sort_unstable();
+        pinned.dedup();
+        let compaction_cpus = dbs.iter().map(|db| db.pinned_compaction_cpus().len()).sum();
         let process = process_cpus();
         // The counts and the startup wording; the masks come from [`Placement::masks`]
         // below, the one function a recompute also calls.
@@ -149,6 +349,8 @@ impl Placement {
             sibling_cpus,
             mode,
             note,
+            shard_cpus: pinned.len(),
+            compaction_cpus,
         };
         plan.masks = plan.masks(&pinned);
         plan
@@ -205,6 +407,8 @@ impl Placement {
             sibling_cpus: 0,
             mode: "unpinned (routes only)",
             note: None,
+            shard_cpus: 0,
+            compaction_cpus: 0,
         }
     }
 
@@ -592,10 +796,6 @@ mod tests {
         assert!(super::too_few_cores(8, 3).contains("--shards"));
     }
 
-    /// #1734: the request, feed and hub runtimes run on the free cores and the shards' SMT
-    /// siblings, the heavy threads on the free cores only, and no runtime on a shard's CPU.
-    /// The box's split (perf287's g80): the server on 0-9,16-25, 4 shards on 0-3, CPU `c`'s
-    /// sibling `c ± 16`, listed by sysfs with `c` itself.
     /// No mask holds a pinned CPU (ai1249's N2 on #1738): the property itself, beside the
     /// exact lists.
     fn off_the_shards(masks: &super::RuntimeMasks, pinned: &[usize]) {
@@ -607,6 +807,10 @@ mod tests {
         }
     }
 
+    /// #1734: the request, feed and hub runtimes run on the free cores and the shards' SMT
+    /// siblings, the heavy threads on the free cores only, and no runtime on a shard's CPU.
+    /// The box's split (perf287's g80): the server on 0-9,16-25, 4 shards on 0-3, CPU `c`'s
+    /// sibling `c ± 16`, listed by sysfs with `c` itself.
     #[test]
     fn the_request_and_feed_runtimes_also_take_the_shards_siblings() {
         use super::{RuntimeMasks, format_cpu_list, layout};
@@ -678,6 +882,87 @@ mod tests {
         );
     }
 
+    /// D317 ticket 8a (cli692's M3): a share's memory goes to the memtables first, at most
+    /// the library's arena per shard, then to the caches at the library's 4:1; overrides
+    /// come off the top, and a share that can't cover the memtables' floor is refused.
+    #[test]
+    fn engine_memory_splits_memtables_first_then_the_caches() {
+        use super::{MEMTABLE_FLOOR, MEMTABLE_PER_SHARD, Memory, memory};
+        let mib = 1u64 << 20;
+        // Plenty: the arena per shard, and the rest 4:1.
+        let m = Memory::of(2048 * mib, 4).unwrap();
+        assert_eq!(m.memtable_per_shard, MEMTABLE_PER_SHARD);
+        let rest = 2048 * mib - 4 * MEMTABLE_PER_SHARD;
+        assert_eq!(
+            (m.block_cache, m.row_cache),
+            (rest * 4 / 5, rest - rest * 4 / 5)
+        );
+        assert_eq!(m.bytes(), 2048 * mib);
+        // Tight: the memtables take it all, smaller per shard.
+        let m = Memory::of(4 * mib, 8).unwrap();
+        assert_eq!(
+            (m.memtable_per_shard, m.block_cache, m.row_cache),
+            (mib / 2, 0, 0)
+        );
+        // Too little for the floor: refused with the least that would do.
+        assert_eq!(Memory::of(MEMTABLE_FLOOR, 2), Err(2 * MEMTABLE_FLOOR));
+        // A node's: unset, the defaults; set, equal shares after the map's overrides.
+        assert_eq!(memory(None, &[(2, 0)]).unwrap(), [Memory::defaults(2)]);
+        let parts = memory(Some(3072 * mib), &[(2, 0), (2, 1024 * mib), (2, 0)]).unwrap();
+        assert_eq!(parts[1].bytes(), 1024 * mib);
+        assert_eq!(
+            (parts[0].bytes(), parts[2].bytes()),
+            (1024 * mib, 1024 * mib)
+        );
+        assert_eq!(parts.iter().map(Memory::bytes).sum::<u64>(), 3072 * mib);
+        // Overrides beyond the node's total, or a share below the floor, name the cause.
+        assert!(memory(Some(mib), &[(1, 2 * mib)]).is_err());
+        let (i, why) = memory(Some(mib), &[(1, 0), (64, 0)]).unwrap_err();
+        assert_eq!(i, Some(1), "{why}");
+        // Overrides beyond the total are no one partition's.
+        assert_eq!(memory(Some(mib), &[(1, 2 * mib)]).unwrap_err().0, None);
+    }
+
+    /// D317 ticket 8a: a node's budget splits into equal shares, the remainder to the first
+    /// partitions, and pinned compaction threads never exceed the node's total.
+    #[test]
+    fn a_nodes_budget_splits_across_its_partitions() {
+        use super::{Share, split};
+        let s = |shards, compaction, confined| Share {
+            shards,
+            compaction,
+            confined,
+        };
+        // One partition: the whole budget.
+        assert_eq!(split(8, 3, 1), [s(8, 3, false)]);
+        // Remainders go to the first partitions.
+        assert_eq!(
+            split(8, 3, 3),
+            [s(3, 1, false), s(3, 1, false), s(2, 1, false)]
+        );
+        assert_eq!(split(7, 4, 2), [s(4, 2, false), s(3, 2, false)]);
+        // Fewer compaction threads than partitions: one pinned each for the first, one
+        // confined each for the rest, so the pinned ones stay at the node's 3.
+        let eight = split(8, 3, 8);
+        assert!(eight.iter().all(|p| p.shards == 1 && p.compaction == 1));
+        assert_eq!(eight.iter().filter(|p| !p.confined).count(), 3);
+        assert!(eight[..3].iter().all(|p| !p.confined));
+        // Fewer shards than partitions: each still gets one.
+        assert!(split(2, 1, 4).iter().all(|p| p.shards == 1));
+        // No compaction threads: none anywhere.
+        assert!(
+            split(4, 0, 2)
+                .iter()
+                .all(|p| p.compaction == 0 && !p.confined)
+        );
+        // Totals are kept whenever there's at least one of each per partition.
+        for n in 1..=8 {
+            let parts = split(16, 8, n);
+            assert_eq!(parts.iter().map(|p| p.shards).sum::<usize>(), 16, "{n}");
+            assert_eq!(parts.iter().map(|p| p.compaction).sum::<usize>(), 8, "{n}");
+        }
+    }
+
     #[test]
     fn a_plan_leaves_threads_for_the_network_side() {
         let dir = std::env::temp_dir().join(format!("phdb-placement-{}", std::process::id()));
@@ -687,7 +972,7 @@ mod tests {
             Options::default().create_if_missing(true).shards(1),
         )
         .unwrap();
-        let plan = Placement::plan(&db, None, None, None, None, true);
+        let plan = Placement::plan(&[&db], None, None, None, None, true);
         assert!(
             plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
@@ -700,13 +985,13 @@ mod tests {
                 "{plan:?}"
             );
         }
-        let given = Placement::plan(&db, Some(3), Some(5), Some(2), Some(7), true);
+        let given = Placement::plan(&[&db], Some(3), Some(5), Some(2), Some(7), true);
         assert_eq!(
             (given.io_threads, given.feed_threads, given.hub_threads),
             (3, 2, 7)
         );
         // `--affinity off`: the same threads, with no mask (ICR 0131).
-        let off = Placement::plan(&db, None, None, None, None, false);
+        let off = Placement::plan(&[&db], None, None, None, None, false);
         assert_eq!(
             (
                 off.io_threads,
@@ -733,16 +1018,16 @@ mod tests {
         // C's default), and `--feed-hub-threads` as given.
         for (feed, hubs) in [(1, 1), (2, 1), (3, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
             assert_eq!(
-                Placement::plan(&db, None, None, Some(feed), None, true).hub_threads,
+                Placement::plan(&[&db], None, None, Some(feed), None, true).hub_threads,
                 hubs
             );
         }
         assert_eq!(
-            Placement::plan(&db, None, None, Some(4), Some(1), true).hub_threads,
+            Placement::plan(&[&db], None, None, Some(4), Some(1), true).hub_threads,
             1
         );
         assert_eq!(
-            Placement::plan(&db, None, None, Some(4), Some(0), true).hub_threads,
+            Placement::plan(&[&db], None, None, Some(4), Some(0), true).hub_threads,
             1
         );
         // A recompute for the start's pinned CPUs gives the start's masks (D317 ticket 6's

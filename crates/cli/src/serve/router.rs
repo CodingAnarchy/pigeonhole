@@ -16,16 +16,28 @@ use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection
 use super::replica::ReadDeadline;
 use super::service::{Partition, Service, ServiceOp, ServiceReply};
 
-/// A cluster node's routing: the node (its map, routes and peers) and the partition it
-/// serves, if the map gives it one.
+/// A cluster node's routing: the node (its map, routes and peers) and the partitions it
+/// serves, each with its own service (D317 ticket 8a), by id.
 #[derive(Debug)]
 pub(crate) struct Cluster {
     pub(crate) node: Arc<super::cluster::Node>,
-    pub(crate) local: Option<String>,
+    pub(crate) parts: Parts,
     pub(crate) forwarder: Arc<Forwarder>,
     /// Partition files streamed in for a restore or a relocation (D317), staged in the
     /// node's cluster directory.
     pub(crate) uploads: Arc<super::cluster::upload::Uploads>,
+}
+
+/// A cluster node's partitions open here, each served by its own [`Service`] sharing the
+/// node's (D317 ticket 8a), by id. Shared with a cluster subscription's task, which opens a
+/// part served here (ticket 7).
+pub(crate) type Parts = Arc<std::collections::BTreeMap<String, Arc<Service>>>;
+
+impl Cluster {
+    /// Partition `id`'s service, if it's open here.
+    pub(crate) fn here(&self, id: &str) -> Option<&Arc<Service>> {
+        self.parts.get(id)
+    }
 }
 
 /// Where a call goes.
@@ -45,19 +57,17 @@ impl Router {
         }
     }
 
-    /// A cluster node's router: `service` serves `local`, the partition the map gives the
-    /// node (`None`: the node only routes).
+    /// A cluster node's router: `service` is the node's (its budgets, pools, sessions caps
+    /// and metrics; it serves no partition itself), and `parts` the partitions the map gives
+    /// the node, each with its service made from the node's ([`Service::for_partition`]).
+    /// None: the node only routes.
     pub(crate) fn cluster(
         service: Service,
         node: Arc<super::cluster::Node>,
-        local: Option<String>,
+        parts: Vec<(String, Service)>,
     ) -> Self {
         let forwarder = Arc::new(Forwarder::new(Arc::clone(&node)));
-        // Its sessions' ids name its partition, so any node routes a call on one (ticket 3).
-        let service = match &local {
-            Some(p) => service.sessions_on(p),
-            None => service,
-        };
+        let parts = parts.into_iter().map(|(id, s)| (id, Arc::new(s))).collect();
         let uploads = Arc::new(super::cluster::upload::Uploads::new(
             node.dir(),
             1,
@@ -67,7 +77,7 @@ impl Router {
             service: Arc::new(service),
             cluster: Some(Cluster {
                 node,
-                local,
+                parts: Arc::new(parts),
                 forwarder,
                 uploads,
             }),
@@ -160,16 +170,25 @@ impl Router {
         self.cluster.as_ref().map(|c| &c.node)
     }
 
-    /// A cluster node's partitions open here, by id: none or one until D317's ticket 8a
-    /// gives a node several. Nothing on a single node, whose one database is the service's.
-    /// Its signature is fixed for 8a (simp724's A1 on 8b): callers iterate it, never
-    /// `Cluster::local` or `Service::part`.
+    /// A cluster node's partitions open here, by id, in id order (D317 ticket 8a). Nothing on
+    /// a single node, whose one database is the service's. Its signature is fixed (simp724's
+    /// A1 on 8b): callers iterate it, never `Cluster::parts` or `Service::part`.
     pub(crate) fn partitions(&self) -> impl Iterator<Item = (&str, &Partition)> {
-        self.cluster
-            .as_ref()
-            .and_then(|c| c.local.as_deref())
-            .zip(self.service.part_opt())
-            .into_iter()
+        self.cluster.iter().flat_map(|c| {
+            c.parts
+                .iter()
+                .filter_map(|(id, s)| s.part_opt().map(|p| (id.as_str(), p)))
+        })
+    }
+
+    /// Every database this server serves: a single node's one, or a cluster node's
+    /// partitions (D317 ticket 8a). For what's done to each alike: feeds started, the dump,
+    /// bulk loads stopped, indexes closed, health.
+    pub(crate) fn parts(&self) -> Vec<&Partition> {
+        match &self.cluster {
+            None => self.service.part_opt().into_iter().collect(),
+            Some(_) => self.partitions().map(|(_, p)| p).collect(),
+        }
     }
 
     /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
@@ -203,11 +222,18 @@ impl Router {
     /// The metrics as Prometheus text (`/metrics`, `Admin.Metrics`): a cluster node's
     /// partitions' each labelled by id (D317 ticket 8b), a single node's one unlabelled.
     pub(crate) fn metrics_text(&self) -> String {
-        if self.cluster.is_none() {
-            return self.service.metrics_text(&self.service.single_parts());
-        }
+        let Some(cluster) = &self.cluster else {
+            return self
+                .service
+                .metrics_text(&self.service.single_parts(), &[&self.service.sessions]);
+        };
         let parts: Vec<_> = self.partitions().map(|(id, p)| (Some(id), p)).collect();
-        self.service.metrics_text(&parts)
+        // The node's table and every partition's (cli692's F1 on #1718).
+        let sessions: Vec<&super::sessions::Sessions> = std::iter::once(&self.service.sessions)
+            .chain(cluster.parts.values().map(|s| &s.sessions))
+            .map(|s| &**s)
+            .collect();
+        self.service.metrics_text(&parts, &sessions)
     }
 
     /// A cluster node's `Admin.Backup` or `BackupDownload` (D317 ticket 8b): of a partition
@@ -337,16 +363,17 @@ impl Router {
                 }
                 _ => {}
             }
-            let target = cluster.target(&op)?;
-            if let Some(owner) = target {
-                let deadline = deadline.map_or_else(
-                    || tokio::time::Instant::now() + self.service.request_timeout(),
-                    tokio::time::Instant::from_std,
-                );
-                return self
-                    .forward(cluster, op, caller, prepaid, owner, deadline)
-                    .await;
-            }
+            return match cluster.target(&op)? {
+                Place::Here(service) => service.call(op, caller, prepaid).await,
+                Place::There(owner) => {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    self.forward(cluster, op, caller, prepaid, owner, deadline)
+                        .await
+                }
+            };
         }
         self.service.call(op, caller, prepaid).await
     }
@@ -408,8 +435,8 @@ impl Router {
                 let op = forward::op_of(again.op.clone())?;
                 match cluster.target(&op)? {
                     // The newer map gives the key to this node.
-                    None => return self.service.call(op, caller, Some(budget)).await,
-                    Some(next) => {
+                    Place::Here(service) => return service.call(op, caller, Some(budget)).await,
+                    Place::There(next) => {
                         let mut again = again;
                         again.map_version = next.map_version;
                         cluster
@@ -451,7 +478,7 @@ impl Router {
         super::cluster::feed::subscribe(
             Arc::clone(&cluster.node),
             Arc::clone(&cluster.forwarder),
-            cluster.local.clone(),
+            Arc::clone(&cluster.parts),
             Arc::clone(&self.service),
             r,
             caller,
@@ -469,8 +496,7 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
-        super::cluster::feed::serve(&cluster.node, cluster.local.as_deref(), &self.service, req)
-            .await
+        super::cluster::feed::serve(&cluster.node, &cluster.parts, req).await
     }
 
     /// A call another node forwarded here (D317 ticket 2): served only if this node's map
@@ -494,7 +520,7 @@ impl Router {
         if matches!(op, ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) {
             return self.serve_forwarded_schema(cluster, op, caller).await;
         }
-        {
+        let service = {
             let routes = cluster.node.routes();
             let Some(routes) = routes.as_ref() else {
                 return Err(ApiError::wrong_partition(
@@ -514,15 +540,13 @@ impl Router {
                     format!("this node doesn't serve partition {p:?}"),
                 ));
             }
-            if cluster.local.as_deref() != Some(p.as_str()) {
-                return Err(not_open(&p));
-            }
-        }
+            cluster.here(&p).ok_or_else(|| not_open(&p))?
+        };
         match op {
             ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
-                self.service.fanout_part(op, caller).await
+                service.fanout_part(op, caller).await
             }
-            op => self.service.call(op, caller, None).await,
+            op => service.call(op, caller, None).await,
         }
     }
 
@@ -553,9 +577,15 @@ pub(crate) struct Target {
     map_version: u64,
 }
 
+/// Where a routed call goes: a partition's service here, or the node serving it.
+pub(crate) enum Place<'a> {
+    Here(&'a Arc<Service>),
+    There(Target),
+}
+
 impl Cluster {
-    /// `None`: `op`'s partition is served here; otherwise the node serving it.
-    fn target(&self, op: &ServiceOp) -> Result<Option<Target>, ApiError> {
+    /// Where `op`'s partition is served: here, or the node serving it.
+    fn target(&self, op: &ServiceOp) -> Result<Place<'_>, ApiError> {
         let routes = self.node.routes();
         let Some(routes) = routes.as_ref() else {
             return Err(ApiError::partition_unavailable(
@@ -570,13 +600,12 @@ impl Cluster {
         // it open: a partition the map moved away is the new owner's, even if its file is
         // still open here.
         if owner.node == self.node.id() {
-            return if self.local.as_deref() == Some(partition.as_str()) {
-                Ok(None)
-            } else {
-                Err(not_open(&partition))
-            };
+            return self
+                .here(&partition)
+                .map(Place::Here)
+                .ok_or_else(|| not_open(&partition));
         }
-        Ok(Some(Target {
+        Ok(Place::There(Target {
             node: owner.node.clone(),
             address: owner.address.clone(),
             map_version: routes.map_version(),

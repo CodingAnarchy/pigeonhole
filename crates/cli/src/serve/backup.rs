@@ -613,7 +613,12 @@ mod tests {
         )
         .unwrap();
         let placement = Arc::new(super::super::placement::Placement::plan(
-            &db, None, None, None, None, true,
+            &[&db],
+            None,
+            None,
+            None,
+            None,
+            true,
         ));
         // No mask here (nothing pinned, or too few cores): nothing to check.
         if let Some(free) = placement.masks.blocking.clone() {

@@ -78,6 +78,10 @@ message Partition {
   // Raised by every relocation; a node writes P only while the map's epoch for P equals
   // the epoch in P's file (D317 §2).
   uint64 epoch = 3;
+  // The engine memory P takes on its node (D317 ticket 8a): its memtables, block cache and
+  // row cache, taken off the top of the node's `--engine-memory` before the rest is split
+  // equally across the node's other partitions. 0: an equal share.
+  uint64 memory_bytes = 4;
 }
 
 message TablePlacement {

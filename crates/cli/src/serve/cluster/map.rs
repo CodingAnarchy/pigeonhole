@@ -349,6 +349,7 @@ mod tests {
             id: id.into(),
             node: node.into(),
             epoch: 1,
+            memory_bytes: 0,
         };
         let table =
             |name: &str, group: &str, splits: Vec<SplitKey>, parts: &[&str]| TablePlacement {
@@ -502,6 +503,7 @@ mod tests {
             id: "p4".into(),
             node: "c".into(),
             epoch: 1,
+            memory_bytes: 0,
         });
         ok.partitions[0].node = "c".into();
         ok.partitions[0].epoch = 2;

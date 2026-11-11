@@ -525,13 +525,36 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
     )
     .unwrap();
     let plan = Arc::new(crate::serve::placement::Placement::plan(
-        &placed, None, None, None, None, true,
+        &[&placed],
+        None,
+        None,
+        None,
+        None,
+        true,
     ));
     placed.close().unwrap();
     let p = Server::start_custom("", limits(), 1, move |svc| svc.placement(&plan));
     let r = Server::start_replica(test_dir(), &p.url, None);
+    // A cluster node's partition families too (D317 ticket 8a), rendered for a partition
+    // made as `cluster::run` makes one, from the primary's service.
+    let cluster = {
+        let service = &p.shared.router.service;
+        let db = service.part().unwrap().db.clone();
+        let backups = crate::serve::backup::Backups::new(None, 1).unwrap();
+        let part = service.for_partition(
+            db,
+            "p1",
+            &backups,
+            crate::serve::service::Pinning::default(),
+            crate::serve::placement::Memory::defaults(1),
+        );
+        service.metrics_text(&[(Some("p1"), part.part().unwrap())], &[&service.sessions])
+    };
     for (server, prefix) in [(&p, "pigeonhole_serve_"), (&r, "pigeonhole_replica_")] {
-        let rendered = names(&server.shared.router.metrics_text(), prefix);
+        let mut rendered = names(&server.shared.router.metrics_text(), prefix);
+        if prefix == "pigeonhole_serve_" {
+            rendered.extend(names(&cluster, prefix));
+        }
         assert!(!rendered.is_empty(), "{prefix}");
         assert_eq!(
             names(guide, prefix),

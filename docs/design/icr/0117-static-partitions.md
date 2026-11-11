@@ -311,6 +311,36 @@
 
 **Metrics by partition:** on a cluster node, `/metrics` and `Admin.Metrics` label every per-partition series `pigeonhole_partition="<id>"`. That covers the engine's metrics (D323, through `pigeonhole-otel`'s `Config::attribute`, ICR 0133) and the serve feed fan-out's and bulk loads' gauges. Node-wide series (connections, replies, sessions) stay unlabelled. Each family's `# HELP`/`# TYPE` comes once, whatever the number of partitions. A single node's text is unchanged. On a cluster node, `Admin.Metrics` is answered by the node itself; it was `Unsupported` before.
 
+## Ticket 8a: several partitions per node
+**A cluster node serves every partition the map gives it** (D317 §10). Before, a map that gave a node more than one was refused at its start.
+- **One service per partition, sharing the node's.** Each partition has its own database, tables, indexes, feeds and session table (ids `<partition>:<hex>`, ticket 3).
+  - **Node-wide:** the budgets and pools (`--inflight-bytes`, `--max-concurrent`, `--max-scans`, `--max-streams`, the blocking pool), connections, metrics, limits, `--max-sessions` and `--max-sessions-per-token`, and `--backup-dir`'s one `Backups`.
+  - A call is admitted once, by whichever service takes it.
+  - Bulk loads, text rebuilds and the SIGUSR1 dump cover every partition; shutdown closes each.
+- **Schema (ticket 5):** every map a node takes reconciles each of its partitions, each through its own service and under its own schema lock, and `Cluster.Status` reports each partition's reconcile (simp724's N1 on #1720).
+- **Calls** route to the partition's own service here, or to its node, as before. Two partitions on one node are still two partitions: a batch across them is `CrossPartition`, and a session id names its own.
+- **Opening:** the partitions open in id order before the network side starts, each checked against the map as in ticket 2. One that fails to open (a missing file, a wrong identity) fails the node's start, naming it, after closing those already open.
+
+**The node's budget (§10, perf287's P1):**
+- **`--shards` and the new `--compaction-threads`** are the node's totals, split across its partitions in id order: equal shares, the remainder one each to the first, at least one shard each.
+  - **Shards:** the share is passed as the database's default shard count (ICR 0132), so a partition whose change feed recorded a count keeps it rather than being resharded.
+  - **Compaction threads:** `--compaction-threads` defaults to the library's per-database default (a quarter of the physical cores, at least 1, at most one per shard), computed once for the node. Pinned compaction threads never exceed it. With fewer than one per partition, the first get one pinned thread each, and the rest one each that is confined to the node's compaction CPUs (`Options::compaction_cpu_set`, ICR 0134) rather than pinned (perf287's A1).
+  - A single node takes `--compaction-threads` too, as its database's `compaction_cores`.
+- **Shards first (perf287's g75):** with several partitions, the node reserves its compaction CPUs before any engine opens: the `--compaction-threads` CPUs that come after all the partitions' shards in the engine's pin order. Every partition's compaction threads are confined to them (`compaction_cpu_set`). So each engine's pin plan holds only its shards, and the shards take the first CPUs together, as one engine's would. Opened one after another without this, each engine pinned its shards and then its compaction threads, interleaving them. The network mask was then split across the AX102's two L3 domains, and its threads ran at 0.70 IPC against 0.91 at one partition (25% less Get throughput). A partition whose feed keeps more shards than its share pins the extra ones onto the reserved CPUs.
+- **The pinning check:** after each open, the node prints the partition's shard and compaction threads, pinned, confined and unpinned. On Linux, an engine with unpinned threads is a warning naming the reason. `/metrics` has `pigeonhole_serve_partition_unpinned_shard_threads` and `pigeonhole_serve_partition_unpinned_compaction_threads`, labelled `pigeonhole_partition`.
+- **The network mask** (D313's R1, #1697) leaves out the shards' CPUs of every partition on the node: the union of their shard threads' CPUs and SMT siblings. The engines' compaction CPUs stay in the mask. g72 (#1703 comment 6787495064) measured leaving them out too: on one node it cost the network side about 3x its throughput, and #1703 stays open for 1.3.0 (the coordinator's call). The startup line counts the shard CPUs left out and the compaction CPUs not. Recomputing the mask after a relocation opens a partition is ticket 6's.
+
+**Engine memory (§10; cli692's M3, perf287's A3):**
+- **`--engine-memory BYTES`** covers the memtables, block cache and row cache. Unset, every database takes the library's defaults (64 MiB of memtable per shard, a 256 MiB block cache, a 64 MiB row cache), as before.
+- **How a share is spent:** the memtables first, at most 64 MiB and at least 128 KiB per shard; the rest to the block cache and row cache at the library's 4:1.
+- **On a cluster node it's the node's total.**
+  - The map's new **`Partition.memory_bytes`** (field 4; 0: none) gives a partition its own amount, taken off the top.
+  - The rest is split equally across the node's other partitions.
+  - A share that can't cover its shards' memtables at 128 KiB each, or overrides above the total, fail the node's start, naming the partition and the least it needs. That's checked against the flag, not the host's RAM.
+- **Reported:** each partition's resolved numbers are on its startup line, and in `/metrics` as `pigeonhole_serve_partition_memtable_bytes`, `pigeonhole_serve_partition_block_cache_bytes` and `pigeonhole_serve_partition_row_cache_bytes`, labelled `pigeonhole_partition`.
+
+**Not changed:** a single node answers as before, with the same mask. Its startup line adds the shard and compaction CPU counts, and it takes the two new flags.
+
 ## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
 **`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
 - **A partition is a set of files,** named by their suffix of the partition's database path: `""` for the main file, `-wal-<n>` for a WAL sidecar, `-feed` for the change feed's sidecar. Each node maps a name onto its own path. **`PartitionFile { name = 1; bytes = 2; sha256 = 3 }`** (common.proto) describes one.

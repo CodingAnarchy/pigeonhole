@@ -244,40 +244,50 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
     o
 }
 
-/// Wires a serving node's reconcile: whenever `node` takes a map, `partition`'s file is
-/// reconciled to it (on the installing thread, before the map's routes serve), and the
-/// service's cached handles go. Runs once now, for the map the node starts with.
+/// Wires a serving node's reconcile: whenever `node` takes a map, each of its partitions'
+/// files is reconciled to it through that partition's own service (D317 ticket 8a, simp724's
+/// N1 on #1720), on the installing thread, before the map's routes serve, and that service's
+/// cached handles go. Runs once now, for the map the node starts with.
 pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
-    let Some(partition) = shared.router.cluster.as_ref().and_then(|c| c.local.clone()) else {
+    let Some(cluster) = shared.router.cluster.as_ref() else {
         return;
     };
+    if cluster.parts.is_empty() {
+        return;
+    }
     let weak = Arc::downgrade(shared);
-    let run = move |map: &ClusterMap| -> Option<Outcome> {
+    let run = move |map: &ClusterMap| -> Option<Vec<(String, Outcome)>> {
         let shared = weak.upgrade()?;
-        let service = &shared.router.service;
-        let part = service.part().ok()?;
-        // The service's schema lock, as a single node's create and drop take it: no
-        // create or drop of its own runs across a reconcile.
-        let _schema = part.schema.blocking_lock();
-        let outcome = reconcile(&part.db, &partition, map);
-        if !outcome.created.is_empty() || !outcome.dropped.is_empty() {
-            service.tables_changed();
+        let parts = &shared.router.cluster.as_ref()?.parts;
+        let mut outcomes = Vec::with_capacity(parts.len());
+        for (partition, service) in parts.iter() {
+            let Ok(part) = service.part() else {
+                continue;
+            };
+            // The partition's schema lock, as a single node's create and drop take it: no
+            // create or drop of its own runs across a reconcile.
+            let _schema = part.schema.blocking_lock();
+            let outcome = reconcile(&part.db, partition, map);
+            if !outcome.created.is_empty() || !outcome.dropped.is_empty() {
+                service.tables_changed();
+            }
+            for name in &outcome.adopted {
+                eprintln!(
+                    "phdb serve: cluster map version {}: table {name:?} in partition {partition} \
+                     was made by hand; a create through the map took it over, and the map now \
+                     owns it (a drop through the map drops it)",
+                    map.map_version
+                );
+            }
+            for e in &outcome.errors {
+                eprintln!(
+                    "phdb serve: reconciling partition {partition} to map version {}: {e}",
+                    map.map_version
+                );
+            }
+            outcomes.push((partition.clone(), outcome));
         }
-        for name in &outcome.adopted {
-            eprintln!(
-                "phdb serve: cluster map version {}: table {name:?} in partition {partition} \
-                 was made by hand; a create through the map took it over, and the map now owns \
-                 it (a drop through the map drops it)",
-                map.map_version
-            );
-        }
-        for e in &outcome.errors {
-            eprintln!(
-                "phdb serve: reconciling partition {partition} to map version {}: {e}",
-                map.map_version
-            );
-        }
-        Some(outcome)
+        Some(outcomes)
     };
     let _ = node.reconciler.set(super::Reconciler(Box::new(run)));
     if let Ok(map) = node.get_map() {
@@ -286,17 +296,19 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
 }
 
 impl Node {
-    /// Reconciles this node's partition to `map`, if a server attached one, and keeps the
-    /// outcome for `Status`.
+    /// Reconciles this node's partitions to `map`, if a server attached them, and keeps each
+    /// one's outcome for `Status`.
     pub(crate) fn reconcile(&self, map: &ClusterMap) {
         if let Some(run) = self.reconciler.get()
-            && let Some(outcome) = (run.0)(map)
+            && let Some(outcomes) = (run.0)(map)
         {
-            *self
+            let mut reconciled = self
                 .reconciled
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((map.map_version, outcome));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (partition, outcome) in outcomes {
+                reconciled.insert(partition, (map.map_version, outcome));
+            }
         }
     }
 }

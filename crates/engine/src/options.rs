@@ -50,6 +50,10 @@ pub struct EngineOptions {
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
     /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,
+    /// Engine-owned mode with `pin_threads`: confine the compaction threads to these CPU
+    /// ids instead of pinning each to a CPU of its own (ICR 0134). `None` (the default) pins
+    /// them like the shards.
+    pub compaction_cpu_set: Option<Vec<usize>>,
     /// Engine-owned mode only: the driver threads the shards run on (D289, ICR 0079). 0
     /// (the default) gives each shard a thread of its own; `k` runs shard `i` on thread
     /// `i % k`.
@@ -281,6 +285,7 @@ impl EngineOptions {
             default_shards: 0,
             pin_threads: true,
             compaction_threads: 0,
+            compaction_cpu_set: None,
             shard_threads: 0,
             adaptive_drivers: false,
             background_workers: 0,

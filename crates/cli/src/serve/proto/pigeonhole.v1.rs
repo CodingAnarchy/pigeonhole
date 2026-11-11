@@ -6171,6 +6171,11 @@ pub struct Partition {
     /// the epoch in P's file (D317 §2).
     #[prost(uint64, tag = "3")]
     pub epoch: u64,
+    /// The engine memory P takes on its node (D317 ticket 8a): its memtables, block cache and
+    /// row cache, taken off the top of the node's `--engine-memory` before the rest is split
+    /// equally across the node's other partitions. 0: an equal share.
+    #[prost(uint64, tag = "4")]
+    pub memory_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {

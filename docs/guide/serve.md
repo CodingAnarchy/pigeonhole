@@ -211,6 +211,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 
 ## Limits
 - `--max-request-bytes` (16 MiB): the largest request.
+- `--engine-memory` (unset: the library's defaults, 64 MiB of memtable per shard, a 256 MiB block cache and a 64 MiB row cache): the database's memtables, block cache and row cache, in bytes. The memtables take theirs first (at most 64 MiB and at least 128 KiB per shard, and a smaller arena means a smaller largest batch), then the caches at 4:1. A size that can't cover the memtables at 128 KiB a shard is refused at start.
 - `--inflight-bytes` (256 MiB): request and reply bytes held at once. A request's share is reserved before its body is read: from `Content-Length` over HTTP, and from the message header over gRPC. Scan pages count too (below).
   - **Unary read replies count as well** (#1567):
     - **Which:** `ReadRow`, `MultiGet`, `Graph.Traverse` and `Vectors.Nearest` (by their `page_bytes`, 1 MiB when 0, up to 8 MiB), `Memory.Recall` (by its byte budget) and `Get`.
@@ -246,7 +247,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 - A write the server has submitted always answers its real outcome.
 
 ## Threads and placement
-- **Threads:** `--shards` sets the shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. The shared subscriptions (hubs) that read the engine's feed run on threads of their own (`phdb-serve-feed-hub`, `--feed-hub-threads`, by default a quarter as many as `--feed-threads`, at least 1), on the same CPUs, so a hub never waits behind its streams' delivery (#1397). A hub with a single stream runs on the feed threads beside it instead (#1689). **The default keeps writes first.** Each hub thread past it costs the writes on the same CPUs: put p50 rose 13–38% at moderate fan-out load, and CPU per delivered event rose with it. When saturated, delivery wasn't better either: at 16 table sets × 16 streams, more hub threads delivered 15–21% fewer events. With 3 feed threads, 16 table sets with 2 streams each, on the AX102 (g76c on #1725):
+- **Threads:** `--shards` sets the shard count (default: half the physical cores), and `--compaction-threads` the threads dedicated to flushes and compactions (default: a quarter of the physical cores this process may run on, at least 1, at most one per shard). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. The shared subscriptions (hubs) that read the engine's feed run on threads of their own (`phdb-serve-feed-hub`, `--feed-hub-threads`, by default a quarter as many as `--feed-threads`, at least 1), on the same CPUs, so a hub never waits behind its streams' delivery (#1397). A hub with a single stream runs on the feed threads beside it instead (#1689). **The default keeps writes first.** Each hub thread past it costs the writes on the same CPUs: put p50 rose 13–38% at moderate fan-out load, and CPU per delivered event rose with it. When saturated, delivery wasn't better either: at 16 table sets × 16 streams, more hub threads delivered 15–21% fewer events. With 3 feed threads, 16 table sets with 2 streams each, on the AX102 (g76c on #1725):
 
   | `--feed-hub-threads` | put p50 at 30K puts/s | at 55K puts/s (saturated): puts | events delivered | lag p99 |
   |--:|--:|--:|--:|--:|
@@ -262,7 +263,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
   - Before #1734, the masked server did the opposite: it held writes to about 33K of the 55K puts/s and delivered every event, or switched between the two. The network and feed threads now also run on the shards' SMT siblings (Placement, below), so the writes no longer queue behind delivery for a CPU.
 
   Each stream's framing still runs on its connection's network thread.
-- **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the server's threads get an affinity mask that keeps them off the shards' CPUs. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206). The startup line's last part says which mask the server built:
+- **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the server's threads get an affinity mask that keeps them off the shards' CPUs: every partition's shards on a cluster node. The compaction threads' CPUs stay in the mask: on one node, leaving them out too cost the network side about three times its throughput (g72 on #1703). The startup line counts both. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206). The startup line's last part says which mask the server built:
   - **`off the shards' cores`:** the network, feed and feed hub workers run on every CPU but the shards' own: the free cores and the shards' SMT siblings. The line then ends with "network and feed threads also on the shards' N SMT siblings (CPUs)", the whole list. The blocking threads (scans, `ReadRow`, `MultiGet`, text and vector calls, `/mcp`) and the background threads (below) stay on the free cores only, since a busy thread on a shard's sibling doubled the shard's p99 (#1244).
     - The siblings are there for the writes: with only the free cores, 256 feed streams' delivery filled them and the network threads waited for a CPU, so puts were held to 33K/s while the siblings sat idle (#1734).
     - Without SMT there are no siblings, and every thread gets the free cores;
@@ -336,6 +337,8 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
+| `pigeonhole_serve_partition_unpinned_shard_threads{pigeonhole_partition}`, `pigeonhole_serve_partition_unpinned_compaction_threads{pigeonhole_partition}` | gauge | On a cluster node, each partition's engine threads left unpinned: shard drivers and compaction threads. Above 0 on Linux, the partition's threads can share CPUs with another's or with the network side's. |
+| `pigeonhole_serve_partition_memtable_bytes{pigeonhole_partition}`, `pigeonhole_serve_partition_block_cache_bytes{pigeonhole_partition}`, `pigeonhole_serve_partition_row_cache_bytes{pigeonhole_partition}` | gauge | On a cluster node, each partition's engine memory as resolved from `--engine-memory` and the map's `memory_bytes`. |
 | `pigeonhole_replica_following`, `pigeonhole_replica_applied_primary_seqno`, `pigeonhole_replica_lag_commits`, `pigeonhole_replica_lag_seconds` | gauge | On a replica only ([Replicas](#replicas)). |
 
 The engine's metrics follow, under the [observability guide's](observability.md#the-metrics) names and labels, with its alerts and its Grafana dashboard.
@@ -403,8 +406,9 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - scans, multi-gets, nearest searches and traversals across partitions;
   - change feeds across partitions;
   - schema through the cluster: tables and families live in the map, made and dropped through any node;
-  - backups.
-- **Still to come:** moving a partition between nodes, several partitions per node, and restore. The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
+  - backups;
+  - several partitions per node.
+- **Still to come:** moving a partition between nodes, and restore. The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -457,9 +461,9 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 
-**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for its partition. `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. Those come with later steps; until then an upload is staged in `DIR/.phdb-incoming` and nothing installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
+**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for each of its partitions. `--shards`, `--compaction-threads` and `--engine-memory` are the node's totals, split across its partitions ([Partitions per node](#partitions-per-node)). `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. Those come with later steps; until then an upload is staged in `DIR/.phdb-incoming` and nothing installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
 
-**Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label.
+**Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label. Each partition also has its unpinned engine threads (`pigeonhole_serve_partition_unpinned_shard_threads`, `…_unpinned_compaction_threads`) and its engine memory (`pigeonhole_serve_partition_memtable_bytes`, `…_block_cache_bytes`, `…_row_cache_bytes`).
 
 ### How calls are routed
 - **Any node takes any call.** It serves the call if it holds the row's partition, and otherwise forwards it to the node that does. A client needs no map. One that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
@@ -467,7 +471,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
 - **Refused with `Unsupported`:** the index searches (`Vectors.Search`, `Text.Search`), which aren't supported on a cluster in this release (for vectors, use `Vectors.Nearest`, which fans out), and, naming the step that brings each, `Info` and `/mcp`.
-- **A node holds one partition** for now, the one its map gives it, opened at start after checking the file's identity row against the map. A node the map gives no partition only routes.
+- **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.
@@ -478,7 +482,7 @@ Tables and their families live in the cluster map (D317 ticket 5). `Schema.Creat
 - **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as the map would. Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
 - **A drop** removes the table from the map, and each partition drops it. Sessions and feeds on the table end as they do on a single node.
 - **The map's writer makes every change.** A create or drop through another node is forwarded to it ([Running a cluster](#running-a-cluster)). Concurrent changes through different nodes all land, one after another. A forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`: a create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
-- **The window:** the writer sets the map and pushes it, and each node brings its partition's file up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. The reply's `unreconciled` lists partitions whose node the push missed. `phdb cluster status` shows each partition's state.
+- **The window:** the writer sets the map and pushes it, and each node brings each of its partitions' files up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. The reply's `unreconciled` lists partitions whose node the push missed. `phdb cluster status` shows each partition's state.
 - **Tables made by hand** in a partition's file stay. One the map doesn't place is left alone, and `Cluster.Status` lists it as unmapped. A create through the map under its name takes it over, data included.
 - **Listing:** `ListTables` and `DescribeTable` answer from the map, so they show every table of the cluster and never a partition's own `__phdb_` tables.
 
@@ -594,9 +598,16 @@ Until then, keep each partition on the node it started on. A node checks its par
 - **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, fenced so that the old cluster, if it still runs, can't write into the restored one ([Fencing and relocation](#fencing-and-relocation) will say how).
 
 ### Partitions per node
-Each node holds one partition for now. Several partitions per node come with D317's ticket 8a. The recommendation for how many comes from a box run at the same node totals with 1, 2, 4 and 8 partitions.
+A node serves every partition its map gives it (D317 ticket 8a). The recommendation for how many comes from a box run at the same node totals with 1, 2, 4 and 8 partitions. **Plan for one partition per node until then.**
 
-**Plan for one partition per node until then.** An early box run (perf287's g74) points the same way: at the same totals, four partitions on one node gave 25–34% less throughput and 30–75% higher p99 than one. Each partition is a whole database engine, with costs that don't shrink with its share of the load:
+**A node's budget is shared by its partitions:**
+- **`--shards` and `--compaction-threads` are the node's totals,** split across its partitions in id order, at least one shard each. A partition whose change feed recorded a shard count keeps it.
+- **The shards pin first:** with several partitions, every partition's shards are pinned before any compaction thread, and the compaction threads share the node's compaction CPUs. So the network side keeps the same CPUs as with one partition. Before this (g74), four partitions on one node gave 25–34% less throughput than one; with it (perf287's g77), about 1–2% less.
+- **`--engine-memory` is the node's total too.** The map's `memory_bytes` for a partition is taken first, and the rest is split equally across the node's other partitions. Set it when a node holds several partitions, or each takes the library's full defaults.
+- **The startup lines** give each partition's shard and compaction threads (pinned, confined or unpinned) and its memory. On Linux, a partition with unpinned threads is a warning. `/metrics` has the same per partition.
+- **Sessions and feeds:** `--max-sessions`, `--max-sessions-per-token`, `--feed-ring-bytes`, `--max-feed-hubs` and `--max-catch-up` count across all of a node's partitions. A feed with tables on two of a node's partitions holds two hubs there.
+
+**What a partition costs** even so: each is a whole database engine, with costs that don't shrink with its share of the load:
 - at least one shard's memtable arena (64 MiB by default);
 - its own WAL, so its own group syncs: the same load over more partitions means more syncs, each covering fewer commits;
 - its own block and row caches, so a busy partition can't use an idle one's;
