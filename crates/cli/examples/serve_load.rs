@@ -17,7 +17,22 @@
 //! - `ycsb-a` (50% `Get`, 50% `Mutate`), `ycsb-b` (95%, 5%) and `ycsb-c` (100% `Get`), on
 //!   rows chosen by a Zipfian distribution (θ 0.99, YCSB's), hot rows scattered.
 //!
-//! Writes use the server's durability default (`GroupSync`).
+//! Writes use the server's durability default (`GroupSync`), or `--durability` per request.
+//!
+//! **Against a running server** (D317 8b's cluster runs): `--server URL` skips the build and
+//! the spawn, and `--server-pid` names the process whose CPU to read. `--load` writes the
+//! rows through the server first (`Mutate`s from `--clients` callers), so a cluster's router
+//! places each by its split keys. The table `t` (family `f`) is created if it's missing and
+//! the server serves `Schema.CreateTable`; otherwise it must exist. The load visits the rows
+//! in a scattered order, so a cluster's partitions fill together, at `--load-durability`
+//! (`Buffered` by default). A row refused (`Overloaded`) or left unknown for 30 s stops it,
+//! and so does any other error, with the server's message.
+//!
+//! On a cluster, a `Batch` whose rows straddle a split key is refused as `CrossPartition`;
+//! such calls are counted on the row's line (`cross-partition N`), not timed.
+//!
+//! **Large stores:** row keys are 8 digits, so up to 100M rows. About 20M of 100 B load in a
+//! few minutes either way. The Zipfian setup sums 20M terms once, about a second.
 //!
 //! ```text
 //! cargo build --release -p pigeonhole-cli --features serve --bin phdb --example serve_load
@@ -25,6 +40,9 @@
 //! # R1's acceptance: the same, with the server's threads unmasked
 //! target/release/examples/serve_load --phdb target/release/phdb --dir /tmp/serveload \
 //!     --serve-arg=--affinity --serve-arg=off
+//! # D317 8b: a cluster's entry node, loaded through it, Buffered writes
+//! target/release/examples/serve_load --server http://10.0.0.2:7448 --server-pid 4242 \
+//!     --load --rows 20000000 --durability buffered
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -46,11 +64,30 @@ use proto::data_client::DataClient;
 #[derive(Parser, Debug, Clone)]
 struct Args {
     /// The `phdb` binary to serve with (built with `--features serve`).
-    #[arg(long)]
-    phdb: PathBuf,
+    #[arg(long, required_unless_present = "server")]
+    phdb: Option<PathBuf>,
     /// A directory for the database (made if missing; the database is built once and reused).
-    #[arg(long)]
-    dir: PathBuf,
+    #[arg(long, required_unless_present = "server")]
+    dir: Option<PathBuf>,
+    /// A running server to load instead of starting one, as `http://HOST:PORT`: gRPC and
+    /// HTTP/JSON share the port.
+    #[arg(long, value_name = "URL", conflicts_with_all = ["phdb", "dir", "serve_args", "server_cpus", "shards"])]
+    server: Option<String>,
+    /// The running server's process id, for its CPU per operation (Linux, same host).
+    #[arg(long, value_name = "PID", requires = "server")]
+    server_pid: Option<u32>,
+    /// Write the `--rows` rows through the running server before the mixes.
+    #[arg(long, requires = "server")]
+    load: bool,
+    /// Each write's durability (`Mutate` and `Batch`, and `--load`'s); `default` leaves it to
+    /// the server's writer default.
+    #[arg(long, value_enum, default_value_t = WriteDurability::Default)]
+    durability: WriteDurability,
+    /// `--load`'s writes' durability. What it loads doesn't depend on it, so the default is
+    /// the fastest that still lands (perf2's N1 on #1712).
+    #[arg(long, value_enum, default_value_t = WriteDurability::Buffered)]
+    load_durability: WriteDurability,
+    /// The port of the server this process starts (ignored with `--server`).
     #[arg(long, default_value_t = 7462)]
     port: u16,
     /// The shard count the database is built and served at (default: `phdb serve`'s, half
@@ -93,6 +130,38 @@ struct Args {
     /// `--serve-arg=--affinity --serve-arg=off`).
     #[arg(long = "serve-arg", allow_hyphen_values = true)]
     serve_args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WriteDurability {
+    Default,
+    None,
+    Buffered,
+    GroupSync,
+    Sync,
+}
+
+impl WriteDurability {
+    fn proto(self) -> proto::Durability {
+        match self {
+            WriteDurability::Default => proto::Durability::Unspecified,
+            WriteDurability::None => proto::Durability::None,
+            WriteDurability::Buffered => proto::Durability::Buffered,
+            WriteDurability::GroupSync => proto::Durability::GroupSync,
+            WriteDurability::Sync => proto::Durability::Sync,
+        }
+    }
+
+    /// The JSON field for a write's body, or nothing for the default.
+    fn json(self) -> &'static str {
+        match self {
+            WriteDurability::Default => "",
+            WriteDurability::None => r#","durability":"DURABILITY_NONE""#,
+            WriteDurability::Buffered => r#","durability":"DURABILITY_BUFFERED""#,
+            WriteDurability::GroupSync => r#","durability":"DURABILITY_GROUP_SYNC""#,
+            WriteDurability::Sync => r#","durability":"DURABILITY_SYNC""#,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -274,8 +343,12 @@ fn shards(args: &Args) -> usize {
 /// is: the count isn't stored in the file (ICR 0132), so `phdb serve` gets it as `--shards`
 /// rather than this process opening the file to check (perf287's F1 on #1697).
 fn build(args: &Args, shards: usize) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(&args.dir)?;
-    let file = args.dir.join("serveload.phdb");
+    let dir = args
+        .dir
+        .as_ref()
+        .ok_or("--dir is needed without --server")?;
+    std::fs::create_dir_all(dir)?;
+    let file = dir.join("serveload.phdb");
     if file.exists() {
         return Ok(file);
     }
@@ -302,13 +375,17 @@ struct Server(Child);
 
 impl Server {
     fn start(args: &Args, file: &Path, shards: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let phdb = args
+            .phdb
+            .as_ref()
+            .ok_or("--phdb is needed without --server")?;
         let mut cmd = match &args.server_cpus {
             Some(list) => {
                 let mut c = Command::new("taskset");
-                c.arg("-c").arg(list).arg(&args.phdb);
+                c.arg("-c").arg(list).arg(phdb);
                 c
             }
-            None => Command::new(&args.phdb),
+            None => Command::new(phdb),
         };
         let child = cmd
             .arg("serve")
@@ -342,6 +419,9 @@ impl Drop for Server {
 struct Tally {
     lat: [Vec<Duration>; OPS.len()],
     refused: u64,
+    /// Calls a cluster refused as `CrossPartition`: a `Batch` whose rows straddle a split
+    /// key (or wrap past the last row). Counted, not timed (perf2's F2, feed1248's F1 on #1712).
+    cross: u64,
 }
 
 impl Tally {
@@ -350,6 +430,7 @@ impl Tally {
             a.extend(b);
         }
         self.refused += other.refused;
+        self.cross += other.cross;
     }
 
     fn ops(&self) -> usize {
@@ -396,14 +477,56 @@ fn row_writes(row: u64, value: &[u8]) -> proto::RowWrites {
     }
 }
 
-/// One gRPC call: `Ok(true)` served, `Ok(false)` refused (`Overloaded`).
+/// How a call ended, short of an error that stops the run.
+#[derive(Debug)]
+enum Outcome {
+    Served,
+    /// `Overloaded`: shed by the server, nothing done.
+    Refused,
+    /// `CrossPartition`: a cluster's batch across partitions, nothing done.
+    Cross,
+}
+
+/// The stable code (ICR 0112) a gRPC status carries in its `ErrorDetail`, or "".
+fn api_code(status: &tonic::Status) -> String {
+    use prost::Message;
+    #[derive(Clone, PartialEq, Message)]
+    struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+        #[prost(message, repeated, tag = "3")]
+        details: Vec<AnyMsg>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct AnyMsg {
+        #[prost(string, tag = "1")]
+        type_url: String,
+        #[prost(bytes = "vec", tag = "2")]
+        value: Vec<u8>,
+    }
+    RpcStatus::decode(status.details())
+        .ok()
+        .and_then(|s| {
+            s.details
+                .iter()
+                .find(|d| d.type_url.ends_with("pigeonhole.v1.ErrorDetail"))
+                .and_then(|d| proto::ErrorDetail::decode(d.value.as_slice()).ok())
+        })
+        .map_or_else(String::new, |d| d.code)
+}
+
+/// One gRPC call: served, refused (`Overloaded`), across partitions (`CrossPartition`), or
+/// an error (anything else, `PartitionUnavailable` included).
 async fn grpc_call(
     c: &mut DataClient<tonic::transport::Channel>,
     op: Op,
     row: u64,
     rows: u64,
     value: &[u8],
-) -> Result<bool, tonic::Status> {
+    durability: proto::Durability,
+) -> Result<Outcome, tonic::Status> {
     let r = match op {
         Op::Get => c
             .get(proto::GetRequest {
@@ -426,7 +549,7 @@ async fn grpc_call(
         Op::Mutate => c
             .mutate(proto::MutateRequest {
                 writes: Some(row_writes(row, value)),
-                ..Default::default()
+                durability: durability as i32,
             })
             .await
             .map(|_| ()),
@@ -435,7 +558,7 @@ async fn grpc_call(
                 rows: (0..BATCH_ROWS)
                     .map(|i| row_writes((row + i) % rows, value))
                     .collect(),
-                ..Default::default()
+                durability: durability as i32,
             })
             .await
             .map(|_| ()),
@@ -462,9 +585,12 @@ async fn grpc_call(
         },
     };
     match r {
-        Ok(()) => Ok(true),
-        Err(s) if s.code() == tonic::Code::Unavailable => Ok(false),
-        Err(s) => Err(s),
+        Ok(()) => Ok(Outcome::Served),
+        Err(s) => match api_code(&s).as_str() {
+            "Overloaded" => Ok(Outcome::Refused),
+            "CrossPartition" => Ok(Outcome::Cross),
+            _ => Err(s),
+        },
     }
 }
 
@@ -500,7 +626,14 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 /// One call's path and JSON body over HTTP.
-fn http_request(op: Op, row: u64, rows: u64, value: &str) -> (&'static str, String) {
+fn http_request(
+    op: Op,
+    row: u64,
+    rows: u64,
+    value: &str,
+    durability: WriteDurability,
+) -> (&'static str, String) {
+    let d = durability.json();
     let k = |r: u64| b64(&key(r));
     let put = |r: u64| {
         format!(
@@ -517,11 +650,11 @@ fn http_request(op: Op, row: u64, rows: u64, value: &str) -> (&'static str, Stri
             ),
         ),
         Op::ReadRow => ("ReadRow", format!(r#"{{"table":"t","row":"{}"}}"#, k(row))),
-        Op::Mutate => ("Mutate", format!(r#"{{"writes":{}}}"#, put(row))),
+        Op::Mutate => ("Mutate", format!(r#"{{"writes":{}{d}}}"#, put(row))),
         Op::Batch => (
             "Batch",
             format!(
-                r#"{{"rows":[{}]}}"#,
+                r#"{{"rows":[{}]{d}}}"#,
                 (0..BATCH_ROWS)
                     .map(|i| put((row + i) % rows))
                     .collect::<Vec<_>>()
@@ -539,7 +672,13 @@ fn http_request(op: Op, row: u64, rows: u64, value: &str) -> (&'static str, Stri
 }
 
 /// One HTTP/JSON caller, on a thread of its own, until `stop`.
-fn http_caller(url: String, mut caller: Caller, rows: u64, stop: Arc<AtomicBool>) -> Tally {
+fn http_caller(
+    url: String,
+    mut caller: Caller,
+    rows: u64,
+    durability: WriteDurability,
+    stop: Arc<AtomicBool>,
+) -> Tally {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()
@@ -548,7 +687,7 @@ fn http_caller(url: String, mut caller: Caller, rows: u64, stop: Arc<AtomicBool>
     let mut tally = Tally::default();
     while !stop.load(Ordering::Relaxed) {
         let (op, row) = caller.next();
-        let (rpc, body) = http_request(op, row, rows, &value);
+        let (rpc, body) = http_request(op, row, rows, &value, durability);
         let t = Instant::now();
         let mut resp = agent
             .post(format!("{url}/v1/Data/{rpc}"))
@@ -560,9 +699,16 @@ fn http_caller(url: String, mut caller: Caller, rows: u64, stop: Arc<AtomicBool>
             .body_mut()
             .read_to_string()
             .unwrap_or_else(|e| panic!("{rpc}: {e}"));
-        match status {
-            200 => tally.lat[op as usize].push(t.elapsed()),
-            503 => tally.refused += 1,
+        // The JSON body's stable code tells `Overloaded` (503) from another 503, such as a
+        // cluster's `PartitionUnavailable`, which stops the run.
+        let code = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        match (status, code.as_str()) {
+            (200, _) => tally.lat[op as usize].push(t.elapsed()),
+            (503, "Overloaded") => tally.refused += 1,
+            (409, "CrossPartition") => tally.cross += 1,
             _ => panic!("{rpc}: {status} {text}"),
         }
     }
@@ -599,14 +745,16 @@ async fn run(
                 let mut c = DataClient::new(channels[i % channels.len()].clone());
                 let stop = Arc::clone(&stop);
                 let rows = args.rows;
+                let durability = args.durability.proto();
                 tasks.push(tokio::spawn(async move {
                     let mut tally = Tally::default();
                     while !stop.load(Ordering::Relaxed) {
                         let (op, row) = caller.next();
                         let t = Instant::now();
-                        match grpc_call(&mut c, op, row, rows, &caller.value).await {
-                            Ok(true) => tally.lat[op as usize].push(t.elapsed()),
-                            Ok(false) => tally.refused += 1,
+                        match grpc_call(&mut c, op, row, rows, &caller.value, durability).await {
+                            Ok(Outcome::Served) => tally.lat[op as usize].push(t.elapsed()),
+                            Ok(Outcome::Refused) => tally.refused += 1,
+                            Ok(Outcome::Cross) => tally.cross += 1,
                             Err(s) => panic!("{}: {s}", op.name()),
                         }
                     }
@@ -620,12 +768,12 @@ async fn run(
             }
         }
         Transport::Http => {
-            let url = format!("http://127.0.0.1:{}", args.port);
-            let rows = args.rows;
+            let url = base_url(args);
+            let (rows, durability) = (args.rows, args.durability);
             let threads: Vec<_> = callers
                 .map(|caller| {
                     let (url, stop) = (url.clone(), Arc::clone(&stop));
-                    std::thread::spawn(move || http_caller(url, caller, rows, stop))
+                    std::thread::spawn(move || http_caller(url, caller, rows, durability, stop))
                 })
                 .collect();
             tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -688,12 +836,171 @@ fn pin_self(_list: &str) -> Result<(), Box<dyn std::error::Error>> {
     Err("--client-cpus needs Linux".into())
 }
 
+/// The server's base URL: `--server`, or the one this process starts.
+fn base_url(args: &Args) -> String {
+    match &args.server {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => format!("http://127.0.0.1:{}", args.port),
+    }
+}
+
+/// How long one row's write may be refused (`Overloaded`) or left unknown before the load
+/// stops (perf2's F1, feed1248's F2 on #1712).
+const LOAD_ROW_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One row of `--load`: sent again while it's `Overloaded`, or its outcome is unknown
+/// (`OutcomeUnknown`: a cluster forward cut after the send; a put of the same row is
+/// idempotent), for at most [`LOAD_ROW_DEADLINE`]. Anything else, `PartitionUnavailable`
+/// from a down node included, stops the load at once with the server's message, which
+/// names the partition.
+async fn load_row(
+    c: &mut DataClient<tonic::transport::Channel>,
+    row: u64,
+    rows: u64,
+    value: &[u8],
+    durability: proto::Durability,
+) -> Result<(), String> {
+    let deadline = Instant::now() + LOAD_ROW_DEADLINE;
+    loop {
+        let last = match grpc_call(c, Op::Mutate, row, rows, value, durability).await {
+            Ok(Outcome::Served) => return Ok(()),
+            Ok(Outcome::Refused) => "Overloaded".to_owned(),
+            Ok(Outcome::Cross) => unreachable!("a one-row write is in one partition"),
+            Err(s) if api_code(&s) == "OutcomeUnknown" => {
+                format!("OutcomeUnknown: {}", s.message())
+            }
+            Err(s) => {
+                return Err(format!(
+                    "row {}: {} ({:?})",
+                    String::from_utf8_lossy(&key(row)),
+                    s.message(),
+                    s.code()
+                ));
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "row {} still refused after {} s: {last}",
+                String::from_utf8_lossy(&key(row)),
+                LOAD_ROW_DEADLINE.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A step coprime with `rows`, so `k * step % rows` visits every row once, scattered.
+fn scatter_step(rows: u64) -> u64 {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    // Primes near 2^32 / φ; the first not dividing `rows` is coprime with it.
+    [2_654_435_761u64, 2_654_435_789, 2_654_435_801]
+        .into_iter()
+        .find(|&p| gcd(p, rows.max(1)) == 1)
+        .unwrap_or(1)
+}
+
+/// `--load`: the rows through the running server, `Mutate`s from `--clients` callers, so a
+/// cluster places each by its split keys. The table is created first where the server
+/// serves `Schema.CreateTable` (a single node); elsewhere it must exist already.
+async fn load(
+    args: &Args,
+    channels: &[tonic::transport::Channel],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut schema = proto::schema_client::SchemaClient::new(channels[0].clone());
+    let created = schema
+        .create_table(proto::CreateTableRequest {
+            name: "t".into(),
+            families: vec![proto::FamilySpec {
+                name: "f".into(),
+                ..Default::default()
+            }],
+            if_missing: true,
+        })
+        .await;
+    match created {
+        Ok(_) => {}
+        // A cluster serves no schema calls yet (D317's ticket 5): `Unimplemented`. Anything
+        // else, `Overloaded` included, stops the load (feed1248's N2 on #1712).
+        Err(s) if s.code() == tonic::Code::Unimplemented => {
+            println!(
+                "load: the server doesn't create tables ({}): using table t as it is",
+                s.message()
+            );
+        }
+        Err(s) => return Err(format!("create table t: {s}").into()),
+    }
+    let started = Instant::now();
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let value = Arc::new(vec![b'v'; args.value_bytes]);
+    let durability = args.load_durability.proto();
+    let step = scatter_step(args.rows);
+    // Set by the first caller that fails, so the others stop at their next row rather than
+    // loading on to the end (perf2's nit on #1712).
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for i in 0..args.clients.max(1) {
+        let mut c = DataClient::new(channels[i % channels.len()].clone());
+        let (next, value, rows) = (Arc::clone(&next), Arc::clone(&value), args.rows);
+        let failed = Arc::clone(&failed);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                if failed.load(Ordering::Relaxed) {
+                    return Ok::<(), String>(());
+                }
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= rows {
+                    return Ok(());
+                }
+                // Rows in a scattered order, every one once, so a cluster's partitions load
+                // together rather than one key range at a time (feed1248's N1 on #1712).
+                let row = u64::try_from(u128::from(k) * u128::from(step) % u128::from(rows))
+                    .expect("below rows");
+                if let Err(e) = load_row(&mut c, row, rows, &value, durability).await {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+                if (k + 1) % 1_000_000 == 0 {
+                    println!(
+                        "load: {} rows, {:.0} s",
+                        k + 1,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }));
+    }
+    // Every caller ends (the failed flag stops the rest early); the first error is the one
+    // reported.
+    let mut first = None;
+    for t in tasks {
+        if let Err(e) = t.await? {
+            first.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first {
+        return Err(format!("load: {e}").into());
+    }
+    println!(
+        "load: {} rows in {:.0} s",
+        args.rows,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let shards = shards(&args);
-    let file = build(&args, shards)?;
-    // The server first, so it doesn't inherit the client's CPUs.
-    let server = Server::start(&args, &file, shards)?;
+    // Against a running server, nothing is built or started here.
+    let (server, shards) = if args.server.is_some() {
+        (None, None)
+    } else {
+        let shards = shards(&args);
+        let file = build(&args, shards)?;
+        // The server first, so it doesn't inherit the client's CPUs.
+        (Some(Server::start(&args, &file, shards)?), Some(shards))
+    };
     if let Some(list) = &args.client_cpus {
         pin_self(list)?;
     }
@@ -705,13 +1012,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_all(
     args: Args,
-    server: Server,
-    shards: usize,
+    server: Option<Server>,
+    shards: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("http://127.0.0.1:{}", args.port);
+    let url = base_url(&args);
     let mut channels = Vec::new();
     for _ in 0..args.conns.max(1) {
         channels.push(connect(&url).await?);
+    }
+    if args.load {
+        load(&args, &channels).await?;
     }
     let zipf = Arc::new(Zipf::new(args.rows));
     let mixes: Vec<Mix> = if args.mix.is_empty() {
@@ -720,20 +1030,27 @@ async fn run_all(
         args.mix.clone()
     };
     println!(
-        "serve_load: {shards} shards, {} rows of {} B, {} callers ({} gRPC connections), {} s per row after {} s warm-up; serve args: {:?}",
+        "serve_load: {}, {} rows of {} B, {} callers ({} gRPC connections), {} s per row after {} s warm-up, durability {:?}; serve args: {:?}",
+        match (&args.server, shards) {
+            (Some(url), _) => format!("server {url}"),
+            (None, Some(n)) => format!("{n} shards"),
+            (None, None) => "a server".to_owned(),
+        },
         args.rows,
         args.value_bytes,
         args.clients,
         args.conns.max(1),
         args.secs,
         args.warmup_secs,
+        args.durability,
         args.serve_args
     );
     println!(
         "{:<5} {:<8} {:>9} {:>11} {:>8}   per op: p50 / p99 / p99.9 ms",
         "proto", "mix", "ops/s", "CPU us/op", "refused"
     );
-    let pid = server.0.id();
+    // CPU per operation: the server this process started, or `--server-pid`'s.
+    let pid = server.as_ref().map(|s| s.0.id()).or(args.server_pid);
     for &transport in &args.transport {
         for (n, &mix) in mixes.iter().enumerate() {
             let seed = 0x5EED ^ ((n as u64) << 8) ^ (transport as u64);
@@ -749,9 +1066,9 @@ async fn run_all(
                 )
                 .await?;
             }
-            let cpu0 = cpu_seconds(pid);
+            let cpu0 = pid.and_then(cpu_seconds);
             let tally = run(&args, &channels, transport, mix, args.secs, seed, &zipf).await?;
-            let cpu = cpu0.zip(cpu_seconds(pid)).map(|(a, b)| b - a);
+            let cpu = cpu0.zip(pid.and_then(cpu_seconds)).map(|(a, b)| b - a);
             let ops = tally.ops();
             let mut line = format!(
                 "{:<5} {:<8} {:>9.0} {:>11} {:>8}  ",
@@ -765,6 +1082,9 @@ async fn run_all(
                     .map_or("-".into(), |c| format!("{:.1}", c * 1e6 / ops as f64)),
                 tally.refused,
             );
+            if tally.cross > 0 {
+                line.push_str(&format!(" cross-partition {}", tally.cross));
+            }
             for op in OPS {
                 let mut lat = tally.lat[op as usize].clone();
                 if lat.is_empty() {

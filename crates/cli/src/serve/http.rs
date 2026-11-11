@@ -296,7 +296,7 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
     if !caller.scope.allows(Scope::Read) {
         return ApiError::permission_denied("read metrics").into_response();
     }
-    let text = shared.router.service.metrics_text();
+    let text = shared.router.metrics_text();
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 

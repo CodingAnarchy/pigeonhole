@@ -658,6 +658,10 @@ pub struct BackupRequest {
     /// Only data durable at the writer's level (`backup_durable`).
     #[prost(bool, tag = "2")]
     pub durable: bool,
+    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupResponse {
@@ -679,6 +683,11 @@ pub struct BackupDownloadRequest {
     /// replica follows from. Refused on a server that is itself a replica.
     #[prost(bool, tag = "4")]
     pub replica: bool,
+    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
+    /// A resume names the same partition its download was taken of.
+    #[prost(string, tag = "5")]
+    pub partition: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupChunk {
@@ -700,6 +709,17 @@ pub struct BackupChunk {
     /// With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
     #[prost(bytes = "bytes", tag = "6")]
     pub feed_token: ::prost::bytes::Bytes,
+    /// On a cluster node (D317 ticket 8b), in the last chunk: the identity the copy holds,
+    /// read from the same snapshot the copy is of (`__phdb_cluster`), and the node's map
+    /// version when the backup started. A cluster backup checks them against its map.
+    #[prost(string, tag = "7")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "10")]
+    pub map_version: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MetricsResponse {

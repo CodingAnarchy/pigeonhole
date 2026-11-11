@@ -83,6 +83,9 @@ message BackupRequest {
   string path = 1;
   // Only data durable at the writer's level (`backup_durable`).
   bool durable = 2;
+  // On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+  // (`WrongPartition` for one another node holds). Required there; empty on a single node.
+  string partition = 3;
 }
 
 message BackupResponse {
@@ -99,6 +102,10 @@ message BackupDownloadRequest {
   // carries the token of a feed of every table opened from that same snapshot, which the
   // replica follows from. Refused on a server that is itself a replica.
   bool replica = 4;
+  // On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+  // (`WrongPartition` for one another node holds). Required there; empty on a single node.
+  // A resume names the same partition its download was taken of.
+  string partition = 5;
 }
 
 message BackupChunk {
@@ -114,6 +121,13 @@ message BackupChunk {
   bytes sha256 = 5;
   // With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
   bytes feed_token = 6;
+  // On a cluster node (D317 ticket 8b), in the last chunk: the identity the copy holds,
+  // read from the same snapshot the copy is of (`__phdb_cluster`), and the node's map
+  // version when the backup started. A cluster backup checks them against its map.
+  string partition = 7;
+  string cluster_id = 8;
+  uint64 epoch = 9;
+  uint64 map_version = 10;
 }
 
 message MetricsResponse {

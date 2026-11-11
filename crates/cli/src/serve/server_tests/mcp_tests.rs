@@ -160,7 +160,7 @@ fn delete(s: &Server, token: Option<&str>, id: &str) -> u16 {
 fn an_mcp_session_belongs_to_its_token_and_ends_with_delete() {
     let s = Server::start("read r3ad\nwrite wr1te\n", limits());
     let id = session(&s, Some("wr1te"));
-    let metrics = s.shared.router.service.metrics_text();
+    let metrics = s.shared.router.metrics_text();
     assert!(
         metrics.contains("pigeonhole_serve_sessions{kind=\"mcp\"} 1"),
         "{metrics}"
@@ -176,7 +176,7 @@ fn an_mcp_session_belongs_to_its_token_and_ends_with_delete() {
     // Ended: the client gets 404, which tells it to start a new session.
     assert_eq!(delete(&s, Some("wr1te"), &id), 204);
     assert_eq!(mcp(&s, Some("wr1te"), Some(&id), None, &ping).status, 404);
-    let metrics = s.shared.router.service.metrics_text();
+    let metrics = s.shared.router.metrics_text();
     assert!(
         metrics.contains("pigeonhole_serve_sessions{kind=\"mcp\"} 0"),
         "{metrics}"

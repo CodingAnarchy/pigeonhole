@@ -1,0 +1,4 @@
+### Added
+- `phdb cluster backup DIR --node URL` backs up every partition of a `phdb serve --cluster` cluster, each through the node that holds it, with the map, into one directory (D317 ticket 8b, ICR 0117). Each copy is checked against the map. `map.json` and `manifest.json` describe the set. Each partition's copy is a consistent snapshot of its own, and the set is not one point in time across partitions. A cluster node's `Admin.Backup` and `BackupDownload` take the `partition` to back up, and cluster nodes now accept `--backup-dir`.
+- On a cluster node, `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition`.
+- `pigeonhole-otel`: `Config::attribute` adds a constant attribute to every metric, and `Collector::render_prometheus_all` renders several databases' metrics as one Prometheus text (ICR 0133).

@@ -8,6 +8,7 @@
 //! `phdb cluster init-partition` takes it too, so nothing else rewrites the map file or a
 //! partition's identity under it.
 
+mod backup;
 pub(crate) mod cli;
 pub(crate) mod fanout;
 pub(crate) mod feed;
@@ -938,11 +939,6 @@ pub(crate) fn run(
             "a later D317 ticket",
         ),
         (
-            args.backup_dir.is_some(),
-            "--backup-dir",
-            "D317's ticket 8 (cluster backup)",
-        ),
-        (
             args.create,
             "--create",
             "D317's ticket 2 (partitions are created by phdb cluster init-partition)",
@@ -1065,15 +1061,19 @@ pub(crate) fn run(
     });
     let limits = args.limits();
     let metrics = Arc::new(super::service::Metrics::default());
-    let service = match &db {
-        Some(db) => super::service::Service::new(
+    let service = match (&db, &local) {
+        (Some(db), Some((id, _))) => super::service::Service::partition_node(
             db.clone(),
+            id,
             limits,
             placement.blocking_threads,
             Arc::clone(&metrics),
         )
+        // A partition's backups (D317 ticket 8b), as a single node's.
+        .backups(args.backup_dir.as_deref(), args.max_backups)
+        .map_err(|e| Failure::usage(&e))?
         .placement(&placement),
-        None => super::service::Service::routing_only(
+        _ => super::service::Service::routing_only(
             limits,
             placement.blocking_threads,
             Arc::clone(&metrics),
