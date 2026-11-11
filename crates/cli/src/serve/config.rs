@@ -132,9 +132,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
     /// Threads that read the engine's change feed into the shared subscriptions (hubs), a
-    /// runtime of their own so a hub never waits behind its streams' delivery (default: as
-    /// many as `--feed-threads`, #1719). A hub with a single stream runs on the feed threads
-    /// beside it instead (#1689).
+    /// runtime of their own so a hub never waits behind its streams' delivery (default: a
+    /// quarter of `--feed-threads`, at least 1). More let many busy subscriptions keep up,
+    /// at a cost to the writes' latency on the same CPUs (#1719). A hub with a single stream
+    /// runs on the feed threads beside it instead (#1689).
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
     /// Whether the network, feed and blocking threads get a CPU mask off the shards' cores

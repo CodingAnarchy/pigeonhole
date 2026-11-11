@@ -19,11 +19,12 @@ pub(crate) struct Placement {
     pub blocking_threads: usize,
     /// The feed delivery runtime's workers (ticket 5's (A)).
     pub feed_threads: usize,
-    /// The feed hubs' runtime's workers: as many as the feed threads by default, or
+    /// The feed hubs' runtime's workers: a quarter of the feed threads, at least 1, or
     /// `--feed-hub-threads` (#1719). A runtime of their own, so a hub never queues behind its
     /// clients' tasks (#1397's 16 hubs × 16), placed on the same CPUs, so the OS shares them.
-    /// A quarter of the feed threads (C, #1696) was one thread at the default on the AX102,
-    /// and 16 busy hubs fell 13.8 s behind on it (g73); an idle worker parks at no cost.
+    /// The default keeps writers first (the coordinator's policy on #1719): in g76c, every
+    /// count above it cost put p50 13–38% at moderate fan-out load and delivered fewer events
+    /// when saturated. A feed-heavy server with CPUs to spare raises it.
     pub hub_threads: usize,
     /// The CPUs outside the shards' (Linux, when the engine pinned any).
     #[cfg(target_os = "linux")]
@@ -82,7 +83,7 @@ impl Placement {
         // left the network side short and every split run fell behind; 9 + 3 kept up.
         let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
-            hub_threads: hubs.unwrap_or(feed_threads).max(1),
+            hub_threads: hubs.unwrap_or_else(|| feed_threads.div_ceil(4)).max(1),
             io_threads: io
                 .unwrap_or(free.saturating_sub(feed_threads).max(2))
                 .max(1),
@@ -389,15 +390,14 @@ mod tests {
             ["unpinned", "unmasked (--affinity off)"].contains(&off.mode),
             "{off:?}"
         );
-        // The hubs' threads (#1719): as many as the feed threads by default, at least 1, and
-        // `--feed-hub-threads` as given.
-        for feed in [1, 2, 3, 5, 9] {
+        // The hubs' threads: a quarter of the feed threads, rounded up, at least 1 (#1719 keeps
+        // C's default), and `--feed-hub-threads` as given.
+        for (feed, hubs) in [(1, 1), (2, 1), (3, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
             assert_eq!(
                 Placement::plan(&db, None, None, Some(feed), None, true).hub_threads,
-                feed
+                hubs
             );
         }
-        assert_eq!(plan.hub_threads, plan.feed_threads, "{plan:?}");
         assert_eq!(
             Placement::plan(&db, None, None, Some(4), Some(1), true).hub_threads,
             1
