@@ -115,14 +115,33 @@ impl Config {
     ///
     /// # Panics
     ///
-    /// If `key` is `pigeonhole.db.name` or one of the attributes a metric carries itself
-    /// ([`MetricInfo::attributes`]): a point would carry the key twice, which Prometheus
-    /// refuses.
+    /// If `key`'s label name is that of `pigeonhole.db.name`, of an attribute a metric
+    /// carries itself ([`MetricInfo::attributes`]), or of another key set here: a sample
+    /// would carry the label twice, which Prometheus refuses. Keys are compared as label
+    /// names, so `pigeonhole_db_name`, or `a-b` after `a.b`, is refused too. So is an empty
+    /// key, which would be an empty label name.
+    ///
+    /// A key whose label name starts with `__` is one Prometheus reserves for itself:
+    /// don't use one.
     pub fn attribute(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        let name = label_name(key);
         assert!(
-            key != attr::DB_NAME && !metrics().any(|m| m.attributes.contains(&key)),
+            !key.is_empty(),
+            "pigeonhole_otel::Config::attribute: an empty key"
+        );
+        assert!(
+            name != label_name(attr::DB_NAME)
+                && !metrics().any(|m| m.attributes.iter().any(|a| label_name(a) == name)),
             "pigeonhole_otel::Config::attribute: {key:?} is an attribute the metrics carry \
              already"
+        );
+        assert!(
+            !self
+                .attributes
+                .iter()
+                .any(|(k, _)| *k != key && label_name(k) == name),
+            "pigeonhole_otel::Config::attribute: {key:?} has the label name {name:?} of \
+             another attribute set"
         );
         let value = value.into();
         match self.attributes.iter_mut().find(|(k, _)| *k == key) {
@@ -442,6 +461,12 @@ fn escape_help(s: &str) -> String {
 /// character outside `[a-zA-Z0-9_]` as `_`, and `_` before a leading digit (ai1249's S1 on
 /// #1711: an attribute key from [`Config::attribute`] can hold anything).
 fn push_label_name(out: &mut String, key: &str) {
+    out.push_str(&label_name(key));
+}
+
+/// [`push_label_name`]'s name for `key`.
+fn label_name(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 1);
     if key.starts_with(|c: char| c.is_ascii_digit()) {
         out.push('_');
     }
@@ -452,6 +477,7 @@ fn push_label_name(out: &mut String, key: &str) {
             '_'
         }
     }));
+    out
 }
 
 /// A label value's escaping: a backslash, a double quote and a newline.

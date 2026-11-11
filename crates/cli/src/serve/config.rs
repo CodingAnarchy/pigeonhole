@@ -93,6 +93,10 @@ pub(crate) struct ServeArgs {
     /// or a snapshot, or fell behind the shared one); the rest wait their turn.
     #[arg(long, value_name = "N", default_value_t = 16)]
     pub max_catch_up: usize,
+    /// On a cluster node: forwards one fanned-out read (`Nearest`, a traversal's hop) has
+    /// running at once to other nodes (D317 §7). The peers' own limits protect them.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub fanout_forwards: usize,
     /// Bytes of recent commits the shared feeds keep for their streams, in all: each table
     /// set's share is this over the sets subscribed. Each commit counts its encoded event, which
     /// holds its resume token (about 45 + 16 × shards bytes), and about 110 bytes more.
@@ -285,6 +289,8 @@ pub(crate) struct Limits {
     pub max_streams: usize,
     pub max_feed_hubs: usize,
     pub max_catch_up: usize,
+    /// A fanned-out read's forwards at once (`--fanout-forwards`, D317 ticket 4b).
+    pub fanout_forwards: usize,
     pub feed_ring_bytes: usize,
     /// How long a quiet feed stream waits before a progress event (ICR 0112: about 10 s).
     pub feed_quiet: Duration,
@@ -316,6 +322,7 @@ impl ServeArgs {
             max_streams: self.max_streams.max(1),
             max_feed_hubs: self.max_feed_hubs.max(1),
             max_catch_up: self.max_catch_up.max(1),
+            fanout_forwards: self.fanout_forwards.max(1),
             feed_ring_bytes: self.feed_ring_bytes.max(1 << 16),
             feed_quiet: Duration::from_secs(10),
             feed_client_events: super::feed::CLIENT_EVENTS,

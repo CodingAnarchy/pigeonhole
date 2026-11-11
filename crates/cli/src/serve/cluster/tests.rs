@@ -562,11 +562,7 @@ fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
         },
     )
     .unwrap();
-    db.table("users")
-        .unwrap()
-        .family("f", pigeonhole::Family::default())
-        .create_if_missing()
-        .unwrap();
+    users(&db);
     db
 }
 
@@ -678,6 +674,19 @@ async fn get_row(port: u16, row: &str) -> Result<Option<Vec<u8>>, tonic::Status>
     Ok(reply.into_inner().cell.map(|c| c.value.to_vec()))
 }
 
+/// The test table `users`: cells in `f`, edges in `out`, 4-dimension vectors in `emb`.
+fn users(db: &pigeonhole::Pigeonhole) -> pigeonhole::Table {
+    let spec =
+        pigeonhole::VectorSpec::new(4, pigeonhole::Element::F32, pigeonhole::Metric::L2).unwrap();
+    db.table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .family("out", pigeonhole::Family::default())
+        .family("emb", pigeonhole::Family::vector(spec))
+        .create_if_missing()
+        .unwrap()
+}
+
 /// The code a status carries in its `ErrorDetail`.
 fn code(status: &tonic::Status) -> String {
     crate::serve::errors::ApiError::from_status(status).map_or_else(String::new, |e| e.code)
@@ -766,15 +775,15 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .connect()
             .await
             .unwrap();
-        let e = super::proto::graph_client::GraphClient::new(channel)
-            .traverse(super::proto::TraverseRequest {
-                table: "users".into(),
+        let e = super::proto::vectors_client::VectorsClient::new(channel)
+            .search(super::proto::VectorSearchRequest {
+                index: "users".into(),
                 ..Default::default()
             })
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("ticket 4"), "{e}");
+        assert!(e.message().contains("ticket 5"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
@@ -2182,11 +2191,14 @@ fn a_partition_that_cant_be_reached_fails_a_fan_out_read_unless_it_may_be_skippe
     let (mut stops, ports, dbs) = three_nodes(&rt);
     let rows: [&[u8]; 3] = [b"a1", b"h1", b"x1"];
     rt.block_on(async {
+        // a1 -> h1 -> x1 and a1 -> x1, with vectors 0, 1 and 2 along the first axis.
+        let edges: [&[&[u8]]; 3] = [&[b"h1", b"x1"], &[b"x1"], &[]];
         for (i, r) in rows.iter().enumerate() {
+            let out: Vec<(Vec<u8>, bool)> = edges[i].iter().map(|d| (d.to_vec(), true)).collect();
             data(ports[0])
                 .await
                 .mutate(super::proto::MutateRequest {
-                    writes: Some(cells_row(r, &[5], i as u64)),
+                    writes: Some(graph_row(r, [i as f32, 0.0, 0.0, 0.0], &out)),
                     durability: 0,
                 })
                 .await
@@ -2261,6 +2273,123 @@ fn a_partition_that_cant_be_reached_fails_a_fan_out_read_unless_it_may_be_skippe
         assert_eq!(got.missing.len(), 1);
         assert_eq!(got.missing[0].partition, "p2");
         assert!(got.next.is_empty());
+        // A page that fills its budget at p1's end, with p2 next (simp724's N2 on #1710): p2
+        // can't be probed for a cell, so the page resumes there, and the resume skips it.
+        let fill = data(ports[2])
+            .await
+            .multi_get(MultiGetRequest {
+                table: "users".into(),
+                keys: vec![b"a1".to_vec().into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .bytes;
+        let at_fill = |after: Vec<u8>| MultiGetRequest {
+            page_bytes: fill,
+            after: after.into(),
+            ..mg(true)
+        };
+        let first = data(ports[2])
+            .await
+            .multi_get(at_fill(Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        let keys: Vec<Vec<u8>> = first.rows.iter().map(|r| r.key.to_vec()).collect();
+        assert_eq!(keys, [b"a1".to_vec()]);
+        assert!(
+            first.missing.is_empty() && !first.next.is_empty(),
+            "{first:?}"
+        );
+        let rest = data(ports[2])
+            .await
+            .multi_get(MultiGetRequest {
+                page_bytes: 0,
+                ..at_fill(first.next.to_vec())
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let keys: Vec<Vec<u8>> = rest.rows.iter().map(|r| r.key.to_vec()).collect();
+        assert_eq!(keys, [b"x1".to_vec()]);
+        assert_eq!(rest.missing.len(), 1);
+        assert_eq!(rest.missing[0].partition, "p2");
+        assert!(rest.next.is_empty());
+        // Nearest (ticket 4b): the top 3 of what's reachable, with p2 missing.
+        let vectors = || async {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", ports[0]))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            super::proto::vectors_client::VectorsClient::new(channel)
+        };
+        let near = |allow_partial| super::proto::NearestRequest {
+            table: "users".into(),
+            family: "emb".into(),
+            query: Some(super::proto::Vector {
+                element: super::proto::Element::F32 as i32,
+                dim: 4,
+                data: [0f32; 4]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<u8>>()
+                    .into(),
+            }),
+            k: 3,
+            allow_partial,
+            ..Default::default()
+        };
+        let e = vectors().await.nearest(near(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = vectors()
+            .await
+            .nearest(near(true))
+            .await
+            .unwrap()
+            .into_inner();
+        let rows: Vec<Vec<u8>> = got.neighbours.iter().map(|n| n.row.to_vec()).collect();
+        assert_eq!(rows, [b"a1".to_vec(), b"x1".to_vec()]);
+        assert_eq!(got.missing.len(), 1);
+        assert_eq!(got.missing[0].partition, "p2");
+        // A traversal: hop 1 reads p1 only; hop 2's frontier (h1, x1) skips p2's h1.
+        let graph = || async {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", ports[2]))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            super::proto::graph_client::GraphClient::new(channel)
+        };
+        let walk = |allow_partial| super::proto::TraverseRequest {
+            table: "users".into(),
+            seeds: vec![b"a1".to_vec().into()],
+            family: "out".into(),
+            hops: 2,
+            allow_partial,
+            ..Default::default()
+        };
+        let e = graph().await.traverse(walk(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = graph()
+            .await
+            .traverse(walk(true))
+            .await
+            .unwrap()
+            .into_inner();
+        let first: Vec<Vec<u8>> = got.hops[0].nodes.iter().map(|k| k.to_vec()).collect();
+        assert_eq!(first, [b"h1".to_vec(), b"x1".to_vec()]);
+        assert_eq!(
+            got.hops.len(),
+            1,
+            "x1 has no edges, and h1's are p2's: {got:?}"
+        );
+        assert_eq!(got.missing.len(), 1);
+        assert_eq!(got.missing[0].partition, "p2");
     });
     for db in dbs {
         let _ = db.close();
@@ -2322,6 +2451,518 @@ fn scans_whose_clients_stop_reading_dont_hold_up_another_scan_to_the_same_node()
         .expect("a scan stalled behind scans whose clients stopped reading");
         drop(stalled);
     });
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+// ---- D317 ticket 4b: fan-out Nearest and Traverse ----
+
+/// A row's writes: a vector in `emb` and edges in `out` (value `yes` or `no`).
+fn graph_row(row: &[u8], v: [f32; 4], edges: &[(Vec<u8>, bool)]) -> super::proto::RowWrites {
+    use super::proto::{Put, RowKey, Value, Vector, Write, value, write};
+    let put = |family: &str, q: Vec<u8>, kind| Write {
+        op: Some(write::Op::Put(Put {
+            family: family.into(),
+            qualifier: q.into(),
+            timestamp: None,
+            value: Some(Value { kind: Some(kind) }),
+        })),
+    };
+    let data: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut writes = vec![put(
+        "emb",
+        Vec::new(),
+        value::Kind::Vector(Vector {
+            element: super::proto::Element::F32 as i32,
+            dim: 4,
+            data: data.into(),
+        }),
+    )];
+    for (d, yes) in edges {
+        let v: &[u8] = if *yes { b"yes" } else { b"no" };
+        writes.push(put("out", d.clone(), value::Kind::Bytes(v.to_vec().into())));
+    }
+    super::proto::RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.to_vec().into(),
+        }),
+        writes,
+    }
+}
+
+#[test]
+fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
+    // D317 §12's model test, ticket 4b, against one database holding every row: nearest
+    // searches over every source kind (vectors repeat, so distances tie and the order's
+    // row and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross
+    // the partitions, with every limit, the byte budget, parents and an edge selection,
+    // stats included.
+    use super::proto::{
+        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
+        key_range::Range, nearest_request::Source, value_filter,
+    };
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("cluster 4b seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    let mut rng = Rng(seed);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, dbs) = three_nodes(&rt);
+    let oracle_dir = test_dir();
+    let oracle = pigeonhole::Pigeonhole::open(
+        oracle_dir.join("oracle.phdb"),
+        pigeonhole::Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let t = users(&oracle);
+    let mut keys: Vec<Vec<u8>> = ["a", "c", "f", "g", "h", "k", "m", "q", "s", "z"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}").into_bytes()))
+        .collect();
+    keys.extend([b"g".to_vec(), b"m".to_vec()]);
+    keys.sort();
+    // A few distinct vectors, so distances tie across partitions.
+    let palette: [[f32; 4]; 4] = [
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ];
+    rt.block_on(async {
+        for key in &keys {
+            let v = palette[rng.below(4) as usize];
+            let edges: Vec<(Vec<u8>, bool)> = (0..rng.below(6))
+                .map(|_| {
+                    (
+                        keys[rng.below(keys.len() as u64) as usize].clone(),
+                        rng.below(2) == 0,
+                    )
+                })
+                .collect();
+            data(ports[rng.below(3) as usize])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(graph_row(key, v, &edges)),
+                    durability: 0,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("seed {seed}: put {key:?}: {e}"));
+            let mut m = t.mutate(key).put_vector_f32("emb", b"", &v);
+            for (d, yes) in &edges {
+                m = m.put("out", d, if *yes { b"yes" } else { b"no" });
+            }
+            m.commit().unwrap();
+        }
+    });
+    let pick = |rng: &mut Rng| keys[rng.below(keys.len() as u64) as usize].clone();
+    let budgets = [40u64, 100, 300, 0];
+    rt.block_on(async {
+        let vectors = |port: u16| async move {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            super::proto::vectors_client::VectorsClient::new(channel)
+        };
+        let graph = |port: u16| async move {
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            super::proto::graph_client::GraphClient::new(channel)
+        };
+        // Nearest searches.
+        for trial in 0..60 {
+            let at = format!("seed {seed}, nearest {trial}");
+            let q = if rng.below(2) == 0 {
+                palette[rng.below(4) as usize]
+            } else {
+                [rng.below(3) as f32, 0.5, rng.below(2) as f32, 0.25]
+            };
+            let k = 1 + rng.below(20) as u32;
+            let page_bytes = budgets[rng.below(budgets.len() as u64) as usize];
+            let budget = if page_bytes == 0 { 1 << 20 } else { page_bytes };
+            let (source, want) = match rng.below(3) {
+                0 => (
+                    None,
+                    t.scan_prefix(b"")
+                        .family("emb")
+                        .nearest_f32(&q, k as usize)
+                        .run_within(budget),
+                ),
+                1 => {
+                    let (mut a, mut b) = (pick(&mut rng), pick(&mut rng));
+                    if a > b {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let (ai, bi) = (rng.below(2) == 0, rng.below(2) == 0);
+                    use std::ops::Bound as B;
+                    let lo = if ai {
+                        B::Included(&a[..])
+                    } else {
+                        B::Excluded(&a[..])
+                    };
+                    let hi = if bi {
+                        B::Included(&b[..])
+                    } else {
+                        B::Excluded(&b[..])
+                    };
+                    (
+                        Some(Source::Range(KeyRange {
+                            range: Some(Range::Bounds(Bounds {
+                                start: Some(Bound {
+                                    key: a.clone().into(),
+                                    inclusive: ai,
+                                }),
+                                end: Some(Bound {
+                                    key: b.clone().into(),
+                                    inclusive: bi,
+                                }),
+                            })),
+                        })),
+                        t.scan_bounds(lo, hi)
+                            .family("emb")
+                            .nearest_f32(&q, k as usize)
+                            .run_within(budget),
+                    )
+                }
+                _ => {
+                    let mut some: Vec<Vec<u8>> =
+                        (0..1 + rng.below(10)).map(|_| pick(&mut rng)).collect();
+                    some.push(b"nope".to_vec());
+                    let set = pigeonhole::KeySet::from_unsorted(some.iter().map(|k| &k[..]));
+                    (
+                        Some(Source::Keys(KeyList {
+                            keys: some.iter().map(|k| k.clone().into()).collect(),
+                        })),
+                        t.keys(&set)
+                            .family("emb")
+                            .nearest_f32(&q, k as usize)
+                            .run_within(budget),
+                    )
+                }
+            };
+            let want = want.unwrap();
+            let got = vectors(ports[rng.below(3) as usize])
+                .await
+                .nearest(NearestRequest {
+                    table: "users".into(),
+                    source: source.clone(),
+                    family: "emb".into(),
+                    query: Some(Vector {
+                        element: super::proto::Element::F32 as i32,
+                        dim: 4,
+                        data: q
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<u8>>()
+                            .into(),
+                    }),
+                    k,
+                    page_bytes,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{at}: {e}"))
+                .into_inner();
+            let got_n: Vec<(Vec<u8>, Vec<u8>, f64)> = got
+                .neighbours
+                .iter()
+                .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
+                .collect();
+            let cut = want.cut_by_budget();
+            let want_n: Vec<(Vec<u8>, Vec<u8>, f64)> = want
+                .into_neighbours()
+                .into_iter()
+                .map(|n| (n.row, n.qualifier, n.distance))
+                .collect();
+            assert_eq!(
+                (&got_n, got.cut_by_budget),
+                (&want_n, cut),
+                "{at}: k {k}, page_bytes {page_bytes}, source {source:?}"
+            );
+        }
+        // Traversals.
+        for trial in 0..80 {
+            let at = format!("seed {seed}, traverse {trial}");
+            let seeds: Vec<Vec<u8>> = (0..1 + rng.below(3)).map(|_| pick(&mut rng)).collect();
+            let hops = 1 + rng.below(4) as u32;
+            let per_node_limit = [0u32, 0, 1, 2, 3][rng.below(5) as usize];
+            let hop_limit = [0u64, 0, 1, 3, 7][rng.below(5) as usize];
+            let max_nodes = [0u64, 0, 5, 12][rng.below(4) as usize];
+            let page_bytes = [0u64, 0, 60, 200][rng.below(4) as usize];
+            let parents = rng.below(2) == 0;
+            let filter = rng.below(3);
+            let set = pigeonhole::KeySet::from_unsorted(seeds.iter().map(|k| &k[..]));
+            let mut w = t
+                .traverse(&set)
+                .family("out")
+                .hops(hops)
+                .parents(parents)
+                .byte_budget(if page_bytes == 0 { 1 << 20 } else { page_bytes });
+            if per_node_limit > 0 {
+                w = w.per_node_limit(per_node_limit);
+            }
+            if hop_limit > 0 {
+                w = w.hop_limit(hop_limit);
+            }
+            if max_nodes > 0 {
+                w = w.max_nodes(max_nodes);
+            }
+            let mut req = TraverseRequest {
+                table: "users".into(),
+                seeds: seeds.iter().map(|k| k.clone().into()).collect(),
+                family: "out".into(),
+                hops,
+                per_node_limit,
+                hop_limit,
+                max_nodes,
+                parents,
+                page_bytes,
+                ..Default::default()
+            };
+            match filter {
+                // Edges whose value starts with "y", with the per-node limit counting only
+                // them (simp724's point 3).
+                1 => {
+                    w = w.value_filter(pigeonhole::ValueFilter::Prefix(b"y".to_vec()));
+                    req.value_filter = Some(ValueFilter {
+                        kind: Some(value_filter::Kind::Prefix(b"y".to_vec().into())),
+                    });
+                }
+                2 => {
+                    w = w.qualifier_prefix(b"m");
+                    req.qualifier_prefix = b"m".to_vec().into();
+                }
+                _ => {}
+            }
+            let want = w.run().unwrap();
+            let got = graph(ports[rng.below(3) as usize])
+                .await
+                .traverse(req.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{at}: {e}"))
+                .into_inner();
+            let want_hops: Vec<(Vec<Vec<u8>>, Vec<u32>)> = want
+                .hops()
+                .iter()
+                .map(|h| {
+                    (
+                        h.nodes().iter().map(<[u8]>::to_vec).collect(),
+                        h.parents().map(<[u32]>::to_vec).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let got_hops: Vec<(Vec<Vec<u8>>, Vec<u32>)> = got
+                .hops
+                .iter()
+                .map(|h| {
+                    (
+                        h.nodes.iter().map(|k| k.to_vec()).collect(),
+                        h.parents.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(got_hops, want_hops, "{at}: {req:?}");
+            let ws = want.stats();
+            let gs = got.stats.unwrap();
+            assert_eq!(
+                (
+                    gs.rows,
+                    gs.edges,
+                    gs.hops_cut,
+                    gs.cut_by_max_nodes,
+                    gs.cut_by_budget
+                ),
+                (
+                    ws.rows,
+                    ws.edges,
+                    ws.hops_cut,
+                    ws.cut_by_max_nodes,
+                    ws.cut_by_budget
+                ),
+                "{at}: stats of {req:?}"
+            );
+        }
+    });
+    for db in dbs {
+        let _ = db.close();
+    }
+    drop(t);
+    let _ = oracle.close();
+}
+
+/// Data nodes `n0`, `n1`, … each serving one partition (`q0`, `q1`, …) of `users`, split at
+/// `splits`, under `limits`; their stop handles, ports and partition databases.
+fn split_nodes(
+    rt: &tokio::runtime::Runtime,
+    splits: &[&str],
+    limits: crate::serve::config::Limits,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    let n = splits.len() + 1;
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| MapNode {
+                id: format!("n{i}"),
+                address: format!("127.0.0.1:{port}"),
+            })
+            .collect(),
+        partitions: (0..n)
+            .map(|i| Partition {
+                id: format!("q{i}"),
+                node: format!("n{i}"),
+                epoch: 1,
+                memory_bytes: 0,
+            })
+            .collect(),
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: splits.iter().map(|s| text(s)).collect(),
+            partitions: (0..n).map(|i| format!("q{i}")).collect(),
+        }],
+    };
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for (i, l) in listeners.into_iter().enumerate() {
+        let dir = test_dir();
+        super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+        let (id, p) = (format!("n{i}"), format!("q{i}"));
+        let (stop, db) = data_node_with(rt, &dir, &id, Some(&p), l, limits);
+        stops.push(stop);
+        dbs.push(db.unwrap());
+    }
+    (stops, ports, dbs)
+}
+
+#[test]
+fn a_nearest_search_over_many_partitions_merges_their_answers_as_they_arrive() {
+    // simp724's S1 on #1713: the merge keeps a running top `k` within the budget as each
+    // partition answers, rather than every answer at once. Five partitions, at most two
+    // read at once (so answers arrive in varied orders), and `k` past any one partition's
+    // answer, against one database's `nearest_f32`, cut by budgets and not.
+    use super::proto::{NearestRequest, Vector};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let limits = crate::serve::config::Limits {
+        fanout_forwards: 2,
+        ..crate::serve::server_tests::limits()
+    };
+    let (_stops, ports, dbs) = split_nodes(&rt, &["c", "f", "j", "p"], limits);
+    let oracle_dir = test_dir();
+    let oracle = pigeonhole::Pigeonhole::open(
+        oracle_dir.join("oracle.phdb"),
+        pigeonhole::Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let t = users(&oracle);
+    // Three rows in each partition, with vectors that tie across them.
+    let keys: Vec<String> = ["a", "d", "g", "k", "s"]
+        .iter()
+        .flat_map(|p| (0..3).map(move |i| format!("{p}{i}")))
+        .collect();
+    rt.block_on(async {
+        for (i, key) in keys.iter().enumerate() {
+            let v = [(i % 4) as f32, (i % 3) as f32, 0.0, 0.0];
+            data(ports[i % ports.len()])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(graph_row(key.as_bytes(), v, &[])),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+            t.mutate(key.as_bytes())
+                .put_vector_f32("emb", b"", &v)
+                .commit()
+                .unwrap();
+        }
+        let channel =
+            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", ports[2]))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+        let mut vectors = super::proto::vectors_client::VectorsClient::new(channel);
+        for q in [[0.0f32, 0.0, 0.0, 0.0], [2.5, 1.0, 0.0, 0.0]] {
+            for k in [1u32, 3, 4, 7, 12, 15, 20] {
+                for page_bytes in [40u64, 100, 200, 0] {
+                    let budget = if page_bytes == 0 { 1 << 20 } else { page_bytes };
+                    let want = t
+                        .scan_prefix(b"")
+                        .family("emb")
+                        .nearest_f32(&q, k as usize)
+                        .run_within(budget)
+                        .unwrap();
+                    let got = vectors
+                        .nearest(NearestRequest {
+                            table: "users".into(),
+                            family: "emb".into(),
+                            query: Some(Vector {
+                                element: super::proto::Element::F32 as i32,
+                                dim: 4,
+                                data: q
+                                    .iter()
+                                    .flat_map(|x| x.to_le_bytes())
+                                    .collect::<Vec<u8>>()
+                                    .into(),
+                            }),
+                            k,
+                            page_bytes,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let got_n: Vec<(Vec<u8>, f64)> = got
+                        .neighbours
+                        .iter()
+                        .map(|n| (n.row.to_vec(), n.distance))
+                        .collect();
+                    let cut = want.cut_by_budget();
+                    let want_n: Vec<(Vec<u8>, f64)> = want
+                        .into_neighbours()
+                        .into_iter()
+                        .map(|n| (n.row, n.distance))
+                        .collect();
+                    assert_eq!(
+                        (&got_n, got.cut_by_budget),
+                        (&want_n, cut),
+                        "q {q:?}, k {k}, page_bytes {page_bytes}"
+                    );
+                }
+            }
+        }
+    });
+    drop(t);
+    oracle.close().unwrap();
     for db in dbs {
         let _ = db.close();
     }

@@ -32,7 +32,7 @@ use crate::serve::config::Limits;
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
     self, ForwardRequest, ForwardScanRequest, MissingRange, MultiGetRequest, MultiGetResponse,
-    ScanPage, ScanRequest, forward_request,
+    NearestRequest, NearestResponse, ScanPage, ScanRequest, forward_request,
 };
 use crate::serve::router::{Cluster, Router, not_open};
 use crate::serve::service::Service;
@@ -235,6 +235,11 @@ impl Router {
     /// page with a position when a cell is there. The first group's read ahead answers for
     /// it when there is one. A partition that can't be read is taken to have one, so the
     /// resume reads it and reports what it answers.
+    ///
+    /// The probes run one after another: a page ends this way rarely, and the first probe is
+    /// usually the read ahead. If this path ever shows up in a profile, they could run
+    /// together under `--fanout-forwards`, as a nearest search's partitions do (simp724's N1
+    /// on #1710).
     async fn first_with_cells<'a>(
         &'a self,
         reach: &'a Reach,
@@ -337,6 +342,21 @@ impl Router {
             deadline: Some(deadline),
             ..Reach::of(self, cluster)
         };
+        let reply = self.merge_keys(&reach, r, caller).await?;
+        self.service
+            .charge_built(caller, ServiceReply::MultiGet(reply))
+            .await
+    }
+
+    /// A multi-get's page across the partitions, as [`fan_multi_get`](Self::fan_multi_get)
+    /// answers it, without its admission or its reply's charge: a traversal's hops read
+    /// their edges through it (D317 ticket 4b).
+    async fn merge_keys(
+        &self,
+        reach: &Reach,
+        r: MultiGetRequest,
+        caller: &Caller,
+    ) -> Result<MultiGetResponse, ApiError> {
         let routes = reach.routes()?;
         let ranges = ranges_of(&routes, &r.table)?;
         let after = Position::from_bytes(&r.after, Kind::Keys)?;
@@ -392,7 +412,7 @@ impl Router {
                 // has no `next` when none has one (#1698's seed 1794362533986056000).
                 next = self
                     .first_with_cells(
-                        &reach,
+                        reach,
                         &groups[i..],
                         caller,
                         &mut ahead,
@@ -413,7 +433,7 @@ impl Router {
                 (_, Some(done)) => Box::pin(async move { done }),
                 (Some(f), None) => f,
                 (None, None) => Box::pin(self.multi_get_part(
-                    &reach,
+                    reach,
                     &range.partition,
                     sub(mine.clone(), inner, left),
                     caller,
@@ -421,7 +441,7 @@ impl Router {
             };
             if let Some((next_range, next_keys)) = groups.get(i + 1) {
                 ahead = Some(Box::pin(self.multi_get_part(
-                    &reach,
+                    reach,
                     &next_range.partition,
                     sub(next_keys.clone(), inner_of(next_range), budget),
                     caller,
@@ -439,7 +459,7 @@ impl Router {
                 // Read ahead with the whole budget, and it doesn't fit: read again with
                 // what's left, so the cut is the partition's own (a single node's).
                 let again = Box::pin(self.multi_get_part(
-                    &reach,
+                    reach,
                     &range.partition,
                     sub(mine.clone(), inner, left),
                     caller,
@@ -463,7 +483,7 @@ impl Router {
                 break;
             }
         }
-        let reply = MultiGetResponse {
+        Ok(MultiGetResponse {
             rows,
             next: next
                 .map(|p| p.to_bytes(Kind::Keys))
@@ -471,10 +491,7 @@ impl Router {
                 .into(),
             bytes: budget - left,
             missing: missed,
-        };
-        self.service
-            .charge_built(caller, ServiceReply::MultiGet(reply))
-            .await
+        })
     }
 
     /// `Data.Scan` on a cluster node (D317 ticket 4a): a stream of the partitions' pages in
@@ -611,6 +628,527 @@ impl Router {
             ServiceReply::Scan(pages) => Ok(pages),
             _ => Err(ApiError::internal("a scan answered another reply")),
         }
+    }
+}
+
+/// A boxed future of a fan-out's.
+type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Runs `futs`, at most `n` at once (`--fanout-forwards`), handing each result to `each`
+/// with its index as it arrives, so a merge holds only what it keeps (simp724's S1 on
+/// #1713). An error from `each` ends the run, dropping the reads still going.
+async fn bounded<'a, T>(
+    futs: Vec<Boxed<'a, T>>,
+    n: usize,
+    mut each: impl FnMut(usize, T) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    let mut queue = futs.into_iter().enumerate();
+    let mut running: Vec<(usize, Boxed<'a, T>)> = Vec::new();
+    std::future::poll_fn(|cx| {
+        loop {
+            while running.len() < n.max(1) {
+                match queue.next() {
+                    Some(f) => running.push(f),
+                    None => break,
+                }
+            }
+            // Done only once every read has run: the queue too, not just this batch.
+            if running.is_empty() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let mut done = false;
+            let mut i = 0;
+            while i < running.len() {
+                if let std::task::Poll::Ready(v) = running[i].1.as_mut().poll(cx) {
+                    let (at, _) = running.swap_remove(i);
+                    each(at, v)?;
+                    done = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if !done {
+                return std::task::Poll::Pending;
+            }
+        }
+    })
+    .await
+}
+
+/// A scan range's bounds as `Bound`s (a prefix as `[prefix, successor)`), `None` for no
+/// bound.
+fn bounds_of(range: Option<&proto::KeyRange>) -> (Option<proto::Bound>, Option<proto::Bound>) {
+    use proto::key_range::Range;
+    match range.and_then(|r| r.range.as_ref()) {
+        Some(Range::Prefix(p)) => (
+            Some(proto::Bound {
+                key: p.clone(),
+                inclusive: true,
+            }),
+            successor(p).map(|k| proto::Bound {
+                key: k.into(),
+                inclusive: false,
+            }),
+        ),
+        Some(Range::Bounds(b)) => (b.start.clone(), b.end.clone()),
+        None => (None, None),
+    }
+}
+
+/// `range` clipped to partition `p`'s rows, as bounds (D317 ticket 4b): a `Nearest`'s
+/// range sent to one partition, which routes and checks it by its bounds.
+fn clipped(range: Option<&proto::KeyRange>, p: &PartRange) -> proto::KeyRange {
+    let (start, end) = bounds_of(range);
+    let start = match start {
+        Some(b) if b.key[..] >= p.start[..] => Some(b),
+        _ => Some(proto::Bound {
+            key: p.start.clone().into(),
+            inclusive: true,
+        }),
+    };
+    let end = match (&p.end, end) {
+        (None, end) => end,
+        // The partition's end comes first: an exclusive bound there. An inclusive end at
+        // `k` reaches `k`'s row, so it stays only if it's below the partition's end.
+        (Some(e), Some(b)) if b.key[..] < e[..] => Some(b),
+        (Some(e), _) => Some(proto::Bound {
+            key: e.clone().into(),
+            inclusive: false,
+        }),
+    };
+    proto::KeyRange {
+        range: Some(proto::key_range::Range::Bounds(proto::Bounds {
+            start,
+            end,
+        })),
+    }
+}
+
+/// A neighbour's size by D308's measure: its row, its qualifier and 16 bytes.
+fn neighbour_bytes(n: &proto::Neighbour) -> u64 {
+    (n.row.len() + n.qualifier.len()) as u64 + 16
+}
+
+/// `kept` and `more` merged by the library's total order (distance, then row, then
+/// qualifier), cut to the first `k` that fit `budget` plus the one after them that didn't,
+/// if any. Distances are never NaN (the query is checked, stored vectors are finite), and
+/// every node computes them with the same code.
+fn merge_nearest(
+    mut kept: Vec<proto::Neighbour>,
+    more: Vec<proto::Neighbour>,
+    k: usize,
+    budget: u64,
+) -> Vec<proto::Neighbour> {
+    kept.extend(more);
+    kept.sort_by(|a, b| {
+        a.distance
+            .total_cmp(&b.distance)
+            .then_with(|| a.row.cmp(&b.row))
+            .then_with(|| a.qualifier.cmp(&b.qualifier))
+    });
+    let mut used = 0;
+    let mut keep = 0;
+    for n in &kept {
+        if keep == k {
+            break;
+        }
+        keep += 1;
+        used += neighbour_bytes(n);
+        if used > budget {
+            // This one didn't fit: kept as the one after the prefix.
+            break;
+        }
+    }
+    kept.truncate(keep);
+    kept
+}
+
+/// A traversal's `max_nodes` when the request sets none: the library's default
+/// (`pigeonhole::Traverse::max_nodes`, 10,000,000), which a single node's traversal takes.
+const DEFAULT_MAX_NODES: u64 = 10_000_000;
+
+/// What a traversal's visited set holds per node, as the library sizes it: the key and
+/// about 48 bytes.
+const VISITED_NODE_BYTES: usize = 48;
+
+impl Router {
+    /// One partition's exact top `k`: here, or forwarded to its node (once more after a
+    /// `WrongPartition`).
+    async fn nearest_part(
+        &self,
+        reach: &Reach,
+        partition: &str,
+        r: NearestRequest,
+        caller: &Caller,
+    ) -> Result<NearestResponse, ApiError> {
+        let mut pulled = false;
+        loop {
+            let routes = reach.routes()?;
+            let reply = match reach.place(&routes, partition)? {
+                Place::Here(service) => service.call(ServiceOp::Nearest(r), caller, None).await?,
+                Place::There(address, map_version) => {
+                    let req = ForwardRequest {
+                        map_version,
+                        caller: Some(forward::forwarded_caller(caller)?),
+                        op: Some(forward_request::Op::Nearest(r.clone())),
+                    };
+                    match reach
+                        .forwarder
+                        .send(&address, req, reach.within()?, false)
+                        .await
+                    {
+                        Err(e) if e.code == "WrongPartition" && !pulled => {
+                            pulled = true;
+                            reach.catch_up(&routes, partition, &address).await?;
+                            continue;
+                        }
+                        other => forward::reply_of(other?)?,
+                    }
+                }
+            };
+            return match reply.uncharge().0 {
+                ServiceReply::Nearest(n) => Ok(n),
+                _ => Err(ApiError::internal(
+                    "a nearest search answered another reply",
+                )),
+            };
+        }
+    }
+
+    /// `Vectors.Nearest` on a cluster node (D317 ticket 4b): every partition the source
+    /// meets answers its exact top `k` under the same `page_bytes`, and the merge keeps the
+    /// first `k` by the library's total order (distance, row, qualifier), then cuts to the
+    /// budget. A partition's answer is a prefix of its own ranking, and a neighbour the
+    /// global prefix keeps never needs more than the budget's bytes of its partition's, so
+    /// the merge is a single node's answer.
+    pub(crate) async fn fan_nearest(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ServiceReply, ApiError> {
+        use proto::nearest_request::Source;
+        let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        let ServiceOp::Nearest(r) = op else {
+            return Err(ApiError::internal("fan_nearest takes a nearest search"));
+        };
+        if !r.snapshot_id.is_empty() {
+            return Err(ApiError::unsupported(
+                "a nearest search at a pinned snapshot on a cluster: a snapshot is one \
+                 partition's",
+            ));
+        }
+        let max_k = crate::serve::service::MAX_NEAREST_K;
+        if r.k == 0 || r.k > max_k {
+            return Err(ApiError::invalid(format!("k is 1 to {max_k}")));
+        }
+        if r.query.is_none() {
+            return Err(ApiError::invalid("a nearest search needs a query vector"));
+        }
+        let reach = Reach {
+            deadline: Some(deadline),
+            ..Reach::of(self, cluster)
+        };
+        let routes = reach.routes()?;
+        let ranges = ranges_of(&routes, &r.table)?;
+        // Each partition's part of the source: its keys, or the range clipped to it.
+        let mut parts: Vec<(PartRange, NearestRequest)> = Vec::new();
+        for p in &ranges {
+            let source = match &r.source {
+                Some(Source::Keys(list)) => {
+                    let mut mine: Vec<_> =
+                        list.keys.iter().filter(|k| p.holds(k)).cloned().collect();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    mine.sort_unstable();
+                    mine.dedup();
+                    Source::Keys(proto::KeyList { keys: mine })
+                }
+                Some(Source::Range(range)) => {
+                    let (lo, hi) = span(Some(range));
+                    if !p.meets(&lo, hi.as_deref()) {
+                        continue;
+                    }
+                    Source::Range(clipped(Some(range), p))
+                }
+                None => Source::Range(clipped(None, p)),
+            };
+            parts.push((
+                p.clone(),
+                NearestRequest {
+                    source: Some(source),
+                    allow_partial: false,
+                    ..r.clone()
+                },
+            ));
+        }
+        type Answer = Result<NearestResponse, ApiError>;
+        let reads: Vec<Pin<Box<dyn Future<Output = Answer> + Send + '_>>> = parts
+            .iter()
+            .map(|(p, sub)| {
+                Box::pin(self.nearest_part(&reach, &p.partition, sub.clone(), caller))
+                    as Pin<Box<dyn Future<Output = Answer> + Send + '_>>
+            })
+            .collect();
+        // The running merge: the first `k` so far that fit the budget, and the next one,
+        // which didn't (it decides `cut_by_budget`). A neighbour past that next one can
+        // never come back into the prefix, since more answers only push it further down.
+        let k = r.k as usize;
+        let budget = page_bytes(r.page_bytes);
+        let mut kept: Vec<proto::Neighbour> = Vec::new();
+        let mut some_cut = false;
+        let mut missed = Vec::new();
+        bounded(
+            reads,
+            self.service.limits().fanout_forwards,
+            |i, answer| match answer {
+                Ok(a) => {
+                    some_cut |= a.cut_by_budget;
+                    kept = merge_nearest(std::mem::take(&mut kept), a.neighbours, k, budget);
+                    Ok(())
+                }
+                Err(e) if r.allow_partial && skippable(&e) => {
+                    missed.push(missing(&r.table, &parts[i].0));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+        )
+        .await?;
+        // `kept` is the prefix plus, when the budget stopped it short of `k`, the neighbour
+        // that didn't fit.
+        let mut used = 0;
+        let mut neighbours = Vec::new();
+        let mut cut = false;
+        for n in kept {
+            if neighbours.len() == k {
+                break;
+            }
+            let size = neighbour_bytes(&n);
+            if used + size > budget {
+                cut = true;
+                break;
+            }
+            used += size;
+            neighbours.push(n);
+        }
+        // `missing` in partition order, whatever order the answers came in.
+        missed.sort_by(|a: &MissingRange, b: &MissingRange| a.start.cmp(&b.start));
+        let reply = NearestResponse {
+            // A partition cut short held more within its top `k`: the merge would have
+            // stopped for the budget at or before them.
+            cut_by_budget: cut || (neighbours.len() < k && some_cut),
+            neighbours,
+            missing: missed,
+        };
+        self.service
+            .charge_built(caller, ServiceReply::Nearest(reply))
+            .await
+    }
+
+    /// `Graph.Traverse` on a cluster node (D317 ticket 4b): each hop runs here, by the
+    /// library's rules exactly ([`pigeonhole::Traverse`]). The frontier's edges are one
+    /// fanned-out multi-get (the edge selection, `column_limit` = `per_node_limit`, which
+    /// counts edges the selection keeps, as the traversal's limit does), read in (source,
+    /// qualifier) order; a destination not visited before is new once, ranked by its first
+    /// edge; `hop_limit`, `max_nodes` and the byte budget cut that ranking, and the reading
+    /// stops where a single node's would, so `stats` match too. Each hop reads at its own
+    /// time, each partition at its own snapshot. One deadline covers the whole traversal,
+    /// and the visited set counts against `--inflight-bytes`.
+    pub(crate) async fn fan_traverse(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ServiceReply, ApiError> {
+        let _request = self.service.admit(&op.admit(), caller, prepaid).await?;
+        let ServiceOp::Traverse(r) = op else {
+            return Err(ApiError::internal("fan_traverse takes a traversal"));
+        };
+        if !r.snapshot_id.is_empty() {
+            return Err(ApiError::unsupported(
+                "a traversal at a pinned snapshot on a cluster: a snapshot is one partition's",
+            ));
+        }
+        if r.seeds.is_empty() {
+            return Err(ApiError::invalid(
+                "a traversal starts from at least one seed",
+            ));
+        }
+        if r.hops > 64 {
+            return Err(ApiError::invalid("hops is at most 64 (0 is 1)"));
+        }
+        let reach = Reach {
+            deadline: Some(deadline),
+            ..Reach::of(self, cluster)
+        };
+        let by_hop = if r.hop_limit == 0 {
+            u64::MAX
+        } else {
+            r.hop_limit
+        };
+        let max_nodes = if r.max_nodes == 0 {
+            DEFAULT_MAX_NODES
+        } else {
+            r.max_nodes
+        };
+        let mut bytes_left = page_bytes(r.page_bytes);
+        let node_extra: u64 = if r.parents { 4 } else { 0 };
+        let selection = proto::Selection {
+            families: vec![r.family.clone()],
+            qualifier_prefix: r.qualifier_prefix.clone(),
+            qualifier_start: r.qualifier_start.clone(),
+            qualifier_end: r.qualifier_end.clone(),
+            time_range: r.time_range,
+            value_filter: r.value_filter.clone(),
+            column_limit: r.per_node_limit,
+            ..Default::default()
+        };
+        let mut frontier: Vec<prost::bytes::Bytes> = r.seeds.clone();
+        frontier.sort_unstable();
+        frontier.dedup();
+        let mut visited: std::collections::HashSet<Vec<u8>> =
+            frontier.iter().map(|k| k.to_vec()).collect();
+        let mut held: Vec<OwnedSemaphorePermit> = Vec::new();
+        let hold = |nodes: &[prost::bytes::Bytes]| {
+            nodes
+                .iter()
+                .map(|k| k.len() + VISITED_NODE_BYTES)
+                .sum::<usize>()
+        };
+        held.push(
+            budget_within(
+                self.service.inflight(),
+                hold(&frontier),
+                // What's left of the arrival deadline (simp724's N2 on #1713).
+                reach.within()?,
+            )
+            .await?,
+        );
+        let mut stats = proto::TraverseStats::default();
+        let mut hops = Vec::new();
+        let mut missed: Vec<MissingRange> = Vec::new();
+        for _ in 0..r.hops.max(1) {
+            let room = max_nodes.saturating_sub(visited.len() as u64);
+            if room == 0 {
+                stats.cut_by_max_nodes = true;
+                break;
+            }
+            let limit = usize::try_from(by_hop.min(room)).unwrap_or(usize::MAX);
+            // The hop: destinations kept, each with the frontier index of its first edge.
+            let mut kept: Vec<(prost::bytes::Bytes, u32)> = Vec::new();
+            let mut seen: std::collections::HashSet<prost::bytes::Bytes> = Default::default();
+            let (mut full, mut cut_by_bytes, mut used) = (false, false, 0u64);
+            let mut after = prost::bytes::Bytes::new();
+            let mut last_row: Option<prost::bytes::Bytes> = None;
+            'pages: loop {
+                let page = self
+                    .merge_keys(
+                        &reach,
+                        MultiGetRequest {
+                            table: r.table.clone(),
+                            keys: frontier.clone(),
+                            selection: Some(selection.clone()),
+                            page_bytes: crate::serve::service::MAX_PAGE_BYTES,
+                            after: after.clone(),
+                            allow_partial: r.allow_partial,
+                        },
+                        caller,
+                    )
+                    .await?;
+                for m in page.missing {
+                    if !missed.iter().any(|x| x.partition == m.partition) {
+                        missed.push(m);
+                    }
+                }
+                for row in page.rows {
+                    let src = frontier
+                        .binary_search(&row.key)
+                        .map_err(|_| ApiError::internal("an edge's row isn't in the frontier"))?;
+                    if last_row.as_ref() != Some(&row.key) {
+                        stats.rows += 1;
+                        last_row = Some(row.key.clone());
+                    }
+                    for cell in row.cells {
+                        stats.edges += 1;
+                        let dest = cell.qualifier;
+                        if visited.contains(&dest[..]) || seen.contains(&dest) {
+                            continue;
+                        }
+                        if kept.len() >= limit {
+                            full = true;
+                            break 'pages;
+                        }
+                        let size = dest.len() as u64 + 16 + node_extra;
+                        if used + size > bytes_left {
+                            cut_by_bytes = true;
+                            break 'pages;
+                        }
+                        used += size;
+                        seen.insert(dest.clone());
+                        kept.push((dest, u32::try_from(src).unwrap_or(u32::MAX)));
+                    }
+                }
+                if page.next.is_empty() {
+                    break;
+                }
+                after = page.next;
+            }
+            if full {
+                stats.hops_cut += 1;
+                if room < by_hop {
+                    stats.cut_by_max_nodes = true;
+                }
+            }
+            bytes_left = bytes_left.saturating_sub(used);
+            kept.sort_unstable();
+            let nodes: Vec<prost::bytes::Bytes> = kept.iter().map(|(k, _)| k.clone()).collect();
+            let hop = proto::Hop {
+                parents: if r.parents {
+                    kept.iter().map(|(_, s)| *s).collect()
+                } else {
+                    Vec::new()
+                },
+                nodes: nodes.clone(),
+            };
+            if cut_by_bytes {
+                // The budget's hop is the last: its in-budget nodes, then nothing more.
+                stats.cut_by_budget = true;
+                if !nodes.is_empty() {
+                    hops.push(hop);
+                }
+                break;
+            }
+            if nodes.is_empty() {
+                break;
+            }
+            held.push(
+                budget_within(
+                    self.service.inflight(),
+                    hold(&nodes),
+                    // What's left of the arrival deadline (simp724's N2 on #1713).
+                    reach.within()?,
+                )
+                .await?,
+            );
+            visited.extend(nodes.iter().map(|k| k.to_vec()));
+            frontier = nodes;
+            hops.push(hop);
+        }
+        drop(held);
+        let reply = proto::TraverseResponse {
+            hops,
+            stats: Some(stats),
+            missing: missed,
+        };
+        self.service
+            .charge_built(caller, ServiceReply::Traverse(reply))
+            .await
     }
 }
 

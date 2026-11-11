@@ -69,14 +69,6 @@ message MultiGetResponse {
   repeated MissingRange missing = 4;
 }
 
-// A partition's key range a cluster read skipped with `allow_partial` (D317 §7): its keys
-// in `[start, end)` of `table` weren't read. An empty `end` is the table's end.
-message MissingRange {
-  string partition = 1;
-  string table = 2;
-  bytes start = 3;
-  bytes end = 4;
-}
 
 message ReadRowRequest {
   string table = 1;

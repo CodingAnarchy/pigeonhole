@@ -1,0 +1,2 @@
+### Changed
+- `phdb serve`: a change-feed subscription with a single stream runs on the feed threads beside it, rather than the hub threads, which saves a handoff between thread pools on every commit (#1689). It moves to the hub threads as soon as a second stream joins, and back once it has had one stream for a second. `/metrics` gains `pigeonhole_serve_feed_solo_hubs` and `pigeonhole_serve_feed_hub_moves_total`.

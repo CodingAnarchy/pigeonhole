@@ -28,11 +28,11 @@ use super::sessions::{SnapshotGuard, Taken};
 /// A page's size when a request leaves it at 0 (D313 §4: 1 MiB), and the cap on a request's
 /// own.
 const DEFAULT_PAGE_BYTES: u64 = 1 << 20;
-const MAX_PAGE_BYTES: u64 = 8 << 20;
+pub(crate) const MAX_PAGE_BYTES: u64 = 8 << 20;
 
 /// `Vectors.Nearest`'s largest `k`: the engine keeps `k` candidates while it ranks, before
 /// the reply's byte budget cuts it (simp724's L1 on #1565).
-const MAX_NEAREST_K: u32 = 10_000;
+pub(crate) const MAX_NEAREST_K: u32 = 10_000;
 
 /// One call, decoded. It holds its request by value: routing moves it, never copies it
 /// (perf287 on D317's seam).
@@ -850,7 +850,7 @@ fn escape_label(out: &mut String, v: &str) {
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
 pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     type Read = fn(&super::feed::Feeds) -> u64;
-    let families: [(&str, &str, Read); 7] = [
+    let families: [(&str, &str, Read); 9] = [
         ("pigeonhole_serve_feed_hubs", "gauge", |f| {
             f.gauges().hubs as u64
         }),
@@ -870,6 +870,13 @@ pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)
         }),
         ("pigeonhole_serve_feed_rejoined_total", "counter", |f| {
             f.stats.rejoined.load(Ordering::Relaxed)
+        }),
+        // #1689's fast path: hubs on the feed runtime beside their one client, and moves.
+        ("pigeonhole_serve_feed_solo_hubs", "gauge", |f| {
+            f.gauges().solo_hubs as u64
+        }),
+        ("pigeonhole_serve_feed_hub_moves_total", "counter", |f| {
+            f.stats.hub_moves.load(Ordering::Relaxed)
         }),
         ("pigeonhole_serve_feed_hub_failures_total", "counter", |f| {
             f.stats.hub_failures.load(Ordering::Relaxed)
@@ -903,6 +910,7 @@ fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
         stream_idle: limits.stream_idle,
         client_events: limits.feed_client_events,
         client_bytes: limits.feed_client_bytes,
+        solo_after: super::feed::SOLO_AFTER,
     }
 }
 
@@ -2601,6 +2609,7 @@ impl Service {
                 cut_by_max_nodes: stats.cut_by_max_nodes,
                 cut_by_budget: stats.cut_by_budget,
             }),
+            missing: Vec::new(),
         })
     }
 
@@ -2653,6 +2662,7 @@ impl Service {
                 })
                 .collect(),
             cut_by_budget,
+            missing: Vec::new(),
         })
     }
 
