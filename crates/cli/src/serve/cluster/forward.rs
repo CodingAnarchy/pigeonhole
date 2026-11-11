@@ -383,6 +383,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::Abort(r) => Op::Abort(r),
         ServiceOp::OpenSnapshot(r) => Op::OpenSnapshot(r),
         ServiceOp::ReleaseSnapshot(r) => Op::ReleaseSnapshot(r),
+        ServiceOp::Nearest(r) => Op::Nearest(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -412,6 +413,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Abort(r) => ServiceOp::Abort(r),
             Op::OpenSnapshot(r) => ServiceOp::OpenSnapshot(r),
             Op::ReleaseSnapshot(r) => ServiceOp::ReleaseSnapshot(r),
+            Op::Nearest(r) => ServiceOp::Nearest(r),
         },
     )
 }
@@ -434,6 +436,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Commit(r) => Reply::Commit(r),
         ServiceReply::OpenSnapshot(r) => Reply::OpenSnapshot(r),
         ServiceReply::Empty(r) => Reply::Empty(r),
+        ServiceReply::Nearest(r) => Reply::Nearest(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -461,6 +464,7 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Commit(r) => ServiceReply::Commit(r),
             Reply::OpenSnapshot(r) => ServiceReply::OpenSnapshot(r),
             Reply::Empty(r) => ServiceReply::Empty(r),
+            Reply::Nearest(r) => ServiceReply::Nearest(r),
         },
     )
 }

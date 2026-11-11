@@ -71,6 +71,7 @@ pub struct Config {
     db_name: Option<String>,
     storage_by_table: bool,
     latency_window: Duration,
+    attributes: Vec<(&'static str, String)>,
 }
 
 impl Default for Config {
@@ -79,6 +80,7 @@ impl Default for Config {
             db_name: None,
             storage_by_table: false,
             latency_window: Duration::from_secs(60),
+            attributes: Vec::new(),
         }
     }
 }
@@ -98,6 +100,54 @@ impl Config {
     /// file name on many hosts does not collide.
     pub fn db_name(mut self, name: impl Into<String>) -> Self {
         self.db_name = Some(name.into());
+        self
+    }
+
+    /// A constant attribute every metric carries, after `pigeonhole.db.name` (ICR 0133): for
+    /// telling apart databases of one process by something other than their file name, such
+    /// as `phdb serve`'s `pigeonhole.partition` on a cluster node holding several partitions.
+    /// Setting a key again replaces its value.
+    ///
+    /// In Prometheus text the key is a label name, as the exporter writes one: every
+    /// character outside `[a-zA-Z0-9_]` becomes `_` (`pigeonhole.partition` is
+    /// `pigeonhole_partition`), with `_` before a leading digit. Each value is one more series
+    /// per metric, so keep the values a bounded set.
+    ///
+    /// # Panics
+    ///
+    /// If `key`'s label name is that of `pigeonhole.db.name`, of an attribute a metric
+    /// carries itself ([`MetricInfo::attributes`]), or of another key set here: a sample
+    /// would carry the label twice, which Prometheus refuses. Keys are compared as label
+    /// names, so `pigeonhole_db_name`, or `a-b` after `a.b`, is refused too. So is an empty
+    /// key, which would be an empty label name.
+    ///
+    /// A key whose label name starts with `__` is one Prometheus reserves for itself:
+    /// don't use one.
+    pub fn attribute(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        let name = label_name(key);
+        assert!(
+            !key.is_empty(),
+            "pigeonhole_otel::Config::attribute: an empty key"
+        );
+        assert!(
+            name != label_name(attr::DB_NAME)
+                && !metrics().any(|m| m.attributes.iter().any(|a| label_name(a) == name)),
+            "pigeonhole_otel::Config::attribute: {key:?} is an attribute the metrics carry \
+             already"
+        );
+        assert!(
+            !self
+                .attributes
+                .iter()
+                .any(|(k, _)| *k != key && label_name(k) == name),
+            "pigeonhole_otel::Config::attribute: {key:?} has the label name {name:?} of \
+             another attribute set"
+        );
+        let value = value.into();
+        match self.attributes.iter_mut().find(|(k, _)| *k == key) {
+            Some(slot) => slot.1 = value,
+            None => self.attributes.push((key, value)),
+        }
         self
     }
 
@@ -145,6 +195,7 @@ impl Config {
     fn shared(&self, db: &Pigeonhole) -> Arc<Shared> {
         Arc::new(Shared {
             name: self.db_name.clone().unwrap_or_else(|| default_name(db)),
+            attributes: self.attributes.clone(),
             storage_by_table: self.storage_by_table,
             window: self.latency_window,
             state: Mutex::new(State::new(db)),
@@ -276,10 +327,30 @@ impl Collector {
     /// underscores (`pigeonhole_db_name`) in name order, as OpenTelemetry's Prometheus
     /// exporter writes them without its scope labels and `target_info`.
     pub fn render_prometheus(&self, out: &mut String) {
+        Self::render_prometheus_all(&[self], out);
+    }
+
+    /// As [`render_prometheus`](Self::render_prometheus), for several databases at once
+    /// (ICR 0133): each metric's `# HELP` and `# TYPE` once, then every collector's samples,
+    /// in `collectors`' order. The exposition format allows a metric's lines only once, so
+    /// rendering the collectors one after another would repeat them. Tell the databases
+    /// apart by `pigeonhole.db.name` or a [`Config::attribute`]. Each collector reads its
+    /// database once.
+    pub fn render_prometheus_all(collectors: &[&Collector], out: &mut String) {
         use std::fmt::Write as _;
-        self.each(|spec, points| {
-            if points.is_empty() {
-                return;
+        // Every collector's points, by metric, from one reading each.
+        let mut read: Vec<Vec<Points>> = collectors
+            .iter()
+            .map(|c| {
+                let mut by_spec = Vec::with_capacity(SPECS.len());
+                c.each(|_, points| by_spec.push(points));
+                by_spec
+            })
+            .collect();
+        for (i, spec) in SPECS.iter().enumerate() {
+            let has = |r: &Vec<Points>| r.get(i).is_some_and(|p| !p.is_empty());
+            if !read.iter().any(has) {
+                continue;
             }
             let name = spec.info.prometheus_name();
             let kind = match spec.info.kind {
@@ -288,30 +359,34 @@ impl Collector {
             };
             let _ = writeln!(out, "# HELP {name} {}", escape_help(spec.info.description));
             let _ = writeln!(out, "# TYPE {name} {kind}");
-            for (value, attrs) in points {
-                out.push_str(&name);
-                // Labels in name order, as the exporter writes them.
-                let mut labels = self.attributes(attrs);
-                labels.sort_unstable_by_key(|(k, _)| *k);
-                for (i, (k, v)) in labels.iter().enumerate() {
-                    out.push(if i == 0 { '{' } else { ',' });
-                    out.push_str(&k.replace('.', "_"));
-                    out.push_str("=\"");
-                    escape_label(out, v);
-                    out.push('"');
-                }
-                // `pigeonhole_db_name` is always there, but a sample without labels has no
-                // braces (ai1249's N2 on #1687).
-                out.push_str(if labels.is_empty() { " " } else { "} " });
-                match spec.value(value) {
-                    PointValue::U64(v) => {
-                        let _ = write!(out, "{v}");
+            for (c, r) in collectors.iter().zip(&mut read) {
+                // A closed database's collector read nothing.
+                let Some(points) = r.get_mut(i) else { continue };
+                for (value, attrs) in std::mem::take(points) {
+                    out.push_str(&name);
+                    // Labels in name order, as the exporter writes them.
+                    let mut labels = c.attributes(attrs);
+                    labels.sort_unstable_by_key(|(k, _)| *k);
+                    for (i, (k, v)) in labels.iter().enumerate() {
+                        out.push(if i == 0 { '{' } else { ',' });
+                        push_label_name(out, k);
+                        out.push_str("=\"");
+                        escape_label(out, v);
+                        out.push('"');
                     }
-                    PointValue::F64(v) => write_float(out, v),
+                    // `pigeonhole_db_name` is always there, but a sample without labels has
+                    // no braces (ai1249's N2 on #1687).
+                    out.push_str(if labels.is_empty() { " " } else { "} " });
+                    match spec.value(value) {
+                        PointValue::U64(v) => {
+                            let _ = write!(out, "{v}");
+                        }
+                        PointValue::F64(v) => write_float(out, v),
+                    }
+                    out.push('\n');
                 }
-                out.push('\n');
             }
-        });
+        }
     }
 
     /// As [`Registration::rebind`].
@@ -340,6 +415,7 @@ impl Collector {
     /// `pigeonhole.db.name`, then a point's own attributes.
     fn attributes(&self, attrs: Vec<(&'static str, Attr)>) -> Vec<(&'static str, String)> {
         std::iter::once((attr::DB_NAME, self.shared.name.clone()))
+            .chain(self.shared.attributes.iter().cloned())
             .chain(attrs.into_iter().map(|(k, v)| (k, v.into_text())))
             .collect()
     }
@@ -379,6 +455,29 @@ pub enum PointValue {
 /// `# HELP`'s escaping: a backslash and a newline.
 fn escape_help(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// `key` as a Prometheus label name, as OpenTelemetry's exporter writes one: every
+/// character outside `[a-zA-Z0-9_]` as `_`, and `_` before a leading digit (ai1249's S1 on
+/// #1711: an attribute key from [`Config::attribute`] can hold anything).
+fn push_label_name(out: &mut String, key: &str) {
+    out.push_str(&label_name(key));
+}
+
+/// [`push_label_name`]'s name for `key`.
+fn label_name(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 1);
+    if key.starts_with(|c: char| c.is_ascii_digit()) {
+        out.push('_');
+    }
+    out.extend(key.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        }
+    }));
+    out
 }
 
 /// A label value's escaping: a backslash, a double quote and a newline.
@@ -1317,6 +1416,8 @@ const REUSE: Duration = Duration::from_millis(100);
 struct Shared {
     /// The `pigeonhole.db.name` attribute's value.
     name: String,
+    /// [`Config::attribute`]'s, after it.
+    attributes: Vec<(&'static str, String)>,
     storage_by_table: bool,
     window: Duration,
     state: Mutex<State>,
@@ -1536,6 +1637,12 @@ fn build(
             for (v, attrs) in points {
                 let attrs: Vec<KeyValue> =
                     std::iter::once(KeyValue::new(attr::DB_NAME, shared.name.clone()))
+                        .chain(
+                            shared
+                                .attributes
+                                .iter()
+                                .map(|(k, v)| KeyValue::new(*k, v.clone())),
+                        )
                         .chain(attrs.into_iter().map(|(k, v)| v.key_value(k)))
                         .collect();
                 emit(v, &attrs);

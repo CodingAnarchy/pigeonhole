@@ -734,3 +734,194 @@ fn a_collector_gives_plain_points_until_the_database_closes() {
     db.close().unwrap();
     assert!(collector.collect().is_empty());
 }
+
+/// ICR 0133: a constant attribute (`Config::attribute`) reaches every point, through the
+/// OpenTelemetry registration and the collector alike, and `render_prometheus_all` writes
+/// each metric's `# HELP`/`# TYPE` once for several databases, each database's samples
+/// told apart by it.
+#[test]
+fn several_databases_render_as_one_exposition_told_apart_by_an_attribute() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let dbs: Vec<Pigeonhole> = ["p1", "p2"]
+        .iter()
+        .map(|p| Pigeonhole::open(dir.join(format!("{p}.phdb")), options()).unwrap())
+        .collect();
+    let tables: Vec<Table> = dbs.iter().map(|db| table(db, "t")).collect();
+    for (db, t) in dbs.iter().zip(&tables) {
+        workload(db, t);
+    }
+    let config = |p: &str| {
+        Config::new()
+            .db_name("same.phdb")
+            .attribute("pigeonhole.partition", "replaced")
+            .attribute("pigeonhole.partition", p)
+    };
+    // Through OpenTelemetry: every point carries it, once, with the last value set.
+    let sdk = Sdk::new();
+    let registration = config("p1").register(&dbs[0], &sdk.meter());
+    for (name, c) in sdk.collect() {
+        for p in &c.points {
+            assert_eq!(
+                p.attrs.get("pigeonhole.partition").map(String::as_str),
+                Some("p1"),
+                "{name}: {:?}",
+                p.attrs
+            );
+        }
+    }
+    drop(registration);
+    // Through collectors, rendered together.
+    let collectors: Vec<_> = ["p1", "p2"]
+        .iter()
+        .zip(&dbs)
+        .map(|(p, db)| config(p).collector(db))
+        .collect();
+    let refs: Vec<&pigeonhole_otel::Collector> = collectors.iter().collect();
+    let mut text = String::new();
+    pigeonhole_otel::Collector::render_prometheus_all(&refs, &mut text);
+    let mut seen = BTreeSet::new();
+    for line in text.lines().filter(|l| l.starts_with("# TYPE ")) {
+        assert!(seen.insert(line), "{line} twice:\n{text}");
+    }
+    let commits = text
+        .lines()
+        .filter(|l| l.starts_with("pigeonhole_commits_total{"))
+        .collect::<Vec<_>>();
+    for p in ["p1", "p2"] {
+        assert!(
+            commits
+                .iter()
+                .any(|l| l.contains(&format!("pigeonhole_partition=\"{p}\""))),
+            "{p}'s commits:\n{text}"
+        );
+    }
+    // A collected point carries it right after `pigeonhole.db.name` (ai1249's N2).
+    for p in refs[1].collect() {
+        assert_eq!(
+            p.attributes.get(1).map(|(k, v)| (*k, v.as_str())),
+            Some(("pigeonhole.partition", "p2")),
+            "{}: {:?}",
+            p.metric.name,
+            p.attributes
+        );
+    }
+    // One database alone renders as `render_prometheus` does: the same lines, values aside
+    // (gauges may move between two readings).
+    let (mut one, mut all) = (String::new(), String::new());
+    refs[0].render_prometheus(&mut one);
+    pigeonhole_otel::Collector::render_prometheus_all(&refs[..1], &mut all);
+    let unvalued = |t: &str| -> Vec<String> {
+        t.lines()
+            .map(|l| match l.starts_with('#') {
+                true => l.to_owned(),
+                false => l.rsplit_once(' ').map_or(l, |(k, _)| k).to_owned(),
+            })
+            .collect()
+    };
+    assert_eq!(unvalued(&one), unvalued(&all));
+    drop(collectors);
+    drop(tables);
+    for db in dbs {
+        db.close().unwrap();
+    }
+}
+
+/// ai1249's S1 on #1711: a `Config::attribute` key becomes a valid Prometheus label name, as
+/// the exporter writes one, whatever it holds.
+#[test]
+fn an_attribute_key_renders_as_a_valid_label_name() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("labels.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    workload(&db, &t);
+    let c = Config::new()
+        .attribute("service-tier/k8s.pod", "a")
+        .attribute("2nd.zone", "b")
+        .collector(&db);
+    let mut text = String::new();
+    c.render_prometheus(&mut text);
+    let commits = text
+        .lines()
+        .find(|l| l.starts_with("pigeonhole_commits_total{"))
+        .expect("a commits sample");
+    assert!(commits.contains("service_tier_k8s_pod=\"a\""), "{commits}");
+    assert!(commits.contains("_2nd_zone=\"b\""), "{commits}");
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let labels = line.split_once('{').map_or("", |(_, rest)| rest);
+        for name in labels
+            .split(',')
+            .filter_map(|kv| kv.split_once('=').map(|(k, _)| k))
+        {
+            assert!(
+                !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "label {name:?} in {line}"
+            );
+        }
+    }
+    drop(c);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// ai1249's N1 on #1711: a key every point or some metric already carries is refused at
+/// once, rather than writing a duplicate label Prometheus refuses.
+#[test]
+#[should_panic(expected = "is an attribute the metrics carry already")]
+fn an_attribute_the_metrics_carry_is_refused() {
+    let _ = Config::new().attribute("pigeonhole.db.name", "x");
+}
+
+#[test]
+#[should_panic(expected = "is an attribute the metrics carry already")]
+fn a_metrics_own_attribute_is_refused() {
+    let _ = Config::new().attribute("pigeonhole.table", "x");
+}
+
+/// Keys are compared as label names (ai1249's follow-up on #1711): one that renders as an
+/// attribute the metrics carry, or as another key set, is refused; the same key again only
+/// replaces its value.
+#[test]
+#[should_panic(expected = "is an attribute the metrics carry already")]
+fn a_key_that_renders_as_db_name_is_refused() {
+    let _ = Config::new().attribute("pigeonhole_db_name", "x");
+}
+
+#[test]
+#[should_panic(expected = "has the label name \"a_b\" of another attribute set")]
+fn two_keys_with_one_label_name_are_refused() {
+    let _ = Config::new().attribute("a.b", "x").attribute("a-b", "y");
+}
+
+#[test]
+fn the_same_key_again_replaces_its_value() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("replace.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    workload(&db, &t);
+    let c = Config::new()
+        .attribute("a.b", "x")
+        .attribute("a.b", "y")
+        .collector(&db);
+    let mut text = String::new();
+    c.render_prometheus(&mut text);
+    let commits = text
+        .lines()
+        .find(|l| l.starts_with("pigeonhole_commits_total{"))
+        .expect("a commits sample");
+    assert!(
+        commits.contains("a_b=\"y\"") && !commits.contains("a_b=\"x\""),
+        "{commits}"
+    );
+    drop(c);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// ai1249's N1 on #1717: an empty key would write an empty label name, which fails the
+/// scrape.
+#[test]
+#[should_panic(expected = "an empty key")]
+fn an_empty_key_is_refused() {
+    let _ = Config::new().attribute("", "x");
+}

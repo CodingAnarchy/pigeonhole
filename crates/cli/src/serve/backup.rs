@@ -53,6 +53,29 @@ pub(crate) struct Kept {
     /// A replica bootstrap's feed token (#1436): what the replica follows the primary from,
     /// returned with every chunk, a resume's too. Empty for an ordinary backup.
     pub feed_token: Vec<u8>,
+    /// A cluster node's copy (D317 ticket 8b): the identity it holds, sent in its last chunk,
+    /// a resume's too. `None` on a single node.
+    pub identity: Option<CopyIdentity>,
+}
+
+/// What a cluster node's backup copy holds (D317 ticket 8b): its identity row
+/// (`__phdb_cluster`), read from the same snapshot the copy is of, and the node's map version
+/// when the backup started. `phdb cluster backup` checks it against its map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyIdentity {
+    pub partition: String,
+    pub cluster_id: String,
+    pub epoch: u64,
+    pub map_version: u64,
+}
+
+/// What a download's backup gives back once its copy is written.
+#[derive(Debug, Default)]
+pub(crate) struct Taken {
+    /// A replica bootstrap's feed token, as announced while it ran; empty otherwise.
+    pub feed_token: Vec<u8>,
+    /// A cluster node's copy's identity.
+    pub identity: Option<CopyIdentity>,
 }
 
 /// A download's copy, as its readers watch it (#1611).
@@ -230,7 +253,7 @@ impl Backups {
     /// slot free (the flake on #1549).
     pub(crate) fn fresh_download(
         self: &Arc<Self>,
-        take: impl FnOnce(&Path, &dyn Fn(Vec<u8>)) -> Result<Vec<u8>, ApiError> + Send + 'static,
+        take: impl FnOnce(&Path, &dyn Fn(Vec<u8>)) -> Result<Taken, ApiError> + Send + 'static,
     ) -> Result<(String, watch::Receiver<Copy>), ApiError> {
         let permit = self.permit()?;
         let (id, path, copy) = self.reserve()?;
@@ -265,11 +288,11 @@ impl Backups {
                 };
                 let started = |token: Vec<u8>| me.started(&tid, token);
                 let written = take(&path, &started)
-                    .and_then(|token| digest(&path).map(|(total, sha)| (total, sha, token)));
+                    .and_then(|taken| digest(&path).map(|(total, sha)| (total, sha, taken)));
                 drop(permit);
                 match written {
-                    Ok((total, sha256, token)) => {
-                        me.finish(&tid, total, sha256, token);
+                    Ok((total, sha256, taken)) => {
+                        me.finish(&tid, total, sha256, taken);
                         pending.done = true;
                     }
                     Err(e) => pending.error = Some(e),
@@ -317,6 +340,7 @@ impl Backups {
                     total: 0,
                     sha256: [0; 32],
                     feed_token: Vec::new(),
+                    identity: None,
                 },
                 ready: false,
                 readers: 1,
@@ -338,7 +362,11 @@ impl Backups {
 
     /// The backup thread wrote and hashed copy `id`: it's ready for its readers. Nothing if
     /// it's gone.
-    fn finish(&self, id: &str, total: u64, sha256: [u8; 32], feed_token: Vec<u8>) {
+    fn finish(&self, id: &str, total: u64, sha256: [u8; 32], taken: Taken) {
+        let Taken {
+            feed_token,
+            identity,
+        } = taken;
         let mut kept = self.lock();
         let Some(e) = kept.get_mut(id) else { return };
         // The token the backup returned is the one it announced (cli692's N3 on #1628).
@@ -349,6 +377,7 @@ impl Backups {
         e.kept.total = total;
         e.kept.sha256 = sha256;
         e.kept.feed_token = feed_token;
+        e.kept.identity = identity;
         e.ready = true;
         e.last_used = Instant::now();
         e.state.send_replace(Copy::Ready(e.kept.clone()));
@@ -655,7 +684,7 @@ mod tests {
         let _in = rt.enter();
         let (id, copy) = b.fresh_download(move |p, _| {
             std::fs::write(p, bytes)
-                .map(|()| Vec::new())
+                .map(|()| Taken::default())
                 .map_err(|e| ApiError::internal(e.to_string()))
         })?;
         Ok((id, wait_copy(rt, copy)?))
@@ -730,7 +759,7 @@ mod tests {
             let (id, path, _copy) = b.reserve().unwrap();
             if i == 0 {
                 std::fs::write(&path, b"backup").unwrap();
-                b.finish(&id, 6, [0; 32], Vec::new());
+                b.finish(&id, 6, [0; 32], Taken::default());
             }
             ids.push(id);
         }
@@ -762,7 +791,10 @@ mod tests {
                 started(b"token".to_vec());
                 let _ = wait.recv();
                 std::fs::write(p, b"backup").map_err(|e| ApiError::internal(e.to_string()))?;
-                Ok(b"token".to_vec())
+                Ok(Taken {
+                    feed_token: b"token".to_vec(),
+                    identity: None,
+                })
             })
             .unwrap()
         };
@@ -811,7 +843,7 @@ mod tests {
                 let _ = wait.recv();
                 std::fs::write(p, b"backup").map_err(|e| ApiError::internal(e.to_string()))?;
                 let _ = written.send(p.to_owned());
-                Ok(Vec::new())
+                Ok(Taken::default())
             })
             .unwrap()
         };

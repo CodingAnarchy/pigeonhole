@@ -870,6 +870,7 @@ impl Replica {
                 backup_id: backup_id.clone(),
                 offset,
                 replica: true,
+                partition: String::new(),
             })?;
             // The primary answers at once and sends a heartbeat (a chunk with no data) every
             // second while it writes its copy (#1611), so every wait is bounded however long

@@ -518,7 +518,7 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
     let p = Server::start("", limits());
     let r = Server::start_replica(test_dir(), &p.url, None);
     for (server, prefix) in [(&p, "pigeonhole_serve_"), (&r, "pigeonhole_replica_")] {
-        let rendered = names(&server.shared.router.service.metrics_text(), prefix);
+        let rendered = names(&server.shared.router.metrics_text(), prefix);
         assert!(!rendered.is_empty(), "{prefix}");
         assert_eq!(
             names(guide, prefix),
