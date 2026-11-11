@@ -93,7 +93,8 @@ jobs:
         continue-on-error: true
         run: |
           apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
-          sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q gdb
+          sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q gdb \
+            || { echo "::warning::gdb isn't installed: a hung model seed will abort without thread stacks"; exit 1; }
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --exclude pigeonhole-bench --all-targets --all-features -- -D warnings
       - run: cargo clippy -p pigeonhole-bench --all-targets --features "$BENCH_FEATURES" -- -D warnings

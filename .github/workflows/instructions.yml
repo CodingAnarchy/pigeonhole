@@ -122,8 +122,20 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Bounded, as sweep.yml's and ci.yml's apt steps: a runner whose DNS or mirror stalls
+      # (#1735's two jobs, "Temporary failure resolving") gets three tries with apt's own
+      # timeouts and retries, then fails the job rather than hold it. Valgrind is required here,
+      # so a failure stays fatal.
       - name: install valgrind
-        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+        timeout-minutes: 8
+        run: |
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          for try in 1 2 3; do
+            sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q valgrind && exit 0
+            echo "::warning::apt install of valgrind failed (try $try of 3)"
+            sleep 20
+          done
+          exit 1
       - name: build the examples (head and base)
         shell: bash
         run: |
