@@ -108,10 +108,22 @@ impl Config {
     /// as `phdb serve`'s `pigeonhole.partition` on a cluster node holding several partitions.
     /// Setting a key again replaces its value.
     ///
-    /// `key` should not be one of the attributes a metric carries itself
-    /// ([`MetricInfo::attributes`]) or `pigeonhole.db.name`: a point would then carry the key
-    /// twice. Each value is one more series per metric, so keep the values a bounded set.
+    /// In Prometheus text the key is a label name, as the exporter writes one: every
+    /// character outside `[a-zA-Z0-9_]` becomes `_` (`pigeonhole.partition` is
+    /// `pigeonhole_partition`), with `_` before a leading digit. Each value is one more series
+    /// per metric, so keep the values a bounded set.
+    ///
+    /// # Panics
+    ///
+    /// If `key` is `pigeonhole.db.name` or one of the attributes a metric carries itself
+    /// ([`MetricInfo::attributes`]): a point would carry the key twice, which Prometheus
+    /// refuses.
     pub fn attribute(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        assert!(
+            key != attr::DB_NAME && !metrics().any(|m| m.attributes.contains(&key)),
+            "pigeonhole_otel::Config::attribute: {key:?} is an attribute the metrics carry \
+             already"
+        );
         let value = value.into();
         match self.attributes.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => slot.1 = value,
@@ -338,7 +350,7 @@ impl Collector {
                     labels.sort_unstable_by_key(|(k, _)| *k);
                     for (i, (k, v)) in labels.iter().enumerate() {
                         out.push(if i == 0 { '{' } else { ',' });
-                        out.push_str(&k.replace('.', "_"));
+                        push_label_name(out, k);
                         out.push_str("=\"");
                         escape_label(out, v);
                         out.push('"');
@@ -424,6 +436,22 @@ pub enum PointValue {
 /// `# HELP`'s escaping: a backslash and a newline.
 fn escape_help(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// `key` as a Prometheus label name, as OpenTelemetry's exporter writes one: every
+/// character outside `[a-zA-Z0-9_]` as `_`, and `_` before a leading digit (ai1249's S1 on
+/// #1711: an attribute key from [`Config::attribute`] can hold anything).
+fn push_label_name(out: &mut String, key: &str) {
+    if key.starts_with(|c: char| c.is_ascii_digit()) {
+        out.push('_');
+    }
+    out.extend(key.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        }
+    }));
 }
 
 /// A label value's escaping: a backslash, a double quote and a newline.

@@ -905,6 +905,12 @@ pub(crate) struct Partition {
     /// The feed fan-out's hubs (D313 R2).
     pub(crate) feeds: Arc<super::feed::Feeds>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
+    ///
+    /// **The node's one** (simp724's N1 on #1711): `Backups::new` clears
+    /// `.phdb-serve-downloads` at startup and counts `--max-backups` itself. A second one per
+    /// partition (several partitions on one node, D317 8a; a partition opened at runtime,
+    /// ticket 6) would delete another partition's live downloads and make the limit per
+    /// partition. Partitions share the node's `Arc`.
     backups: Arc<super::backup::Backups>,
     /// The vector indexes open, and their rebalancing threads.
     pub(crate) indexes: Arc<super::indexes::Indexes>,
@@ -1017,7 +1023,8 @@ impl Service {
     }
 
     /// A cluster node serving partition `id` on `db` (D317): its per-partition metrics are
-    /// labelled with the id.
+    /// labelled with the id. Its backups are the node's ([`backups`](Self::backups)): with
+    /// several partitions on a node (8a), they share that one `Backups`, never one each.
     pub(crate) fn partition_node(
         db: Pigeonhole,
         id: &str,
