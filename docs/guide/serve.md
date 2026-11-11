@@ -599,11 +599,25 @@ Until then, keep each partition on the node it started on. A node checks its par
 - **Restore comes with a later step.** It will put each partition's file back on the node the backup's map (or an edited copy of it) gives it, fenced so that the old cluster, if it still runs, can't write into the restored one ([Fencing and relocation](#fencing-and-relocation) will say how).
 
 ### Partitions per node
-A node serves every partition its map gives it (D317 ticket 8a). The recommendation for how many comes from a box run at the same node totals with 1, 2, 4 and 8 partitions. **Plan for one partition per node until then.**
+A node serves every partition its map gives it (D317 ticket 8a). **Several partitions on one node cost nothing measurable, and don't change its capacity, as long as the node's totals are set.** Capacity follows the node's totals and its network threads, not the number of partitions.
+
+**Measured** (perf287's box runs, #1482), with 20M rows of 100 B split evenly by key range and two rounds at each N:
+- **At a fixed load:** one node on 12 cores, `--shards 8 --compaction-threads 4 --engine-memory 1073741824` (1 GiB), with 1, 2, 4 and 8 partitions and 64 callers.
+  - ycsb-a at Buffered, ycsb-a at GroupSync and zipf ycsb-c: throughput and p99 at every N fell within the run-to-run noise at N=1. That noise was 4% in throughput for ycsb-a at Buffered.
+  - The worst cell against one partition in the same round was 2 partitions at GroupSync: 2% fewer ops/s, and 4% more p99 on Mutate.
+- **At saturation:** one node on 8 cores, `--shards 4 --compaction-threads 2 --engine-memory 1073741824`, with 1, 2 and 4 partitions and 512 callers.
+  - Capacity was the same at every N: about 270–280K ops/s for ycsb-a at Buffered (p99 about 4.4–5.2 ms) and about 305–333K ops/s for ycsb-c.
+  - Rounds differed by up to 8%, more than any N did.
+  - What saturated was the node's network threads (6 on that node, each at 100% of a CPU), not its shards. The network side is node-wide, so splitting the node doesn't change it.
+
+**To get that:**
+- **Set `--engine-memory`,** or each partition takes the library's full caches.
+- **Keep `--shards` a multiple of the partition count.** A remainder gives the first partitions one shard more than the rest.
+- **Partitions past `--compaction-threads` share the node's compaction CPUs.** The run measured 8 partitions on 4.
 
 **A node's budget is shared by its partitions:**
 - **`--shards` and `--compaction-threads` are the node's totals,** split across its partitions in id order, at least one shard each. A partition whose change feed recorded a shard count keeps it.
-- **The shards pin first:** with several partitions, every partition's shards are pinned before any compaction thread, and the compaction threads share the node's compaction CPUs. So the network side keeps the same CPUs as with one partition. Before this (g74), four partitions on one node gave 25–34% less throughput than one; with it (perf287's g77), about 1–2% less.
+- **The shards pin first:** with several partitions, every partition's shards are pinned before any compaction thread, and the compaction threads share the node's compaction CPUs. So the network side keeps the same CPUs as with one partition. Before this (g74), four partitions on one node gave 25–34% less throughput than one; with it, the runs above found no measurable difference: up to eight partitions at a fixed load, and up to four at saturation.
 - **`--engine-memory` is the node's total too.** The map's `memory_bytes` for a partition is taken first, and the rest is split equally across the node's other partitions. Set it when a node holds several partitions, or each takes the library's full defaults.
 - **The startup lines** give each partition's shard and compaction threads (pinned, confined or unpinned) and its memory. On Linux, a partition with unpinned threads is a warning. `/metrics` has the same per partition.
 - **Sessions and feeds:** `--max-sessions`, `--max-sessions-per-token`, `--feed-ring-bytes`, `--max-feed-hubs` and `--max-catch-up` count across all of a node's partitions. A feed with tables on two of a node's partitions holds two hubs there.
