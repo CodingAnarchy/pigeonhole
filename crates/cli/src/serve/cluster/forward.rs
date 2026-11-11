@@ -21,7 +21,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use super::Node;
-use crate::serve::auth::{Caller, Scope};
+use crate::serve::auth::{ANONYMOUS, Caller, Scope, Tokens};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
     ForwardRequest, ForwardResponse, ForwardScanRequest, ForwardedCaller, ScanPage,
@@ -304,11 +304,22 @@ pub(crate) fn forwarded_caller(caller: &Caller) -> Result<ForwardedCaller, ApiEr
         scope: scope.to_owned(),
         all_namespaces: caller.namespaces.is_none(),
         namespaces: caller.namespaces.clone().unwrap_or_default(),
+        // Its sessions' binding (D317 ticket 3); none on a cluster without tokens.
+        token_digest: if caller.principal == ANONYMOUS {
+            prost::bytes::Bytes::new()
+        } else {
+            prost::bytes::Bytes::copy_from_slice(caller.principal.digest())
+        },
     })
 }
 
-/// The caller a forward is for, on the owner: never more than `write` (D317 ticket 2).
-pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> {
+/// The caller a forward is for, on the owner (D317 ticket 3): this node's own entry for
+/// the token's digest, so its scope (capped at `write`, D317 ticket 2) and namespaces are
+/// what this node lists, and its sessions are bound to the token as on a single node
+/// (cli692's R1 on #1702). A digest this node doesn't list, or any digest on a node without
+/// tokens, is `PermissionDenied` (R2): a cluster's nodes list the same tokens. Without
+/// tokens anywhere, the forward's scope and namespaces stand, and the caller is anyone.
+pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<Caller, ApiError> {
     let f = f.ok_or_else(|| ApiError::invalid("a forward names no caller"))?;
     let scope = match f.scope.as_str() {
         "read" => Scope::Read,
@@ -319,15 +330,38 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>) -> Result<Caller, ApiError> 
             )));
         }
     };
-    Ok(Caller {
-        // Not a token of this node's: forwarded calls hold no sessions.
-        token: u32::MAX,
-        scope,
-        namespaces: (!f.all_namespaces).then_some(f.namespaces),
-        // The reply goes back to the forwarding node as protobuf; that node charges and
-        // renders it for its own client (#1567).
-        json: false,
-    })
+    if !tokens.any() {
+        if !f.token_digest.is_empty() {
+            return Err(ApiError::unlisted_token());
+        }
+        return Ok(Caller {
+            principal: ANONYMOUS,
+            scope,
+            namespaces: (!f.all_namespaces).then_some(f.namespaces),
+            // The reply goes back to the forwarding node as protobuf; that node charges and
+            // renders it for its own client (#1567).
+            json: false,
+        });
+    }
+    // Never the digest in the message (cli692's S1 on ticket 3).
+    let digest: [u8; 32] = f
+        .token_digest
+        .as_ref()
+        .try_into()
+        .map_err(|_| ApiError::unlisted_token())?;
+    let mut caller = tokens
+        .caller_by_digest(&digest)
+        .ok_or_else(ApiError::unlisted_token)?;
+    caller.scope = match caller.scope {
+        Scope::Read => Scope::Read,
+        Scope::Write | Scope::Admin => Scope::Write,
+        Scope::Cluster => {
+            return Err(ApiError::permission_denied(
+                "make a data call with a cluster token",
+            ));
+        }
+    };
+    Ok(caller)
 }
 
 /// A routed call as a forward's op. Only what [`crate::serve::router`] routes reaches here.
@@ -341,6 +375,14 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::MutateReturning(r) => Op::MutateReturning(r),
         ServiceOp::Batch(r) => Op::Batch(r),
         ServiceOp::MultiGet(r) => Op::MultiGet(r),
+        ServiceOp::Begin(r) => Op::Begin(r),
+        ServiceOp::TxnGet(r) => Op::TxnGet(r),
+        ServiceOp::TxnGetRow(r) => Op::TxnGetRow(r),
+        ServiceOp::TxnWrite(r) => Op::TxnWrite(r),
+        ServiceOp::Commit(r) => Op::Commit(r),
+        ServiceOp::Abort(r) => Op::Abort(r),
+        ServiceOp::OpenSnapshot(r) => Op::OpenSnapshot(r),
+        ServiceOp::ReleaseSnapshot(r) => Op::ReleaseSnapshot(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -362,6 +404,14 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::MutateReturning(r) => ServiceOp::MutateReturning(r),
             Op::Batch(r) => ServiceOp::Batch(r),
             Op::MultiGet(r) => ServiceOp::MultiGet(r),
+            Op::Begin(r) => ServiceOp::Begin(r),
+            Op::TxnGet(r) => ServiceOp::TxnGet(r),
+            Op::TxnGetRow(r) => ServiceOp::TxnGetRow(r),
+            Op::TxnWrite(r) => ServiceOp::TxnWrite(r),
+            Op::Commit(r) => ServiceOp::Commit(r),
+            Op::Abort(r) => ServiceOp::Abort(r),
+            Op::OpenSnapshot(r) => ServiceOp::OpenSnapshot(r),
+            Op::ReleaseSnapshot(r) => ServiceOp::ReleaseSnapshot(r),
         },
     )
 }
@@ -380,6 +430,10 @@ pub(crate) fn reply_to_forward(
         ServiceReply::CheckAndMutate(r) => Reply::CheckAndMutate(r),
         ServiceReply::MutateReturning(r) => Reply::MutateReturning(r),
         ServiceReply::MultiGet(r) => Reply::MultiGet(r),
+        ServiceReply::Begin(r) => Reply::Begin(r),
+        ServiceReply::Commit(r) => Reply::Commit(r),
+        ServiceReply::OpenSnapshot(r) => Reply::OpenSnapshot(r),
+        ServiceReply::Empty(r) => Reply::Empty(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -403,13 +457,60 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::CheckAndMutate(r) => ServiceReply::CheckAndMutate(r),
             Reply::MutateReturning(r) => ServiceReply::MutateReturning(r),
             Reply::MultiGet(r) => ServiceReply::MultiGet(r),
+            Reply::Begin(r) => ServiceReply::Begin(r),
+            Reply::Commit(r) => ServiceReply::Commit(r),
+            Reply::OpenSnapshot(r) => ServiceReply::OpenSnapshot(r),
+            Reply::Empty(r) => ServiceReply::Empty(r),
         },
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{caller_of, classify};
+    use crate::serve::auth::{Scope, Tokens};
+    use crate::serve::proto::ForwardedCaller;
+
+    fn forwarded(scope: &str, token: &[u8]) -> Option<ForwardedCaller> {
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(token).into();
+        Some(ForwardedCaller {
+            scope: scope.into(),
+            namespaces: Vec::new(),
+            all_namespaces: true,
+            token_digest: if token.is_empty() {
+                Default::default()
+            } else {
+                digest.to_vec().into()
+            },
+        })
+    }
+
+    /// The owner's own entry for the token decides the forwarded caller's scope and
+    /// namespaces, whatever the entry node sent (cli692's R1 on #1702); a digest it doesn't
+    /// list, or any digest on a node without tokens, is refused (R2).
+    #[test]
+    fn a_forwarded_caller_is_what_this_node_lists_for_its_token() {
+        let tokens =
+            Tokens::parse("read ns=team-a t0ken\nadmin b0ss\ncluster n0de\n", "t").unwrap();
+        let c = caller_of(forwarded("write", b"t0ken"), &tokens).unwrap();
+        assert_eq!(c.scope, Scope::Read);
+        assert_eq!(c.namespaces, Some(vec!["team-a".to_owned()]));
+        let boss = caller_of(forwarded("read", b"b0ss"), &tokens).unwrap();
+        assert_eq!((boss.scope, boss.namespaces), (Scope::Write, None));
+        for (f, why) in [
+            (forwarded("write", b"other"), "unlisted"),
+            (forwarded("write", b""), "no digest"),
+            (forwarded("write", b"n0de"), "a cluster token"),
+        ] {
+            let e = caller_of(f, &tokens).unwrap_err();
+            assert_eq!(e.code, "PermissionDenied", "{why}: {}", e.message);
+        }
+        let none = Tokens::parse("", "t").unwrap();
+        let e = caller_of(forwarded("write", b"t0ken"), &none).unwrap_err();
+        assert_eq!(e.code, "PermissionDenied", "{}", e.message);
+        let anyone = caller_of(forwarded("write", b""), &none).unwrap();
+        assert_eq!(anyone.scope, Scope::Write);
+    }
 
     /// tonic's status for a failed connect, as the channel builds it: a `ConnectError` around
     /// the OS's error.
