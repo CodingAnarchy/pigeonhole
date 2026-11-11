@@ -246,6 +246,7 @@ mod tests {
             id: id.into(),
             node: node.into(),
             epoch,
+            memory_bytes: 0,
         };
         ClusterMap {
             cluster_id: "c1".into(),

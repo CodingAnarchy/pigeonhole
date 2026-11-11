@@ -73,6 +73,8 @@ fn runtimes_pin_to_distinct_cpus_and_one_without_free_cpus_runs_unpinned() {
     assert_eq!(p.unpinned, Some(Unpinned::TooFewCpus));
     assert_eq!(p.pinned + p.failed, cpus, "{p:?}");
     assert_eq!(over.pinned_driver_cpus().len(), p.pinned);
+    // ICR 0134: the unpinned compaction threads list no CPU.
+    assert!(over.pinned_compaction_cpus().is_empty());
     over.shutdown().unwrap();
     // Drivers and a pinned compaction thread: only the drivers' CPUs are listed.
     if cpus >= 3 {
@@ -85,6 +87,17 @@ fn runtimes_pin_to_distinct_cpus_and_one_without_free_cpus_runs_unpinned() {
         } else {
             assert!(drivers <= 2 && drivers <= p.pinned, "{drivers} of {p:?}");
         }
+        // ICR 0134: the compaction thread's CPU is listed apart, never a driver's, and every
+        // pinned thread is in one list or the other.
+        let compaction = both.pinned_compaction_cpus();
+        assert!(compaction.len() <= 1, "{compaction:?}");
+        assert!(
+            compaction
+                .iter()
+                .all(|c| !both.pinned_driver_cpus().contains(c)),
+            "{compaction:?}"
+        );
+        assert_eq!(drivers + compaction.len(), p.pinned, "{p:?}");
         both.shutdown().unwrap();
     }
 }

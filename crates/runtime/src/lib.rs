@@ -154,6 +154,12 @@ pub struct RuntimeConfig {
     /// value with [`Error::InvalidConfig`]. As with tasks on shards, tasks still queued or
     /// running on engine-owned workers at shutdown are dropped unfinished.
     pub compaction_threads: usize,
+    /// Engine-owned mode with `pin_threads`: confine the compaction threads to these CPU ids
+    /// (any of them) instead of pinning each to a CPU of its own (ICR 0134). For a process
+    /// whose own threads already hold those CPUs, such as a server with several databases
+    /// sharing one compaction budget (D317 ticket 8a): only the shards are then planned CPUs
+    /// of their own. `None` (the default) pins compaction threads like shard threads.
+    pub compaction_cpu_set: Option<Arc<[usize]>>,
     /// Engine-owned mode: the driver threads the shards run on (D289). Zero (the default)
     /// gives each shard a thread of its own; `k` in `1..shards` runs the shards' turns on
     /// `k` threads, shard `i` on thread `i % k`, each pinned like a shard thread. A larger
@@ -198,6 +204,7 @@ impl RuntimeConfig {
             shards: pigeonhole_io::sys::default_shards(),
             pin_threads: true,
             compaction_threads: 0,
+            compaction_cpu_set: None,
             shard_threads: 0,
             adaptive_drivers: false,
             time_slice: Duration::from_micros(500),
@@ -1026,8 +1033,11 @@ pub struct Pinning {
     /// Why threads the runtime asked to pin were planned no CPU: it pinned none, or, with
     /// too few free CPUs for every thread, only the shards (D252).
     pub unpinned: Option<pigeonhole_io::sys::Unpinned>,
-    /// Threads the OS refused to pin; they run unpinned.
+    /// Threads the OS refused to pin, or to confine to the compaction set; they run unpinned.
     pub failed: usize,
+    /// Compaction threads confined to [`RuntimeConfig::compaction_cpu_set`] rather than
+    /// pinned (ICR 0134); not counted in `pinned`.
+    pub confined: usize,
 }
 
 /// A started driver: its handle (its shards' handlers come back at shutdown) and start ack.
@@ -1082,6 +1092,25 @@ fn spawn_pinned<T: Send + 'static>(
     Ok((handle, ack_rx))
 }
 
+/// Spawns a thread confined to the CPU ids `set` (ICR 0134); its ack says whether the OS
+/// took the set.
+fn spawn_confined<T: Send + 'static>(
+    name: String,
+    set: Arc<[usize]>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<(JoinHandle<T>, Receiver<bool>)> {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let handle = thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            let ok = pigeonhole_io::sys::confine_current_thread_to(&set).is_ok();
+            let _ = ack_tx.send(ok);
+            f()
+        })
+        .map_err(Error::Spawn)?;
+    Ok((handle, ack_rx))
+}
+
 /// Engine-owned mode: the runtime's own pinned shard threads.
 ///
 /// See the [crate example](crate#example). Dropping a `Runtime` shuts it down like
@@ -1100,6 +1129,8 @@ pub struct Runtime<H: ShardHandler> {
     pinning: Pinning,
     /// The CPUs the driver threads pinned themselves to, in driver order (ICR 0101).
     driver_cpus: Vec<usize>,
+    /// The CPUs the compaction threads pinned themselves to, in thread order (ICR 0134).
+    compaction_cpus: Vec<usize>,
     /// Each shard's caller-run entry, in shard order, with caller-runs on (D321); empty
     /// with it off.
     callers: Vec<CallerEntry>,
@@ -1157,13 +1188,19 @@ impl<H: ShardHandler> Runtime<H> {
             Arc::clone(&submitters),
         ));
         let threads = k + config.compaction_threads;
+        // Compaction threads confined to a set take no CPU of the plan (ICR 0134).
+        let confine = config
+            .compaction_cpu_set
+            .clone()
+            .filter(|set| config.pin_threads && config.compaction_threads > 0 && !set.is_empty());
+        let planned_threads = if confine.is_some() { k } else { threads };
         let (plan, unpinned) = if config.pin_threads {
-            match pigeonhole_io::sys::pin_plan(threads) {
+            match pigeonhole_io::sys::pin_plan(planned_threads) {
                 Ok(plan) => (Some(plan), None),
                 // Too few CPUs for the compaction threads too: pin the shard threads, which
                 // carry the commits, and leave the compaction threads unpinned (D252).
                 Err(why @ pigeonhole_io::sys::Unpinned::TooFewCpus)
-                    if config.compaction_threads > 0 =>
+                    if config.compaction_threads > 0 && confine.is_none() =>
                 {
                     (pigeonhole_io::sys::pin_plan(k).ok(), Some(why))
                 }
@@ -1172,6 +1209,10 @@ impl<H: ShardHandler> Runtime<H> {
         } else {
             (None, None)
         };
+        // Confined only where the shards' plan holds: where pinning was refused (no hard
+        // affinity, a CPU quota, too few CPUs for the shards alone), the compaction threads
+        // run unpinned like the rest (cli692's F3 on #1718).
+        let confine = confine.filter(|_| plan.is_some());
         let cpu = |k: usize| plan.as_ref().and_then(|p| p.cpu(k));
         let mut rt = Runtime {
             submitters,
@@ -1181,6 +1222,7 @@ impl<H: ShardHandler> Runtime<H> {
             workers: Vec::new(),
             plan: None,
             driver_cpus: Vec::new(),
+            compaction_cpus: Vec::new(),
             callers: Vec::new(),
             pinning: Pinning {
                 threads,
@@ -1188,13 +1230,20 @@ impl<H: ShardHandler> Runtime<H> {
                 ..Pinning::default()
             },
         };
+        let mut confined = Vec::new();
         for (j, driver) in drivers.into_iter().enumerate() {
             let vfs = Arc::clone(&config.vfs);
-            let (handle, ack) = spawn_pinned(
-                format!("pigeonhole-compaction-{j}"),
-                cpu(k + j),
-                move || pool::worker_main(driver, vfs),
-            )?;
+            let name = format!("pigeonhole-compaction-{j}");
+            let work = move || pool::worker_main(driver, vfs);
+            let (handle, ack) = match &confine {
+                Some(set) => {
+                    let (handle, ack) = spawn_confined(name, Arc::clone(set), work)?;
+                    confined.push(ack);
+                    rt.workers.push(handle);
+                    continue;
+                }
+                None => spawn_pinned(name, cpu(k + j), work)?,
+            };
             rt.workers.push(handle);
             acks.push(ack);
         }
@@ -1226,13 +1275,23 @@ impl<H: ShardHandler> Runtime<H> {
         for (i, ack) in acks.into_iter().enumerate() {
             if ack.recv() == Ok(true) {
                 pinned += 1;
-                if let Some(c) = i.checked_sub(first_driver).and_then(cpu) {
-                    rt.driver_cpus.push(c);
+                match i.checked_sub(first_driver) {
+                    Some(d) => rt.driver_cpus.extend(cpu(d)),
+                    // Compaction thread `i` was spawned on the plan's CPU `k + i`.
+                    None => rt.compaction_cpus.extend(cpu(k + i)),
                 }
             }
         }
         rt.pinning.pinned = pinned;
         rt.pinning.failed = planned.saturating_sub(pinned);
+        // A thread the OS wouldn't confine runs unpinned, and counts as a refused pin.
+        for ack in confined {
+            if ack.recv() == Ok(true) {
+                rt.pinning.confined += 1;
+            } else {
+                rt.pinning.failed += 1;
+            }
+        }
         rt.plan = plan;
         Ok(rt)
     }
@@ -1342,6 +1401,14 @@ impl<H: ShardHandler> Runtime<H> {
     /// CPU set where pinning is unsafe, or every pin refused.
     pub fn pinned_driver_cpus(&self) -> &[usize] {
         &self.driver_cpus
+    }
+
+    /// The CPUs the compaction threads are pinned to, one per pinned thread, in thread order
+    /// (ICR 0134). Empty when none is pinned: no compaction threads, `pin_threads` off, or
+    /// too few free CPUs (D252: the shards are pinned first and the compaction threads run
+    /// unpinned).
+    pub fn pinned_compaction_cpus(&self) -> &[usize] {
+        &self.compaction_cpus
     }
 
     /// The driver threads the shards run on now (D289): the controller's choice with

@@ -114,6 +114,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 id: (*id).into(),
                 node: (*node).into(),
                 epoch: 1,
+                memory_bytes: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -556,50 +557,85 @@ fn data_node_full(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    let locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)> =
+        local.map(|p| (p, db)).into_iter().collect();
+    let (stop, mut dbs) = data_node_many(rt, dir, id, locals, listener, tokens, limits, restart);
+    (stop, dbs.pop())
+}
+
+/// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
+/// epoch 1, with a change feed and the `users` table.
+fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
+    test_partition_with(dir, p, pigeonhole::Options::default())
+}
+
+/// [`test_partition`], created with `options` (a shard count, say). Its change feed records
+/// the shard count, which every later open keeps (ICR 0132).
+fn test_partition_with(
+    dir: &Path,
+    p: &str,
+    options: pigeonhole::Options,
+) -> pigeonhole::Pigeonhole {
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join(format!("{p}.phdb")),
+        options
+            .create_if_missing(true)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    identity::write(
+        &db,
+        &identity::Identity {
+            cluster_id: "c1".into(),
+            partition_id: p.into(),
+            epoch: 1,
+        },
+    )
+    .unwrap();
+    users(&db);
+    db
+}
+
+/// A test data node serving `locals` (each partition's database given, or opened by
+/// [`test_partition`]): the node's service and one per partition made from it, sharing one
+/// `Backups`, as `cluster::run` builds them (D317 ticket 8a, 8b). Returns its stop handle and
+/// the partitions' databases, in `locals`' order. `restart`: the node starts with a map, and
+/// takes its peers' newer ones, as `run` has it.
+#[allow(clippy::too_many_arguments)]
+fn data_node_many(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
     let metrics = Arc::new(Metrics::default());
-    let db = db.or_else(|| {
-        local.map(|p| {
-            let db = pigeonhole::Pigeonhole::open(
-                dir.join(format!("{p}.phdb")),
-                pigeonhole::Options::default()
-                    .create_if_missing(true)
-                    .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
-            )
-            .unwrap();
-            identity::write(
-                &db,
-                &identity::Identity {
-                    cluster_id: "c1".into(),
-                    partition_id: p.into(),
-                    epoch: 1,
-                },
-            )
-            .unwrap();
-            users(&db);
-            db
-        })
-    });
-    let service = match &db {
-        Some(db) => {
-            // Its backups (D317 ticket 8b), beside the partition.
-            let backups = dir.join(format!("backups-{id}"));
-            std::fs::create_dir_all(&backups).unwrap();
-            Service::partition_node(
-                db.clone(),
-                local.expect("a partition's node"),
-                limits,
-                2,
-                Arc::clone(&metrics),
-            )
-            .backups(Some(&backups), 1)
-            .unwrap()
-        }
-        None => Service::routing_only(limits, 2, Arc::clone(&metrics)),
-    };
+    let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
+    let backup_dir = dir.join(format!("backups-{id}"));
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
+    let mut dbs = Vec::new();
+    let mut parts = Vec::new();
+    for (p, db) in locals {
+        let db = db.unwrap_or_else(|| test_partition(dir, p));
+        let pinning = crate::serve::service::Pinning::default();
+        let memory = crate::serve::placement::Memory::defaults(1);
+        parts.push((
+            p.to_owned(),
+            service.for_partition(db.clone(), p, &backups, pinning, memory),
+        ));
+        dbs.push(db);
+    }
     let shared = Arc::new(Shared {
-        router: Router::cluster(service, Arc::clone(&node), local.map(str::to_owned)),
+        router: Router::cluster(service, Arc::clone(&node), parts),
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
@@ -636,7 +672,7 @@ fn data_node_full(
         let _in = rt.enter();
         start();
     }
-    (stop, db)
+    (stop, dbs)
 }
 
 async fn data(port: u16) -> super::proto::data_client::DataClient<tonic::transport::Channel> {
@@ -1257,8 +1293,14 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
     // database does, so its default runs no poll (D198 amendment 4).
     let dir = test_dir();
-    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None, None)
-        .create_if_missing(true);
+    let share = crate::serve::placement::split(2, 1, 1)[0];
+    let options = super::partition_options(
+        crate::serve::config::ShardSpin::Micros(0),
+        None,
+        None,
+        share,
+    )
+    .create_if_missing(true);
     let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
     let t = db
         .table("users")
@@ -2892,6 +2934,7 @@ fn split_nodes(
                 id: format!("q{i}"),
                 node: format!("n{i}"),
                 epoch: 1,
+                memory_bytes: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -3468,4 +3511,5 @@ mod backup;
 mod charge;
 mod feed;
 mod metrics;
+mod several;
 mod upload;

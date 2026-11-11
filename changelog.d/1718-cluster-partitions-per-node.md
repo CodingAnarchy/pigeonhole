@@ -1,0 +1,3 @@
+### Added
+- `phdb serve --cluster`: a node serves every partition the map gives it (D317 ticket 8a, ICR 0117). `--shards` and the new `--compaction-threads` are the node's totals, split across its partitions, and each partition's thread placement and memory are on its startup line and in `/metrics`. `--engine-memory` sets the engine's memtables, block cache and row cache; on a cluster node it's the node's total, after the map's per-partition `memory_bytes`.
+- `pigeonhole`: `Options::compaction_cpu_set` confines the compaction threads to a set of CPUs instead of pinning each, and `Pigeonhole::pinned_compaction_cpus()` lists the CPUs they're pinned to (ICR 0134). `EngineMetrics::threads_confined` counts the confined ones.

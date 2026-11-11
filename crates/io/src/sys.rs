@@ -181,6 +181,15 @@ pub fn pin_current_thread_to(cpu: usize) -> Result<()> {
     crate::os::pin_current_thread_to(cpu)
 }
 
+/// Confines the calling thread to the CPU ids `cpus` (ICR 0134): the OS places it on any of
+/// them, as it places an unpinned thread on any CPU. For threads that share a set of CPUs
+/// rather than holding one each, such as a server's extra compaction threads on its
+/// compaction CPUs. `Unsupported` on platforms without hard affinity; an empty set, or an
+/// id out of range, is an error and leaves the thread where it was.
+pub fn confine_current_thread_to(cpus: &[usize]) -> Result<()> {
+    crate::os::confine_current_thread_to(cpus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Unpinned, plan_from};

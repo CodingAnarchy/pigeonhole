@@ -223,7 +223,7 @@ fn served_shards(file: &std::path::Path, shards: Option<usize>) -> usize {
     let crate::args::Command::Serve(args) = &cli.command else {
         unreachable!("parsed as serve")
     };
-    let db = super::open(&cli, args).unwrap();
+    let (db, _) = super::open(&cli, args).unwrap();
     let n = db.info().unwrap().shards;
     db.close().unwrap();
     n

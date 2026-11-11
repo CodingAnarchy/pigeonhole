@@ -579,10 +579,70 @@ pub(crate) struct Feeds {
     hub_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     db: pigeonhole::Pigeonhole,
     hubs: Mutex<HashMap<HubKey, Weak<Hub>>>,
+    /// The node's catch-up slots (`--max-catch-up`), shared by its partitions' feeds.
     catch_up: Arc<Semaphore>,
     limits: FeedLimits,
     pub(crate) stats: Arc<FeedStats>,
+    /// The node's live hubs, every partition's: the ring budget (`--feed-ring-bytes`) is
+    /// split across them, and `--max-feed-hubs` counts them (D317 ticket 8a).
     live: Arc<AtomicU64>,
+}
+
+/// A hub's place in the node's live count (`--max-feed-hubs`, D317 ticket 8a), taken before
+/// the hub opens and given back if it doesn't: the hub, once made, gives it back when it's
+/// dropped.
+struct HubPlace<'a> {
+    live: &'a AtomicU64,
+    kept: bool,
+}
+
+impl<'a> HubPlace<'a> {
+    /// A place under `max` (`replacing`: a failed hub of the same key that's being replaced
+    /// still counts until it's dropped, and not against its replacement), or `None`.
+    fn take(live: &'a AtomicU64, replacing: u64, max: u64) -> Option<Self> {
+        let mut n = live.load(Ordering::Relaxed);
+        loop {
+            if n.saturating_sub(replacing) >= max {
+                return None;
+            }
+            match live.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Self { live, kept: false }),
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// The hub opened: it holds the place now.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for HubPlace<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.live.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a node's feeds share across its partitions (D317 ticket 8a, the coordinator's call
+/// on cli692's S1 on #1718): the catch-up slots and the live hub count, so
+/// `--feed-ring-bytes`, `--max-feed-hubs` and `--max-catch-up` are the node's, "in all", as
+/// they are on a single node.
+#[derive(Debug, Clone)]
+pub(crate) struct FeedShared {
+    catch_up: Arc<Semaphore>,
+    live: Arc<AtomicU64>,
+}
+
+impl FeedShared {
+    pub(crate) fn new(max_catch_up: usize) -> Self {
+        Self {
+            catch_up: Arc::new(Semaphore::new(max_catch_up.max(1))),
+            live: Arc::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Feeds {
@@ -604,16 +664,20 @@ pub(crate) struct FeedGauges {
 }
 
 impl Feeds {
-    pub(crate) fn new(db: pigeonhole::Pigeonhole, limits: FeedLimits) -> Arc<Self> {
+    pub(crate) fn new(
+        db: pigeonhole::Pigeonhole,
+        limits: FeedLimits,
+        shared: &FeedShared,
+    ) -> Arc<Self> {
         Arc::new(Self {
             runtime: std::sync::OnceLock::new(),
             hub_runtime: std::sync::OnceLock::new(),
             db,
             hubs: Mutex::new(HashMap::new()),
-            catch_up: Arc::new(Semaphore::new(limits.max_catch_up.max(1))),
+            catch_up: Arc::clone(&shared.catch_up),
             limits,
             stats: Arc::default(),
-            live: Arc::default(),
+            live: Arc::clone(&shared.live),
         })
     }
 
@@ -798,13 +862,21 @@ impl Feeds {
         {
             return Ok(hub);
         }
+        // A failed hub under this key is being replaced: it's still live until its clients
+        // let go, and mustn't count against its own replacement.
+        let replacing = u64::from(hubs.get(&key).and_then(Weak::upgrade).is_some());
         hubs.retain(|k, w| w.strong_count() > 0 && *k != key);
-        if hubs.len() >= self.limits.max_hubs.max(1) {
-            return Err(ApiError::overloaded(
-                "the server is at its feed hub limit (--max-feed-hubs): too many distinct table \
-                 sets are subscribed",
-            ));
-        }
+        // The node's live hubs, every partition's (D317 ticket 8a): `--max-feed-hubs` is
+        // the node's. The place is taken here, atomically: two partitions' hubs opening at
+        // once each hold only their own map's lock, so a load then an add would let both
+        // past the limit. It's given back if the hub doesn't open.
+        let place = HubPlace::take(&self.live, replacing, self.limits.max_hubs.max(1) as u64)
+            .ok_or_else(|| {
+                ApiError::overloaded(
+                    "the server is at its feed hub limit (--max-feed-hubs): too many distinct \
+                     table sets are subscribed",
+                )
+            })?;
         // From a snapshot taken now, at the visibility it delivers at, so the ring knows the
         // position it starts from exactly: a client catching up can then rejoin it before
         // the hub has a commit of its own.
@@ -819,7 +891,8 @@ impl Feeds {
         let (head, _) = watch::channel(0);
         let stats = Arc::clone(&self.stats);
         let live = Arc::clone(&self.live);
-        live.fetch_add(1, Ordering::Relaxed);
+        // From here the hub holds the place, and gives it back when it's dropped.
+        place.keep();
         // A new hub has one client coming: it starts beside it on the feed runtime (#1689),
         // when the server has both runtimes.
         let runtimes = self
@@ -1735,6 +1808,7 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
             },
+            &FeedShared::new(1),
         );
         let slots = Arc::new(Semaphore::new(8));
         let spec = || Spec {
@@ -1855,7 +1929,11 @@ mod tests {
         let (_, db, dir) = commits("feedrt", 0);
         let (requests, delivery, hubs) = server_runtimes(1);
         let t = db.table("t").unwrap().open().unwrap();
-        let feeds = Feeds::new(db.clone(), limits_solo_after(Duration::from_millis(50)));
+        let feeds = Feeds::new(
+            db.clone(),
+            limits_solo_after(Duration::from_millis(50)),
+            &FeedShared::new(1),
+        );
         feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         let before = delivery.metrics().num_alive_tasks();
@@ -1942,7 +2020,11 @@ mod tests {
         let (_, db, dir) = commits("feedmove", 0);
         let (requests, delivery, hubs) = server_runtimes(2);
         let t = db.table("t").unwrap().open().unwrap();
-        let feeds = Feeds::new(db.clone(), limits_solo_after(Duration::ZERO));
+        let feeds = Feeds::new(
+            db.clone(),
+            limits_solo_after(Duration::ZERO),
+            &FeedShared::new(1),
+        );
         feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         requests.block_on(async {
@@ -2040,6 +2122,7 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
             },
+            &FeedShared::new(1),
         );
         feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
@@ -2122,6 +2205,7 @@ mod tests {
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
             },
+            &FeedShared::new(1),
         );
         let slots = Arc::new(Semaphore::new(1));
         let mut direct = t.feed().open().unwrap();
@@ -2214,6 +2298,7 @@ mod tests {
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
             },
+            &FeedShared::new(1),
         );
         let slots = Arc::new(Semaphore::new(1));
         let mut direct = t.feed().open().unwrap();
@@ -2312,6 +2397,7 @@ mod tests {
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
             },
+            &FeedShared::new(1),
         );
         let slots = Arc::new(Semaphore::new(1));
         rt.block_on(async {

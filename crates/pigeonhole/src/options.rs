@@ -43,6 +43,7 @@ pub struct Options {
     shards: usize,
     default_shards: usize,
     compaction_cores: Option<usize>,
+    compaction_cpu_set: Option<Vec<usize>>,
     pin_threads: bool,
     wal_preallocate: bool,
     memtable_budget: u64,
@@ -278,6 +279,7 @@ impl Default for Options {
             shards: 0,
             default_shards: 0,
             compaction_cores: None,
+            compaction_cpu_set: None,
             pin_threads: true,
             wal_preallocate: false,
             memtable_budget: 64 << 20,
@@ -383,6 +385,37 @@ impl Options {
     ///   on background workers ([`Options::background_workers`], D284).
     pub fn compaction_cores(mut self, k: usize) -> Self {
         self.compaction_cores = Some(k);
+        self
+    }
+
+    /// Confine the [`compaction_cores`](Options::compaction_cores) threads to these CPU ids
+    /// instead of pinning each to a CPU of its own (ICR 0134). The OS then places them on any
+    /// of the set, shared with whatever else runs there.
+    ///
+    /// - **What it's for:** a process with several databases and one compaction budget, such
+    ///   as a server holding several partitions (D317 ticket 8a). The first databases' pinned
+    ///   compaction threads take the budget's CPUs, and later ones share those CPUs
+    ///   ([`Pigeonhole::pinned_compaction_cpus`](crate::Pigeonhole::pinned_compaction_cpus))
+    ///   rather than claiming more, so compaction never spreads onto the shards' CPUs or the
+    ///   application's.
+    /// - **Only the shards are planned CPUs of their own** while this is set, so it never
+    ///   reduces how many shard threads are pinned.
+    /// - **No effect** with [`pin_threads`](Options::pin_threads) off, with no compaction
+    ///   threads, in application-owned mode, or with an empty set. On a platform without hard
+    ///   affinity (macOS), the threads run unpinned.
+    /// - **Reported** in [`EngineMetrics::threads_confined`](crate::EngineMetrics::threads_confined).
+    ///   A thread the OS won't confine runs unpinned, and `unpinned_reason` says so.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A second database sharing the first one's compaction CPUs.
+    /// let first_compaction_cpus = vec![6, 7];
+    /// let options = Options::default().compaction_cores(1).compaction_cpu_set(first_compaction_cpus);
+    /// # let _ = options;
+    /// ```
+    pub fn compaction_cpu_set(mut self, cpus: impl Into<Vec<usize>>) -> Self {
+        self.compaction_cpu_set = Some(cpus.into());
         self
     }
 
@@ -1840,6 +1873,7 @@ impl Options {
             self.shard_threads,
             self.compaction_cores,
         );
+        o.compaction_cpu_set = self.compaction_cpu_set.clone();
         o.compaction_threads = match self.compaction_cores {
             Some(k) => k,
             // Application-owned mode starts no threads (D40).
