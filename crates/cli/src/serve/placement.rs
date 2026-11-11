@@ -10,7 +10,9 @@
 //!   puts were held to 33K/s at 16 hubs × 16 subscribers with 1.35 cores of network threads
 //!   waiting (#1734, perf287's g80b), and the coordinator chose the siblings over unmasking.
 //! - **The server's own heavy threads** (bulk loads, index builds and rebalancers,
-//!   `Replication.Follow`, embedding) stay on the free cores only: [`Placement::enter`].
+//!   `Replication.Follow`, embedding) and the request runtime's blocking pool (scans,
+//!   `read_row`, `/mcp` and the other sync client calls) stay on the free cores only:
+//!   [`Placement::enter`].
 
 use pigeonhole::Pigeonhole;
 
@@ -20,9 +22,11 @@ use pigeonhole::Pigeonhole;
 /// closes a partition (D317 ticket 6).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RuntimeMasks {
-    /// The request runtime: its workers and its blocking pool (client calls).
+    /// The request runtime's workers. Its blocking pool, which runs heavy client calls,
+    /// takes `blocking` ([`Placement::enter_network`]).
     pub network: Option<Vec<usize>>,
-    /// The server's own heavy threads, which start through [`Placement::enter`].
+    /// The server's own heavy threads, which start through [`Placement::enter`], and the
+    /// request runtime's blocking pool.
     pub blocking: Option<Vec<usize>>,
     /// The feed delivery runtime.
     pub feed: Option<Vec<usize>>,
@@ -137,7 +141,9 @@ impl Placement {
 
     /// Each runtime's mask with `pinned` held by shards, from the process's CPUs at the start:
     /// the start's masks for the start's pinned CPUs, and the ones to reapply when a cluster
-    /// node's set of open partitions (and so of pinned CPUs) changes (D317 ticket 6).
+    /// node's set of open partitions (and so of pinned CPUs) changes (D317 ticket 6). A
+    /// reapply masks each thread with [`Placement::apply`], which turns `None` back into the
+    /// process's CPUs.
     pub(crate) fn masks(&self, pinned: &[usize]) -> RuntimeMasks {
         #[cfg(target_os = "linux")]
         if !self.process.is_empty() {
@@ -184,39 +190,67 @@ impl Placement {
     /// Called on each of the server's own heavy threads as it starts (bulk loads, index
     /// builds and rebalancers, `Replication.Follow`, embedding): the free cores only.
     pub(crate) fn enter(&self) {
-        apply(self.masks.blocking.as_deref());
+        self.apply(self.masks.blocking.as_deref());
     }
 
-    /// Called on each request runtime thread (worker or blocking) as it starts.
+    /// Called on each request runtime thread as it starts. Tokio runs it on the runtime's
+    /// blocking-pool threads as well as its workers, and the pool runs heavy client calls
+    /// (`Service::blocking`'s scans, `read_row`, `multi_get`, text and vector calls, `/mcp`,
+    /// and the replica's and cluster's sync calls): so the free cores, as
+    /// [`Placement::enter`], off the shards' siblings (#1244, ai1249's S1 on #1738). A
+    /// worker widens itself to `network` as it first unparks ([`Placement::unpark_network`]).
     pub(crate) fn enter_network(&self) {
-        apply(self.masks.network.as_deref());
+        self.enter();
+    }
+
+    /// Called each time a request runtime worker unparks: the first time on a thread, it
+    /// masks the thread to `network`, the free cores and the shards' siblings. Only workers
+    /// unpark (Tokio's blocking pool never calls it), so the blocking pool stays on the free
+    /// cores. After the first, it's a thread-local read.
+    pub(crate) fn unpark_network(&self) {
+        thread_local! {
+            static WIDENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if !WIDENED.get() {
+            WIDENED.set(true);
+            self.apply(self.masks.network.as_deref());
+        }
     }
 
     /// Called on each feed runtime worker as it starts.
     pub(crate) fn enter_feed(&self) {
-        apply(self.masks.feed.as_deref());
+        self.apply(self.masks.feed.as_deref());
     }
 
     /// Called on each feed hub runtime worker as it starts.
     pub(crate) fn enter_hub(&self) {
-        apply(self.masks.hub.as_deref());
+        self.apply(self.masks.hub.as_deref());
     }
-}
 
-/// Masks the calling thread to `cpus` (Linux); `None`, or another OS, leaves it be.
-fn apply(cpus: Option<&[usize]>) {
-    #[cfg(target_os = "linux")]
-    if let Some(cpus) = cpus {
-        let mut mask = nix::sched::CpuSet::new();
-        for &c in cpus {
-            let _ = mask.set(c);
+    /// Masks the calling thread to `cpus` (Linux). `None` means where the OS puts it, so the
+    /// thread gets the process's CPUs back: a reapply after a recompute that lands on no
+    /// mask (D317 ticket 6: `--affinity off`, or too few free cores once a partition opens)
+    /// must not leave a thread on an old mask that may now hold a new shard's CPU (ai1249's
+    /// N1 on #1738). Without a process set (another OS, a node that only routes), it leaves
+    /// the thread be.
+    pub(crate) fn apply(&self, cpus: Option<&[usize]>) {
+        #[cfg(target_os = "linux")]
+        {
+            let cpus = cpus.unwrap_or(&self.process);
+            if cpus.is_empty() {
+                return;
+            }
+            let mut mask = nix::sched::CpuSet::new();
+            for &c in cpus {
+                let _ = mask.set(c);
+            }
+            // The calling thread: pid 0. A failure leaves the thread where the OS put it,
+            // which is correct, only slower.
+            let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &mask);
         }
-        // The calling thread: pid 0. A failure leaves the thread where the OS put it, which
-        // is correct, only slower.
-        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &mask);
+        #[cfg(not(target_os = "linux"))]
+        let _ = cpus;
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = cpus;
 }
 
 /// The process's CPUs (Linux's affinity set), read once at the start before any thread is
@@ -511,12 +545,24 @@ mod tests {
     /// siblings, the heavy threads on the free cores only, and no runtime on a shard's CPU.
     /// The box's split (perf287's g80): the server on 0-9,16-25, 4 shards on 0-3, CPU `c`'s
     /// sibling `c ± 16`, listed by sysfs with `c` itself.
+    /// No mask holds a pinned CPU (ai1249's N2 on #1738): the property itself, beside the
+    /// exact lists.
+    fn off_the_shards(masks: &super::RuntimeMasks, pinned: &[usize]) {
+        for m in [&masks.network, &masks.blocking, &masks.feed, &masks.hub] {
+            assert!(
+                m.iter().flatten().all(|c| !pinned.contains(c)),
+                "{masks:?} holds one of {pinned:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_request_and_feed_runtimes_also_take_the_shards_siblings() {
         use super::{RuntimeMasks, format_cpu_list, layout};
         let process: Vec<usize> = (0..10).chain(16..26).collect();
         let sysfs = |c: usize| vec![c % 16, c % 16 + 16];
         let l = layout(&process, &[0, 1, 2, 3], sysfs, true);
+        off_the_shards(&l.masks, &[0, 1, 2, 3]);
         let wide: Vec<usize> = (4..10).chain(16..26).collect();
         let cores: Vec<usize> = (4..10).chain(20..26).collect();
         assert_eq!(
@@ -537,8 +583,15 @@ mod tests {
         // free (CPU `c`'s sibling `c ^ 4`, sysfs-style).
         let pairs = |c: usize| vec![c & 3, (c & 3) + 4];
         let l = layout(&(0..8).collect::<Vec<_>>(), &[0, 4, 1], pairs, true);
+        off_the_shards(&l.masks, &[0, 4, 1]);
         assert_eq!(l.masks.blocking, Some(vec![2, 3, 6, 7]));
         assert_eq!(l.masks.network, Some(vec![2, 3, 5, 6, 7]));
+        // A taskset that leaves out a shard's sibling: it never comes back (CPU 4 here).
+        let l = layout(&[0, 1, 2, 3, 5, 6, 7], &[0, 1], pairs, true);
+        off_the_shards(&l.masks, &[0, 1]);
+        assert_eq!(l.masks.blocking, Some(vec![2, 3, 6, 7]));
+        assert_eq!(l.masks.network, Some(vec![2, 3, 5, 6, 7]));
+        assert_eq!((l.free, l.siblings), (4, 1));
         // `--affinity off`: the same counts, no masks.
         let off = layout(&process, &[0, 1, 2, 3], sysfs, false);
         assert_eq!(off.masks, RuntimeMasks::default());
@@ -628,12 +681,40 @@ mod tests {
         // reapply calls it as a partition opens or closes).
         assert_eq!(plan.masks(&db.pinned_shard_cpus()), plan.masks, "{plan:?}");
         assert_eq!(off.masks(&db.pinned_shard_cpus()), off.masks, "{off:?}");
+        // On Linux, the masks a thread really gets: a request runtime thread starts on the
+        // free cores (its blocking pool stays there, ai1249's S1), a worker widens to
+        // `network` as it first unparks, and `apply(None)` gives back the process's CPUs.
+        #[cfg(target_os = "linux")]
+        if let Some(blocking) = plan.masks.blocking.clone() {
+            let now = || {
+                let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+                (0..nix::sched::CpuSet::count())
+                    .filter(|&c| set.is_set(c).unwrap_or(false))
+                    .collect::<Vec<usize>>()
+            };
+            let process = now();
+            let p = plan.clone();
+            let (network, after) = std::thread::spawn(move || {
+                p.enter_network();
+                let start = now();
+                p.unpark_network();
+                let widened = now();
+                p.apply(None);
+                (start, (widened, now()))
+            })
+            .join()
+            .unwrap();
+            assert_eq!(network, blocking, "{plan:?}");
+            assert_eq!(Some(after.0), plan.masks.network, "{plan:?}");
+            assert_eq!(after.1, process, "{plan:?}");
+        }
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         for enter in [
             Placement::enter,
             Placement::enter_network,
             Placement::enter_feed,
             Placement::enter_hub,
+            Placement::unpark_network,
         ] {
             let p = plan.clone();
             std::thread::spawn(move || enter(&p)).join().unwrap();

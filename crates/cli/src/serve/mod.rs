@@ -456,6 +456,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         start,
     } = s;
     let enter = Arc::clone(&placement);
+    let unpark = Arc::clone(&placement);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.io_threads)
         // Tokio's own blocking threads (file I/O, `spawn_blocking`): ours are bounded by the
@@ -463,6 +464,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .max_blocking_threads(placement.blocking_threads + 16)
         .thread_name("phdb-serve")
         .on_thread_start(move || enter.enter_network())
+        .on_thread_unpark(move || unpark.unpark_network())
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the runtime", &e))?;

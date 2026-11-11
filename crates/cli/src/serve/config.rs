@@ -139,10 +139,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
     /// Whether the server's threads get a CPU mask off the shards' CPUs (Linux, where the
-    /// engine pinned its shards): the network, feed and hub threads on the free cores and the
-    /// shards' SMT siblings, the background threads on the free cores only. `off` keeps the same thread counts but
-    /// leaves the threads where the OS puts them: for a host shared with other work, where
-    /// the server shouldn't claim the CPUs (D313's R1, ICR 0131).
+    /// engine pinned its shards): the network, feed and hub workers on the free cores and the
+    /// shards' SMT siblings, the blocking and background threads on the free cores only.
+    /// `off` keeps the same thread counts but leaves the threads where the OS puts them: for
+    /// a host shared with other work, where the server shouldn't claim the CPUs (D313's R1,
+    /// ICR 0131).
     #[arg(long, value_enum, value_name = "on|off", default_value_t = Affinity::On)]
     pub affinity: Affinity,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
