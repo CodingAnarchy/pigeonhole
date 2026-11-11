@@ -799,7 +799,7 @@ fn escape_label(out: &mut String, v: &str) {
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
 pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     type Read = fn(&super::feed::Feeds) -> u64;
-    let families: [(&str, &str, Read); 9] = [
+    let families: [(&str, &str, Read); 11] = [
         ("pigeonhole_serve_feed_hubs", "gauge", |f| {
             f.gauges().hubs as u64
         }),
@@ -830,6 +830,13 @@ pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)
         ("pigeonhole_serve_feed_hub_failures_total", "counter", |f| {
             f.stats.hub_failures.load(Ordering::Relaxed)
         }),
+        // #1726's ring hold: holds begun, and hubs holding now.
+        ("pigeonhole_serve_feed_paced_waits_total", "counter", |f| {
+            f.stats.paced_waits.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_feed_paced_hubs", "gauge", |f| {
+            f.gauges().paced_hubs as u64
+        }),
     ];
     for (name, kind, read) in families {
         render_family(
@@ -838,6 +845,28 @@ pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)
             kind,
             parts.iter().map(|(id, part)| (*id, read(&part.feeds))),
         );
+    }
+    // Holds that ended with the slow client falling off, by why (#1726).
+    if !parts.is_empty() {
+        use std::fmt::Write as _;
+        let name = "pigeonhole_serve_feed_paced_released_total";
+        let _ = writeln!(out, "# TYPE {name} counter");
+        for (id, part) in parts {
+            let st = &part.feeds.stats;
+            for (reason, n) in [
+                ("slot", &st.released_slot),
+                ("hold", &st.released_hold),
+                ("retention", &st.released_retention),
+            ] {
+                let _ = write!(out, "{name}{{reason=\"{reason}\"");
+                if let Some(id) = id {
+                    let _ = write!(out, ",pigeonhole_partition=\"");
+                    escape_label(out, id);
+                    out.push('"');
+                }
+                let _ = writeln!(out, "}} {}", n.load(Ordering::Relaxed));
+            }
+        }
     }
 }
 
@@ -860,6 +889,7 @@ fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
         client_events: limits.feed_client_events,
         client_bytes: limits.feed_client_bytes,
         solo_after: super::feed::SOLO_AFTER,
+        ring_hold: super::feed::RING_HOLD,
     }
 }
 

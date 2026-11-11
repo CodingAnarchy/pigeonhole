@@ -67,7 +67,23 @@ pub(crate) struct FeedLimits {
     /// How long a hub on the hub runtime must have had at most one client before it moves
     /// back to the feed runtime ([`SOLO_AFTER`]; #1689).
     pub solo_after: Duration,
+    /// How long a hub holds an entry its slowest on-ring client still needs while every
+    /// catch-up slot is busy, with that client not advancing ([`RING_HOLD`]; #1726).
+    pub ring_hold: Duration,
 }
+
+/// How long a hub holds an entry its slowest on-ring client still needs, while every
+/// `--max-catch-up` slot is busy and that client takes nothing (#1726): past it, the client
+/// falls off the ring as it would without the hold. A hub's other clients wait at most this
+/// long for a stuck one.
+pub(crate) const RING_HOLD: Duration = Duration::from_secs(1);
+
+/// How often a held hub looks again: for a catch-up slot freed (a semaphore has no release
+/// signal) and for its hold's limits. A client that advances wakes it at once.
+const PACE_TICK: Duration = Duration::from_millis(10);
+
+/// How often a held hub probes its engine feed's history for the retention bound.
+const RETENTION_PROBE: Duration = Duration::from_secs(1);
 
 /// How long a hub must have had at most one client before its task moves back to the feed
 /// runtime (#1689): a client that joins and leaves doesn't bounce it on every join.
@@ -285,6 +301,24 @@ struct Ring {
     passed_token: Bytes,
     /// The shared feed ended (an error): clients move to their own streams.
     failed: bool,
+    /// A lower bound on its on-ring clients' next indices (#1726): an entry below it is
+    /// needed by none of them. Recomputed from the trackers only when `base` reaches it, and
+    /// lowered when a client joins or rejoins; clients only move forward. `u64::MAX` with
+    /// none on the ring.
+    floor: u64,
+}
+
+/// What evicting a ring's oldest entries to its share did (#1726).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evict {
+    /// Within its share, or nothing evicted that an on-ring client needed.
+    Clear,
+    /// An entry an on-ring client still needed was evicted: a catch-up slot was free, or
+    /// the hold was released. That client falls off at its next look.
+    Released,
+    /// Held: the oldest entry is needed by an on-ring client and every catch-up slot is
+    /// busy, so it stays, and the hub reads no further until that changes.
+    Held,
 }
 
 impl Ring {
@@ -330,8 +364,15 @@ struct Hub {
     stats: Arc<FeedStats>,
     /// Live hubs, shared: each ring's cap is the total over it.
     live: Arc<AtomicU64>,
-    /// Its clients' trackers, for the dump; a gone client's is pruned there.
+    /// Its clients' trackers, for the dump and the ring's floor; a gone client's is pruned
+    /// there.
     clients: Mutex<Vec<Weak<Tracker>>>,
+    /// The node's catch-up slots: a hub holds a needed entry only while none is free.
+    catch_up: Arc<Semaphore>,
+    /// Holding a needed entry, waiting for its slowest on-ring client (#1726).
+    paced: AtomicBool,
+    /// Rung by a client that advanced while the hub is paced.
+    advanced: Arc<tokio::sync::Notify>,
 }
 
 impl Hub {
@@ -367,8 +408,8 @@ impl Hub {
         clients.push(Arc::downgrade(tracker));
     }
 
-    fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
-        let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
+    /// Appends a commit, then evicts the oldest entries to the ring's share ([`Self::evict`]).
+    fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) -> Evict {
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
         let mut entry = Entry::new(&commit, token.clone());
@@ -379,16 +420,70 @@ impl Hub {
         r.passed_token = token;
         r.entries.push_back(Arc::new(entry));
         r.bytes += bytes;
-        // Always keep the newest: a client at the head needs its boundary.
+        let evicted = self.evict(&mut r, total, false);
+        let head = r.head();
+        drop(r);
+        self.head.send_replace(head);
+        evicted
+    }
+
+    /// Evicts the ring's oldest entries while it's over its share of `total`, always keeping
+    /// the newest (a client at the head needs its boundary).
+    ///
+    /// **The hold (#1726):** an entry an on-ring client still needs isn't evicted while every
+    /// catch-up slot is busy, unless `force`: pushed off, that client would only queue for a
+    /// slot, delivering nothing, and its own stream would cost more per event than the
+    /// ring. The hub reads no further meanwhile, so it lags through its engine feed, never
+    /// slowing a write. With a slot free, a slow client falls off as before (D313 R2).
+    fn evict(&self, r: &mut Ring, total: usize, force: bool) -> Evict {
+        let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
+        let mut out = Evict::Clear;
         while r.bytes > limit && r.entries.len() > 1 {
+            if r.base >= r.floor {
+                r.floor = self.slowest_on_ring();
+            }
+            if r.base >= r.floor {
+                if !force && self.catch_up.available_permits() == 0 {
+                    return Evict::Held;
+                }
+                out = Evict::Released;
+            }
             if let Some(e) = r.entries.pop_front() {
                 r.bytes -= e.bytes;
                 r.base += 1;
             }
         }
-        let head = r.head();
-        drop(r);
-        self.head.send_replace(head);
+        out
+    }
+
+    /// The lowest next index of the clients on this hub's ring, from their trackers;
+    /// `u64::MAX` with none. Taken under the ring's lock (the lock order: ring, then the
+    /// tracker list).
+    fn slowest_on_ring(&self) -> u64 {
+        let me = std::ptr::from_ref(self) as usize;
+        let clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        clients
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|t| {
+                t.hub.load(Ordering::Relaxed) == me && t.state.load(Ordering::Relaxed) == ON_RING
+            })
+            .map(|t| t.at.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// The ring's evictions again, for a held hub's task: `force` releases the hold.
+    fn evict_again(&self, total: usize, force: bool) -> (Evict, u64) {
+        let mut r = self.ring();
+        let out = self.evict(&mut r, total, force);
+        (out, r.floor)
+    }
+
+    /// A client of this hub's ring at index `at`, joining or rejoining it under its lock.
+    fn on_ring(r: &mut Ring, tracker: &Tracker, at: u64) {
+        tracker.set(ON_RING, at);
+        r.floor = r.floor.min(at);
     }
 
     /// The hub's feed found nothing at `position`: the ring holds everything up to it.
@@ -460,6 +555,115 @@ struct Driver {
     place: Place,
     /// When the task first saw its hub alone on the hub runtime, and the joins then.
     alone: Option<(Instant, u64)>,
+    ring_hold: Duration,
+    /// For the hold's retention bound: the database and the hub's spec.
+    probe: Probe,
+}
+
+/// What a held hub needs to probe its engine feed's history (#1726).
+#[derive(Clone)]
+struct Probe {
+    db: pigeonhole::Pigeonhole,
+    tables: Vec<Table>,
+    visible: bool,
+}
+
+impl Probe {
+    /// The oldest seqno the feed's history still holds for the hub's tables: a feed opened
+    /// from the oldest, its start position read, and dropped at once (it reads nothing).
+    /// `None` if it can't open.
+    fn oldest(&self) -> Option<u64> {
+        let feed = open(&self.tables, self.visible, &Start::Oldest).ok()?;
+        Some(feed.position().seqno())
+    }
+}
+
+/// Whether a held hub's engine feed lags past half of what the history holds (#1726,
+/// perf287's retention bound): `visible − position` against `visible − oldest`. Past it, the
+/// hold is released, so the hub's feed never runs into the history's end, which would fail
+/// the hub and push every client to catch up.
+fn past_half_retention(visible: u64, position: u64, oldest: u64) -> bool {
+    visible.saturating_sub(position).saturating_mul(2) > visible.saturating_sub(oldest)
+}
+
+/// Why a hold ended in an eviction (#1726), for `/metrics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// A catch-up slot freed: the slow client falls off and takes it.
+    Slot,
+    /// The slowest on-ring client didn't advance for the hold's limit.
+    Hold,
+    /// The hub's engine feed lagged past half its history.
+    Retention,
+}
+
+/// Waits while `d`'s hub holds a needed entry (#1726) and evicts as soon as it may: the
+/// slowest on-ring client advanced, a catch-up slot freed, that client stalled for
+/// `ring_hold`, or the hub's engine feed lags past half its history. `None` once the hub
+/// is gone. It holds no reference to the hub while it waits, so a hub whose clients all
+/// leave still drops.
+async fn pace(d: &mut Driver) -> Option<()> {
+    let advanced = {
+        let hub = d.hub.upgrade()?;
+        hub.paced.store(true, Ordering::Relaxed);
+        hub.stats.paced_waits.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(&hub.advanced)
+    };
+    let mut slowest: Option<u64> = None;
+    let mut since = Instant::now();
+    let mut probed = Instant::now();
+    let release = loop {
+        tokio::select! {
+            () = advanced.notified() => {}
+            () = tokio::time::sleep(PACE_TICK) => {}
+        }
+        let hub = d.hub.upgrade()?;
+        match hub.evict_again(d.ring_bytes, false) {
+            (Evict::Clear, _) => break None,
+            (Evict::Released, _) => break Some(Release::Slot),
+            (Evict::Held, floor) => {
+                if slowest != Some(floor) {
+                    slowest = Some(floor);
+                    since = Instant::now();
+                }
+            }
+        }
+        if since.elapsed() >= d.ring_hold {
+            break Some(Release::Hold);
+        }
+        if probed.elapsed() >= RETENTION_PROBE {
+            probed = Instant::now();
+            let probe = d.probe.clone();
+            let position = d.stream.position().seqno();
+            let past = tokio::task::spawn_blocking(move || {
+                let oldest = probe.oldest()?;
+                Some(past_half_retention(
+                    probe.db.visible_seqno(),
+                    position,
+                    oldest,
+                ))
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if past {
+                break Some(Release::Retention);
+            }
+        }
+    };
+    let hub = d.hub.upgrade()?;
+    if let Some(why) = release {
+        hub.evict_again(d.ring_bytes, true);
+        let counter = match why {
+            Release::Slot => &hub.stats.released_slot,
+            Release::Hold => &hub.stats.released_hold,
+            Release::Retention => &hub.stats.released_retention,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    hub.paced.store(false, Ordering::Relaxed);
+    Some(())
 }
 
 impl Driver {
@@ -518,7 +722,14 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             match item {
                 Some(Ok(commit)) => {
                     let at = d.stream.position().seqno();
-                    hub.push(commit, token_of(&d.stream), at, d.ring_bytes);
+                    if hub.push(commit, token_of(&d.stream), at, d.ring_bytes) == Evict::Held {
+                        // Read nothing more until the hold ends (#1726).
+                        drop(hub);
+                        if pace(&mut d).await.is_none() {
+                            return;
+                        }
+                        continue;
+                    }
                     if let Some(to) = d.moves(&hub)
                         && let Some((feed, hubs)) = d.runtimes.clone()
                     {
@@ -568,6 +779,13 @@ pub(crate) struct FeedStats {
     pub catch_up_waits: AtomicU64,
     /// Hub tasks that moved between the feed and hub runtimes (#1689).
     pub hub_moves: AtomicU64,
+    /// Hubs that held an entry a slow on-ring client needed while catch-up was full (#1726).
+    pub paced_waits: AtomicU64,
+    /// Holds that ended in that client falling off: a catch-up slot freed, the client
+    /// stalled for [`RING_HOLD`], or the hub's engine feed lagged past half its history.
+    pub released_slot: AtomicU64,
+    pub released_hold: AtomicU64,
+    pub released_retention: AtomicU64,
 }
 
 /// The hubs, by table set.
@@ -601,6 +819,8 @@ pub(crate) struct FeedGauges {
     pub catching_up: usize,
     /// Hubs whose task runs on the feed runtime beside their one client (#1689).
     pub solo_hubs: usize,
+    /// Hubs holding an entry for a slow on-ring client while catch-up is full (#1726).
+    pub paced_hubs: usize,
 }
 
 impl Feeds {
@@ -667,6 +887,10 @@ impl Feeds {
             solo_hubs: live
                 .iter()
                 .filter(|h| h.solo.load(Ordering::Relaxed))
+                .count(),
+            paced_hubs: live
+                .iter()
+                .filter(|h| h.paced.load(Ordering::Relaxed))
                 .count(),
         }
     }
@@ -744,7 +968,7 @@ impl Feeds {
             }
             let _ = writeln!(
                 out,
-                "  hub {i} (feeds {:?}, {}{}, {}): engine feed {} seqnos behind (at {passed}); ring {entries} \
+                "  hub {i} (feeds {:?}, {}{}, {}{}): engine feed {} seqnos behind (at {passed}); ring {entries} \
                  entries [{base}, {head}), {bytes}/{limit} bytes; clients: {} on the ring (entries \
                  behind its head, min/p50/max {}), {} on their own streams (seqnos behind the hub {}), \
                  {waiting} waiting for a catch-up slot",
@@ -755,6 +979,11 @@ impl Feeds {
                     "solo on the feed threads"
                 } else {
                     "on the hub threads"
+                },
+                if hub.paced.load(Ordering::Relaxed) {
+                    ", paced (catch-up full, holding for its slowest client)"
+                } else {
+                    ""
                 },
                 db_seqno.map_or_else(|| "?".into(), |s| s.saturating_sub(passed).to_string()),
                 on_ring.len(),
@@ -836,6 +1065,12 @@ impl Feeds {
                 solo_after: self.limits.solo_after,
                 place: Place::Feed,
                 alone: None,
+                ring_hold: self.limits.ring_hold,
+                probe: Probe {
+                    db: self.db.clone(),
+                    tables: tables.to_vec(),
+                    visible,
+                },
             };
             let task = match &runtimes {
                 Some((feed, _)) => feed.spawn(drive(driver)),
@@ -856,6 +1091,9 @@ impl Feeds {
                 stats,
                 live,
                 clients: Mutex::default(),
+                catch_up: Arc::clone(&self.catch_up),
+                paced: AtomicBool::new(false),
+                advanced: Arc::default(),
             }
         });
         hubs.insert(key, Arc::downgrade(&hub));
@@ -876,9 +1114,16 @@ impl Feeds {
         // and whatever of it is at or below `after` predates the subscribe and is passed over.
         // Taken here, not when the client's task first runs, so a commit pushed meanwhile
         // (the caller's own write, say) is still the client's.
+        // Counted under the hub first, off the ring until it has a place there: the ring's
+        // floor counts on-ring clients only (#1726).
+        let tracker = Arc::new(Tracker::default());
+        tracker.set(WAITING, 0);
+        let joined = hub.join(&tracker);
         let ring_start = matches!(spec.start, Start::Now).then(|| {
-            let r = hub.ring();
-            (r.head(), r.passed, r.passed_token.clone())
+            let mut r = hub.ring();
+            let at = r.head();
+            Hub::on_ring(&mut r, &tracker, at);
+            (at, r.passed, r.passed_token.clone())
         });
         let after = match spec.start {
             Start::Now if spec.visible => self.db.snapshot()?.seqno(),
@@ -886,8 +1131,6 @@ impl Feeds {
             _ => 0,
         };
         let (sink, events, end_tx) = Sink::new(&self.limits);
-        let tracker = Arc::new(Tracker::default());
-        let joined = hub.join(&tracker);
         drop(hub);
         let client = Client {
             feeds: Arc::clone(self),
@@ -1176,6 +1419,11 @@ impl Client {
                 at += 1;
                 self.cover_entry(&e, pos).await?;
             }
+            // A held hub waits for its slowest on-ring client: say this one moved (#1726).
+            self.tracker.set(ON_RING, at);
+            if hub.paced.load(Ordering::Relaxed) {
+                hub.advanced.notify_one();
+            }
         }
     }
 
@@ -1201,10 +1449,11 @@ impl Client {
             }
             self.tracker.set(ON_OWN, pos.seqno.unwrap_or(0));
             if let Some(seqno) = pos.seqno {
-                let r = hub.ring();
+                let mut r = hub.ring();
                 if !r.failed
                     && let Some(at) = r.rejoin_at(seqno)
                 {
+                    Hub::on_ring(&mut r, &self.tracker, at);
                     drop(r);
                     drop(slot);
                     self.feeds.stats.rejoined.fetch_add(1, Ordering::Relaxed);
@@ -1645,6 +1894,9 @@ mod tests {
             joins: AtomicU64::new(0),
             solo: AtomicBool::new(false),
             stats: Arc::default(),
+            catch_up: Arc::new(Semaphore::new(1)),
+            paced: AtomicBool::new(false),
+            advanced: Arc::default(),
             live: Arc::new(AtomicU64::new(1)),
             clients: Mutex::default(),
         };
@@ -1734,6 +1986,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                ring_hold: RING_HOLD,
             },
         );
         let slots = Arc::new(Semaphore::new(8));
@@ -1818,6 +2071,7 @@ mod tests {
             client_events: CLIENT_EVENTS,
             client_bytes: CLIENT_BYTES,
             solo_after,
+            ring_hold: RING_HOLD,
         }
     }
 
@@ -2010,6 +2264,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1726's setup: a feed with a small ring and one catch-up slot, `ring_hold` as given,
+    /// two `Now` clients (one of them, `slow`, buffering a single event), and `n` commits of
+    /// 300-byte values written once both are on the ring, with their seqnos.
+    struct Held {
+        rt: tokio::runtime::Runtime,
+        db: Pigeonhole,
+        dir: std::path::PathBuf,
+        feeds: Arc<Feeds>,
+        slow: FeedEvents,
+        fast: FeedEvents,
+        want: Vec<u64>,
+    }
+
+    impl Held {
+        fn start(name: &str, ring_hold: Duration, slot: &mut Option<OwnedSemaphorePermit>) -> Self {
+            const N: usize = 40;
+            let (_, db, dir) = commits(name, 0);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let t = db.table("t").unwrap().open().unwrap();
+            let limits = FeedLimits {
+                ring_bytes: 4096,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: Duration::from_secs(3600),
+                stream_idle: Duration::from_secs(30),
+                client_events: 1,
+                client_bytes: CLIENT_BYTES,
+                solo_after: SOLO_AFTER,
+                ring_hold,
+            };
+            let feeds = Feeds::new(db.clone(), limits);
+            // Every catch-up slot busy.
+            *slot = Some(Arc::clone(&feeds.catch_up).try_acquire_owned().unwrap());
+            let slots = Arc::new(Semaphore::new(8));
+            let (slow, fast) = rt.block_on(async {
+                let sub = || {
+                    let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+                    let spec = Spec {
+                        tables: vec![t.clone()],
+                        prefix: Vec::new(),
+                        visible: false,
+                        start: Start::Now,
+                        skip: 0,
+                        announce: false,
+                    };
+                    feeds.subscribe(spec, slot, |_| {}).unwrap()
+                };
+                (sub(), sub())
+            });
+            let want = (0..N)
+                .map(|i| {
+                    t.mutate(format!("r{i}").as_bytes())
+                        .put("f", b"q", &[b'v'; 300])
+                        .commit()
+                        .unwrap()
+                        .seqno
+                })
+                .collect();
+            Self {
+                rt,
+                db,
+                dir,
+                feeds,
+                slow,
+                fast,
+                want,
+            }
+        }
+
+        /// Waits up to 2 s for `f` to hold.
+        fn until(&self, f: impl Fn(&Feeds) -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if f(&self.feeds) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            f(&self.feeds)
+        }
+
+        fn close(self) {
+            drop((self.slow, self.fast, self.feeds));
+            drop(self.rt);
+            self.db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_hub_holds_its_slow_clients_place_while_catch_up_is_full() {
+        // #1726: with every catch-up slot busy, the hub doesn't evict the entry its slow
+        // on-ring client needs. It waits, reading no further, and once the client takes its
+        // events both clients get every commit once, in order, with nobody falling off.
+        let mut slot = None;
+        let mut h = Held::start("hold", Duration::from_secs(30), &mut slot);
+        assert!(
+            h.until(|f| f.gauges().paced_hubs == 1),
+            "the hub holds: {:?}",
+            h.feeds.gauges()
+        );
+        assert_eq!(h.feeds.stats.fell_behind.load(Ordering::Relaxed), 0);
+        assert!(h.feeds.dump().contains(", paced (catch-up full"));
+        let (slow, fast) = h.rt.block_on(async {
+            tokio::join!(
+                seqnos(&mut h.slow, Duration::from_secs(2)),
+                seqnos(&mut h.fast, Duration::from_secs(2))
+            )
+        });
+        assert_eq!(slow, h.want, "the slow client, every commit once in order");
+        assert_eq!(fast, h.want, "the fast one too");
+        let st = &h.feeds.stats;
+        assert_eq!(st.fell_behind.load(Ordering::Relaxed), 0, "nobody fell off");
+        assert!(st.paced_waits.load(Ordering::Relaxed) >= 1);
+        let released = st.released_slot.load(Ordering::Relaxed)
+            + st.released_hold.load(Ordering::Relaxed)
+            + st.released_retention.load(Ordering::Relaxed);
+        assert_eq!(released, 0, "every hold ended with the client taking");
+        assert_eq!(h.feeds.gauges().paced_hubs, 0);
+        drop(slot);
+        h.close();
+    }
+
+    #[test]
+    fn a_hold_ends_when_a_catch_up_slot_frees_and_the_slow_client_catches_up() {
+        // #1726: a freed slot ends the hold. The slow client falls off as before the hold, the
+        // fast one gets everything, and the slow one catches up on its own stream.
+        let mut slot = None;
+        let mut h = Held::start("holdslot", Duration::from_secs(30), &mut slot);
+        assert!(h.until(|f| f.gauges().paced_hubs == 1));
+        drop(slot.take());
+        assert!(
+            h.until(|f| f.stats.released_slot.load(Ordering::Relaxed) == 1),
+            "released by the slot"
+        );
+        let (slow, fast) = h.rt.block_on(async {
+            let fast = seqnos(&mut h.fast, Duration::from_secs(2)).await;
+            let slow = seqnos(&mut h.slow, Duration::from_secs(2)).await;
+            (slow, fast)
+        });
+        assert_eq!(fast, h.want);
+        assert_eq!(slow, h.want, "caught up on its own stream");
+        assert!(h.feeds.stats.fell_behind.load(Ordering::Relaxed) >= 1);
+        h.close();
+    }
+
+    #[test]
+    fn a_hold_ends_when_the_slow_client_stalls_for_the_ring_hold() {
+        // #1726: a client that takes nothing holds the hub for `ring_hold` at most; then it
+        // falls off (to wait for a slot), and the fast client gets everything.
+        let mut slot = None;
+        let mut h = Held::start("holdstall", Duration::from_millis(200), &mut slot);
+        let fast =
+            h.rt.block_on(async { seqnos(&mut h.fast, Duration::from_secs(2)).await });
+        assert_eq!(fast, h.want);
+        assert!(h.feeds.stats.released_hold.load(Ordering::Relaxed) >= 1);
+        assert_eq!(h.feeds.stats.released_slot.load(Ordering::Relaxed), 0);
+        drop(slot);
+        h.close();
+    }
+
+    #[test]
+    fn a_held_hub_releases_past_half_its_feeds_history() {
+        // #1726, perf287's retention bound: lag (visible − position) against the history's
+        // span (visible − oldest).
+        assert!(!past_half_retention(1000, 900, 0), "a tenth behind");
+        assert!(!past_half_retention(1000, 500, 0), "exactly half");
+        assert!(past_half_retention(1000, 499, 0), "past half");
+        assert!(
+            past_half_retention(1000, 700, 600),
+            "past half of a short history"
+        );
+        assert!(
+            !past_half_retention(1000, 1000, 1000),
+            "caught up, no history"
+        );
+    }
+
     #[test]
     fn a_hub_with_a_backlog_yields_its_feed_worker() {
         // #1397's fan-out wedge: a hub that fell behind is always ready, and its feed isn't
@@ -2039,6 +2475,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                ring_hold: RING_HOLD,
             },
         );
         feeds.run_on(delivery.handle().clone(), delivery.handle().clone());
@@ -2121,6 +2558,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
+                ring_hold: RING_HOLD,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
@@ -2213,6 +2651,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
+                ring_hold: RING_HOLD,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
@@ -2311,6 +2750,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                ring_hold: RING_HOLD,
             },
         );
         let slots = Arc::new(Semaphore::new(1));
