@@ -877,3 +877,23 @@ fn an_attribute_the_metrics_carry_is_refused() {
 fn a_metrics_own_attribute_is_refused() {
     let _ = Config::new().attribute("pigeonhole.table", "x");
 }
+
+/// Keys are compared as label names (ai1249's follow-up on #1711): one that renders as an
+/// attribute the metrics carry, or as another key set, is refused; the same key again only
+/// replaces its value.
+#[test]
+#[should_panic(expected = "is an attribute the metrics carry already")]
+fn a_key_that_renders_as_db_name_is_refused() {
+    let _ = Config::new().attribute("pigeonhole_db_name", "x");
+}
+
+#[test]
+#[should_panic(expected = "has the label name \"a_b\" of another attribute set")]
+fn two_keys_with_one_label_name_are_refused() {
+    let _ = Config::new().attribute("a.b", "x").attribute("a-b", "y");
+}
+
+#[test]
+fn the_same_key_again_replaces_its_value() {
+    let _ = Config::new().attribute("a.b", "x").attribute("a.b", "y");
+}
