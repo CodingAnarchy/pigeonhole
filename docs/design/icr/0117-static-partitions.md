@@ -198,7 +198,7 @@
 - **A resume token** of another cluster or another subscription is `InvalidArgument`. So is a single node's token.
 - **Expiry:**
   - one from a map that changed the subscription's partitions is `FeedExpired`. Only a table new to the subscription can do that; a subscription with an explicit table list never sees it;
-  - so is one from before a partition's epoch rose. A relocation by promotion gives the partition another history; ticket 6 will let a relocation by file copy keep it.
+  - so is one from before a partition's history began (`Partition.history_epoch`, ticket 6): a promotion or a restore gives the partition another history. A relocation by copy keeps it, and the position continues on the new node.
 
 **`allow_partial`** (`SubscribeRequest` field 7):
 - **Without it,** a partition that can't be opened fails the call, and one that goes away ends the stream with `PartitionUnavailable` naming it, after a last checkpoint.
@@ -251,6 +251,42 @@
 `DIR` must be new or empty. Copies are written as `<partition>.phdb.partial` and renamed once checked, and the manifest is written last, so a backup without one isn't whole. **Each partition's copy is a consistent snapshot of its own. The set is not one point in time across partitions.**
 
 **Metrics by partition:** on a cluster node, `/metrics` and `Admin.Metrics` label every per-partition series `pigeonhole_partition="<id>"`. That covers the engine's metrics (D323, through `pigeonhole-otel`'s `Config::attribute`, ICR 0133) and the serve feed fan-out's and bulk loads' gauges. Node-wide series (connections, replies, sessions) stay unlabelled. Each family's `# HELP`/`# TYPE` comes once, whatever the number of partitions. A single node's text is unchanged. On a cluster node, `Admin.Metrics` is answered by the node itself; it was `Unsupported` before.
+
+## Ticket 6 PR 2: relocation by file copy
+A partition moved by copying its closed files keeps its history, so feed tokens resume across the move. Fencing, closing, `relocate` and the stamp are PR 1's (its own section). PR 2 adds:
+
+**`Partition.history_epoch`** (cluster.proto, field 5, `uint64`): the epoch P's current history began at.
+- **Derived where a map is set** (`SetMap`), never taken from the map sent, so a map built by hand or from an older one can't carry a history across a move that broke it:
+  - an unchanged epoch keeps the current map's value;
+  - an epoch raised by a relocation by copy keeps it;
+  - any other raise (a promotion, a restore) sets it to the new epoch;
+  - a new partition's is its epoch.
+- **Checked:** a map whose `history_epoch` is past its `epoch` is invalid.
+- **Maps from before ticket 6** have 0. No epoch had moved then, so it reads as "never broken".
+- **Peers take it as set:** a pushed or pulled map arrives derived.
+
+**`SetMapRequest.copies`** (cluster.proto, field 4, `repeated string`): the partitions this change relocates by copy (`relocate --copy`, which `phdb cluster move` calls).
+- It marks the change only and is never part of the map.
+- Each listed partition must move to another node at exactly its epoch + 1. Otherwise the call is `InvalidArgument`. A node's first map can't list one.
+
+**Feeds:** a cluster token's component taken at epoch `e` resumes while its partition's `history_epoch` is at most `e`. Otherwise it's `FeedExpired`. That's checked at the resume, and again when a part reopens where the map now puts its partition. A part that reopens records the epoch it opened at, so later checkpoints carry the new epoch. The token format is unchanged.
+
+**`BackupDownloadRequest.fenced_file`** (admin.proto, field 6, `string`): on a cluster node, one file of `partition`, closed here after a fence, sent as it lies. No backup is taken.
+- `fenced_file` names the file by its suffix after the partition's database path (`""` the main file, `-wal-<n>`, `-feed`; ICR 0135).
+- **The chunks** are `BackupChunk`s of the file's bytes from `offset`. The last carries `total` and the file's `sha256`, as hashed at the close.
+- **Refusals:**
+  - only a partition in state `closed` (PR 1); otherwise `FailedPrecondition`;
+  - `partition` is required;
+  - `durable`, `replica` and `backup_id` must be unset (`InvalidArgument`);
+  - a single node refuses `fenced_file` (`InvalidArgument`).
+
+**`PartitionFile`** (common.proto, a new message): `{ string name = 1; uint64 bytes = 2; bytes sha256 = 3; }`. One file of a partition's database, named by its suffix. It's shared by PR 1's closed-partition status (`LocalPartition.files`) and the upload's manifest.
+
+**Agreed with 8b's restore** (perf2's PR; recorded here so the numbers are in one place):
+- `Admin.PartitionUpload` (client streaming): `PartitionUploadChunk { header = 1; offset = 2; data = 3; }` → `PartitionUploadReply { received = 1; complete = 2; }`.
+- `PartitionUploadHeader { partition = 1; cluster_id = 2; epoch = 3; upload_id = 4; purpose = 5; file = 6 (PartitionFile); repeated PartitionFile manifest = 7; }`, with `enum PartitionUploadPurpose { UNSPECIFIED = 0; RESTORE = 1; RELOCATE = 2; }`.
+- `Admin.PartitionUploadStatus`: `PartitionUploadStatusRequest { upload_id = 1; }` → `PartitionUploadStatusReply { received = 1; complete = 2; }`.
+- A move sends the closed partition's whole file set (main file, any WAL sidecars, the feed sidecar `-feed`), which the installer installs only once complete. That's why feed history survives: the feed sidecar is bound to the database's id and holds the feed's sessions.
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

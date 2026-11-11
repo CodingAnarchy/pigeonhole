@@ -25,6 +25,24 @@ pub(crate) struct Cluster {
     pub(crate) forwarder: Arc<Forwarder>,
 }
 
+impl Cluster {
+    /// File `name` (a suffix after the partition's database path, ICR 0135) of `partition`,
+    /// closed on this node after a fence, with its size and SHA-256 as hashed at the close:
+    /// what a relocation by copy downloads (D317 ticket 6). Closing comes with ticket 6's
+    /// fencing (PR 1), which records each closed partition's files; until then no partition
+    /// is ever closed here.
+    pub(crate) fn closed_file(
+        &self,
+        partition: &str,
+        name: &str,
+    ) -> Result<(std::path::PathBuf, super::proto::PartitionFile), ApiError> {
+        let _ = name;
+        Err(ApiError::failed_precondition(format!(
+            "partition {partition:?} isn't closed on this node: fence and close it first"
+        )))
+    }
+}
+
 /// Where a call goes.
 #[derive(Debug)]
 pub(crate) struct Router {
@@ -149,6 +167,19 @@ impl Router {
             ServiceOp::Backup(r) => {
                 let part = named(&r.partition)?;
                 self.service.backup(part, r).await.map(ServiceReply::Backup)
+            }
+            // A closed partition's file as it lies, for a relocation by copy (D317 ticket 6).
+            ServiceOp::BackupDownload(r) if !r.fenced_file.is_empty() => {
+                if r.partition.is_empty() {
+                    return Err(ApiError::invalid(
+                        "a fenced file names its partition (`partition`)",
+                    ));
+                }
+                let (path, file) = cluster.closed_file(&r.partition, &r.fenced_file)?;
+                self.service
+                    .fenced_download(path, file, r)
+                    .await
+                    .map(ServiceReply::Download)
             }
             ServiceOp::BackupDownload(r) => {
                 let part = named(&r.partition)?;

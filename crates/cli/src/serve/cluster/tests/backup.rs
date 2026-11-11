@@ -186,6 +186,17 @@ fn a_node_backs_up_only_a_partition_it_holds_named() {
         )
         .await;
         assert!(e.is_ok(), "{e:?}");
+        // A fenced file (D317 ticket 6) only of a partition closed here: p1 is serving.
+        let fenced = |partition: &str| BackupDownloadRequest {
+            partition: partition.into(),
+            fenced_file: "-feed".into(),
+            ..Default::default()
+        };
+        let e = first(ports[0], fenced("p1")).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+        assert!(e.message().contains("isn't closed on this node"), "{e:?}");
+        let e = first(ports[0], fenced("")).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
     });
 }
 

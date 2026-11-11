@@ -405,6 +405,20 @@ pub struct MissingRange {
     #[prost(bytes = "bytes", tag = "4")]
     pub end: ::prost::bytes::Bytes,
 }
+/// One file of a partition's database (D317 ticket 6, ICR 0135): a closed partition's files
+/// in `Cluster.Status`, and an upload's manifest.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionFile {
+    /// The suffix after the partition's database path: "" for the main file, "-wal-<n>",
+    /// "-feed". Each node maps it onto its own path.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub bytes: u64,
+    /// The file's SHA-256 (32 bytes).
+    #[prost(bytes = "bytes", tag = "3")]
+    pub sha256: ::prost::bytes::Bytes,
+}
 /// How durable a commit is before it returns (the Rust API's `Durability`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
