@@ -249,15 +249,45 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 - **Threads:** `--shards` sets a new database's shard count (default: half the physical cores). On Linux the network threads run on the CPUs the shards don't use; `--io-threads` and `--blocking-threads` override their counts. The change feed's delivery runs on threads of its own (`phdb-serve-feed`, `--feed-threads`, by default a quarter of those CPUs, at least 1, taken from the network threads' default), so a put never waits behind feed streams for a worker. They're placed as the network threads are. Each stream's framing still runs on its connection's network thread.
 - **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the network, feed and blocking threads get an affinity mask of the other CPUs. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206), and one on a shard's SMT sibling doubled p99 (#1244). The startup line's last part says which mask the server built:
   - **`off the shards' cores`:** every CPU but the shards' and their SMT siblings;
-  - **`off the shards' CPUs`:** too few CPUs to leave the siblings out as well, so only the shards' own CPUs are left out;
+  - **`unmasked (too few free cores)`:** fewer than two CPUs are left once the shards' cores and their SMT siblings are taken out: a small host, or a `--shards` near the core count. Each shard's driver thread takes a core, so at one shard per core none is left. The threads then get no mask, and the server says why on a line of its own. On the shards' SMT siblings they cost the shards more than they do left to the OS (g70d). Lower `--shards` to get the mask back;
   - **`unpinned`:** no shard is pinned, and the threads run where the OS puts them. That's macOS (no hard affinity), a host with too few free CPUs, a CPU quota narrower than the affinity set, or an OS that refused the pin. `/metrics` counts the engine's threads pinned and not (`pigeonhole_threads{pigeonhole_thread_pinned}`).
   - **`unmasked (--affinity off)`:** the shards are pinned, but the server's threads get no mask.
-- **`--affinity off`** (default `on`) keeps the same thread counts but sets no mask, so the network, feed and blocking threads run where the OS puts them. It's for a host the server shares with other work, where the server shouldn't claim every CPU outside the shards. The shards stay pinned: that's `Options::pin_threads`, not this flag. On a host of its own, leave it on: a network thread on a shard's core costs the shard's p99.
+- **`--affinity off`** (default `on`) keeps the same thread counts but sets no mask, so the network, feed and blocking threads run where the OS puts them. The shards stay pinned: that's `Options::pin_threads`, not this flag.
+  - **Leave it on for writes:** in the measurements below, the mask raised gRPC `Mutate` throughput 25% at 21% less CPU per write, and cut `Mutate`'s p99.9 in mixed workloads by 1.5–4.5×.
+  - **Read-heavy deployments should use `--affinity off`.** With the mask, `ReadRow` ran 16% slower over gRPC and 26% slower over HTTP: with few writes, the shards' cores sit idle, and the mask keeps reads off them. Point `Get`s were level.
+  - **Turn it off on a host shared with other work,** where the server shouldn't claim every CPU outside the shards.
 - **The server's background threads** run off the shards' cores too: an index's rebalancer (`phdb-serve-rebalance`), a bulk load (`phdb-serve-bulk-load`) and a text rebuild (`phdb-serve-text-rebuild`). So do the embedder's threads with `--embed-local` ([Agent memory](#agent-memory)).
 
 - **The shards' poll:** a shard thread sleeps as soon as its queue is empty (`--shard-spin 0`, the default). The library's embedded default polls up to a millisecond first, which saves a wakeup per commit, but behind a network round trip the wakeup is small, and on a busy server (about 55,000 puts a second over 4 shards on the reference machine, perf287's g51) the poll was a quarter to half of the CPU per put. At low rates it costs little. `--shard-spin US` sets a fixed poll in microseconds (at most 10,000), and `--shard-spin adaptive` restores the library's default.
 
-> **Measured with and without the mask:** the serve bench (`crates/cli/examples/serve_load.rs`) on the reference machine. This section gets its p99 and p99.9 once that run is in (D313 ticket 9b).
+**Measured with and without the mask** (D313 ticket 9b, perf287's g70e2; [the full table](https://github.com/CodingAnarchy/pigeonhole/issues/1397#issuecomment-6780991941)):
+- **The setup:**
+  - **Machine:** the reference machine (AX102), with 8 shards (the default). The server ran on 12 cores under `taskset`, 8 holding the shards and 4 free: "6 network, 2 feed and 8 blocking threads on 8 free CPUs, off the shards' cores". The client ran on 4 cores of its own.
+  - **Load:** `crates/cli/examples/serve_load.rs` at its defaults: 100,000 rows of 100 B, 64 callers, 8 gRPC connections, 20 s per row after a 5 s warm-up, and writes at `GroupSync`.
+  - **Arms:** mask on against `--affinity off`, two runs each, rotated. The values are the two runs' means.
+- **Reading it:** "on → off" for each. p99.9 is the row's operation, or its `Mutate` in the YCSB mixes.
+
+| Transport | Mix | ops/s | CPU µs per op | p99.9 ms |
+|---|---|--:|--:|--:|
+| gRPC | `Get` | 315K → 297K | 18.6 → 19.5 | 0.49 → 0.52 |
+| gRPC | `ReadRow` | 177K → 210K | 39.5 → 36.7 | 0.83 → 0.72 |
+| gRPC | `Mutate` | 265K → 211K | 38.8 → 49.2 | 0.82 → 0.99 |
+| gRPC | `Batch` (10 rows) | 166K → 165K | 67.5 → 73.4 | 4.6 → 5.1 |
+| gRPC | `Scan` (10 rows) | 10K → 9K | 443 → 470 | 7.9 → 8.9 |
+| gRPC | YCSB A (50% writes) | 226K → 205K | 37.8 → 42.5 | 0.96 → 1.47 |
+| gRPC | YCSB B (5% writes) | 232K → 220K | 26.9 → 28.2 | 0.83 → 1.59 |
+| gRPC | YCSB C (reads) | 239K → 232K | 24.9 → 25.3 | 0.65 → 0.66 |
+| HTTP | `Get` | 202K → 212K | 29.6 → 28.1 | 0.79 → 0.73 |
+| HTTP | `ReadRow` | 105K → 142K | 69.6 → 75.9 | 1.00 → 0.87 |
+| HTTP | `Mutate` | 268K → 241K | 41.8 → 45.7 | 1.32 → 1.24 |
+| HTTP | `Batch` (10 rows) | 131K → 138K | 72.8 → 81.6 | 7.1 → 6.5 |
+| HTTP | `Scan` (10 rows) | 5.5K → 6.5K | 705 → 703 | 14.5 → 13.3 |
+| HTTP | YCSB A | 232K → 223K | 38.1 → 39.6 | 0.89 → 2.29 |
+| HTTP | YCSB B | 235K → 232K | 27.1 → 27.7 | 0.92 → 4.2 |
+| HTTP | YCSB C | 242K → 251K | 24.8 → 23.7 | 0.66 → 0.63 |
+
+- **Writes gain from the mask, and reads that could use the idle shard cores lose.** `Batch` is the one write row whose p99 rose with the mask (gRPC 1.11 against 0.82 ms). The engine's compaction threads, pinned to three of the four free cores and at about 2.5 cores busy in those rows, likely contributed; p99.9 couldn't separate them.
+- **These are a fresh server's numbers.** A server restarted before #1699 reopened with one shard per core, and its mask fell back to the shards' SMT siblings, where the mask mostly hurt (section 2 of the write-up). Since #1699 a restart keeps the default, and since #1697 a host with too few free cores gets no mask rather than the siblings.
 
 ## Metrics
 - **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (service time: from the decoded request to its answer, on every path, so the wait for the request's body, an HTTP/1.1 pre-read included, isn't in it; a scan's runs to the end of its stream), open sessions by kind, the oldest open session's age, the feed's shared subscriptions, their memory, and the streams that fell behind or are catching up, and a running bulk load's phase, vectors and bytes. After those come the engine's metrics for the served database, under the names and labels the [observability guide](observability.md#the-metrics) lists (`pigeonhole_commits_total`, `pigeonhole_write_stall_time_seconds_total` and the rest, each with `pigeonhole_db_name`), with its alerts and dashboard. On Unix, `kill -USR1 <pid>` makes the server write its feed hubs to stderr (it doesn't stop the server): for each, how far its engine feed is behind the database, its ring against its share of `--feed-ring-bytes`, and its streams on the ring (entries behind its head), on their own catch-up streams, and waiting for a `--max-catch-up` slot.

@@ -459,6 +459,9 @@ pub(crate) fn run(
             placement.free_cpus,
             placement.mode,
         );
+        if let Some(note) = &placement.note {
+            let _ = writeln!(stderr, "phdb serve: {note}");
+        }
         if args.memory.embed_local
             && let Some(line) = candle_advice(
                 placement.cpu_list(),
