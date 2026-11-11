@@ -420,7 +420,7 @@ struct Tally {
     lat: [Vec<Duration>; OPS.len()],
     refused: u64,
     /// Calls a cluster refused as `CrossPartition`: a `Batch` whose rows straddle a split
-    /// key (or wrap past the last row). Counted, not timed (#1712's F2).
+    /// key (or wrap past the last row). Counted, not timed (perf2's F2, feed1248's F1 on #1712).
     cross: u64,
 }
 
@@ -845,12 +845,12 @@ fn base_url(args: &Args) -> String {
 }
 
 /// How long one row's write may be refused (`Overloaded`) or left unknown before the load
-/// stops (#1712's F1).
+/// stops (perf2's F1, feed1248's F2 on #1712).
 const LOAD_ROW_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One row of `--load`: sent again while it's `Overloaded`, or its outcome is unknown
-/// (`OutcomeUnknown`, `Unknown`: a cluster forward cut after the send; a put of the same row
-/// is idempotent), for at most [`LOAD_ROW_DEADLINE`]. Anything else, `PartitionUnavailable`
+/// (`OutcomeUnknown`: a cluster forward cut after the send; a put of the same row is
+/// idempotent), for at most [`LOAD_ROW_DEADLINE`]. Anything else, `PartitionUnavailable`
 /// from a down node included, stops the load at once with the server's message, which
 /// names the partition.
 async fn load_row(
@@ -936,21 +936,31 @@ async fn load(
     let value = Arc::new(vec![b'v'; args.value_bytes]);
     let durability = args.load_durability.proto();
     let step = scatter_step(args.rows);
+    // Set by the first caller that fails, so the others stop at their next row rather than
+    // loading on to the end (perf2's nit on #1712).
+    let failed = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     for i in 0..args.clients.max(1) {
         let mut c = DataClient::new(channels[i % channels.len()].clone());
         let (next, value, rows) = (Arc::clone(&next), Arc::clone(&value), args.rows);
+        let failed = Arc::clone(&failed);
         tasks.push(tokio::spawn(async move {
             loop {
+                if failed.load(Ordering::Relaxed) {
+                    return Ok::<(), String>(());
+                }
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 if k >= rows {
-                    return Ok::<(), String>(());
+                    return Ok(());
                 }
                 // Rows in a scattered order, every one once, so a cluster's partitions load
                 // together rather than one key range at a time (feed1248's N1 on #1712).
                 let row = u64::try_from(u128::from(k) * u128::from(step) % u128::from(rows))
                     .expect("below rows");
-                load_row(&mut c, row, rows, &value, durability).await?;
+                if let Err(e) = load_row(&mut c, row, rows, &value, durability).await {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
                 if (k + 1) % 1_000_000 == 0 {
                     println!(
                         "load: {} rows, {:.0} s",
@@ -961,8 +971,16 @@ async fn load(
             }
         }));
     }
+    // Every caller ends (the failed flag stops the rest early); the first error is the one
+    // reported.
+    let mut first = None;
     for t in tasks {
-        t.await?.map_err(|e| format!("load: {e}"))?;
+        if let Err(e) = t.await? {
+            first.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first {
+        return Err(format!("load: {e}").into());
     }
     println!(
         "load: {} rows in {:.0} s",
