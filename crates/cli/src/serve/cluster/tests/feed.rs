@@ -664,24 +664,33 @@ fn a_partition_whose_node_never_answers_doesnt_hold_up_the_others() {
             matches!(&first.event, Some(Event::PartitionState(st)) if st.partition == "p2" && !st.available),
             "{first:?}"
         );
-        // Across about three retry rounds of 5 s opens.
+        // Across about three retry rounds of 5 s opens, and at least 20 rows, however long
+        // the puts take (ai1249's N1 on #1724), within 30 s.
         let started = std::time::Instant::now();
         let mut i = 0;
-        while started.elapsed() < Duration::from_secs(12) {
+        while started.elapsed() < Duration::from_secs(12) || i < 20 {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "only {i} rows in 30 s: p1's puts are stalling"
+            );
             let row = format!("a{i:04}");
+            // The bound is on the delivery, from the commit's return: what p2's opens could
+            // hold up. The commit itself (a group sync on a, which a runner's disk can stall
+            // for seconds) is outside it, and reported with it (#1723).
             let wrote = std::time::Instant::now();
             put(a, &row, "v").await;
+            let (committed, put_took) = (std::time::Instant::now(), wrote.elapsed());
             let (seen, _) = commits(&mut s, 1).await;
             assert_eq!(seen[0].rows, std::slice::from_ref(&row));
+            let delivered = committed.elapsed();
             assert!(
-                wrote.elapsed() < Duration::from_secs(1),
-                "p1's commit {row} took {:?} behind p2's opens",
-                wrote.elapsed()
+                delivered < Duration::from_secs(1),
+                "p1's commit {row} arrived {delivered:?} after it returned (its put took \
+                 {put_took:?}), behind p2's opens"
             );
             i += 1;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        assert!(i >= 20, "{i}");
     });
     rt.shutdown_background();
     let _ = db_a.map(pigeonhole::Pigeonhole::close);
