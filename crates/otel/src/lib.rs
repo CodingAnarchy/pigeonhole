@@ -118,9 +118,17 @@ impl Config {
     /// If `key`'s label name is that of `pigeonhole.db.name`, of an attribute a metric
     /// carries itself ([`MetricInfo::attributes`]), or of another key set here: a sample
     /// would carry the label twice, which Prometheus refuses. Keys are compared as label
-    /// names, so `pigeonhole_db_name`, or `a-b` after `a.b`, is refused too.
+    /// names, so `pigeonhole_db_name`, or `a-b` after `a.b`, is refused too. So is an empty
+    /// key, which would be an empty label name.
+    ///
+    /// A key whose label name starts with `__` is one Prometheus reserves for itself:
+    /// don't use one.
     pub fn attribute(mut self, key: &'static str, value: impl Into<String>) -> Self {
         let name = label_name(key);
+        assert!(
+            !key.is_empty(),
+            "pigeonhole_otel::Config::attribute: an empty key"
+        );
         assert!(
             name != label_name(attr::DB_NAME)
                 && !metrics().any(|m| m.attributes.iter().any(|a| label_name(a) == name)),
