@@ -877,3 +877,51 @@ fn an_attribute_the_metrics_carry_is_refused() {
 fn a_metrics_own_attribute_is_refused() {
     let _ = Config::new().attribute("pigeonhole.table", "x");
 }
+
+/// Keys are compared as label names (ai1249's follow-up on #1711): one that renders as an
+/// attribute the metrics carry, or as another key set, is refused; the same key again only
+/// replaces its value.
+#[test]
+#[should_panic(expected = "is an attribute the metrics carry already")]
+fn a_key_that_renders_as_db_name_is_refused() {
+    let _ = Config::new().attribute("pigeonhole_db_name", "x");
+}
+
+#[test]
+#[should_panic(expected = "has the label name \"a_b\" of another attribute set")]
+fn two_keys_with_one_label_name_are_refused() {
+    let _ = Config::new().attribute("a.b", "x").attribute("a-b", "y");
+}
+
+#[test]
+fn the_same_key_again_replaces_its_value() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("replace.phdb"), options()).unwrap();
+    let t = table(&db, "t");
+    workload(&db, &t);
+    let c = Config::new()
+        .attribute("a.b", "x")
+        .attribute("a.b", "y")
+        .collector(&db);
+    let mut text = String::new();
+    c.render_prometheus(&mut text);
+    let commits = text
+        .lines()
+        .find(|l| l.starts_with("pigeonhole_commits_total{"))
+        .expect("a commits sample");
+    assert!(
+        commits.contains("a_b=\"y\"") && !commits.contains("a_b=\"x\""),
+        "{commits}"
+    );
+    drop(c);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// ai1249's N1 on #1717: an empty key would write an empty label name, which fails the
+/// scrape.
+#[test]
+#[should_panic(expected = "an empty key")]
+fn an_empty_key_is_refused() {
+    let _ = Config::new().attribute("", "x");
+}
