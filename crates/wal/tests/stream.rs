@@ -496,6 +496,65 @@ fn foreign_segments_and_bad_options_are_refused() {
     assert!(Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::new(0, 0)).is_ok());
 }
 
+/// A segment header with a `features` bit this build doesn't know (a newer build wrote it)
+/// fails the open, as a newer `format_version` does (#496). Read as a blank slot, its
+/// segment and every record in it would be skipped without a word. Checked for the first
+/// slot (where the slot size is found) and for a later one.
+#[test]
+fn an_unknown_segment_feature_bit_fails_the_open() {
+    use pigeonhole_format::wal::{KNOWN_SEGMENT_FEATURES, SEGMENT_HEADER_LEN};
+    use pigeonhole_io::OpenOptions;
+    let unknown = !KNOWN_SEGMENT_FEATURES & (1 << 31);
+    assert_ne!(unknown, 0, "pick a bit this build doesn't know");
+    for slot in [0u64, 1] {
+        let vfs = sim(40 + slot);
+        let opts = opts(2, 0);
+        let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+        // Two segments: the second record doesn't fit in the first.
+        for (seqno, size) in [(1, 100), (2, FRAME_SIZE - 200)] {
+            wal.append(&batch(seqno, size).record(), Durability::GroupSync)
+                .unwrap();
+            wal.sync().unwrap();
+        }
+        drop(wal);
+        assert!(
+            headers(&vfs, opts.segment_size)
+                .iter()
+                .filter(|h| h.is_some())
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            replay(&vfs, Lsn::default()).unwrap().0.seqnos(),
+            [1, 2],
+            "slot {slot}: replays before the bit is set"
+        );
+
+        // Set the bit in the slot's header and fix its CRC: an intact header from a newer
+        // build, not a torn one.
+        let mut rw = OpenOptions::read();
+        rw.write = true;
+        let f = vfs.open(&path(), rw).unwrap();
+        let at = slot * opts.segment_size;
+        let mut h = [0u8; SEGMENT_HEADER_LEN];
+        f.read_at(&mut h, at).unwrap();
+        let features = u32::from_le_bytes(h[56..60].try_into().unwrap()) | unknown;
+        h[56..60].copy_from_slice(&features.to_le_bytes());
+        let crc = pigeonhole_format::checksum::crc32c(&h[..124]);
+        h[124..128].copy_from_slice(&crc.to_le_bytes());
+        f.write_at(&h, at).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        match Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::default()) {
+            Err(Error::Format(pigeonhole_format::Error::UnsupportedFeature { value, .. })) => {
+                assert_eq!(value, u64::from(unknown), "slot {slot}");
+            }
+            other => panic!("slot {slot}: the open must refuse the segment, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn checkpoint_in_a_segment_that_never_reached_disk() {
     // A Buffered commit lands in a fresh segment, is flushed and checkpointed, and power is
