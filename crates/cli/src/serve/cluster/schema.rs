@@ -249,16 +249,14 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
 /// N1 on #1720), on the installing thread, before the map's routes serve, and that service's
 /// cached handles go. Runs once now, for the map the node starts with.
 pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
-    let Some(cluster) = shared.router.cluster.as_ref() else {
-        return;
-    };
-    if cluster.parts.is_empty() {
+    // Attached on a node that only routes too: a partition may open there later (ticket 6).
+    if shared.router.cluster.is_none() {
         return;
     }
     let weak = Arc::downgrade(shared);
     let run = move |map: &ClusterMap| -> Option<Vec<(String, Outcome)>> {
         let shared = weak.upgrade()?;
-        let parts = &shared.router.cluster.as_ref()?.parts;
+        let parts = shared.router.cluster.as_ref()?.parts.load_full();
         let mut outcomes = Vec::with_capacity(parts.len());
         for (partition, service) in parts.iter() {
             let Ok(part) = service.part() else {

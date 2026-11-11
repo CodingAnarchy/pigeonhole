@@ -30,13 +30,40 @@ pub(crate) struct Cluster {
 
 /// A cluster node's partitions open here, each served by its own [`Service`] sharing the
 /// node's (D317 ticket 8a), by id. Shared with a cluster subscription's task, which opens a
-/// part served here (ticket 7).
-pub(crate) type Parts = Arc<std::collections::BTreeMap<String, Arc<Service>>>;
+/// part served here (ticket 7). Swapped whole as a partition opens or closes on a running
+/// node (ticket 6); every call loads it once.
+pub(crate) type Parts = Arc<arc_swap::ArcSwap<PartMap>>;
+
+/// [`Parts`]' map: each open partition's service, by id.
+pub(crate) type PartMap = std::collections::BTreeMap<String, Arc<Service>>;
 
 impl Cluster {
     /// Partition `id`'s service, if it's open here.
-    pub(crate) fn here(&self, id: &str) -> Option<&Arc<Service>> {
-        self.parts.get(id)
+    pub(crate) fn here(&self, id: &str) -> Option<Arc<Service>> {
+        self.parts.load().get(id).cloned()
+    }
+}
+
+/// A partition's service that serves one ([`Service::part_opt`] is `Some`), read as its
+/// [`Partition`]: what [`Router::parts`] and [`Router::partition`] give, owned, so a
+/// partition closed meanwhile stays whole until it's dropped.
+#[derive(Debug, Clone)]
+pub(crate) struct PartRef(Arc<Service>);
+
+impl PartRef {
+    fn of(service: &Arc<Service>) -> Option<Self> {
+        service.part_opt().map(|_| Self(Arc::clone(service)))
+    }
+}
+
+impl std::ops::Deref for PartRef {
+    type Target = Partition;
+
+    fn deref(&self) -> &Partition {
+        // `of` made it only from a service with a partition, which never loses it.
+        self.0
+            .part_opt()
+            .expect("a PartRef's service serves a partition")
     }
 }
 
@@ -77,7 +104,7 @@ impl Router {
             service: Arc::new(service),
             cluster: Some(Cluster {
                 node,
-                parts: Arc::new(parts),
+                parts: Arc::new(arc_swap::ArcSwap::from_pointee(parts)),
                 forwarder,
                 uploads,
             }),
@@ -123,7 +150,8 @@ impl Router {
                 "an upload's first message carries its header",
             ));
         };
-        let open = |p: &str| self.partitions().any(|(id, _)| id == p);
+        let partitions = self.partitions();
+        let open = |p: &str| partitions.iter().any(|(id, _)| id == p);
         let mut writing = uploads.begin(header, open)?;
         let mut chunk = Some(first);
         while let Some(c) = chunk.take() {
@@ -170,31 +198,36 @@ impl Router {
         self.cluster.as_ref().map(|c| &c.node)
     }
 
-    /// A cluster node's partitions open here, by id, in id order (D317 ticket 8a). Nothing on
-    /// a single node, whose one database is the service's. Its signature is fixed (simp724's
-    /// A1 on 8b): callers iterate it, never `Cluster::parts` or `Service::part`.
-    pub(crate) fn partitions(&self) -> impl Iterator<Item = (&str, &Partition)> {
-        self.cluster.iter().flat_map(|c| {
-            c.parts
-                .iter()
-                .filter_map(|(id, s)| s.part_opt().map(|p| (id.as_str(), p)))
-        })
+    /// A cluster node's partitions open now, by id, in id order (D317 ticket 8a). Nothing on
+    /// a single node, whose one database is the service's. Callers use it, never
+    /// `Cluster::parts` or `Service::part` (simp724's A1 on 8b).
+    pub(crate) fn partitions(&self) -> Vec<(String, PartRef)> {
+        self.cluster
+            .iter()
+            .flat_map(|c| {
+                c.parts
+                    .load()
+                    .iter()
+                    .filter_map(|(id, s)| PartRef::of(s).map(|p| (id.clone(), p)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Every database this server serves: a single node's one, or a cluster node's
-    /// partitions (D317 ticket 8a). For what's done to each alike: feeds started, the dump,
-    /// bulk loads stopped, indexes closed, health.
-    pub(crate) fn parts(&self) -> Vec<&Partition> {
+    /// partitions open now (D317 ticket 8a). For what's done to each alike: feeds started,
+    /// the dump, bulk loads stopped, indexes closed, health.
+    pub(crate) fn parts(&self) -> Vec<PartRef> {
         match &self.cluster {
-            None => self.service.part_opt().into_iter().collect(),
-            Some(_) => self.partitions().map(|(_, p)| p).collect(),
+            None => PartRef::of(&self.service).into_iter().collect(),
+            Some(_) => self.partitions().into_iter().map(|(_, p)| p).collect(),
         }
     }
 
     /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
     /// node, ticket 2's `not_open` when the map gives it here but it isn't open, `NotFound`
     /// when the map has no such partition.
-    pub(crate) fn partition(&self, id: &str) -> Result<&Partition, ApiError> {
+    pub(crate) fn partition(&self, id: &str) -> Result<PartRef, ApiError> {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::invalid("this server isn't a cluster node"));
         };
@@ -213,9 +246,10 @@ impl Router {
                 format!("partition {id:?} is node {:?}'s", owner.node),
             ));
         }
-        self.partitions()
-            .find(|(p, _)| *p == id)
-            .map(|(_, part)| part)
+        cluster
+            .here(id)
+            .as_ref()
+            .and_then(PartRef::of)
             .ok_or_else(|| not_open(id))
     }
 
@@ -227,10 +261,15 @@ impl Router {
                 .service
                 .metrics_text(&self.service.single_parts(), &[&self.service.sessions]);
         };
-        let parts: Vec<_> = self.partitions().map(|(id, p)| (Some(id), p)).collect();
-        // The node's table and every partition's (cli692's F1 on #1718).
+        let partitions = self.partitions();
+        let parts: Vec<_> = partitions
+            .iter()
+            .map(|(id, p)| (Some(id.as_str()), &**p))
+            .collect();
+        // The node's table and every partition's open now (cli692's F1 on #1718).
+        let open = cluster.parts.load();
         let sessions: Vec<&super::sessions::Sessions> = std::iter::once(&self.service.sessions)
-            .chain(cluster.parts.values().map(|s| &s.sessions))
+            .chain(open.values().map(|s| &s.sessions))
             .map(|s| &**s)
             .collect();
         self.service.metrics_text(&parts, &sessions)
@@ -264,12 +303,15 @@ impl Router {
         match op {
             ServiceOp::Backup(r) => {
                 let part = named(&r.partition)?;
-                self.service.backup(part, r).await.map(ServiceReply::Backup)
+                self.service
+                    .backup(&part, r)
+                    .await
+                    .map(ServiceReply::Backup)
             }
             ServiceOp::BackupDownload(r) => {
                 let part = named(&r.partition)?;
                 self.service
-                    .backup_download(part, r, Some(map_version))
+                    .backup_download(&part, r, Some(map_version))
                     .await
                     .map(ServiceReply::Download)
             }
@@ -578,14 +620,14 @@ pub(crate) struct Target {
 }
 
 /// Where a routed call goes: a partition's service here, or the node serving it.
-pub(crate) enum Place<'a> {
-    Here(&'a Arc<Service>),
+pub(crate) enum Place {
+    Here(Arc<Service>),
     There(Target),
 }
 
 impl Cluster {
     /// Where `op`'s partition is served: here, or the node serving it.
-    fn target(&self, op: &ServiceOp) -> Result<Place<'_>, ApiError> {
+    fn target(&self, op: &ServiceOp) -> Result<Place, ApiError> {
         let routes = self.node.routes();
         let Some(routes) = routes.as_ref() else {
             return Err(ApiError::partition_unavailable(
