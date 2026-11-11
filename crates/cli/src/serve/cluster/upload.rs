@@ -329,7 +329,7 @@ impl Uploads {
         Ok(Writing {
             uploads: Arc::clone(self),
             header,
-            file: f,
+            file: Some(f),
             part,
             received,
             _permit: permit,
@@ -343,7 +343,8 @@ impl Uploads {
 pub(crate) struct Writing {
     uploads: Arc<Uploads>,
     header: PartitionUploadHeader,
-    file: std::fs::File,
+    /// The `.part` file, open for writing; closed before it's renamed (Windows).
+    file: Option<std::fs::File>,
     part: PathBuf,
     received: u64,
     _permit: OwnedSemaphorePermit,
@@ -372,9 +373,10 @@ impl Writing {
                 "more bytes than the file's {total}"
             )));
         }
+        let file = self.file.as_mut().expect("open until finish");
         disk_fault()
-            .and_then(|()| self.file.seek(SeekFrom::Start(self.received)))
-            .and_then(|_| self.file.write_all(&chunk.data))
+            .and_then(|()| file.seek(SeekFrom::Start(self.received)))
+            .and_then(|_| file.write_all(&chunk.data))
             .map_err(|e| io_error("write", &self.part, &e))?;
         self.received += chunk.data.len() as u64;
         if let Some(e) = self.uploads.lock().get_mut(&self.header.upload_id) {
@@ -394,9 +396,10 @@ impl Writing {
                 complete: false,
             });
         }
-        self.file
-            .sync_all()
-            .map_err(|e| io_error("sync", &self.part, &e))?;
+        let synced = self.file.as_ref().expect("open until finish").sync_all();
+        synced.map_err(|e| io_error("sync", &self.part, &e))?;
+        // Closed before any rename, which Windows refuses on a file held open.
+        drop(self.file.take());
         let sha = digest(&self.part)?;
         if sha[..] != file.sha256[..] {
             // The bytes aren't the file the header names: start over.
@@ -599,9 +602,14 @@ fn check_file(f: &PartitionFile) -> Result<(), ApiError> {
 fn write_header(path: &Path, h: &PartitionUploadHeader) -> Result<(), ApiError> {
     let json = serde_json::to_vec(h).expect("a header serializes");
     let tmp = path_with(path, ".tmp");
+    // Written and synced through one writable handle: Windows refuses to flush a file
+    // opened read-only.
     disk_fault()
-        .and_then(|()| std::fs::write(&tmp, &json))
-        .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|()| {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()
+        })
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
