@@ -734,3 +734,75 @@ fn a_collector_gives_plain_points_until_the_database_closes() {
     db.close().unwrap();
     assert!(collector.collect().is_empty());
 }
+
+/// ICR 0133: a constant attribute (`Config::attribute`) reaches every point, through the
+/// OpenTelemetry registration and the collector alike, and `render_prometheus_all` writes
+/// each metric's `# HELP`/`# TYPE` once for several databases, each database's samples
+/// told apart by it.
+#[test]
+fn several_databases_render_as_one_exposition_told_apart_by_an_attribute() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let dbs: Vec<Pigeonhole> = ["p1", "p2"]
+        .iter()
+        .map(|p| Pigeonhole::open(dir.join(format!("{p}.phdb")), options()).unwrap())
+        .collect();
+    let tables: Vec<Table> = dbs.iter().map(|db| table(db, "t")).collect();
+    for (db, t) in dbs.iter().zip(&tables) {
+        workload(db, t);
+    }
+    let config = |p: &str| {
+        Config::new()
+            .db_name("same.phdb")
+            .attribute("pigeonhole.partition", "replaced")
+            .attribute("pigeonhole.partition", p)
+    };
+    // Through OpenTelemetry: every point carries it, once, with the last value set.
+    let sdk = Sdk::new();
+    let registration = config("p1").register(&dbs[0], &sdk.meter());
+    for (name, c) in sdk.collect() {
+        for p in &c.points {
+            assert_eq!(
+                p.attrs.get("pigeonhole.partition").map(String::as_str),
+                Some("p1"),
+                "{name}: {:?}",
+                p.attrs
+            );
+        }
+    }
+    drop(registration);
+    // Through collectors, rendered together.
+    let collectors: Vec<_> = ["p1", "p2"]
+        .iter()
+        .zip(&dbs)
+        .map(|(p, db)| config(p).collector(db))
+        .collect();
+    let refs: Vec<&pigeonhole_otel::Collector> = collectors.iter().collect();
+    let mut text = String::new();
+    pigeonhole_otel::Collector::render_prometheus_all(&refs, &mut text);
+    let mut seen = BTreeSet::new();
+    for line in text.lines().filter(|l| l.starts_with("# TYPE ")) {
+        assert!(seen.insert(line), "{line} twice:\n{text}");
+    }
+    let commits = text
+        .lines()
+        .filter(|l| l.starts_with("pigeonhole_commits_total{"))
+        .collect::<Vec<_>>();
+    for p in ["p1", "p2"] {
+        assert!(
+            commits
+                .iter()
+                .any(|l| l.contains(&format!("pigeonhole_partition=\"{p}\""))),
+            "{p}'s commits:\n{text}"
+        );
+    }
+    // One database alone renders as `render_prometheus` does.
+    let (mut one, mut all) = (String::new(), String::new());
+    refs[0].render_prometheus(&mut one);
+    pigeonhole_otel::Collector::render_prometheus_all(&refs[..1], &mut all);
+    assert_eq!(one.lines().count(), all.lines().count());
+    drop(collectors);
+    drop(tables);
+    for db in dbs {
+        db.close().unwrap();
+    }
+}

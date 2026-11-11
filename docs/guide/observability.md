@@ -90,13 +90,16 @@ for point in metrics.collect() {
 
 A collection reads the database on the calling thread, as an exporter's collection does (see [What it costs](#what-it-costs)). `Config::new()…collector(&db)` takes the same options as `register`, and a collector has `rebind` and `watch_feed` too.
 
+For several databases in one `/metrics`, render them together with `Collector::render_prometheus_all(&[&a, &b], &mut text)`. The text format allows each metric's `# HELP` and `# TYPE` once, so rendering the collectors one after another would repeat them.
+
 **`phdb serve`** does this: its `/metrics` carries every metric below for the database it serves, after the server's own (see the [CLI guide](cli.md)).
 
 ## Options
-`pigeonhole_otel::Config` sets three things:
+`pigeonhole_otel::Config` sets four things:
 - **`db_name`:** the `pigeonhole.db.name` attribute every metric carries. By default it's the database file's name (`app.phdb`). It tells the databases of one process apart. The OpenTelemetry **resource** (`service.name`, `host.name`, `service.instance.id`) tells processes apart, so the same file name on many hosts doesn't collide.
 - **`storage_by_table(true)`:** the SST and blob gauges also carry `pigeonhole.table` and `pigeonhole.family`. Off by default; see [Cardinality](#cardinality).
 - **`latency_window`:** the window `pigeonhole.commit.engine_latency` covers, 60 seconds by default.
+- **`attribute(key, value)`:** a constant attribute every metric carries, after `pigeonhole.db.name`, such as `phdb serve`'s `pigeonhole.partition` on a cluster node. Use a key no metric carries itself, and a bounded set of values: each value is another series per metric.
 
 ```rust,ignore
 let _metrics = pigeonhole_otel::Config::new()
