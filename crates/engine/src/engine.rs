@@ -260,6 +260,9 @@ pub struct Metrics {
     /// own (D235), and how many it started (shards and compaction threads): `(pinned,
     /// started)`. Both 0 for an application-owned or closed engine.
     pub pinned_threads: (u64, u64),
+    /// Of the threads an engine-owned open started, the compaction threads confined to
+    /// `EngineOptions::compaction_cpu_set` rather than pinned (ICR 0134).
+    pub confined_threads: u64,
     /// Why threads are unpinned although `pin_threads` asked for them: the platform has no
     /// hard thread affinity (macOS), a CPU quota is narrower than the affinity set, too few
     /// free CPUs in the affinity set (other pinned databases in this process hold the rest;
@@ -1735,6 +1738,10 @@ impl Engine {
         config.shards = shards;
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
+        config.compaction_cpu_set = options
+            .compaction_cpu_set
+            .as_ref()
+            .map(|set| set.as_slice().into());
         config.shard_threads = options.shard_threads;
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
@@ -3766,6 +3773,19 @@ impl Engine {
         self.inner.shared.failure.get()
     }
 
+    /// The CPUs this engine pinned its compaction threads to (D235, ICR 0134), one per
+    /// pinned compaction thread. Empty when none is pinned: no compaction threads,
+    /// application-owned mode, `pin_threads` off, a platform or CPU set where pinning is
+    /// unsafe, too few free CPUs (D252: the shards are pinned first), or every pin refused.
+    pub fn pinned_compaction_cpus(&self) -> Vec<usize> {
+        self.inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(Vec::new, |rt| rt.pinned_compaction_cpus().to_vec())
+    }
+
     /// The CPUs this engine pinned its shard threads to (D235, ICR 0101), one per pinned
     /// shard driver thread. Empty when none is pinned: application-owned mode, `pin_threads`
     /// off, a platform or CPU set where pinning is unsafe, or every pin refused.
@@ -3794,6 +3814,7 @@ impl Engine {
         {
             let p = rt.pinning();
             m.pinned_threads = (p.pinned as u64, p.threads as u64);
+            m.confined_threads = p.confined as u64;
             m.unpinned = match (p.unpinned, p.failed) {
                 (Some(why), _) => Some(why.as_str()),
                 (None, 0) => None,

@@ -49,6 +49,20 @@ pub(crate) struct ServeArgs {
     /// recorded). A count other than the feed's reshards it and ends the feed's history.
     #[arg(long, value_name = "N")]
     pub shards: Option<usize>,
+    /// Threads dedicated to flush and compaction, pinned (default: a quarter of the physical
+    /// cores, at least 1, at most one per shard). On a cluster node, `--shards` and this are
+    /// the node's totals, split across its partitions (D317 ticket 8a): pinned compaction
+    /// threads never exceed it, and partitions past it share the pinned ones' CPUs.
+    #[arg(long, value_name = "N")]
+    pub compaction_threads: Option<usize>,
+    /// The engine's memory, in bytes: its memtables, block cache and row cache (default: the
+    /// library's for each database, 64 MiB of memtable per shard plus a 256 MiB block cache
+    /// and a 64 MiB row cache). Taken by the memtables first, at most 64 MiB and at least
+    /// 128 KiB per shard, then by the caches at 4:1. On a cluster node, the node's total,
+    /// split equally across its partitions after any the map gives a `memory_bytes` of their
+    /// own (D317 ticket 8a).
+    #[arg(long, value_name = "BYTES")]
+    pub engine_memory: Option<u64>,
     /// The largest request body, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = 16 << 20)]
     pub max_request_bytes: usize,

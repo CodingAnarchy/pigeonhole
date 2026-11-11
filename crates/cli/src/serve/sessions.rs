@@ -85,21 +85,70 @@ impl Entry {
     }
 }
 
+/// A node's session counts (`--max-sessions`, `--max-sessions-per-token`), shared by every
+/// table on it: one per partition on a cluster node (D317 ticket 8a), whose caps stay the
+/// node's. The total and each principal's count are under one lock (cli692's Q2), taken
+/// inside a table's lock and never the other way round.
 #[derive(Default)]
+pub(crate) struct Caps(Mutex<Counts>);
+
+#[derive(Default)]
+struct Counts {
+    total: usize,
+    per_principal: HashMap<Principal, usize>,
+}
+
+impl Caps {
+    fn lock(&self) -> MutexGuard<'_, Counts> {
+        // Every change under it is a pair of counter steps, done together.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts a session for `principal`, or refuses it at either cap.
+    fn take(&self, principal: Principal, leases: &Leases) -> Result<(), ApiError> {
+        let mut c = self.lock();
+        if c.total >= leases.max_sessions {
+            return Err(ApiError::overloaded(
+                "the server is at its session limit (--max-sessions)",
+            ));
+        }
+        let mine = c.per_principal.entry(principal).or_insert(0);
+        if *mine >= leases.max_per_token {
+            if *mine == 0 {
+                c.per_principal.remove(&principal);
+            }
+            return Err(ApiError::overloaded(
+                "this token is at its session limit (--max-sessions-per-token)",
+            ));
+        }
+        *mine += 1;
+        c.total += 1;
+        Ok(())
+    }
+
+    /// A session of `principal`'s ended.
+    fn give(&self, principal: Principal) {
+        let mut c = self.lock();
+        c.total = c.total.saturating_sub(1);
+        if let Some(n) = c.per_principal.get_mut(&principal) {
+            *n -= 1;
+            if *n == 0 {
+                c.per_principal.remove(&principal);
+            }
+        }
+    }
+}
+
 struct Table {
     map: HashMap<Id, Entry>,
-    per_token: HashMap<Principal, usize>,
+    /// The node's counts, which this table's sessions are part of.
+    caps: Arc<Caps>,
 }
 
 impl Table {
     fn remove(&mut self, id: &Id) -> Option<Entry> {
         let e = self.map.remove(id)?;
-        if let Some(n) = self.per_token.get_mut(&e.principal) {
-            *n -= 1;
-            if *n == 0 {
-                self.per_token.remove(&e.principal);
-            }
-        }
+        self.caps.give(e.principal);
         Some(e)
     }
 
@@ -164,15 +213,16 @@ pub(crate) struct Stats {
 }
 
 impl Sessions {
-    pub(crate) fn new(leases: Leases) -> Arc<Self> {
-        Self::on(leases, None)
-    }
-
-    /// The session table of a cluster node serving `partition` (D317 ticket 3): its ids
-    /// name it.
-    pub(crate) fn on(leases: Leases, partition: Option<String>) -> Arc<Self> {
+    /// A session table: a single node's (`partition` `None`, ids 32 hex), or a cluster
+    /// partition's, whose ids name it (D317 ticket 3: `<partition>:<32 hex>`). It counts
+    /// against `caps`, which every table on the node shares (D317 ticket 8a): the caps stay
+    /// the node's.
+    pub(crate) fn sharing(leases: Leases, partition: Option<String>, caps: Arc<Caps>) -> Arc<Self> {
         Arc::new(Self {
-            table: Mutex::new(Table::default()),
+            table: Mutex::new(Table {
+                map: HashMap::new(),
+                caps,
+            }),
             leases,
             reaper: Once::new(),
             partition,
@@ -218,18 +268,7 @@ impl Sessions {
         let id = new_id()?;
         let now = Instant::now();
         let mut t = self.lock();
-        if t.map.len() >= self.leases.max_sessions {
-            return Err(ApiError::overloaded(
-                "the server is at its session limit (--max-sessions)",
-            ));
-        }
-        let mine = t.per_token.get(&principal).copied().unwrap_or(0);
-        if mine >= self.leases.max_per_token {
-            return Err(ApiError::overloaded(
-                "this token is at its session limit (--max-sessions-per-token)",
-            ));
-        }
-        *t.per_token.entry(principal).or_insert(0) += 1;
+        t.caps.take(principal, &self.leases)?;
         t.map.insert(
             id,
             Entry {
@@ -782,7 +821,7 @@ mod tests {
     #[test]
     fn a_second_call_on_a_transaction_is_busy_until_the_first_ends() {
         let (db, dir) = db("busy");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         let first = open(s.take(&id, p(1)));
         let Err(e) = s.take(&id, p(1)) else {
@@ -811,7 +850,7 @@ mod tests {
     #[test]
     fn ids_are_bound_to_their_token() {
         let (db, dir) = db("token");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         assert_eq!(id.len(), 32);
         assert_eq!(s.take(&id, p(2)).err().unwrap().code, "NotFound");
@@ -832,7 +871,7 @@ mod tests {
     #[test]
     fn caps_count_every_session_per_token_and_in_total() {
         let (db, dir) = db("caps");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         for _ in 0..3 {
             s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         }
@@ -845,10 +884,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// D317 ticket 8a: a node's partitions' tables count against the node's caps together,
+    /// and a session ended in one frees a place for another's.
+    #[test]
+    fn tables_sharing_caps_count_together() {
+        let (db, dir) = db("shared-caps");
+        let caps = Arc::new(Caps::default());
+        let p1 = Sessions::sharing(leases(), Some("p1".into()), Arc::clone(&caps));
+        let p3 = Sessions::sharing(leases(), Some("p3".into()), Arc::clone(&caps));
+        // Token 1's cap is 3, across both partitions.
+        let a = p1.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        p1.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        p3.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        let e = p3.begin(p(1), db.transaction().unwrap(), None).unwrap_err();
+        assert!(e.message.contains("per-token"), "{e:?}");
+        // The node's total is 4, across both partitions.
+        p3.open_snapshot(p(2), db.snapshot().unwrap()).unwrap();
+        let e = p1.open_snapshot(p(3), db.snapshot().unwrap()).unwrap_err();
+        assert!(e.message.contains("--max-sessions)"), "{e:?}");
+        // An abort in p1 frees a place, which p3 takes.
+        open(p1.take(&a, p(1))).abort();
+        p3.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        // Ids stay their own partition's.
+        assert_eq!(p3.take(&a, p(1)).err().unwrap().code, "NotFound");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_reaper_skips_a_session_with_a_call_in_flight() {
         let (db, dir) = db("reaper");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         let call = open(s.take(&id, p(1)));
         // The call outlasts the idle lease and the hard lifetime: the reaper leaves it.
@@ -878,7 +944,7 @@ mod tests {
     #[test]
     fn a_tombstone_never_answers_transaction_expired() {
         let (db, dir) = db("tomb");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         let id = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
         let (txn, _, ticket) = open(s.take(&id, p(1))).commit();
         let info = txn.commit().unwrap();
@@ -895,7 +961,7 @@ mod tests {
     #[test]
     fn a_released_snapshot_finishes_its_running_reads_only() {
         let (db, dir) = db("release");
-        let s = Sessions::new(leases());
+        let s = Sessions::sharing(leases(), None, Arc::default());
         let snap = s.open_snapshot(p(1), db.snapshot().unwrap()).unwrap();
         let read = s.snapshot(&snap, p(1)).unwrap();
         s.release(&snap, p(1)).unwrap();
@@ -910,8 +976,8 @@ mod tests {
         assert!(parse_id(&hex(&[0xab; 16])).is_some_and(|id| id == [0xab; 16]));
         // A cluster node's ids name its partition (D317 ticket 3); a single node's don't, and
         // neither takes the other's form or another partition's id (cli692's S4).
-        let one = Sessions::new(leases());
-        let p2 = Sessions::on(leases(), Some("p2".into()));
+        let one = Sessions::sharing(leases(), None, Arc::default());
+        let p2 = Sessions::sharing(leases(), Some("p2".into()), Arc::default());
         let h = hex(&[0xab; 16]);
         assert_eq!(p2.text(&[0xab; 16]), format!("p2:{h}"));
         assert_eq!(p2.parse(&format!("p2:{h}")), Some([0xab; 16]));

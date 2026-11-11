@@ -12788,6 +12788,9 @@ impl serde::Serialize for Partition {
         if self.epoch != 0 {
             len += 1;
         }
+        if self.memory_bytes != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Partition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -12799,6 +12802,11 @@ impl serde::Serialize for Partition {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        if self.memory_bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("memory_bytes", ToString::to_string(&self.memory_bytes).as_str())?;
         }
         struct_ser.end()
     }
@@ -12813,6 +12821,8 @@ impl<'de> serde::Deserialize<'de> for Partition {
             "id",
             "node",
             "epoch",
+            "memory_bytes",
+            "memoryBytes",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -12820,6 +12830,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
             Id,
             Node,
             Epoch,
+            MemoryBytes,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -12844,6 +12855,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                             "id" => Ok(GeneratedField::Id),
                             "node" => Ok(GeneratedField::Node),
                             "epoch" => Ok(GeneratedField::Epoch),
+                            "memoryBytes" | "memory_bytes" => Ok(GeneratedField::MemoryBytes),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -12866,6 +12878,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                 let mut id__ = None;
                 let mut node__ = None;
                 let mut epoch__ = None;
+                let mut memory_bytes__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -12888,12 +12901,21 @@ impl<'de> serde::Deserialize<'de> for Partition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::MemoryBytes => {
+                            if memory_bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("memoryBytes"));
+                            }
+                            memory_bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(Partition {
                     id: id__.unwrap_or_default(),
                     node: node__.unwrap_or_default(),
                     epoch: epoch__.unwrap_or_default(),
+                    memory_bytes: memory_bytes__.unwrap_or_default(),
                 })
             }
         }

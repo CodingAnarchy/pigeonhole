@@ -143,6 +143,10 @@ pub struct EngineMetrics {
     pub threads_started: u64,
     /// Gauge: of those, threads pinned to a CPU of their own (`Options::pin_threads`).
     pub threads_pinned: u64,
+    /// Gauge: of those, compaction threads confined to
+    /// [`Options::compaction_cpu_set`](crate::Options::compaction_cpu_set) rather than pinned
+    /// (ICR 0134). They run on those CPUs, shared, so they're neither pinned nor unpinned.
+    pub threads_confined: u64,
     /// Gauge: why threads are unpinned although `pin_threads` asked for them, for people to
     /// read (the wording may change): the platform has no hard thread affinity (macOS), a
     /// CPU quota is narrower than the affinity set, too few free CPUs (with room for the
@@ -403,6 +407,7 @@ impl EngineMetrics {
             // The engine fills `pinned_threads` as (pinned, started).
             threads_started: m.pinned_threads.1,
             threads_pinned: m.pinned_threads.0,
+            threads_confined: m.confined_threads,
             unpinned_reason: m.unpinned,
             // Filled from the handle's own counters (`Pigeonhole::engine_metrics`).
             transactions: 0,

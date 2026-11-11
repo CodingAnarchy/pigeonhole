@@ -535,7 +535,9 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         _req: Request<proto::Empty>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
-        let ok = !self.0.router.service.part()?.db.is_failed();
+        // Every database this server serves (a cluster node's partitions, D317 ticket 8a), as
+        // `/v1/health` checks; a cluster node that only routes is up.
+        let ok = self.0.router.parts().iter().all(|p| !p.db.is_failed());
         Ok(Response::new(proto::HealthResponse {
             status: if ok { "ok" } else { "failed" }.into(),
         }))

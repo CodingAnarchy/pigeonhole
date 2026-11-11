@@ -1234,6 +1234,38 @@ impl Pigeonhole {
         self.engine().pinned_shard_cpus()
     }
 
+    /// The CPUs the engine pinned its compaction threads to (D235, ICR 0134): one per
+    /// pinned [`compaction_cores`](crate::Options::compaction_cores) thread, in thread order.
+    /// With [`pinned_shard_cpus`](Self::pinned_shard_cpus), every CPU the engine pinned.
+    /// A compaction thread runs flushes and compactions: a busy thread placed on its CPU
+    /// slows them, which shows up as write stalls under heavy writes (#1703).
+    /// Empty when no compaction thread is pinned: none configured, or the reasons
+    /// [`pinned_shard_cpus`](Self::pinned_shard_cpus) lists. With too few free CPUs for both,
+    /// the shards are pinned and the compaction threads run unpinned (D252).
+    /// An in-place recovery ([`Options::auto_recover`](crate::Options::auto_recover)) starts
+    /// new threads, which may pin to other CPUs: read this again after one.
+    ///
+    /// ```
+    /// use pigeonhole::{Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(
+    ///     dir.join("app.phdb"),
+    ///     Options::default().shards(1).compaction_cores(1),
+    /// )?;
+    /// // Never one of the shards' CPUs; none on macOS.
+    /// let compaction = db.pinned_compaction_cpus();
+    /// assert!(compaction.iter().all(|c| !db.pinned_shard_cpus().contains(c)));
+    /// assert!((compaction.len() + db.pinned_shard_cpus().len()) as u64 <= db.engine_metrics().threads_pinned);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn pinned_compaction_cpus(&self) -> Vec<usize> {
+        self.engine().pinned_compaction_cpus()
+    }
+
     /// Counts one retried transaction attempt in
     /// [`EngineMetrics::transaction_retries`](crate::EngineMetrics::transaction_retries), as
     /// [`transact`](Self::transact) counts its own: for a binding that runs its own retry

@@ -717,6 +717,28 @@ pub(crate) fn pin_current_thread_to(id: usize) -> Result<()> {
     Ok(())
 }
 
+/// Confines the calling thread to the CPU ids `ids` (any of them).
+#[cfg(target_os = "linux")]
+pub(crate) fn confine_current_thread_to(ids: &[usize]) -> Result<()> {
+    if ids.is_empty() {
+        return Err(Error::new(ErrorKind::Other, "an empty cpu set"));
+    }
+    // SAFETY: `cpu_set_t` is plain old data; all-zero is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &id in ids {
+        if id >= 8 * std::mem::size_of::<libc::cpu_set_t>() {
+            return Err(Error::new(ErrorKind::Other, "cpu id out of range"));
+        }
+        // SAFETY: `id` is below the set's bit size (checked above).
+        unsafe { libc::CPU_SET(id, &mut set) };
+    }
+    // SAFETY: `set` is a valid, initialized `cpu_set_t`.
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } != 0 {
+        return Err(last_error("sched_setaffinity"));
+    }
+    Ok(())
+}
+
 /// macOS and the other Unixes: no hard thread affinity (macOS affinity tags are hints).
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn pin_order() -> Option<Vec<usize>> {
@@ -725,6 +747,14 @@ pub(crate) fn pin_order() -> Option<Vec<usize>> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn pin_current_thread_to(_id: usize) -> Result<()> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "thread affinity is not available on this platform",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn confine_current_thread_to(_ids: &[usize]) -> Result<()> {
     Err(Error::new(
         ErrorKind::Unsupported,
         "thread affinity is not available on this platform",

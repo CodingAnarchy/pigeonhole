@@ -262,6 +262,16 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<Pigeonhole, Failure> {
     if let Some(n) = args.shards {
         options = options.shards(n);
     }
+    // Unset, the library's default (D289), which is the same number.
+    if let Some(n) = args.compaction_threads {
+        options = options.compaction_cores(n);
+    }
+    if let Some(total) = args.engine_memory {
+        let shards = args.shards.unwrap_or_else(placement::default_shards);
+        let memory = placement::memory(Some(total), &[(shards, 0)])
+            .map_err(|(_, why)| Failure::usage(&format!("--engine-memory: {why}")))?;
+        options = memory[0].apply(options);
+    }
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
     }
@@ -353,7 +363,7 @@ pub(crate) fn run(
         }
     }
     let placement = Arc::new(placement::Placement::plan(
-        &db,
+        &[&db],
         args.io_threads,
         args.blocking_threads,
         args.feed_threads,
@@ -403,7 +413,7 @@ pub(crate) fn run(
             placement,
             tls,
             serving: args.db_file().display().to_string(),
-            db: Some(db),
+            dbs: vec![db],
             replica,
             start: None,
         },
@@ -419,8 +429,9 @@ pub(crate) struct Serving<'a> {
     pub(crate) tls: Option<tokio_rustls::TlsAcceptor>,
     /// What the startup line says is served: the file, or a cluster node's partition.
     pub(crate) serving: String,
-    /// The database to close last; `None` on a cluster node that only routes.
-    pub(crate) db: Option<Pigeonhole>,
+    /// The databases to close last: a single node's one, a cluster node's partitions'
+    /// (D317 ticket 8a), none on a cluster node that only routes.
+    pub(crate) dbs: Vec<Pigeonhole>,
     pub(crate) replica: Option<Arc<replica::Replica>>,
     /// Run on the request runtime once the server listens (a cluster node's map sync).
     pub(crate) start: Option<Box<dyn FnOnce() + Send>>,
@@ -437,7 +448,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         placement,
         tls,
         serving,
-        db,
+        dbs,
         replica,
         start,
     } = s;
@@ -477,28 +488,39 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed hub runtime", &e))?;
-    if let Some(part) = shared.router.service.part_opt() {
+    for part in shared.router.parts() {
         part.feeds
             .run_on(feed_runtime.handle().clone(), hub_runtime.handle().clone());
     }
 
     let served = runtime.block_on(async {
         // SIGUSR1 writes a report of the feed hubs and their clients to stderr (#1397).
+        // Node-wide (cli692's Q1 on 8a): every partition's feeds, one after another.
         #[cfg(unix)]
-        if let Some(part) = shared.router.service.part_opt() {
-            let feeds = Arc::clone(&part.feeds);
-            tokio::spawn(async move {
-                use tokio::signal::unix::{SignalKind, signal};
-                let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
-                    return;
-                };
-                while usr1.recv().await.is_some() {
-                    let f = Arc::clone(&feeds);
-                    if let Ok(text) = tokio::task::spawn_blocking(move || f.dump()).await {
-                        eprint!("{text}");
+        {
+            let feeds: Vec<_> = shared
+                .router
+                .parts()
+                .into_iter()
+                .map(|p| Arc::clone(&p.feeds))
+                .collect();
+            if !feeds.is_empty() {
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+                        return;
+                    };
+                    while usr1.recv().await.is_some() {
+                        let f = feeds.clone();
+                        let dumped = tokio::task::spawn_blocking(move || {
+                            f.iter().map(|f| f.dump()).collect::<String>()
+                        });
+                        if let Ok(text) = dumped.await {
+                            eprint!("{text}");
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         let listener = tokio::net::TcpListener::bind(args.listen)
             .await
@@ -506,7 +528,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         let addr = listener.local_addr().map_err(|e| Failure::io("listen", &e))?;
         let _ = writeln!(
             stderr,
-            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed, {} feed hub and {} blocking threads on {} free CPUs, {})",
+            "phdb serve: serving {} on {addr} ({}, {}; {} network, {} feed, {} feed hub and {} blocking threads on {} free CPUs, {}; {} shard CPUs left out, {} compaction CPUs not)",
             serving,
             if tls.is_some() { "TLS" } else { "no TLS" },
             if shared.tokens.any() { "tokens required" } else { "no tokens" },
@@ -516,6 +538,8 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
             placement.blocking_threads,
             placement.free_cpus,
             placement.mode,
+            placement.shard_cpus,
+            placement.compaction_cpus,
         );
         if let Some(note) = &placement.note {
             let _ = writeln!(stderr, "phdb serve: {note}");
@@ -541,7 +565,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         let stopping = Arc::clone(&shared);
         let signal = async move {
             shutdown_signal().await;
-            if let Some(part) = stopping.router.service.part_opt() {
+            for part in stopping.router.parts() {
                 part.bulk.stop();
             }
         };
@@ -563,20 +587,28 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
     // database closes. The front-ends are gone, so a load's input has ended: it writes what
     // came, and rebalances inline if its index does.
-    if let Some(part) = shared.router.service.part_opt() {
+    for part in shared.router.parts() {
         part.bulk.close();
         // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
         part.texts.close();
         part.indexes.close();
     }
-    let closed = match db {
-        Some(db) => {
-            let _ = writeln!(stderr, "phdb serve: stopped; closing the database");
-            db.close().map_err(|e| Failure::db("close", &e))
-        }
-        None => {
+    let closed = match dbs.len() {
+        0 => {
             let _ = writeln!(stderr, "phdb serve: stopped");
             Ok(())
+        }
+        n => {
+            let _ = writeln!(
+                stderr,
+                "phdb serve: stopped; closing the database{}",
+                if n > 1 { "s" } else { "" }
+            );
+            // Every one is closed, and the first failure reported (per partition, cli692's
+            // Q1 on 8a).
+            dbs.into_iter()
+                .map(|db| db.close().map_err(|e| Failure::db("close", &e)))
+                .fold(Ok(()), Result::and)
         }
     };
     served?;
