@@ -32,6 +32,12 @@ fn test_dir() -> PathBuf {
 
 /// A node over `dir` (its persisted map loaded, as `run` loads it), without tokens or TLS.
 fn node(dir: &Path, id: &str) -> Arc<Node> {
+    node_with(dir, id, "")
+}
+
+/// [`node`] with the token file `tokens` (empty: none); with tokens, it forwards with
+/// [`NODE_TOKEN`], which `tokens` lists with cluster scope.
+fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
     let mut state = MapState::default();
     if let Some(m) = read_map(dir).unwrap() {
         let json = super::map::canonical_json(&m);
@@ -41,9 +47,9 @@ fn node(dir: &Path, id: &str) -> Arc<Node> {
         dir,
         id,
         true,
-        Tokens::parse("", "none").unwrap(),
+        Tokens::parse(tokens, "tokens").unwrap(),
         Peers {
-            token: None,
+            token: (!tokens.is_empty()).then(|| NODE_TOKEN.to_owned()),
             scheme: "http",
             ca: None,
             push_timeout: Duration::from_millis(500),
@@ -447,6 +453,9 @@ fn data_node(
     )
 }
 
+/// The cluster token the tests' nodes forward with, when they have tokens.
+const NODE_TOKEN: &str = "n0de-secret";
+
 /// [`data_node`] with its own limits.
 fn data_node_with(
     rt: &tokio::runtime::Runtime,
@@ -459,7 +468,7 @@ fn data_node_with(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
-    data_node_on(rt, dir, id, local, listener, limits, None)
+    data_node_full(rt, dir, id, local, listener, "", limits, None)
 }
 
 /// [`data_node_with`], serving `db` if given (the same node's database again, after its
@@ -477,8 +486,58 @@ fn data_node_on(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    data_node_full(rt, dir, id, local, listener, "", limits, db)
+}
+
+/// [`data_node`] with the token file `tokens` (empty: none), for its clients and its peers.
+fn data_node_tokens(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
+    let limits = crate::serve::server_tests::limits();
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
+}
+
+/// [`data_node`] with the token file `tokens` and under `limits`.
+fn data_node_limits(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
+    data_node_full(rt, dir, id, local, listener, tokens, limits, None)
+}
+
+/// Every test data node: `tokens` (empty: none), `limits`, and `db` if given.
+#[allow(clippy::too_many_arguments)]
+fn data_node_full(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    local: Option<&str>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    db: Option<pigeonhole::Pigeonhole>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Option<pigeonhole::Pigeonhole>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
-    let node = node(dir, id);
+    let node = node_with(dir, id, tokens);
     let metrics = Arc::new(Metrics::default());
     let db = db.or_else(|| {
         local.map(|p| {
@@ -525,7 +584,7 @@ fn data_node_on(
     };
     let shared = Arc::new(Shared {
         router: Router::cluster(service, node, local.map(str::to_owned)),
-        tokens: Tokens::parse("", "none").unwrap(),
+        tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
     });
@@ -837,9 +896,11 @@ impl Rng {
 
 #[test]
 fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
-    // D317 §12's model test, single-partition half: every single-key call and every
-    // one-partition batch answers as a single database would, whichever node it enters;
-    // every cross-partition batch is refused with nothing written. The oracle is a map.
+    // D317 §12's model test, single-partition half: every single-key call, every
+    // one-partition batch, and every transaction and snapshot (ticket 3) answers as a single
+    // database would, whichever node each call enters; every cross-partition batch, and
+    // every row outside a session's partition, is refused with nothing written. The oracle
+    // is a map.
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -866,9 +927,15 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
         super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
     }
     let mut it = listeners.into_iter();
-    let (_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
-    let (_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
-    let (_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    // Every session counts against the caps until its record expires, as on a single node,
+    // and the workload's are all one (anonymous) caller's: room for every one it opens.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.leases.max_sessions = 1 << 16;
+    limits.leases.max_per_token = 1 << 16;
+    let node = |dir: &PathBuf, id, local, l| data_node_limits(&rt, dir, id, local, l, "", limits);
+    let (_a, db_a) = node(&dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_b, db_b) = node(&dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_c, _) = node(&dirs[2], "c", None, it.next().unwrap());
     // Rows on both sides of the split at "m".
     let rows: Vec<String> = ["a", "f", "k", "lz", "m", "n", "s", "z"]
         .iter()
@@ -888,14 +955,174 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
         .unwrap_or(300u64);
     rt.block_on(async {
         let mut clients = Vec::new();
+        let mut tx = Vec::new();
+        let mut snaps = Vec::new();
         for &port in &ports {
             clients.push(data(port).await);
+            tx.push(txns(port).await);
+            snaps.push(snapshots(port).await);
         }
+        let read_req = |row: &str| super::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        };
+        let value_of = |r: super::proto::GetResponse| {
+            r.cell.map(|c| String::from_utf8(c.value.to_vec()).unwrap())
+        };
         for i in 0..ops {
             let entry = rng.below(3) as usize;
-            let c = &mut clients[entry];
             let at = format!("seed {seed}, op {i}, entry node {entry}");
-            match rng.below(4) {
+            let kind = rng.below(6);
+            if kind == 4 {
+                // A transaction, each call through a random node: reads of its partition see
+                // its snapshot, a row of the other is CrossPartition, and the commit applies
+                // its writes, unless a put to a row it read came between (Conflict).
+                let home = rows[rng.below(rows.len() as u64) as usize].clone();
+                let id = tx[entry]
+                    .begin(super::proto::BeginRequest {
+                        durability: 0,
+                        route: route_row(&home),
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: begin at {home}: {e}"))
+                    .into_inner()
+                    .txn_id;
+                assert!(id.starts_with(&format!("p{}:", part(&home))), "{at}: {id}");
+                let seen = model.clone();
+                let (mut read, mut wrote) = (Vec::new(), Vec::new());
+                for step in 0..1 + rng.below(4) {
+                    let via = rng.below(3) as usize;
+                    let row = rows[rng.below(rows.len() as u64) as usize].clone();
+                    let mine = part(&row) == part(&home);
+                    let at = format!("{at}, step {step} via {via}");
+                    if rng.below(2) == 0 && !wrote.contains(&row) {
+                        let got = tx[via]
+                            .get(super::proto::TxnGetRequest {
+                                txn_id: id.clone(),
+                                table: "users".into(),
+                                row: row.as_bytes().to_vec().into(),
+                                family: "f".into(),
+                                qualifier: b"q".to_vec().into(),
+                            })
+                            .await;
+                        match got {
+                            Ok(r) if mine => {
+                                assert_eq!(
+                                    value_of(r.into_inner()).as_ref(),
+                                    seen.get(&row),
+                                    "{at}: txn get {row}"
+                                );
+                                read.push(row);
+                            }
+                            Err(e) if !mine => assert_eq!(code(&e), "CrossPartition", "{at}: {e}"),
+                            other => panic!("{at}: txn get {row}: {other:?}"),
+                        }
+                    } else {
+                        let reply = tx[via]
+                            .write(super::proto::TxnWriteRequest {
+                                txn_id: id.clone(),
+                                rows: vec![put_row(&row, &format!("t{i}"))],
+                            })
+                            .await;
+                        match reply {
+                            Ok(_) if mine => wrote.push(row),
+                            Err(e) if !mine => assert_eq!(code(&e), "CrossPartition", "{at}: {e}"),
+                            other => panic!("{at}: txn write {row}: {other:?}"),
+                        }
+                    }
+                }
+                // Sometimes a put to a row it read comes first; sometimes it aborts.
+                let interfere = !read.is_empty() && rng.below(3) == 0;
+                if interfere {
+                    let row = &read[rng.below(read.len() as u64) as usize];
+                    clients[rng.below(3) as usize]
+                        .mutate(super::proto::MutateRequest {
+                            writes: Some(put_row(row, &format!("x{i}"))),
+                            durability: 0,
+                        })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                    model.insert(row.clone(), format!("x{i}"));
+                }
+                let via = rng.below(3) as usize;
+                if rng.below(4) == 0 {
+                    tx[via]
+                        .abort(super::proto::TxnAbortRequest { txn_id: id.clone() })
+                        .await
+                        .unwrap_or_else(|e| panic!("{at}: abort via {via}: {e}"));
+                    continue;
+                }
+                let reply = tx[via]
+                    .commit(super::proto::TxnCommitRequest {
+                        txn_id: id.clone(),
+                        rows: Vec::new(),
+                    })
+                    .await;
+                // A transaction without writes commits as a consistent read, whatever came
+                // between.
+                let interfere = interfere && !wrote.is_empty();
+                match reply {
+                    Ok(_) if !interfere => {
+                        for row in wrote {
+                            model.insert(row, format!("t{i}"));
+                        }
+                    }
+                    Err(e) if interfere => assert_eq!(code(&e), "Conflict", "{at}: {e}"),
+                    other => panic!("{at}: commit via {via} (interfered: {interfere}): {other:?}"),
+                }
+                continue;
+            }
+            if kind == 5 {
+                // A snapshot opened through one node, read through others after a put: its
+                // partition's rows as they were, another partition's CrossPartition.
+                let home = rows[rng.below(rows.len() as u64) as usize].clone();
+                let id = snaps[entry]
+                    .open(super::proto::OpenSnapshotRequest {
+                        durable: false,
+                        route: route_row(&home),
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: open at {home}: {e}"))
+                    .into_inner()
+                    .snapshot_id;
+                let seen = model.clone();
+                let row = &rows[rng.below(rows.len() as u64) as usize];
+                clients[rng.below(3) as usize]
+                    .mutate(super::proto::MutateRequest {
+                        writes: Some(put_row(row, &format!("s{i}"))),
+                        durability: 0,
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: put {row}: {e}"));
+                model.insert(row.clone(), format!("s{i}"));
+                for _ in 0..2 {
+                    let via = rng.below(3) as usize;
+                    let row = &rows[rng.below(rows.len() as u64) as usize];
+                    let mut req = read_req(row);
+                    req.snapshot_id = id.clone();
+                    match clients[via].get(req).await {
+                        Ok(r) if part(row) == part(&home) => assert_eq!(
+                            value_of(r.into_inner()).as_ref(),
+                            seen.get(row),
+                            "{at}: get {row} at the snapshot via {via}"
+                        ),
+                        Err(e) if part(row) != part(&home) => {
+                            assert_eq!(code(&e), "CrossPartition", "{at}: {e}");
+                        }
+                        other => panic!("{at}: get {row} at the snapshot via {via}: {other:?}"),
+                    }
+                }
+                snaps[rng.below(3) as usize]
+                    .release(super::proto::ReleaseSnapshotRequest { snapshot_id: id })
+                    .await
+                    .unwrap_or_else(|e| panic!("{at}: release: {e}"));
+                continue;
+            }
+            let c = &mut clients[entry];
+            match kind {
                 0 | 1 => {
                     let row = &rows[rng.below(rows.len() as u64) as usize];
                     let value = format!("v{i}");
@@ -1013,6 +1240,405 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     assert_eq!(spin, 0, "a partition opened with --shard-spin 0 polled");
     drop(t);
     db.close().unwrap();
+}
+
+/// A three-node cluster (a: p1, b: p2, c routes only) whose nodes list `tokens` (empty:
+/// none; `tokens_c` for c, if given): its runtime, ports, stops and partitions' files.
+struct Three {
+    rt: tokio::runtime::Runtime,
+    ports: [u16; 3],
+    stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    dbs: Vec<pigeonhole::Pigeonhole>,
+}
+
+impl Three {
+    fn start(tokens: [&str; 3]) -> Self {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listeners: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+        let ports = [ports[0], ports[1], ports[2]];
+        let mut map = the_map(1, &ports);
+        map.partitions.retain(|p| p.id != "p3");
+        let mut stops = Vec::new();
+        let mut dbs = Vec::new();
+        for ((l, (id, local)), tokens) in listeners
+            .into_iter()
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+            .zip(tokens)
+        {
+            let dir = test_dir();
+            super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+            let (stop, db) = data_node_tokens(&rt, &dir, id, local, l, tokens);
+            stops.push(stop);
+            dbs.extend(db);
+        }
+        Self {
+            rt,
+            ports,
+            stops,
+            dbs,
+        }
+    }
+}
+
+impl Drop for Three {
+    fn drop(&mut self) {
+        self.stops.clear();
+        for db in self.dbs.drain(..) {
+            let _ = db.close();
+        }
+    }
+}
+
+/// `m` with the bearer `token`, if any.
+fn with<T>(m: T, token: Option<&str>) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(m);
+    if let Some(t) = token {
+        r.metadata_mut()
+            .insert("authorization", format!("Bearer {t}").parse().unwrap());
+    }
+    r
+}
+
+async fn txns(
+    port: u16,
+) -> super::proto::transactions_client::TransactionsClient<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    super::proto::transactions_client::TransactionsClient::new(channel)
+}
+
+async fn snapshots(
+    port: u16,
+) -> super::proto::snapshots_client::SnapshotsClient<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    super::proto::snapshots_client::SnapshotsClient::new(channel)
+}
+
+fn route_row(row: &str) -> Option<super::proto::RoutingKey> {
+    Some(super::proto::RoutingKey {
+        key: Some(super::proto::routing_key::Key::Row(super::proto::RowKey {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+        })),
+    })
+}
+
+async fn begin(port: u16, row: &str, token: Option<&str>) -> Result<String, tonic::Status> {
+    let r = super::proto::BeginRequest {
+        durability: 0,
+        route: route_row(row),
+    };
+    Ok(txns(port)
+        .await
+        .begin(with(r, token))
+        .await?
+        .into_inner()
+        .txn_id)
+}
+
+async fn txn_write(
+    port: u16,
+    id: &str,
+    rows: Vec<super::proto::RowWrites>,
+    token: Option<&str>,
+) -> Result<(), tonic::Status> {
+    let r = super::proto::TxnWriteRequest {
+        txn_id: id.into(),
+        rows,
+    };
+    txns(port).await.write(with(r, token)).await.map(drop)
+}
+
+async fn commit(port: u16, id: &str, token: Option<&str>) -> Result<u64, tonic::Status> {
+    let r = super::proto::TxnCommitRequest {
+        txn_id: id.into(),
+        rows: Vec::new(),
+    };
+    let reply = txns(port).await.commit(with(r, token)).await?.into_inner();
+    Ok(reply.commit.map_or(0, |c| c.seqno))
+}
+
+async fn txn_get(port: u16, id: &str, row: &str) -> Result<Option<Vec<u8>>, tonic::Status> {
+    let r = super::proto::TxnGetRequest {
+        txn_id: id.into(),
+        table: "users".into(),
+        row: row.as_bytes().to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+    };
+    let reply = txns(port).await.get(r).await?.into_inner();
+    Ok(reply.cell.map(|c| c.value.to_vec()))
+}
+
+async fn get_at(port: u16, row: &str, snapshot: &str) -> Result<Option<Vec<u8>>, tonic::Status> {
+    let reply = data(port)
+        .await
+        .get(super::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            snapshot_id: snapshot.into(),
+            ..Default::default()
+        })
+        .await?;
+    Ok(reply.into_inner().cell.map(|c| c.value.to_vec()))
+}
+
+async fn put(port: u16, row: &str, value: &str) {
+    data(port)
+        .await
+        .mutate(super::proto::MutateRequest {
+            writes: Some(put_row(row, value)),
+            durability: 0,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("put {row} through {port}: {e}"));
+}
+
+#[test]
+fn a_transaction_lives_on_its_partitions_node_and_any_node_serves_its_calls() {
+    // a serves p1 (users < "m"), b serves p2 (users >= "m"), c only routes.
+    let t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        // `route` is required on a cluster.
+        let e = txns(c)
+            .await
+            .begin(super::proto::BeginRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        // Begun through c by a row of p2: the id names p2, and any node serves its calls.
+        let id = begin(c, "zed", None).await.unwrap();
+        assert!(id.starts_with("p2:"), "{id}");
+        txn_write(a, &id, vec![put_row("yan", "1")], None)
+            .await
+            .unwrap();
+        // A row of another partition is refused, before anything is buffered or written.
+        let e = txn_write(
+            c,
+            &id,
+            vec![put_row("yo", "2"), put_row("alice", "2")],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        assert!(
+            e.message().contains("p1") && e.message().contains("p2"),
+            "{e}"
+        );
+        let e = txn_get(b, &id, "alice").await.unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        let first = commit(b, &id, None).await.unwrap();
+        assert_eq!(get_row(c, "yan").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "yo").await.unwrap(), None);
+        assert_eq!(get_row(c, "alice").await.unwrap(), None);
+        // A Commit sent again, through another node, answers the first outcome (B1).
+        assert_eq!(commit(a, &id, None).await.unwrap(), first);
+        // A conflicting pair through different nodes: the second to commit is refused.
+        put(c, "zed", "0").await;
+        let (t1, t2) = (
+            begin(a, "zed", None).await.unwrap(),
+            begin(b, "zz", None).await.unwrap(),
+        );
+        for (entry, id) in [(a, &t1), (c, &t2)] {
+            assert_eq!(
+                txn_get(entry, id, "zed").await.unwrap(),
+                Some(b"0".to_vec())
+            );
+            txn_write(entry, id, vec![put_row("zed", id)], None)
+                .await
+                .unwrap();
+        }
+        commit(c, &t1, None).await.unwrap();
+        let e = commit(a, &t2, None).await.unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        assert_eq!(get_row(b, "zed").await.unwrap(), Some(t1.into_bytes()));
+        // An id in a single node's form, or of a partition the map doesn't list: NotFound.
+        for bad in [
+            "0123456789abcdef0123456789abcdef",
+            "p9:0123456789abcdef0123456789abcdef",
+        ] {
+            let e = commit(c, bad, None).await.unwrap_err();
+            assert_eq!(code(&e), "NotFound", "{bad}: {e}");
+        }
+    });
+}
+
+#[test]
+fn a_snapshot_reads_its_own_partition_through_any_node() {
+    let t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        put(a, "zed", "1").await;
+        put(a, "alice", "1").await;
+        let id = snapshots(c)
+            .await
+            .open(super::proto::OpenSnapshotRequest {
+                durable: false,
+                route: Some(super::proto::RoutingKey {
+                    key: Some(super::proto::routing_key::Key::Partition("p2".into())),
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshot_id;
+        assert!(id.starts_with("p2:"), "{id}");
+        put(c, "zed", "2").await;
+        for entry in [a, b, c] {
+            assert_eq!(
+                get_at(entry, "zed", &id).await.unwrap(),
+                Some(b"1".to_vec())
+            );
+        }
+        // Another partition's row, a multi-get or a scan that reaches one: CrossPartition.
+        let e = get_at(a, "alice", &id).await.unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        let at = Some(super::proto::Selection {
+            snapshot_id: id.clone(),
+            ..Default::default()
+        });
+        let e = data(c)
+            .await
+            .scan(super::proto::ScanRequest {
+                table: "users".into(),
+                selection: at.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        let e = data(c)
+            .await
+            .multi_get(super::proto::MultiGetRequest {
+                table: "users".into(),
+                keys: vec![b"zed".to_vec().into(), b"alice".to_vec().into()],
+                selection: at.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "CrossPartition", "{e}");
+        // Within it, they read the snapshot through any node: a multi-get forwarded as a
+        // single-key call is, a scan streamed from the snapshot's partition alone.
+        let reply = data(a)
+            .await
+            .multi_get(super::proto::MultiGetRequest {
+                table: "users".into(),
+                keys: vec![b"zed".to_vec().into()],
+                selection: at.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let values = |rows: &[super::proto::Row]| -> Vec<(Vec<u8>, Vec<u8>)> {
+            rows.iter()
+                .flat_map(|r| r.cells.iter().map(|c| (r.key.to_vec(), c.value.to_vec())))
+                .collect()
+        };
+        assert_eq!(values(&reply.rows), [(b"zed".to_vec(), b"1".to_vec())]);
+        // A scan at the snapshot, here (b: pinned for the stream) and forwarded (a, c).
+        for entry in [a, b, c] {
+            let mut pages = data(entry)
+                .await
+                .scan(super::proto::ScanRequest {
+                    table: "users".into(),
+                    range: Some(super::proto::KeyRange {
+                        range: Some(super::proto::key_range::Range::Prefix(b"z".to_vec().into())),
+                    }),
+                    selection: at.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let mut got = Vec::new();
+            while let Some(page) = pages.message().await.unwrap() {
+                got.extend(values(&page.rows));
+            }
+            assert_eq!(got, [(b"zed".to_vec(), b"1".to_vec())], "via {entry}");
+        }
+        // Released through another node: gone everywhere.
+        snapshots(b)
+            .await
+            .release(super::proto::ReleaseSnapshotRequest {
+                snapshot_id: id.clone(),
+            })
+            .await
+            .unwrap();
+        let e = get_at(c, "zed", &id).await.unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+    });
+}
+
+#[test]
+fn a_session_is_its_tokens_on_every_node() {
+    // a and c list every token; b, p2's node, doesn't list t0ken-c, and lists t0ken-d as
+    // read where the others list it as write.
+    let all = format!(
+        "write t0ken-a\nwrite t0ken-b\nwrite t0ken-c\nwrite t0ken-d\ncluster {NODE_TOKEN}\n"
+    );
+    let b_tokens = format!("write t0ken-a\nwrite t0ken-b\nread t0ken-d\ncluster {NODE_TOKEN}\n");
+    let t = Three::start([&all, &b_tokens, &all]);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin(a, "zed", Some("t0ken-a")).await.unwrap();
+        // Another token's session, through another node: as on a single node, not found.
+        let e = txn_write(c, &id, vec![put_row("yan", "1")], Some("t0ken-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+        // Its own token, through any node.
+        txn_write(c, &id, vec![put_row("yan", "1")], Some("t0ken-a"))
+            .await
+            .unwrap();
+        commit(c, &id, Some("t0ken-a")).await.unwrap();
+        // A token the partition's node doesn't list: refused there, and the digest isn't
+        // in the message.
+        let e = begin(c, "zed", Some("t0ken-c")).await.unwrap_err();
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
+        let digest: String = <sha2::Sha256 as sha2::Digest>::digest(b"t0ken-c")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(!e.message().contains(&digest[..16]), "{e}");
+        // On p1, whose node lists it, it's served.
+        begin(c, "alice", Some("t0ken-c")).await.unwrap();
+        // The partition's node decides the scope by its own entry (cli692's R1 on #1702):
+        // t0ken-d writes to p1, and is refused writing to p2.
+        let write = |row: &str| super::proto::MutateRequest {
+            writes: Some(put_row(row, "d")),
+            durability: 0,
+        };
+        data(c)
+            .await
+            .mutate(with(write("alice"), Some("t0ken-d")))
+            .await
+            .unwrap();
+        let e = data(c)
+            .await
+            .mutate(with(write("zed"), Some("t0ken-d")))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
+    });
 }
 
 // ---- D317 ticket 4a: fan-out scans and multi-gets ----

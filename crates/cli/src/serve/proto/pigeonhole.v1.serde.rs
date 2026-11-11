@@ -6237,6 +6237,30 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::MultiGet(v) => {
                     struct_ser.serialize_field("multi_get", v)?;
                 }
+                forward_request::Op::Begin(v) => {
+                    struct_ser.serialize_field("begin", v)?;
+                }
+                forward_request::Op::TxnGet(v) => {
+                    struct_ser.serialize_field("txn_get", v)?;
+                }
+                forward_request::Op::TxnGetRow(v) => {
+                    struct_ser.serialize_field("txn_get_row", v)?;
+                }
+                forward_request::Op::TxnWrite(v) => {
+                    struct_ser.serialize_field("txn_write", v)?;
+                }
+                forward_request::Op::Commit(v) => {
+                    struct_ser.serialize_field("commit", v)?;
+                }
+                forward_request::Op::Abort(v) => {
+                    struct_ser.serialize_field("abort", v)?;
+                }
+                forward_request::Op::OpenSnapshot(v) => {
+                    struct_ser.serialize_field("open_snapshot", v)?;
+                }
+                forward_request::Op::ReleaseSnapshot(v) => {
+                    struct_ser.serialize_field("release_snapshot", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6263,6 +6287,19 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "batch",
             "multi_get",
             "multiGet",
+            "begin",
+            "txn_get",
+            "txnGet",
+            "txn_get_row",
+            "txnGetRow",
+            "txn_write",
+            "txnWrite",
+            "commit",
+            "abort",
+            "open_snapshot",
+            "openSnapshot",
+            "release_snapshot",
+            "releaseSnapshot",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6276,6 +6313,14 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             MutateReturning,
             Batch,
             MultiGet,
+            Begin,
+            TxnGet,
+            TxnGetRow,
+            TxnWrite,
+            Commit,
+            Abort,
+            OpenSnapshot,
+            ReleaseSnapshot,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6306,6 +6351,14 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "mutateReturning" | "mutate_returning" => Ok(GeneratedField::MutateReturning),
                             "batch" => Ok(GeneratedField::Batch),
                             "multiGet" | "multi_get" => Ok(GeneratedField::MultiGet),
+                            "begin" => Ok(GeneratedField::Begin),
+                            "txnGet" | "txn_get" => Ok(GeneratedField::TxnGet),
+                            "txnGetRow" | "txn_get_row" => Ok(GeneratedField::TxnGetRow),
+                            "txnWrite" | "txn_write" => Ok(GeneratedField::TxnWrite),
+                            "commit" => Ok(GeneratedField::Commit),
+                            "abort" => Ok(GeneratedField::Abort),
+                            "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
+                            "releaseSnapshot" | "release_snapshot" => Ok(GeneratedField::ReleaseSnapshot),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6393,6 +6446,62 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::MultiGet)
 ;
                         }
+                        GeneratedField::Begin => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("begin"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Begin)
+;
+                        }
+                        GeneratedField::TxnGet => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("txnGet"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TxnGet)
+;
+                        }
+                        GeneratedField::TxnGetRow => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("txnGetRow"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TxnGetRow)
+;
+                        }
+                        GeneratedField::TxnWrite => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("txnWrite"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TxnWrite)
+;
+                        }
+                        GeneratedField::Commit => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("commit"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Commit)
+;
+                        }
+                        GeneratedField::Abort => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("abort"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Abort)
+;
+                        }
+                        GeneratedField::OpenSnapshot => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("openSnapshot"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::OpenSnapshot)
+;
+                        }
+                        GeneratedField::ReleaseSnapshot => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("releaseSnapshot"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::ReleaseSnapshot)
+;
+                        }
                     }
                 }
                 Ok(ForwardRequest {
@@ -6437,6 +6546,18 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::MultiGet(v) => {
                     struct_ser.serialize_field("multi_get", v)?;
                 }
+                forward_response::Reply::Begin(v) => {
+                    struct_ser.serialize_field("begin", v)?;
+                }
+                forward_response::Reply::Commit(v) => {
+                    struct_ser.serialize_field("commit", v)?;
+                }
+                forward_response::Reply::OpenSnapshot(v) => {
+                    struct_ser.serialize_field("open_snapshot", v)?;
+                }
+                forward_response::Reply::Empty(v) => {
+                    struct_ser.serialize_field("empty", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6459,6 +6580,11 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "mutateReturning",
             "multi_get",
             "multiGet",
+            "begin",
+            "commit",
+            "open_snapshot",
+            "openSnapshot",
+            "empty",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6469,6 +6595,10 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             CheckAndMutate,
             MutateReturning,
             MultiGet,
+            Begin,
+            Commit,
+            OpenSnapshot,
+            Empty,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6496,6 +6626,10 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "checkAndMutate" | "check_and_mutate" => Ok(GeneratedField::CheckAndMutate),
                             "mutateReturning" | "mutate_returning" => Ok(GeneratedField::MutateReturning),
                             "multiGet" | "multi_get" => Ok(GeneratedField::MultiGet),
+                            "begin" => Ok(GeneratedField::Begin),
+                            "commit" => Ok(GeneratedField::Commit),
+                            "openSnapshot" | "open_snapshot" => Ok(GeneratedField::OpenSnapshot),
+                            "empty" => Ok(GeneratedField::Empty),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6558,6 +6692,34 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("multiGet"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::MultiGet)
+;
+                        }
+                        GeneratedField::Begin => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("begin"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Begin)
+;
+                        }
+                        GeneratedField::Commit => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("commit"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Commit)
+;
+                        }
+                        GeneratedField::OpenSnapshot => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("openSnapshot"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::OpenSnapshot)
+;
+                        }
+                        GeneratedField::Empty => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("empty"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Empty)
 ;
                         }
                     }
@@ -6903,6 +7065,9 @@ impl serde::Serialize for ForwardedCaller {
         if self.all_namespaces {
             len += 1;
         }
+        if !self.token_digest.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardedCaller", len)?;
         if !self.scope.is_empty() {
             struct_ser.serialize_field("scope", &self.scope)?;
@@ -6912,6 +7077,11 @@ impl serde::Serialize for ForwardedCaller {
         }
         if self.all_namespaces {
             struct_ser.serialize_field("all_namespaces", &self.all_namespaces)?;
+        }
+        if !self.token_digest.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("token_digest", pbjson::private::base64::encode(&self.token_digest).as_str())?;
         }
         struct_ser.end()
     }
@@ -6927,6 +7097,8 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
             "namespaces",
             "all_namespaces",
             "allNamespaces",
+            "token_digest",
+            "tokenDigest",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6934,6 +7106,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
             Scope,
             Namespaces,
             AllNamespaces,
+            TokenDigest,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6958,6 +7131,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                             "scope" => Ok(GeneratedField::Scope),
                             "namespaces" => Ok(GeneratedField::Namespaces),
                             "allNamespaces" | "all_namespaces" => Ok(GeneratedField::AllNamespaces),
+                            "tokenDigest" | "token_digest" => Ok(GeneratedField::TokenDigest),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6980,6 +7154,7 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                 let mut scope__ = None;
                 let mut namespaces__ = None;
                 let mut all_namespaces__ = None;
+                let mut token_digest__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Scope => {
@@ -7000,12 +7175,21 @@ impl<'de> serde::Deserialize<'de> for ForwardedCaller {
                             }
                             all_namespaces__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::TokenDigest => {
+                            if token_digest__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("tokenDigest"));
+                            }
+                            token_digest__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(ForwardedCaller {
                     scope: scope__.unwrap_or_default(),
                     namespaces: namespaces__.unwrap_or_default(),
                     all_namespaces: all_namespaces__.unwrap_or_default(),
+                    token_digest: token_digest__.unwrap_or_default(),
                 })
             }
         }

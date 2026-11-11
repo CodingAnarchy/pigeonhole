@@ -12,7 +12,7 @@ use super::auth::Caller;
 use super::cluster::forward::{self, Forwarder};
 use super::cluster::route::Routes;
 use super::errors::ApiError;
-use super::proto::{ForwardRequest, RowWrites};
+use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
 use super::service::{Partition, Service, ServiceOp, ServiceReply};
 
@@ -50,6 +50,11 @@ impl Router {
         local: Option<String>,
     ) -> Self {
         let forwarder = Arc::new(Forwarder::new(Arc::clone(&node)));
+        // Its sessions' ids name its partition, so any node routes a call on one (ticket 3).
+        let service = match &local {
+            Some(p) => service.sessions_on(p),
+            None => service,
+        };
         Self {
             service: Arc::new(service),
             cluster: Some(Cluster {
@@ -178,9 +183,11 @@ impl Router {
     ) -> Result<ServiceReply, ApiError> {
         if let Some(cluster) = &self.cluster {
             // A read across a table's partitions fans out (D317 ticket 4a); a subscription
-            // follows every partition it covers (ticket 7).
-            match op {
-                ServiceOp::MultiGet(_) => {
+            // follows every partition it covers (ticket 7). One at a snapshot reads its
+            // partition only (ticket 3): a multi-get is routed and forwarded as a single-key
+            // call is, a scan streams that partition alone.
+            match &op {
+                ServiceOp::MultiGet(r) if snapshot_of(r.selection.as_ref()).is_none() => {
                     let deadline = deadline.map_or_else(
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
@@ -243,7 +250,7 @@ impl Router {
                 .ok_or_else(ApiError::deadline_exceeded)
         };
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
-        let writes = op.writes();
+        let writes = forward_writes(&op);
         let req = ForwardRequest {
             map_version: owner.map_version,
             caller: Some(forward::forwarded_caller(caller)?),
@@ -294,7 +301,7 @@ impl Router {
         // A read's reply is charged here too, for this node's own client: its front-end
         // holds the charge until the reply is written (#1567, cli692's F1 on ticket 2).
         match reply {
-            ServiceReply::Get(_) | ServiceReply::ReadRow(_) => {
+            ServiceReply::Get(_) | ServiceReply::ReadRow(_) | ServiceReply::MultiGet(_) => {
                 self.service.charge_built(caller, reply).await
             }
             reply => Ok(reply),
@@ -437,9 +444,12 @@ impl Cluster {
     }
 }
 
-/// The partition `op` goes to on a cluster node: a single-key call's, or a batch's when all
-/// its rows are in one. Everything else is refused until its D317 ticket.
-fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
+/// The partition `op` goes to on a cluster node: a single-key call's, a batch's when all
+/// its rows are in one, and a transaction's or snapshot's (D317 ticket 3): its `route` when
+/// it begins, then the partition its id names, with every row it reads or writes checked to
+/// be in it (`CrossPartition`). The owner routes a forwarded call again, so it checks too.
+/// Everything else is refused until its D317 ticket.
+pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
     let one = |table: &str, row: &[u8]| {
         routes
             .partition(table, row)
@@ -453,17 +463,39 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
             .ok_or_else(|| ApiError::invalid("the writes name no row"))?;
         one(&key.table, &key.row)
     };
-    match op {
-        ServiceOp::Get(r) if !r.snapshot_id.is_empty() => Err(later("a snapshot", 3)),
-        ServiceOp::Get(r) => one(&r.table, &r.row),
-        ServiceOp::ReadRow(r)
-            if r.selection
-                .as_ref()
-                .is_some_and(|s| !s.snapshot_id.is_empty()) =>
-        {
-            Err(later("a snapshot", 3))
+    // A session's partition, from its id; a row of `table` must be in it.
+    let session = |id: &str, what: &str| session_partition(routes, id, what);
+    let within = |p: String, what: &str, table: &str, row: &[u8]| {
+        let q = one(table, row)?;
+        if q == p {
+            Ok(p)
+        } else {
+            Err(outside(what, &p, &q, table, row))
         }
-        ServiceOp::ReadRow(r) => one(&r.table, &r.row),
+    };
+    let rows_within = |p: String, what: &str, rows: &[RowWrites]| {
+        for w in rows {
+            let key = w
+                .row
+                .as_ref()
+                .ok_or_else(|| ApiError::invalid("the writes name no row"))?;
+            let q = one(&key.table, &key.row)?;
+            if q != p {
+                return Err(outside(what, &p, &q, &key.table, &key.row));
+            }
+        }
+        Ok(p)
+    };
+    match op {
+        ServiceOp::Get(r) if !r.snapshot_id.is_empty() => {
+            let p = session(&r.snapshot_id, "snapshot")?;
+            within(p, "the snapshot", &r.table, &r.row)
+        }
+        ServiceOp::Get(r) => one(&r.table, &r.row),
+        ServiceOp::ReadRow(r) => match snapshot_of(r.selection.as_ref()) {
+            Some(id) => within(session(id, "snapshot")?, "the snapshot", &r.table, &r.row),
+            None => one(&r.table, &r.row),
+        },
         ServiceOp::Mutate(r) | ServiceOp::MutateReturning(r) => writes(&r.writes),
         ServiceOp::CheckAndMutate(r) => writes(&r.writes),
         ServiceOp::Batch(r) => {
@@ -495,34 +527,84 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
                 ))),
             }
         }
-        ServiceOp::Begin(_)
-        | ServiceOp::TxnGet(_)
-        | ServiceOp::TxnGetRow(_)
-        | ServiceOp::TxnWrite(_)
-        | ServiceOp::Commit(_)
-        | ServiceOp::Abort(_) => Err(later("a transaction", 3)),
-        ServiceOp::OpenSnapshot(_) | ServiceOp::ReleaseSnapshot(_) => Err(later("a snapshot", 3)),
-        // One partition's keys of a multi-get another node fans out (D317 ticket 4a): every
-        // key in that partition. A client's multi-get fans out before it gets here.
-        ServiceOp::MultiGet(r) => {
-            let mut parts = r.keys.iter().map(|k| one(&r.table, k));
-            match parts.next() {
-                None => Err(ApiError::invalid("a forwarded multi-get with no keys")),
-                Some(first) => {
-                    let first = first?;
-                    for p in parts {
-                        if p? != first {
-                            return Err(ApiError::invalid(
-                                "a forwarded multi-get's keys are in more than one partition",
-                            ));
-                        }
+        ServiceOp::Begin(r) => begins(routes, r.route.as_ref(), "a transaction"),
+        ServiceOp::OpenSnapshot(r) => begins(routes, r.route.as_ref(), "a snapshot"),
+        ServiceOp::TxnGet(r) => {
+            let p = session(&r.txn_id, "transaction")?;
+            within(p, "the transaction", &r.table, &r.row)
+        }
+        ServiceOp::TxnGetRow(r) => {
+            let p = session(&r.txn_id, "transaction")?;
+            within(p, "the transaction", &r.table, &r.row)
+        }
+        ServiceOp::TxnWrite(r) => rows_within(
+            session(&r.txn_id, "transaction")?,
+            "the transaction",
+            &r.rows,
+        ),
+        ServiceOp::Commit(r) => rows_within(
+            session(&r.txn_id, "transaction")?,
+            "the transaction",
+            &r.rows,
+        ),
+        ServiceOp::Abort(r) => session(&r.txn_id, "transaction"),
+        ServiceOp::ReleaseSnapshot(r) => session(&r.snapshot_id, "snapshot"),
+        // A read at a snapshot stays in the snapshot's partition (cli692's S3 on ticket 3).
+        // Without one, a client's fans out before it gets here (ticket 4a), and this is one
+        // partition's keys of a multi-get another node fans out: every key in it.
+        ServiceOp::MultiGet(r) => match snapshot_of(r.selection.as_ref()) {
+            Some(id) => {
+                let p = session(id, "snapshot")?;
+                for k in &r.keys {
+                    let q = one(&r.table, k)?;
+                    if q != p {
+                        return Err(outside("the snapshot", &p, &q, &r.table, k));
                     }
-                    Ok(first)
+                }
+                Ok(p)
+            }
+            None => {
+                let mut parts = r.keys.iter().map(|k| one(&r.table, k));
+                match parts.next() {
+                    None => Err(ApiError::invalid("a forwarded multi-get with no keys")),
+                    Some(first) => {
+                        let first = first?;
+                        for p in parts {
+                            if p? != first {
+                                return Err(ApiError::invalid(
+                                    "a forwarded multi-get's keys are in more than one partition",
+                                ));
+                            }
+                        }
+                        Ok(first)
+                    }
                 }
             }
-        }
-        ServiceOp::Scan(_)
-        | ServiceOp::Nearest(_)
+        },
+        // A scan fans out before it gets here (ticket 4a); one at a snapshot reads only the
+        // snapshot's partition, which this checks.
+        ServiceOp::Scan(r) => match snapshot_of(r.selection.as_ref()) {
+            Some(id) => {
+                let p = session(id, "snapshot")?;
+                let span = scan_span(routes, r)?;
+                match span.iter().find(|q| **q != p) {
+                    None => Ok(p),
+                    Some(q) => Err(ApiError::cross_partition(format!(
+                        "the scan of table {:?} reaches partition {q}, and the snapshot is \
+                         partition {p}'s: a snapshot reads one partition",
+                        r.table
+                    ))),
+                }
+            }
+            None => Err(later("a read across partitions", 4)),
+        },
+        ServiceOp::Nearest(r) if !r.snapshot_id.is_empty() => Err(ApiError::unsupported(
+            "a nearest-neighbour search at a snapshot isn't supported on a cluster",
+        )),
+        ServiceOp::Traverse(r) if !r.snapshot_id.is_empty() => Err(ApiError::unsupported(
+            "a traversal at a snapshot isn't supported on a cluster",
+        )),
+        ServiceOp::Nearest(_)
         | ServiceOp::Traverse(_)
         | ServiceOp::VectorSearch(_)
         | ServiceOp::TextSearch(_) => Err(later("a read across partitions", 4)),
@@ -540,6 +622,99 @@ fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
             "this call isn't served by a cluster node (D317)",
         )),
     }
+}
+
+/// A read's snapshot, if it names one.
+pub(crate) fn snapshot_of(s: Option<&Selection>) -> Option<&str> {
+    s.map(|s| s.snapshot_id.as_str())
+        .filter(|id| !id.is_empty())
+}
+
+/// Where a transaction or snapshot begins on a cluster: its `route`, which every cluster
+/// requires, one partition or many (cli692's S2 on ticket 3), so a client doesn't break
+/// when the map gains one.
+fn begins(routes: &Routes, key: Option<&RoutingKey>, what: &str) -> Result<String, ApiError> {
+    match key.and_then(|k| k.key.as_ref()) {
+        Some(routing_key::Key::Row(k)) => routes
+            .partition(&k.table, &k.row)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ApiError::not_found(format!("table {:?} isn't in the cluster map", k.table))
+            }),
+        Some(routing_key::Key::Partition(p)) => {
+            if routes.owner(p).is_some() {
+                Ok(p.clone())
+            } else {
+                Err(ApiError::not_found(format!(
+                    "the cluster map has no partition {p:?}"
+                )))
+            }
+        }
+        None => Err(ApiError::invalid(format!(
+            "{what} on a cluster names where it runs: `route`, a row or a partition"
+        ))),
+    }
+}
+
+/// The partition a session id names (`<partition>:<32 hex>`). Any other form, or a
+/// partition the map doesn't list, is `NotFound`, as an unknown id is on a single node.
+fn session_partition(routes: &Routes, id: &str, what: &str) -> Result<String, ApiError> {
+    super::sessions::partition_of(id)
+        .map(|(p, _)| p)
+        .filter(|p| routes.owner(p).is_some())
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::not_found(format!("no such {what}")))
+}
+
+/// A row outside a session's partition (D317 ticket 3).
+fn outside(what: &str, session: &str, row_partition: &str, table: &str, row: &[u8]) -> ApiError {
+    ApiError::cross_partition(format!(
+        "row {table}/{} is in partition {row_partition}, and {what} is partition {session}'s: \
+         a transaction or snapshot stays in one partition",
+        row.escape_ascii()
+    ))
+}
+
+/// The partitions a scan's range reaches.
+fn scan_span<'a>(routes: &'a Routes, r: &ScanRequest) -> Result<Vec<&'a str>, ApiError> {
+    use super::proto::key_range::Range;
+    let (lo, hi): (&[u8], Option<(Vec<u8>, bool)>) =
+        match r.range.as_ref().and_then(|k| k.range.as_ref()) {
+            None => (&[], None),
+            Some(Range::Prefix(p)) => (p, prefix_end(p).map(|e| (e, false))),
+            Some(Range::Bounds(b)) => (
+                b.start.as_ref().map_or(&[][..], |s| &s.key[..]),
+                b.end.as_ref().map(|e| (e.key.to_vec(), e.inclusive)),
+            ),
+        };
+    routes
+        .span(
+            &r.table,
+            lo,
+            hi.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+        )
+        .ok_or_else(|| ApiError::not_found(format!("table {:?} isn't in the cluster map", r.table)))
+}
+
+/// The first key after every key starting with `prefix`; `None` when there is none (all
+/// `0xff`, or empty).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Whether a forward of `op` that fails after it was sent leaves an outcome unknown (B3):
+/// a write, and a transaction's buffered writes, commit and abort (ticket 3).
+fn forward_writes(op: &ServiceOp) -> bool {
+    // `TxnWrite` needs write scope, so `writes()` has it; a `Commit` without rows commits
+    // the buffered ones.
+    op.writes() || matches!(op, ServiceOp::Commit(_) | ServiceOp::Abort(_))
 }
 
 /// A partition the map gives this node that it doesn't have open: it opens partitions at

@@ -923,7 +923,7 @@ pub(crate) async fn serve(
     service: &Service,
     req: proto::ForwardSubscribeRequest,
 ) -> Result<FeedEvents, ApiError> {
-    let caller = super::forward::caller_of(req.caller)?;
+    let caller = super::forward::caller_of(req.caller, &node.tokens)?;
     let r = req
         .request
         .ok_or_else(|| ApiError::invalid("a ForwardSubscribe carries no request"))?;
