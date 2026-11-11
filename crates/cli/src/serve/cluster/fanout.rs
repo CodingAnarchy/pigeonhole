@@ -225,6 +225,37 @@ async fn race(
 }
 
 impl Router {
+    /// The first of `groups` (each from its start) whose keys have a cell, after a page
+    /// that used its whole budget: probed with a one-byte budget, which returns an empty
+    /// page with a position when a cell is there. The first group's read ahead answers for
+    /// it when there is one. A partition that can't be read is taken to have one, so the
+    /// resume reads it and reports what it answers.
+    async fn first_with_cells<'a>(
+        &'a self,
+        reach: &'a Reach,
+        groups: &[(&PartRange, Vec<prost::bytes::Bytes>)],
+        caller: &Caller,
+        ahead: &mut Option<Read<'a>>,
+        ahead_done: &mut Option<Result<MultiGetResponse, ApiError>>,
+        sub: &impl Fn(Vec<prost::bytes::Bytes>, Option<&Vec<u8>>, u64) -> MultiGetRequest,
+    ) -> Option<String> {
+        for (i, (range, mine)) in groups.iter().enumerate() {
+            let page = match (i, ahead_done.take(), ahead.take()) {
+                (0, Some(done), _) => done,
+                (0, None, Some(f)) => f.await,
+                _ => {
+                    self.multi_get_part(reach, &range.partition, sub(mine.clone(), None, 1), caller)
+                        .await
+                }
+            };
+            match page {
+                Ok(p) if p.rows.is_empty() && p.next.is_empty() => {}
+                _ => return Some(range.partition.clone()),
+            }
+        }
+        None
+    }
+
     /// One partition's page of a multi-get: here, or forwarded to its node (once more after
     /// a `WrongPartition`, with the newer map).
     async fn multi_get_part(
@@ -351,11 +382,24 @@ impl Router {
         let mut ahead_done = None;
         for (i, (range, mine)) in groups.iter().enumerate() {
             if left == 0 {
-                // The budget ended exactly at a partition's end (simp724's M1).
-                next = Some(Position {
-                    partition: range.partition.clone(),
-                    inner: None,
-                });
+                // The budget ended exactly at a partition's end (simp724's M1). A single
+                // node gives a position only when a cell is left that didn't fit, so this
+                // page resumes at the first later partition with a cell for the keys, and
+                // has no `next` when none has one (#1698's seed 1794362533986056000).
+                next = self
+                    .first_with_cells(
+                        &reach,
+                        &groups[i..],
+                        caller,
+                        &mut ahead,
+                        &mut ahead_done,
+                        &sub,
+                    )
+                    .await
+                    .map(|partition| Position {
+                        partition,
+                        inner: None,
+                    });
                 break;
             }
             let inner = inner_of(range);
