@@ -21,6 +21,7 @@ pub(crate) mod schema;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
+pub(crate) mod upload;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -220,6 +221,11 @@ impl Node {
 
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The node's cluster directory (`--cluster`).
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, MapState> {
@@ -880,7 +886,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             }
             _ => forward::caller_of(msg.caller, &self.0.tokens)?,
         };
-        let reply = shared.router.serve_forwarded(op, &caller).await?;
+        let reply = shared
+            .router
+            .serve_forwarded(op, &caller, msg.fanout_part)
+            .await?;
         let (reply, charge) = forward::reply_to_forward(reply)?;
         let mut resp = tonic::Response::new(reply);
         // A read's charge lasts until the reply's body is written: `routes` holds it there.
@@ -1216,6 +1225,7 @@ pub(crate) fn run(
             args.io_threads,
             args.blocking_threads,
             args.feed_threads,
+            args.feed_hub_threads,
             args.affinity == super::config::Affinity::On,
         )
     });
@@ -1259,7 +1269,8 @@ pub(crate) fn run(
         )
     };
     let shared = Arc::new(super::Shared {
-        router: super::router::Router::cluster(service, Arc::clone(&node), parts),
+        router: super::router::Router::cluster(service, Arc::clone(&node), parts)
+            .max_uploads(args.max_uploads),
         // The data calls' tokens: the same file the node's own calls read.
         tokens: super::tokens(args)?,
         limits,

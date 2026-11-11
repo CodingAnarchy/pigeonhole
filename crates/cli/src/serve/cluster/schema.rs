@@ -417,6 +417,7 @@ impl Router {
                 .map(|n| n.address.clone())
                 .unwrap_or_default();
             let req = ForwardRequest {
+                fanout_part: false,
                 map_version: map.map_version,
                 caller: Some(super::forward::forwarded_caller(caller)?),
                 op: Some(op.clone()),
@@ -639,9 +640,13 @@ mod tests {
     use pigeonhole::{Family, Options, Pigeonhole};
 
     fn db() -> Pigeonhole {
+        // A count as well as the time: tests run in parallel, and two in one clock tick
+        // would otherwise open one file (`WriterLocked`).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "phdb-schema-{}-{}",
+            "phdb-schema-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -691,6 +691,11 @@ impl Feeds {
         let _ = self.hub_runtime.set(hubs);
     }
 
+    /// The hub runtime's threads (#1719), once `run_on` set it.
+    pub(crate) fn hub_threads(&self) -> Option<usize> {
+        self.hub_runtime.get().map(|h| h.metrics().num_workers())
+    }
+
     /// Spawns a hub's task on the hub runtime, or as [`spawn`](Self::spawn) does without one.
     fn spawn_hub<F>(&self, f: F) -> tokio::task::JoinHandle<F::Output>
     where
@@ -758,9 +763,11 @@ impl Feeds {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "phdb serve: feed dump: {} hubs, database seqno {}; catch-up slots {}/{max_catch_up} in use; \
-             fell behind {}, rejoined {}, catch-up waits {}, hub failures {}",
+            "phdb serve: feed dump: {} hubs on {} hub threads, database seqno {}; catch-up slots \
+             {}/{max_catch_up} in use; fell behind {}, rejoined {}, catch-up waits {}, hub failures {}",
             hubs.len(),
+            self.hub_threads()
+                .map_or_else(|| "?".into(), |n| n.to_string()),
             db_seqno.map_or_else(|| "?".into(), |s| s.to_string()),
             max_catch_up - self.catch_up.available_permits(),
             st.fell_behind.load(Ordering::Relaxed),
@@ -1989,6 +1996,12 @@ mod tests {
             assert_eq!(feeds.stats.hub_moves.load(Ordering::Relaxed), 2);
             drop(a);
         });
+        // The dump names the hub runtime's threads (#1719): one here.
+        assert!(
+            feeds.dump().contains(" hubs on 1 hub threads,"),
+            "{}",
+            feeds.dump()
+        );
         drop(t);
         drop(requests);
         drop(delivery);

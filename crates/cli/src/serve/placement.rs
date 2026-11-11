@@ -209,9 +209,12 @@ pub(crate) struct Placement {
     pub blocking_threads: usize,
     /// The feed delivery runtime's workers (ticket 5's (A)).
     pub feed_threads: usize,
-    /// The feed hubs' runtime's workers: a quarter of the feed threads, at least 1 (#1397's
-    /// 16 hubs × 16, where the hubs fell behind their engine feeds queued behind the
-    /// clients' tasks on the feed runtime). Placed on the same CPUs, so the OS shares them.
+    /// The feed hubs' runtime's workers: a quarter of the feed threads, at least 1, or
+    /// `--feed-hub-threads` (#1719). A runtime of their own, so a hub never queues behind its
+    /// clients' tasks (#1397's 16 hubs × 16), placed on the same CPUs, so the OS shares them.
+    /// The default keeps writers first (the coordinator's policy on #1719): in g76c, every
+    /// count above it cost put p50 13–38% at moderate fan-out load and delivered fewer events
+    /// when saturated. A feed-heavy server with CPUs to spare raises it.
     pub hub_threads: usize,
     /// The CPUs outside the shards' (Linux, when the engine pinned any).
     #[cfg(target_os = "linux")]
@@ -245,6 +248,7 @@ impl Placement {
         io: Option<usize>,
         blocking: Option<usize>,
         feed: Option<usize>,
+        hubs: Option<usize>,
         affinity: bool,
     ) -> Self {
         // Every engine's pinned shard threads: the union across a node's partitions (D317
@@ -279,7 +283,7 @@ impl Placement {
         // left the network side short and every split run fell behind; 9 + 3 kept up.
         let feed_threads = feed.unwrap_or(free / 4).max(1);
         Self {
-            hub_threads: feed_threads.div_ceil(4).max(1),
+            hub_threads: hubs.unwrap_or_else(|| feed_threads.div_ceil(4)).max(1),
             io_threads: io
                 .unwrap_or(free.saturating_sub(feed_threads).max(2))
                 .max(1),
@@ -629,7 +633,7 @@ mod tests {
             Options::default().create_if_missing(true).shards(1),
         )
         .unwrap();
-        let plan = Placement::plan(&[&db], None, None, None, true);
+        let plan = Placement::plan(&[&db], None, None, None, None, true);
         assert!(
             plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
@@ -642,10 +646,13 @@ mod tests {
                 "{plan:?}"
             );
         }
-        let given = Placement::plan(&[&db], Some(3), Some(5), Some(2), true);
-        assert_eq!((given.io_threads, given.feed_threads), (3, 2));
+        let given = Placement::plan(&[&db], Some(3), Some(5), Some(2), Some(7), true);
+        assert_eq!(
+            (given.io_threads, given.feed_threads, given.hub_threads),
+            (3, 2, 7)
+        );
         // `--affinity off`: the same threads, with no mask (ICR 0131).
-        let off = Placement::plan(&[&db], None, None, None, false);
+        let off = Placement::plan(&[&db], None, None, None, None, false);
         assert_eq!(
             (
                 off.io_threads,
@@ -668,13 +675,22 @@ mod tests {
             ["unpinned", "unmasked (--affinity off)"].contains(&off.mode),
             "{off:?}"
         );
-        // The hubs' threads: a quarter of the feed threads, rounded up, at least 1.
+        // The hubs' threads: a quarter of the feed threads, rounded up, at least 1 (#1719 keeps
+        // C's default), and `--feed-hub-threads` as given.
         for (feed, hubs) in [(1, 1), (2, 1), (3, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
             assert_eq!(
-                Placement::plan(&[&db], None, None, Some(feed), true).hub_threads,
+                Placement::plan(&[&db], None, None, Some(feed), None, true).hub_threads,
                 hubs
             );
         }
+        assert_eq!(
+            Placement::plan(&[&db], None, None, Some(4), Some(1), true).hub_threads,
+            1
+        );
+        assert_eq!(
+            Placement::plan(&[&db], None, None, Some(4), Some(0), true).hub_threads,
+            1
+        );
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         let p = plan.clone();
         std::thread::spawn(move || p.enter()).join().unwrap();

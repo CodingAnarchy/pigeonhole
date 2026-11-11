@@ -143,11 +143,16 @@ pub(crate) struct ServeArgs {
     pub blocking_threads: Option<usize>,
     /// Threads that deliver the change feed to its streams, a runtime of their own so feed
     /// delivery never holds a request's worker (default: a quarter of the CPUs the shards
-    /// don't use, at least 1, taken from `--io-threads`' default). The feed's shared
-    /// subscriptions (hubs) read the engine on a quarter as many threads again, at least 1,
-    /// so a hub never waits behind its streams' delivery.
+    /// don't use, at least 1, taken from `--io-threads`' default).
     #[arg(long, value_name = "N")]
     pub feed_threads: Option<usize>,
+    /// Threads that read the engine's change feed into the shared subscriptions (hubs), a
+    /// runtime of their own so a hub never waits behind its streams' delivery (default: a
+    /// quarter of `--feed-threads`, at least 1). More let many busy subscriptions keep up,
+    /// at a cost to the writes' latency on the same CPUs (#1719). A hub with a single stream
+    /// runs on the feed threads beside it instead (#1689).
+    #[arg(long, value_name = "N")]
+    pub feed_hub_threads: Option<usize>,
     /// Whether the network, feed and blocking threads get a CPU mask off the shards' cores
     /// (Linux, where the engine pinned its shards). `off` keeps the same thread counts but
     /// leaves the threads where the OS puts them: for a host shared with other work, where
@@ -193,6 +198,10 @@ pub(crate) struct ServeArgs {
     /// more are refused (`Overloaded`).
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub max_backups: usize,
+    /// A cluster node's partition uploads at once (`Admin.PartitionUpload`, a restore's or a
+    /// relocation's files, D317); more are refused (`Overloaded`).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub max_uploads: usize,
     /// Turn the change feed on, keeping up to this many bytes of history: `Feed.Subscribe`
     /// and replicas (`Replication.Follow`) read it. Without it, a database whose feed is on
     /// keeps it (the open inherits it). A replica that falls further behind than this
