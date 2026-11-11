@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::{
-    ClusterMap, GetMapRequest, Node as MapNode, Partition, SetMapRequest, SplitKey, StatusRequest,
-    TablePlacement, split_key,
+    ClusterMap, GetMapRequest, Node as MapNode, Partition, PushMapRequest, SetMapRequest, SplitKey,
+    StatusRequest, TablePlacement, split_key,
 };
 use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
@@ -3442,9 +3442,13 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             "{e:?}"
         );
         let p1_epoch = history(&forced, "p1").0;
-        if let Err(e) = super::cli::set_map(&args(ports[1]), forced, true).await {
-            panic!("the forced map: {e:?}");
-        }
+        let report = match super::cli::set_map(&args(ports[1]), forced, true).await {
+            Ok(r) => r,
+            Err(e) => panic!("the forced map: {e:?}"),
+        };
+        // a couldn't be reached, so the forced epochs weren't checked against its map: the
+        // report names it.
+        assert_eq!(report.document["unchecked"], serde_json::json!(["a"]));
         let v = current.map_version + 1;
         assert_eq!((version(ports[1]).await, version(ports[2]).await), (v, v));
         // p1's history restarts at its new epoch, on b and on c, which took b's push; p2's,
@@ -3538,6 +3542,105 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
     for db in dbs.into_iter().flatten() {
         let _ = db.close();
     }
+}
+
+#[test]
+fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
+    // simp724's F1 and F2 on #1729: a forced map's `history_epoch` is derived against the
+    // receiving node's map, so its epochs must be new. The node refuses one that goes back
+    // or moves a partition at a kept epoch (F1); `set-map --force` refuses one below, or
+    // moved at, an epoch a reachable node has, even when the receiving node is behind (F2).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let args = |port: u16| super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{port}"),
+        token_file: None,
+        ca: None,
+    };
+    let with_p3 = |m: &ClusterMap, version: u64, node: &str, epoch: u64| {
+        let mut m = m.clone();
+        m.map_version = version;
+        for p in &mut m.partitions {
+            if p.id == "p3" {
+                p.node = node.into();
+                p.epoch = epoch;
+                p.history_epoch = epoch;
+            }
+        }
+        m
+    };
+    rt.block_on(async {
+        let v1 = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        // b and c take a map that raised p3's epoch to 2; a doesn't, so it's behind.
+        let v2 = with_p3(&v1, 2, "c", 2);
+        for &port in &ports[1..] {
+            client(port)
+                .await
+                .push_map(PushMapRequest {
+                    map: Some(v2.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        let force_at = |port: u16, map: ClusterMap| async move {
+            client(port)
+                .await
+                .set_map(SetMapRequest {
+                    copies: Vec::new(),
+                    force: true,
+                    expected_map_version: 0,
+                    map: Some(map),
+                })
+                .await
+        };
+        // F1, at b: p3's epoch can't go back to 1, and p3 can't move to a at epoch 2.
+        for (map, why) in [
+            (with_p3(&v2, 3, "c", 1), "epoch went back from 2 to 1"),
+            (with_p3(&v2, 3, "a", 2), "without a new epoch"),
+        ] {
+            let e = force_at(ports[1], map).await.unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+            assert!(e.message().contains(why), "{e:?}");
+        }
+        assert_eq!(version(ports[1]).await, 2, "nothing was set at b");
+        // F2, at a, whose own map (p3 at 1 on c) accepts both: b's and c's don't.
+        for (map, why) in [
+            (with_p3(&v1, 3, "c", 1), "epoch went back from 2 to 1"),
+            (with_p3(&v1, 3, "b", 2), "without a new epoch"),
+        ] {
+            assert_eq!(version(ports[0]).await, 1, "a is still behind");
+            let Err(e) = super::cli::set_map(&args(ports[0]), map, true).await else {
+                panic!("a forced map reusing an epoch b and c have was set ({why})");
+            };
+            let e = format!("{e:?}");
+            assert!(
+                e.contains("has a newer placement than the forced map"),
+                "{e}"
+            );
+            assert!(e.contains(why), "{e}");
+        }
+        for &port in &ports {
+            assert!(version(port).await <= 2, "no forced map was set");
+        }
+        // An epoch above every node's is set, and nothing is unchecked: all three answered.
+        let r = super::cli::set_map(&args(ports[0]), with_p3(&v1, 3, "b", 3), true)
+            .await
+            .unwrap();
+        assert_eq!(r.document["unchecked"], serde_json::json!([]));
+        let m = client(ports[2])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert_eq!((p3.node.as_str(), p3.epoch, p3.history_epoch), ("b", 3, 3));
+    });
 }
 
 mod backup;

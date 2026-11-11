@@ -324,7 +324,10 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
   - an epoch raised by a relocation by copy keeps it;
   - any other raise (a promotion, a restore) sets it to the new epoch;
   - a new partition's is its epoch.
-  - **A forced map** (`SetMapRequest.force`, amendment 1) is derived the same way against the receiving node's map, as a change that copied nothing, and can't list `copies` (`InvalidArgument`): a copy is a planned move, made through the writer. Against a node behind the cluster that's conservative: an epoch raise it hasn't seen restarts that partition's history, so a token can expire but never resumes across a history it doesn't share.
+  - **A forced map** (`SetMapRequest.force`, amendment 1) is derived the same way against the receiving node's map, as a change that copied nothing, and can't list `copies` (`InvalidArgument`): a copy is a planned move, made through the writer. Its epochs must be new, so no history value is used twice (simp724's F1 and F2 on #1729):
+    - **The node** refuses (`InvalidArgument`) a forced map that lowers a partition's epoch or moves it to another node at the same epoch, against its own map. The table rules of a change don't apply.
+    - **`phdb cluster set-map --force`** checks the same against every node it reaches, since the receiving node can be behind. It refuses, naming the node, and reports the nodes it couldn't reach as `unchecked`.
+    - So a token can expire across a forced map but never resumes across another history, provided no unreachable node had a newer epoch. An unchecked node is normally the down writer: check its map file (`phdb cluster show-map --file`) if it may have one.
 - **Checked:** a map whose `history_epoch` is past its `epoch` is invalid.
 - **Maps from before ticket 6** have 0. No epoch had moved then, so it reads as "never broken".
 - **Peers take it as set:** a pushed or pulled map arrives derived.

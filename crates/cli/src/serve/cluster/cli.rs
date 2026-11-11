@@ -56,7 +56,9 @@ pub(crate) enum ClusterCommand {
         /// Recovery when the map's writer (the node with the smallest id) is down: set the
         /// map at `--node` rather than the writer. Its version is put above every reachable
         /// node's, and it must name a reachable writer (remove the down one, or let another
-        /// id be the smallest). Only for a writer that's down: a writer that's up and cut
+        /// id be the smallest). No partition's epoch may go back, or stay with another node,
+        /// against any reachable node's map; unreachable nodes are reported `unchecked`.
+        /// Only for a writer that's down: a writer that's up and cut
         /// off can change the map meanwhile, and its change is lost (D317 amendment 1).
         #[arg(long)]
         force: bool,
@@ -327,6 +329,8 @@ pub(crate) async fn set_map(
         Err(s) => return Err(Failure::usage(&format!("{}: {}", args.node, s.message()))),
     };
     let mut at = args.node.clone();
+    // The nodes a forced map's epochs weren't checked against: they couldn't be reached.
+    let mut forced_unchecked: Option<Vec<String>> = None;
     let reply = if force {
         // Above every reachable node's version, and naming a writer that's reachable.
         let mut ids: Vec<(String, String)> = Vec::new();
@@ -337,18 +341,42 @@ pub(crate) async fn set_map(
         }
         let mut top = current.as_ref().map_or(0, |c| c.map_version);
         let mut live = Vec::new();
+        let mut unchecked = Vec::new();
         for (id, address) in &ids {
             let got = async {
                 let (mut c, token) = connect(args, &url_of(args, address)).await?;
-                c.status(request(StatusRequest {}, token.as_deref())?)
+                let s = c
+                    .status(request(StatusRequest {}, token.as_deref())?)
                     .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| Failure::usage(s.message()))
+                    .map_err(|s| Failure::usage(s.message()))?
+                    .into_inner();
+                let map = match c
+                    .get_map(request(GetMapRequest {}, token.as_deref())?)
+                    .await
+                {
+                    Ok(r) => Some(r.into_inner()),
+                    Err(s) if s.code() == tonic::Code::NotFound => None,
+                    Err(s) => return Err(Failure::usage(s.message())),
+                };
+                Ok((s, map))
             }
             .await;
-            if let Ok(s) = got {
-                top = top.max(s.map_version);
-                live.push(id.clone());
+            let Ok((s, map)) = got else {
+                unchecked.push(id.clone());
+                continue;
+            };
+            top = top.max(s.map_version);
+            live.push(id.clone());
+            // No partition's epoch below, or kept with another node than, one a reachable
+            // node has: a forced map's histories are then new everywhere it reaches
+            // (simp724's F2 on #1729).
+            if let Some(theirs) = map {
+                super::map::validate_epochs(&theirs, &m).map_err(|e| {
+                    Failure::usage(&format!(
+                        "node {id:?} has a newer placement than the forced map: {e}; give \
+                         each moved partition an epoch above every node's"
+                    ))
+                })?;
             }
         }
         let w = super::schema::writer(&m).to_owned();
@@ -360,6 +388,7 @@ pub(crate) async fn set_map(
             )));
         }
         m.map_version = m.map_version.max(top + 1);
+        forced_unchecked = Some(unchecked);
         c.set_map(request(
             SetMapRequest {
                 copies: Vec::new(),
@@ -402,7 +431,7 @@ pub(crate) async fn set_map(
         .map_err(|s| Failure::usage(&format!("{at}: {}", s.message())))?
         .into_inner()
     };
-    let summary = vec![
+    let mut summary = vec![
         ("node", json!(at)),
         ("map_version", json!(reply.map_version)),
         (
@@ -414,7 +443,13 @@ pub(crate) async fn set_map(
             json!(reply.pushed.iter().filter(|p| !p.ok).count()),
         ),
     ];
+    if let Some(u) = &forced_unchecked {
+        summary.push(("unchecked", json!(u.join(","))));
+    }
     let mut r = report("cluster set-map", summary, Value::Null);
+    if let Some(u) = forced_unchecked {
+        r.document.insert("unchecked".into(), json!(u));
+    }
     r.columns = ["node", "ok", "error"].into_iter().map(column).collect();
     r.rows = reply
         .pushed

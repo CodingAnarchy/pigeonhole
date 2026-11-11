@@ -187,11 +187,12 @@ enum MapSource<'a> {
     /// its partitions' `history_epoch` derived (`map::with_history`), keeping the history
     /// of each partition in `SetMapRequest.copies`.
     Change(&'a [String]),
-    /// Set here by the forced recovery (`SetMap` with `force`): only the same cluster's and
-    /// newer (`map::validate_catch_up`), with `history_epoch` derived as for a change that
-    /// copied nothing. Against a node behind the cluster that's conservative: an epoch it
-    /// hasn't seen raised restarts its partition's history, so a token can expire, never
-    /// resume across a history it doesn't share.
+    /// Set here by the forced recovery (`SetMap` with `force`): the same cluster's and newer
+    /// (`map::validate_catch_up`), with no epoch going back and no move keeping one
+    /// (`map::validate_epochs`), and `history_epoch` derived as for a change that copied
+    /// nothing. That's only as new as this node's map: `phdb cluster set-map --force`
+    /// checks the epochs against every node it reaches (simp724's F2 on #1729), so a forced
+    /// epoch is above every one the cluster used and its history value is new.
     Forced,
     /// A peer's, pushed or pulled: only the same cluster's and newer (cli692's R1), taken
     /// as it arrives, derived where it was set.
@@ -323,6 +324,9 @@ impl Node {
                     }
                     MapSource::Forced => {
                         map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
+                        // No epoch goes back and no move keeps one, so no history value is
+                        // used twice (simp724's F1 on #1729); the tables needn't step.
+                        map::validate_epochs(old, map).map_err(ApiError::invalid)?;
                         derived =
                             Some(map::with_history(old, map, &[]).map_err(ApiError::invalid)?);
                     }

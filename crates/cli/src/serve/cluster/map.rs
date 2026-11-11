@@ -258,29 +258,40 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
-        match new_partitions.get(p.id.as_str()) {
-            None if used.contains(p.id.as_str()) => {
-                return Err(format!(
-                    "partition {:?} holds a table placement and can't be dropped",
-                    p.id
-                ));
-            }
-            None => {}
-            Some(n) => {
-                if n.epoch < p.epoch {
-                    return Err(format!(
-                        "partition {:?}'s epoch went back from {} to {}",
-                        p.id, p.epoch, n.epoch
-                    ));
-                }
-                if n.node != p.node && n.epoch == p.epoch {
-                    return Err(format!(
-                        "partition {:?} moved from node {:?} to {:?} without a new epoch \
-                         (relocate it: D317 §2)",
-                        p.id, p.node, n.node
-                    ));
-                }
-            }
+        if !new_partitions.contains_key(p.id.as_str()) && used.contains(p.id.as_str()) {
+            return Err(format!(
+                "partition {:?} holds a table placement and can't be dropped",
+                p.id
+            ));
+        }
+    }
+    validate_epochs(old, new)
+}
+
+/// Checks each partition `old` and `new` both have: its epoch never goes back, and it moves
+/// to another node only with a higher epoch (D317 §2). So no epoch, and no history begun at
+/// one (ticket 6), is used twice. Part of [`validate_change`]; a forced map (amendment 1)
+/// passes it too, against the receiving node's map, and `phdb cluster set-map --force`
+/// against every node's it reaches.
+pub(crate) fn validate_epochs(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    let new_partitions: HashMap<&str, _> =
+        new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
+    for p in &old.partitions {
+        let Some(n) = new_partitions.get(p.id.as_str()) else {
+            continue;
+        };
+        if n.epoch < p.epoch {
+            return Err(format!(
+                "partition {:?}'s epoch went back from {} to {}",
+                p.id, p.epoch, n.epoch
+            ));
+        }
+        if n.node != p.node && n.epoch == p.epoch {
+            return Err(format!(
+                "partition {:?} moved from node {:?} to {:?} without a new epoch \
+                 (relocate it: D317 §2)",
+                p.id, p.node, n.node
+            ));
         }
     }
     Ok(())
@@ -295,7 +306,8 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
 ///   were copied whole. A copy must move to another node at exactly `old`'s epoch + 1.
 /// - **A new partition:** its epoch.
 ///
-/// Run after [`validate_change`] has passed the step.
+/// Run after [`validate_change`] has passed the step, or, for a forced map, after
+/// [`validate_epochs`].
 pub(crate) fn with_history(
     old: &ClusterMap,
     new: &ClusterMap,
