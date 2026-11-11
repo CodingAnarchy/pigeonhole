@@ -799,7 +799,7 @@ fn escape_label(out: &mut String, v: &str) {
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
 pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     type Read = fn(&super::feed::Feeds) -> u64;
-    let families: [(&str, &str, Read); 7] = [
+    let families: [(&str, &str, Read); 9] = [
         ("pigeonhole_serve_feed_hubs", "gauge", |f| {
             f.gauges().hubs as u64
         }),
@@ -819,6 +819,13 @@ pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)
         }),
         ("pigeonhole_serve_feed_rejoined_total", "counter", |f| {
             f.stats.rejoined.load(Ordering::Relaxed)
+        }),
+        // #1689's fast path: hubs on the feed runtime beside their one client, and moves.
+        ("pigeonhole_serve_feed_solo_hubs", "gauge", |f| {
+            f.gauges().solo_hubs as u64
+        }),
+        ("pigeonhole_serve_feed_hub_moves_total", "counter", |f| {
+            f.stats.hub_moves.load(Ordering::Relaxed)
         }),
         ("pigeonhole_serve_feed_hub_failures_total", "counter", |f| {
             f.stats.hub_failures.load(Ordering::Relaxed)
@@ -852,6 +859,7 @@ fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
         stream_idle: limits.stream_idle,
         client_events: limits.feed_client_events,
         client_bytes: limits.feed_client_bytes,
+        solo_after: super::feed::SOLO_AFTER,
     }
 }
 
