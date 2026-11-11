@@ -337,6 +337,13 @@ impl Placement {
         }
     }
 
+    /// Counts `cpus`, the node's reserved compaction CPUs its partitions' compaction threads
+    /// are confined to (ICR 0134), among the compaction CPUs the mask doesn't leave out, as
+    /// pinned ones are.
+    pub(crate) fn confined_compaction(&mut self, cpus: &[usize]) {
+        self.compaction_cpus += cpus.len();
+    }
+
     /// Whether the server's threads are masked off the shards' cores: pinning works here,
     /// and the shards are pinned.
     pub(crate) fn masked(&self) -> bool {
@@ -599,6 +606,16 @@ mod tests {
 
     /// D317 ticket 8a: a node's budget splits into equal shares, the remainder to the first
     /// partitions, and pinned compaction threads never exceed the node's total.
+    #[test]
+    fn the_reserved_compaction_cpus_count_on_the_serving_line() {
+        // perf287's 8b run: confined compaction counted nothing, so the line said "0
+        // compaction CPUs not" with four of them on 8-11.
+        let mut p = Placement::routes_only(Some(2), Some(2));
+        assert_eq!(p.compaction_cpus, 0);
+        p.confined_compaction(&[8, 9, 10, 11]);
+        assert_eq!(p.compaction_cpus, 4);
+    }
+
     #[test]
     fn a_nodes_budget_splits_across_its_partitions() {
         use super::{Share, split};

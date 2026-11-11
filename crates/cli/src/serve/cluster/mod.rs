@@ -1333,7 +1333,7 @@ pub(crate) fn run(
         stderr,
     )?;
     let dbs: Vec<&pigeonhole::Pigeonhole> = opened.iter().map(|o| &o.db).collect();
-    let placement = Arc::new(if dbs.is_empty() {
+    let mut placement = if dbs.is_empty() {
         super::placement::Placement::routes_only(args.io_threads, args.blocking_threads)
     } else {
         super::placement::Placement::plan(
@@ -1344,7 +1344,15 @@ pub(crate) fn run(
             args.feed_hub_threads,
             args.affinity == super::config::Affinity::On,
         )
-    });
+    };
+    // Compaction threads confined to the node's reserved CPUs run there as pinned ones
+    // would: the startup line counts those CPUs too (perf287's 8b run).
+    if let Some(r) = reserved.as_deref()
+        && opened.iter().any(|o| o.pinning.compaction_confined > 0)
+    {
+        placement.confined_compaction(r);
+    }
+    let placement = Arc::new(placement);
     let limits = args.limits();
     let metrics = Arc::new(super::service::Metrics::default());
     // The node's service, which serves no partition itself: its budgets, pools, session
