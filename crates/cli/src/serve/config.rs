@@ -138,8 +138,9 @@ pub(crate) struct ServeArgs {
     /// runs on the feed threads beside it instead (#1689).
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
-    /// Whether the network, feed and blocking threads get a CPU mask off the shards' cores
-    /// (Linux, where the engine pinned its shards). `off` keeps the same thread counts but
+    /// Whether the server's threads get a CPU mask off the shards' CPUs (Linux, where the
+    /// engine pinned its shards): the network, feed and hub threads on the free cores and the
+    /// shards' SMT siblings, the background threads on the free cores only. `off` keeps the same thread counts but
     /// leaves the threads where the OS puts them: for a host shared with other work, where
     /// the server shouldn't claim the CPUs (D313's R1, ICR 0131).
     #[arg(long, value_enum, value_name = "on|off", default_value_t = Affinity::On)]
