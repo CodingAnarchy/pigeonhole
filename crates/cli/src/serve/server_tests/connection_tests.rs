@@ -231,7 +231,7 @@ fn metrics_report_the_feed_hub_threads() {
     )
     .unwrap();
     let plan = Arc::new(crate::serve::placement::Placement::plan(
-        &db,
+        &[&db],
         None,
         None,
         Some(2),

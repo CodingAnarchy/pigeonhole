@@ -3,6 +3,7 @@
 //! talk to a running node (`show-map --file` reads a down node's map file instead).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -96,6 +97,60 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "N", default_value_t = 4)]
         parallel: usize,
     },
+    /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
+    /// through every node until it's unfenced, relocated or closed; reads go on. Answers
+    /// once the writes admitted before the fence have finished. Kept across a restart.
+    Fence {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Lift a partition's fence on `--node` (a closed partition reopens first). Refused
+    /// unless the map names that node for it at its file's epoch. A partition fenced since
+    /// the node started is unfenced only once a peer's map confirms it, as at start.
+    Unfence {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Lift a start fence that no peer's map confirms: only when no peer can answer and
+        /// you know the partition hasn't moved. A peer's newer map may have given it to
+        /// another node, and then both would take writes.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Close a fenced partition on `--node`: its files become final (for a relocation's
+    /// copy), its calls answer `PartitionUnavailable`, and `status` lists the files with
+    /// their SHA-256 once hashed. `unfence` reopens it.
+    Close {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Move a partition to node `--to`, whose staging holds its files (uploaded, or a
+    /// closed copy already there): the new node installs them and takes the next epoch,
+    /// then the map gives it the partition, and it serves at once. The node serving it now
+    /// must have it fenced or closed, unless `--old-unreachable`.
+    Relocate {
+        partition: String,
+        /// The node id it moves to.
+        #[arg(long, value_name = "ID")]
+        to: String,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// The node serving it now can't be reached (its process is stopped): skip the
+        /// check that it's fenced or closed there.
+        #[arg(long)]
+        old_unreachable: bool,
+    },
+    /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
+    /// once the map no longer places it there and it isn't open (close it first). Nothing
+    /// is deleted: delete that directory once the move is checked. It frees no space
+    /// until then.
+    DropPartition {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
 }
 
 pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
@@ -158,7 +213,227 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             durable,
             parallel,
         } => runtime()?.block_on(super::backup::backup(node, dir, *durable, *parallel)),
+        ClusterCommand::Fence { partition, node } => {
+            runtime()?.block_on(partition_call(node, partition, Call::Fence))
+        }
+        ClusterCommand::Unfence {
+            partition,
+            node,
+            force,
+        } => runtime()?.block_on(partition_call(node, partition, Call::Unfence(*force))),
+        ClusterCommand::Close { partition, node } => {
+            runtime()?.block_on(partition_call(node, partition, Call::Close))
+        }
+        ClusterCommand::DropPartition { partition, node } => {
+            runtime()?.block_on(partition_call(node, partition, Call::Drop))
+        }
+        ClusterCommand::Relocate {
+            partition,
+            to,
+            node,
+            old_unreachable,
+        } => runtime()?.block_on(relocate(node, partition, to, *old_unreachable)),
     }
+}
+
+/// One of the per-partition calls on a node (D317 ticket 6).
+#[derive(Clone, Copy)]
+enum Call {
+    Fence,
+    /// With `--force`.
+    Unfence(bool),
+    Close,
+    Drop,
+}
+
+/// `phdb cluster fence | unfence | close | drop-partition`: the call on `--node`, and the
+/// partition's line there.
+async fn partition_call(args: &NodeArgs, partition: &str, call: Call) -> Result<Report, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let req = request(
+        proto::PartitionRequest {
+            partition: partition.to_owned(),
+            force: matches!(call, Call::Unfence(true)),
+        },
+        token.as_deref(),
+    )?;
+    let (command, reply) = match call {
+        Call::Fence => ("cluster fence", c.fence(req).await),
+        Call::Unfence(_) => ("cluster unfence", c.unfence(req).await),
+        Call::Close => ("cluster close", c.close(req).await),
+        Call::Drop => ("cluster drop-partition", c.drop_partition(req).await),
+    };
+    let lp = reply
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    Ok(local_report(command, &args.node, &lp))
+}
+
+/// A partition's line on a node as a report.
+fn local_report(command: &'static str, node: &str, lp: &proto::LocalPartition) -> Report {
+    let summary = vec![
+        ("node", json!(node)),
+        ("partition", json!(lp.id)),
+        ("epoch", json!(lp.epoch)),
+        ("state", json!(state_text(lp))),
+        ("file", json!(lp.file)),
+        ("files", json!(lp.files.len())),
+    ];
+    report(
+        command,
+        summary,
+        json!({ "local": serde_json::to_value(lp).expect("LocalPartition serializes") }),
+    )
+}
+
+/// A partition's state for a person: `serving`, `fenced (operator)`, `fenced (awaiting peer
+/// map)`, `closed`, `opening`, or empty when the node doesn't hold it open.
+pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
+    use proto::{FenceReason, LocalPartitionState};
+    match (lp.state(), lp.fence_reason()) {
+        (LocalPartitionState::Serving, _) => "serving".into(),
+        (LocalPartitionState::Fenced, FenceReason::Operator) => "fenced (operator)".into(),
+        (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap) => {
+            "fenced (awaiting peer map)".into()
+        }
+        (LocalPartitionState::Fenced, _) => "fenced".into(),
+        (LocalPartitionState::Closed, _) => "closed".into(),
+        (LocalPartitionState::Opening, _) => "opening".into(),
+        (LocalPartitionState::Unspecified, _) => String::new(),
+    }
+}
+
+/// `phdb cluster relocate P --to NEW` (D317 ticket 6): stamp NEW from the map's epoch `e`
+/// to `e + 1`, then set the map with P on NEW at `e + 1` through the writer. Run again
+/// once done (the map names NEW, and P isn't closed there), it answers so and does nothing.
+pub(crate) async fn relocate(
+    args: &NodeArgs,
+    partition: &str,
+    to: &str,
+    old_unreachable: bool,
+) -> Result<Report, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let mut m = c
+        .get_map(request(GetMapRequest {}, token.as_deref())?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    let Some(p) = m.partitions.iter().find(|p| p.id == partition).cloned() else {
+        return Err(Failure::usage(&format!(
+            "the map (version {}) has no partition {partition:?}",
+            m.map_version
+        )));
+    };
+    let address = |id: &str| {
+        m.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| url_of(args, &n.address))
+    };
+    let Some(new_url) = address(to) else {
+        return Err(Failure::usage(&format!("the map has no node {to:?}")));
+    };
+    let old_url = address(&p.node).unwrap_or_default();
+    // The partition on the node serving it now: fenced or closed (cli692's S7). An
+    // in-place restore (the same node) needs it closed.
+    let probe = async {
+        let (mut c, token) = connect(args, &old_url).await?;
+        c.status(request(StatusRequest {}, token.as_deref())?)
+            .await
+            .map(|r| {
+                r.into_inner()
+                    .partitions
+                    .into_iter()
+                    .find(|lp| lp.id == partition)
+            })
+            .map_err(|s| Failure::usage(&format!("{old_url}: {}", s.message())))
+    };
+    let old_state = if old_unreachable {
+        // Still asked, briefly (cli692's S3 on #1755): a node that answers and serves P
+        // isn't unreachable, and a move now would give P two writers.
+        if let Ok(Ok(Some(lp))) = tokio::time::timeout(Duration::from_secs(3), probe).await
+            && lp.state() == proto::LocalPartitionState::Serving
+        {
+            return Err(Failure::usage(&format!(
+                "--old-unreachable, but node {:?} answers and serves partition {partition}: \
+                 fence it there first (phdb cluster fence), or stop its process",
+                p.node
+            )));
+        }
+        None
+    } else {
+        Some(probe.await?.map(|lp| lp.state()).unwrap_or_default())
+    };
+    use proto::LocalPartitionState as S;
+    if p.node == to && old_state != Some(S::Closed) {
+        let mut r = report(
+            "cluster relocate",
+            vec![
+                ("partition", json!(partition)),
+                ("node", json!(to)),
+                ("epoch", json!(p.epoch)),
+                ("map_version", json!(m.map_version)),
+                ("done", json!("the map already gives it this node")),
+            ],
+            Value::Null,
+        );
+        r.status = ExitStatus::SUCCESS;
+        return Ok(r);
+    }
+    if let Some(state) = old_state
+        && !matches!(state, S::Fenced | S::Closed)
+    {
+        return Err(Failure::usage(&format!(
+            "partition {partition} isn't fenced or closed on node {:?}: fence it there first \
+             (phdb cluster fence), or pass --old-unreachable if that node's process is stopped",
+            p.node
+        )));
+    }
+    let (mut new, new_token) = connect(args, &new_url).await?;
+    let stamped = new
+        .stamp(request(
+            proto::StampRequest {
+                cluster_id: m.cluster_id.clone(),
+                partition: partition.to_owned(),
+                from_epoch: p.epoch,
+                to_epoch: p.epoch + 1,
+                restore: false,
+                restore_from_cluster_id: String::new(),
+            },
+            new_token.as_deref(),
+        )?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{new_url}: stamp: {}", s.message())))?
+        .into_inner();
+    for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
+        q.node = to.to_owned();
+        q.epoch = p.epoch + 1;
+    }
+    m.map_version += 1;
+    let set = set_map(args, m, false).await?;
+    let mut r = report(
+        "cluster relocate",
+        vec![
+            ("partition", json!(partition)),
+            ("from", json!(p.node)),
+            ("node", json!(to)),
+            ("epoch", json!(p.epoch + 1)),
+            ("installed_files", json!(stamped.files.len())),
+            (
+                "map_version",
+                set.document
+                    .get("map_version")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        ],
+        Value::Null,
+    );
+    r.document.insert(
+        "installed".into(),
+        serde_json::to_value(&stamped.files).expect("files serialize"),
+    );
+    Ok(r)
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
@@ -463,7 +738,7 @@ pub(crate) async fn set_map(
     Ok(r)
 }
 
-async fn status(args: &NodeArgs) -> Result<Report, Failure> {
+pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     let m = c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
@@ -494,14 +769,26 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     behind += 1;
                 }
                 let ok = s.partitions.iter().filter(|p| p.ok).count();
-                rows.push(vec![
-                    json!(n.id),
-                    json!(n.address),
-                    json!(s.map_version),
-                    json!(format!("{ok}/{}", s.partitions.len())),
-                    json!(s.divergent.join(",")),
-                    json!(""),
-                ]);
+                let node_row = |partition: &str, state: String, error: &str| {
+                    vec![
+                        json!(n.id),
+                        json!(n.address),
+                        json!(s.map_version),
+                        json!(partition),
+                        json!(state),
+                        json!(format!("{ok}/{}", s.partitions.len())),
+                        json!(s.divergent.join(",")),
+                        json!(error),
+                    ]
+                };
+                // A row per partition, with its state on the node (D317 ticket 6); a node
+                // that holds none has one row.
+                if s.partitions.is_empty() {
+                    rows.push(node_row("", String::new(), ""));
+                }
+                for lp in &s.partitions {
+                    rows.push(node_row(&lp.id, state_text(lp), &lp.error));
+                }
                 nodes.push(serde_json::to_value(&s).expect("NodeStatus serializes"));
             }
             Err(e) => {
@@ -510,6 +797,8 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     json!(n.id),
                     json!(n.address),
                     Value::Null,
+                    json!(""),
+                    json!(""),
                     Value::Null,
                     json!(""),
                     json!(e.message()),
@@ -529,6 +818,8 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
         "node",
         "address",
         "map_version",
+        "partition",
+        "state",
         "partitions_ok",
         "divergent",
         "error",

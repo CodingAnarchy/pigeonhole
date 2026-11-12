@@ -392,6 +392,7 @@ pub pigeonhole::EngineMetrics::reader_slots_reclaimed: u64
 pub pigeonhole::EngineMetrics::room_stall_nanos: u64
 pub pigeonhole::EngineMetrics::room_stalls: u64
 pub pigeonhole::EngineMetrics::shard_busy_nanos: u64
+pub pigeonhole::EngineMetrics::threads_confined: u64
 pub pigeonhole::EngineMetrics::threads_pinned: u64
 pub pigeonhole::EngineMetrics::threads_started: u64
 pub pigeonhole::EngineMetrics::transaction_conflicts: u64
@@ -623,6 +624,7 @@ pub fn pigeonhole::Options::caller_runs(self, bool) -> Self
 pub fn pigeonhole::Options::change_feed(self, pigeonhole::FeedRetention) -> Self
 pub fn pigeonhole::Options::change_feed_off(self) -> Self
 pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self
+pub fn pigeonhole::Options::compaction_cpu_set(self, impl core::convert::Into<alloc::vec::Vec<usize>>) -> Self
 pub fn pigeonhole::Options::cpu_profile(self, pigeonhole::CpuProfile) -> Self
 pub fn pigeonhole::Options::create_if_missing(self, bool) -> Self
 pub fn pigeonhole::Options::default_shards(self, usize) -> Self
@@ -669,6 +671,7 @@ pub fn pigeonhole::Pigeonhole::open(impl core::convert::AsRef<std::path::Path>, 
 pub fn pigeonhole::Pigeonhole::open_application_owned(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::AppOwned>
 pub fn pigeonhole::Pigeonhole::open_reader(impl core::convert::AsRef<std::path::Path>, pigeonhole::ReaderOptions) -> pigeonhole::Result<pigeonhole::PigeonholeReader>
 pub fn pigeonhole::Pigeonhole::path(&self) -> &std::path::Path
+pub fn pigeonhole::Pigeonhole::pinned_compaction_cpus(&self) -> alloc::vec::Vec<usize>
 pub fn pigeonhole::Pigeonhole::pinned_shard_cpus(&self) -> alloc::vec::Vec<usize>
 pub fn pigeonhole::Pigeonhole::recovery_stats(&self) -> pigeonhole::RecoveryStats
 pub fn pigeonhole::Pigeonhole::row_cache_stats(&self) -> pigeonhole::RowCacheStats
@@ -684,6 +687,9 @@ pub fn pigeonhole::Pigeonhole::write_batch(&self) -> pigeonhole::WriteBatch
 impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::compact_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
 pub fn pigeonhole::Pigeonhole::flush_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
+impl pigeonhole::Pigeonhole
+pub fn pigeonhole::Pigeonhole::database_file_suffix<'a>(&std::path::Path, &'a std::path::Path) -> core::option::Option<&'a str>
+pub fn pigeonhole::Pigeonhole::database_files(impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<alloc::vec::Vec<std::path::PathBuf>>
 impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::transact<T, E>(&self, &pigeonhole::RetryPolicy, impl core::ops::function::FnMut(&mut pigeonhole::Transaction) -> core::result::Result<T, E>) -> core::result::Result<(T, pigeonhole::CommitInfo), E> where E: core::convert::From<pigeonhole::Error>
 pub struct pigeonhole::PigeonholeReader

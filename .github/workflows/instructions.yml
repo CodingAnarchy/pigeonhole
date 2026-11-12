@@ -35,7 +35,12 @@ on:
       - 'scripts/instruction-ceilings.py'
       - 'crates/bench/baselines/instruction-ceilings.txt'
       - '.github/workflows/instructions.yml'
+      - 'scripts/install-valgrind.sh'
   workflow_dispatch:
+  # Daily on main, only the valgrind-debs job: it saves this image's valgrind .debs once per
+  # image version, in main's cache scope, which every PR can read.
+  schedule:
+    - cron: '23 5 * * *'
 
 permissions:
   contents: read
@@ -74,8 +79,50 @@ env:
   THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8
 
 jobs:
+  # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
+  # every hosted runner on 2026-11-11, #1736). Keyed on the runner image, whose package lists
+  # and libc6 fix the versions apt picks (libc6-dbg must match libc6 exactly). On a miss for
+  # this image it installs through apt and saves the .debs: once per image version on main
+  # (the daily schedule), and in a PR's own scope only when main has no entry for the image
+  # yet. A cache entry is never overwritten; `v1` is the salt to force a refresh, ahead of the
+  # image so a bump also stops the older-image fallback from matching the old entries.
+  valgrind-debs:
+    name: valgrind .debs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: scripts/install-valgrind.sh
+          sparse-checkout-cone-mode: false
+      - id: key
+        run: echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - id: have
+        uses: actions/cache/restore@v5
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      # Not fatal here: with the archive down, the measuring jobs may still install from an
+      # older image's entry, and they fail on their own if they can't install at all.
+      - name: install valgrind through apt, keeping the .debs
+        id: apt
+        if: steps.have.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 8
+        run: scripts/install-valgrind.sh apt /tmp/valgrind-debs
+      - if: steps.apt.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.key.outputs.key }}
+
   instructions:
     name: ${{ matrix.name }}
+    # After the .debs job, but also when it failed (the archive down with no entry yet): the
+    # install step then tries apt itself, bounded, and fails the job if that fails too.
+    needs: valgrind-debs
+    if: ${{ !cancelled() && github.event_name != 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Two jobs in parallel (#1575): the read and write shapes, and the text-search shapes,
@@ -122,8 +169,27 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The .debs the valgrind-debs job saved for this image (or, on a new image, the newest
+      # entry for an older one), installed through dpkg with no network; apt when there are
+      # none or they don't install (scripts/install-valgrind.sh). A notice names the source.
+      # The key is computed here, not taken from that job: this runner's image can differ.
+      - id: debs-key
+        run: |
+          echo "key=callgrind-debs-v1-${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+          echo "prefix=callgrind-debs-v1-${ImageOS}-" >> "$GITHUB_OUTPUT"
+      - id: debs
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: /tmp/valgrind-debs
+          key: ${{ steps.debs-key.outputs.key }}
+          restore-keys: ${{ steps.debs-key.outputs.prefix }}
       - name: install valgrind
-        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+        timeout-minutes: 8
+        env:
+          DEBS_KEY: ${{ steps.debs-key.outputs.key }}
+          DEBS_MATCHED: ${{ steps.debs.outputs.cache-matched-key }}
+        run: scripts/install-valgrind.sh cached /tmp/valgrind-debs
       - name: build the examples (head and base)
         shell: bash
         run: |

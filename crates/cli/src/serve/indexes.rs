@@ -40,6 +40,10 @@ pub(crate) struct Indexes {
     /// Set on a replica (#1436): a background index's rebalancer isn't started, since its
     /// writes would be refused; its lists stay marked for after a promote.
     paused: AtomicBool,
+    /// A cluster partition's write gate (D317 ticket 6): a rebalancer takes it for each
+    /// slice of work, so while the partition is fenced it pauses at its next slice, and
+    /// resumes when it's unfenced.
+    gate: Option<Arc<super::gate::WriteGate>>,
 }
 
 impl std::fmt::Debug for Indexes {
@@ -51,9 +55,14 @@ impl std::fmt::Debug for Indexes {
 }
 
 impl Indexes {
-    pub(crate) fn new(db: Pigeonhole, placement: Option<Arc<super::placement::Placement>>) -> Self {
+    pub(crate) fn new(
+        db: Pigeonhole,
+        placement: Option<Arc<super::placement::Placement>>,
+        gate: Option<Arc<super::gate::WriteGate>>,
+    ) -> Self {
         Self {
             placement,
+            gate,
             db,
             open: Mutex::new(super::handles::Handles::default()),
             rebalancers: Mutex::new(Vec::new()),
@@ -160,13 +169,14 @@ impl Indexes {
             running.fetch_add(1, Ordering::Relaxed);
             let index_name = name.to_owned();
             let placement = self.placement.clone();
+            let gate = self.gate.clone();
             let spawned = std::thread::Builder::new()
                 .name("phdb-serve-rebalance".into())
                 .spawn(move || {
                     if let Some(p) = placement {
                         p.enter();
                     }
-                    rebalance(rebalancer, &index_name);
+                    rebalance(rebalancer, &index_name, gate.as_ref());
                     running.fetch_sub(1, Ordering::Relaxed);
                 });
             match spawned {
@@ -255,9 +265,21 @@ fn closed() -> ApiError {
 
 /// A background index's rebalancer, run until its index closes: the loop the crate's
 /// rustdoc gives. An error leaves the list marked for a later call.
-fn rebalance(mut r: Rebalancer, name: &str) {
+fn rebalance(mut r: Rebalancer, name: &str, gate: Option<&Arc<super::gate::WriteGate>>) {
     while !r.closed() {
-        match r.run_once(SLICE) {
+        // Each slice's writes under the partition's gate: a fenced partition's wait for its
+        // writes waits for one slice at most.
+        let held = match gate.map(|g| g.enter()) {
+            Some(Err(_)) => {
+                r.wait(IDLE);
+                continue;
+            }
+            Some(Ok(h)) => Some(h),
+            None => None,
+        };
+        let worked = r.run_once(SLICE);
+        drop(held);
+        match worked {
             Ok(true) => {}
             Ok(false) => r.wait(IDLE),
             Err(e) => {
@@ -282,7 +304,7 @@ mod tests {
         let db = Pigeonhole::open(dir.join("i.phdb"), Options::default().shards(1)).unwrap();
         let spec = VectorSpec::new(2, Element::F32, Metric::L2).unwrap();
         drop(Index::create(&db, "v", spec, IndexOptions::new()).unwrap());
-        let indexes = Indexes::new(db.clone(), None);
+        let indexes = Indexes::new(db.clone(), None, None);
         // The steps of `get`, with a forget between the open and the keep.
         let started = indexes.handles().generation();
         let (index, rebalancer) = Index::open_with_rebalancer(&db, "v").unwrap();

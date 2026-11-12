@@ -295,7 +295,15 @@ impl BulkLoads {
     /// Runs one load into `index`: waits at most `op.wait` for the slot, then loads on a
     /// thread of its own. The thread outlives a client that goes away: the load then ends
     /// with what came (the stream broke off), and its result is dropped.
-    pub(crate) async fn run(&self, index: Arc<Index>, op: BulkLoadOp) -> Result<(), ApiError> {
+    /// On a cluster partition, `gate` is its write gate (D317 ticket 6): the load holds it
+    /// until its thread ends, and checks it between messages, so a fence stops it there
+    /// with `Fenced`, the vectors before loaded.
+    pub(crate) async fn run(
+        &self,
+        index: Arc<Index>,
+        op: BulkLoadOp,
+        gate: Option<&Arc<super::gate::WriteGate>>,
+    ) -> Result<(), ApiError> {
         let slot = match tokio::time::timeout(op.wait, Arc::clone(&self.slot).acquire_owned()).await
         {
             Ok(Ok(slot)) => slot,
@@ -315,6 +323,9 @@ impl BulkLoads {
         if stopping.flag.load(Ordering::Acquire) {
             return Err(closed());
         }
+        // `Service::call` admitted the load, and holds its gate until this returns.
+        let held = gate.map(super::gate::WriteGate::extend);
+        let gate = gate.cloned();
         {
             let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
             if self.closed.load(Ordering::Acquire) {
@@ -338,12 +349,15 @@ impl BulkLoads {
                             ended: false,
                             gauges: &gauges,
                             stopping: &stopping,
+                            gate,
                         };
                         let r = loader(&index, expected, &mut input);
                         // The loader's own failure first; else the stream's.
                         let r = r.and_then(|_| input.failed.take().map_or(Ok(()), Err));
                         drop(input);
                         drop(index);
+                        // Its last write is done: a fence's drain may finish.
+                        drop(held);
                         for g in [&gauges.phase, &gauges.vectors, &gauges.bytes] {
                             g.store(0, Ordering::Relaxed);
                         }
@@ -401,6 +415,8 @@ struct Input<'g> {
     ended: bool,
     gauges: &'g Gauges,
     stopping: &'g Stop,
+    /// A cluster partition's write gate: a fence ends the input at the next message.
+    gate: Option<Arc<super::gate::WriteGate>>,
 }
 
 /// The shutdown flag, and the waker of a loader waiting for its next message. The loader
@@ -428,7 +444,12 @@ enum Next {
     Gone,
     /// The server is shutting down.
     Stopped,
+    /// The partition was fenced (D317 ticket 6).
+    Fenced,
 }
+
+/// How often a load waiting for its next message looks at its partition's fence.
+const FENCE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Iterator for Input<'_> {
     type Item = Item;
@@ -458,6 +479,11 @@ impl Iterator for Input<'_> {
                     self.current = b.items.into_iter();
                     self.held = b.budget;
                 }
+                Next::Fenced => self.end(Some(ApiError::fenced(
+                    "the partition was fenced: the load stopped there, and the vectors before \
+                     were loaded; resume from the last acknowledged one once it's unfenced or \
+                     at its new node",
+                ))),
                 Next::Msg(Msg::End) => self.end(None),
                 Next::Msg(Msg::Failed(e)) => self.end(Some(e)),
                 // The front-end went away without ending the stream: its client is gone.
@@ -483,10 +509,17 @@ impl Input<'_> {
             if self.stopping.flag.load(Ordering::Acquire) {
                 return Next::Stopped;
             }
+            if self.gate.as_ref().is_some_and(|g| g.fenced().is_some()) {
+                return Next::Fenced;
+            }
             match self.rx.poll_recv(&mut cx) {
                 std::task::Poll::Ready(Some(m)) => return Next::Msg(m),
                 std::task::Poll::Ready(None) => return Next::Gone,
-                // A spurious unpark only loops.
+                // A spurious unpark only loops. With a gate, the fence is looked at again
+                // every `FENCE_POLL`: nothing wakes a load when its partition is fenced.
+                std::task::Poll::Pending if self.gate.is_some() => {
+                    std::thread::park_timeout(FENCE_POLL);
+                }
                 std::task::Poll::Pending => std::thread::park(),
             }
         }

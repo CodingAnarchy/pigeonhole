@@ -152,6 +152,141 @@ fn a_replica_bootstraps_follows_and_refuses_writes() {
 }
 
 #[test]
+fn a_bootstrap_clears_a_failed_one_s_side_files() {
+    // #1748: a bootstrap that failed after its copy's clean close (or a process that died
+    // mid-bootstrap) left the copy's WAL and feed sidecars beside the database
+    // (`t.phdb.bootstrap-wal-*`, `-feed`: a change feed's clean close keeps its WAL). Every
+    // later bootstrap opened its fresh copy beside them and failed with "WAL segment belongs
+    // to another database", so the replica retried for ever. The bootstrap now removes
+    // every file of the side copy (`Pigeonhole::database_files`) before it downloads.
+    let p = Server::start("admin s3cret", limits());
+    let tok = Some("s3cret");
+    for i in 0..5 {
+        let value = json!({"bytes": b64(format!("v{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), tok)
+                .0,
+            200
+        );
+    }
+    // Another database's side copy, closed cleanly with a feed, its main file then removed
+    // as the old failure path did: its WAL and feed sidecars stay.
+    let dir = test_dir();
+    let side = dir.join("t.phdb.bootstrap");
+    let other = Pigeonhole::open(
+        &side,
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .change_feed(pigeonhole::FeedRetention::bytes(64 << 20)),
+    )
+    .unwrap();
+    other
+        .table("z")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    other.close().unwrap();
+    std::fs::remove_file(&side).unwrap();
+    let left = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("t.phdb.bootstrap"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        left(&dir),
+        ["t.phdb.bootstrap-feed", "t.phdb.bootstrap-wal-0"],
+        "the failed bootstrap's leftovers"
+    );
+    let r = Server::start_replica(dir.clone(), &p.url, tok);
+    // The first bootstrap succeeds: the leftovers go before it opens its copy, so the
+    // replica never shows `retrying` (a failed attempt sits there for its 100 ms pause,
+    // longer than `wait_replica`'s 50 ms poll).
+    let caught = caught_up(&p, tok);
+    let mut states: Vec<String> = Vec::new();
+    let info = wait_replica(&r, "caught up past a failed bootstrap's files", |info| {
+        let state = info["state"].as_str().unwrap_or_default().to_owned();
+        if states.last() != Some(&state) {
+            states.push(state);
+        }
+        caught(info)
+    });
+    assert!(
+        !states.iter().any(|s| s == "retrying"),
+        "a bootstrap failed first: {states:?}, {info}"
+    );
+    assert_eq!(get_value(&r, "t", "r3", None), b64(b"v3"));
+    assert!(
+        left(&dir).is_empty(),
+        "no side file is left: {:?}",
+        left(&dir)
+    );
+}
+
+#[test]
+fn a_restarted_replica_clears_a_side_copy_its_last_process_left() {
+    // #1752: a process that died during a re-bootstrap left its side copy. Restarted with a
+    // stored token, the replica follows from it and takes no bootstrap, so the copy is
+    // cleared when the replica starts rather than kept until the next bootstrap.
+    let p = Server::start("", limits());
+    for i in 0..5 {
+        let value = json!({"bytes": b64(format!("a{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), None)
+                .0,
+            200
+        );
+    }
+    let dir = test_dir();
+    let mut r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    r.keep_dir = true;
+    drop(r);
+
+    // What a death mid-bootstrap leaves: a partial download, and another open's WAL and feed.
+    let side = dir.join("t.phdb.bootstrap");
+    let other = Pigeonhole::open(
+        &side,
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .change_feed(pigeonhole::FeedRetention::bytes(64 << 20)),
+    )
+    .unwrap();
+    other.close().unwrap();
+    std::fs::write(&side, b"a partial download").unwrap();
+    let left = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("t.phdb.bootstrap"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        left(),
+        [
+            "t.phdb.bootstrap",
+            "t.phdb.bootstrap-feed",
+            "t.phdb.bootstrap-wal-0"
+        ]
+    );
+    let downloads = || std::fs::read_dir(p.dir.join("backups")).map_or(0, |d| d.count());
+    let before = downloads();
+    let r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up after its restart", caught_up(&p, None));
+    assert_eq!(downloads(), before, "a restart takes no bootstrap copy");
+    assert!(left().is_empty(), "the side copy is left: {:?}", left());
+    assert_eq!(get_value(&r, "t", "r3", None), b64(b"a3"));
+}
+
+#[test]
 fn a_restarted_replica_resumes_and_a_new_primary_bootstraps_it_again() {
     let p = Server::start("", limits());
     for i in 0..10 {

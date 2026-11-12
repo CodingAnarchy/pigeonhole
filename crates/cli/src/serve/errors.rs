@@ -394,6 +394,20 @@ impl ApiError {
         )
     }
 
+    /// D317 ticket 6: a write to a partition fenced on its node (`phdb cluster fence`, or a
+    /// restarted node's partition before it has a peer's map), refused before anything is
+    /// written. Not retried automatically: the partition is being moved or recovered, and
+    /// takes writes again once it's unfenced or at its new node.
+    pub(crate) fn fenced(message: impl Into<String>) -> Self {
+        Self::new(
+            "Fenced",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     /// D317 (ICR 0117): the partition's node couldn't be reached, and nothing was sent to
     /// it, so a write is safe to retry too (B3: a forward that failed after it was sent
     /// answers `OutcomeUnknown` instead).

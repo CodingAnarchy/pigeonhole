@@ -554,6 +554,15 @@ impl Replica {
     async fn run(&self, shared: &Shared) {
         let mut stop = self.stop.subscribe();
         let mut backoff = Duration::from_millis(100);
+        // A side copy a process left when it died mid-bootstrap goes now (#1752): a replica
+        // that restarts with a stored token follows from it, so no bootstrap would clear it
+        // until the next one. Its failure only leaves the files (every bootstrap clears
+        // them first, #1748): Info says why.
+        if let Ok(part) = shared.router.service.part()
+            && let Err(e) = clear_side(&side_path(part.db.path())).await
+        {
+            self.status().last_error = e;
+        }
         loop {
             if *stop.borrow() {
                 return;
@@ -803,8 +812,12 @@ impl Replica {
             .db
             .clone();
         let side = side_path(db.path());
-        // A stop mid-download leaves a partial side file: harmless, since the next
-        // bootstrap truncates it (`File::create`) before writing (cli692's N4 on #1583).
+        // Every file of an earlier side copy goes first: a bootstrap that failed after its
+        // copy's clean close, or a process that died mid-bootstrap, leaves the copy's WAL and
+        // feed sidecars (a feed's clean close keeps its WAL), and a fresh copy opened beside
+        // them fails, every time, with "WAL segment belongs to another database" (#1748). A
+        // stop mid-download leaves a partial side file, which this removes too.
+        clear_side(&side).await.map_err(Halt::Failed)?;
         let token = tokio::select! {
             r = self.download(&side, shared.limits.stream_idle) => r.map_err(Halt::Failed)?,
             _ = stop.changed() => return Err(Halt::Stopped),
@@ -817,23 +830,38 @@ impl Replica {
         let swap_side = side.clone();
         self.set_bootstrap_phase("opening the copy");
         let opened = tokio::task::spawn_blocking(move || {
-            let copy = Pigeonhole::open(&swap_side, pigeonhole::Options::default())?;
+            // A small memtable budget: this open only records the token, and the copy has no
+            // log to replay (a backup copy is one file). The shared-memory check is then
+            // 8 MiB a shard, not the default 64 (#1752): a node short of `/dev/shm` still
+            // bootstraps, as the served engine's own region is already held. The shard
+            // count stays the copy's (another would end its feed's history), and the swap
+            // opens it with the server's own options.
+            let copy = Pigeonhole::open(
+                &swap_side,
+                pigeonhole::Options::default().memtable_budget(8 << 20),
+            )?;
             copy.begin_replication(&FeedToken::from_bytes(token))?;
             copy.close()
         })
         .await
-        .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
         if let Err(e) = opened {
-            let _ = std::fs::remove_file(&side);
+            let _ = clear_side(&side).await;
             return Err(Halt::Failed(format!("bootstrap: {e}")));
         }
         self.set_bootstrap_phase("swapping");
         let swap_side = side.clone();
+        // A panic in the swap is a failed swap (#1752): its side files go and the served
+        // handle drops what it cached, as for an error, since the swap may have got as far as
+        // replacing or closing the engine.
         let swapped = tokio::task::spawn_blocking(move || db.replace_with(&swap_side))
             .await
-            .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
-        // The side file is the database now, or the bootstrap failed: either way it goes.
-        let _ = std::fs::remove_file(&side);
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        // The side file is the database now, or the bootstrap failed: either way its files go
+        // (after a failure, its WAL and feed sidecars too: #1748).
+        let _ = clear_side(&side).await;
         // The served handle is on the new engine (or closed, if the swap failed late):
         // nothing cached of the old one may serve again.
         service.engine_replaced();
@@ -1079,6 +1107,27 @@ fn halt_of(status: &tonic::Status) -> Halt {
         }
         _ => Halt::Failed(status.message().to_owned()),
     }
+}
+
+/// Removes every file of the side copy at `side` (its main file, WAL streams and feed
+/// sidecar, as `Pigeonhole::database_files` lists them, ICR 0135), on a blocking thread.
+/// Only `<db>.bootstrap`'s set: never the served database's.
+async fn clear_side(side: &Path) -> Result<(), String> {
+    let side = side.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let files = Pigeonhole::database_files(&side)
+            .map_err(|e| format!("listing {}'s files: {e}", side.display()))?;
+        for f in files {
+            match std::fs::remove_file(&f) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("removing {}: {e}", f.display())),
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("clearing the bootstrap's side copy: {e}"))?
 }
 
 /// The bootstrap copy's side file, beside the database.

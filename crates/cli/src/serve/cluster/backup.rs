@@ -456,12 +456,14 @@ mod tests {
                     id: "p1".into(),
                     node: "n1".into(),
                     epoch,
+                    memory_bytes: 0,
                 },
                 Partition {
                     history_epoch: 0,
                     id: "p2".into(),
                     node: "n1".into(),
                     epoch: 1,
+                    memory_bytes: 0,
                 },
             ],
             tables: vec![TablePlacement {
@@ -503,6 +505,7 @@ mod tests {
             id: "p3".into(),
             node: "n1".into(),
             epoch: 1,
+            memory_bytes: 0,
         });
         assert!(moved(&a, &added).is_some_and(|w| w.contains("added")));
         let mut resplit = map(9, 1, &["m"]);

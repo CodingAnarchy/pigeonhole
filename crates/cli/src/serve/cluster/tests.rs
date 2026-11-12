@@ -115,6 +115,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 id: (*id).into(),
                 node: (*node).into(),
                 epoch: 1,
+                memory_bytes: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -643,54 +644,182 @@ fn data_node_full(
     tokio::sync::oneshot::Sender<()>,
     Option<pigeonhole::Pigeonhole>,
 ) {
+    let locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)> =
+        local.map(|p| (p, db)).into_iter().collect();
+    let (stop, mut dbs) = data_node_many(rt, dir, id, locals, listener, tokens, limits, restart);
+    (stop, dbs.pop())
+}
+
+/// Runs `body` for the test `test` in module `module` (its `module_path!()`) in a child
+/// process of the test binary filtered `--exact` to that test alone, so the process-wide
+/// CPU pin claims are its own whatever other tests pin (#1741). In the child, it runs
+/// `body`. The parent checks the child ran it: a filter that matches nothing passes too.
+#[cfg(target_os = "linux")]
+fn run_alone(module: &str, test: &str, body: fn()) {
+    const ALONE: &str = "PHDB_PIN_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some() {
+        return body();
+    }
+    // The test's path without the crate's name, as the harness filters it.
+    let name = format!("{}::{test}", module.split_once("::").unwrap().1);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(ALONE, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the test alone failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}
+
+/// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
+/// epoch 1, with a change feed and the `users` table.
+fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
+    test_partition_with(dir, p, pigeonhole::Options::default())
+}
+
+/// [`test_partition`], created with `options` (a shard count, say). Its change feed records
+/// the shard count, which every later open keeps (ICR 0132).
+fn test_partition_with(
+    dir: &Path,
+    p: &str,
+    options: pigeonhole::Options,
+) -> pigeonhole::Pigeonhole {
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join(format!("{p}.phdb")),
+        options
+            .create_if_missing(true)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    identity::write(
+        &db,
+        &identity::Identity {
+            cluster_id: "c1".into(),
+            partition_id: p.into(),
+            epoch: 1,
+        },
+    )
+    .unwrap();
+    users(&db);
+    db
+}
+
+/// A test data node serving `locals` (each partition's database given, or opened by
+/// [`test_partition`]): the node's service and one per partition made from it, sharing one
+/// `Backups`, as `cluster::run` builds them (D317 ticket 8a, 8b). Returns its stop handle and
+/// the partitions' databases, in `locals`' order. `restart`: the node starts with a map, and
+/// takes its peers' newer ones, as `run` has it.
+#[allow(clippy::too_many_arguments)]
+fn data_node_many(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    // Unpinned: the rig's partitions share the test process's CPUs.
+    let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+    let (stop, dbs, _) = data_node_placed(
+        rt, dir, id, locals, listener, tokens, limits, restart, placement, None,
+    );
+    (stop, dbs)
+}
+
+/// [`data_node_many`] with `placement` for the partitions it opens while it serves (D317
+/// ticket 6), returning its node too. `engine_memory`: the node's `--engine-memory`, split
+/// across `locals` at start as `run` splits it ([`super::start_budget`]), and what a
+/// partition opened later gets what's left of.
+#[allow(clippy::too_many_arguments)]
+fn data_node_placed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+    placement: crate::serve::placement::Placement,
+    engine_memory: Option<u64>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+    Arc<Node>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
+    // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
+    node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
-    let db = db.or_else(|| {
-        local.map(|p| {
-            let db = pigeonhole::Pigeonhole::open(
-                dir.join(format!("{p}.phdb")),
-                pigeonhole::Options::default()
-                    .create_if_missing(true)
-                    .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
-            )
-            .unwrap();
-            identity::write(
-                &db,
-                &identity::Identity {
-                    cluster_id: "c1".into(),
-                    partition_id: p.into(),
-                    epoch: 1,
-                },
-            )
-            .unwrap();
-            users(&db);
-            db
-        })
-    });
-    let service = match &db {
-        Some(db) => {
-            // Its backups (D317 ticket 8b), beside the partition.
-            let backups = dir.join(format!("backups-{id}"));
-            std::fs::create_dir_all(&backups).unwrap();
-            Service::partition_node(
-                db.clone(),
-                local.expect("a partition's node"),
-                limits,
-                2,
-                Arc::clone(&metrics),
-            )
-            .backups(Some(&backups), 1)
-            .unwrap()
+    let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
+    let backup_dir = dir.join(format!("backups-{id}"));
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
+    let mut dbs = Vec::new();
+    let mut parts = Vec::new();
+    // Each partition's memory as `run` plans it, one shard each.
+    let mine: Vec<(String, u64)> = locals.iter().map(|(p, _)| ((*p).to_owned(), 1)).collect();
+    let (_, memories) = super::start_budget(
+        node.get_map().ok().as_ref(),
+        &mine,
+        mine.len().max(1),
+        0,
+        engine_memory,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message()));
+    for (i, (p, db)) in locals.into_iter().enumerate() {
+        let db = db.unwrap_or_else(|| test_partition(dir, p));
+        let pinning = crate::serve::service::Pinning::default();
+        let memory = memories
+            .as_ref()
+            .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
+        // Fenced as `run` opens it (D317 ticket 6). A restarted node waits for its peers'
+        // maps to unfence it; a fresh one stands for a node already serving.
+        let gate = node.open_gate(p, 1);
+        if !restart {
+            gate.unfence();
         }
-        None => Service::routing_only(limits, 2, Arc::clone(&metrics)),
-    };
+        parts.push((
+            p.to_owned(),
+            service.for_partition(db.clone(), p, &backups, pinning, memory, gate),
+        ));
+        dbs.push(db);
+    }
     let shared = Arc::new(Shared {
-        router: Router::cluster(service, Arc::clone(&node), local.map(str::to_owned)),
+        router: Router::cluster(service, Arc::clone(&node), parts),
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
+    // Partitions a map gives it while it serves open as `run` has them.
+    super::open::attach_opener(
+        &node,
+        super::open::Opener {
+            shared: Arc::downgrade(&shared),
+            placement: Arc::new(placement),
+            backups: Arc::clone(&backups),
+            options: Box::new(|share, _| {
+                pigeonhole::Options::default()
+                    .default_shards(share.shards)
+                    .compaction_cores(share.compaction)
+            }),
+            shards: 1,
+            compaction: 0,
+            engine_memory,
+        },
+    );
     super::schema::attach(&node, &shared);
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
     let start = if restart {
@@ -723,7 +852,7 @@ fn data_node_full(
         let _in = rt.enter();
         start();
     }
-    (stop, db)
+    (stop, dbs, node)
 }
 
 async fn data(port: u16) -> super::proto::data_client::DataClient<tonic::transport::Channel> {
@@ -1344,8 +1473,14 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
     // database does, so its default runs no poll (D198 amendment 4).
     let dir = test_dir();
-    let options = super::partition_options(crate::serve::config::ShardSpin::Micros(0), None, None)
-        .create_if_missing(true);
+    let share = crate::serve::placement::split(2, 1, 1)[0];
+    let options = super::partition_options(
+        crate::serve::config::ShardSpin::Micros(0),
+        None,
+        None,
+        share,
+    )
+    .create_if_missing(true);
     let db = pigeonhole::Pigeonhole::open(dir.join("p1.phdb"), options).unwrap();
     let t = db
         .table("users")
@@ -1787,6 +1922,32 @@ fn three_nodes(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    three_nodes_within(rt, 256 << 20)
+}
+
+/// [`three_nodes`] with `inflight` bytes of in-flight budget on each node.
+fn three_nodes_within(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    three_nodes_held(rt, inflight, false)
+}
+
+/// [`three_nodes_within`], with each node's fanned-out scans held after each partition's
+/// page until the partition's next page has taken its share (`hold`, #1753's seam).
+fn three_nodes_held(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+    hold: bool,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -1808,10 +1969,11 @@ fn three_nodes(
         // one on the partition's.
         let limits = crate::serve::config::Limits {
             max_scans: 64,
-            inflight_bytes: 256 << 20,
+            inflight_bytes: inflight,
             // Longer than the stalled-stream test's bound, so a stall can't clear itself by
             // idling out.
             stream_idle: Duration::from_secs(30),
+            hold_after_part_page: hold,
             ..crate::serve::server_tests::limits()
         };
         let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
@@ -1918,15 +2080,95 @@ fn fanned_out_reads_at_seeds_that_failed() {
     fan_out_model(1794362533986056000);
 }
 
+#[test]
+fn fanned_out_reads_with_no_spare_budget_answer_as_one_database_does() {
+    // #1715: with no spare budget a multi-get reads no partition ahead, and its pages must
+    // still be a single node's, exactly. Each node's budget is below twice the smallest
+    // page budget drawn, so a read ahead (a page's share beside the request's own holding
+    // of one) can never be taken: every multi-get here reads its partitions one by one.
+    let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!(
+        "cluster fan-out seed, no spare budget: {seed} (PHDB_CLUSTER_SEED={seed} replays it)"
+    );
+    fan_out_model_within(seed, 2199, &[1100, 1500, 2000]);
+}
+
+/// #1753: a fanned-out scan of a partition served on its entry node, with a budget too
+/// small for two of its pages, finishes. The entry's page used to take a share of its own
+/// after the partition's page gave its share back; held there (the seam) until the
+/// partition's next page took the bytes, the entry's page waited for them until the request
+/// timed out, since only the entry could take that next page. Now the entry's page keeps
+/// the partition's share.
+#[test]
+fn a_scan_of_a_partition_on_its_entry_node_charges_each_page_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes_held(&rt, 2199, true);
+    // 12 rows of about 420 bytes in p1 (keys below "g"), which the first node serves: pages
+    // of 1500 bytes hold 3 rows, and two pages don't fit in 2199 bytes.
+    let keys: Vec<Vec<u8>> = (0..12).map(|i| format!("a{i:02}").into_bytes()).collect();
+    rt.block_on(async {
+        for (i, key) in keys.iter().enumerate() {
+            data(ports[0])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(cells_row(key, &[400], i as u64)),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+        }
+        use super::proto::{KeyRange, ScanRequest, key_range::Range};
+        let started = std::time::Instant::now();
+        let pages = scan_pages(
+            ports[0],
+            ScanRequest {
+                table: "users".into(),
+                range: Some(KeyRange {
+                    range: Some(Range::Prefix(b"a".to_vec().into())),
+                }),
+                page_bytes: 1500,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("after {:?}: {e}", started.elapsed()));
+        assert!(pages.len() >= 3, "{} pages", pages.len());
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.bytes > 2199 / 2 || p.next.is_empty())
+        );
+        let got: Vec<Vec<u8>> = pages
+            .iter()
+            .flat_map(|p| p.rows.iter().map(|r| r.key.to_vec()))
+            .collect();
+        assert_eq!(got, keys);
+    });
+}
+
 /// D317 §12's model test, fan-out half (ticket 4a), against one database holding every
 /// row: scans over every kind of range, with row limits and byte budgets, resumed from
 /// every page's `next` through another entry node; multi-gets of random key sets, page by
 /// page, which must match the single database's pages exactly (the budget's merge across
 /// partitions, simp724's S1 and M1).
 fn fan_out_model(seed: u64) {
+    fan_out_model_within(seed, 256 << 20, &[300, 450, 700, 1500, 0]);
+}
+
+/// [`fan_out_model`] with `inflight` bytes of in-flight budget on each node, and its reads'
+/// `page_bytes` drawn from `budgets` (0: the default page).
+fn fan_out_model_within(seed: u64, inflight: usize, budgets: &[u64]) {
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_stops, ports, dbs) = three_nodes(&rt);
+    let (_stops, ports, dbs) = three_nodes_within(&rt, inflight);
     let oracle_dir = test_dir();
     let oracle = pigeonhole::Pigeonhole::open(
         oracle_dir.join("oracle.phdb"),
@@ -1974,7 +2216,7 @@ fn fan_out_model(seed: u64) {
         }
     });
     let pick = |rng: &mut Rng| keys[rng.below(keys.len() as u64) as usize].clone();
-    let budgets = [300u64, 450, 700, 1500, 0];
+
     rt.block_on(async {
         // Scans.
         for trial in 0..60 {
@@ -2106,7 +2348,7 @@ fn fan_out_model(seed: u64) {
             .filter(|k| k.as_slice() < b"g".as_slice())
             .count() as u64;
         for &port in &ports {
-            for page_bytes in [300, 0] {
+            for page_bytes in [budgets[0], budgets[budgets.len() - 1]] {
                 let pages = scan_pages(
                     port,
                     super::proto::ScanRequest {
@@ -2583,15 +2825,6 @@ fn graph_row(row: &[u8], v: [f32; 4], edges: &[(Vec<u8>, bool)]) -> super::proto
 
 #[test]
 fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
-    // D317 §12's model test, ticket 4b, against one database holding every row: nearest
-    // searches over every source kind (vectors repeat, so distances tie and the order's
-    // row and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross
-    // the partitions, with every limit, the byte budget, parents and an edge selection,
-    // stats included.
-    use super::proto::{
-        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
-        key_range::Range, nearest_request::Source, value_filter,
-    };
     let seed: u64 = std::env::var("PHDB_CLUSTER_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2602,6 +2835,27 @@ fn fanned_out_nearest_searches_and_traversals_answer_as_one_database_does() {
                 .as_nanos() as u64
         });
     eprintln!("cluster 4b seed: {seed} (PHDB_CLUSTER_SEED={seed} replays it)");
+    nearest_traverse_model(seed);
+}
+
+/// Seeds that failed once, run every time.
+#[test]
+fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
+    // #1715: hop pages read at the traversal's own `page_bytes` cut a frontier row across
+    // two pages, and the second page's `column_limit` started over, past `per_node_limit`.
+    nearest_traverse_model(1794386011110329000);
+}
+
+/// D317 §12's model test, ticket 4b, against one database holding every row: nearest
+/// searches over every source kind (vectors repeat, so distances tie and the order's row
+/// and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross the
+/// partitions, with every limit, the byte budget, parents and an edge selection, stats
+/// included.
+fn nearest_traverse_model(seed: u64) {
+    use super::proto::{
+        Bound, Bounds, KeyList, KeyRange, NearestRequest, TraverseRequest, ValueFilter, Vector,
+        key_range::Range, nearest_request::Source, value_filter,
+    };
     let mut rng = Rng(seed);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, dbs) = three_nodes(&rt);
@@ -2929,6 +3183,7 @@ fn split_nodes(
                 id: format!("q{i}"),
                 node: format!("n{i}"),
                 epoch: 1,
+                memory_bytes: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -3644,6 +3899,12 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
 }
 
 mod backup;
+mod charge;
+mod close;
 mod feed;
+mod fence;
 mod metrics;
+mod open;
+mod several;
+mod stamp;
 mod upload;

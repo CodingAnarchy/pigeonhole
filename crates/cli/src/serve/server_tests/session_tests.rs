@@ -269,7 +269,7 @@ fn reads_at_a_pinned_snapshot_agree_until_it_is_released() {
     assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
     let text = s.shared.metrics.render();
     let mut text = text;
-    super::service::render_sessions(&mut text, &s.shared.router.service.sessions);
+    super::service::render_sessions(&mut text, &[&s.shared.router.service.sessions]);
     assert!(
         text.contains(r#"pigeonhole_serve_sessions{kind="transaction"} 1"#),
         "{text}"

@@ -65,8 +65,9 @@ const PARTITION_FIELD: u32 = 5;
 /// What a subscription needs to open (and open again) its components: shared by its task.
 struct Ctx {
     node: Arc<Node>,
-    /// The partition served here and its service, if any.
-    local: Option<String>,
+    /// The partitions served here, each with its service (D317 ticket 8a).
+    parts: crate::serve::router::Parts,
+    /// The node's service: its stream slots, limits and timeouts.
     service: Arc<Service>,
     caller: Caller,
     prefix: Bytes,
@@ -104,7 +105,7 @@ struct Part {
 pub(crate) async fn subscribe(
     node: Arc<Node>,
     forwarder: Arc<super::forward::Forwarder>,
-    local: Option<String>,
+    served: crate::serve::router::Parts,
     service: Arc<Service>,
     r: proto::SubscribeRequest,
     caller: &Caller,
@@ -193,7 +194,7 @@ pub(crate) async fn subscribe(
     let ctx = Arc::new(Ctx {
         node,
         forwarder,
-        local,
+        parts: served,
         service: Arc::clone(&service),
         caller: caller.clone(),
         prefix: r.prefix.clone(),
@@ -775,14 +776,13 @@ impl Ctx {
         }
         let epoch = owner.epoch;
         if owner.node == self.node.id() {
-            if self.local.as_deref() != Some(open.partition.as_str()) {
+            let Some(here) = self.parts.load().get(&open.partition).cloned() else {
                 return Err(ApiError::partition_unavailable(format!(
                     "the map gives this node partition {:?}, but it isn't open here",
                     open.partition
                 )));
-            }
-            let events = self
-                .service
+            };
+            let events = here
                 .subscribe_part(open.request, &self.caller, open.skip, true)
                 .await?;
             return Ok((Box::pin(LocalEvents(events)), epoch));
@@ -926,8 +926,7 @@ impl tonic::codec::Decoder for RawDecoder {
 /// `WrongPartition` with this node's map version, never forwarded on.
 pub(crate) async fn serve(
     node: &Node,
-    local: Option<&str>,
-    service: &Service,
+    parts: &crate::serve::router::Parts,
     req: proto::ForwardSubscribeRequest,
 ) -> Result<FeedEvents, ApiError> {
     let caller = super::forward::caller_of(req.caller, &node.tokens)?;
@@ -939,7 +938,7 @@ pub(crate) async fn serve(
             "a forwarded subscription is one partition's: no cluster-only fields",
         ));
     }
-    {
+    let service = {
         let routes = node.routes();
         let Some(routes) = routes.as_ref() else {
             return Err(ApiError::wrong_partition(
@@ -964,13 +963,14 @@ pub(crate) async fn serve(
                 ),
             ));
         }
-        if local != Some(req.partition.as_str()) {
+        let Some(service) = parts.load().get(&req.partition).cloned() else {
             return Err(ApiError::partition_unavailable(format!(
                 "the map gives this node partition {:?}, but it isn't open here",
                 req.partition
             )));
-        }
-    }
+        };
+        service
+    };
     service
         .subscribe_part(r, &caller, req.skip_through, true)
         .await

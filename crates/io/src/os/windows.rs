@@ -508,6 +508,24 @@ pub(crate) fn pin_current_thread_to(id: usize) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn confine_current_thread_to(ids: &[usize]) -> Result<()> {
+    if ids.is_empty() {
+        return Err(Error::new(ErrorKind::Other, "an empty cpu set"));
+    }
+    let mut mask: usize = 0;
+    for &id in ids {
+        if id >= usize::BITS as usize {
+            return Err(Error::new(ErrorKind::Other, "cpu id out of range"));
+        }
+        mask |= 1 << id;
+    }
+    // SAFETY: the current-thread pseudo-handle and a mask of CPUs within the process mask.
+    if unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) } == 0 {
+        return Err(last_error("SetThreadAffinityMask"));
+    }
+    Ok(())
+}
+
 pub(crate) fn numa_node_of(_cpu: usize) -> Option<u32> {
     None
 }

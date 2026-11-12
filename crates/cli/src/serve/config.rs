@@ -49,6 +49,21 @@ pub(crate) struct ServeArgs {
     /// recorded). A count other than the feed's reshards it and ends the feed's history.
     #[arg(long, value_name = "N")]
     pub shards: Option<usize>,
+    /// Threads dedicated to flush and compaction, pinned (default: a quarter of the physical
+    /// cores, at least 1, at most one per shard). On a cluster node, `--shards` and this are
+    /// the node's totals, split across its partitions (D317 ticket 8a): pinned compaction
+    /// threads never exceed it, and partitions past it share the pinned ones' CPUs. A count
+    /// given here is taken as given, even above the shard count (cli692's N3 on #1718).
+    #[arg(long, value_name = "N")]
+    pub compaction_threads: Option<usize>,
+    /// The engine's memory, in bytes: its memtables, block cache and row cache (default: the
+    /// library's for each database, 64 MiB of memtable per shard plus a 256 MiB block cache
+    /// and a 64 MiB row cache). Taken by the memtables first, at most 64 MiB and at least
+    /// 128 KiB per shard, then by the caches at 4:1. On a cluster node, the node's total,
+    /// split equally across its partitions after any the map gives a `memory_bytes` of their
+    /// own (D317 ticket 8a).
+    #[arg(long, value_name = "BYTES")]
+    pub engine_memory: Option<u64>,
     /// The largest request body, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = 16 << 20)]
     pub max_request_bytes: usize,
@@ -118,9 +133,11 @@ pub(crate) struct ServeArgs {
     /// Sessions one token may hold at once.
     #[arg(long, value_name = "N", default_value_t = 64)]
     pub max_sessions_per_token: usize,
-    /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
-    /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
-    /// blocking threads compete only while blocking calls run.
+    /// Threads for the network side (default: the CPUs the shards don't use, less the feed
+    /// threads, at least 2). With `--blocking-threads`'s default, the two together can be
+    /// twice those CPUs: the blocking threads compete only while blocking calls run. With
+    /// the shards' SMT siblings in the network threads' mask, a node whose feed side keeps up
+    /// gains from raising it to count them too (the serving guide, #1745).
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
     /// Threads for blocking calls (default: the CPUs the shards don't use, at least 2).
@@ -138,10 +155,12 @@ pub(crate) struct ServeArgs {
     /// runs on the feed threads beside it instead (#1689).
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
-    /// Whether the network, feed and blocking threads get a CPU mask off the shards' cores
-    /// (Linux, where the engine pinned its shards). `off` keeps the same thread counts but
-    /// leaves the threads where the OS puts them: for a host shared with other work, where
-    /// the server shouldn't claim the CPUs (D313's R1, ICR 0131).
+    /// Whether the server's threads get a CPU mask off the shards' CPUs (Linux, where the
+    /// engine pinned its shards): the network workers on the free cores and the shards' SMT
+    /// siblings, the feed, hub, blocking and background threads on the free cores only.
+    /// `off` keeps the same thread counts but leaves the threads where the OS puts them: for
+    /// a host shared with other work, where the server shouldn't claim the CPUs (D313's R1,
+    /// ICR 0131).
     #[arg(long, value_enum, value_name = "on|off", default_value_t = Affinity::On)]
     pub affinity: Affinity,
     /// The bytes one HTTP/2 stream may queue for its client beyond the client's window
@@ -293,6 +312,10 @@ pub(crate) struct Limits {
     pub feed_client_bytes: usize,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
+    /// A test's hold seam (#1753): a fanned-out scan's entry waits after each partition's
+    /// page until the partition's next page has taken its share.
+    #[cfg(test)]
+    pub hold_after_part_page: bool,
     pub leases: Leases,
     /// The remote MCP tools' result limits and a session's cursor cache.
     pub mcp: crate::mcp::Limits,
@@ -323,6 +346,8 @@ impl ServeArgs {
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
+            #[cfg(test)]
+            hold_after_part_page: false,
             leases: Leases {
                 txn_idle: Duration::from_millis(self.txn_idle_ms.max(1)),
                 txn_lifetime: Duration::from_millis(self.txn_lifetime_ms.max(1)),

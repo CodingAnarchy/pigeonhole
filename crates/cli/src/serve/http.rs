@@ -271,13 +271,10 @@ async fn tables(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
 }
 
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
-    // Liveness only, with no token: whether the database is open and not failed. A node that
-    // only routes has none, and is up while it runs (D317 ticket 2).
-    let ok = shared
-        .router
-        .service
-        .part_opt()
-        .is_none_or(|p| !p.db.is_failed());
+    // Liveness only, with no token: whether every database served here is open and not
+    // failed (a cluster node's partitions, D317 ticket 8a). A node that only routes has none,
+    // and is up while it runs (D317 ticket 2).
+    let ok = shared.router.parts().iter().all(|p| !p.db.is_failed());
     let reply = proto::HealthResponse {
         status: if ok { "ok" } else { "failed" }.into(),
     };
