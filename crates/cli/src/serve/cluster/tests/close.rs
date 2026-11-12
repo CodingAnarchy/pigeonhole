@@ -149,3 +149,85 @@ fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
     assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
     assert!(e.message.contains("closed on this node"), "{}", e.message);
 }
+
+/// `drop-partition`: refused while the map still places the partition on the node, then
+/// its files move to `.phdb-dropped/`, nothing deleted.
+#[test]
+fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let a = ports[0];
+    let drop_p1 = async || {
+        client(a)
+            .await
+            .drop_partition(PartitionRequest {
+                partition: "p1".into(),
+            })
+            .await
+            .map(tonic::Response::into_inner)
+    };
+    rt.block_on(async {
+        client(a)
+            .await
+            .fence(PartitionRequest {
+                partition: "p1".into(),
+            })
+            .await
+            .unwrap();
+        close(a, "p1").await.unwrap();
+        let e = drop_p1().await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("still places"), "{e}");
+        assert!(dirs[0].join("p1.phdb").exists());
+        // The map moves p1 to b (its files there are the relocation's business).
+        let mut m = the_map(2, &ports);
+        m.partitions.retain(|p| p.id != "p3");
+        m.partitions
+            .iter_mut()
+            .filter(|p| p.id == "p1")
+            .for_each(|p| {
+                p.node = "b".into();
+                p.epoch = 2;
+            });
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(m),
+            })
+            .await
+            .unwrap();
+        let lp = drop_p1().await.unwrap();
+        assert_eq!(lp.epoch, 1, "{lp:?}");
+        assert!(lp.file.starts_with(".phdb-dropped/p1-1-"), "{lp:?}");
+        assert!(!dirs[0].join("p1.phdb").exists());
+        assert!(dirs[0].join(&lp.file).join("p1.phdb").is_file());
+        // Nothing of p1 left to drop.
+        let e = drop_p1().await.unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

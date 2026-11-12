@@ -205,3 +205,107 @@ fn hash_file(file: &Path) -> Result<(u64, [u8; 32]), String> {
     }
     Ok((bytes, h.finalize().into()))
 }
+
+/// Where `drop-partition` moves a partition's files: inside the cluster directory, so the
+/// move is a rename, and never deleted by the node.
+pub(crate) const DROPPED: &str = ".phdb-dropped";
+
+impl Node {
+    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): moves partition `id`'s files
+    /// (and any `.replaced` ones an install moved aside) to
+    /// `.phdb-dropped/<P>-<epoch>-<unix time>/`, deleting nothing: the operator deletes that
+    /// directory once the move is checked. Refused while the map names this node for it,
+    /// or it's open here. The reply's `file` is the directory, relative to the cluster's.
+    pub(crate) async fn drop_partition(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<LocalPartition, ApiError> {
+        let _one = self.fences.changing.lock().await;
+        let _open = self.opening.lock().await;
+        if !super::map::id_ok(id) {
+            return Err(ApiError::invalid(format!("{id:?} isn't a partition id")));
+        }
+        if let Ok(map) = self.get_map()
+            && map
+                .partitions
+                .iter()
+                .any(|p| p.id == id && p.node == self.id)
+        {
+            return Err(ApiError::failed_precondition(format!(
+                "the cluster map (version {}) still places partition {id:?} on this node: move \
+                 it first (phdb cluster relocate)",
+                map.map_version
+            )));
+        }
+        if self.part_state(id).is_some() {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {id:?} is open here: close it first (phdb cluster close)"
+            )));
+        }
+        let dir = self.dir.clone();
+        let part = id.to_owned();
+        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))??;
+        self.fences.closed().remove(id);
+        eprintln!(
+            "phdb serve: partition {id}'s files moved to {}: delete it once checked",
+            lp.file
+        );
+        Ok(lp)
+    }
+}
+
+/// [`Node::drop_partition`]'s move, on a blocking thread.
+fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
+    let main = dir.join(format!("{id}.phdb"));
+    if !main.exists() {
+        return Err(ApiError::not_found(format!(
+            "this node has no files of partition {id}"
+        )));
+    }
+    // The epoch from the file's identity, read without opening it for writes.
+    let epoch = super::identity::read_file(&main)
+        .map_err(ApiError::internal)?
+        .map_or(0, |i| i.epoch);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = format!("{id}-{epoch}-{now}");
+    let to = dir.join(DROPPED).join(&name);
+    if to.exists() {
+        return Err(ApiError::failed_precondition(format!(
+            "{} exists already: try again in a second",
+            to.display()
+        )));
+    }
+    std::fs::create_dir_all(&to)
+        .map_err(|e| ApiError::internal(format!("create {}: {e}", to.display())))?;
+    let mut files = pigeonhole::Pigeonhole::database_files(&main)
+        .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;
+    let prefix = format!("{id}.phdb");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&prefix) && n.ends_with(".replaced") {
+                files.push(e.path());
+            }
+        }
+    }
+    for f in &files {
+        let Some(n) = f.file_name() else { continue };
+        std::fs::rename(f, to.join(n))
+            .map_err(|e| ApiError::internal(format!("move {}: {e}", f.display())))?;
+    }
+    super::upload::sync_dir(&to);
+    super::upload::sync_dir(dir);
+    let mut lp = LocalPartition {
+        id: id.to_owned(),
+        epoch,
+        file: format!("{DROPPED}/{name}"),
+        ok: true,
+        ..Default::default()
+    };
+    lp.set_state(LocalPartitionState::Unspecified);
+    Ok(lp)
+}

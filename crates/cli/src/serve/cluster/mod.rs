@@ -913,12 +913,14 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
+    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope.
     async fn drop_partition(
         &self,
-        _req: Request<proto::PartitionRequest>,
+        req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
-        Err(ApiError::unsupported("not yet").into())
+        self.caller(&req, &[Scope::Admin], "drop a partition's files")?;
+        let id = req.into_inner().partition;
+        Ok(tonic::Response::new(self.0.drop_partition(&id).await?))
     }
 
     /// `Cluster.Stamp` (D317 ticket 6): relocate's and restore's first step on the node the
