@@ -1,0 +1,2 @@
+### Fixed
+- **`phdb serve`: change-feed subscribers with a row prefix keep up like unfiltered ones** (#1780). A prefix subscriber decoded and re-encoded every commit for itself, about 13 times the cost of an unfiltered subscriber's shared event, so many prefix subscribers on one busy table fell behind the shared ring and lagged by seconds. It now reads which rows a commit touches straight off the shared encoding. When every row matches, it sends the shared event; when none match, it sends nothing. Only a commit with some matching rows is decoded and filtered.
