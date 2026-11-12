@@ -23,6 +23,15 @@ impl Pigeonhole {
     /// The list is a snapshot of the directory. While the database is open, its files keep
     /// changing, so copy them only once it's closed.
     ///
+    /// The directory is scanned, not the main file read: sidecars whose main file is gone
+    /// are listed (what a removal left half done, so a caller can finish it), and a path
+    /// with no files, or no directory, answers an empty list, so a cleanup can run again.
+    ///
+    /// Names are matched by suffix alone: don't keep a database whose name is another's
+    /// plus `-feed` or `-wal-<n>` in the same directory, since it would be listed as the
+    /// other's sidecar (the engine would open it as one too). A path that isn't UTF-8 lists
+    /// nothing.
+    ///
     /// ```
     /// use pigeonhole::{Options, Pigeonhole};
     ///
@@ -49,8 +58,15 @@ impl Pigeonhole {
         let mut main = None;
         let mut wal = Vec::new();
         let mut feed = None;
-        for entry in std::fs::read_dir(dir).map_err(io)? {
-            let file = entry.map_err(io)?.path();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io(e)),
+        };
+        for entry in entries {
+            // Named beside `path` as given, so a bare relative path (`data.phdb`, read from
+            // `.`) matches its own files.
+            let file = path.with_file_name(entry.map_err(io)?.file_name());
             match Self::database_file_suffix(path, &file) {
                 Some("") => main = Some(file),
                 Some(FEED_SUFFIX) => feed = Some(file),
@@ -75,6 +91,9 @@ impl Pigeonhole {
     ///
     /// A file is named by this suffix when it's copied to where another path holds the same
     /// database (`db` there plus the suffix), so nothing parses file names itself.
+    ///
+    /// Paths are compared as written, not canonicalized (`./data/x` isn't `data/x`): pass
+    /// files named from the same `db`, as [`database_files`](Self::database_files) gives.
     ///
     /// ```
     /// use std::path::Path;
@@ -197,6 +216,22 @@ mod tests {
         }
     }
 
+    /// A removal that stopped after the main file (feed1248's #1748: a replica bootstrap's
+    /// side copy): its sidecars are still listed, so they can be removed too.
+    #[test]
+    fn sidecars_whose_main_file_is_gone_are_listed() {
+        let dir = crate::doc_support::temp_dir();
+        let path = dir.join("p1.phdb.bootstrap");
+        for name in [
+            "p1.phdb.bootstrap-wal-0",
+            "p1.phdb.bootstrap-feed",
+            "p1.phdb",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        assert_eq!(suffixes(&path), ["-wal-0", "-feed"]);
+    }
+
     #[test]
     fn a_database_that_doesnt_exist_has_no_files() {
         let dir = crate::doc_support::temp_dir();
@@ -204,6 +239,32 @@ mod tests {
             Pigeonhole::database_files(dir.join("none.phdb"))
                 .unwrap()
                 .is_empty()
+        );
+        // Nor one whose directory is gone: a cleanup that runs again (cli692's N2).
+        assert!(
+            Pigeonhole::database_files(dir.join("gone").join("none.phdb"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A bare relative path's files, as `database_files` names them read from `.`: beside
+    /// the path as given, never `./`-prefixed (cli692's N5).
+    #[test]
+    fn a_bare_relative_paths_files_match_it() {
+        let db = Path::new("data.phdb");
+        assert_eq!(
+            Pigeonhole::database_file_suffix(db, &db.with_file_name("data.phdb-wal-0")),
+            Some("-wal-0")
+        );
+        assert_eq!(
+            Pigeonhole::database_file_suffix(db, Path::new("data.phdb-feed")),
+            Some("-feed")
+        );
+        // What `read_dir(".")` gives: compared as written, not this database's form.
+        assert_eq!(
+            Pigeonhole::database_file_suffix(db, Path::new("./data.phdb-wal-0")),
+            None
         );
     }
 }
