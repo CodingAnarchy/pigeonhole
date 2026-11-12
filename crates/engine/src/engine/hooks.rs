@@ -84,6 +84,10 @@ pub enum HookSite {
     /// cross-shard commit whose share apply failed: where a caller that heard the answer
     /// commits again while the shard thread is still inside the handler (#1358).
     FailedShareAnswered,
+    /// On the thread running a compaction task, after the task reported its committed
+    /// result to its shard and before the task ends: where the compaction's caller can run
+    /// on while the runtime still holds the task (#1765).
+    CompactionReported,
 }
 
 /// A one-shot test callback.
