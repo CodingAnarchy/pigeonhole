@@ -758,7 +758,7 @@ mod tests {
             let start = tokio::time::Instant::now();
             let mut wait = Waiting::new(
                 "waiting for node \"c\" to serve p1 at epoch 2".into(),
-                Some(Duration::from_millis(1000)),
+                Some(Duration::from_millis(1100)),
                 "The map already gives p1 to node \"c\"".into(),
             );
             let mut ticks = 0;
@@ -767,14 +767,16 @@ mod tests {
                     Ok(()) => ticks += 1,
                     Err(e) => break e,
                 }
+                assert!(ticks < 100, "never gave up");
             };
-            // Polled every 200 ms, and the last sleep is cut to the limit: given up at it.
-            assert_eq!(start.elapsed(), Duration::from_millis(1000));
-            assert_eq!(ticks, 5);
+            // Polled every 200 ms, and the last sleep is cut to the limit: given up at it,
+            // not at the next poll.
+            assert_eq!(start.elapsed(), Duration::from_millis(1100));
+            assert_eq!(ticks, 6);
             assert_eq!(e.status(), crate::ExitStatus::ERROR);
             assert_eq!(
                 e.message(),
-                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 1s (--timeout): \
+                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 1.1s (--timeout): \
                  opening. The map already gives p1 to node \"c\""
             );
         });
@@ -786,10 +788,10 @@ mod tests {
             let start = tokio::time::Instant::now();
             let mut wait = Waiting::new("waiting".into(), Some(Duration::from_secs(3)), "".into());
             wait.tick("closed").await.unwrap();
-            let e = wait
-                .ask(std::future::pending::<()>())
-                .await
-                .expect_err("given up");
+            let e = tokio::select! {
+                r = wait.ask(std::future::pending::<()>()) => r.expect_err("given up"),
+                () = tokio::time::sleep(Duration::from_secs(60)) => panic!("never gave up"),
+            };
             assert_eq!(start.elapsed(), Duration::from_secs(3));
             assert!(
                 e.message().contains("the node didn't answer"),
