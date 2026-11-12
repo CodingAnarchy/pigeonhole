@@ -418,15 +418,18 @@ impl Merge {
     }
 
     async fn run(&mut self, sink: &Sink, quiet: Duration) -> Result<(), ApiError> {
-        let mut last_sent = tokio::time::Instant::now();
         let mut turn = 0;
+        // One timer each for the whole stream, moved only when its deadline changes: a timer
+        // built per iteration registers with tokio's timer driver, under its mutex, once per
+        // event (#1758).
+        let mut retry = Timer::new();
+        let mut quiet = Quiet::new(quiet);
         loop {
             for event in std::mem::take(&mut self.states) {
                 sink.put(Out::Event(event)).await?;
-                last_sent = tokio::time::Instant::now();
+                quiet.sent();
             }
-            let retry_at = self.parts.iter().filter_map(|p| p.retry).min();
-            let quiet_at = last_sent + quiet;
+            retry.set(self.parts.iter().filter_map(|p| p.retry).min());
             let next = std::future::poll_fn(|cx| poll_parts(&mut self.parts, &mut turn, cx));
             tokio::select! {
                 () = sink.closed() => return Ok(()),
@@ -435,7 +438,7 @@ impl Merge {
                         Some(Ok(bytes)) => match self.cover(i, bytes) {
                             Ok(Some(out)) => {
                                 sink.put(out).await?;
-                                last_sent = tokio::time::Instant::now();
+                                quiet.sent();
                                 None
                             }
                             Ok(None) => None,
@@ -458,7 +461,8 @@ impl Merge {
                         return Err(e);
                     }
                 }
-                () = sleep_until(retry_at) => {
+                () = retry.wait() => {
+                    // Every part due is reopened, so the next `set` moves or disarms it.
                     let now = tokio::time::Instant::now();
                     for i in 0..self.parts.len() {
                         if self.parts[i].retry.is_some_and(|at| at <= now) {
@@ -466,11 +470,11 @@ impl Merge {
                         }
                     }
                 }
-                () = tokio::time::sleep_until(quiet_at) => {
+                () = quiet.wait() => {
                     if self.moved {
                         sink.put(Out::Event(self.progress())).await?;
                     }
-                    last_sent = tokio::time::Instant::now();
+                    quiet.sent();
                 }
             }
         }
@@ -600,10 +604,91 @@ fn poll_parts(
     Poll::Pending
 }
 
-async fn sleep_until(at: Option<tokio::time::Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
+/// The quiet interval: done once `quiet` passes with nothing sent. Its timer lags the last
+/// send rather than following it: when it fires early (something was sent since it was set)
+/// it moves to the real deadline, so it moves at most once per quiet period, not once per
+/// send (#1758).
+struct Quiet {
+    quiet: Duration,
+    last_sent: tokio::time::Instant,
+    timer: Timer,
+}
+
+impl Quiet {
+    fn new(quiet: Duration) -> Self {
+        let last_sent = tokio::time::Instant::now();
+        let mut timer = Timer::new();
+        timer.set(Some(last_sent + quiet));
+        Self {
+            quiet,
+            last_sent,
+            timer,
+        }
+    }
+
+    /// Something was sent now.
+    fn sent(&mut self) {
+        self.last_sent = tokio::time::Instant::now();
+    }
+
+    /// Done once `quiet` has passed since the last send. Safe to drop at any point (another
+    /// `select!` branch won): the timer keeps its deadline.
+    async fn wait(&mut self) {
+        loop {
+            self.timer.wait().await;
+            let due = self.last_sent + self.quiet;
+            if tokio::time::Instant::now() >= due {
+                return;
+            }
+            self.timer.set(Some(due));
+        }
+    }
+}
+
+/// A timer kept for a whole stream: set to a deadline, or to none, and moved only when the
+/// deadline changes (#1758). Waiting on it doesn't register anything new, and dropping a
+/// wait (another `select!` branch won) leaves it armed.
+struct Timer {
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    at: Option<tokio::time::Instant>,
+    /// How many times it was moved, for the tests.
+    #[cfg(test)]
+    moves: u32,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            // Not polled until it's set, so not registered.
+            sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
+            at: None,
+            #[cfg(test)]
+            moves: 0,
+        }
+    }
+
+    /// Arms it for `at`, or disarms it (`None`). Unchanged costs nothing.
+    fn set(&mut self, at: Option<tokio::time::Instant>) {
+        if at == self.at {
+            return;
+        }
+        self.at = at;
+        if let Some(at) = at {
+            self.sleep.as_mut().reset(at);
+            #[cfg(test)]
+            {
+                self.moves += 1;
+            }
+        }
+    }
+
+    /// Done once its deadline passes; never while disarmed. Stays done until it's set
+    /// again.
+    async fn wait(&mut self) {
+        match self.at {
+            Some(_) => self.sleep.as_mut().await,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -1056,6 +1141,92 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime on a paused clock: virtual time, advanced only when every task waits.
+    fn paused() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    /// Whether `f` is done within `d` of virtual time.
+    async fn done_within(d: Duration, f: impl std::future::Future<Output = ()>) -> bool {
+        tokio::time::timeout(d, f).await.is_ok()
+    }
+
+    #[test]
+    fn a_timer_moves_only_when_its_deadline_changes() {
+        // #1758: the merge sets the retry timer on every event; only a change may move it.
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let mut t = Timer::new();
+            assert!(
+                !done_within(Duration::from_secs(3600), t.wait()).await,
+                "unset"
+            );
+            let at = tokio::time::Instant::now() + Duration::from_secs(1);
+            for _ in 0..1000 {
+                t.set(Some(at));
+            }
+            assert_eq!(t.moves, 1, "set to the same deadline 1000 times");
+            t.wait().await;
+            assert_eq!(tokio::time::Instant::now(), at, "done at its deadline");
+            assert!(start < at);
+            assert!(
+                done_within(Duration::ZERO, t.wait()).await,
+                "stays done until set again"
+            );
+            t.set(None);
+            assert!(
+                !done_within(Duration::from_secs(3600), t.wait()).await,
+                "disarmed"
+            );
+            let later = tokio::time::Instant::now() + Duration::from_secs(5);
+            t.set(Some(later));
+            t.wait().await;
+            assert_eq!(tokio::time::Instant::now(), later);
+            assert_eq!(t.moves, 2);
+        });
+    }
+
+    #[test]
+    fn the_quiet_timer_moves_once_per_quiet_period_not_per_send() {
+        // #1758: a send per event moved a new quiet timer per event. Sends now only note the
+        // time; the timer moves when it fires early, and the wait still ends exactly `quiet`
+        // after the last send.
+        paused().block_on(async {
+            let quiet = Duration::from_millis(100);
+            let mut q = Quiet::new(quiet);
+            assert_eq!(q.timer.moves, 1, "armed once");
+            // 1000 sends 1 ms apart: 10 quiet periods' worth, never quiet.
+            for _ in 0..1000 {
+                tokio::time::advance(Duration::from_millis(1)).await;
+                q.sent();
+                assert!(
+                    !done_within(Duration::ZERO, q.wait()).await,
+                    "not quiet yet"
+                );
+            }
+            assert!(
+                q.timer.moves <= 11,
+                "moved {} times for 1000 sends over 10 quiet periods",
+                q.timer.moves
+            );
+            let last = tokio::time::Instant::now();
+            q.wait().await;
+            assert_eq!(
+                tokio::time::Instant::now(),
+                last + quiet,
+                "quiet after the last send"
+            );
+            // Quiet again a period after it's noted as sent.
+            q.sent();
+            q.wait().await;
+            assert_eq!(tokio::time::Instant::now(), last + quiet * 2);
+        });
+    }
 
     fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
         let e = proto::FeedEvent {
