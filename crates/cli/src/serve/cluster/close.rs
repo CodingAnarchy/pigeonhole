@@ -33,6 +33,13 @@ pub(crate) struct Closed {
     error: Option<String>,
 }
 
+/// A hold seam (tests): the next close in this cluster directory waits, after the partition
+/// left the parts and before its database closes, until the sender is dropped or sends.
+#[cfg(test)]
+pub(crate) static HOLD_BEFORE_DB_CLOSE: std::sync::Mutex<
+    Option<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
 /// Each close's [`Closed::generation`].
 static CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -48,6 +55,11 @@ impl Closed {
     pub(crate) fn describe(&self, lp: &mut LocalPartition) {
         lp.set_state(LocalPartitionState::Closed);
         lp.epoch = self.epoch;
+        // Between the close's swap and its database's close, a read of the file is still
+        // refused by the writer lock: transient, and the partition's identity was the map's
+        // while it served, so only the close's own errors count (cli692's N1 on #1769).
+        lp.ok = true;
+        lp.error.clear();
         if let Some(e) = &self.error {
             lp.ok = false;
             lp.error = format!("its database's close reported: {e}");
@@ -128,7 +140,20 @@ impl Node {
             },
         );
         // Its users end and its database closes, off the async threads.
+        #[cfg(test)]
+        let dir = self.dir.clone();
         let closed = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                let mut armed = HOLD_BEFORE_DB_CLOSE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if armed.as_ref().is_some_and(|(d, _)| *d == dir) {
+                    let (_, wait) = armed.take().expect("armed");
+                    drop(armed);
+                    let _ = wait.recv();
+                }
+            }
             let Some(part) = service.part_opt() else {
                 return Ok(());
             };

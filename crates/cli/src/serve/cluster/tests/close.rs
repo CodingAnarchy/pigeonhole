@@ -244,3 +244,61 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
         let _ = db.close();
     }
 }
+
+/// cli692's N1 on #1769: while a close is between taking the partition out of the parts and
+/// closing its database, a read of the file is refused by the writer lock. Status then
+/// shows the partition closed, with no error: the lock is the close's own, and transient.
+#[test]
+fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let a = ports[0];
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    *super::super::close::HOLD_BEFORE_DB_CLOSE.lock().unwrap() = Some((dirs[0].clone(), wait));
+    rt.block_on(async {
+        client(a)
+            .await
+            .fence(PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let closing = tokio::spawn(async move { close(a, "p1").await });
+        eventually("p1 to be closing", async || {
+            local(a, "p1").await.state() == LocalPartitionState::Closed
+        })
+        .await;
+        // Held before its database closes: the file is still locked.
+        let lp = local(a, "p1").await;
+        assert!(lp.ok, "{lp:?}");
+        assert!(lp.error.is_empty(), "{lp:?}");
+        assert_eq!(lp.epoch, 1, "{lp:?}");
+        release.send(()).unwrap();
+        let lp = closing.await.unwrap().unwrap();
+        assert_eq!(lp.state(), LocalPartitionState::Closed, "{lp:?}");
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
