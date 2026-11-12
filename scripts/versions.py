@@ -4,8 +4,9 @@
     versions.py check               fails unless each line is consistent (CI runs it)
     versions.py list                prints `<crate> <version>` for every published crate, in
                                     publish order
-    versions.py release-check TAG   fails if a line's crates changed since the release TAG while
-                                    the line's version did not move (`.coord/publish.sh` runs it)
+    versions.py release-check TAG   fails if a line's version is below the release TAG's, or if
+                                    its crates changed since TAG while its version did not go up
+                                    (`.coord/publish.sh` runs it)
 
 - **The internal line:** the 12 internal crates (`INTERNAL`) each set the same `version` in
   their own Cargo.toml. Any incompatible change to any of them takes the line's next major.
@@ -32,9 +33,12 @@
 
 **Release check:** `publish.sh` skips a crate already on crates.io at its version, so a line
 whose crates changed since the last release but whose version did not move would ship the
-previous release's code under the new `pigeonhole` (perf287's S2 on #1196). `release-check`
-counts what changes a crate's behaviour or dependencies: its `src/`, a `build.rs`, and its
-`Cargo.toml` other than the `version` line, plus the workspace `Cargo.toml`'s shared settings
+previous release's code under the new `pigeonhole` (perf287's S2 on #1196). A version below
+the tag's fails too, changed or not: `publish.sh` would skip it as published, and a TAG from a
+release branch (v1.1.2) can be ahead of `main` (1.1.0). Versions compare by semver's
+precedence (numbers as numbers, a pre-release below its release). `release-check` counts what
+changes a crate's behaviour or dependencies: its `src/`, a `build.rs`, and its `Cargo.toml`
+other than the `version` line, plus the workspace `Cargo.toml`'s shared settings
 (`[workspace.dependencies]` other than the crates' own pins, and `[workspace.package]` other
 than `version`), which every packaged manifest inherits. Tests, benches and docs don't count.
 
@@ -232,6 +236,28 @@ def changed(tag, d):
     return False
 
 
+def semver(v):
+    """`v` as a comparable key, by semver's precedence: `(major, minor, patch)`, then a release
+    above its pre-releases (`1.2.0-rc.1` < `1.2.0`), whose dot-separated identifiers compare
+    numerically when numeric (`rc.9` < `rc.10`, ai1249's N1 on #1791) and below alphanumeric
+    ones, a longer list above its prefix. Build metadata is ignored."""
+    core, _, pre = v.split("+", 1)[0].partition("-")
+    ids = tuple(
+        (0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")
+    ) if pre else ()
+    return tuple(int(x) for x in core.split(".")), pre == "", ids
+
+
+def line_errors(label, tag, now, then, changed_what):
+    """A line's errors against `tag`: its version `now` against `then` (the tag's), where
+    `changed_what` says what changed since the tag ("" if nothing)."""
+    if semver(now) < semver(then):
+        return [f"{label} is {now}, below {then} at {tag}: a version never goes back"]
+    if changed_what and semver(now) == semver(then):
+        return [f"{label} is still {now}, as at {tag}, but {changed_what}"]
+    return []
+
+
 def release_check(tag):
     root, crates = versions()
     old_root = toml_at(tag, "Cargo.toml")
@@ -248,24 +274,22 @@ def release_check(tag):
         now = crates[dirs[0]] or workspace
         then = old_version(dirs[0])
         moved = [d for d in dirs if changed(tag, d)]
+        what = ""
         if shared:
-            moved = list(dirs)
-        if moved and now == then:
-            errors.append(
-                f"the {line} line is still {now}, as at {tag}, but "
-                + ("the workspace's shared settings changed" if shared else "these changed: ")
-                + ("" if shared else ", ".join(name(d) for d in moved))
+            what = f"the workspace's shared settings changed: bump the {line} line (and its pins)"
+        elif moved:
+            what = (
+                "these changed: " + ", ".join(name(d) for d in moved)
                 + f": bump the {line} line (and its pins)"
             )
+        errors += line_errors(f"the {line} line", tag, now, then, what)
     for d in OWN:
         try:
             then = toml_at(tag, f"crates/{d}/Cargo.toml")["package"]["version"]
         except subprocess.CalledProcessError:
             continue  # new since the tag: its first release
-        if (changed(tag, d) or shared) and crates[d] == then:
-            errors.append(
-                f"{name(d)} is still {then}, as at {tag}, but it changed: bump its version (and its pin)"
-            )
+        what = "it changed: bump its version (and its pin)" if changed(tag, d) or shared else ""
+        errors += line_errors(name(d), tag, crates[d], then, what)
     if errors:
         for e in errors:
             print(f"error: {e}", file=sys.stderr)
