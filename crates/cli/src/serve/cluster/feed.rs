@@ -36,7 +36,7 @@ use prost::bytes::{Buf, BufMut, Bytes};
 use tonic::transport::Channel;
 
 use super::Node;
-use super::token::{At, ClusterToken, Component, subscription_hash};
+use super::token::{At, ClusterToken, subscription_hash};
 use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
 use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT, Sink};
@@ -212,6 +212,9 @@ pub(crate) async fn subscribe(
         next_checkpoint: 1,
         moved: false,
         states: Vec::new(),
+        token: Vec::new(),
+        scratch: Vec::new(),
+        tail: tail_buffer(),
         opens: tokio::task::JoinSet::new(),
     };
     merge.open_all().await?;
@@ -299,6 +302,12 @@ struct Merge {
     moved: bool,
     /// `PartitionState` events to send.
     states: Vec<proto::FeedEvent>,
+    /// The last checkpoint's token ([`Merge::checkpoint`]), and its components' compacted
+    /// bytes on their way: kept, so a checkpoint per event allocates nothing (#1758).
+    token: Vec<u8>,
+    scratch: Vec<u8>,
+    /// Each commit's tail is written here and split off ([`Merge::cover`]).
+    tail: prost::bytes::BytesMut,
     /// Parts opening again in the background, each bounded by the request timeout, so
     /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
     /// #1700).
@@ -424,6 +433,11 @@ impl Merge {
         // event (#1758).
         let mut retry = Timer::new();
         let mut quiet = Quiet::new(quiet);
+        // The client going away, waited on for the whole stream: a new wait per iteration
+        // registered and dropped a waiter on the channel's `Notify`, under its mutex, per
+        // event (#1758's g86c).
+        let closed = sink.closed();
+        tokio::pin!(closed);
         loop {
             for event in std::mem::take(&mut self.states) {
                 sink.put(Out::Event(event)).await?;
@@ -432,7 +446,7 @@ impl Merge {
             retry.set(self.parts.iter().filter_map(|p| p.retry).min());
             let next = std::future::poll_fn(|cx| poll_parts(&mut self.parts, &mut turn, cx));
             tokio::select! {
-                () = sink.closed() => return Ok(()),
+                () = &mut closed => return Ok(()),
                 (i, item) = next => {
                     let ended = match item {
                         Some(Ok(bytes)) => match self.cover(i, bytes) {
@@ -501,27 +515,41 @@ impl Merge {
                 // over by its node, so any commit is past it (simp724's N2).
                 self.parts[i].skip = 0;
                 self.since_checkpoint += 1;
-                let mut tail = Vec::with_capacity(16 + self.parts[i].partition.len());
+                // The tail goes into the merge's own buffer, split off for the event: no
+                // allocation per event once it has grown (#1758).
                 put_field(
-                    &mut tail,
+                    &mut self.tail,
                     PARTITION_FIELD,
                     self.parts[i].partition.as_bytes(),
                 );
                 if self.since_checkpoint >= self.next_checkpoint {
-                    let token = self.checkpoint();
-                    put_field(&mut tail, TOKEN_FIELD, &token);
+                    self.checkpoint();
+                    put_field(&mut self.tail, TOKEN_FIELD, &self.token);
                 }
                 Ok(Some(Out::Spliced {
                     body,
-                    tail: Bytes::from(tail),
+                    tail: self.tail.split().freeze(),
                 }))
             }
         }
     }
 
-    /// The cluster token as of now, and the next checkpoint's distance from it.
-    fn checkpoint(&mut self) -> Vec<u8> {
-        let token = self.token().encode();
+    /// The cluster token as of now, into [`Merge::token`], and the next checkpoint's distance
+    /// from it. One per event on a one-partition subscription, so it builds the bytes from
+    /// the parts in reused buffers (#1758).
+    fn checkpoint(&mut self) {
+        self.token.clear();
+        super::token::encode_into(
+            &self.cluster_id,
+            self.map_version,
+            self.subscription,
+            self.parts
+                .iter()
+                .map(|p| (p.partition.as_str(), p.epoch, &p.at)),
+            &mut self.token,
+            &mut self.scratch,
+        );
+        let token = &self.token;
         self.since_checkpoint = 0;
         self.moved = false;
         self.next_checkpoint = if self.parts.len() == 1 {
@@ -531,30 +559,15 @@ impl Merge {
         } else {
             (token.len().div_ceil(TOKEN_BYTES_PER_EVENT) as u64).clamp(1, MAX_EVERY)
         };
-        token
-    }
-
-    fn token(&self) -> ClusterToken {
-        ClusterToken {
-            cluster_id: self.cluster_id.clone(),
-            map_version: self.map_version,
-            subscription: self.subscription,
-            components: self
-                .parts
-                .iter()
-                .map(|p| Component {
-                    partition: p.partition.clone(),
-                    epoch: p.epoch,
-                    at: p.at.clone(),
-                })
-                .collect(),
-        }
     }
 
     /// A progress event with a checkpoint.
     fn progress(&mut self) -> proto::FeedEvent {
         proto::FeedEvent {
-            token: Bytes::from(self.checkpoint()),
+            token: {
+                self.checkpoint();
+                Bytes::copy_from_slice(&self.token)
+            },
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
         }
@@ -583,6 +596,17 @@ impl Merge {
         }
         Err(in_partition(&self.parts[i].partition, e))
     }
+}
+
+/// What a merge's tail buffer starts with ([`Merge::tail`]): each event's tail is split off
+/// it, and a buffer that started empty reallocates exactly to size after each split, then
+/// grows: 4 allocations an event against main's 2 for a client that's behind (cli692's S1
+/// on #1766, measured). Starting with room, it allocates about once per this many bytes of
+/// tails (0.02 an event at 8 KiB). Not `BytesMut::new()`: a test holds it.
+const TAIL_CAPACITY: usize = 8 << 10;
+
+fn tail_buffer() -> prost::bytes::BytesMut {
+    prost::bytes::BytesMut::with_capacity(TAIL_CAPACITY)
 }
 
 /// Polls every available part, from `turn` on so none starves, for its next event.
@@ -729,7 +753,10 @@ fn state_event(partition: &str, e: Option<&ApiError>) -> proto::FeedEvent {
 fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
     let mut token = Bytes::new();
     let mut kind = Kind::Other;
-    let mut kept: Vec<(usize, usize)> = Vec::new();
+    // The body's ranges: one in the usual case (the token is its first field), held without
+    // an allocation (#1758); more only if the token sits between other fields.
+    let mut first: Option<(usize, usize)> = None;
+    let mut more: Vec<(usize, usize)> = Vec::new();
     let mut buf = bytes.clone();
     while buf.has_remaining() {
         let start = bytes.len() - buf.remaining();
@@ -760,18 +787,21 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
             _ => {}
         }
         let end = bytes.len() - buf.remaining();
-        match kept.last_mut() {
-            Some(last) if last.1 == start => last.1 = end,
-            _ => kept.push((start, end)),
+        match (more.last_mut(), &mut first) {
+            (Some(last), _) if last.1 == start => last.1 = end,
+            (Some(_), _) => more.push((start, end)),
+            (None, Some(f)) if f.1 == start => f.1 = end,
+            (None, Some(_)) => more.push((start, end)),
+            (None, None) => first = Some((start, end)),
         }
     }
-    let body = match kept.as_slice() {
-        [] => Bytes::new(),
-        [(a, b)] => bytes.slice(*a..*b),
-        ranges => {
+    let body = match (first, more.is_empty()) {
+        (None, _) => Bytes::new(),
+        (Some((a, b)), true) => bytes.slice(a..b),
+        (Some(f), false) => {
             let mut v = Vec::with_capacity(bytes.len());
-            for (a, b) in ranges {
-                v.extend_from_slice(&bytes[*a..*b]);
+            for (a, b) in std::iter::once(f).chain(more) {
+                v.extend_from_slice(&bytes[a..b]);
             }
             Bytes::from(v)
         }
@@ -780,7 +810,7 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
 }
 
 /// Appends a length-delimited field.
-fn put_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
     prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
     prost::encoding::encode_varint(value.len() as u64, out);
     out.put_slice(value);
@@ -1245,6 +1275,29 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_s_tail_buffer_starts_with_room() {
+        // cli692's S1 on #1766: an empty start reallocates per event once tails are split
+        // off it. Tails split off a buffer with room share its allocation.
+        let mut tail = tail_buffer();
+        assert!(tail.capacity() >= 4 << 10, "{}", tail.capacity());
+        let before = tail.as_ptr();
+        put_field(&mut tail, PARTITION_FIELD, b"p1");
+        let first = tail.split().freeze();
+        put_field(&mut tail, PARTITION_FIELD, b"p2");
+        let second = tail.split().freeze();
+        assert_eq!(
+            first.as_ptr(),
+            before,
+            "the first tail is in the buffer's allocation"
+        );
+        assert_eq!(
+            second.as_ptr(),
+            before.wrapping_add(first.len()),
+            "and the next one right after it"
+        );
+    }
+
+    #[test]
     fn an_event_splits_into_its_token_and_the_rest_and_splices_back() {
         let bytes = event(b"position", Some(42));
         let (token, body, kind) = split(bytes).unwrap();
@@ -1273,5 +1326,18 @@ mod tests {
             split(Bytes::from_static(&[0x0a, 0x05, 1])).is_err(),
             "truncated"
         );
+        // A token between other fields (not prost's order, but valid): the body is the
+        // fields around it, joined.
+        let mut odd = Vec::new();
+        put_field(&mut odd, PARTITION_FIELD, b"p1");
+        put_field(&mut odd, TOKEN_FIELD, b"tok");
+        put_field(&mut odd, PROGRESS_FIELD, b"");
+        let (token, body, kind) = split(Bytes::from(odd)).unwrap();
+        assert_eq!(&token[..], b"tok");
+        assert!(matches!(kind, Kind::Progress));
+        let mut want = Vec::new();
+        put_field(&mut want, PARTITION_FIELD, b"p1");
+        put_field(&mut want, PROGRESS_FIELD, b"");
+        assert_eq!(&body[..], &want[..]);
     }
 }
