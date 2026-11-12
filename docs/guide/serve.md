@@ -263,6 +263,22 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
   - Before #1734, the masked server did the opposite: it held writes to about 33K of the 55K puts/s and delivered every event, or switched between the two. The network threads now also run on the shards' SMT siblings (Placement, below), so the writes no longer queue behind delivery for a CPU.
 
   Each stream's framing still runs on its connection's network thread.
+
+  **When to raise `--io-threads`** (#1745). The default is the free cores' CPUs less the feed threads. Since #1734 the network threads also run on the shards' SMT siblings (Placement, below), and the default doesn't count those, so on a node whose network threads are the limit, part of their mask sits idle.
+  - **Raise it on a node whose feed side keeps up:** no feeds, or feeds whose delivery has headroom, meaning `pigeonhole_serve_feed_fell_behind_total` isn't rising and no `phdb-serve-feed-hub` thread runs near a full core. Raise it to the CPUs the network threads may run on, less the feed threads: the startup line's free CPUs, plus the SMT siblings named at the end of the line, minus its feed threads.
+    - That tail is there only with the mask on (`--affinity on`) and SMT. Without SMT the default already fills the mask, so there's nothing to raise.
+    - In perf287's g83, at 512 callers on ycsb-a and ycsb-c with no feeds:
+      - on the AX102 single node, 13 network threads instead of 9 gave about 23% more ops/s (ycsb-a 345K → 425K);
+      - on an 8-core node, 10 instead of 6 gave 34–37% more;
+      - p99 was lower in both.
+
+    The cost:
+    - CPU per op rose 12–18% in g83, and up to 37% on one row of an earlier single-round run (8bio), partly limited by its client;
+    - a mixed read/put row's p99.9 rose 25–35%, with its p99 level or lower;
+    - at 16 table sets × 16 streams and 20K puts/s, put p50 rose about 45 µs and put p99 about 12% (1.63 → 1.84 ms, two rounds each), with subscriber lag unchanged.
+  - **Don't raise it on a node whose feed side saturates,** where `pigeonhole_serve_feed_fell_behind_total` rises or a hub thread runs at a full core. At 16 × 16 streams and 55K puts/s on the AX102, 13 network threads held puts to 38–48K/s, with a put p99 of seconds, in 4 of 4 runs (perf287's g83 and g84). 11 threads fell short in 1 of 2 runs, and even their good run had a put p99 of 0.84 s against the default's 0.12–0.14 s.
+    - The extra workers queued for CPU behind each other: about one core's worth of run-queue wait, against 0.04 with the default. The feed and hub threads weren't short of CPU.
+    - The default keeps the writes first there. [#1737](https://github.com/CodingAnarchy/pigeonhole/issues/1737) tracks scaling the feed side.
 - **Placement** (Linux, D313 R1): where the engine pinned its shard threads (the default, `Options::pin_threads`), the server's threads get an affinity mask that keeps them off the shards' CPUs: every partition's shards on a cluster node. The compaction threads' CPUs stay in the mask: on one node, leaving them out too cost the network side about three times its throughput (g72 on #1703). The startup line counts both. A client thread preempting a pinned shard thread raised `Buffered` put p99.9 (#1206). The startup line's last part says which mask the server built:
   - **`off the shards' cores`:** the network workers run on every CPU but the shards' own: the free cores and the shards' SMT siblings. The line then ends with "network threads also on the shards' N SMT siblings (CPUs)", the whole list. The feed and feed hub threads, the blocking threads (scans, `ReadRow`, `MultiGet`, text and vector calls, `/mcp`) and the background threads (below) stay on the free cores only, since a busy thread on a shard's sibling doubled the shard's p99 (#1244).
     - The siblings are there for the writes: with only the free cores, 256 feed streams' delivery filled them and the network threads waited for a CPU, so puts were held to 33K/s while the siblings sat idle (#1734).

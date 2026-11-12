@@ -1299,16 +1299,17 @@ enum PartPages {
 }
 
 impl PartPages {
-    async fn next(&mut self) -> Option<Result<ScanPage, ApiError>> {
+    /// The next page, with its share of this node's in-flight budget when the partition is
+    /// here: the entry's page is the same page, so it keeps the share rather than giving it
+    /// back and waiting for it again (#1753). A page from another node holds that node's
+    /// budget, not this one's.
+    async fn next(&mut self) -> Option<Result<(ScanPage, Option<OwnedSemaphorePermit>), ApiError>> {
         match self {
-            Self::Here(pages) => {
-                std::future::poll_fn(|cx| {
-                    futures_core::Stream::poll_next(Pin::new(&mut *pages), cx)
-                })
+            Self::Here(pages) => std::future::poll_fn(|cx| pages.poll_next_charged(cx))
                 .await
-            }
+                .map(|page| page.map(|(page, share)| (page, Some(share)))),
             Self::There(stream, address, lease) => match stream.message().await {
-                Ok(Some(page)) => Some(Ok(page)),
+                Ok(Some(page)) => Some(Ok((page, None))),
                 Ok(None) => {
                     lease.ended();
                     None
@@ -1398,17 +1399,25 @@ impl ScanJob {
         let table = self.r.table.clone();
         let allow_partial = self.r.allow_partial;
         // Sends one page, waiting for the client to take the one before it, with its share
-        // of the in-flight budget held until the client takes it.
+        // of the in-flight budget held until the client takes it: the local partition's
+        // share for its page (`$paid`), or one taken here (#1753: never a second share for a
+        // page whose first is held, which the partition's next page could take meanwhile).
         macro_rules! send {
-            ($page:expr) => {{
+            ($page:expr, $paid:expr) => {{
                 let page: ScanPage = $page;
+                let paid: Option<OwnedSemaphorePermit> = $paid;
                 let Some(space) = room(&pages, &mut queued, limits.stream_idle).await? else {
                     return Ok(());
                 };
-                let share = usize::try_from(page.bytes)
-                    .unwrap_or(usize::MAX)
-                    .min(limits.max_request_bytes);
-                let paid = budget_within(&self.inflight, share, limits.request_timeout).await?;
+                let paid = match paid {
+                    Some(paid) => paid,
+                    None => {
+                        let share = usize::try_from(page.bytes)
+                            .unwrap_or(usize::MAX)
+                            .min(limits.max_request_bytes);
+                        budget_within(&self.inflight, share, limits.request_timeout).await?
+                    }
+                };
                 let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
                 space.send(Arc::clone(&slot));
                 queued = Some(slot);
@@ -1448,7 +1457,7 @@ impl ScanJob {
             let mut from_here = false;
             let mut ended_at: Option<bool> = None;
             while let Some(page) = stream.next().await {
-                let page = match page {
+                let (page, paid) = match page {
                     Ok(page) => page,
                     // Unreachable before any of its pages: skipped. Partway, the stream ends
                     // with the error, and the last page's `next` resumes it.
@@ -1459,6 +1468,10 @@ impl ScanJob {
                     Err(e) => return Err(e),
                 };
                 from_here = true;
+                #[cfg(test)]
+                if self.limits.hold_after_part_page {
+                    hold_after_part_page(&self.inflight).await;
+                }
                 let continued = matches!(
                     (&last_row, page.rows.first()),
                     (Some(p), Some(first)) if first.key[..] == p[..]
@@ -1488,15 +1501,18 @@ impl ScanJob {
                 // follows, says nothing the page before didn't: it isn't sent.
                 let silent = page.rows.is_empty() && done_here && next.is_some();
                 if !silent || !missed.is_empty() {
-                    send!(ScanPage {
-                        rows: page.rows,
-                        next: next
-                            .map(|p| p.to_bytes(Kind::Scan))
-                            .unwrap_or_default()
-                            .into(),
-                        bytes: page.bytes,
-                        missing: std::mem::take(&mut missed),
-                    });
+                    send!(
+                        ScanPage {
+                            rows: page.rows,
+                            next: next
+                                .map(|p| p.to_bytes(Kind::Scan))
+                                .unwrap_or_default()
+                                .into(),
+                            bytes: page.bytes,
+                            missing: std::mem::take(&mut missed),
+                        },
+                        paid
+                    );
                 }
                 ended_at = Some(done_here);
             }
@@ -1509,15 +1525,31 @@ impl ScanJob {
         }
         // Skipped ranges not yet reported, or a scan that sent nothing: a last, empty page.
         if !missed.is_empty() || !sent_any {
-            send!(ScanPage {
-                rows: Vec::new(),
-                next: Default::default(),
-                bytes: 0,
-                missing: missed,
-            });
+            send!(
+                ScanPage {
+                    rows: Vec::new(),
+                    next: Default::default(),
+                    bytes: 0,
+                    missing: missed,
+                },
+                None
+            );
         }
         room(&pages, &mut queued, limits.stream_idle).await?;
         Ok(())
+    }
+}
+
+/// A test's hold seam (#1753): the entry's scan job waits here after a partition's page,
+/// before sending it on, until the partition's next page has taken its share of the budget
+/// (or 300 ms), so a test sees the order that used to stall: the partition's next page
+/// charged before the entry's page.
+#[cfg(test)]
+async fn hold_after_part_page(inflight: &Semaphore) {
+    let before = inflight.available_permits();
+    let until = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+    while inflight.available_permits() >= before && tokio::time::Instant::now() < until {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 

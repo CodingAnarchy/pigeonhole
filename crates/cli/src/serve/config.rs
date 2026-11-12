@@ -133,9 +133,11 @@ pub(crate) struct ServeArgs {
     /// Sessions one token may hold at once.
     #[arg(long, value_name = "N", default_value_t = 64)]
     pub max_sessions_per_token: usize,
-    /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
-    /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
-    /// blocking threads compete only while blocking calls run.
+    /// Threads for the network side (default: the CPUs the shards don't use, less the feed
+    /// threads, at least 2). With `--blocking-threads`'s default, the two together can be
+    /// twice those CPUs: the blocking threads compete only while blocking calls run. With
+    /// the shards' SMT siblings in the network threads' mask, a node whose feed side keeps up
+    /// gains from raising it to count them too (the serving guide, #1745).
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
     /// Threads for blocking calls (default: the CPUs the shards don't use, at least 2).
@@ -310,6 +312,10 @@ pub(crate) struct Limits {
     pub feed_client_bytes: usize,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
+    /// A test's hold seam (#1753): a fanned-out scan's entry waits after each partition's
+    /// page until the partition's next page has taken its share.
+    #[cfg(test)]
+    pub hold_after_part_page: bool,
     pub leases: Leases,
     /// The remote MCP tools' result limits and a session's cursor cache.
     pub mcp: crate::mcp::Limits,
@@ -340,6 +346,8 @@ impl ServeArgs {
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
+            #[cfg(test)]
+            hold_after_part_page: false,
             leases: Leases {
                 txn_idle: Duration::from_millis(self.txn_idle_ms.max(1)),
                 txn_lifetime: Duration::from_millis(self.txn_lifetime_ms.max(1)),

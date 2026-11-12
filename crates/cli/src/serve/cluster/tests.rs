@@ -1847,6 +1847,20 @@ fn three_nodes_within(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    three_nodes_held(rt, inflight, false)
+}
+
+/// [`three_nodes_within`], with each node's fanned-out scans held after each partition's
+/// page until the partition's next page has taken its share (`hold`, #1753's seam).
+fn three_nodes_held(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+    hold: bool,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -1872,6 +1886,7 @@ fn three_nodes_within(
             // Longer than the stalled-stream test's bound, so a stall can't clear itself by
             // idling out.
             stream_idle: Duration::from_secs(30),
+            hold_after_part_page: hold,
             ..crate::serve::server_tests::limits()
         };
         let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
@@ -1997,6 +2012,59 @@ fn fanned_out_reads_with_no_spare_budget_answer_as_one_database_does() {
         "cluster fan-out seed, no spare budget: {seed} (PHDB_CLUSTER_SEED={seed} replays it)"
     );
     fan_out_model_within(seed, 2199, &[1100, 1500, 2000]);
+}
+
+/// #1753: a fanned-out scan of a partition served on its entry node, with a budget too
+/// small for two of its pages, finishes. The entry's page used to take a share of its own
+/// after the partition's page gave its share back; held there (the seam) until the
+/// partition's next page took the bytes, the entry's page waited for them until the request
+/// timed out, since only the entry could take that next page. Now the entry's page keeps
+/// the partition's share.
+#[test]
+fn a_scan_of_a_partition_on_its_entry_node_charges_each_page_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes_held(&rt, 2199, true);
+    // 12 rows of about 420 bytes in p1 (keys below "g"), which the first node serves: pages
+    // of 1500 bytes hold 3 rows, and two pages don't fit in 2199 bytes.
+    let keys: Vec<Vec<u8>> = (0..12).map(|i| format!("a{i:02}").into_bytes()).collect();
+    rt.block_on(async {
+        for (i, key) in keys.iter().enumerate() {
+            data(ports[0])
+                .await
+                .mutate(super::proto::MutateRequest {
+                    writes: Some(cells_row(key, &[400], i as u64)),
+                    durability: 0,
+                })
+                .await
+                .unwrap();
+        }
+        use super::proto::{KeyRange, ScanRequest, key_range::Range};
+        let started = std::time::Instant::now();
+        let pages = scan_pages(
+            ports[0],
+            ScanRequest {
+                table: "users".into(),
+                range: Some(KeyRange {
+                    range: Some(Range::Prefix(b"a".to_vec().into())),
+                }),
+                page_bytes: 1500,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("after {:?}: {e}", started.elapsed()));
+        assert!(pages.len() >= 3, "{} pages", pages.len());
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.bytes > 2199 / 2 || p.next.is_empty())
+        );
+        let got: Vec<Vec<u8>> = pages
+            .iter()
+            .flat_map(|p| p.rows.iter().map(|r| r.key.to_vec()))
+            .collect();
+        assert_eq!(got, keys);
+    });
 }
 
 /// D317 §12's model test, fan-out half (ticket 4a), against one database holding every
