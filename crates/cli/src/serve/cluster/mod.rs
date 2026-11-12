@@ -1396,12 +1396,7 @@ pub(crate) fn run(
             memories: memories.as_deref(),
         },
         |share, memory| {
-            let options = partition_options(
-                args.shard_spin,
-                cli.shm_dir.as_deref(),
-                args.change_feed,
-                share,
-            );
+            let options = partition_options(super::served_options(cli, args), share);
             match memory {
                 Some(m) => m.apply(options),
                 None => options,
@@ -1491,8 +1486,7 @@ pub(crate) fn run(
     });
     // A partition a map gives the node while it serves opens as the start's do (D317
     // ticket 6), with its share of the same totals.
-    let (shard_spin, shm_dir, change_feed) =
-        (args.shard_spin, cli.shm_dir.clone(), args.change_feed);
+    let served = super::served_options(cli, args);
     open::attach_opener(
         &node,
         open::Opener {
@@ -1500,7 +1494,7 @@ pub(crate) fn run(
             placement: Arc::clone(&placement),
             backups: Arc::clone(&backups),
             options: Box::new(move |share, memory| {
-                let options = partition_options(shard_spin, shm_dir.as_deref(), change_feed, share);
+                let options = partition_options(served.clone(), share);
                 match memory {
                     Some(m) => m.apply(options),
                     None => options,
@@ -1740,30 +1734,20 @@ pub(crate) fn start_sync(node: &Arc<Node>, version: u64) -> Option<Box<dyn FnOnc
     })
 }
 
-/// The options a cluster node opens its partition with: the server's shard poll (none by
-/// default, D198 amendment 4), its share of the node's budget (D317 ticket 8a), `--shm-dir` and
-/// `--change-feed`, as a single node's (cli692's M1 on #1686). A partition whose feed is on
-/// keeps it without the flag (D317 ticket 7), and its feed's recorded shard count.
+/// The options a cluster node opens its partition with: `served`, the options every
+/// database the server opens takes ([`served_options`](super::served_options): the shard
+/// poll, WAL preallocation, `--shm-dir` and `--change-feed`, as a single node's), with its
+/// share of the node's budget (D317 ticket 8a). A partition whose feed is on keeps it
+/// without the flag (D317 ticket 7), and its feed's recorded shard count.
 pub(crate) fn partition_options(
-    shard_spin: config::ShardSpin,
-    shm_dir: Option<&Path>,
-    change_feed: Option<u64>,
+    served: pigeonhole::Options,
     share: super::placement::Share,
 ) -> pigeonhole::Options {
     // Its share of the node's budget (D317 ticket 8a): the shard count as a default, so a
     // partition whose feed recorded a count keeps it (ICR 0132), never resharding it.
-    let mut options = shard_spin.apply(
-        pigeonhole::Options::default()
-            .default_shards(share.shards)
-            .compaction_cores(share.compaction),
-    );
-    if let Some(dir) = shm_dir {
-        options = options.shm_dir(dir);
-    }
-    if let Some(bytes) = change_feed {
-        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
-    }
-    options
+    served
+        .default_shards(share.shards)
+        .compaction_cores(share.compaction)
 }
 
 /// Opens the database at `path` for writing, retrying a moment while a read-only open of

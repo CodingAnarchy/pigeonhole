@@ -263,15 +263,30 @@ fn candle_advice(
     ))
 }
 
-/// Opens the served database, with its engine memory as resolved if `--engine-memory` is set.
-fn open(cli: &Cli, args: &ServeArgs) -> Result<(Pigeonhole, Option<placement::Memory>), Failure> {
+/// The options every database `serve` opens takes: a single node's and each cluster
+/// partition's alike (#1775: a partition had missed `--no-wal-preallocate`'s default, so its
+/// logs grew while commits waited on them). Only the shard count, the compaction threads and
+/// `--create` are set per database, by [`single_options`] and
+/// [`cluster::partition_options`].
+pub(crate) fn served_options(cli: &Cli, args: &ServeArgs) -> Options {
     // The server's shard poll (D198 amendment 4): none by default. The logs are sized at
     // start-up, not while commits wait on them (#1621, ICR 0130).
-    let mut options = args.shard_spin.apply(
-        Options::default()
-            .create_if_missing(args.create)
-            .wal_preallocate(!args.no_wal_preallocate),
-    );
+    let mut options = args
+        .shard_spin
+        .apply(Options::default().wal_preallocate(!args.no_wal_preallocate));
+    if let Some(dir) = &cli.shm_dir {
+        options = options.shm_dir(dir);
+    }
+    if let Some(bytes) = args.change_feed {
+        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
+    }
+    options
+}
+
+/// A single node's options: [`served_options`], with `--create`, the shard count and the
+/// compaction threads.
+fn single_options(cli: &Cli, args: &ServeArgs) -> Options {
+    let mut options = served_options(cli, args).create_if_missing(args.create);
     // The server's default shard count on every open, a restart's too: the count isn't
     // stored in the file, so without it a reopen took the library's one per core (perf287's
     // g70d on #1697). As a default, not a setting: a change feed's recorded count still
@@ -284,6 +299,12 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<(Pigeonhole, Option<placement::Me
     if let Some(n) = args.compaction_threads {
         options = options.compaction_cores(n);
     }
+    options
+}
+
+/// Opens the served database, with its engine memory as resolved if `--engine-memory` is set.
+fn open(cli: &Cli, args: &ServeArgs) -> Result<(Pigeonhole, Option<placement::Memory>), Failure> {
+    let options = single_options(cli, args);
     // `--engine-memory`, for the shard count asked; a database whose change feed recorded
     // another keeps it (ICR 0132), and is reopened with the memory resized for that count
     // (cli692's F2 on #1718).
@@ -296,12 +317,6 @@ fn open(cli: &Cli, args: &ServeArgs) -> Result<(Pigeonhole, Option<placement::Me
         }
         None => None,
     };
-    if let Some(dir) = &cli.shm_dir {
-        options = options.shm_dir(dir);
-    }
-    if let Some(bytes) = args.change_feed {
-        options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
-    }
     if !args.create && !args.db_file().exists() {
         return Err(Failure::file_not_found(args.db_file()));
     }
