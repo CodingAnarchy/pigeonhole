@@ -533,7 +533,8 @@ pub(crate) struct CompactionWork {
     pub task: CompactionTask,
     job: Option<CompactionJob>,
     /// The view the inputs were taken from: pins their extents while the job reads them.
-    view: Arc<View>,
+    /// Released by [`report`](Self::report), before the shard hears the job is done (#1765).
+    view: Option<Arc<View>>,
     /// A `Drop`'s blob live-byte changes: the pointers its SSTs held (read before submit).
     drop_delta: Vec<(BlobFileId, i64)>,
     /// The finished job's per-SST blob references (#240).
@@ -629,7 +630,7 @@ impl CompactionWork {
             shard,
             task,
             job,
-            view,
+            view: Some(view),
             drop_delta: Vec::new(),
             blob_refs: Vec::new(),
             meta,
@@ -657,17 +658,14 @@ impl CompactionWork {
         use pigeonhole_sst::{ReadOptions, ScanFilter};
 
         let family = self.task.family;
-        if !self
-            .view
-            .catalog
-            .blob_files
-            .values()
-            .any(|b| b.family == family)
-        {
+        // Read before the report, which is what releases the view.
+        let Some(view) = self.view.clone() else {
+            return Err(Error::Closed);
+        };
+        if !view.catalog.blob_files.values().any(|b| b.family == family) {
             return Ok(());
         }
-        let fam = self
-            .view
+        let fam = view
             .ssts
             .family(self.task.tablet, family)
             .ok_or_else(|| Error::Corruption("dropped SSTs are gone".to_owned()))?;
@@ -684,7 +682,7 @@ impl CompactionWork {
             // Its recorded references (#240) count every row: usable unless the SST also
             // holds rows outside this tablet (shared with a sibling, or inherited from a
             // split's parent).
-            let catalog = &self.view.catalog;
+            let catalog = &view.catalog;
             if let Some(refs) = catalog.blob_refs.get(id)
                 && !catalog.sst_shared(*id)
                 && !sticks_out(&sst.meta, range)
@@ -699,7 +697,7 @@ impl CompactionWork {
                 continue;
             }
             let mut it = sst
-                .reader(&self.view.ssts, priority)?
+                .reader(&view.ssts, priority)?
                 .iter(ScanFilter::all(), read);
             match &range.start {
                 Some(s) => it.seek(s)?,
@@ -732,6 +730,11 @@ impl CompactionWork {
     }
 
     fn report(&mut self, result: Result<ManifestVersion>) {
+        // The inputs' pin goes first (#1765): once the shard hears of the report, the
+        // compaction's caller may run on (`compact` returns), and a `shrink` it starts must
+        // find the inputs this job retired free to reclaim, not pinned by a task the runtime
+        // has yet to drop.
+        self.view = None;
         let nanos = self
             .shared
             .vfs
@@ -1131,6 +1134,11 @@ impl Task for CompactionWork {
                 Stage::Commit(rx) => match self.waker.poll(waker, rx) {
                     Poll::Ready(Some(r)) => {
                         self.report(r);
+                        #[cfg(feature = "test-hooks")]
+                        self.shared
+                            .hooks
+                            .sites
+                            .run(crate::engine::hooks::HookSite::CompactionReported);
                         return TaskPoll::Done;
                     }
                     Poll::Ready(None) => {
