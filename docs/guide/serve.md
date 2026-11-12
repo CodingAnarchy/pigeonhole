@@ -477,6 +477,8 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
      - Its version goes above every node `phdb cluster` can reach.
      - The map must name a writer that's up: remove the down node from it, or let another id be the smallest. Give the down node's partitions to other nodes with a higher epoch.
      - When the old writer comes back, it takes the forced map from the others before it changes anything, and follows it.
+     - A partition whose epoch the forced map raises starts a new history, as a promotion does: its change-feed tokens from before answer `FeedExpired`.
+     - No partition's epoch may go back, or stay the same with another node, against the receiving node's map or any node's that `phdb cluster` reaches. Give each moved partition an epoch above every node's. The report lists the nodes it couldn't reach as `unchecked`; read their map files (`phdb cluster show-map --file`) if they may be newer.
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. A row per partition gives its state on its node: `serving`, `fenced (operator)`, `fenced (awaiting peer map)` or `closed`. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 
@@ -600,7 +602,20 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 - **Positions:** a token's `seqno`s are partition-local. There's no cluster-wide position, so compare progress per partition.
 
 ### Fencing and relocation
-A node writes a partition only while its newest map names it for the partition at the file's epoch, and the partition isn't fenced (D317). Moving a partition is manual: fence it, close it, copy its files, then relocate it.
+A node writes a partition only while its newest map names it for the partition at the file's epoch, and the partition isn't fenced (D317). `phdb cluster move` does a whole move. The commands after it are its steps, for doing one by hand or for a node that's down.
+
+- **`phdb cluster move P --to ID --node URL [--drop-source]`** (admin scope) moves P to node `ID` with its files copied whole, so its change-feed history carries over: tokens taken before the move resume after it, through any node.
+  - **Its steps:**
+    1. It fences and closes P on the node serving it, and waits for the close to hash its files.
+    2. It copies each file to `ID`: the main file, every WAL file a clean close keeps, and the feed's.
+    3. It stamps P there at the next epoch, and checks the installed set against the closed one: each file's name, size and SHA-256.
+    4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
+  - **A mismatch** stops the move before the map changes, so the old node still holds P: `unfence` serves it there again.
+  - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
+  - **Run it again** to resume a move that stopped. A copy picks up from what arrived. A move that's finished answers that the map already gives P to `ID`.
+  - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P.
+    - A rerun after the stamp can't check the copy again, because the stamp installs nothing the second time. It finishes the move, says the copy isn't re-verified, and drops nothing. Its report gives the `drop-partition` command to run once you've checked.
+  - **The old node must answer.** For a node that's down, promote another with `relocate --old-unreachable`, below. That starts a new feed history.
 
 - **`phdb cluster fence P --node URL`** (admin scope) fences P on the node that serves it.
   - Its writes then answer `Fenced` through every node, until it's unfenced, closed and moved, or the node restarts with it unfenced.
@@ -617,14 +632,17 @@ A node writes a partition only while its newest map names it for the partition a
   - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
   - A failed hash shows in the partition's error, and `close` again retries it.
   - `unfence` reopens a closed partition.
-- **Copy the closed files to the new node** with `Admin.PartitionUpload`. They're staged in its `DIR/.phdb-incoming`, and nothing serves them yet.
+- **Copy the closed files to the new node** with `Admin.PartitionUpload`, taking each from the old node with `Admin.BackupDownload`'s `fenced_file` (its name in `status`'s list). They're staged in the new node's `DIR/.phdb-incoming`, and nothing serves them yet.
 - **`phdb cluster relocate P --to ID --node URL`** moves P to node `ID`, whose staging holds its files. (`--node` is the node the command talks to, as in every `phdb cluster` command.)
   - It checks that P is fenced or closed on the node serving it. `--old-unreachable` skips that check, for a node whose process you've stopped.
   - The new node installs the files and takes the next epoch. Then the map gives it P, and it serves at once.
   - An install interrupted by a crash finishes the next time the node is stamped or opens P.
   - Run again once done, `relocate` answers that the map already gives P to that node. Run again after a map change that didn't land, it stamps again (the file is already at the new epoch, so that does nothing) and sets the map.
   - `--old-unreachable` still asks the old node briefly, and refuses if it answers and serves P.
-  - A move by file copy restarts the partition's feed history. Keeping it (`--copy`) comes with the next step.
+  - **`--copy`** says the staged files are P's own, copied whole from the node serving it, as `move` copies them. P then keeps its feed history, and tokens from before resume on the new node.
+    - Without `--copy`, the move starts a new history (a promotion, a restore), and older tokens answer `FeedExpired`.
+    - `--copy` is refused with `--old-unreachable`: a copy is taken from that node's closed files.
+    - Use it only for files copied whole from the partition as it closed. Tokens taken before the move then name changes the new files have.
 - **`phdb cluster drop-partition P --node URL`** moves P's files on the old node into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`. It's refused while the map still places P on that node, or while P is open there, so close it first.
   - Nothing is deleted, and nothing is freed until you delete that directory, once you've checked the move.
 - **A node opens a partition while it serves** when a map gives it one. Its share of the node's `--shards` and `--compaction-threads` is the share it would get at start for the new set of partitions, and the partitions already open keep theirs.

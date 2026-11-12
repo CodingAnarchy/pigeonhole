@@ -307,6 +307,105 @@ fn a_backup_lands_inside_the_backup_dir_only() {
 }
 
 #[test]
+fn a_fenced_file_streams_as_it_lies_from_any_offset() {
+    // D317 ticket 6: a closed partition's file goes out raw, with its size and SHA-256 as
+    // hashed at the close, for a relocation by copy. The cluster node looks the file up
+    // (ticket 6's close records it); this is the stream it answers with.
+    use sha2::{Digest, Sha256};
+    let dir = test_dir();
+    let db = Pigeonhole::open(
+        dir.join("db.phdb"),
+        Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let service = Service::new(db, limits(), 2, Arc::new(Metrics::default()));
+    // Two and a half chunks, not all the same byte.
+    let bytes: Vec<u8> = (0..(5u32 << 19)).map(|i| (i % 251) as u8).collect();
+    let path = dir.join("p1.phdb-feed");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = proto::PartitionFile {
+        name: "-feed".into(),
+        bytes: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).to_vec().into(),
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fetch = |offset: u64, durable: bool| {
+        let req = proto::BackupDownloadRequest {
+            partition: "p1".into(),
+            fenced_file: Some("-feed".into()),
+            offset,
+            durable,
+            ..Default::default()
+        };
+        rt.block_on(async {
+            let mut d = service
+                .fenced_download(path.clone(), file.clone(), req)
+                .await?;
+            let mut out = Vec::new();
+            while let Some(c) = d.chunks.recv().await {
+                out.push(c?);
+            }
+            Ok::<_, errors::ApiError>(out)
+        })
+    };
+    let all = fetch(0, false).unwrap();
+    assert_eq!(all.len(), 3, "three chunks of at most 1 MiB");
+    let got: Vec<u8> = all.iter().flat_map(|c| c.data.to_vec()).collect();
+    assert_eq!(got, bytes);
+    let last = all.last().unwrap();
+    assert_eq!(last.total, bytes.len() as u64);
+    assert_eq!(
+        last.sha256, file.sha256,
+        "the last chunk carries the file's SHA-256"
+    );
+    assert!(all[..2].iter().all(|c| c.total == 0 && c.sha256.is_empty()));
+    // A resume from an offset is the rest of the file; the end itself is one empty last
+    // chunk; past it is refused.
+    let rest = fetch(1 << 20, false).unwrap();
+    assert_eq!(rest[0].offset, 1 << 20);
+    let tail: Vec<u8> = rest.iter().flat_map(|c| c.data.to_vec()).collect();
+    assert_eq!(tail, bytes[1 << 20..]);
+    let end = fetch(bytes.len() as u64, false).unwrap();
+    assert_eq!((end.len(), end[0].data.len()), (1, 0));
+    assert_eq!(end[0].sha256, file.sha256);
+    assert!(fetch(bytes.len() as u64 + 1, false).is_err());
+    // A file goes as it lies: no durable copy of it.
+    assert_eq!(fetch(0, true).unwrap_err().code, "InvalidArgument");
+    // A file that changed after its hash fails the download rather than streaming forever
+    // (shorter) or past its size (longer).
+    std::fs::write(&path, &bytes[..bytes.len() - 10]).unwrap();
+    let e = fetch(0, false).unwrap_err();
+    assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+    assert!(e.message.contains("changed after"), "{}", e.message);
+    let mut longer = bytes.clone();
+    longer.extend_from_slice(b"appended");
+    std::fs::write(&path, &longer).unwrap();
+    let e = fetch(0, false).unwrap_err();
+    assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+    assert_eq!(
+        fetch(bytes.len() as u64, false).unwrap_err().code,
+        "FailedPrecondition"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_single_node_refuses_a_fenced_file() {
+    let s = Server::start("", limits());
+    let (status, body) = s.rpc(
+        "Admin/BackupDownload",
+        &json!({"fenced_file": "-feed"}),
+        None,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("cluster node's"), "{body}");
+}
+
+#[test]
 fn a_backup_download_streams_resumes_and_checks_out() {
     use sha2::{Digest, Sha256};
     let s = Server::start("", limits());

@@ -46,6 +46,7 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
                 force: false,
                 expected_map_version: 1,
                 map: Some(the_map(2, &ports)),
+                copies: Vec::new(),
             })
             .await
             .unwrap();
@@ -182,6 +183,7 @@ fn opened_off_the_others_cores_alone() {
         node: "a".into(),
         epoch: 1,
         memory_bytes: 0,
+        history_epoch: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -324,6 +326,7 @@ fn opened_off_the_others_cores_alone() {
                 force: false,
                 expected_map_version: 1,
                 map: Some(map),
+                copies: Vec::new(),
             })
             .await
             .unwrap();
@@ -408,6 +411,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         node: "a".into(),
         epoch: 1,
         memory_bytes: 0,
+        history_epoch: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -456,6 +460,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
                 force: false,
                 expected_map_version: 1,
                 map: Some(map),
+                copies: Vec::new(),
             })
             .await
             .unwrap();
@@ -561,6 +566,7 @@ async fn give_c_p3(ports: &[u16; 3]) {
             force: false,
             expected_map_version: 1,
             map: Some(the_map(2, ports)),
+            copies: Vec::new(),
         })
         .await
         .unwrap();

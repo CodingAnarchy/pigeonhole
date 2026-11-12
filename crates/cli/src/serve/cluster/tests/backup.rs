@@ -186,6 +186,17 @@ fn a_node_backs_up_only_a_partition_it_holds_named() {
         )
         .await;
         assert!(e.is_ok(), "{e:?}");
+        // A fenced file (D317 ticket 6) only of a partition closed here: p1 is serving.
+        let fenced = |partition: &str| BackupDownloadRequest {
+            partition: partition.into(),
+            fenced_file: Some("-feed".into()),
+            ..Default::default()
+        };
+        let e = first(ports[0], fenced("p1")).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+        assert!(e.message().contains("isn't closed on this node"), "{e:?}");
+        let e = first(ports[0], fenced("")).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
     });
 }
 
@@ -212,6 +223,7 @@ fn a_table_created_during_a_backup_is_in_the_map_it_keeps() {
             client(ports[0])
                 .await
                 .set_map(SetMapRequest {
+                    copies: Vec::new(),
                     force: false,
                     expected_map_version: 1,
                     map: Some(m),
@@ -259,6 +271,7 @@ fn a_table_dropped_and_created_again_during_a_backup_fails_it() {
                         force: false,
                         expected_map_version: expected,
                         map: Some(m),
+                        copies: Vec::new(),
                     })
                     .await
                     .unwrap();
