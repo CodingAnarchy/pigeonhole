@@ -247,6 +247,18 @@ impl Uploads {
         }
     }
 
+    /// `FailedPrecondition` while partition `partition`'s install is in progress here: its
+    /// marker (`<P>.installing`, [`super::stamp`]) is in the staging directory.
+    fn not_installing(&self, partition: &str) -> Result<(), ApiError> {
+        if self.dir.join(format!("{partition}.installing")).exists() {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {partition:?} has an install in progress here: its stamp finishes it \
+                 first; resume the upload then"
+            )));
+        }
+        Ok(())
+    }
+
     /// Starts (or resumes) the upload `header` names: checks it, takes a `--max-uploads`
     /// place, and claims its file. `open` says whether a partition is open on this node.
     pub(crate) fn begin(
@@ -257,16 +269,7 @@ impl Uploads {
         check_header(&header)?;
         // A set being installed takes no new file until the install finishes (feed1248's
         // S1 on #1755): its staged files are what the install checks and renames.
-        let installing = self
-            .dir
-            .join(INCOMING)
-            .join(format!("{}.installing", header.partition));
-        if installing.exists() {
-            return Err(ApiError::failed_precondition(format!(
-                "partition {:?} has an install in progress here: its stamp finishes it first",
-                header.partition
-            )));
-        }
+        self.not_installing(&header.partition)?;
         if open(&header.partition) {
             return Err(ApiError::failed_precondition(format!(
                 "partition {:?} is open on this node: its files can't be replaced while it's \
@@ -421,6 +424,10 @@ impl Writing {
                 self.header.partition, file.name
             )));
         }
+        // Not over a file an install in progress is renaming (feed1248's nit on #1755): an
+        // upload begun before the stamp wrote its marker waits, its bytes kept, and resumes
+        // (with nothing left to send) once the install is done.
+        self.uploads.not_installing(&self.header.partition)?;
         let dir = &self.uploads.dir;
         let ready = dir.join(ready_name(&self.header.partition, &file.name));
         let ready_header = path_with(&ready, ".header");
@@ -753,6 +760,44 @@ mod tests {
         w.write(&chunk(0, wal)).unwrap();
         w.finish().unwrap();
         assert!(ready_set(&d, "p2").is_none(), "mixed epochs");
+    }
+
+    /// An install in progress (its marker in the staging directory) takes no new upload of
+    /// its partition, and an upload already under way finishes only after it, its bytes kept
+    /// (feed1248's S1 and nit on #1755).
+    #[test]
+    fn an_install_in_progress_holds_off_uploads_of_its_partition() {
+        let d = dir();
+        let up = Arc::new(Uploads::new(&d, 1, CHUNK));
+        let main = b"the main file".as_slice();
+        let manifest = [file("", main)];
+        let h = header('a', &manifest[0], &manifest);
+        // Begun before the stamp writes its marker.
+        let mut w = up.begin(h.clone(), CLOSED).unwrap();
+        w.write(&chunk(0, main)).unwrap();
+        let marker = d.join(INCOMING).join("p2.installing");
+        std::fs::write(&marker, b"{}").unwrap();
+        let e = w.finish().unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition", "{e:?}");
+        assert!(!d.join(INCOMING).join("p2.phdb.ready").exists());
+        // A new upload of it is refused too; another partition's isn't.
+        let Err(e) = up.begin(h.clone(), CLOSED) else {
+            panic!("an upload of p2 began during its install");
+        };
+        assert_eq!(e.code, "FailedPrecondition", "{e:?}");
+        let mut other = h.clone();
+        other.partition = "p3".into();
+        other.upload_id = "b".repeat(32);
+        drop(up.begin(other, CLOSED).unwrap());
+        // The install done, the upload resumes with nothing left to send and stages.
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(up.status(&h.upload_id).unwrap().received, main.len() as u64);
+        let w = up.begin(h, CLOSED).unwrap();
+        assert!(w.finish().unwrap().complete);
+        assert_eq!(
+            std::fs::read(d.join(INCOMING).join("p2.phdb.ready")).unwrap(),
+            main
+        );
     }
 
     #[test]
