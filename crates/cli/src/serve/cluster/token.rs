@@ -8,9 +8,10 @@
 //!   subscription over many partitions would be several times the size of the events.
 //! - **Compact components:** a D310 token is fixed-width (16 bytes a shard stream). Its
 //!   numbers are mostly small or close together, so a component carries it as varints and
-//!   deltas. The layout is the engine's, read here without its help, so every compaction is
-//!   checked by expanding it again: a token that doesn't come back byte for byte is carried
-//!   raw. An engine change to the layout can make tokens larger, never wrong.
+//!   deltas. The layout is the engine's, read here without its help: a token whose length
+//!   doesn't fit a layout this build knows is carried raw, and one that fits comes back byte
+//!   for byte whatever its fields hold ([`compact`]). An engine change to the layout can
+//!   make tokens larger, never wrong.
 
 use prost::bytes::Bytes;
 use prost::encoding::{decode_varint, encode_varint};
@@ -63,36 +64,6 @@ pub(crate) struct ClusterToken {
 }
 
 impl ClusterToken {
-    /// The token's bytes, each component compacted where that's exact.
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + self.components.len() * 64);
-        out.push(MAGIC);
-        out.push(VERSION);
-        put_bytes(&mut out, self.cluster_id.as_bytes());
-        encode_varint(self.map_version, &mut out);
-        out.extend_from_slice(&self.subscription.to_le_bytes());
-        encode_varint(self.components.len() as u64, &mut out);
-        for c in &self.components {
-            put_bytes(&mut out, c.partition.as_bytes());
-            encode_varint(c.epoch, &mut out);
-            match &c.at {
-                At::Now => out.push(NOW),
-                At::Oldest => out.push(OLDEST),
-                At::Token(token) => match compact(token) {
-                    Some(small) => {
-                        out.push(COMPACT);
-                        put_bytes(&mut out, &small);
-                    }
-                    None => {
-                        out.push(RAW);
-                        put_bytes(&mut out, token);
-                    }
-                },
-            }
-        }
-        out
-    }
-
     /// A token from `bytes`; why not, for bytes that aren't a cluster token.
     pub(crate) fn decode(mut bytes: &[u8]) -> Result<Self, String> {
         let buf = &mut bytes;
@@ -193,44 +164,94 @@ fn unzigzag(v: u64) -> i64 {
 /// count (`u32`), the last seqno delivered and the writer session (`u64` each).
 const HEAD: usize = 1 + 16 + 4 + 8 + 8;
 
-/// A D310 token compacted (perf287's form on ticket 7), or `None` when it isn't a layout
-/// this build knows or doesn't come back exactly ([`expand`]):
+/// A cluster token's bytes, appended to `out`, from its parts as a subscription holds them,
+/// so a checkpoint (one per event on a one-partition subscription) builds no
+/// [`ClusterToken`] and allocates nothing once `out` and `scratch` have grown (#1758).
+/// `scratch` holds each compacted component on its way.
+pub(crate) fn encode_into<'a>(
+    cluster_id: &str,
+    map_version: u64,
+    subscription: u64,
+    components: impl ExactSizeIterator<Item = (&'a str, u64, &'a At)>,
+    out: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) {
+    out.push(MAGIC);
+    out.push(VERSION);
+    put_bytes(out, cluster_id.as_bytes());
+    encode_varint(map_version, out);
+    out.extend_from_slice(&subscription.to_le_bytes());
+    encode_varint(components.len() as u64, out);
+    for (partition, epoch, at) in components {
+        put_bytes(out, partition.as_bytes());
+        encode_varint(epoch, out);
+        match at {
+            At::Now => out.push(NOW),
+            At::Oldest => out.push(OLDEST),
+            At::Token(token) => {
+                scratch.clear();
+                if compact_into(token, scratch) {
+                    out.push(COMPACT);
+                    put_bytes(out, scratch);
+                } else {
+                    out.push(RAW);
+                    put_bytes(out, token);
+                }
+            }
+        }
+    }
+}
+
+/// A D310 token compacted (perf287's form on ticket 7), appended to `out`; false, with `out`
+/// as it was, for one whose length doesn't fit a layout this build knows:
 /// - version and database id as they are;
 /// - the stream count and the last seqno delivered as varints; the writer session as its 8
 ///   bytes (it's random, so a varint would be longer);
 /// - each stream's `(hint, delivered_end)`: the hint as a zigzag varint delta from the
 ///   previous stream's hint, and the end as one from its hint (the same segment, usually);
 /// - a feed of every table's catalog positions (version 2) as varints.
-pub(crate) fn compact(raw: &[u8]) -> Option<Vec<u8>> {
-    let version = *raw.first()?;
+fn compact_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
+    let Some(&version) = raw.first() else {
+        return false;
+    };
     if raw.len() < HEAD || !matches!(version, 1 | 2) {
-        return None;
+        return false;
     }
     let u64_at = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().expect("8 bytes"));
     let streams = u32::from_le_bytes(raw[17..21].try_into().expect("4 bytes")) as usize;
     let tail = if version == 2 { 16 } else { 0 };
     if raw.len() != HEAD + streams * 16 + tail {
-        return None;
+        return false;
     }
-    let mut out = Vec::with_capacity(HEAD + streams * 4 + tail);
+    let from = out.len();
     out.extend_from_slice(&raw[..17]);
-    encode_varint(streams as u64, &mut out);
-    encode_varint(u64_at(21), &mut out);
+    encode_varint(streams as u64, out);
+    encode_varint(u64_at(21), out);
     out.extend_from_slice(&raw[29..37]);
     let mut prev = 0u64;
     for s in 0..streams {
         let (hint, end) = (u64_at(HEAD + s * 16), u64_at(HEAD + s * 16 + 8));
-        encode_varint(zigzag(hint.wrapping_sub(prev) as i64), &mut out);
-        encode_varint(zigzag(end.wrapping_sub(hint) as i64), &mut out);
+        encode_varint(zigzag(hint.wrapping_sub(prev) as i64), out);
+        encode_varint(zigzag(end.wrapping_sub(hint) as i64), out);
         prev = hint;
     }
     if version == 2 {
         let at = HEAD + streams * 16;
-        encode_varint(u64_at(at), &mut out);
-        encode_varint(u64_at(at + 8), &mut out);
+        encode_varint(u64_at(at), out);
+        encode_varint(u64_at(at + 8), out);
     }
-    // The check: the engine's layout, read without its help, must come back byte for byte.
-    (expand(&out).ok()? == raw).then_some(out)
+    // Once the length matches the layout, every field is read whole and each step (a
+    // varint, a zigzag of a wrapping difference) is exact, so the bytes come back as they
+    // were whatever they hold: a layout this build misreads makes a token larger, never
+    // wrong. Checked here in debug builds (every test), and over random tokens by
+    // `any_token_of_a_known_layout_comes_back_byte_for_byte`, rather than per event
+    // (#1758: expanding it again was part of a checkpoint's cost on every event).
+    debug_assert_eq!(
+        expand(&out[from..]).as_deref(),
+        Ok(raw),
+        "a compaction that doesn't come back"
+    );
+    true
 }
 
 /// A compacted D310 token as the engine's bytes.
@@ -279,6 +300,28 @@ pub(crate) fn expand(small: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    fn compact(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        compact_into(raw, &mut out).then_some(out)
+    }
+
+    impl ClusterToken {
+        fn encode(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            encode_into(
+                &self.cluster_id,
+                self.map_version,
+                self.subscription,
+                self.components
+                    .iter()
+                    .map(|c| (c.partition.as_str(), c.epoch, &c.at)),
+                &mut out,
+                &mut Vec::new(),
+            );
+            out
+        }
+    }
+
     /// A D310 token of `version` with `streams` streams, its hints `epoch << 32 | offset`.
     fn d310(version: u8, streams: u32, epoch: u64) -> Vec<u8> {
         let mut t = vec![version];
@@ -296,6 +339,54 @@ mod tests {
             t.extend_from_slice(&4u64.to_le_bytes());
         }
         t
+    }
+
+    #[test]
+    fn any_token_of_a_known_layout_comes_back_byte_for_byte() {
+        // #1758: the per-event check is a debug assertion now, so this is the guarantee:
+        // whatever a known layout's fields hold (random bytes, extremes), compacting then
+        // expanding gives the token back. Seeded; the seed prints on failure.
+        let seed: u64 = std::env::var("PHDB_TOKEN_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5eed_1758);
+        let mut x = seed;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..2000 {
+            let version = if next() % 2 == 0 { 1u8 } else { 2 };
+            let streams = (next() % 33) as u32;
+            let mut raw = vec![version];
+            for _ in 0..16 {
+                raw.push(next() as u8);
+            }
+            raw.extend_from_slice(&streams.to_le_bytes());
+            let words = 2 + 2 * streams as usize + if version == 2 { 2 } else { 0 };
+            for _ in 0..words {
+                let w = match next() % 4 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => next(),
+                };
+                raw.extend_from_slice(&w.to_le_bytes());
+            }
+            let mut out = vec![0xAA];
+            assert!(compact_into(&raw, &mut out), "seed {seed} round {round}");
+            assert_eq!(out[0], 0xAA, "appended after what was there");
+            assert_eq!(
+                expand(&out[1..]).unwrap(),
+                raw,
+                "seed {seed} round {round}: {raw:?}"
+            );
+        }
+        // One that doesn't compact leaves `out` as it was.
+        let mut out = vec![1, 2];
+        assert!(!compact_into(&[3u8; 70], &mut out));
+        assert_eq!(out, [1, 2]);
     }
 
     #[test]
