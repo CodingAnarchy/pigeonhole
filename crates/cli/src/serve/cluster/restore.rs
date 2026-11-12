@@ -21,8 +21,13 @@
 //! - **History starts over.** A restored partition is its backup's main file alone: its
 //!   WAL and feed files are moved aside (`.replaced-<time>`), so feed tokens from before
 //!   the restore answer `FeedExpired`.
-//! - **Run again** after a failure: the uploads resume or start over, a stamp that's done
-//!   answers so, and the map is set once every stamp has.
+//! - **Run again** after a failure (simp724's S1 on #1764): `DIR/restore-progress.json`
+//!   records each partition stamped (its node and new epoch, under the live map's version)
+//!   and the map once set. A run again skips a partition recorded and found at that epoch
+//!   on its node (no upload, no second install), and once the map is recorded and the live
+//!   map still places every partition so, it only unfences them. An upload not finished
+//!   resumes. The file goes once the restore is done, so a later restore from the same
+//!   backup starts afresh.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -64,6 +69,88 @@ pub(crate) struct RestoreArgs {
 /// How long a restored partition may take to open on its node once the map is set.
 const OPEN_WAIT: Duration = Duration::from_secs(60);
 
+/// The restore's progress, in the backup's directory.
+const PROGRESS: &str = "restore-progress.json";
+
+/// A test's fault seam: the next restore from this directory fails at this step
+/// (`"stamped"`: after every stamp, before the map; `"mapped"`: after the map, before the
+/// unfences), as a crash there would leave it.
+#[cfg(test)]
+pub(crate) static FAIL_AT: std::sync::Mutex<Option<(PathBuf, &'static str)>> =
+    std::sync::Mutex::new(None);
+
+fn fault(dir: &Path, step: &'static str) -> Result<(), Failure> {
+    #[cfg(test)]
+    {
+        let mut armed = FAIL_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if armed.as_ref().is_some_and(|(d, s)| d == dir && *s == step) {
+            *armed = None;
+            return Err(Failure::usage(&format!("the test's fault after {step}")));
+        }
+    }
+    let _ = (dir, step);
+    Ok(())
+}
+
+/// What a restore from a directory has done so far: under the live map at
+/// `live_map_version` (0 for none), each partition stamped (its node and new epoch), and
+/// the map's version once set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Progress {
+    cluster_id: String,
+    live_map_version: u64,
+    stamped: BTreeMap<String, Stamped>,
+    map_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamped {
+    node: String,
+    epoch: u64,
+}
+
+fn read_progress(dir: &Path) -> Option<Progress> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(PROGRESS)).ok()?).ok()?;
+    let mut stamped = BTreeMap::new();
+    for (p, st) in v["stamped"].as_object()? {
+        stamped.insert(
+            p.clone(),
+            Stamped {
+                node: st["node"].as_str()?.to_owned(),
+                epoch: st["epoch"].as_u64()?,
+            },
+        );
+    }
+    Some(Progress {
+        cluster_id: v["cluster_id"].as_str()?.to_owned(),
+        live_map_version: v["live_map_version"].as_u64()?,
+        stamped,
+        map_version: v["map_version"].as_u64(),
+    })
+}
+
+/// Written whole and renamed in, so a crash leaves the last one.
+fn write_progress(dir: &Path, p: &Progress) -> Result<(), Failure> {
+    let doc = json!({
+        "cluster_id": p.cluster_id,
+        "live_map_version": p.live_map_version,
+        "stamped": p.stamped.iter().map(|(id, st)| {
+            (id.clone(), json!({"node": st.node, "epoch": st.epoch}))
+        }).collect::<serde_json::Map<String, Value>>(),
+        "map_version": p.map_version,
+    });
+    let path = dir.join(PROGRESS);
+    let tmp = dir.join(format!("{PROGRESS}.tmp"));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(&doc).expect("progress serializes"),
+    )
+    .and_then(|()| std::fs::rename(&tmp, &path))
+    .map_err(|e| Failure::io(&format!("write {}", path.display()), &e))
+}
+
 /// One partition's copy in the backup.
 #[derive(Debug, Clone)]
 struct Copy {
@@ -82,6 +169,8 @@ struct Job {
     node: String,
     url: String,
     epoch: u64,
+    /// Stamped by an earlier run: no upload, no stamp.
+    earlier: bool,
 }
 
 /// `phdb cluster restore DIR`.
@@ -173,7 +262,47 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         let got = tokio::time::timeout(Duration::from_secs(10), got).await;
         states.insert(id.clone(), got.ok().and_then(Result::ok));
     }
+    let live_version = live.as_ref().map_or(0, |l| l.map_version);
+    let progress = read_progress(&r.dir).filter(|p| p.cluster_id == target);
+    // An earlier run set the map, and the live map still places every partition as it did:
+    // only the unfences are left.
+    if let (Some(pr), Some(l)) = (&progress, &live)
+        && let Some(v) = pr.map_version
+        && l.map_version >= v
+        && m.partitions.iter().all(|p| {
+            pr.stamped.get(&p.id).is_some_and(|st| {
+                st.node == p.node
+                    && l.partitions
+                        .iter()
+                        .any(|q| q.id == p.id && q.node == st.node && q.epoch == st.epoch)
+            })
+        })
+    {
+        let jobs: Vec<Job> = m
+            .partitions
+            .iter()
+            .map(|p| Job {
+                url: nodes[&p.node].clone(),
+                node: p.node.clone(),
+                epoch: pr.stamped[&p.id].epoch,
+                copy: copies[&p.id].clone(),
+                earlier: true,
+            })
+            .collect();
+        for job in &jobs {
+            serve(args, token.as_deref(), job).await?;
+        }
+        let _ = std::fs::remove_file(r.dir.join(PROGRESS));
+        let mut out = restored_report(&target, &jobs, json!(v), Value::Null);
+        out.document
+            .insert("resumed".into(), json!("the map was set by an earlier run"));
+        return Ok(out);
+    }
+    let progress =
+        progress.filter(|p| p.live_map_version == live_version && p.map_version.is_none());
     let mut jobs = Vec::new();
+    // Nodes that held a restored partition and don't get it back (simp724's S2).
+    let mut old_owners = Vec::new();
     for p in &m.partitions {
         let copy = copies[&p.id].clone();
         for (id, s) in &states {
@@ -194,8 +323,10 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             if *id == p.node && state == LocalPartitionState::Fenced {
                 return Err(Failure::usage(&format!(
                     "partition {} is open (fenced) on node {id:?}, which it's restored to: \
-                     close it there first (phdb cluster close)",
-                    p.id
+                     close it there first (phdb cluster close). If a restore already set the \
+                     map (it places {} on {id:?} at this file's epoch) and its {PROGRESS} is \
+                     gone, `phdb cluster unfence {} --node <{id}'s URL>` finishes it instead",
+                    p.id, p.id, p.id
                 )));
             }
         }
@@ -220,14 +351,39 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                 o.node, p.id
             )));
         }
+        if let Some(o) = old
+            && o.node != p.node
+        {
+            old_owners.push(json!({"partition": p.id, "node": o.node}));
+        }
         let epoch = 1 + copy.epoch.max(p.epoch).max(old.map_or(0, |o| o.epoch));
+        // Stamped by an earlier run under this live map, and its node's file says so.
+        let earlier = progress.as_ref().is_some_and(|pr| {
+            pr.stamped.get(&p.id)
+                == Some(&Stamped {
+                    node: p.node.clone(),
+                    epoch,
+                })
+        }) && states
+            .get(&p.node)
+            .and_then(Option::as_ref)
+            .is_some_and(|s| s.iter().any(|lp| lp.id == p.id && lp.epoch == epoch));
         jobs.push(Job {
             url: nodes[&p.node].clone(),
             node: p.node.clone(),
             epoch,
             copy,
+            earlier,
         });
     }
+    let mut progress = progress.unwrap_or_else(|| Progress {
+        cluster_id: target.clone(),
+        live_map_version: live_version,
+        ..Default::default()
+    });
+    progress
+        .stamped
+        .retain(|p, _| jobs.iter().any(|j| j.earlier && j.copy.partition == *p));
 
     // The uploads, `parallel` at once.
     let mut set = tokio::task::JoinSet::new();
@@ -235,7 +391,9 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     let mut failed: Option<Failure> = None;
     loop {
         while failed.is_none() && set.len() < r.parallel.max(1) {
-            let Some(job) = pending.next() else { break };
+            let Some(job) = pending.find(|j| !j.earlier) else {
+                break;
+            };
             let (args, token, cluster) = (args.clone(), token.clone(), backup_cluster.clone());
             set.spawn(async move { upload(&args, token.as_deref(), &cluster, &job).await });
         }
@@ -261,7 +419,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     } else {
         backup_cluster.clone()
     };
-    for job in &jobs {
+    for job in jobs.iter().filter(|j| !j.earlier) {
         let (c, _) = channel(args, &job.url).await?;
         proto::cluster_client::ClusterClient::new(c)
             .stamp(request(
@@ -284,7 +442,16 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                     s.message()
                 ))
             })?;
+        progress.stamped.insert(
+            job.copy.partition.clone(),
+            Stamped {
+                node: job.node.clone(),
+                epoch: job.epoch,
+            },
+        );
+        write_progress(&r.dir, &progress)?;
     }
+    fault(&r.dir, "stamped")?;
     // The map, forced: tables exactly as the backup's.
     for p in &mut m.partitions {
         p.epoch = jobs
@@ -293,33 +460,59 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             .map_or(p.epoch, |j| j.epoch);
     }
     let set = set_map(args, m, true).await?;
+    progress.map_version = set.document.get("map_version").and_then(Value::as_u64);
+    write_progress(&r.dir, &progress)?;
+    fault(&r.dir, "mapped")?;
     // Each partition opens on its node with the map, still under the fence the operator
     // set before the restore (it's persisted): lifted here once it's open.
     for job in &jobs {
         serve(args, token.as_deref(), job).await?;
     }
-    let bytes: u64 = jobs.iter().map(|j| j.copy.bytes).sum();
+    let _ = std::fs::remove_file(r.dir.join(PROGRESS));
+    let mut out = restored_report(
+        &target,
+        &jobs,
+        set.document
+            .get("map_version")
+            .cloned()
+            .unwrap_or(Value::Null),
+        set.document.get("missed").cloned().unwrap_or(Value::Null),
+    );
+    if let Some(pushed) = set.document.get("pushed") {
+        out.document.insert("pushed".into(), pushed.clone());
+    }
+    // Their copies stay open there, fenced, and their files until dropped.
+    out.document
+        .insert("close_and_drop_on".into(), Value::Array(old_owners));
+    Ok(out)
+}
+
+/// The restore's report.
+fn restored_report(target: &str, jobs: &[Job], map_version: Value, missed: Value) -> Report {
+    let bytes: u64 = jobs
+        .iter()
+        .filter(|j| !j.earlier)
+        .map(|j| j.copy.bytes)
+        .sum();
     let summary = vec![
         ("cluster_id", json!(target)),
         ("partitions", json!(jobs.len())),
-        ("bytes", json!(bytes)),
-        (
-            "map_version",
-            set.document
-                .get("map_version")
-                .cloned()
-                .unwrap_or(Value::Null),
-        ),
-        (
-            "missed",
-            set.document.get("missed").cloned().unwrap_or(Value::Null),
-        ),
+        ("uploaded_bytes", json!(bytes)),
+        ("map_version", map_version),
+        ("missed", missed),
     ];
     let mut out = report("cluster restore", summary, Value::Null);
-    out.columns = ["partition", "node", "epoch", "bytes"]
+    out.columns = ["partition", "node", "epoch", "bytes", "installed"]
         .into_iter()
         .map(column)
         .collect();
+    let installed = |j: &Job| {
+        if j.earlier {
+            "by an earlier run"
+        } else {
+            "now"
+        }
+    };
     out.rows = jobs
         .iter()
         .map(|j| {
@@ -328,6 +521,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                 json!(j.node),
                 json!(j.epoch),
                 json!(j.copy.bytes),
+                json!(installed(j)),
             ]
         })
         .collect();
@@ -342,15 +536,13 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                         "epoch": j.epoch,
                         "backup_epoch": j.copy.epoch,
                         "bytes": j.copy.bytes,
+                        "installed": installed(j),
                     })
                 })
                 .collect(),
         ),
     );
-    if let Some(pushed) = set.document.get("pushed") {
-        out.document.insert("pushed".into(), pushed.clone());
-    }
-    Ok(out)
+    out
 }
 
 /// Waits (up to [`OPEN_WAIT`]) for `job`'s partition to open on its node, and unfences it
@@ -392,7 +584,9 @@ async fn serve(args: &NodeArgs, token: Option<&str>, job: &Job) -> Result<(), Fa
     }
     Err(Failure::usage(&format!(
         "partition {p} is restored and in the map, but isn't serving on node {} yet ({last}): \
-         check `phdb cluster status`, and unfence it there once it's open",
+         check `phdb cluster status`, then run the restore again, or `phdb cluster unfence {p} \
+         --node <its URL>` once it's open. A fence since the node started needs a peer's map to \
+         confirm it: if no peer can answer, `--force` only if you know it hasn't moved",
         job.node
     )))
 }

@@ -264,3 +264,88 @@ fn a_restore_refuses_a_copy_that_isnt_the_manifests() {
         e.message()
     );
 }
+
+fn epochs(m: &ClusterMap) -> Vec<u64> {
+    m.partitions.iter().map(|p| p.epoch).collect()
+}
+
+async fn the_live_map(port: u16) -> ClusterMap {
+    client(port)
+        .await
+        .get_map(GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// simp724's S1 on #1764: a restore that failed after its stamps, run again, neither
+/// uploads nor installs again; one that failed after its map, run again, only unfences.
+#[test]
+fn a_restore_run_again_skips_what_an_earlier_run_did() {
+    use crate::serve::cluster::restore::FAIL_AT;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, c) = (ports[0], ports[2]);
+    let mut rows = load(&rt, a, 12);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    let progress = out.join("restore-progress.json");
+    rt.block_on(async {
+        // Stopped after every stamp, before the map.
+        assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
+        assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
+        *FAIL_AT.lock().unwrap() = Some((out.clone(), "stamped"));
+        let e = restore(&args(a), &restore_args(&out)).await.err().unwrap();
+        assert!(e.message().contains("after stamped"), "{}", e.message());
+        assert!(progress.exists());
+        assert_eq!(epochs(&the_live_map(c).await), [1, 1, 1]);
+        // Again: nothing uploaded or installed a second time; the map, then served.
+        let report = restore(&args(a), &restore_args(&out)).await.unwrap();
+        assert_eq!(
+            report.document["uploaded_bytes"], 0,
+            "{:?}",
+            report.document
+        );
+        for r in report.document["restored"].as_array().unwrap() {
+            assert_eq!(r["installed"], "by an earlier run", "{r}");
+            assert_eq!(r["epoch"], 2, "{r}");
+        }
+        assert!(
+            !progress.exists(),
+            "a finished restore leaves no progress file"
+        );
+        assert_eq!(epochs(&the_live_map(c).await), [2, 2, 2]);
+        assert_eq!(keys(c).await, rows);
+
+        // Again from the same backup, stopped after the map: the partitions are open on
+        // their nodes, fenced. Run again, it only unfences: no epoch 4.
+        assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
+        assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
+        *FAIL_AT.lock().unwrap() = Some((out.clone(), "mapped"));
+        let e = restore(&args(a), &restore_args(&out)).await.err().unwrap();
+        assert!(e.message().contains("after mapped"), "{}", e.message());
+        assert_eq!(epochs(&the_live_map(c).await), [3, 3, 3]);
+        let report = restore(&args(a), &restore_args(&out)).await.unwrap();
+        assert_eq!(
+            report.document["resumed"], "the map was set by an earlier run",
+            "{:?}",
+            report.document
+        );
+        assert_eq!(epochs(&the_live_map(c).await), [3, 3, 3]);
+        assert!(!progress.exists());
+        for (port, (_, p)) in ports.iter().zip(NODES) {
+            let serving = client(*port)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == p && lp.state() == LocalPartitionState::Serving);
+            assert!(serving, "{p} serves");
+        }
+        assert_eq!(keys(c).await, rows);
+    });
+}
