@@ -10,14 +10,18 @@
 
 mod backup;
 pub(crate) mod cli;
+pub(crate) mod close;
 pub(crate) mod fanout;
 pub(crate) mod feed;
+pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
+pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod route;
 pub(crate) mod schema;
+pub(crate) mod stamp;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
@@ -167,6 +171,16 @@ pub(crate) struct Node {
     /// concurrent ones queue rather than retry each other's compare-and-set (D317
     /// amendment 1). Held across the set and its push, never inside an install.
     pub(crate) schema_changes: tokio::sync::Mutex<()>,
+    /// The partitions served here: their write gates, and the operator's fences (D317
+    /// ticket 6).
+    fences: fence::Fences,
+    /// How the node opens a partition while it serves ([`open::attach_opener`]).
+    opener: std::sync::OnceLock<open::Opener>,
+    /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
+    /// it. Taken after `fences.changing` where both are.
+    opening: tokio::sync::Mutex<()>,
+    /// This node, for the tasks an install starts.
+    me: std::sync::Weak<Node>,
 }
 
 /// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
@@ -196,7 +210,7 @@ impl Node {
             .map
             .as_ref()
             .map(|(m, _)| Arc::new(route::Routes::new(m)));
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -210,6 +224,10 @@ impl Node {
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
+            fences: fence::Fences::default(),
+            opener: std::sync::OnceLock::new(),
+            opening: tokio::sync::Mutex::new(()),
+            me: me.clone(),
         })
     }
 
@@ -319,6 +337,9 @@ impl Node {
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
+        drop(st);
+        // A partition the map now gives this node opens (D317 ticket 6, §3).
+        self.open_missing_soon();
         Ok(version)
     }
 
@@ -448,29 +469,40 @@ impl Node {
             return;
         };
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let fetched = tokio::time::timeout(self.peers.push_timeout, async {
-                let mut client = self.client(&n.address).await?;
-                let req = self.request(GetMapRequest {})?;
-                client
-                    .get_map(req)
+            let fetched =
+                tokio::time::timeout(self.peers.push_timeout, self.fetch_map(&n.address)).await;
+            let Ok(Ok(theirs)) = fetched else {
+                continue;
+            };
+            if theirs.map_version > self.state().version()
+                && let Err(e) = self
+                    .push_map_async(theirs.clone(), Some(n.id.clone()))
                     .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            })
-            .await;
-            if let Ok(Ok(theirs)) = fetched
-                && theirs.map_version > self.state().version()
-                && let Err(e) = self.push_map_async(theirs, Some(n.id.clone())).await
             {
                 eprintln!(
                     "phdb serve: node {}'s newer cluster map: {}",
                     n.id, e.message
                 );
             }
+            // Its partitions' start fences (D317 ticket 6).
+            self.confirm(&theirs);
         }
         self.push_all().await;
         self.synced
             .store(true, std::sync::atomic::Ordering::Release);
+        // Partitions no peer has confirmed yet: asked again until one does (cli692's S3).
+        self.confirm_after_start().await;
+    }
+
+    /// Peer `address`'s map.
+    async fn fetch_map(&self, address: &str) -> Result<ClusterMap, String> {
+        let mut client = self.client(address).await?;
+        let req = self.request(GetMapRequest {})?;
+        client
+            .get_map(req)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|s| s.message().to_owned())
     }
 
     /// [`Node::push_map`] on a blocking thread.
@@ -488,6 +520,19 @@ impl Node {
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
     /// Blocking ([`Node::install`]).
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
+        let pushed = from.is_some().then(|| map.clone());
+        let version = self.push_map_install(map, from)?;
+        // A peer's map, taken or the same as this node's: its partitions' start fences
+        // (D317 ticket 6).
+        if let Some(theirs) = pushed {
+            self.confirm(&theirs);
+        }
+        Ok(PushMapResponse {
+            map_version: version,
+        })
+    }
+
+    fn push_map_install(&self, map: ClusterMap, from: Option<&str>) -> Result<u64, ApiError> {
         let version = self.install(&map, false, |st| {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
@@ -506,9 +551,7 @@ impl Node {
                 old.map_version
             )))
         })?;
-        Ok(PushMapResponse {
-            map_version: version,
-        })
+        Ok(version)
     }
 
     /// `Cluster.Status`: the node, its map version, and its directory's partition files.
@@ -618,6 +661,15 @@ impl Node {
                     lp.unmapped_tables = o.unmapped.clone();
                     lp.adopted_tables = o.adopted.clone();
                 }
+            }
+        }
+        // Each open partition's state, and a closed one's files (D317 ticket 6).
+        for lp in &mut partitions {
+            if let Some((state, reason)) = self.part_state(&lp.id) {
+                lp.set_state(state);
+                lp.set_fence_reason(reason);
+            } else if let Some(closed) = self.fences.closed().get(&lp.id) {
+                closed.describe(lp);
             }
         }
         NodeStatus {
@@ -811,8 +863,83 @@ impl ClusterGrpc {
 
 const READERS: &[Scope] = &[Scope::Read, Scope::Cluster];
 
+impl ClusterGrpc {
+    /// Partition `id`'s line of `Status`.
+    async fn local(&self, id: &str) -> Result<LocalPartition, ApiError> {
+        let node = Arc::clone(&self.0);
+        let status = tokio::task::spawn_blocking(move || node.status())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        status
+            .partitions
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| ApiError::not_found(format!("no partition {id:?} on this node")))
+    }
+}
+
 #[tonic::async_trait]
 impl proto::cluster_server::Cluster for ClusterGrpc {
+    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope.
+    async fn fence(
+        &self,
+        req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(&req, &[Scope::Admin], "fence a partition")?;
+        let id = req.into_inner().partition;
+        self.0.fence(&id).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
+    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope.
+    async fn unfence(
+        &self,
+        req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(&req, &[Scope::Admin], "unfence a partition")?;
+        let req = req.into_inner();
+        let id = req.partition;
+        self.0.unfence(&id, req.force).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
+    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
+    async fn close(
+        &self,
+        req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(&req, &[Scope::Admin], "close a partition")?;
+        let id = req.into_inner().partition;
+        self.0.close(&id).await?;
+        Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
+    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope.
+    async fn drop_partition(
+        &self,
+        req: Request<proto::PartitionRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(&req, &[Scope::Admin], "drop a partition's files")?;
+        let id = req.into_inner().partition;
+        Ok(tonic::Response::new(self.0.drop_partition(&id).await?))
+    }
+
+    /// `Cluster.Stamp` (D317 ticket 6): relocate's and restore's first step on the node the
+    /// partition goes to. Cluster scope, as a peer's calls; `phdb cluster relocate` sends it
+    /// with the cluster token. The reply's `files` is the set it installed, if any.
+    async fn stamp(
+        &self,
+        req: Request<proto::StampRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(&req, &[Scope::Cluster, Scope::Admin], "stamp a partition")?;
+        let req = req.into_inner();
+        let id = req.partition.clone();
+        let installed = self.0.stamp(req).await?;
+        let mut lp = self.local(&id).await?;
+        lp.files = installed;
+        Ok(tonic::Response::new(lp))
+    }
+
     async fn get_map(
         &self,
         req: Request<GetMapRequest>,
@@ -1132,6 +1259,7 @@ pub(crate) fn run(
         },
         state,
     );
+    node.load_fences().map_err(|e| Failure::usage(&e))?;
     // The partitions the map gives this node, in id order, with their epochs: none before
     // a first map, or when the map gives none (the node only routes).
     let mine: Vec<(String, u64)> = {
@@ -1155,34 +1283,14 @@ pub(crate) fn run(
     let total_compaction = args
         .compaction_threads
         .unwrap_or_else(|| super::placement::default_compaction_threads(total_shards));
-    let shares = super::placement::split(total_shards, total_compaction, mine.len());
-    // Each partition's engine memory (D317 ticket 8a): the map's `memory_bytes` off the top,
-    // the rest of `--engine-memory` in equal shares; unset, the library's defaults.
-    let overrides: Vec<u64> = {
-        let state = node.state();
-        mine.iter()
-            .map(|(p, _)| {
-                state
-                    .map
-                    .as_ref()
-                    .and_then(|(m, _)| m.partitions.iter().find(|q| q.id == *p))
-                    .map_or(0, |q| q.memory_bytes)
-            })
-            .collect()
-    };
-    let set_memory = args.engine_memory.is_some() || overrides.iter().any(|&m| m > 0);
-    let memories = super::placement::memory(
+    let map_now = node.state().map.as_ref().map(|(m, _)| m.clone());
+    let (shares, memories) = start_budget(
+        map_now.as_ref(),
+        &mine,
+        total_shards,
+        total_compaction,
         args.engine_memory,
-        &shares
-            .iter()
-            .zip(&overrides)
-            .map(|(s, &m)| (s.shards, m))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|(i, why)| match i.and_then(|i| mine.get(i)) {
-        Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
-        None => Failure::usage(&format!("--engine-memory: {why}")),
-    })?;
+    )?;
     // With several partitions, the node's compaction CPUs are reserved before any engine
     // opens: the CPUs right after all the partitions' shards in the pin order, and every
     // partition's compaction threads are confined to them (ICR 0134). Engines opened one
@@ -1200,7 +1308,7 @@ pub(crate) fn run(
             shares: &shares,
             reserved: reserved.as_deref(),
             // Unset, the library's own defaults, exactly as before.
-            memories: set_memory.then_some(&memories[..]),
+            memories: memories.as_deref(),
         },
         |share, memory| {
             let options = partition_options(
@@ -1217,7 +1325,7 @@ pub(crate) fn run(
         stderr,
     )?;
     let dbs: Vec<&pigeonhole::Pigeonhole> = opened.iter().map(|o| &o.db).collect();
-    let placement = Arc::new(if dbs.is_empty() {
+    let mut placement = if dbs.is_empty() {
         super::placement::Placement::routes_only(args.io_threads, args.blocking_threads)
     } else {
         super::placement::Placement::plan(
@@ -1228,7 +1336,15 @@ pub(crate) fn run(
             args.feed_hub_threads,
             args.affinity == super::config::Affinity::On,
         )
-    });
+    };
+    // Compaction threads confined to the node's reserved CPUs run there as pinned ones
+    // would: the startup line counts those CPUs too (perf287's 8b run).
+    if let Some(r) = reserved.as_deref()
+        && opened.iter().any(|o| o.pinning.compaction_confined > 0)
+    {
+        placement.confined_compaction(r);
+    }
+    let placement = Arc::new(placement);
     let limits = args.limits();
     let metrics = Arc::new(super::service::Metrics::default());
     // The node's service, which serves no partition itself: its budgets, pools, session
@@ -1245,8 +1361,11 @@ pub(crate) fn run(
     let parts: Vec<(String, super::service::Service)> = opened
         .iter()
         .map(|o| {
+            // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
+            let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
+            let gate = node.open_gate(&o.id, epoch);
             let part = service
-                .for_partition(o.db.clone(), &o.id, &backups, o.pinning, o.memory)
+                .for_partition(o.db.clone(), &o.id, &backups, o.pinning, o.memory, gate)
                 .placement(&placement);
             (o.id.clone(), part)
         })
@@ -1259,7 +1378,15 @@ pub(crate) fn run(
     } else {
         let list: Vec<String> = mine
             .iter()
-            .map(|(p, epoch)| format!("{p} (epoch {epoch})"))
+            .map(|(p, epoch)| match node.fence_of(p) {
+                Some(crate::serve::gate::Fence::Operator) => {
+                    format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
+                }
+                Some(crate::serve::gate::Fence::Start) => {
+                    format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
+                }
+                None => format!("{p} (epoch {epoch})"),
+            })
             .collect();
         format!(
             "partition{} {} as cluster node {id} of {}; map version {version}",
@@ -1275,7 +1402,30 @@ pub(crate) fn run(
         tokens: super::tokens(args)?,
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
+    // A partition a map gives the node while it serves opens as the start's do (D317
+    // ticket 6), with its share of the same totals.
+    let (shard_spin, shm_dir, change_feed) =
+        (args.shard_spin, cli.shm_dir.clone(), args.change_feed);
+    open::attach_opener(
+        &node,
+        open::Opener {
+            shared: Arc::downgrade(&shared),
+            placement: Arc::clone(&placement),
+            backups: Arc::clone(&backups),
+            options: Box::new(move |share, memory| {
+                let options = partition_options(shard_spin, shm_dir.as_deref(), change_feed, share);
+                match memory {
+                    Some(m) => m.apply(options),
+                    None => options,
+                }
+            }),
+            shards: total_shards,
+            compaction: total_compaction,
+            engine_memory: args.engine_memory,
+        },
+    );
     // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
     // map it takes.
     schema::attach(&node, &shared);
@@ -1294,6 +1444,49 @@ pub(crate) fn run(
         },
         stderr,
     )
+}
+
+/// The node's start split of its budget across `mine`, the partitions the map gives it
+/// (D317 ticket 8a): each one's share of `shards` and `compaction`, and, when
+/// `--engine-memory` or the map sets any, each one's memory: the map's `memory_bytes` off
+/// the top, the rest of `engine_memory` in equal shares. A restart re-splits it across
+/// every partition the map gives the node, which is how a node a run-time open refused
+/// for memory takes that partition (D317 ticket 6).
+pub(crate) fn start_budget(
+    map: Option<&ClusterMap>,
+    mine: &[(String, u64)],
+    shards: usize,
+    compaction: usize,
+    engine_memory: Option<u64>,
+) -> Result<
+    (
+        Vec<super::placement::Share>,
+        Option<Vec<super::placement::Memory>>,
+    ),
+    Failure,
+> {
+    let shares = super::placement::split(shards, compaction, mine.len());
+    let overrides: Vec<u64> = mine
+        .iter()
+        .map(|(p, _)| {
+            map.and_then(|m| m.partitions.iter().find(|q| q.id == *p))
+                .map_or(0, |q| q.memory_bytes)
+        })
+        .collect();
+    let set_memory = engine_memory.is_some() || overrides.iter().any(|&m| m > 0);
+    let memories = super::placement::memory(
+        engine_memory,
+        &shares
+            .iter()
+            .zip(&overrides)
+            .map(|(s, &m)| (s.shards, m))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|(i, why)| match i.and_then(|i| mine.get(i)) {
+        Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
+        None => Failure::usage(&format!("--engine-memory: {why}")),
+    })?;
+    Ok((shares, set_memory.then_some(memories)))
 }
 
 /// How a node's partitions share its budget as they open (D317 ticket 8a).
@@ -1498,6 +1691,9 @@ fn open_partition(
     epoch: u64,
     options: pigeonhole::Options,
 ) -> Result<pigeonhole::Pigeonhole, Failure> {
+    // An install a crash interrupted is finished first: the partition never opens with its
+    // marker there (D317 ticket 6, feed1248's F1).
+    stamp::finish_install(dir, partition).map_err(|e| Failure::usage(&e.message))?;
     let path = dir.join(format!("{partition}.phdb"));
     if !path.exists() {
         return Err(Failure::usage(&format!(

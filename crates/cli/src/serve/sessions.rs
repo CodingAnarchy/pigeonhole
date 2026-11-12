@@ -69,6 +69,9 @@ struct Entry {
     busy: usize,
     /// The transaction's durability, for its commit.
     durability: Option<Durability>,
+    /// Whether a `TxnWrite` buffered writes in the transaction: its `Commit` is then a
+    /// write, which a fenced partition refuses (D317 ticket 6).
+    wrote: bool,
     renewed: Instant,
     idle: Duration,
     hard: Instant,
@@ -276,6 +279,7 @@ impl Sessions {
                 state,
                 busy: 0,
                 durability,
+                wrote: false,
                 renewed: now,
                 idle,
                 hard: now + lifetime,
@@ -344,6 +348,7 @@ impl Sessions {
                     id: key,
                     txn: Some(txn),
                     durability: e.durability,
+                    wrote: e.wrote,
                     ended: false,
                 }))
             }
@@ -544,11 +549,12 @@ impl Sessions {
     }
 
     /// Puts a call's transaction back, or (with `None`) records that the call lost it.
-    fn put_back(&self, id: &Id, txn: Option<Transaction>) {
+    fn put_back(&self, id: &Id, txn: Option<Transaction>, wrote: bool) {
         let now = Instant::now();
         let mut t = self.lock();
         if let Some(e) = t.map.get_mut(id) {
             e.busy = 0;
+            e.wrote |= wrote;
             e.renew(now);
             e.state = match txn {
                 Some(txn) => State::Txn(Some(txn)),
@@ -595,6 +601,9 @@ pub(crate) struct TxnGuard {
     id: Id,
     txn: Option<Transaction>,
     durability: Option<Durability>,
+    /// The entry's `wrote`, and set by [`TxnGuard::wrote_now`]: put back with the
+    /// transaction.
+    wrote: bool,
     ended: bool,
 }
 
@@ -615,6 +624,16 @@ impl TxnGuard {
 
     pub(crate) fn restore(&mut self, txn: Transaction) {
         self.txn = Some(txn);
+    }
+
+    /// Records that this call buffered writes in the transaction.
+    pub(crate) fn wrote_now(&mut self) {
+        self.wrote = true;
+    }
+
+    /// Whether the transaction has buffered writes from a `TxnWrite`.
+    pub(crate) fn wrote(&self) -> bool {
+        self.wrote
     }
 
     /// Starts the commit: the session answers `SessionBusy` until the ticket records the
@@ -647,7 +666,8 @@ impl TxnGuard {
 impl Drop for TxnGuard {
     fn drop(&mut self) {
         if !self.ended {
-            self.sessions.put_back(&self.id, self.txn.take());
+            self.sessions
+                .put_back(&self.id, self.txn.take(), self.wrote);
         }
     }
 }

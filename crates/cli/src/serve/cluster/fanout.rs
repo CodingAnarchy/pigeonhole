@@ -103,6 +103,7 @@ impl Reach {
         if owner.node == self.node.id() {
             return self
                 .parts
+                .load()
                 .get(partition)
                 .map(|s| Place::Here(Arc::clone(s)))
                 .ok_or_else(|| not_open(partition));
@@ -559,7 +560,8 @@ impl Router {
         // Here, the snapshot is pinned for the stream's life, as on a single node; on its
         // node, the forwarded scan pins it there.
         // Its partition's session table holds it (each partition's has its own, 8a).
-        let pinned = match only.as_ref().and_then(|p| reach.parts.get(p)) {
+        let open = reach.parts.load();
+        let pinned = match only.as_ref().and_then(|p| open.get(p)) {
             Some(service) => service.pinned_selection(r.selection.as_ref(), caller)?,
             None => None,
         };
@@ -567,7 +569,7 @@ impl Router {
         // there (one per partition served here, D317 ticket 8a).
         let mut here = HashMap::new();
         for p in &parts {
-            if let Some(service) = reach.parts.get(&p.partition) {
+            if let Some(service) = open.get(&p.partition) {
                 here.insert(p.partition.clone(), service.scan_opener(&r.table).await?);
             }
         }
@@ -648,7 +650,7 @@ impl Router {
                     )));
                 }
             }
-            Arc::clone(service)
+            service
         };
         match service.call(ServiceOp::Scan(r), caller, None).await? {
             ServiceReply::Scan(pages) => Ok(pages),

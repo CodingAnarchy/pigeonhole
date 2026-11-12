@@ -857,7 +857,7 @@ impl Ctx {
             })?
         };
         if owner.node == self.node.id() {
-            let Some(here) = self.parts.get(&open.partition) else {
+            let Some(here) = self.parts.load().get(&open.partition).cloned() else {
                 return Err(ApiError::partition_unavailable(format!(
                     "the map gives this node partition {:?}, but it isn't open here",
                     open.partition
@@ -1041,13 +1041,13 @@ pub(crate) async fn serve(
                 ),
             ));
         }
-        let Some(service) = parts.get(&req.partition) else {
+        let Some(service) = parts.load().get(&req.partition).cloned() else {
             return Err(ApiError::partition_unavailable(format!(
                 "the map gives this node partition {:?}, but it isn't open here",
                 req.partition
             )));
         };
-        Arc::clone(service)
+        service
     };
     service
         .subscribe_part(r, &caller, req.skip_through, true)
