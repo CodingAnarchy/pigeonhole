@@ -32,7 +32,7 @@ use crate::output::Report;
 use crate::serve::proto::{self, BackupDownloadRequest, ClusterMap, GetMapRequest};
 
 /// A copy's stream may break this many times; each break resumes from what was written.
-const RESUMES: u32 = 5;
+pub(super) const RESUMES: u32 = 5;
 
 /// What the backup of one partition gave.
 #[derive(Debug, Clone)]
@@ -314,7 +314,7 @@ impl Job {
 }
 
 /// Whether a download's error is a break to resume from, not a refusal.
-fn resumable(s: &tonic::Status) -> bool {
+pub(super) fn resumable(s: &tonic::Status) -> bool {
     matches!(
         s.code(),
         tonic::Code::Unavailable
@@ -367,7 +367,7 @@ fn write_new(path: &PathBuf, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|e| Failure::io(&format!("write {}", path.display()), &e))
 }
 
-fn digest(path: &Path) -> Result<[u8; 32], Failure> {
+pub(super) fn digest(path: &Path) -> Result<[u8; 32], Failure> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(path)
         .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
@@ -385,7 +385,7 @@ fn digest(path: &Path) -> Result<[u8; 32], Failure> {
     Ok(h.finalize().into())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
