@@ -1247,3 +1247,47 @@ fn a_promote_during_the_first_bootstrap_is_refused_and_the_bootstrap_goes_on() {
     let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
     assert_eq!(status, 200, "{body}");
 }
+
+#[test]
+fn a_promote_that_fails_after_the_stop_reports_a_replica_that_follows_nothing() {
+    // audit120's S1 on #1801: past its bootstrap check a promote stops the loop, and a
+    // failure after that left Info at `following` and the gauge at 1 on a replica that
+    // followed nothing. It's `stopped` now, with why, and another Promote may try again.
+    let p = Server::start("", limits());
+    let (status, body) = p.post(
+        "Mutate",
+        &put("r1", "f", "q", json!({"bytes": b64(b"v")})),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let dir = test_dir();
+    let r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let path = r
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .path()
+        .to_path_buf();
+    *super::super::replica::FAIL_PROMOTE.lock().unwrap() = Some(path);
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    *super::super::replica::FAIL_PROMOTE.lock().unwrap() = None;
+    assert_eq!(body["code"].as_str(), Some("Internal"), "{status}: {body}");
+    let (_, info) = r.rpc("Admin/Info", &json!({}), None);
+    assert_eq!(info["replica"]["state"], "stopped", "{info}");
+    assert!(
+        info["replica"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("promote failed")),
+        "{info}"
+    );
+    let (_, m) = r.rpc("Admin/Metrics", &json!({}), None);
+    let text = m["text"].as_str().unwrap();
+    assert!(text.contains("pigeonhole_replica_following 0"), "{text}");
+    // Another Promote goes through.
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 200, "{body}");
+}
