@@ -16,6 +16,7 @@ pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
+pub(crate) mod idle;
 pub(crate) mod map;
 pub(crate) mod open;
 pub(crate) mod position;

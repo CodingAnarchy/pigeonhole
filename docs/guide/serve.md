@@ -335,6 +335,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_request_duration_seconds{rpc}` | histogram | Each RPC's service time, from the decoded request to its answer (a stream's to its end). Buckets from 100 µs to 10 s. |
 | `pigeonhole_serve_shed_total` | counter | Requests refused at `--max-concurrent`, before they ran. |
 | `pigeonhole_serve_replies_lost_total` | counter | Writes that finished after their client went away. The write's outcome went to the log instead. |
+| `pigeonhole_serve_feed_idle_drops_total` | counter | Feed subscriptions ended at `--stream-idle-ms`, because the client left an event untaken that long (on a cluster: took nothing that long). Each one also ends its `Feed.Subscribe` with `DeadlineExceeded`. A cluster subscription counts once, on the node it entered. |
 | `pigeonhole_serve_connections`, `pigeonhole_serve_connections_max` | gauge | Open connections, and `--max-connections`. |
 | `pigeonhole_serve_connections_refused_total` | counter | Connections closed at the cap. |
 | `pigeonhole_serve_accept_errors_total` | counter | Failed accepts, such as running out of file descriptors (`EMFILE`). |
@@ -586,8 +587,8 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 
 #### Limits
 - **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
-- **Memory:** it buffers up to 256 KiB on its entry node and on each partition's node, so (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
-- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use.
+- **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node buffers nothing of its own: it merges the partitions' events as its client reads them.
+- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: on a cluster the limit counts the client's reads, not the events it gets, so it ends a client that stopped reading, never one that's waiting for a commit.
 
 #### Expiry and what isn't supported
 - **Expired tokens:**

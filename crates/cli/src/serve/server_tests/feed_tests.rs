@@ -150,6 +150,13 @@ fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Ve
         }
     }
     assert!(next_event(&s, &mut stalled, Duration::from_secs(1)).is_none());
+    // Counted once as an idle drop, as a cluster subscription's watchdog counts one
+    // (#1758's B, simp724's point 2).
+    let text = s.shared.metrics.render();
+    assert!(
+        text.contains("pigeonhole_serve_feed_idle_drops_total 1\n"),
+        "{text}"
+    );
     (got, written)
 }
 
