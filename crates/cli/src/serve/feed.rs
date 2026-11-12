@@ -1158,7 +1158,7 @@ impl Client {
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
             };
-            self.send(Out::Event(event), &mut pos).await?;
+            self.send(Out::event(event), &mut pos).await?;
         }
         loop {
             source = match source {
@@ -1337,7 +1337,7 @@ impl Client {
             if self.skipping(commit.seqno())? {
                 return Ok(());
             }
-            self.send(Out::Event(commit_event(token.clone(), c)), pos)
+            self.send(Out::event(commit_event(token.clone(), c)), pos)
                 .await?;
         }
         Ok(())
@@ -1378,7 +1378,7 @@ impl Client {
         // carries the position past one with none).
         match e.for_prefix(&self.prefix) {
             Some(_) if self.skipping(e.seqno)? => Ok(()),
-            Some(event) => self.send(Out::Event(event), pos).await,
+            Some(event) => self.send(Out::event(event), pos).await,
             None => Ok(()),
         }
     }
@@ -1391,7 +1391,7 @@ impl Client {
             return Ok(());
         }
         self.send(
-            Out::Event(proto::FeedEvent {
+            Out::event(proto::FeedEvent {
                 token: pos.token.clone(),
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
@@ -1569,20 +1569,24 @@ pub(crate) struct FeedEvents {
 /// An event as it leaves a client: its own, or a ring entry encoded once for every client
 /// with no prefix.
 pub(crate) enum Out {
-    Event(proto::FeedEvent),
+    /// Boxed, so `Out` is two `Bytes` wide (`Spliced`), not a whole message: every event is
+    /// moved through a `Sink`'s put and channel by value, once per stream it goes to (#1758's
+    /// g88: those moves were most of the cluster path's memmove).
+    Event(Box<proto::FeedEvent>),
     /// An entry whose `encoded()` is `Some`.
     Shared(Arc<Entry>),
     /// A cluster subscription's event (D317 ticket 7): a component's event without its
     /// token (`body`), then the fields the merge adds (`tail`: the partition, and on a
     /// checkpoint the cluster token). A protobuf message is the concatenation of its fields,
     /// so the component's encoding is sent as it is, not decoded and built again.
-    Spliced {
-        body: Bytes,
-        tail: Bytes,
-    },
+    Spliced { body: Bytes, tail: Bytes },
 }
 
 impl Out {
+    pub(crate) fn event(e: proto::FeedEvent) -> Self {
+        Out::Event(Box::new(e))
+    }
+
     fn token(&self) -> &Bytes {
         static NONE: Bytes = Bytes::new();
         match self {
@@ -1613,7 +1617,7 @@ impl Out {
     /// The event as a message (HTTP, which renders JSON, and tests).
     pub(crate) fn into_proto(self) -> proto::FeedEvent {
         match self {
-            Out::Event(e) => e,
+            Out::Event(e) => *e,
             Out::Shared(e) => e
                 .encoded()
                 .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
@@ -1902,6 +1906,14 @@ mod tests {
             rt(delivery_threads, Some("phdb-serve-feed")),
             rt(1, Some("phdb-serve-feed-hub")),
         )
+    }
+
+    #[test]
+    fn an_out_is_two_bytes_wide_not_a_whole_message() {
+        // #1758's g88: each event's `Out` is moved by value through every stream's put and
+        // channel slot; with the message inline it was 136 bytes.
+        let size = std::mem::size_of::<Out>();
+        assert!(size <= 72, "Out is {size} bytes");
     }
 
     #[test]
