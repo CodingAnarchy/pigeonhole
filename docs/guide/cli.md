@@ -18,9 +18,9 @@
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
 | `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
 | `phdb mcp <file> [--read-only] [--create] [--memory NAME]` | A Model Context Protocol server on standard input and output, for AI agents, with optional [agent memory tools](ai-agents.md#the-memory-tools): see [Using Pigeonhole from AI agents](ai-agents.md). New in 1.1.0. |
-| `phdb serve <file> [--listen ADDR:PORT] [--tls-cert PEM --tls-key PEM] [--token-file FILE]` | Serve the database over gRPC and HTTP/JSON on one port (ICR 0112): see [Serving a database](serve.md). Only in a build with the `serve` feature (`cargo install pigeonhole-cli --features serve`). New in 1.2.0, in progress. |
+| `phdb serve <file> [--listen ADDR:PORT] [--tls-cert PEM --tls-key PEM] [--token-file FILE]` | Serve the database over gRPC and HTTP/JSON on one port (ICR 0112): see [Serving a database](serve.md). Only in a build with the `serve` feature (`cargo install pigeonhole-cli --features serve`). New in 1.2.0. |
 | `phdb promote <file>` | Turn a stopped replica's database (`phdb serve --replica-of`) into a primary that takes writes: see [Replicas](serve.md#replicas). Only with the `serve` feature. New in 1.2.0. |
-| `phdb cluster (init-partition \| set-map \| show-map \| status \| fence \| unfence \| close \| relocate \| move \| drop-partition \| backup \| restore)` | Operate a partitioned cluster of `phdb serve --cluster` nodes (D317): see [Clusters](serve.md#clusters). Only with the `serve` feature. New in 1.2.0, in progress. |
+| `phdb cluster (init-partition \| set-map \| show-map \| status \| fence \| unfence \| close \| relocate \| move \| drop-partition \| backup \| restore)` | Operate a partitioned cluster of `phdb serve --cluster` nodes (D317): see [Clusters](serve.md#clusters). Only with the `serve` feature. New in 1.2.0. |
 
 **Global flags,** before or after the command:
 

@@ -135,7 +135,7 @@ The example serves on Tokio with axum.
 - **To restore,** stop the server, put the copy in place, and start the server again. Commits after the backup's point are lost, so take backups as often as you can afford to lose work.
 
 ## The limits
-- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)); partitioning across nodes (D317) is on `main`, with what's still to come listed under [Clusters](serve.md#clusters).
+- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)), and clusters that split a database across nodes by key range, each partition with one writer node (D317, [Clusters](serve.md#clusters)).
 - **The file is on the server's local disk.** Network filesystems are refused at open.
 - **Throughput is one machine's.**
 - **Your server is your API.** Versioning, auth beyond a token, and rate limits are yours to add. `phdb serve` has a versioned API ([ICR 0112](../design/icr/0112-network-api.md)), scoped tokens and TLS, and limits on connections, requests and sessions ([Limits](serve.md#limits)).

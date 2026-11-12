@@ -473,8 +473,8 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Backups of a replica** (`Admin.Backup`, `phdb backup`) are ordinary copies, a good way to take backups off the primary. A copy restored and opened as a primary needs `phdb promote` first. A replica can't be another replica's source: replicas follow the primary.
 
 ## Clusters
-**In progress (D317, ICR 0117).** A cluster splits one database across several `phdb serve` nodes by key range. Each partition is a whole database file, served by one node.
-- **What works now:**
+**New in 1.2.0 (D317, ICR 0117).** A cluster splits one database across several `phdb serve` nodes by key range. Each partition is a whole database file, served by one node.
+- **What it does:**
   - any node takes any call and forwards what it doesn't hold;
   - single-row reads and writes, and batches within one partition;
   - transactions and snapshots in one partition;
@@ -485,7 +485,12 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - whole moves (`phdb cluster move`, `relocate --copy`), which keep the partition's change-feed history;
   - backups and restore;
   - several partitions per node.
-- **Still to come:** the IVF and full-text indexes (building them as well as searching them), agent memory and `/mcp` aren't served by a cluster node in this release (#1722, 1.3.0); [How calls are routed](#how-calls-are-routed) lists every call a node refuses. Each section below says which of its parts are still to come.
+- **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
+  - the IVF and full-text indexes (building them as well as searching them), agent memory and `/mcp` aren't served by a cluster node (#1722); [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
+  - a table's split keys are fixed once its ranges hold data (#1499);
+  - a restarted node unfences a partition on one peer's map (#1760);
+  - a partition opened on a running node doesn't re-split the node's `--engine-memory`, `--shards` and `--compaction-threads`, and the running threads keep their old affinity mask (#1761, #1762);
+  - `--change-feed` is each partition's, not the node's (#1786).
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
