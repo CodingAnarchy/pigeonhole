@@ -36,7 +36,7 @@ use prost::bytes::{Buf, BufMut, Bytes};
 use tonic::transport::Channel;
 
 use super::Node;
-use super::token::{At, ClusterToken, Component, subscription_hash};
+use super::token::{At, ClusterToken, subscription_hash};
 use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
 use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT, Sink};
@@ -212,6 +212,9 @@ pub(crate) async fn subscribe(
         next_checkpoint: 1,
         moved: false,
         states: Vec::new(),
+        token: Vec::new(),
+        scratch: Vec::new(),
+        tail: tail_buffer(),
         opens: tokio::task::JoinSet::new(),
     };
     merge.open_all().await?;
@@ -299,6 +302,12 @@ struct Merge {
     moved: bool,
     /// `PartitionState` events to send.
     states: Vec<proto::FeedEvent>,
+    /// The last checkpoint's token ([`Merge::checkpoint`]), and its components' compacted
+    /// bytes on their way: kept, so a checkpoint per event allocates nothing (#1758).
+    token: Vec<u8>,
+    scratch: Vec<u8>,
+    /// Each commit's tail is written here and split off ([`Merge::cover`]).
+    tail: prost::bytes::BytesMut,
     /// Parts opening again in the background, each bounded by the request timeout, so
     /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
     /// #1700).
@@ -418,24 +427,32 @@ impl Merge {
     }
 
     async fn run(&mut self, sink: &Sink, quiet: Duration) -> Result<(), ApiError> {
-        let mut last_sent = tokio::time::Instant::now();
         let mut turn = 0;
+        // One timer each for the whole stream, moved only when its deadline changes: a timer
+        // built per iteration registers with tokio's timer driver, under its mutex, once per
+        // event (#1758).
+        let mut retry = Timer::new();
+        let mut quiet = Quiet::new(quiet);
+        // The client going away, waited on for the whole stream: a new wait per iteration
+        // registered and dropped a waiter on the channel's `Notify`, under its mutex, per
+        // event (#1758's g86c).
+        let closed = sink.closed();
+        tokio::pin!(closed);
         loop {
             for event in std::mem::take(&mut self.states) {
                 sink.put(Out::Event(event)).await?;
-                last_sent = tokio::time::Instant::now();
+                quiet.sent();
             }
-            let retry_at = self.parts.iter().filter_map(|p| p.retry).min();
-            let quiet_at = last_sent + quiet;
+            retry.set(self.parts.iter().filter_map(|p| p.retry).min());
             let next = std::future::poll_fn(|cx| poll_parts(&mut self.parts, &mut turn, cx));
             tokio::select! {
-                () = sink.closed() => return Ok(()),
+                () = &mut closed => return Ok(()),
                 (i, item) = next => {
                     let ended = match item {
                         Some(Ok(bytes)) => match self.cover(i, bytes) {
                             Ok(Some(out)) => {
                                 sink.put(out).await?;
-                                last_sent = tokio::time::Instant::now();
+                                quiet.sent();
                                 None
                             }
                             Ok(None) => None,
@@ -458,7 +475,8 @@ impl Merge {
                         return Err(e);
                     }
                 }
-                () = sleep_until(retry_at) => {
+                () = retry.wait() => {
+                    // Every part due is reopened, so the next `set` moves or disarms it.
                     let now = tokio::time::Instant::now();
                     for i in 0..self.parts.len() {
                         if self.parts[i].retry.is_some_and(|at| at <= now) {
@@ -466,11 +484,11 @@ impl Merge {
                         }
                     }
                 }
-                () = tokio::time::sleep_until(quiet_at) => {
+                () = quiet.wait() => {
                     if self.moved {
                         sink.put(Out::Event(self.progress())).await?;
                     }
-                    last_sent = tokio::time::Instant::now();
+                    quiet.sent();
                 }
             }
         }
@@ -497,27 +515,41 @@ impl Merge {
                 // over by its node, so any commit is past it (simp724's N2).
                 self.parts[i].skip = 0;
                 self.since_checkpoint += 1;
-                let mut tail = Vec::with_capacity(16 + self.parts[i].partition.len());
+                // The tail goes into the merge's own buffer, split off for the event: no
+                // allocation per event once it has grown (#1758).
                 put_field(
-                    &mut tail,
+                    &mut self.tail,
                     PARTITION_FIELD,
                     self.parts[i].partition.as_bytes(),
                 );
                 if self.since_checkpoint >= self.next_checkpoint {
-                    let token = self.checkpoint();
-                    put_field(&mut tail, TOKEN_FIELD, &token);
+                    self.checkpoint();
+                    put_field(&mut self.tail, TOKEN_FIELD, &self.token);
                 }
                 Ok(Some(Out::Spliced {
                     body,
-                    tail: Bytes::from(tail),
+                    tail: self.tail.split().freeze(),
                 }))
             }
         }
     }
 
-    /// The cluster token as of now, and the next checkpoint's distance from it.
-    fn checkpoint(&mut self) -> Vec<u8> {
-        let token = self.token().encode();
+    /// The cluster token as of now, into [`Merge::token`], and the next checkpoint's distance
+    /// from it. One per event on a one-partition subscription, so it builds the bytes from
+    /// the parts in reused buffers (#1758).
+    fn checkpoint(&mut self) {
+        self.token.clear();
+        super::token::encode_into(
+            &self.cluster_id,
+            self.map_version,
+            self.subscription,
+            self.parts
+                .iter()
+                .map(|p| (p.partition.as_str(), p.epoch, &p.at)),
+            &mut self.token,
+            &mut self.scratch,
+        );
+        let token = &self.token;
         self.since_checkpoint = 0;
         self.moved = false;
         self.next_checkpoint = if self.parts.len() == 1 {
@@ -527,30 +559,15 @@ impl Merge {
         } else {
             (token.len().div_ceil(TOKEN_BYTES_PER_EVENT) as u64).clamp(1, MAX_EVERY)
         };
-        token
-    }
-
-    fn token(&self) -> ClusterToken {
-        ClusterToken {
-            cluster_id: self.cluster_id.clone(),
-            map_version: self.map_version,
-            subscription: self.subscription,
-            components: self
-                .parts
-                .iter()
-                .map(|p| Component {
-                    partition: p.partition.clone(),
-                    epoch: p.epoch,
-                    at: p.at.clone(),
-                })
-                .collect(),
-        }
     }
 
     /// A progress event with a checkpoint.
     fn progress(&mut self) -> proto::FeedEvent {
         proto::FeedEvent {
-            token: Bytes::from(self.checkpoint()),
+            token: {
+                self.checkpoint();
+                Bytes::copy_from_slice(&self.token)
+            },
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
         }
@@ -581,6 +598,17 @@ impl Merge {
     }
 }
 
+/// What a merge's tail buffer starts with ([`Merge::tail`]): each event's tail is split off
+/// it, and a buffer that started empty reallocates exactly to size after each split, then
+/// grows: 4 allocations an event against main's 2 for a client that's behind (cli692's S1
+/// on #1766, measured). Starting with room, it allocates about once per this many bytes of
+/// tails (0.02 an event at 8 KiB). Not `BytesMut::new()`: a test holds it.
+const TAIL_CAPACITY: usize = 8 << 10;
+
+fn tail_buffer() -> prost::bytes::BytesMut {
+    prost::bytes::BytesMut::with_capacity(TAIL_CAPACITY)
+}
+
 /// Polls every available part, from `turn` on so none starves, for its next event.
 fn poll_parts(
     parts: &mut [Part],
@@ -600,10 +628,91 @@ fn poll_parts(
     Poll::Pending
 }
 
-async fn sleep_until(at: Option<tokio::time::Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
+/// The quiet interval: done once `quiet` passes with nothing sent. Its timer lags the last
+/// send rather than following it: when it fires early (something was sent since it was set)
+/// it moves to the real deadline, so it moves at most once per quiet period, not once per
+/// send (#1758).
+struct Quiet {
+    quiet: Duration,
+    last_sent: tokio::time::Instant,
+    timer: Timer,
+}
+
+impl Quiet {
+    fn new(quiet: Duration) -> Self {
+        let last_sent = tokio::time::Instant::now();
+        let mut timer = Timer::new();
+        timer.set(Some(last_sent + quiet));
+        Self {
+            quiet,
+            last_sent,
+            timer,
+        }
+    }
+
+    /// Something was sent now.
+    fn sent(&mut self) {
+        self.last_sent = tokio::time::Instant::now();
+    }
+
+    /// Done once `quiet` has passed since the last send. Safe to drop at any point (another
+    /// `select!` branch won): the timer keeps its deadline.
+    async fn wait(&mut self) {
+        loop {
+            self.timer.wait().await;
+            let due = self.last_sent + self.quiet;
+            if tokio::time::Instant::now() >= due {
+                return;
+            }
+            self.timer.set(Some(due));
+        }
+    }
+}
+
+/// A timer kept for a whole stream: set to a deadline, or to none, and moved only when the
+/// deadline changes (#1758). Waiting on it doesn't register anything new, and dropping a
+/// wait (another `select!` branch won) leaves it armed.
+struct Timer {
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    at: Option<tokio::time::Instant>,
+    /// How many times it was moved, for the tests.
+    #[cfg(test)]
+    moves: u32,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            // Not polled until it's set, so not registered.
+            sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
+            at: None,
+            #[cfg(test)]
+            moves: 0,
+        }
+    }
+
+    /// Arms it for `at`, or disarms it (`None`). Unchanged costs nothing.
+    fn set(&mut self, at: Option<tokio::time::Instant>) {
+        if at == self.at {
+            return;
+        }
+        self.at = at;
+        if let Some(at) = at {
+            self.sleep.as_mut().reset(at);
+            #[cfg(test)]
+            {
+                self.moves += 1;
+            }
+        }
+    }
+
+    /// Done once its deadline passes; never while disarmed. Stays done until it's set
+    /// again.
+    async fn wait(&mut self) {
+        match self.at {
+            Some(_) => self.sleep.as_mut().await,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -644,7 +753,10 @@ fn state_event(partition: &str, e: Option<&ApiError>) -> proto::FeedEvent {
 fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
     let mut token = Bytes::new();
     let mut kind = Kind::Other;
-    let mut kept: Vec<(usize, usize)> = Vec::new();
+    // The body's ranges: one in the usual case (the token is its first field), held without
+    // an allocation (#1758); more only if the token sits between other fields.
+    let mut first: Option<(usize, usize)> = None;
+    let mut more: Vec<(usize, usize)> = Vec::new();
     let mut buf = bytes.clone();
     while buf.has_remaining() {
         let start = bytes.len() - buf.remaining();
@@ -675,18 +787,21 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
             _ => {}
         }
         let end = bytes.len() - buf.remaining();
-        match kept.last_mut() {
-            Some(last) if last.1 == start => last.1 = end,
-            _ => kept.push((start, end)),
+        match (more.last_mut(), &mut first) {
+            (Some(last), _) if last.1 == start => last.1 = end,
+            (Some(_), _) => more.push((start, end)),
+            (None, Some(f)) if f.1 == start => f.1 = end,
+            (None, Some(_)) => more.push((start, end)),
+            (None, None) => first = Some((start, end)),
         }
     }
-    let body = match kept.as_slice() {
-        [] => Bytes::new(),
-        [(a, b)] => bytes.slice(*a..*b),
-        ranges => {
+    let body = match (first, more.is_empty()) {
+        (None, _) => Bytes::new(),
+        (Some((a, b)), true) => bytes.slice(a..b),
+        (Some(f), false) => {
             let mut v = Vec::with_capacity(bytes.len());
-            for (a, b) in ranges {
-                v.extend_from_slice(&bytes[*a..*b]);
+            for (a, b) in std::iter::once(f).chain(more) {
+                v.extend_from_slice(&bytes[a..b]);
             }
             Bytes::from(v)
         }
@@ -695,7 +810,7 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
 }
 
 /// Appends a length-delimited field.
-fn put_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
     prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
     prost::encoding::encode_varint(value.len() as u64, out);
     out.put_slice(value);
@@ -1057,6 +1172,92 @@ where
 mod tests {
     use super::*;
 
+    /// A runtime on a paused clock: virtual time, advanced only when every task waits.
+    fn paused() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    /// Whether `f` is done within `d` of virtual time.
+    async fn done_within(d: Duration, f: impl std::future::Future<Output = ()>) -> bool {
+        tokio::time::timeout(d, f).await.is_ok()
+    }
+
+    #[test]
+    fn a_timer_moves_only_when_its_deadline_changes() {
+        // #1758: the merge sets the retry timer on every event; only a change may move it.
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let mut t = Timer::new();
+            assert!(
+                !done_within(Duration::from_secs(3600), t.wait()).await,
+                "unset"
+            );
+            let at = tokio::time::Instant::now() + Duration::from_secs(1);
+            for _ in 0..1000 {
+                t.set(Some(at));
+            }
+            assert_eq!(t.moves, 1, "set to the same deadline 1000 times");
+            t.wait().await;
+            assert_eq!(tokio::time::Instant::now(), at, "done at its deadline");
+            assert!(start < at);
+            assert!(
+                done_within(Duration::ZERO, t.wait()).await,
+                "stays done until set again"
+            );
+            t.set(None);
+            assert!(
+                !done_within(Duration::from_secs(3600), t.wait()).await,
+                "disarmed"
+            );
+            let later = tokio::time::Instant::now() + Duration::from_secs(5);
+            t.set(Some(later));
+            t.wait().await;
+            assert_eq!(tokio::time::Instant::now(), later);
+            assert_eq!(t.moves, 2);
+        });
+    }
+
+    #[test]
+    fn the_quiet_timer_moves_once_per_quiet_period_not_per_send() {
+        // #1758: a send per event moved a new quiet timer per event. Sends now only note the
+        // time; the timer moves when it fires early, and the wait still ends exactly `quiet`
+        // after the last send.
+        paused().block_on(async {
+            let quiet = Duration::from_millis(100);
+            let mut q = Quiet::new(quiet);
+            assert_eq!(q.timer.moves, 1, "armed once");
+            // 1000 sends 1 ms apart: 10 quiet periods' worth, never quiet.
+            for _ in 0..1000 {
+                tokio::time::advance(Duration::from_millis(1)).await;
+                q.sent();
+                assert!(
+                    !done_within(Duration::ZERO, q.wait()).await,
+                    "not quiet yet"
+                );
+            }
+            assert!(
+                q.timer.moves <= 11,
+                "moved {} times for 1000 sends over 10 quiet periods",
+                q.timer.moves
+            );
+            let last = tokio::time::Instant::now();
+            q.wait().await;
+            assert_eq!(
+                tokio::time::Instant::now(),
+                last + quiet,
+                "quiet after the last send"
+            );
+            // Quiet again a period after it's noted as sent.
+            q.sent();
+            q.wait().await;
+            assert_eq!(tokio::time::Instant::now(), last + quiet * 2);
+        });
+    }
+
     fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
         let e = proto::FeedEvent {
             token: Bytes::copy_from_slice(token),
@@ -1071,6 +1272,29 @@ mod tests {
             partition: String::new(),
         };
         Bytes::from(prost::Message::encode_to_vec(&e))
+    }
+
+    #[test]
+    fn a_merge_s_tail_buffer_starts_with_room() {
+        // cli692's S1 on #1766: an empty start reallocates per event once tails are split
+        // off it. Tails split off a buffer with room share its allocation.
+        let mut tail = tail_buffer();
+        assert!(tail.capacity() >= 4 << 10, "{}", tail.capacity());
+        let before = tail.as_ptr();
+        put_field(&mut tail, PARTITION_FIELD, b"p1");
+        let first = tail.split().freeze();
+        put_field(&mut tail, PARTITION_FIELD, b"p2");
+        let second = tail.split().freeze();
+        assert_eq!(
+            first.as_ptr(),
+            before,
+            "the first tail is in the buffer's allocation"
+        );
+        assert_eq!(
+            second.as_ptr(),
+            before.wrapping_add(first.len()),
+            "and the next one right after it"
+        );
     }
 
     #[test]
@@ -1102,5 +1326,18 @@ mod tests {
             split(Bytes::from_static(&[0x0a, 0x05, 1])).is_err(),
             "truncated"
         );
+        // A token between other fields (not prost's order, but valid): the body is the
+        // fields around it, joined.
+        let mut odd = Vec::new();
+        put_field(&mut odd, PARTITION_FIELD, b"p1");
+        put_field(&mut odd, TOKEN_FIELD, b"tok");
+        put_field(&mut odd, PROGRESS_FIELD, b"");
+        let (token, body, kind) = split(Bytes::from(odd)).unwrap();
+        assert_eq!(&token[..], b"tok");
+        assert!(matches!(kind, Kind::Progress));
+        let mut want = Vec::new();
+        put_field(&mut want, PARTITION_FIELD, b"p1");
+        put_field(&mut want, PROGRESS_FIELD, b"");
+        assert_eq!(&body[..], &want[..]);
     }
 }
