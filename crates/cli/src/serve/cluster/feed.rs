@@ -1492,6 +1492,239 @@ mod tests {
         );
     }
 
+    /// A part's events as a test feeds them.
+    struct Fed(tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, ApiError>>);
+
+    impl Stream for Fed {
+        type Item = Result<Bytes, ApiError>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
+
+    fn fed() -> (Feed, Events) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Box::pin(Fed(rx)))
+    }
+
+    /// A merge of `n` parts (`p0`, `p1`, ...), each fed by the test or not open yet
+    /// (`None`), with `allow_partial`, as its client's stream would hold it. Its node has no
+    /// map, so a reopen fails as unavailable.
+    fn merging(events: Vec<Option<Events>>, quiet: Duration, idle: Duration) -> Merging {
+        let dir = super::super::tests::test_dir();
+        let node = super::super::tests::node(&dir, "a");
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("svc.phdb"),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let service = Arc::new(Service::new(
+            db,
+            crate::serve::server_tests::limits(),
+            2,
+            Arc::new(crate::serve::service::Metrics::default()),
+        ));
+        let ctx = Arc::new(Ctx {
+            node: Arc::clone(&node),
+            parts: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
+            service,
+            caller: Caller::anonymous(),
+            prefix: Bytes::new(),
+            visible: false,
+            forwarder: Arc::new(super::super::forward::Forwarder::new(node)),
+            channels: Mutex::new(HashMap::new()),
+        });
+        let parts = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, events)| Part {
+                partition: format!("p{i}"),
+                tables: vec!["users".into()],
+                epoch: 1,
+                at: At::Now,
+                skip: 0,
+                opening: events.is_none(),
+                events,
+                retry: None,
+                unavailable: false,
+            })
+            .collect();
+        let merge = Merge {
+            ctx,
+            parts,
+            allow_partial: true,
+            every: 0,
+            map_version: 1,
+            subscription: 9,
+            cluster_id: "c1".into(),
+            since_checkpoint: 0,
+            next_checkpoint: 1,
+            moved: false,
+            states: Vec::new(),
+            token: Vec::new(),
+            cache: super::super::token::TokenCache::default(),
+            tail: tail_buffer(),
+            opens: tokio::task::JoinSet::new(),
+        };
+        let slot = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        Merging::new(merge, slot, quiet, idle)
+    }
+
+    /// The next item, within `d` of virtual time: `None` if nothing woke the stream with one.
+    async fn next_within(m: &mut Merging, d: Duration) -> Option<Option<Result<Out, ApiError>>> {
+        tokio::time::timeout(d, std::future::poll_fn(|cx| m.poll(cx)))
+            .await
+            .ok()
+    }
+
+    fn commit_of(item: Option<Option<Result<Out, ApiError>>>) -> (String, u64) {
+        let e = item
+            .expect("woken")
+            .expect("not ended")
+            .unwrap()
+            .into_proto();
+        match e.event {
+            Some(proto::feed_event::Event::Commit(c)) => (e.partition, c.seqno),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const QUIET: Duration = Duration::from_secs(10);
+    const IDLE: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn the_quiet_tick_alone_wakes_the_stream_with_a_checkpoint() {
+        // simp724's R3: with the parts quiet, the quiet timer is what wakes the stream.
+        paused().block_on(async {
+            let (p0, events) = fed();
+            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            p0.send(Ok(event(b"t1", Some(1)))).unwrap();
+            // The part's own progress moves the position past the last checkpoint (one
+            // part: every commit is one), and sends nothing.
+            p0.send(Ok(event(b"t2", None))).unwrap();
+            let start = tokio::time::Instant::now();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 1)
+            );
+            // Nothing more from the part: the next item is the quiet checkpoint, at the
+            // quiet interval after the last send exactly. Only the keepalive (every half idle limit) and the
+            // quiet timer could wake it; the quiet one comes first.
+            let e = next_within(&mut m, QUIET * 2)
+                .await
+                .expect("woken by the quiet timer")
+                .unwrap()
+                .unwrap()
+                .into_proto();
+            assert!(
+                matches!(e.event, Some(proto::feed_event::Event::Progress(_))),
+                "{e:?}"
+            );
+            assert!(!e.token.is_empty(), "a checkpoint");
+            assert_eq!(tokio::time::Instant::now(), start + QUIET);
+        });
+    }
+
+    #[test]
+    fn an_open_finishing_alone_wakes_the_stream() {
+        paused().block_on(async {
+            let mut m = merging(vec![None], QUIET, IDLE);
+            let (p0, events) = fed();
+            m.merge.opens.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (0, Ok(events))
+            });
+            p0.send(Ok(event(b"t1", Some(5)))).unwrap();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::from_millis(200)).await),
+                ("p0".into(), 5),
+                "the open's finish woke it, and its part's event came"
+            );
+        });
+    }
+
+    #[test]
+    fn the_retry_timer_alone_wakes_the_stream_to_reopen_a_part() {
+        paused().block_on(async {
+            let mut m = merging(vec![None], QUIET, IDLE);
+            m.merge.parts[0].opening = false;
+            let start = tokio::time::Instant::now();
+            m.merge.parts[0].retry = Some(start + RETRY);
+            m.merge.parts[0].unavailable = true;
+            // Nothing to send: it waits, and the retry timer wakes it at RETRY to reopen p0
+            // (which fails, its node having no map, and is due again a RETRY later).
+            assert!(
+                next_within(&mut m, RETRY + Duration::from_millis(50))
+                    .await
+                    .is_none()
+            );
+            let again = m.merge.parts[0].retry;
+            assert!(
+                m.merge.parts[0].opening || again.is_some_and(|at| at > start + RETRY),
+                "reopened at the retry: {again:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_skipped_event_never_stalls_the_stream() {
+        // A progress event is passed over (`cover` gives nothing): the stream goes on to the
+        // next, rather than returning Pending with nothing to wake it.
+        paused().block_on(async {
+            let (p0, events) = fed();
+            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            p0.send(Ok(event(b"t1", None))).unwrap();
+            p0.send(Ok(event(b"t2", None))).unwrap();
+            p0.send(Ok(event(b"t3", Some(3)))).unwrap();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 3)
+            );
+        });
+    }
+
+    #[test]
+    fn a_part_gone_unavailable_is_reported_right_after_its_failure() {
+        // simp724's N1 on #1772, end to end: p0's commits keep coming, p1 fails (with
+        // allow_partial); p1's state is the next item after its failure, not behind p0's.
+        paused().block_on(async {
+            let (p0, e0) = fed();
+            let (p1, e1) = fed();
+            let mut m = merging(vec![Some(e0), Some(e1)], QUIET, IDLE);
+            for s in 1..=10 {
+                p0.send(Ok(event(format!("t{s}").as_bytes(), Some(s))))
+                    .unwrap();
+            }
+            p1.send(Err(ApiError::partition_unavailable("gone")))
+                .unwrap();
+            // Round-robin from p0: p0's first, then p1's failure, whose state comes next.
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 1)
+            );
+            let e = next_within(&mut m, Duration::ZERO)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_proto();
+            match e.event {
+                Some(proto::feed_event::Event::PartitionState(st)) => {
+                    assert_eq!((st.partition.as_str(), st.available), ("p1", false));
+                }
+                other => panic!("p1's state next, got {other:?}"),
+            }
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 2)
+            );
+        });
+    }
+
     #[test]
     fn an_event_splits_into_its_token_and_the_rest_and_splices_back() {
         let bytes = event(b"position", Some(42));

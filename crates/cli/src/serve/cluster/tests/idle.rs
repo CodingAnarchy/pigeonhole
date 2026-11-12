@@ -136,7 +136,9 @@ fn a_client_that_stops_reading_loses_its_subscription_and_slot_at_the_idle_limit
     rt.block_on(async {
         let stuck = subscribe(c).await.unwrap();
         // c's one place is taken.
-        let e = subscribe(c).await.err().expect("no place left");
+        let Err(e) = subscribe(c).await else {
+            panic!("no place left");
+        };
         assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
         assert!(e.message().contains("--max-streams"), "{e:?}");
         // Far more than the HTTP/2 windows and the client's buffers hold, never read.

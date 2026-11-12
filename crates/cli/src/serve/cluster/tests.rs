@@ -15,7 +15,7 @@ use super::proto::{
 use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
 
-fn test_dir() -> PathBuf {
+pub(super) fn test_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -31,7 +31,7 @@ fn test_dir() -> PathBuf {
 }
 
 /// A node over `dir` (its persisted map loaded, as `run` loads it), without tokens or TLS.
-fn node(dir: &Path, id: &str) -> Arc<Node> {
+pub(super) fn node(dir: &Path, id: &str) -> Arc<Node> {
     node_with(dir, id, "")
 }
 

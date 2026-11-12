@@ -586,8 +586,8 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 
 #### Limits
 - **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
-- **Memory:** it buffers up to 256 KiB on its entry node and on each partition's node, so (partitions + 1) × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed.
-- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use.
+- **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node buffers nothing of its own: it merges the partitions' events as its client reads them.
+- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens.
 
 #### Expiry and what isn't supported
 - **Expired tokens:**
