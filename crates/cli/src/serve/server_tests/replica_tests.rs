@@ -229,6 +229,64 @@ fn a_bootstrap_clears_a_failed_one_s_side_files() {
 }
 
 #[test]
+fn a_restarted_replica_clears_a_side_copy_its_last_process_left() {
+    // #1752: a process that died during a re-bootstrap left its side copy. Restarted with a
+    // stored token, the replica follows from it and takes no bootstrap, so the copy is
+    // cleared when the replica starts rather than kept until the next bootstrap.
+    let p = Server::start("", limits());
+    for i in 0..5 {
+        let value = json!({"bytes": b64(format!("a{i}").as_bytes())});
+        assert_eq!(
+            p.post("Mutate", &put(&format!("r{i}"), "f", "q", value), None)
+                .0,
+            200
+        );
+    }
+    let dir = test_dir();
+    let mut r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    r.keep_dir = true;
+    drop(r);
+
+    // What a death mid-bootstrap leaves: a partial download, and another open's WAL and feed.
+    let side = dir.join("t.phdb.bootstrap");
+    let other = Pigeonhole::open(
+        &side,
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .change_feed(pigeonhole::FeedRetention::bytes(64 << 20)),
+    )
+    .unwrap();
+    other.close().unwrap();
+    std::fs::write(&side, b"a partial download").unwrap();
+    let left = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("t.phdb.bootstrap"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        left(),
+        [
+            "t.phdb.bootstrap",
+            "t.phdb.bootstrap-feed",
+            "t.phdb.bootstrap-wal-0"
+        ]
+    );
+    let downloads = || std::fs::read_dir(p.dir.join("backups")).map_or(0, |d| d.count());
+    let before = downloads();
+    let r = Server::start_replica(dir.clone(), &p.url, None);
+    wait_replica(&r, "caught up after its restart", caught_up(&p, None));
+    assert_eq!(downloads(), before, "a restart takes no bootstrap copy");
+    assert!(left().is_empty(), "the side copy is left: {:?}", left());
+    assert_eq!(get_value(&r, "t", "r3", None), b64(b"a3"));
+}
+
+#[test]
 fn a_restarted_replica_resumes_and_a_new_primary_bootstraps_it_again() {
     let p = Server::start("", limits());
     for i in 0..10 {

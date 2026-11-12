@@ -554,6 +554,15 @@ impl Replica {
     async fn run(&self, shared: &Shared) {
         let mut stop = self.stop.subscribe();
         let mut backoff = Duration::from_millis(100);
+        // A side copy a process left when it died mid-bootstrap goes now (#1752): a replica
+        // that restarts with a stored token follows from it, so no bootstrap would clear it
+        // until the next one. Its failure only leaves the files (every bootstrap clears
+        // them first, #1748): Info says why.
+        if let Ok(part) = shared.router.service.part()
+            && let Err(e) = clear_side(&side_path(part.db.path())).await
+        {
+            self.status().last_error = e;
+        }
         loop {
             if *stop.borrow() {
                 return;
@@ -821,21 +830,35 @@ impl Replica {
         let swap_side = side.clone();
         self.set_bootstrap_phase("opening the copy");
         let opened = tokio::task::spawn_blocking(move || {
-            let copy = Pigeonhole::open(&swap_side, pigeonhole::Options::default())?;
+            // A small memtable budget: this open only records the token, and the copy has no
+            // log to replay (a backup copy is one file). The shared-memory check is then
+            // 8 MiB a shard, not the default 64 (#1752): a node short of `/dev/shm` still
+            // bootstraps, as the served engine's own region is already held. The shard
+            // count stays the copy's (another would end its feed's history), and the swap
+            // opens it with the server's own options.
+            let copy = Pigeonhole::open(
+                &swap_side,
+                pigeonhole::Options::default().memtable_budget(8 << 20),
+            )?;
             copy.begin_replication(&FeedToken::from_bytes(token))?;
             copy.close()
         })
         .await
-        .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
         if let Err(e) = opened {
             let _ = clear_side(&side).await;
             return Err(Halt::Failed(format!("bootstrap: {e}")));
         }
         self.set_bootstrap_phase("swapping");
         let swap_side = side.clone();
+        // A panic in the swap is a failed swap (#1752): its side files go and the served
+        // handle drops what it cached, as for an error, since the swap may have got as far as
+        // replacing or closing the engine.
         let swapped = tokio::task::spawn_blocking(move || db.replace_with(&swap_side))
             .await
-            .map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
         // The side file is the database now, or the bootstrap failed: either way its files go
         // (after a failure, its WAL and feed sidecars too: #1748).
         let _ = clear_side(&side).await;
