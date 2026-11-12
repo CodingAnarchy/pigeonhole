@@ -302,6 +302,13 @@ pub(crate) struct Replica {
     applied: watch::Sender<u64>,
 }
 
+/// `Admin.Promote`'s answer before the first bootstrap has finished.
+fn not_bootstrapped() -> ApiError {
+    ApiError::failed_precondition(
+        "the replica hasn't finished its bootstrap: there is nothing to promote",
+    )
+}
+
 /// Why following stopped.
 enum Halt {
     /// `Admin.Promote` or shutdown.
@@ -516,14 +523,26 @@ impl Replica {
         }
         let promoted = self.promote_once(db).await;
         if promoted.is_err() {
-            // The loop is stopped either way: a failed promote leaves a replica that no
-            // longer follows (Info says so), and another Promote may try again.
+            // Past the bootstrap check the loop is stopped either way: a failed promote
+            // leaves a replica that no longer follows (Info says so), and another Promote
+            // may try again.
             self.promoting.store(false, Ordering::Release);
         }
         promoted
     }
 
     async fn promote_once(&self, db: &Pigeonhole) -> Result<Vec<u8>, ApiError> {
+        // Refused before the loop stops: during the first bootstrap there is nothing to
+        // promote, and a stopped loop would leave the replica bootstrapping until a restart
+        // (audit120). Once a bootstrap has stored a position, every later copy has one too.
+        let check = db.clone();
+        let bootstrapped = tokio::task::spawn_blocking(move || check.replicated_seqno())
+            .await
+            .map_err(|e| ApiError::internal(format!("promote: {e}")))??
+            .is_some();
+        if !bootstrapped {
+            return Err(not_bootstrapped());
+        }
         self.stop().await;
         let db = db.clone();
         let token = tokio::task::spawn_blocking(move || {
@@ -535,9 +554,7 @@ impl Replica {
         .await
         .map_err(|e| ApiError::internal(format!("promote: {e}")))??;
         let Some(token) = token else {
-            return Err(ApiError::failed_precondition(
-                "the replica hasn't finished its bootstrap: there is nothing to promote",
-            ));
+            return Err(not_bootstrapped());
         };
         self.promoted.store(true, Ordering::Release);
         // A primary now: every read waiting for a seqno passes (the loop is stopped, so

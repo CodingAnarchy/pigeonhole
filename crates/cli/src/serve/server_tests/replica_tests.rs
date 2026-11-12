@@ -1208,3 +1208,42 @@ fn a_copy_that_fails_after_a_heartbeat_reports_why() {
     assert!(error.contains(REFUSED), "{info}");
     assert!(!error.contains("no such backup download"), "{info}");
 }
+
+#[test]
+fn a_promote_during_the_first_bootstrap_is_refused_and_the_bootstrap_goes_on() {
+    // audit120: Admin.Promote stopped the loop before it found there was nothing to
+    // promote, so a replica asked during its first bootstrap answered FailedPrecondition and
+    // stayed bootstrapping until a restart. It's refused now with the loop left running.
+    let p = Server::start_slow_copies(Duration::from_millis(1500), false);
+    let (status, body) = p.post(
+        "Mutate",
+        &put("r1", "f", "q", json!({"bytes": b64(b"v")})),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let r = Server::start_replica(test_dir(), &p.url, None);
+    wait_replica(&r, "into its bootstrap", |info| {
+        info["state"] == "bootstrapping"
+    });
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("hasn't finished its bootstrap")),
+        "{body}"
+    );
+    wait_replica(
+        &r,
+        "caught up after the refused promote",
+        caught_up(&p, None),
+    );
+    assert_eq!(get_value(&r, "t", "r1", None), b64(b"v"));
+    // Bootstrapped now: a promote goes through.
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 200, "{body}");
+}
