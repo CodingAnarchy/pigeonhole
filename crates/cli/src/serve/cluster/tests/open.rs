@@ -84,6 +84,27 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
             })
             .await
             .unwrap();
+        // c holds p3: a write through a goes to c, which answers for the table only once
+        // it has reconciled to the writer's map (the call answers before then, #1778).
+        let want = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .map_version;
+        eventually("c's p3 to reconcile to the map with items", async || {
+            client(c)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p3" && lp.reconciled_version == want)
+        })
+        .await;
         let mut w = put_row("pen", "1");
         w.row.as_mut().unwrap().table = "items".into();
         data(a)
@@ -490,6 +511,148 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     .unwrap_or_else(|f| panic!("{}", f.message()));
     let total: u64 = memories.unwrap().iter().map(|m| m.bytes()).sum();
     assert!(total <= BUDGET, "{total}");
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// Three nodes (a: p1, b: p2, c routes only) with p3's one-shard file in c's directory.
+struct P3OnC {
+    rt: tokio::runtime::Runtime,
+    ports: [u16; 3],
+    stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    dbs: Vec<pigeonhole::Pigeonhole>,
+    dirs: [PathBuf; 3],
+}
+
+fn three_with_p3_on_c() -> P3OnC {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    test_partition_with(&dirs[2], "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    P3OnC {
+        rt,
+        ports,
+        stops,
+        dbs,
+        dirs,
+    }
+}
+
+async fn give_c_p3(ports: &[u16; 3]) {
+    client(ports[0])
+        .await
+        .set_map(SetMapRequest {
+            force: false,
+            expected_map_version: 1,
+            map: Some(the_map(2, ports)),
+        })
+        .await
+        .unwrap();
+}
+
+async fn p3_on_c(c: u16) -> Option<crate::serve::proto::LocalPartition> {
+    client(c)
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == "p3")
+}
+
+/// #1770: a partition being opened shows as opening in Status, which doesn't read its file:
+/// a read-only open there would refuse the node's own open.
+#[test]
+fn a_partition_being_opened_shows_opening_and_status_leaves_its_file_alone() {
+    use crate::serve::proto::LocalPartitionState;
+    let P3OnC {
+        rt,
+        ports,
+        stops,
+        dbs,
+        dirs,
+    } = three_with_p3_on_c();
+    let c = ports[2];
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    *super::super::open::HOLD_OPEN.lock().unwrap() = Some((dirs[2].clone(), wait));
+    rt.block_on(async {
+        give_c_p3(&ports).await;
+        eventually("p3 to be opening", async || {
+            p3_on_c(c)
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Opening)
+        })
+        .await;
+        let lp = p3_on_c(c).await.unwrap();
+        assert!(lp.ok && lp.error.is_empty(), "{lp:?}");
+        release.send(()).unwrap();
+        eventually("p3 to serve", async || {
+            p3_on_c(c)
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Serving)
+        })
+        .await;
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// #1770: an open the map drives retries a moment when a read-only open of the file holds
+/// its lock (an operator's `phdb info`, a Status from before #1770), rather than leaving the
+/// partition unopened until the next map.
+#[test]
+fn an_open_retries_while_a_read_only_open_holds_the_file() {
+    use crate::serve::proto::LocalPartitionState;
+    let P3OnC {
+        rt,
+        ports,
+        stops,
+        dbs,
+        dirs,
+    } = three_with_p3_on_c();
+    let c = ports[2];
+    let reader = pigeonhole::Pigeonhole::open(
+        dirs[2].join("p3.phdb"),
+        pigeonhole::Options::default().read_only(true),
+    )
+    .unwrap();
+    rt.block_on(async {
+        give_c_p3(&ports).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(reader);
+        eventually("p3 to serve once the reader is gone", async || {
+            p3_on_c(c)
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Serving)
+        })
+        .await;
+    });
+    drop(stops);
     for db in dbs {
         let _ = db.close();
     }

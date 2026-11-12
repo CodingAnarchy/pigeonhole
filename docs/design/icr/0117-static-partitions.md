@@ -302,7 +302,7 @@
 1. It reads the map from `--node` (V).
 2. It downloads every partition's copy from the node V gives it, at most N at once (default 4), resuming a broken stream, and checks each copy's SHA-256.
 3. Each copy's identity must be the map's: cluster, partition, and the partition's epoch at V. Otherwise the backup fails, naming both.
-4. It reads the map again (V′). V′ must have the same partitions, owners and epochs as V, and place every table both hold the same way. Otherwise it fails: "the map changed during the backup". Tables created or dropped in between are allowed.
+4. It reads the map again (V′). V′ must have the same partitions, owners and epochs as V, and place every table both hold the same way, with the same `created` (a table dropped and created again under its name fails it: simp724's N2 on #1711). Otherwise it fails: "the map changed during the backup". Tables created or dropped in between are allowed.
 5. It writes `DIR/map.json` (V′, so a restore reconciles the copies against the map they were taken under: simp724's A2), and `DIR/manifest.json`:
    - `cluster_id`, `map_version` (V′), `map_version_at_start` (V), `durable`, and `consistency`;
    - and per partition: `file`, `node`, `epoch`, `bytes`, `sha256` and the node's map version.
