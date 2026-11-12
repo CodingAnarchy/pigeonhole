@@ -227,7 +227,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     rt.block_on(async {
         put(b, "alice", "1").await;
         // Not fenced on a: refused.
-        let e = super::super::cli::relocate(&args, "p1", "c", false, false)
+        let e = within(super::super::cli::relocate(&args, "p1", "c", false, false))
             .await
             .err()
             .expect("refused");
@@ -237,7 +237,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             e.message()
         );
         // --old-unreachable still asks a, which answers and serves p1 (cli692's S3).
-        let e = super::super::cli::relocate(&args, "p1", "c", true, false)
+        let e = within(super::super::cli::relocate(&args, "p1", "c", true, false))
             .await
             .err()
             .expect("refused");
@@ -247,7 +247,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             e.message()
         );
         // A copy is taken from the old node's closed files, so it's never unreachable.
-        let e = super::super::cli::relocate(&args, "p1", "c", true, true)
+        let e = within(super::super::cli::relocate(&args, "p1", "c", true, true))
             .await
             .err()
             .expect("refused");
@@ -256,7 +256,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
         client(a).await.close(req()).await.unwrap();
         upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
         // Its files were copied whole (`--copy`): p1 keeps its feed history (D317 ticket 6).
-        let r = super::super::cli::relocate(&args, "p1", "c", false, true)
+        let r = within(super::super::cli::relocate(&args, "p1", "c", false, true))
             .await
             .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
@@ -285,7 +285,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
         put(a, "alice", "2").await;
         assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"2".to_vec()));
         // Again: done.
-        let r = super::super::cli::relocate(&args, "p1", "c", false, true)
+        let r = within(super::super::cli::relocate(&args, "p1", "c", false, true))
             .await
             .unwrap();
         assert!(r.document.contains_key("done"), "{:?}", r.document);
@@ -370,7 +370,7 @@ fn a_move_run_again_after_its_stamp_finishes_but_drops_nothing() {
             .into_inner();
         assert!(!lp.files.is_empty(), "installed: {lp:?}");
 
-        let r = super::super::moving::run(&args, "p1", "c", true)
+        let r = within(super::super::moving::run(&args, "p1", "c", true))
             .await
             .unwrap();
         assert_eq!(r.document["verified"], false, "{:?}", r.document);

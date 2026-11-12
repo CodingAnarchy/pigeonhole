@@ -722,7 +722,7 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
         let token = seen[at].token.clone().unwrap();
         let mut want: Vec<String> = seen[at + 1..].iter().flat_map(|x| x.rows.clone()).collect();
 
-        let r = super::super::moving::run(&args, "p1", "c", true)
+        let r = within(super::super::moving::run(&args, "p1", "c", true))
             .await
             .unwrap();
         assert_eq!(r.document["verified"], true, "{:?}", r.document);
@@ -772,7 +772,7 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
         }
 
         // Again: done.
-        let r = super::super::moving::run(&args, "p1", "c", true)
+        let r = within(super::super::moving::run(&args, "p1", "c", true))
             .await
             .unwrap();
         assert!(r.document.contains_key("done"), "{:?}", r.document);

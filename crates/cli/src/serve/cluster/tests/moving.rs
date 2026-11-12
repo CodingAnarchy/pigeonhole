@@ -79,7 +79,7 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
         let [a, b, _] = t.ports;
         t.rt.block_on(async {
             STOP.lock().unwrap().push((t.args.node.clone(), step));
-            let e = super::super::moving::run(&t.args, "p1", "c", true)
+            let e = within(super::super::moving::run(&t.args, "p1", "c", true))
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{step:?}: not stopped"));
@@ -89,7 +89,7 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
                 e.message()
             );
 
-            let r = super::super::moving::run(&t.args, "p1", "c", true)
+            let r = within(super::super::moving::run(&t.args, "p1", "c", true))
                 .await
                 .unwrap_or_else(|e| panic!("{step:?}: the rerun failed: {}", e.message()));
             let doc = &r.document;

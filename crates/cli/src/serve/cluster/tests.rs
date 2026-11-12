@@ -150,6 +150,15 @@ async fn version(port: u16) -> u64 {
         .map_version
 }
 
+/// A `phdb cluster move` or `relocate` within 2 minutes: one that hangs fails its test, with
+/// the move's progress lines in the output, rather than the CI job at its time limit
+/// (#1729's Windows run).
+async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(120), f)
+        .await
+        .expect("the move or relocation finishes within 2 minutes")
+}
+
 /// Waits for `cond` (a node's state settling after a background push or pull).
 async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
     for _ in 0..100 {
