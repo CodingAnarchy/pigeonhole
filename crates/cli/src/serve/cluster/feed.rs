@@ -25,7 +25,7 @@
 //!   again from its own position, so nothing is skipped. A `WrongPartition` answer (the map
 //!   moved it) makes the node pull the newer map and open it where the map now puts it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
@@ -36,10 +36,11 @@ use prost::bytes::{Buf, BufMut, Bytes};
 use tonic::transport::Channel;
 
 use super::Node;
+use super::idle::Watched;
 use super::token::{At, ClusterToken, subscription_hash};
 use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
-use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT, Sink};
+use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT};
 use crate::serve::proto::{self, subscribe_request::Start as S};
 use crate::serve::service::Service;
 
@@ -49,6 +50,9 @@ pub(crate) const MAX_EVERY: u64 = SKIP_LIMIT;
 
 /// Token bytes per event the checkpoint cadence aims for, on average.
 const TOKEN_BYTES_PER_EVENT: usize = 150;
+
+/// The keepalive's shortest interval ([`Merging`]).
+const ALIVE_FLOOR: Duration = Duration::from_millis(10);
 
 /// How long an unavailable partition waits between attempts to open it again.
 const RETRY: Duration = Duration::from_secs(1);
@@ -214,24 +218,215 @@ pub(crate) async fn subscribe(
         moved: false,
         states: Vec::new(),
         token: Vec::new(),
-        scratch: Vec::new(),
+        cache: super::token::TokenCache::default(),
         tail: tail_buffer(),
         opens: tokio::task::JoinSet::new(),
     };
     merge.open_all().await?;
+    // The merge runs as the client polls (#1758's B): no task or queue of its own between
+    // the parts and the client. Its state, the slot included, is watched for the idle limit,
+    // which nothing inside an unpolled stream could enforce (simp724's R1).
     let limits = service.feed_limits();
-    let (sink, events, end) = Sink::new(&limits);
-    tokio::spawn(async move {
-        let outcome = merge.run(&sink, limits.quiet).await;
-        drop(slot);
-        if let Err(e) = outcome
-            && !sink.is_closed()
-        {
-            // The connection may have gone meanwhile: nobody to tell.
-            let _ = end.send(e);
+    let metrics = Arc::clone(&service.metrics);
+    let partitions: Vec<String> = merge.parts.iter().map(|p| p.partition.clone()).collect();
+    let started = std::time::Instant::now();
+    let idle = limits.stream_idle;
+    let watched = Watched::new(
+        Merging::new(merge, slot, limits.quiet, idle),
+        idle,
+        move || {
+            metrics
+                .feed_idle_drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics.count(
+                crate::serve::service::FEED,
+                Some("DeadlineExceeded"),
+                started.elapsed(),
+            );
+            eprintln!(
+                "phdb serve: a cluster feed subscription over {partitions:?} took no event for \
+             --stream-idle-ms ({} ms): ended",
+                idle.as_millis()
+            );
+        },
+    );
+    Ok(FeedEvents::merged(ClusterEvents {
+        watched,
+        idle,
+        done: false,
+    }))
+}
+
+/// A cluster subscription as its client's stream (#1758's B): each poll does what one turn
+/// of the merge does, so an event goes from its part to the client through no queue of the
+/// merge's own (one per event, as on a single node, not two).
+pub(crate) struct ClusterEvents {
+    watched: Watched<Merging>,
+    idle: Duration,
+    /// Ended: nothing more.
+    done: bool,
+}
+
+impl ClusterEvents {
+    pub(crate) fn poll_out(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
+        if self.done {
+            return Poll::Ready(None);
         }
-    });
-    Ok(events)
+        // Every poll is the client asking: a reader of a quiet subscription keeps it
+        // (simp724's point 1).
+        self.watched.took();
+        let mut state = self.watched.lock();
+        let Some(m) = state.as_mut() else {
+            // The watchdog dropped it: the client took nothing for the idle limit.
+            self.done = true;
+            return Poll::Ready(Some(Err(ApiError::deadline(format!(
+                "the client took no feed event for --stream-idle-ms ({} ms); resume from the \
+                 last event's token",
+                self.idle.as_millis()
+            )))));
+        };
+        let out = m.poll(cx);
+        if matches!(out, Poll::Ready(None)) {
+            self.done = true;
+        }
+        out
+    }
+}
+
+/// A merge with what its stream holds: its `--max-streams` place, its timers, and what goes
+/// out before anything else.
+struct Merging {
+    merge: Merge,
+    /// The subscription's `--max-streams` place, freed with it.
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    retry: Timer,
+    quiet: Quiet,
+    /// Wakes the stream every half idle limit with nothing else to do, so a client that
+    /// reads a quiet subscription is polled, and so counted as taking, in time: with
+    /// `--stream-idle-ms` below the quiet interval, nothing else would (simp724's point 1).
+    /// A stuck client isn't polled even then, as its window is full.
+    alive: Timer,
+    alive_every: Duration,
+    turn: usize,
+    /// Out first: parts' states, and the last checkpoint then the error that ends the stream
+    /// (simp724's R2).
+    queued: VecDeque<Result<Out, ApiError>>,
+    ended: bool,
+}
+
+impl Merging {
+    fn new(
+        merge: Merge,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        quiet: Duration,
+        idle: Duration,
+    ) -> Self {
+        // Half the limit, so a poll always lands inside it; at least 10 ms, so a limit set
+        // near zero doesn't spin the stream (simp724's N1 on #1777). A higher floor would
+        // break the half-limit guarantee for limits under twice it.
+        let alive_every = (idle / 2).max(ALIVE_FLOOR);
+        let mut alive = Timer::new();
+        alive.set(Some(tokio::time::Instant::now() + alive_every));
+        Self {
+            merge,
+            _slot: slot,
+            retry: Timer::new(),
+            quiet: Quiet::new(quiet),
+            alive,
+            alive_every,
+            turn: 0,
+            queued: VecDeque::new(),
+            ended: false,
+        }
+    }
+
+    /// The next item, registering every wake source when there's none: an open finishing,
+    /// the retry timer, a part's event, the quiet timer (simp724's R3).
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
+        loop {
+            if let Some(item) = self.queued.pop_front() {
+                if item.is_ok() {
+                    self.quiet.mark();
+                }
+                return Poll::Ready(Some(item));
+            }
+            if self.ended {
+                return Poll::Ready(None);
+            }
+            // A part's state goes out next, right after the event that failed it.
+            if !self.merge.states.is_empty() {
+                for e in std::mem::take(&mut self.merge.states) {
+                    self.queued.push_back(Ok(Out::event(e)));
+                }
+                continue;
+            }
+            if !self.merge.opens.is_empty()
+                && let Poll::Ready(Some(done)) = self.merge.opens.poll_join_next(cx)
+            {
+                let opened = done
+                    .map_err(|e| ApiError::internal(e.to_string()))
+                    .and_then(|(i, result)| self.merge.opened(i, result));
+                if let Err(e) = opened {
+                    self.end(e);
+                }
+                continue;
+            }
+            self.retry
+                .set(self.merge.parts.iter().filter_map(|p| p.retry).min());
+            if self.retry.poll(cx).is_ready() {
+                // Every part due is reopened, so the next `set` moves or disarms it.
+                let now = tokio::time::Instant::now();
+                for i in 0..self.merge.parts.len() {
+                    if self.merge.parts[i].retry.is_some_and(|at| at <= now) {
+                        self.merge.reopen(i, false);
+                    }
+                }
+                continue;
+            }
+            if let Poll::Ready((i, item)) = poll_parts(&mut self.merge.parts, &mut self.turn, cx) {
+                match self.merge.item(i, item) {
+                    Ok(Some(out)) => {
+                        self.quiet.mark();
+                        return Poll::Ready(Some(Ok(out)));
+                    }
+                    // A progress passed over, or a part's failure handled: on to the next,
+                    // never a stall with nothing registered.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        self.end(e);
+                        continue;
+                    }
+                }
+            }
+            // Nothing ready: the batch is over, and the quiet interval counts from its last
+            // send, timed once here (#1758's g88).
+            self.quiet.settle();
+            if self.quiet.poll(cx).is_ready() {
+                if self.merge.moved {
+                    self.queued.push_back(Ok(Out::event(self.merge.progress())));
+                } else {
+                    self.quiet.sent();
+                }
+                continue;
+            }
+            if self.alive.poll(cx).is_ready() {
+                self.alive
+                    .set(Some(tokio::time::Instant::now() + self.alive_every));
+                continue;
+            }
+            return Poll::Pending;
+        }
+    }
+
+    /// The stream ends with `e`: after a checkpoint, if the position moved since the last,
+    /// so the client resumes from as late as it can.
+    fn end(&mut self, e: ApiError) {
+        if self.merge.moved {
+            self.queued.push_back(Ok(Out::event(self.merge.progress())));
+        }
+        self.queued.push_back(Err(e));
+        self.ended = true;
+    }
 }
 
 /// Each component's start from a resume token, after checking that it's this cluster's,
@@ -302,10 +497,11 @@ struct Merge {
     moved: bool,
     /// `PartitionState` events to send.
     states: Vec<proto::FeedEvent>,
-    /// The last checkpoint's token ([`Merge::checkpoint`]), and its components' compacted
-    /// bytes on their way: kept, so a checkpoint per event allocates nothing (#1758).
+    /// The last checkpoint's token ([`Merge::checkpoint`]), kept so a checkpoint per event
+    /// allocates nothing (#1758), and what it was built from: only a part that moved is
+    /// encoded again (2a).
     token: Vec<u8>,
-    scratch: Vec<u8>,
+    cache: super::token::TokenCache,
     /// Each commit's tail is written here and split off ([`Merge::cover`]).
     tail: prost::bytes::BytesMut,
     /// Parts opening again in the background, each bounded by the request timeout, so
@@ -429,72 +625,23 @@ impl Merge {
             .spawn(async move { (i, ctx.reopen(open, pull).await) });
     }
 
-    async fn run(&mut self, sink: &Sink, quiet: Duration) -> Result<(), ApiError> {
-        let mut turn = 0;
-        // One timer each for the whole stream, moved only when its deadline changes: a timer
-        // built per iteration registers with tokio's timer driver, under its mutex, once per
-        // event (#1758).
-        let mut retry = Timer::new();
-        let mut quiet = Quiet::new(quiet);
-        // The client going away, waited on for the whole stream: a new wait per iteration
-        // registered and dropped a waiter on the channel's `Notify`, under its mutex, per
-        // event (#1758's g86c).
-        let closed = sink.closed();
-        tokio::pin!(closed);
-        loop {
-            for event in std::mem::take(&mut self.states) {
-                sink.put(Out::Event(event)).await?;
-                quiet.sent();
-            }
-            retry.set(self.parts.iter().filter_map(|p| p.retry).min());
-            let next = std::future::poll_fn(|cx| poll_parts(&mut self.parts, &mut turn, cx));
-            tokio::select! {
-                () = &mut closed => return Ok(()),
-                (i, item) = next => {
-                    let ended = match item {
-                        Some(Ok(bytes)) => match self.cover(i, bytes) {
-                            Ok(Some(out)) => {
-                                sink.put(out).await?;
-                                quiet.sent();
-                                None
-                            }
-                            Ok(None) => None,
-                            Err(e) => Some(e),
-                        },
-                        Some(Err(e)) => Some(e),
-                        None => Some(ApiError::partition_unavailable("its stream ended")),
-                    };
-                    if let Some(e) = ended
-                        && let Err(e) = self.failed(i, e)
-                    {
-                        self.last_checkpoint(sink).await;
-                        return Err(e);
-                    }
-                }
-                Some(done) = self.opens.join_next(), if !self.opens.is_empty() => {
-                    let (i, result) = done.map_err(|e| ApiError::internal(e.to_string()))?;
-                    if let Err(e) = self.opened(i, result) {
-                        self.last_checkpoint(sink).await;
-                        return Err(e);
-                    }
-                }
-                () = retry.wait() => {
-                    // Every part due is reopened, so the next `set` moves or disarms it.
-                    let now = tokio::time::Instant::now();
-                    for i in 0..self.parts.len() {
-                        if self.parts[i].retry.is_some_and(|at| at <= now) {
-                            self.reopen(i, false);
-                        }
-                    }
-                }
-                () = quiet.wait() => {
-                    if self.moved {
-                        sink.put(Out::Event(self.progress())).await?;
-                    }
-                    quiet.sent();
-                }
-            }
-        }
+    /// Part `i`'s next item: an event to send; nothing (a progress, or the part's failure
+    /// handled: reopened, or unavailable with `allow_partial`); or the error that ends the
+    /// stream.
+    fn item(
+        &mut self,
+        i: usize,
+        item: Option<Result<Bytes, ApiError>>,
+    ) -> Result<Option<Out>, ApiError> {
+        let ended = match item {
+            Some(Ok(bytes)) => match self.cover(i, bytes) {
+                Ok(out) => return Ok(out),
+                Err(e) => e,
+            },
+            Some(Err(e)) => e,
+            None => ApiError::partition_unavailable("its stream ended"),
+        };
+        self.failed(i, ended).map(|()| None)
     }
 
     /// Takes part `i`'s event: its position, and what to send for it, if anything.
@@ -542,7 +689,7 @@ impl Merge {
     /// the parts in reused buffers (#1758).
     fn checkpoint(&mut self) {
         self.token.clear();
-        super::token::encode_into(
+        self.cache.encode(
             &self.cluster_id,
             self.map_version,
             self.subscription,
@@ -550,7 +697,6 @@ impl Merge {
                 .iter()
                 .map(|p| (p.partition.as_str(), p.epoch, &p.at)),
             &mut self.token,
-            &mut self.scratch,
         );
         let token = &self.token;
         self.since_checkpoint = 0;
@@ -573,14 +719,6 @@ impl Merge {
             },
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
-        }
-    }
-
-    /// Before the stream ends with an error: a checkpoint, if the position moved since the
-    /// last, so the client resumes from as late as it can. Best effort.
-    async fn last_checkpoint(&mut self, sink: &Sink) {
-        if self.moved {
-            let _ = sink.put(Out::Event(self.progress())).await;
         }
     }
 
@@ -638,7 +776,12 @@ fn poll_parts(
 struct Quiet {
     quiet: Duration,
     last_sent: tokio::time::Instant,
+    /// Sends since `last_sent` was taken ([`Quiet::mark`]), not yet timed.
+    marked: bool,
     timer: Timer,
+    /// How many times the clock was read for a send, for the tests.
+    #[cfg(test)]
+    reads: u32,
 }
 
 impl Quiet {
@@ -649,23 +792,47 @@ impl Quiet {
         Self {
             quiet,
             last_sent,
+            marked: false,
             timer,
+            #[cfg(test)]
+            reads: 0,
         }
     }
 
     /// Something was sent now.
     fn sent(&mut self) {
-        self.last_sent = tokio::time::Instant::now();
+        self.mark();
+        self.settle();
     }
 
-    /// Done once `quiet` has passed since the last send. Safe to drop at any point (another
-    /// `select!` branch won): the timer keeps its deadline.
-    async fn wait(&mut self) {
+    /// Something was sent: timed at the next [`Quiet::settle`], once for a batch of sends
+    /// (#1758's g88: a clock read per event).
+    fn mark(&mut self) {
+        self.marked = true;
+    }
+
+    /// The last send, if any since the last settle, was now: called right after a batch's
+    /// last send, so the quiet bound counts from it exactly.
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.marked) {
+            self.last_sent = tokio::time::Instant::now();
+            #[cfg(test)]
+            {
+                self.reads += 1;
+            }
+        }
+    }
+
+    /// Ready once `quiet` has passed since the last send; otherwise registered to wake then.
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // Every batch settles before the merge waits again, or the quiet bound would count
+        // from an earlier send: checked in every test.
+        debug_assert!(!self.marked, "a send marked but never settled");
         loop {
-            self.timer.wait().await;
+            std::task::ready!(self.timer.poll(cx));
             let due = self.last_sent + self.quiet;
             if tokio::time::Instant::now() >= due {
-                return;
+                return Poll::Ready(());
             }
             self.timer.set(Some(due));
         }
@@ -709,12 +876,12 @@ impl Timer {
         }
     }
 
-    /// Done once its deadline passes; never while disarmed. Stays done until it's set
-    /// again.
-    async fn wait(&mut self) {
+    /// Ready once its deadline passes; never while disarmed (and then registers nothing).
+    /// Stays ready until it's set again.
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self.at {
-            Some(_) => self.sleep.as_mut().await,
-            None => std::future::pending().await,
+            Some(_) => self.sleep.as_mut().poll(cx),
+            None => Poll::Pending,
         }
     }
 }
@@ -1225,6 +1392,16 @@ mod tests {
             .unwrap()
     }
 
+    /// A timer as a future: ready once it fires.
+    async fn wait(t: &mut Timer) {
+        std::future::poll_fn(|cx| t.poll(cx)).await;
+    }
+
+    /// The quiet interval as a future: ready once it has passed since the last send.
+    async fn quiet_passed(q: &mut Quiet) {
+        std::future::poll_fn(|cx| q.poll(cx)).await;
+    }
+
     /// Whether `f` is done within `d` of virtual time.
     async fn done_within(d: Duration, f: impl std::future::Future<Output = ()>) -> bool {
         tokio::time::timeout(d, f).await.is_ok()
@@ -1237,7 +1414,7 @@ mod tests {
             let start = tokio::time::Instant::now();
             let mut t = Timer::new();
             assert!(
-                !done_within(Duration::from_secs(3600), t.wait()).await,
+                !done_within(Duration::from_secs(3600), wait(&mut t)).await,
                 "unset"
             );
             let at = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -1245,23 +1422,47 @@ mod tests {
                 t.set(Some(at));
             }
             assert_eq!(t.moves, 1, "set to the same deadline 1000 times");
-            t.wait().await;
+            wait(&mut t).await;
             assert_eq!(tokio::time::Instant::now(), at, "done at its deadline");
             assert!(start < at);
             assert!(
-                done_within(Duration::ZERO, t.wait()).await,
+                done_within(Duration::ZERO, wait(&mut t)).await,
                 "stays done until set again"
             );
             t.set(None);
             assert!(
-                !done_within(Duration::from_secs(3600), t.wait()).await,
+                !done_within(Duration::from_secs(3600), wait(&mut t)).await,
                 "disarmed"
             );
             let later = tokio::time::Instant::now() + Duration::from_secs(5);
             t.set(Some(later));
-            t.wait().await;
+            wait(&mut t).await;
             assert_eq!(tokio::time::Instant::now(), later);
             assert_eq!(t.moves, 2);
+        });
+    }
+
+    #[test]
+    fn a_batch_of_sends_reads_the_clock_once_and_quiet_counts_from_its_end() {
+        // #1758's g88 (2c-3): the merge marks each send and settles once per drained batch.
+        // One clock read for the batch, and the quiet bound counts exactly from the settle,
+        // right after the batch's last send.
+        paused().block_on(async {
+            let quiet = Duration::from_millis(100);
+            let mut q = Quiet::new(quiet);
+            tokio::time::advance(Duration::from_millis(30)).await;
+            for _ in 0..500 {
+                q.mark();
+            }
+            q.settle();
+            assert_eq!(q.reads, 1, "one read for 500 sends");
+            let last = tokio::time::Instant::now();
+            // Settling with nothing marked reads nothing and moves nothing.
+            tokio::time::advance(Duration::from_millis(10)).await;
+            q.settle();
+            assert_eq!(q.reads, 1);
+            quiet_passed(&mut q).await;
+            assert_eq!(tokio::time::Instant::now(), last + quiet);
         });
     }
 
@@ -1279,7 +1480,7 @@ mod tests {
                 tokio::time::advance(Duration::from_millis(1)).await;
                 q.sent();
                 assert!(
-                    !done_within(Duration::ZERO, q.wait()).await,
+                    !done_within(Duration::ZERO, quiet_passed(&mut q)).await,
                     "not quiet yet"
                 );
             }
@@ -1289,7 +1490,7 @@ mod tests {
                 q.timer.moves
             );
             let last = tokio::time::Instant::now();
-            q.wait().await;
+            quiet_passed(&mut q).await;
             assert_eq!(
                 tokio::time::Instant::now(),
                 last + quiet,
@@ -1297,7 +1498,7 @@ mod tests {
             );
             // Quiet again a period after it's noted as sent.
             q.sent();
-            q.wait().await;
+            quiet_passed(&mut q).await;
             assert_eq!(tokio::time::Instant::now(), last + quiet * 2);
         });
     }
@@ -1339,6 +1540,239 @@ mod tests {
             before.wrapping_add(first.len()),
             "and the next one right after it"
         );
+    }
+
+    /// A part's events as a test feeds them.
+    struct Fed(tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, ApiError>>);
+
+    impl Stream for Fed {
+        type Item = Result<Bytes, ApiError>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
+
+    fn fed() -> (Feed, Events) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Box::pin(Fed(rx)))
+    }
+
+    /// A merge of `n` parts (`p0`, `p1`, ...), each fed by the test or not open yet
+    /// (`None`), with `allow_partial`, as its client's stream would hold it. Its node has no
+    /// map, so a reopen fails as unavailable.
+    fn merging(events: Vec<Option<Events>>, quiet: Duration, idle: Duration) -> Merging {
+        let dir = super::super::tests::test_dir();
+        let node = super::super::tests::node(&dir, "a");
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("svc.phdb"),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let service = Arc::new(Service::new(
+            db,
+            crate::serve::server_tests::limits(),
+            2,
+            Arc::new(crate::serve::service::Metrics::default()),
+        ));
+        let ctx = Arc::new(Ctx {
+            node: Arc::clone(&node),
+            parts: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
+            service,
+            caller: Caller::anonymous(),
+            prefix: Bytes::new(),
+            visible: false,
+            forwarder: Arc::new(super::super::forward::Forwarder::new(node)),
+            channels: Mutex::new(HashMap::new()),
+        });
+        let parts = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, events)| Part {
+                partition: format!("p{i}"),
+                tables: vec!["users".into()],
+                epoch: 1,
+                at: At::Now,
+                skip: 0,
+                opening: events.is_none(),
+                events,
+                retry: None,
+                unavailable: false,
+            })
+            .collect();
+        let merge = Merge {
+            ctx,
+            parts,
+            allow_partial: true,
+            every: 0,
+            map_version: 1,
+            subscription: 9,
+            cluster_id: "c1".into(),
+            since_checkpoint: 0,
+            next_checkpoint: 1,
+            moved: false,
+            states: Vec::new(),
+            token: Vec::new(),
+            cache: super::super::token::TokenCache::default(),
+            tail: tail_buffer(),
+            opens: tokio::task::JoinSet::new(),
+        };
+        let slot = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        Merging::new(merge, slot, quiet, idle)
+    }
+
+    /// The next item, within `d` of virtual time: `None` if nothing woke the stream with one.
+    async fn next_within(m: &mut Merging, d: Duration) -> Option<Option<Result<Out, ApiError>>> {
+        tokio::time::timeout(d, std::future::poll_fn(|cx| m.poll(cx)))
+            .await
+            .ok()
+    }
+
+    fn commit_of(item: Option<Option<Result<Out, ApiError>>>) -> (String, u64) {
+        let e = item
+            .expect("woken")
+            .expect("not ended")
+            .unwrap()
+            .into_proto();
+        match e.event {
+            Some(proto::feed_event::Event::Commit(c)) => (e.partition, c.seqno),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const QUIET: Duration = Duration::from_secs(10);
+    const IDLE: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn the_quiet_tick_alone_wakes_the_stream_with_a_checkpoint() {
+        // simp724's R3: with the parts quiet, the quiet timer is what wakes the stream.
+        paused().block_on(async {
+            let (p0, events) = fed();
+            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            p0.send(Ok(event(b"t1", Some(1)))).unwrap();
+            // The part's own progress moves the position past the last checkpoint (one
+            // part: every commit is one), and sends nothing.
+            p0.send(Ok(event(b"t2", None))).unwrap();
+            let start = tokio::time::Instant::now();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 1)
+            );
+            // Nothing more from the part: the next item is the quiet checkpoint, at the
+            // quiet interval after the last send exactly. Only the keepalive (every half idle limit) and the
+            // quiet timer could wake it; the quiet one comes first.
+            let e = next_within(&mut m, QUIET * 2)
+                .await
+                .expect("woken by the quiet timer")
+                .unwrap()
+                .unwrap()
+                .into_proto();
+            assert!(
+                matches!(e.event, Some(proto::feed_event::Event::Progress(_))),
+                "{e:?}"
+            );
+            assert!(!e.token.is_empty(), "a checkpoint");
+            assert_eq!(tokio::time::Instant::now(), start + QUIET);
+        });
+    }
+
+    #[test]
+    fn an_open_finishing_alone_wakes_the_stream() {
+        paused().block_on(async {
+            let mut m = merging(vec![None], QUIET, IDLE);
+            let (p0, events) = fed();
+            m.merge.opens.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (0, Ok((events, 1)))
+            });
+            p0.send(Ok(event(b"t1", Some(5)))).unwrap();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::from_millis(200)).await),
+                ("p0".into(), 5),
+                "the open's finish woke it, and its part's event came"
+            );
+        });
+    }
+
+    #[test]
+    fn the_retry_timer_alone_wakes_the_stream_to_reopen_a_part() {
+        paused().block_on(async {
+            let mut m = merging(vec![None], QUIET, IDLE);
+            m.merge.parts[0].opening = false;
+            let start = tokio::time::Instant::now();
+            m.merge.parts[0].retry = Some(start + RETRY);
+            m.merge.parts[0].unavailable = true;
+            // Nothing to send: it waits, and the retry timer wakes it at RETRY to reopen p0
+            // (which fails, its node having no map, and is due again a RETRY later).
+            assert!(
+                next_within(&mut m, RETRY + Duration::from_millis(50))
+                    .await
+                    .is_none()
+            );
+            let again = m.merge.parts[0].retry;
+            assert!(
+                m.merge.parts[0].opening || again.is_some_and(|at| at > start + RETRY),
+                "reopened at the retry: {again:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_skipped_event_never_stalls_the_stream() {
+        // A progress event is passed over (`cover` gives nothing): the stream goes on to the
+        // next, rather than returning Pending with nothing to wake it.
+        paused().block_on(async {
+            let (p0, events) = fed();
+            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            p0.send(Ok(event(b"t1", None))).unwrap();
+            p0.send(Ok(event(b"t2", None))).unwrap();
+            p0.send(Ok(event(b"t3", Some(3)))).unwrap();
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 3)
+            );
+        });
+    }
+
+    #[test]
+    fn a_part_gone_unavailable_is_reported_right_after_its_failure() {
+        // simp724's N1 on #1772, end to end: p0's commits keep coming, p1 fails (with
+        // allow_partial); p1's state is the next item after its failure, not behind p0's.
+        paused().block_on(async {
+            let (p0, e0) = fed();
+            let (p1, e1) = fed();
+            let mut m = merging(vec![Some(e0), Some(e1)], QUIET, IDLE);
+            for s in 1..=10 {
+                p0.send(Ok(event(format!("t{s}").as_bytes(), Some(s))))
+                    .unwrap();
+            }
+            p1.send(Err(ApiError::partition_unavailable("gone")))
+                .unwrap();
+            // Round-robin from p0: p0's first, then p1's failure, whose state comes next.
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 1)
+            );
+            let e = next_within(&mut m, Duration::ZERO)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_proto();
+            match e.event {
+                Some(proto::feed_event::Event::PartitionState(st)) => {
+                    assert_eq!((st.partition.as_str(), st.available), ("p1", false));
+                }
+                other => panic!("p1's state next, got {other:?}"),
+            }
+            assert_eq!(
+                commit_of(next_within(&mut m, Duration::ZERO).await),
+                ("p0".into(), 2)
+            );
+        });
     }
 
     #[test]

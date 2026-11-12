@@ -85,6 +85,56 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     );
 }
 
+/// Partition `id` marked as opening on a node, until dropped.
+struct Opening<'a> {
+    node: &'a Node,
+    id: String,
+}
+
+impl<'a> Opening<'a> {
+    fn mark(node: &'a Node, id: &str) -> Self {
+        node.fences
+            .opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned());
+        Self {
+            node,
+            id: id.to_owned(),
+        }
+    }
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        self.node
+            .fences
+            .opening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// A hold seam (tests): the next open in this cluster directory waits, marked as opening,
+/// before its engine opens, until the sender sends or is dropped.
+#[cfg(test)]
+pub(crate) static HOLD_OPEN: std::sync::Mutex<
+    Option<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn hold_open(dir: &std::path::Path) {
+    let mut armed = HOLD_OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if armed.as_ref().is_some_and(|(d, _)| d == dir) {
+        let (_, wait) = armed.take().expect("armed");
+        drop(armed);
+        let _ = wait.recv();
+    }
+}
+
 /// Lets `node` open partitions while `shared` serves (a node's start, and the test rig's).
 pub(crate) fn attach_opener(node: &Arc<Node>, opener: Opener) {
     let _ = node.opener.set(opener);
@@ -184,6 +234,8 @@ impl Node {
                 Some(memory)
             }
         };
+        // Opening from here: `Status` shows it so, and doesn't read its file (#1770).
+        let _opening = Opening::mark(self, id);
         // Joined from a blocking thread, so no async worker waits on the open.
         let node = Arc::clone(self);
         let (part, cluster_id) = (id.to_owned(), map.cluster_id.clone());
@@ -197,6 +249,8 @@ impl Node {
                 std::thread::Builder::new()
                     .name("phdb-open-partition".into())
                     .spawn_scoped(scope, || {
+                        #[cfg(test)]
+                        hold_open(&node.dir);
                         opener.placement.enter();
                         let mut log = Vec::new();
                         let opened = super::open_partitions(
