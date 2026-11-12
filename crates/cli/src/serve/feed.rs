@@ -145,7 +145,7 @@ impl Tracker {
 /// something meanwhile (perf287's profile on #1397: a wake and a new timer per take, per
 /// subscriber, were `Client::send`'s 9.6% self at 16 hubs × 16).
 #[derive(Debug)]
-struct TakeClock {
+pub(crate) struct TakeClock {
     /// On Tokio's clock, so a paused test clock pauses it too.
     base: tokio::time::Instant,
     /// Nanoseconds from `base` to the last take; 0 before the first.
@@ -153,7 +153,7 @@ struct TakeClock {
 }
 
 impl TakeClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base: tokio::time::Instant::now(),
             last: AtomicU64::new(0),
@@ -161,13 +161,13 @@ impl TakeClock {
     }
 
     /// A take, now.
-    fn took(&self) {
+    pub(crate) fn took(&self) {
         let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.last.store(nanos.max(1), Ordering::Relaxed);
     }
 
     /// When the last take was, or `None` before the first.
-    fn last(&self) -> Option<tokio::time::Instant> {
+    pub(crate) fn last(&self) -> Option<tokio::time::Instant> {
         match self.last.load(Ordering::Relaxed) {
             0 => None,
             n => Some(self.base + Duration::from_nanos(n)),
