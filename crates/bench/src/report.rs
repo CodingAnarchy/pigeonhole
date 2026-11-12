@@ -573,6 +573,10 @@ pub struct FeedReport {
     pub expired: u64,
     /// Other errors subscribers saw.
     pub errors: u64,
+    /// The first few errors each subscriber saw, expired ones included: the code, the seqno
+    /// its feed had covered, and the message (a reader process's prefixed so), #1773.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_messages: Vec<String>,
     /// Subscribers whose drain after the phase hit its 30 s bound before they covered the
     /// phase's last commit, every subscriber counted: their rows miss the phase's tail, so
     /// a latency row with any is biased low.

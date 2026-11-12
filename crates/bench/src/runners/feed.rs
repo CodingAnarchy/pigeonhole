@@ -71,7 +71,13 @@ pub(crate) struct Followed {
     pub(crate) errors: u64,
     /// 1 if the drain's deadline stopped it before it covered the phase's last commit.
     pub(crate) drain_timeouts: u64,
+    /// The first [`KEPT_ERRORS`] errors (expired or not), each with its code and where the
+    /// feed had got to, so a record with any says what they were (#1773).
+    pub(crate) error_messages: Vec<String>,
 }
+
+/// How many of a subscriber's errors [`Followed::error_messages`] keeps.
+pub(crate) const KEPT_ERRORS: usize = 4;
 
 /// Follows `feed` until `stop` says so, recording each commit's delivery latency. An expired
 /// feed is counted and reopened at now (the row is void anyway, [`FeedReport::expired`]).
@@ -93,6 +99,15 @@ pub(crate) fn follow(
             }
             Ok(None) => {}
             Err(e) => {
+                let what = format!(
+                    "{:?} after seqno {}: {e}",
+                    e.code(),
+                    feed.progress().covered_seqno()
+                );
+                eprintln!("phdb-bench: a feed subscriber's error: {what}");
+                if out.error_messages.len() < KEPT_ERRORS {
+                    out.error_messages.push(what);
+                }
                 if e.code() == ErrorCode::FeedExpired {
                     out.expired += 1;
                 } else {
@@ -218,6 +233,7 @@ impl Running {
             r.drain(through);
         }
         let (mut expired, mut errors, mut drain_timeouts) = (0, 0, 0);
+        let mut error_messages = Vec::new();
         let mut join = |handles: Vec<JoinHandle<Followed>>| -> Result<(u32, Histogram), String> {
             let n = handles.len() as u32;
             let mut hist = Histogram::new();
@@ -227,6 +243,7 @@ impl Running {
                 expired += f.expired;
                 errors += f.errors;
                 drain_timeouts += f.drain_timeouts;
+                error_messages.extend(f.error_messages);
             }
             Ok((n, hist))
         };
@@ -250,6 +267,7 @@ impl Running {
             retained_taken: after.taken.saturating_sub(self.before.taken),
             retained_wal_peak,
             held_blob_peak,
+            error_messages,
             ..FeedReport::default()
         };
         if let Some(r) = self.readers.take() {
@@ -261,6 +279,11 @@ impl Running {
             report.expired += f.expired;
             report.errors += f.errors;
             report.drain_timeouts += f.drain_timeouts;
+            report.error_messages.extend(
+                f.error_messages
+                    .into_iter()
+                    .map(|m| format!("reader process: {m}")),
+            );
         }
         report.drain_ms = drained.elapsed().as_millis() as u64;
         Ok(report)
