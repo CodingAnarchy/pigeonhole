@@ -3905,6 +3905,7 @@ mod close;
 mod feed;
 mod fence;
 mod metrics;
+mod moving;
 mod open;
 mod several;
 mod stamp;

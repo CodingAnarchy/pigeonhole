@@ -17,7 +17,7 @@ pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod map;
-mod moving;
+pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod route;

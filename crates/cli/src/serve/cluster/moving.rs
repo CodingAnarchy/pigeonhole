@@ -175,7 +175,32 @@ pub(super) async fn run(
         return Err(Failure::usage(&format!("the map has no node {to:?}")));
     };
     if p.node == to {
-        // An earlier move finished, or P was never elsewhere: nothing to copy or compare.
+        // An earlier run finished the move (or P was never elsewhere): nothing to copy, and
+        // the copy can't be compared again, so nothing is dropped. Where the old copy lies
+        // closed, the advice names it.
+        let mut closed_on = Vec::new();
+        for n in m.nodes.iter().filter(|n| n.id != to) {
+            let Ok(at) = At::new(args, &n.id, &n.address).await else {
+                continue;
+            };
+            if let Ok(Some(lp)) = at.local(partition).await
+                && lp.state() == LocalPartitionState::Closed
+            {
+                closed_on.push(format!(
+                    "phdb cluster drop-partition {partition} --node {}",
+                    at.args.node
+                ));
+            }
+        }
+        let advice = if closed_on.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ". Its old copy is still closed there; once you've checked node {to}'s, move \
+                 it aside: {}",
+                closed_on.join("; ")
+            )
+        };
         let mut r = report(
             "cluster move",
             vec![
@@ -186,8 +211,8 @@ pub(super) async fn run(
                 (
                     "done",
                     json!(format!(
-                        "the map already gives {partition} to node {to}: nothing moved, and \
-                         nothing was dropped"
+                        "the map already gives {partition} to node {to}: an earlier run moved \
+                         it, and nothing was dropped{advice}"
                     )),
                 ),
             ],
@@ -231,6 +256,7 @@ pub(super) async fn run(
         old.call(partition, "close").await?;
     }
     let files = closed_files(&old, partition).await?;
+    stop_after(args, Step::Closed)?;
 
     // 2 and 3. Copied and stamped, unless an earlier run stamped it already.
     let stamped_earlier = new
@@ -244,6 +270,7 @@ pub(super) async fn run(
         for f in &files {
             sent.push(copy_file(&old, &new, &m.cluster_id, partition, e, f, &files).await?);
         }
+        stop_after(args, Step::Copied)?;
         let installed = stamp(&new, &m.cluster_id, partition, e).await?;
         if installed.is_empty() {
             // Stamped meanwhile by another run: nothing of this one's to compare.
@@ -262,9 +289,11 @@ pub(super) async fn run(
         }
     };
 
+    stop_after(args, Step::Stamped)?;
     // 4. The map, marked as copied.
     let set = relocate(args, partition, to, false, true).await?;
     let map_at = Instant::now();
+    stop_after(args, Step::Mapped)?;
 
     // 5. Serving on NEW.
     let mut wait = Waiting::new(format!(
@@ -282,6 +311,7 @@ pub(super) async fn run(
         }
     }
     let serving_at = Instant::now();
+    stop_after(args, Step::Serving)?;
 
     // 6. OLD's files aside, only after a comparison that matched.
     let drop_command = format!(
@@ -353,6 +383,40 @@ pub(super) async fn run(
         );
     }
     Ok(r)
+}
+
+/// The steps a move can be stopped after, in the tests: a process killed there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Step {
+    Closed,
+    Copied,
+    Stamped,
+    Mapped,
+    Serving,
+}
+
+/// Moves to stop, each by the `--node` URL it runs with and the step it stops after (a
+/// fault seam: each test's nodes have ports of their own).
+#[cfg(test)]
+pub(super) static STOP: std::sync::Mutex<Vec<(String, Step)>> = std::sync::Mutex::new(Vec::new());
+
+/// The fault seam: in the tests, a move listed in [`STOP`] ends here, as if killed.
+fn stop_after(args: &NodeArgs, step: Step) -> Result<(), Failure> {
+    #[cfg(test)]
+    {
+        let mut stops = STOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = stops
+            .iter()
+            .position(|(n, s)| *n == args.node && *s == step)
+        {
+            stops.remove(i);
+            return Err(Failure::usage(&format!("stopped after {step:?} (test)")));
+        }
+    }
+    let _ = (args, step);
+    Ok(())
 }
 
 /// OLD's closed files once their hash is done: a failed hash is retried by closing again.
