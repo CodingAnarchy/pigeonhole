@@ -588,9 +588,7 @@ impl ShardArena {
                 count += 1;
             }
             if self.usable(first, count) >= bytes {
-                for c in first..first + count {
-                    self.free[c] = false;
-                }
+                self.free[first..first + count].fill(false);
                 self.free_count -= count;
                 self.publish_free();
                 return Ok(Run {

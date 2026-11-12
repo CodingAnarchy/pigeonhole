@@ -18,8 +18,11 @@ if [ ! -f "$dir/README.md" ]; then
   echo "error: $dir/README.md is missing: add the placeholder and its RELEASE_CORPORA entry first" >&2
   exit 1
 fi
-PIGEONHOLE_CORPUS_RELEASE=$version cargo test -p pigeonhole --test corpus -- \
+# With `__unstable-replication`, so the corpus has the `replica` entry: `phdb serve
+# --replica-of` writes replicas, and FORMAT.md §13 promises their files.
+features=(--features __unstable-replication)
+PIGEONHOLE_CORPUS_RELEASE=$version cargo test -p pigeonhole "${features[@]}" --test corpus -- \
   --ignored --exact generate_corpus --nocapture
-cargo test -p pigeonhole --test corpus -- --exact release_corpus_entries_open_read_check_and_write
+cargo test -p pigeonhole "${features[@]}" --test corpus -- --exact release_corpus_entries_open_read_check_and_write
 git add "$dir"
 echo "v$version corpus written and staged ($dir). Commit it in the release PR."
