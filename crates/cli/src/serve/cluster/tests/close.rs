@@ -296,6 +296,33 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
         release.send(()).unwrap();
         let lp = closing.await.unwrap().unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Closed, "{lp:?}");
+        assert!(lp.ok && lp.error.is_empty(), "{lp:?}");
+        // Closed now, the file's own read stands: a finding shows (cli692's S1). A forced
+        // map at epoch 2 for p1, whose file is still at 1.
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.partitions
+            .iter_mut()
+            .filter(|p| p.id == "p1")
+            .for_each(|p| p.epoch = 2);
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: true,
+                expected_map_version: 0,
+                map: Some(m),
+            })
+            .await
+            .unwrap();
+        let lp = local(a, "p1").await;
+        assert_eq!(lp.state(), LocalPartitionState::Closed, "{lp:?}");
+        assert!(!lp.ok, "{lp:?}");
+        assert!(lp.error.contains("epoch 2"), "{lp:?}");
     });
     drop(stops);
     for db in dbs {

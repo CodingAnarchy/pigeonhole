@@ -31,6 +31,9 @@ pub(crate) struct Closed {
     generation: u64,
     /// The database's own close error, if it reported one (cli692's N4).
     error: Option<String>,
+    /// Its database is still closing: until then a read of the file is refused by the
+    /// writer lock, which isn't a finding (cli692's N1 and S1 on #1769).
+    db_open: bool,
 }
 
 /// A hold seam (tests): the next close in this cluster directory waits, after the partition
@@ -57,9 +60,12 @@ impl Closed {
         lp.epoch = self.epoch;
         // Between the close's swap and its database's close, a read of the file is still
         // refused by the writer lock: transient, and the partition's identity was the map's
-        // while it served, so only the close's own errors count (cli692's N1 on #1769).
-        lp.ok = true;
-        lp.error.clear();
+        // while it served (cli692's N1 on #1769). Once it has closed, the file's own read
+        // stands: a finding there is real (S1).
+        if self.db_open {
+            lp.ok = true;
+            lp.error.clear();
+        }
         if let Some(e) = &self.error {
             lp.ok = false;
             lp.error = format!("its database's close reported: {e}");
@@ -137,6 +143,7 @@ impl Node {
                 files: Hashing::Running,
                 generation: CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 error: None,
+                db_open: true,
             },
         );
         // Its users end and its database closes, off the async threads.
@@ -166,11 +173,14 @@ impl Node {
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-        if let Err(e) = closed {
-            eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
-            if let Some(c) = self.fences.closed().get_mut(id) {
+        if let Some(c) = self.fences.closed().get_mut(id) {
+            c.db_open = false;
+            if let Err(e) = &closed {
                 c.error = Some(e.to_string());
             }
+        }
+        if let Err(e) = closed {
+            eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
         }
         // Its shards' CPUs are free now: the server's threads take them back.
         if let Some(opener) = self.opener.get() {
