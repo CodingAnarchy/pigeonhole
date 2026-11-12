@@ -819,9 +819,6 @@ A table's split keys are fixed once its ranges hold data, until range moves in 1
 
 **A range that turns out hot:** until ranges can move, give its partition a node of its own or a bigger one, by moving the partition ([Fencing and relocation](#fencing-and-relocation)).
 
-## Performance
-> **Coming with D313 ticket 9b:** the serve bench's numbers on the reference machine: puts, gets and scans over gRPC and HTTP/JSON, and the change feed's delivery at many subscribers, with and without the placement mask.
-
 ## Next
 - [Observability](observability.md): the engine's metrics, alerts and dashboard.
 - [Using Pigeonhole from AI agents](ai-agents.md): `phdb mcp`, and remote MCP's client configuration.
