@@ -32,8 +32,8 @@ async fn stamp(
         .map(tonic::Response::into_inner)
 }
 
-/// Uploads every file of the database at `main` to `port` as partition p3's set at epoch 1.
-async fn upload_set(port: u16, main: &Path, ids: u8) -> Vec<PartitionFile> {
+/// Uploads every file of the database at `main` to `port` as partition `p`'s set at epoch 1.
+async fn upload_set(port: u16, p: &str, main: &Path, ids: u8) -> Vec<PartitionFile> {
     let files: Vec<(PartitionFile, Vec<u8>)> = pigeonhole::Pigeonhole::database_files(main)
         .unwrap()
         .iter()
@@ -53,7 +53,7 @@ async fn upload_set(port: u16, main: &Path, ids: u8) -> Vec<PartitionFile> {
     let manifest: Vec<PartitionFile> = files.iter().map(|(f, _)| f.clone()).collect();
     for (i, (file, data)) in files.iter().enumerate() {
         let header = PartitionUploadHeader {
-            partition: "p3".into(),
+            partition: p.into(),
             cluster_id: "c1".into(),
             epoch: 1,
             upload_id: format!("{ids:02x}{i:02x}").repeat(8),
@@ -122,9 +122,8 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
         // Staged, then an install that fails after its first rename, as a crash would
         // leave it: the marker stays, and the next stamp finishes it.
-        let manifest = upload_set(c, &main, 1).await;
-        super::super::stamp::FAIL_AFTER_FIRST_RENAME
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let manifest = upload_set(c, "p3", &main, 1).await;
+        *super::super::stamp::FAIL_AFTER_FIRST_RENAME.lock().unwrap() = Some(dirs[2].clone());
         let e = stamp(c, 1, 2, false).await.unwrap_err();
         assert!(e.message().contains("after the first rename"), "{e}");
         assert!(dirs[2].join(".phdb-incoming/p3.installing").exists());
@@ -179,6 +178,84 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         // Open now: a stamp is refused.
         let e = stamp(c, 4, 5, false).await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// `phdb cluster relocate` end to end: p1, fenced and closed on a, its files uploaded to c,
+/// moves to c, which serves its rows and takes its writes; run again, it's done; a's old
+/// files then drop.
+#[test]
+fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let [a, b, c] = ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    let req = || PartitionRequest {
+        partition: "p1".into(),
+    };
+    rt.block_on(async {
+        put(b, "alice", "1").await;
+        // Not fenced on a: refused.
+        let e = super::super::cli::relocate(&args, "p1", "c", false)
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            e.message().contains("isn't fenced or closed"),
+            "{}",
+            e.message()
+        );
+        client(a).await.fence(req()).await.unwrap();
+        client(a).await.close(req()).await.unwrap();
+        upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
+        let r = super::super::cli::relocate(&args, "p1", "c", false)
+            .await
+            .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert!(r.document["installed_files"].as_u64().unwrap() >= 1);
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+        // Writes through a go to c now.
+        put(a, "alice", "2").await;
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"2".to_vec()));
+        // Again: done.
+        let r = super::super::cli::relocate(&args, "p1", "c", false)
+            .await
+            .unwrap();
+        assert!(r.document.contains_key("done"), "{:?}", r.document);
+        // a's old copy goes aside.
+        client(a).await.drop_partition(req()).await.unwrap();
+        assert!(!dirs[0].join("p1.phdb").exists());
     });
     drop(stops);
     for db in dbs {

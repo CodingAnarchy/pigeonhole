@@ -19,11 +19,12 @@ use super::{Node, identity};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{PartitionFile, PartitionUploadHeader, StampRequest};
 
-/// A fault seam (tests): the install fails after its first rename, as a crash there would
-/// leave it.
+/// A fault seam (tests): the next install in this cluster directory fails after its first
+/// rename, as a crash there would leave it. Keyed by the directory, so other tests'
+/// installs run on.
 #[cfg(test)]
-pub(crate) static FAIL_AFTER_FIRST_RENAME: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FAIL_AFTER_FIRST_RENAME: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
 
 /// `.phdb-incoming/<P>.installing`.
 fn marker(dir: &Path, partition: &str) -> PathBuf {
@@ -96,9 +97,11 @@ fn install(
             #[cfg(test)]
             {
                 renamed += 1;
-                if renamed == 1
-                    && FAIL_AFTER_FIRST_RENAME.swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
+                let mut armed = FAIL_AFTER_FIRST_RENAME
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if renamed == 1 && armed.as_deref() == Some(dir) {
+                    *armed = None;
                     return Err(ApiError::internal(
                         "the test's fault after the first rename",
                     ));
