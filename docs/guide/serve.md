@@ -273,7 +273,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
       - p99 was lower in both.
 
     The cost:
-    - CPU per op rose 12–18%;
+    - CPU per op rose 12–18% in g83, and up to 37% on one row of an earlier single-round run (8bio), partly limited by its client;
     - a mixed read/put row's p99.9 rose 25–35%, with its p99 level or lower;
     - at 16 table sets × 16 streams and 20K puts/s, put p50 rose about 45 µs and put p99 about 12% (1.63 → 1.84 ms, two rounds each), with subscriber lag unchanged.
   - **Don't raise it on a node whose feed side saturates,** where `pigeonhole_serve_feed_fell_behind_total` rises or a hub thread runs at a full core. At 16 × 16 streams and 55K puts/s on the AX102, 13 network threads held puts to 38–48K/s, with a put p99 of seconds, in 4 of 4 runs (perf287's g83 and g84). 11 threads fell short in 1 of 2 runs, and even their good run had a put p99 of 0.84 s against the default's 0.12–0.14 s.
