@@ -612,7 +612,7 @@ A node writes a partition only while its newest map names it for the partition a
     4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
   - **A mismatch** stops the move before the map changes, so the old node still holds P: `unfence` serves it there again.
   - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
-  - **`--timeout SECS`** bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
+  - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
     - **The hash:** the map still gives P to the old node, closed there. Run the move again to go on waiting, or `unfence` P there.
     - **Serving:** the map already gives P to `ID`, so check that node.
     

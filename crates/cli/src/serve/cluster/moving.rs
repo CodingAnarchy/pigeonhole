@@ -480,11 +480,15 @@ pub(super) async fn serving(
     );
     loop {
         match wait.ask(new.local(p)).await? {
-            // A node serves P only at the map's epoch for it, which is `e` now. Until #1767,
-            // `Status` can't read an open file's epoch (its read-only open is refused), so
-            // the state is the check; once it lands, this can check `lp.epoch == e` too
-            // (simp724's N1 on #1729).
-            Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving => return Ok(()),
+            // The map's epoch for P is `e` now. `Status` reads a served partition's epoch
+            // from its handle (#1767), so a node still serving an older epoch isn't taken
+            // for done (simp724's N1 on #1729 and #1787).
+            Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving && lp.epoch == e => {
+                return Ok(());
+            }
+            Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving => {
+                wait.tick(&format!("serving at epoch {}", lp.epoch)).await?;
+            }
             Ok(Some(lp)) => wait.tick(&said(&lp)).await?,
             Ok(None) => wait.tick("not listed yet").await?,
             Err(f) => wait.tick(f.message()).await?,
@@ -834,6 +838,29 @@ mod tests {
                 "gave up waiting after 300ms (--timeout): opening: retrying. "
             );
         });
+    }
+
+    #[test]
+    fn a_timeout_of_zero_is_refused() {
+        let parse = |t: &str| {
+            <crate::args::Cli as clap::Parser>::try_parse_from([
+                "phdb",
+                "cluster",
+                "move",
+                "p1",
+                "--to",
+                "c",
+                "--node",
+                "http://n:1",
+                "--timeout",
+                t,
+            ])
+        };
+        assert!(
+            parse("0").is_err(),
+            "--timeout 0 would give up without asking"
+        );
+        assert!(parse("1").is_ok());
     }
 
     #[test]
