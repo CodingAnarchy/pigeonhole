@@ -897,8 +897,9 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
         self.caller(&req, &[Scope::Admin], "unfence a partition")?;
-        let id = req.into_inner().partition;
-        self.0.unfence(&id).await?;
+        let req = req.into_inner();
+        let id = req.partition;
+        self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
@@ -1282,34 +1283,14 @@ pub(crate) fn run(
     let total_compaction = args
         .compaction_threads
         .unwrap_or_else(|| super::placement::default_compaction_threads(total_shards));
-    let shares = super::placement::split(total_shards, total_compaction, mine.len());
-    // Each partition's engine memory (D317 ticket 8a): the map's `memory_bytes` off the top,
-    // the rest of `--engine-memory` in equal shares; unset, the library's defaults.
-    let overrides: Vec<u64> = {
-        let state = node.state();
-        mine.iter()
-            .map(|(p, _)| {
-                state
-                    .map
-                    .as_ref()
-                    .and_then(|(m, _)| m.partitions.iter().find(|q| q.id == *p))
-                    .map_or(0, |q| q.memory_bytes)
-            })
-            .collect()
-    };
-    let set_memory = args.engine_memory.is_some() || overrides.iter().any(|&m| m > 0);
-    let memories = super::placement::memory(
+    let map_now = node.state().map.as_ref().map(|(m, _)| m.clone());
+    let (shares, memories) = start_budget(
+        map_now.as_ref(),
+        &mine,
+        total_shards,
+        total_compaction,
         args.engine_memory,
-        &shares
-            .iter()
-            .zip(&overrides)
-            .map(|(s, &m)| (s.shards, m))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|(i, why)| match i.and_then(|i| mine.get(i)) {
-        Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
-        None => Failure::usage(&format!("--engine-memory: {why}")),
-    })?;
+    )?;
     // With several partitions, the node's compaction CPUs are reserved before any engine
     // opens: the CPUs right after all the partitions' shards in the pin order, and every
     // partition's compaction threads are confined to them (ICR 0134). Engines opened one
@@ -1327,7 +1308,7 @@ pub(crate) fn run(
             shares: &shares,
             reserved: reserved.as_deref(),
             // Unset, the library's own defaults, exactly as before.
-            memories: set_memory.then_some(&memories[..]),
+            memories: memories.as_deref(),
         },
         |share, memory| {
             let options = partition_options(
@@ -1463,6 +1444,49 @@ pub(crate) fn run(
         },
         stderr,
     )
+}
+
+/// The node's start split of its budget across `mine`, the partitions the map gives it
+/// (D317 ticket 8a): each one's share of `shards` and `compaction`, and, when
+/// `--engine-memory` or the map sets any, each one's memory: the map's `memory_bytes` off
+/// the top, the rest of `engine_memory` in equal shares. A restart re-splits it across
+/// every partition the map gives the node, which is how a node a run-time open refused
+/// for memory takes that partition (D317 ticket 6).
+pub(crate) fn start_budget(
+    map: Option<&ClusterMap>,
+    mine: &[(String, u64)],
+    shards: usize,
+    compaction: usize,
+    engine_memory: Option<u64>,
+) -> Result<
+    (
+        Vec<super::placement::Share>,
+        Option<Vec<super::placement::Memory>>,
+    ),
+    Failure,
+> {
+    let shares = super::placement::split(shards, compaction, mine.len());
+    let overrides: Vec<u64> = mine
+        .iter()
+        .map(|(p, _)| {
+            map.and_then(|m| m.partitions.iter().find(|q| q.id == *p))
+                .map_or(0, |q| q.memory_bytes)
+        })
+        .collect();
+    let set_memory = engine_memory.is_some() || overrides.iter().any(|&m| m > 0);
+    let memories = super::placement::memory(
+        engine_memory,
+        &shares
+            .iter()
+            .zip(&overrides)
+            .map(|(s, &m)| (s.shards, m))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|(i, why)| match i.and_then(|i| mine.get(i)) {
+        Some((p, _)) => Failure::usage(&format!("partition {p}'s engine memory: {why}")),
+        None => Failure::usage(&format!("--engine-memory: {why}")),
+    })?;
+    Ok((shares, set_memory.then_some(memories)))
 }
 
 /// How a node's partitions share its budget as they open (D317 ticket 8a).

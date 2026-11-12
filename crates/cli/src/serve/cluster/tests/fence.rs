@@ -23,6 +23,7 @@ async fn fence(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
         .await
         .fence(PartitionRequest {
             partition: p.into(),
+            ..Default::default()
         })
         .await
         .map(tonic::Response::into_inner)
@@ -33,6 +34,7 @@ async fn unfence(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
         .await
         .unfence(PartitionRequest {
             partition: p.into(),
+            ..Default::default()
         })
         .await
         .map(tonic::Response::into_inner)
@@ -256,6 +258,21 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         assert_eq!(code(&e), "Fenced", "{e}");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(state(ports[0], "p1").await, LocalPartitionState::Fenced);
+        // An operator's unfence of a start fence asks the peers too, and none answers
+        // (cli692's S1); --force lifts it anyway.
+        let e = unfence(ports[0], "p1").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("no peer's map"), "{e}");
+        let lp = client(ports[0])
+            .await
+            .unfence(PartitionRequest {
+                partition: "p1".into(),
+                force: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
     });
     // Then b and c: each confirms the others, and a its peers, as their maps answer.
     for i in [1, 2] {

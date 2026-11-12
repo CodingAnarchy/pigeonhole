@@ -353,6 +353,7 @@
   - `files = 11`: a closed partition's files once hashed, as `PartitionFile`;
   - `fence_reason = 12`: a `FenceReason`, `OPERATOR` or `AWAITING_PEER_MAP`, set only when `FENCED`.
 - **`StampRequest`** has six fields: `cluster_id`, `partition`, `from_epoch`, `to_epoch`, `restore` and `restore_from_cluster_id`.
+- **`PartitionRequest.force = 2`** (bool), read only by `Unfence` (cli692's S1): it lifts a start fence that no peer's map confirms.
 - **A new code, `Fenced`:** gRPC `FAILED_PRECONDITION`, HTTP 409. Nothing is written. The sender passes it through unchanged and never retries it.
 
 **The write gate:** each partition's writes take a gate: an in-flight count, a fence flag and a `Notify`, with `SeqCst` admission (Dekker-style).
@@ -364,6 +365,8 @@
 - **Lock order:** the gate comes after the service's admission (budget, scope) and is held until the write's commit ends, past its reply for a write that runs detached.
 - **`Fence`** sets the flag, persists `DIR/fenced.json`, and waits up to 30 s for the writes admitted before it.
 - **`Unfence`** checks that the map names the node at the file's epoch, persists `fenced.json`, reconciles the schema, and clears the flag last.
+  - **A start fence** needs a peer's map too, at least as new as the node's own and naming it at the file's epoch, asked at the call (a newer one is taken), or `force`. The node's own map may be stale. A cluster of one confirms on its own map.
+  - **The accepted risk:** auto-unfence and this check trust one peer's map at least as new as the node's. A peer that missed the same move holds the same stale version. A quorum, or the newest of every reachable peer, is for 1.3.0.
 - **Start:** every partition opens fenced. A peer's map at least as new as the node's own, naming the node at the file's epoch, unfences it. The sources are `sync_on_start`, a push from a peer, and a retry loop (250 ms up to 5 s). A one-node cluster unfences on its own map. An operator's fence stays.
 - **Not stopped by a fence:** a text index rebuild runs to its end, since the library rebuilds an index in one call. The fence's drain waits for it within its deadline. A per-batch hook in pigeonhole-text is a 1.3.0 follow-up.
 
@@ -371,13 +374,16 @@
 - **When:**
   - a map that gives the node a partition not open there opens it, then unfences it on that map;
   - `unfence` reopens a closed partition.
-- **Its share** is the node's totals split for the new set. Open engines keep theirs; resharing an open engine is out of scope.
+- **Its share** of `--shards` and `--compaction-threads` is the node's totals split for the new set. Open engines keep theirs; resharing an open engine is out of scope.
+- **Its memory** is what the open partitions leave of `--engine-memory`, never past it (perf287's P2). Below the memtables' floor, the open is refused, naming the budget, and a restart of that node alone re-splits it (`start_budget`), since the map already gives it the partition. A target with no partitions gets all of it. Re-splitting the open engines live is a 1.3.0 option.
 - **Where it opens (the coordinator's mask directive):** on a fresh thread that first takes the narrow free-core mask (`Placement::enter`). `pin_plan` plans from the calling thread's mask, so the new shards land off every open partition's shard cores and their SMT siblings.
 - **Too few free cores:** where the new partition's shards don't fit, the open is refused, never pinned onto a sibling or left unpinned.
 - **The mask reapply:** each runtime's masks sit in an `ArcSwap` with a generation, published before the bump.
   - A thread records its role and reapplies its mask when the generation moved.
   - The triggers are the request, feed and hub runtimes' park and unpark hooks, each `Service::call`, and each blocking task's start, so a busy worker takes it at its next call.
-  - Thread counts stay as started (Tokio can't resize a runtime), so a mask that shrank has more threads per CPU (cli692 on #1745).
+  - The hub's read loop and the feed's delivery loops refresh too, once per read or batch: a busy hub may never park (perf287's P1).
+  - Thread counts stay as started (Tokio can't resize a runtime), so a mask that shrank has more threads per CPU (cli692 on #1745). The log line gives each runtime's threads against its CPUs, and says so when the masks fall back to none (too few free cores).
+  - **Known gaps:** the engines' unpinned threads take the mask they started on and never refresh (the engine owns them). A partition opened later can pin shards on CPUs where they run. Background threads already running (a backup, a bulk load, an index build, a replica's follow) keep their CPUs until they end.
 
 **Close (amendment 2):**
 - **It refuses an unfenced partition,** then waits 30 s for the fence's writes.
@@ -386,7 +392,7 @@
   2. its feed hubs fail (their clients resume from their tokens);
   3. its bulk load, text rebuilds and index threads end;
   4. its database closes.
-- **It answers `CLOSED` at once.** Each file is hashed on a blocking thread (SHA-256, then `posix_fadvise(DONTNEED)` on Linux).
+- **It answers `CLOSED` at once.** Each file is hashed on a blocking thread (SHA-256, then `posix_fadvise(DONTNEED)` on Linux). Each close has a generation, so a hash started for an earlier close of the same partition never lands on a later one (cli692's S2). The database's own close error shows in `error`.
   - A failed hash sets `error`, and `close` again retries it.
   - A call already running on the partition answers `PartitionUnavailable`, not the engine's `Closed`.
 
@@ -394,9 +400,10 @@
 1. **The staged set is checked** (upload's `ready_set`): the header against the request, and each staged file's size and SHA-256 against the manifest, before any rename (feed1248's F2).
 2. **The install is resumable (F1):**
    - it writes `.phdb-incoming/<P>.installing` (the header) first;
-   - it moves P's files outside the manifest aside to `<file>.replaced`, renames the staged files in, and syncs the directory;
+   - it moves P's files outside the manifest aside to `<file>.replaced-<nanos>`; then, for each staged file, it checks it against the manifest again, moves the file it replaces aside the same way (never overwritten, feed1248's S2), and renames it in; then it syncs the directory;
    - it removes the marker last, then P's leftover staged files (N2).
-   - A stamp or an open that finds the marker rolls it forward, checking the files already renamed against the manifest. P never opens while the marker is there.
+   - A stamp or an open that finds the marker rolls it forward, checking the files already renamed against the manifest. P never opens while the marker is there, and an upload of P is refused while it is (feed1248's S1).
+   - The stamp opens the file for its identity row with one shard by default (a fed file keeps its recorded count), small memory and no pinned threads (feed1248's S3).
 3. **The identity row is raised** from `from_epoch` to `to_epoch`.
    - Already at `to_epoch`: success, nothing done.
    - A stale file is refused unless `restore`.
@@ -409,7 +416,8 @@
   - Then it stamps the target from `e` to `e + 1`, and sets the map through the writer.
   - Run again once done, it answers done.
   - `--copy` (keeping the feed history, `SetMapRequest.copies = 4`) comes with feed1248's #1729, ticket 6 PR 2.
-- **`drop-partition`** moves P's files and any `.replaced` ones into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`, deleting nothing. It refuses while the map places P on the node or P is open there.
+- **`drop-partition`** moves P's files and any `.replaced` ones into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`, deleting nothing, the main file last, so a drop that stopped part way finishes on a retry (cli692's N6). It refuses while the map places P on the node or P is open there.
+- **`relocate --old-unreachable`** still asks the old node's `Status` for 3 s, and refuses if it answers serving P (cli692's S3).
 - **`phdb cluster status`** gives each partition's state, for example `fenced (operator)`.
 
 ## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)

@@ -72,6 +72,25 @@ pub(crate) fn write(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
             ));
         }
     }
+    put(db, id)
+}
+
+/// Restores `db`, a backup of cluster `from`'s partition, into `id`'s cluster (D317 ticket
+/// 6's stamp with `restore_from_cluster_id`): the one place a file's cluster changes.
+/// Refused unless the file says it's that partition of `from`.
+pub(crate) fn restore(db: &Pigeonhole, id: &Identity, from: &str) -> Result<(), String> {
+    match read(db)? {
+        Some(old) if old.cluster_id == from && old.partition_id == id.partition_id => put(db, id),
+        Some(old) => Err(format!(
+            "the file is partition {:?} of cluster {:?}, not partition {:?} of cluster {from:?}",
+            old.partition_id, old.cluster_id, id.partition_id
+        )),
+        None => Err("the file has no identity row: it isn't a cluster partition".into()),
+    }
+}
+
+/// Writes `id` into `db`'s identity row, creating the table.
+fn put(db: &Pigeonhole, id: &Identity) -> Result<(), String> {
     let table = db
         .table(TABLE)
         .map_err(|e| format!("{TABLE}: {e}"))?

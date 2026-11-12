@@ -8,9 +8,10 @@
 //! then reads the count. Both `SeqCst`, so at least one of them sees the other: a write the
 //! fence didn't wait for saw the flag and answered `Fenced` without writing.
 //!
-//! Lock order: a write takes the gate before the service's own admission (scope, size, the
-//! in-flight budget), and holds it until its commit has finished, past its reply when the
-//! write runs detached from its request.
+//! Lock order: a write takes the gate after the service's own admission (scope, size, the
+//! in-flight budget), so a fence's drain never waits behind a write still waiting for
+//! budget, and holds it until its commit has finished, past its reply when the write runs
+//! detached from its request.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -114,6 +115,15 @@ impl WriteGate {
     pub(crate) fn extend(self: &Arc<Self>) -> Held {
         self.inflight.fetch_add(1, Ordering::SeqCst);
         Held(Arc::clone(self))
+    }
+
+    /// Counts work that runs whatever the fence (the schema reconcile, which a start fence
+    /// must not stop), then reads the fence: `enter`'s order, so a fence's drain either waits
+    /// for it or it sees the fence. The caller decides from the fence whether to go on.
+    pub(crate) fn hold(self: &Arc<Self>) -> (Held, Option<Fence>) {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        let held = Held(Arc::clone(self));
+        (held, self.fenced())
     }
 
     /// Writes admitted and not yet finished.

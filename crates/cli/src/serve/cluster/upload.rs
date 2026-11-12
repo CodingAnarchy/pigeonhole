@@ -255,6 +255,18 @@ impl Uploads {
         open: impl Fn(&str) -> bool,
     ) -> Result<Writing, ApiError> {
         check_header(&header)?;
+        // A set being installed takes no new file until the install finishes (feed1248's
+        // S1 on #1755): its staged files are what the install checks and renames.
+        let installing = self
+            .dir
+            .join(INCOMING)
+            .join(format!("{}.installing", header.partition));
+        if installing.exists() {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {:?} has an install in progress here: its stamp finishes it first",
+                header.partition
+            )));
+        }
         if open(&header.partition) {
             return Err(ApiError::failed_precondition(format!(
                 "partition {:?} is open on this node: its files can't be replaced while it's \

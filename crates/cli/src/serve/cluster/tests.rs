@@ -644,13 +644,15 @@ fn data_node_many(
     // Unpinned: the rig's partitions share the test process's CPUs.
     let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
     let (stop, dbs, _) = data_node_placed(
-        rt, dir, id, locals, listener, tokens, limits, restart, placement,
+        rt, dir, id, locals, listener, tokens, limits, restart, placement, None,
     );
     (stop, dbs)
 }
 
 /// [`data_node_many`] with `placement` for the partitions it opens while it serves (D317
-/// ticket 6), returning its node too.
+/// ticket 6), returning its node too. `engine_memory`: the node's `--engine-memory`, split
+/// across `locals` at start as `run` splits it ([`super::start_budget`]), and what a
+/// partition opened later gets what's left of.
 #[allow(clippy::too_many_arguments)]
 fn data_node_placed(
     rt: &tokio::runtime::Runtime,
@@ -662,6 +664,7 @@ fn data_node_placed(
     limits: crate::serve::config::Limits,
     restart: bool,
     placement: crate::serve::placement::Placement,
+    engine_memory: Option<u64>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     Vec<pigeonhole::Pigeonhole>,
@@ -678,10 +681,22 @@ fn data_node_placed(
     let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
     let mut dbs = Vec::new();
     let mut parts = Vec::new();
-    for (p, db) in locals {
+    // Each partition's memory as `run` plans it, one shard each.
+    let mine: Vec<(String, u64)> = locals.iter().map(|(p, _)| ((*p).to_owned(), 1)).collect();
+    let (_, memories) = super::start_budget(
+        node.get_map().ok().as_ref(),
+        &mine,
+        mine.len().max(1),
+        0,
+        engine_memory,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message()));
+    for (i, (p, db)) in locals.into_iter().enumerate() {
         let db = db.unwrap_or_else(|| test_partition(dir, p));
         let pinning = crate::serve::service::Pinning::default();
-        let memory = crate::serve::placement::Memory::defaults(1);
+        let memory = memories
+            .as_ref()
+            .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
         // Fenced as `run` opens it (D317 ticket 6). A restarted node waits for its peers'
         // maps to unfence it; a fresh one stands for a node already serving.
         let gate = node.open_gate(p, 1);
@@ -715,7 +730,7 @@ fn data_node_placed(
             }),
             shards: 1,
             compaction: 0,
-            engine_memory: None,
+            engine_memory,
         },
     );
     super::schema::attach(&node, &shared);

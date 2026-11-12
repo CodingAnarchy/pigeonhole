@@ -8,7 +8,7 @@
 //!
 //! What still holds the partition when it closes: its feed hubs fail (their clients
 //! resume from their tokens elsewhere), its bulk load, text rebuilds and vector index
-//! threads end, and a call already running on it ends with the database's `Closed`.
+//! threads end, and a call already running on it answers `PartitionUnavailable`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +26,15 @@ const DRAIN: Duration = Duration::from_secs(30);
 pub(crate) struct Closed {
     epoch: u64,
     files: Hashing,
+    /// Which close this is: a hash started for an earlier close of the same partition
+    /// (reopened, written, closed again) never lands on this one (cli692's S2 on #1755).
+    generation: u64,
+    /// The database's own close error, if it reported one (cli692's N4).
+    error: Option<String>,
 }
+
+/// Each close's [`Closed::generation`].
+static CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 enum Hashing {
@@ -40,12 +48,21 @@ impl Closed {
     pub(crate) fn describe(&self, lp: &mut LocalPartition) {
         lp.set_state(LocalPartitionState::Closed);
         lp.epoch = self.epoch;
+        if let Some(e) = &self.error {
+            lp.ok = false;
+            lp.error = format!("its database's close reported: {e}");
+        }
         match &self.files {
             Hashing::Running => {}
             Hashing::Done(files) => lp.files.clone_from(files),
             Hashing::Failed(e) => {
                 lp.ok = false;
-                lp.error = format!("its files' hash failed (close it again to retry): {e}");
+                if !lp.error.is_empty() {
+                    lp.error.push_str("; ");
+                }
+                lp.error.push_str(&format!(
+                    "its files' hash failed (close it again to retry): {e}"
+                ));
             }
         }
     }
@@ -86,7 +103,10 @@ impl Node {
             .get()
             .and_then(|o| o.shared.upgrade())
             .ok_or_else(|| {
-                ApiError::unsupported("this node closes no partition while it serves")
+                ApiError::unsupported(
+                    "this node can't close a partition: it wasn't started to open and close \
+                     partitions while it serves",
+                )
             })?;
         let cluster = shared
             .router
@@ -103,6 +123,8 @@ impl Node {
             Closed {
                 epoch,
                 files: Hashing::Running,
+                generation: CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                error: None,
             },
         );
         // Its users end and its database closes, off the async threads.
@@ -121,6 +143,9 @@ impl Node {
         .map_err(|e| ApiError::internal(e.to_string()))?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
+            if let Some(c) = self.fences.closed().get_mut(id) {
+                c.error = Some(e.to_string());
+            }
         }
         // Its shards' CPUs are free now: the server's threads take them back.
         if let Some(opener) = self.opener.get() {
@@ -137,9 +162,12 @@ impl Node {
         let Some(node) = self.me.upgrade() else {
             return;
         };
-        if let Some(c) = self.fences.closed().get_mut(id) {
+        let Some(generation) = self.fences.closed().get_mut(id).map(|c| {
             c.files = Hashing::Running;
-        }
+            c.generation
+        }) else {
+            return;
+        };
         let id = id.to_owned();
         let path = self.dir.join(format!("{id}.phdb"));
         tokio::task::spawn_blocking(move || {
@@ -150,8 +178,11 @@ impl Node {
                     Hashing::Failed(e)
                 }
             };
-            // Still closed: a reopen meanwhile dropped it, and its files changed.
-            if let Some(c) = node.fences.closed().get_mut(&id) {
+            // Still this close: a reopen meanwhile dropped it, and a later close of the same
+            // partition has its own hash (cli692's S2).
+            if let Some(c) = node.fences.closed().get_mut(&id)
+                && c.generation == generation
+            {
                 c.files = files;
             }
         });
@@ -263,15 +294,31 @@ impl Node {
 /// [`Node::drop_partition`]'s move, on a blocking thread.
 fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
     let main = dir.join(format!("{id}.phdb"));
-    if !main.exists() {
+    let mut files = pigeonhole::Pigeonhole::database_files(&main)
+        .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;
+    let prefix = format!("{id}.phdb");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&prefix) && n.contains(".replaced") {
+                files.push(e.path());
+            }
+        }
+    }
+    if files.is_empty() {
         return Err(ApiError::not_found(format!(
             "this node has no files of partition {id}"
         )));
     }
-    // The epoch from the file's identity, read without opening it for writes.
-    let epoch = super::identity::read_file(&main)
-        .map_err(ApiError::internal)?
-        .map_or(0, |i| i.epoch);
+    // The epoch from the file's identity, read without opening it for writes; 0 when a
+    // drop that stopped part way already moved the main file.
+    let epoch = if main.exists() {
+        super::identity::read_file(&main)
+            .map_err(ApiError::internal)?
+            .map_or(0, |i| i.epoch)
+    } else {
+        0
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -285,17 +332,9 @@ fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
     }
     std::fs::create_dir_all(&to)
         .map_err(|e| ApiError::internal(format!("create {}: {e}", to.display())))?;
-    let mut files = pigeonhole::Pigeonhole::database_files(&main)
-        .map_err(|e| ApiError::internal(format!("list {}'s files: {e}", main.display())))?;
-    let prefix = format!("{id}.phdb");
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let n = e.file_name().to_string_lossy().into_owned();
-            if n.starts_with(&prefix) && n.ends_with(".replaced") {
-                files.push(e.path());
-            }
-        }
-    }
+    // The main file last (cli692's N6 on #1755): a drop that stops part way leaves it, or
+    // only sidecars, and a retry lists what's left and finishes.
+    files.sort_by_key(|f| *f == main);
     for f in &files {
         let Some(n) = f.file_name() else { continue };
         std::fs::rename(f, to.join(n))

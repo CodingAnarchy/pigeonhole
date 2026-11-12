@@ -191,10 +191,95 @@ fn opened_off_the_others_cores_alone() {
         crate::serve::server_tests::limits(),
         false,
         placement,
+        None,
     );
     map.map_version = 2;
     map.partitions.extend([part("p3"), part("p4")]);
     let shared = node.opener.get().unwrap().shared.upgrade().unwrap();
+    // p1's feed side on runtimes of its own, entered as the server's are but with no park or
+    // unpark hooks, so only the hub's and delivery's own refreshes can move them (perf287's
+    // P1 on #1755: a busy hub may never park).
+    let feed_rt = {
+        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("phdb-test-feed")
+            .on_thread_start(move || p.enter_feed())
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let hub_rt = {
+        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("phdb-test-hub")
+            .on_thread_start(move || p.enter_hub())
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    for part in shared.router.parts() {
+        part.feeds
+            .run_on(feed_rt.handle().clone(), hub_rt.handle().clone());
+    }
+    // A subscriber to p1's `users`, and writes to it, so the hub reads and delivers.
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _subscriber = rt.spawn(async move {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut s = crate::serve::proto::feed_client::FeedClient::new(channel)
+            .subscribe(crate::serve::proto::SubscribeRequest {
+                tables: vec!["users".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        while let Ok(Some(_)) = s.message().await {}
+    });
+    let writer = {
+        let busy = Arc::clone(&busy);
+        rt.spawn(async move {
+            let mut i = 0u64;
+            while busy.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = data(port)
+                    .await
+                    .mutate(crate::serve::proto::MutateRequest {
+                        writes: Some(put_row(&format!("a{i}"), "1")),
+                        durability: 0,
+                    })
+                    .await;
+                i += 1;
+            }
+        })
+    };
+    // The process's CPUs, which an unmasked thread gets back.
+    let process: Vec<usize> = {
+        let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        (0..nix::sched::CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .collect()
+    };
+    // A thread's CPUs, by its name.
+    let cpus_of = |name: &str| -> Option<Vec<usize>> {
+        for task in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            if comm.trim() == name {
+                let tid: i32 = task.file_name().to_string_lossy().parse().ok()?;
+                let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+                return Some(
+                    (0..nix::sched::CpuSet::count())
+                        .filter(|&c| set.is_set(c).unwrap_or(false))
+                        .collect(),
+                );
+            }
+        }
+        None
+    };
     // A thread of the server's own, on the free cores before p3 opens: it takes the mask
     // the open reapplies at its next refresh.
     let placement = Arc::clone(&node.opener.get().unwrap().placement);
@@ -243,18 +328,33 @@ fn opened_off_the_others_cores_alone() {
         }
         // The masks were reapplied without p3's shard and its siblings, and a thread of
         // ours takes them.
+        // Where p3's shard and its siblings leave fewer than two free cores (a 4-CPU
+        // runner with SMT), the masks fall back to none, and the threads get the process's
+        // CPUs back, as at start.
         let now = placement.current();
-        let blocking = now.blocking.clone().expect("still masked");
-        let mut off: Vec<usize> = new.iter().flat_map(|&c| siblings(c)).collect();
-        off.extend(&new);
-        assert!(
-            blocking
-                .iter()
-                .all(|c| !off.contains(c) && !taken.contains(c)),
-            "the free cores {blocking:?} after p3's shard {new:?}"
-        );
+        let blocking = match &now.blocking {
+            Some(free) => {
+                let mut off: Vec<usize> = new.iter().flat_map(|&c| siblings(c)).collect();
+                off.extend(&new);
+                assert!(
+                    free.iter().all(|c| !off.contains(c) && !taken.contains(c)),
+                    "the free cores {free:?} after p3's shard {new:?}"
+                );
+                free.clone()
+            }
+            None => process.clone(),
+        };
         go.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), blocking);
+        // The feed side's thread, busy delivering p1's commits (with one client the hub
+        // reads on the feed runtime too, #1689), takes the new mask by its own refresh.
+        let feed = now.feed.clone().unwrap_or_else(|| process.clone());
+        eventually("the busy feed thread to take the new mask", async || {
+            cpus_of("phdb-test-feed").as_ref() == Some(&feed)
+        })
+        .await;
+        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = writer.await;
         let e = node.open_part("p4").await.unwrap_err();
         assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
         assert!(
@@ -266,6 +366,125 @@ fn opened_off_the_others_cores_alone() {
     });
     drop(shared);
     drop(stop);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// A run-time open gets what the open partitions leave of `--engine-memory` (perf287's P2 on
+/// #1755). At start they split all of it, so the open is refused, saying to restart the
+/// node; restarting that node alone re-splits it across both, and the partition serves (the
+/// coordinator's recovery requirement).
+#[test]
+fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
+    use crate::serve::proto::LocalPartitionState;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let part = |id: &str| Partition {
+        id: id.into(),
+        node: "a".into(),
+        epoch: 1,
+        memory_bytes: 0,
+    };
+    let mut map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: vec![MapNode {
+            id: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+        }],
+        partitions: vec![part("p1")],
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+            created: 0,
+        }],
+    };
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    const BUDGET: u64 = 4 << 20;
+    let start = |listener, locals, restart| {
+        data_node_placed(
+            &rt,
+            &dir,
+            "a",
+            locals,
+            listener,
+            "",
+            crate::serve::server_tests::limits(),
+            restart,
+            crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
+            Some(BUDGET),
+        )
+    };
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    let (stop, _, node) = start(listener, vec![("p1", Some(p1.clone()))], false);
+    test_partition_with(&dir, "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    map.map_version = 2;
+    map.partitions.push(part("p3"));
+    rt.block_on(async {
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(map),
+            })
+            .await
+            .unwrap();
+        let e = node.open_part("p3").await.unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+        assert!(
+            e.message
+                .contains("Restart this node to re-split --engine-memory"),
+            "{}",
+            e.message
+        );
+    });
+    // The node restarts alone: the map already gives it p3.
+    drop(node);
+    let _ = stop.send(());
+    rt.block_on(async {
+        eventually("the node to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        })
+        .await;
+    });
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let (_stop, dbs, _node) = start(listener, vec![("p1", Some(p1)), ("p3", None)], true);
+    rt.block_on(async {
+        eventually("p3 to serve after the restart", async || {
+            client(port)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p3" && lp.state() == LocalPartitionState::Serving)
+        })
+        .await;
+    });
+    // Each took half of the budget, as `run` splits it.
+    let (_, memories) = super::super::start_budget(
+        None,
+        &[("p1".into(), 1), ("p3".into(), 1)],
+        2,
+        0,
+        Some(BUDGET),
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message()));
+    let total: u64 = memories.unwrap().iter().map(|m| m.bytes()).sum();
+    assert!(total <= BUDGET, "{total}");
     for db in dbs {
         let _ = db.close();
     }

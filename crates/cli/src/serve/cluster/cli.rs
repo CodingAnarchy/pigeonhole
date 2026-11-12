@@ -3,6 +3,7 @@
 //! talk to a running node (`show-map --file` reads a down node's map file instead).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -103,11 +104,17 @@ pub(crate) enum ClusterCommand {
         node: NodeArgs,
     },
     /// Lift a partition's fence on `--node` (a closed partition reopens first). Refused
-    /// unless the map names that node for it at its file's epoch.
+    /// unless the map names that node for it at its file's epoch. A partition fenced since
+    /// the node started is unfenced only once a peer's map confirms it, as at start.
     Unfence {
         partition: String,
         #[command(flatten)]
         node: NodeArgs,
+        /// Lift a start fence that no peer's map confirms: only when no peer can answer and
+        /// you know the partition hasn't moved. A peer's newer map may have given it to
+        /// another node, and then both would take writes.
+        #[arg(long)]
+        force: bool,
     },
     /// Close a fenced partition on `--node`: its files become final (for a relocation's
     /// copy), its calls answer `PartitionUnavailable`, and `status` lists the files with
@@ -207,9 +214,11 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
         ClusterCommand::Fence { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Fence))
         }
-        ClusterCommand::Unfence { partition, node } => {
-            runtime()?.block_on(partition_call(node, partition, Call::Unfence))
-        }
+        ClusterCommand::Unfence {
+            partition,
+            node,
+            force,
+        } => runtime()?.block_on(partition_call(node, partition, Call::Unfence(*force))),
         ClusterCommand::Close { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Close))
         }
@@ -229,7 +238,8 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
 #[derive(Clone, Copy)]
 enum Call {
     Fence,
-    Unfence,
+    /// With `--force`.
+    Unfence(bool),
     Close,
     Drop,
 }
@@ -241,12 +251,13 @@ async fn partition_call(args: &NodeArgs, partition: &str, call: Call) -> Result<
     let req = request(
         proto::PartitionRequest {
             partition: partition.to_owned(),
+            force: matches!(call, Call::Unfence(true)),
         },
         token.as_deref(),
     )?;
     let (command, reply) = match call {
         Call::Fence => ("cluster fence", c.fence(req).await),
-        Call::Unfence => ("cluster unfence", c.unfence(req).await),
+        Call::Unfence(_) => ("cluster unfence", c.unfence(req).await),
         Call::Close => ("cluster close", c.close(req).await),
         Call::Drop => ("cluster drop-partition", c.drop_partition(req).await),
     };
@@ -323,23 +334,33 @@ pub(crate) async fn relocate(
     let old_url = address(&p.node).unwrap_or_default();
     // The partition on the node serving it now: fenced or closed (cli692's S7). An
     // in-place restore (the same node) needs it closed.
+    let probe = async {
+        let (mut c, token) = connect(args, &old_url).await?;
+        c.status(request(StatusRequest {}, token.as_deref())?)
+            .await
+            .map(|r| {
+                r.into_inner()
+                    .partitions
+                    .into_iter()
+                    .find(|lp| lp.id == partition)
+            })
+            .map_err(|s| Failure::usage(&format!("{old_url}: {}", s.message())))
+    };
     let old_state = if old_unreachable {
+        // Still asked, briefly (cli692's S3 on #1755): a node that answers and serves P
+        // isn't unreachable, and a move now would give P two writers.
+        if let Ok(Ok(Some(lp))) = tokio::time::timeout(Duration::from_secs(3), probe).await
+            && lp.state() == proto::LocalPartitionState::Serving
+        {
+            return Err(Failure::usage(&format!(
+                "--old-unreachable, but node {:?} answers and serves partition {partition}: \
+                 fence it there first (phdb cluster fence), or stop its process",
+                p.node
+            )));
+        }
         None
     } else {
-        let lp = async {
-            let (mut c, token) = connect(args, &old_url).await?;
-            c.status(request(StatusRequest {}, token.as_deref())?)
-                .await
-                .map(|r| {
-                    r.into_inner()
-                        .partitions
-                        .into_iter()
-                        .find(|lp| lp.id == partition)
-                })
-                .map_err(|s| Failure::usage(&format!("{old_url}: {}", s.message())))
-        }
-        .await?;
-        Some(lp.map(|lp| lp.state()).unwrap_or_default())
+        Some(probe.await?.map(|lp| lp.state()).unwrap_or_default())
     };
     use proto::LocalPartitionState as S;
     if p.node == to && old_state != Some(S::Closed) {

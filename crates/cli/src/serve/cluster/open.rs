@@ -58,18 +58,30 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     pinned.sort_unstable();
     pinned.dedup();
     let masks = placement.reapply(&pinned);
-    let list = |m: &Option<Vec<usize>>| {
-        m.as_deref().map_or_else(
-            || "any CPU".to_owned(),
-            crate::serve::placement::format_cpu_list,
-        )
+    // Each runtime's threads against its CPUs, so an operator sees how a shrunken mask
+    // packs them (perf287's note 1 on #1755); the counts stay as the server started them.
+    let on = |threads: usize, m: &Option<Vec<usize>>| match m {
+        Some(cpus) => format!(
+            "{threads} on {} CPUs ({})",
+            cpus.len(),
+            crate::serve::placement::format_cpu_list(cpus)
+        ),
+        None => format!("{threads} on any CPU"),
+    };
+    let unmasked = if masks.blocking.is_none() && !pinned.is_empty() {
+        ", unmasked: too few free cores off the shards' cores"
+    } else {
+        ""
     };
     eprintln!(
-        "phdb serve: {why}: the server's threads now run on {} (request workers on {}), off \
-         the shards' {} CPUs; the thread counts stay as the server started them",
-        list(&masks.blocking),
-        list(&masks.network),
-        pinned.len()
+        "phdb serve: {why}: off the shards' {} CPUs{unmasked}: request workers {}, feed {} \
+         and hub {}, blocking {}; the thread counts stay as the server started them (restart \
+         to size them again)",
+        pinned.len(),
+        on(placement.io_threads, &masks.network),
+        on(placement.feed_threads, &masks.feed),
+        on(placement.hub_threads, &masks.hub),
+        on(placement.blocking_threads, &masks.blocking),
     );
 }
 
@@ -144,27 +156,32 @@ impl Node {
                     })?
             }
             Some(total) => {
-                let overrides: Vec<(usize, u64)> = shares
+                // What the open partitions leave of --engine-memory, never past it (perf287's
+                // P2 on #1755): at start they split all of it, so a node needs headroom for
+                // a partition opened later.
+                let held: u64 = open_now
+                    .values()
+                    .filter_map(|s| s.part_opt().and_then(|p| p.engine_memory))
+                    .map(|m| m.bytes())
+                    .sum();
+                let left = total.saturating_sub(held);
+                let asked = map
+                    .partitions
                     .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let named = if i + 1 == n {
-                            Some(id)
-                        } else {
-                            open_now.keys().nth(i).map(String::as_str)
-                        };
-                        let bytes = named
-                            .and_then(|q| map.partitions.iter().find(|p| p.id == q))
-                            .map_or(0, |p| p.memory_bytes);
-                        (s.shards, bytes)
-                    })
-                    .collect();
-                let memories = crate::serve::placement::memory(Some(total), &overrides).map_err(
-                    |(_, why)| {
-                        ApiError::failed_precondition(format!("partition {id}'s memory: {why}"))
-                    },
-                )?;
-                Some(memories[n - 1])
+                    .find(|p| p.id == id)
+                    .map_or(0, |p| p.memory_bytes);
+                let bytes = if asked > 0 { asked.min(left) } else { left };
+                let memory = Memory::of(bytes, share.shards).map_err(|least| {
+                    ApiError::failed_precondition(format!(
+                        "partition {id} can't open here: --engine-memory is {total} bytes, the \
+                         open partitions hold {held} of it, which leaves {left}, and its {} \
+                         shards' memtables need at least {least}. Restart this node to re-split \
+                         --engine-memory across its partitions (the map already gives it {id}), \
+                         or start it with headroom",
+                        share.shards
+                    ))
+                })?;
+                Some(memory)
             }
         };
         // Joined from a blocking thread, so no async worker waits on the open.

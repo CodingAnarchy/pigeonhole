@@ -591,6 +591,9 @@ A node writes a partition only while its newest map names it for the partition a
   - The fence is kept in `DIR/fenced.json`, so it outlasts a restart.
 - **A restarted node** opens every partition fenced, and unfences each one once a peer's map, at least as new as its own, still names it for the partition at the file's epoch. A node whose peers don't answer keeps them fenced: `phdb cluster status` shows `fenced (awaiting peer map)`, and `fenced (operator)` for a fence of yours. A one-node cluster unfences on its own map.
 - **`phdb cluster unfence P --node URL`** lifts either fence. It's refused unless the node's map names that node for P at its file's epoch.
+  - **A fence since the node started** lifts only once a peer's map, at least as new as the node's own, confirms it, as at start: the command asks the peers first. The node was down, and a move may have passed it by.
+  - **`--force`** lifts it without a peer's map. Use it only when no peer can answer and you know P hasn't moved. If a peer's newer map gave P to another node, both would then take writes.
+  - **Don't unfence P during a relocation.** Between `relocate`'s check and its map change, the old node's map still names it, so an unfence there resumes its writes.
 - **`phdb cluster close P --node URL`** closes a fenced partition. Its database closes, so its files are final, and its calls answer `PartitionUnavailable`. A call already running on it ends the same way.
   - The partition's feed hubs end, and their clients resume from their tokens.
   - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
@@ -601,13 +604,15 @@ A node writes a partition only while its newest map names it for the partition a
   - It checks that P is fenced or closed on the node serving it. `--old-unreachable` skips that check, for a node whose process you've stopped.
   - The new node installs the files and takes the next epoch. Then the map gives it P, and it serves at once.
   - An install interrupted by a crash finishes the next time the node is stamped or opens P.
-  - Run again once done, `relocate` answers that the map already gives P to that node.
+  - Run again once done, `relocate` answers that the map already gives P to that node. Run again after a map change that didn't land, it stamps again (the file is already at the new epoch, so that does nothing) and sets the map.
+  - `--old-unreachable` still asks the old node briefly, and refuses if it answers and serves P.
   - A move by file copy restarts the partition's feed history. Keeping it (`--copy`) comes with the next step.
 - **`phdb cluster drop-partition P --node URL`** moves P's files on the old node into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`. It's refused while the map still places P on that node, or while P is open there, so close it first.
   - Nothing is deleted, and nothing is freed until you delete that directory, once you've checked the move.
-- **A node opens a partition while it serves** when a map gives it one. Its share of the node's `--shards`, `--compaction-threads` and `--engine-memory` is the share it would get at start for the new set of partitions, and the partitions already open keep theirs.
+- **A node opens a partition while it serves** when a map gives it one. Its share of the node's `--shards` and `--compaction-threads` is the share it would get at start for the new set of partitions, and the partitions already open keep theirs.
+  - **Memory:** it gets what the open partitions leave of `--engine-memory`, never more. A node that started with partitions gave them all of it, so there the open is refused, saying so. **Restart that node alone:** the map already gives it P, and its start splits `--engine-memory` across every partition, P included. A node that held no partition, the usual move target, gives P all of it. Without `--engine-memory`, every partition takes the library's defaults, as at start.
   - It opens on the free cores, off every open partition's shard cores and their SMT siblings. If its shards don't fit there, the open is refused, naming how many would run unpinned, rather than put on a sibling.
-  - **The server's threads then move off the new shards' CPUs** (or back onto a closed partition's), and a log line names the new CPUs. Their counts stay as the server started them, since a runtime can't be resized. After a partition opens, the network, feed and blocking threads share fewer CPUs, and run more of them per CPU than a node started with that partition would. Restart the node to size them again.
+  - **The server's threads then move off the new shards' CPUs** (or back onto a closed partition's), and a log line names each runtime's threads against its CPUs. Their counts stay as the server started them, since a runtime can't be resized. A background thread already running (a backup, a bulk load, an index build, a replica's follow) keeps its CPUs until it ends, and the new partition's own engine threads keep the CPUs it opened on. After a partition opens, the network, feed and blocking threads share fewer CPUs, and run more of them per CPU than a node started with that partition would. Restart the node to size them again.
 - **Errors:** `Fenced` (409, gRPC `FAILED_PRECONDITION`) means the write wasn't applied because its partition is fenced. Send it again once the partition is unfenced or has moved: a node that takes it reroutes to the new owner.
 
 ### Backup and restore

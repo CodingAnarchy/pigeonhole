@@ -13489,9 +13489,15 @@ impl serde::Serialize for PartitionRequest {
         if !self.partition.is_empty() {
             len += 1;
         }
+        if self.force {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionRequest", len)?;
         if !self.partition.is_empty() {
             struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if self.force {
+            struct_ser.serialize_field("force", &self.force)?;
         }
         struct_ser.end()
     }
@@ -13504,11 +13510,13 @@ impl<'de> serde::Deserialize<'de> for PartitionRequest {
     {
         const FIELDS: &[&str] = &[
             "partition",
+            "force",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Partition,
+            Force,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -13531,6 +13539,7 @@ impl<'de> serde::Deserialize<'de> for PartitionRequest {
                     {
                         match value {
                             "partition" => Ok(GeneratedField::Partition),
+                            "force" => Ok(GeneratedField::Force),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -13551,6 +13560,7 @@ impl<'de> serde::Deserialize<'de> for PartitionRequest {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut partition__ = None;
+                let mut force__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Partition => {
@@ -13559,10 +13569,17 @@ impl<'de> serde::Deserialize<'de> for PartitionRequest {
                             }
                             partition__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Force => {
+                            if force__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("force"));
+                            }
+                            force__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(PartitionRequest {
                     partition: partition__.unwrap_or_default(),
+                    force: force__.unwrap_or_default(),
                 })
             }
         }

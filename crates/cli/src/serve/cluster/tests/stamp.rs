@@ -221,6 +221,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     };
     let req = || PartitionRequest {
         partition: "p1".into(),
+        ..Default::default()
     };
     rt.block_on(async {
         put(b, "alice", "1").await;
@@ -231,6 +232,16 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             .expect("refused");
         assert!(
             e.message().contains("isn't fenced or closed"),
+            "{}",
+            e.message()
+        );
+        // --old-unreachable still asks a, which answers and serves p1 (cli692's S3).
+        let e = super::super::cli::relocate(&args, "p1", "c", true)
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            e.message().contains("answers and serves"),
             "{}",
             e.message()
         );

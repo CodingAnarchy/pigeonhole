@@ -268,7 +268,7 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
             // partition's tables must be there when it's unfenced. Counted on the gate
             // first, then the fence read, so a fence's drain waits for a reconcile it
             // didn't stop.
-            let held = service.gate().map(|g| (g.extend(), g.fenced()));
+            let held = service.gate().map(|g| g.hold());
             if let Some((_, Some(crate::serve::gate::Fence::Operator))) = held {
                 continue;
             }

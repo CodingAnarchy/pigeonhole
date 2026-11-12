@@ -6137,6 +6137,11 @@ pub mod vectors_server {
 pub struct PartitionRequest {
     #[prost(string, tag = "1")]
     pub partition: ::prost::alloc::string::String,
+    /// `Unfence` only: lift a start fence even though no peer's map (at least as new as this
+    /// node's, naming it for the partition at its file's epoch) confirms it. For a node whose
+    /// peers can't answer; it risks two writers if a peer's newer map moved the partition.
+    #[prost(bool, tag = "2")]
+    pub force: bool,
 }
 /// `Cluster.Stamp` (D317 ticket 6).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

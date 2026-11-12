@@ -10,6 +10,7 @@ async fn close(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
         .await
         .close(PartitionRequest {
             partition: p.into(),
+            ..Default::default()
         })
         .await
         .map(tonic::Response::into_inner)
@@ -61,6 +62,7 @@ fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
             .await
             .fence(PartitionRequest {
                 partition: "p1".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -96,6 +98,7 @@ fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
             .await
             .unfence(PartitionRequest {
                 partition: "p1".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -181,6 +184,7 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
             .await
             .drop_partition(PartitionRequest {
                 partition: "p1".into(),
+                ..Default::default()
             })
             .await
             .map(tonic::Response::into_inner)
@@ -190,6 +194,7 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
             .await
             .fence(PartitionRequest {
                 partition: "p1".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -225,6 +230,14 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
         // Nothing of p1 left to drop.
         let e = drop_p1().await.unwrap_err();
         assert_eq!(code(&e), "NotFound", "{e}");
+        // A drop that stopped after the main file (as before cli692's N6, or a crash):
+        // a retry moves the sidecars that are left.
+        std::fs::write(dirs[0].join("p1.phdb-wal-0"), b"left").unwrap();
+        std::fs::write(dirs[0].join("p1.phdb-feed"), b"left").unwrap();
+        let lp = drop_p1().await.unwrap();
+        assert!(lp.file.starts_with(".phdb-dropped/p1-0-"), "{lp:?}");
+        assert!(dirs[0].join(&lp.file).join("p1.phdb-feed").is_file());
+        assert!(!dirs[0].join("p1.phdb-wal-0").exists());
     });
     drop(stops);
     for db in dbs {

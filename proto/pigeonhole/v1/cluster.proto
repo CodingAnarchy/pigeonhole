@@ -79,6 +79,10 @@ service Cluster {
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
 message PartitionRequest {
   string partition = 1;
+  // `Unfence` only: lift a start fence even though no peer's map (at least as new as this
+  // node's, naming it for the partition at its file's epoch) confirms it. For a node whose
+  // peers can't answer; it risks two writers if a peer's newer map moved the partition.
+  bool force = 2;
 }
 
 // `Cluster.Stamp` (D317 ticket 6).
