@@ -16,6 +16,7 @@ pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
+pub(crate) mod idle;
 pub(crate) mod map;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -578,6 +579,14 @@ impl Node {
             })
             .unwrap_or_default();
         files.sort();
+        // The partitions this node has open: their identity comes from their own handle,
+        // since a read-only open of a file a writer holds is refused (#1767).
+        let open: std::collections::BTreeMap<String, crate::serve::router::PartRef> = self
+            .opener
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .map(|shared| shared.router.partitions().into_iter().collect())
+            .unwrap_or_default();
         for path in files {
             let file = path
                 .file_name()
@@ -595,7 +604,19 @@ impl Node {
                 error: String::new(),
                 ..Default::default()
             };
-            match identity::read_file(&path) {
+            // A partition being opened: no read of its file, whose read-only open would refuse
+            // the node's own open (#1770). It shows as opening.
+            if self.fences.is_opening(&named) {
+                lp.set_state(proto::LocalPartitionState::Opening);
+                lp.ok = true;
+                partitions.push(lp);
+                continue;
+            }
+            let read = match open.get(&named) {
+                Some(part) => identity::read(&part.db),
+                None => identity::read_file(&path),
+            };
+            match read {
                 Ok(None) => lp.error = "no identity row: run phdb cluster init-partition".into(),
                 Err(e) => lp.error = e,
                 Ok(Some(id)) => {
@@ -1682,6 +1703,27 @@ pub(crate) fn partition_options(
     options
 }
 
+/// Opens the database at `path` for writing, retrying a moment while a read-only open of
+/// the file holds its writer lock (an operator's `phdb info`, another node's tooling): 50 ms,
+/// doubling, about 1.5 s in all, then the refusal stands (#1770).
+pub(crate) fn open_retrying(
+    path: &Path,
+    options: &pigeonhole::Options,
+) -> pigeonhole::Result<pigeonhole::Pigeonhole> {
+    let mut wait = std::time::Duration::from_millis(50);
+    loop {
+        match pigeonhole::Pigeonhole::open(path, options.clone()) {
+            Err(e)
+                if e.code() == pigeonhole::ErrorCode::WriterLocked && wait.as_millis() <= 800 =>
+            {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            opened => return opened,
+        }
+    }
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -1703,8 +1745,7 @@ fn open_partition(
             path.display()
         )));
     }
-    let db = pigeonhole::Pigeonhole::open(&path, options)
-        .map_err(|e| Failure::db("open the partition", &e))?;
+    let db = open_retrying(&path, &options).map_err(|e| Failure::db("open the partition", &e))?;
     let want = identity::Identity {
         cluster_id: cluster_id.to_owned(),
         partition_id: partition.to_owned(),

@@ -145,7 +145,7 @@ impl Tracker {
 /// something meanwhile (perf287's profile on #1397: a wake and a new timer per take, per
 /// subscriber, were `Client::send`'s 9.6% self at 16 hubs × 16).
 #[derive(Debug)]
-struct TakeClock {
+pub(crate) struct TakeClock {
     /// On Tokio's clock, so a paused test clock pauses it too.
     base: tokio::time::Instant,
     /// Nanoseconds from `base` to the last take; 0 before the first.
@@ -153,7 +153,7 @@ struct TakeClock {
 }
 
 impl TakeClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base: tokio::time::Instant::now(),
             last: AtomicU64::new(0),
@@ -161,13 +161,13 @@ impl TakeClock {
     }
 
     /// A take, now.
-    fn took(&self) {
+    pub(crate) fn took(&self) {
         let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.last.store(nanos.max(1), Ordering::Relaxed);
     }
 
     /// When the last take was, or `None` before the first.
-    fn last(&self) -> Option<tokio::time::Instant> {
+    pub(crate) fn last(&self) -> Option<tokio::time::Instant> {
         match self.last.load(Ordering::Relaxed) {
             0 => None,
             n => Some(self.base + Duration::from_nanos(n)),
@@ -1545,11 +1545,11 @@ impl Sink {
             client_bytes,
             stream_idle: limits.stream_idle,
         };
-        let events = FeedEvents {
+        let events = FeedEvents(EventSource::Sink {
             events: rx,
             taken,
             end: Some(end_rx),
-        };
+        });
         (sink, events, end_tx)
     }
 
@@ -1678,13 +1678,28 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
     }
 }
 
-/// A client's events, then its error if it failed.
-#[derive(Debug)]
-pub(crate) struct FeedEvents {
-    events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
-    /// Each take's time, for a send waiting for room.
-    taken: Arc<TakeClock>,
-    end: Option<oneshot::Receiver<ApiError>>,
+/// A client's events, then its error if it failed: a single node's, from its [`Sink`]; or
+/// a cluster subscription's, merged as the client polls ([`crate::serve::cluster::feed`],
+/// #1758's B).
+pub(crate) struct FeedEvents(EventSource);
+
+enum EventSource {
+    Sink {
+        events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
+        /// Each take's time, for a send waiting for room.
+        taken: Arc<TakeClock>,
+        end: Option<oneshot::Receiver<ApiError>>,
+    },
+    Merged(Box<crate::serve::cluster::feed::ClusterEvents>),
+}
+
+impl std::fmt::Debug for FeedEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            EventSource::Sink { .. } => "FeedEvents(sink)",
+            EventSource::Merged(_) => "FeedEvents(merged)",
+        })
+    }
 }
 
 /// An event as it leaves a client: its own, or a ring entry encoded once for every client
@@ -1777,26 +1792,35 @@ impl FeedEvents {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
-        match self.events.poll_recv(cx) {
+        let (events, taken, end) = match &mut self.0 {
+            EventSource::Merged(m) => return m.poll_out(cx),
+            EventSource::Sink { events, taken, end } => (events, taken, end),
+        };
+        match events.poll_recv(cx) {
             // Taken: its bytes go back to the client's buffer.
             Poll::Ready(Some((e, room))) => {
                 drop(room);
-                self.taken.took();
+                taken.took();
                 return Poll::Ready(Some(Ok(e)));
             }
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => {}
         }
-        let Some(end) = self.end.as_mut() else {
+        let Some(rx) = end.as_mut() else {
             return Poll::Ready(None);
         };
-        let out = match Pin::new(end).poll(cx) {
+        let out = match Pin::new(rx).poll(cx) {
             Poll::Ready(Ok(e)) => Some(Err(e)),
             Poll::Ready(Err(_)) => None,
             Poll::Pending => return Poll::Pending,
         };
-        self.end = None;
+        *end = None;
         Poll::Ready(out)
+    }
+
+    /// A cluster subscription's events: merged as the client polls.
+    pub(crate) fn merged(events: crate::serve::cluster::feed::ClusterEvents) -> Self {
+        FeedEvents(EventSource::Merged(Box::new(events)))
     }
 }
 
