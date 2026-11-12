@@ -108,3 +108,131 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
         let _ = db.close();
     }
 }
+
+/// A partition opened while the node serves pins its shards on the free cores (the
+/// coordinator's mask directive): never on an open partition's shard CPU or its SMT
+/// sibling. One whose shards don't fit there is refused, not pinned onto a sibling or left
+/// unpinned. Linux only (elsewhere nothing pins); alone in its process, since pin claims
+/// are process-wide (#1741).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partition_opened_while_serving_pins_off_the_others_cores_or_is_refused() {
+    run_alone(
+        module_path!(),
+        "a_partition_opened_while_serving_pins_off_the_others_cores_or_is_refused",
+        opened_off_the_others_cores_alone,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn opened_off_the_others_cores_alone() {
+    use crate::serve::placement::{Placement, siblings};
+    let dir = test_dir();
+    let one = || pigeonhole::Options::default().shards(1);
+    let p1 = test_partition_with(&dir, "p1", one());
+    let held = p1.pinned_shard_cpus();
+    if held.is_empty() {
+        println!("skipped: nothing pins here");
+        return;
+    }
+    // The node's placement as `run` plans it around p1's shard.
+    let placement = Placement::plan(&[&p1], Some(2), Some(2), None, None, true);
+    let Some(free) = placement.masks.blocking.clone() else {
+        println!("skipped: too few free cores for a mask");
+        return;
+    };
+    // p3 fits on the free cores; p4 has as many shards as they hold, one of which p3 takes.
+    test_partition_with(&dir, "p3", one()).close().unwrap();
+    test_partition_with(
+        &dir,
+        "p4",
+        pigeonhole::Options::default().shards(free.len()),
+    )
+    .close()
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let part = |id: &str| Partition {
+        id: id.into(),
+        node: "a".into(),
+        epoch: 1,
+        memory_bytes: 0,
+    };
+    let mut map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: vec![MapNode {
+            id: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+        }],
+        partitions: vec![part("p1")],
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+            created: 0,
+        }],
+    };
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (stop, dbs, node) = data_node_placed(
+        &rt,
+        &dir,
+        "a",
+        vec![("p1", Some(p1))],
+        listener,
+        "",
+        crate::serve::server_tests::limits(),
+        false,
+        placement,
+    );
+    map.map_version = 2;
+    map.partitions.extend([part("p3"), part("p4")]);
+    let shared = node.opener.get().unwrap().shared.upgrade().unwrap();
+    rt.block_on(async {
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(map),
+            })
+            .await
+            .unwrap();
+        eventually("p3 to open", async || shared.router.partition("p3").is_ok()).await;
+        let mut taken: Vec<usize> = held.iter().flat_map(|&c| siblings(c)).collect();
+        taken.extend(&held);
+        let new = shared
+            .router
+            .partition("p3")
+            .unwrap()
+            .db
+            .pinned_shard_cpus();
+        assert_eq!(new.len(), 1, "p3's shard pinned");
+        for c in &new {
+            assert!(
+                !taken.contains(c),
+                "p3's shard on {c}: p1's {held:?} with siblings {taken:?}"
+            );
+            assert!(
+                free.contains(c),
+                "p3's shard on {c}, off the free cores {free:?}"
+            );
+        }
+        let e = node.open_part("p4").await.unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+        assert!(
+            e.message.contains("don't fit on this node's free cores"),
+            "{}",
+            e.message
+        );
+        assert!(shared.router.partition("p4").is_err());
+    });
+    drop(shared);
+    drop(stop);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

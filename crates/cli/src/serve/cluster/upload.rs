@@ -470,13 +470,6 @@ impl Drop for Writing {
 /// identity (partition, cluster id, epoch, manifest): the header, and each file's staged
 /// path by name. `None` while any is missing or the ready files disagree. For the install
 /// that D317 ticket 6's open runs.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "D317 ticket 6a PR 1's stamp installs through it (simp724); tested here"
-    )
-)]
 pub(crate) fn ready_set(
     cluster_dir: &Path,
     partition: &str,
@@ -501,11 +494,11 @@ pub(crate) fn ready_set(
 }
 
 /// `<partition>.phdb<suffix>.ready`.
-fn ready_name(partition: &str, suffix: &str) -> String {
+pub(super) fn ready_name(partition: &str, suffix: &str) -> String {
     format!("{partition}.phdb{suffix}.ready")
 }
 
-fn path_with(path: &Path, ext: &str) -> PathBuf {
+pub(super) fn path_with(path: &Path, ext: &str) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(ext);
     PathBuf::from(p)
@@ -599,7 +592,7 @@ fn check_file(f: &PartitionFile) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn write_header(path: &Path, h: &PartitionUploadHeader) -> Result<(), ApiError> {
+pub(super) fn write_header(path: &Path, h: &PartitionUploadHeader) -> Result<(), ApiError> {
     let json = serde_json::to_vec(h).expect("a header serializes");
     let tmp = path_with(path, ".tmp");
     // Written and synced through one writable handle: Windows refuses to flush a file
@@ -617,12 +610,12 @@ fn write_header(path: &Path, h: &PartitionUploadHeader) -> Result<(), ApiError> 
         })
 }
 
-fn read_header(path: &Path) -> Result<PartitionUploadHeader, String> {
+pub(super) fn read_header(path: &Path) -> Result<PartitionUploadHeader, String> {
     let json = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_json::from_slice(&json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn digest(path: &Path) -> Result<[u8; 32], ApiError> {
+pub(super) fn digest(path: &Path) -> Result<[u8; 32], ApiError> {
     let mut f = std::fs::File::open(path)
         .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))?;
     let mut h = Sha256::new();
@@ -639,7 +632,7 @@ fn digest(path: &Path) -> Result<[u8; 32], ApiError> {
     Ok(h.finalize().into())
 }
 
-fn sync_dir(dir: &Path) {
+pub(super) fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();

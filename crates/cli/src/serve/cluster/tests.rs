@@ -563,6 +563,32 @@ fn data_node_full(
     (stop, dbs.pop())
 }
 
+/// Runs `body` for the test `test` in module `module` (its `module_path!()`) in a child
+/// process of the test binary filtered `--exact` to that test alone, so the process-wide
+/// CPU pin claims are its own whatever other tests pin (#1741). In the child, it runs
+/// `body`. The parent checks the child ran it: a filter that matches nothing passes too.
+#[cfg(target_os = "linux")]
+fn run_alone(module: &str, test: &str, body: fn()) {
+    const ALONE: &str = "PHDB_PIN_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some() {
+        return body();
+    }
+    // The test's path without the crate's name, as the harness filters it.
+    let name = format!("{}::{test}", module.split_once("::").unwrap().1);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(ALONE, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the test alone failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}
+
 /// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
 /// epoch 1, with a change feed and the `users` table.
 fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
@@ -615,6 +641,32 @@ fn data_node_many(
     tokio::sync::oneshot::Sender<()>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    // Unpinned: the rig's partitions share the test process's CPUs.
+    let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+    let (stop, dbs, _) = data_node_placed(
+        rt, dir, id, locals, listener, tokens, limits, restart, placement,
+    );
+    (stop, dbs)
+}
+
+/// [`data_node_many`] with `placement` for the partitions it opens while it serves (D317
+/// ticket 6), returning its node too.
+#[allow(clippy::too_many_arguments)]
+fn data_node_placed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+    placement: crate::serve::placement::Placement,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+    Arc<Node>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
     // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
@@ -649,15 +701,12 @@ fn data_node_many(
         metrics,
         feed_runtimes: std::sync::OnceLock::new(),
     });
-    // Partitions a map gives it while it serves open as `run` has them, unpinned here.
+    // Partitions a map gives it while it serves open as `run` has them.
     super::open::attach_opener(
         &node,
         super::open::Opener {
             shared: Arc::downgrade(&shared),
-            placement: Arc::new(crate::serve::placement::Placement::routes_only(
-                Some(2),
-                Some(2),
-            )),
+            placement: Arc::new(placement),
             backups: Arc::clone(&backups),
             options: Box::new(|share, _| {
                 pigeonhole::Options::default()
@@ -701,7 +750,7 @@ fn data_node_many(
         let _in = rt.enter();
         start();
     }
-    (stop, dbs)
+    (stop, dbs, node)
 }
 
 async fn data(port: u16) -> super::proto::data_client::DataClient<tonic::transport::Channel> {
@@ -3544,4 +3593,5 @@ mod fence;
 mod metrics;
 mod open;
 mod several;
+mod stamp;
 mod upload;

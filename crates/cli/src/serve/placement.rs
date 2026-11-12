@@ -668,7 +668,7 @@ fn too_few_cores(cpus: usize, pinned: usize) -> String {
 
 /// `cpu`'s SMT siblings, from sysfs (`0-1` or `0,8` style lists); none if unreadable.
 #[cfg(target_os = "linux")]
-fn siblings(cpu: usize) -> Vec<usize> {
+pub(crate) fn siblings(cpu: usize) -> Vec<usize> {
     let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
     std::fs::read_to_string(path)
         .map(|s| parse_cpu_list(s.trim()))

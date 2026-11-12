@@ -21,6 +21,7 @@ pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod route;
 pub(crate) mod schema;
+pub(crate) mod stamp;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
@@ -920,12 +921,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Err(ApiError::unsupported("not yet").into())
     }
 
+    /// `Cluster.Stamp` (D317 ticket 6): relocate's and restore's first step on the node the
+    /// partition goes to. Cluster scope, as a peer's calls; `phdb cluster relocate` sends it
+    /// with the cluster token. The reply's `files` is the set it installed, if any.
     async fn stamp(
         &self,
-        _req: Request<proto::StampRequest>,
+        req: Request<proto::StampRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        // WIP (D317 ticket 6 PR 1): implemented in the following commits.
-        Err(ApiError::unsupported("not yet").into())
+        self.caller(&req, &[Scope::Cluster, Scope::Admin], "stamp a partition")?;
+        let req = req.into_inner();
+        let id = req.partition.clone();
+        let installed = self.0.stamp(req).await?;
+        let mut lp = self.local(&id).await?;
+        lp.files = installed;
+        Ok(tonic::Response::new(lp))
     }
 
     async fn get_map(
@@ -1656,6 +1665,9 @@ fn open_partition(
     epoch: u64,
     options: pigeonhole::Options,
 ) -> Result<pigeonhole::Pigeonhole, Failure> {
+    // An install a crash interrupted is finished first: the partition never opens with its
+    // marker there (D317 ticket 6, feed1248's F1).
+    stamp::finish_install(dir, partition).map_err(|e| Failure::usage(&e.message))?;
     let path = dir.join(format!("{partition}.phdb"));
     if !path.exists() {
         return Err(Failure::usage(&format!(
