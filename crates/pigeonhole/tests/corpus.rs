@@ -41,10 +41,11 @@ fn corpus_dir() -> PathBuf {
 /// only its README is a placeholder until that release writes it.
 const RELEASE_CORPORA: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
 
-/// Entries only a build with a feature has: `replica` needs `__unstable-replication`, which
-/// `scripts/release-corpus.sh` writes the release corpus with. A build without the feature
-/// still checks such an entry's files against `frozen.txt`, but skips opening it.
-const FEATURE_ENTRIES: [&str; 1] = ["replica"];
+/// Entries only a build with a feature has, each with whether this build has it: `replica`
+/// needs `__unstable-replication`, which `scripts/release-corpus.sh` writes the release corpus
+/// with. A build without the feature still checks such an entry's files against `frozen.txt`,
+/// but skips opening it; a build with it must open it (ai1249's N1 on #1790).
+const FEATURE_ENTRIES: [(&str, bool); 1] = [("replica", cfg!(feature = "__unstable-replication"))];
 
 /// The frozen hash list's name inside a release corpus.
 const FROZEN: &str = "frozen.txt";
@@ -2073,7 +2074,7 @@ fn release_corpus_entries_open_read_check_and_write() {
             // behind a feature this build lacks is skipped (its files were checked above).
             let Some(e) = crate::entries().into_iter().find(|e| e.name == entry) else {
                 assert!(
-                    FEATURE_ENTRIES.contains(&entry),
+                    FEATURE_ENTRIES.iter().any(|&(n, on)| n == entry && !on),
                     "v{version}/{entry}: not an entry of this build"
                 );
                 eprintln!("v{version}/{entry}: behind a feature this build lacks; skipped");
