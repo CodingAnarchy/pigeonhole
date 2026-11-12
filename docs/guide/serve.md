@@ -454,15 +454,15 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
    - The writer validates the map, keeps it, and pushes it to the others.
    - A node that misses the push pulls the map when it next hears from a node that has it, or at its own start.
    - A map may add tables, partitions and nodes, and give a partition another node with a higher epoch. A table's split keys and partitions are fixed once set.
-   - A partition added to a running node's map, or given to it, isn't opened there until the node restarts: nodes open their partitions at start, for now. Until then the node answers calls for it with `PartitionUnavailable` ("isn't open here").
+   - A partition the map gives a running node opens there when the node takes the map, and serves at once ([Fencing and relocation](#fencing-and-relocation)). Until it has opened, the node answers calls for it with `PartitionUnavailable` ("isn't open here").
    - **When the writer is down,** no map change and no schema call can be made. `phdb cluster set-map MAP.json --node URL --force` sets a map at another node:
      - Its version goes above every node `phdb cluster` can reach.
      - The map must name a writer that's up: remove the down node from it, or let another id be the smallest. Give the down node's partitions to other nodes with a higher epoch.
      - When the old writer comes back, it takes the forced map from the others before it changes anything, and follows it.
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
-6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
+6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. A row per partition gives its state on its node: `serving`, `fenced (operator)`, `fenced (awaiting peer map)` or `closed`. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 
-**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for each of its partitions. `--shards`, `--compaction-threads` and `--engine-memory` are the node's totals, split across its partitions ([Partitions per node](#partitions-per-node)). `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. Those come with later steps; until then an upload is staged in `DIR/.phdb-incoming` and nothing installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
+**Flags:** a cluster node takes `--shard-spin`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for each of its partitions. `--shards`, `--compaction-threads` and `--engine-memory` are the node's totals, split across its partitions ([Partitions per node](#partitions-per-node)). `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. An upload is staged in `DIR/.phdb-incoming` until `phdb cluster relocate` installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
 
 **Metrics:** a cluster node's `/metrics` and `Admin.Metrics` label each partition's series `pigeonhole_partition="<id>"`: the engine's, and the feed fan-out's and bulk loads'. The node's own (connections, requests, sessions) carry no label. Each partition also has its unpinned engine threads (`pigeonhole_serve_partition_unpinned_shard_threads`, `…_unpinned_compaction_threads`) and its engine memory (`pigeonhole_serve_partition_memtable_bytes`, `…_block_cache_bytes`, `…_row_cache_bytes`).
 
@@ -477,6 +477,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
   - A forwarded write whose answer was lost after it was sent answers `OutcomeUnknown`, as on a single node. Check before you retry.
   - `CrossPartition` (409): the request can't succeed as written. Split it.
+  - `Fenced` (409): the write's partition is fenced, and nothing was written. Send it again once the partition is unfenced or has moved ([Fencing and relocation](#fencing-and-relocation)).
 
 ### Schema through the cluster
 Tables and their families live in the cluster map (D317 ticket 5). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
@@ -581,9 +582,33 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 - **Positions:** a token's `seqno`s are partition-local. There's no cluster-wide position, so compare progress per partition.
 
 ### Fencing and relocation
-**Comes with D317's ticket 6.** Moving a partition to another node, fencing a partition's old node so it can't write, and dropping a partition are being built. This section will describe them, including which kinds of move keep a feed's tokens.
+A node writes a partition only while its newest map names it for the partition at the file's epoch, and the partition isn't fenced (D317). Moving a partition is manual: fence it, close it, copy its files, then relocate it.
 
-Until then, keep each partition on the node it started on. A node checks its partition file's epoch against the map at start, and nothing yet stops an old node from writing while a new one takes over.
+- **`phdb cluster fence P --node URL`** (admin scope) fences P on the node that serves it.
+  - Its writes then answer `Fenced` through every node, until it's unfenced, closed and moved, or the node restarts with it unfenced.
+  - Reads go on, and so do its flushes and compactions.
+  - The command answers once the writes admitted before the fence have finished. Past 30 s it answers `FailedPrecondition`, naming how many still run.
+  - The fence is kept in `DIR/fenced.json`, so it outlasts a restart.
+- **A restarted node** opens every partition fenced, and unfences each one once a peer's map, at least as new as its own, still names it for the partition at the file's epoch. A node whose peers don't answer keeps them fenced: `phdb cluster status` shows `fenced (awaiting peer map)`, and `fenced (operator)` for a fence of yours. A one-node cluster unfences on its own map.
+- **`phdb cluster unfence P --node URL`** lifts either fence. It's refused unless the node's map names that node for P at its file's epoch.
+- **`phdb cluster close P --node URL`** closes a fenced partition. Its database closes, so its files are final, and its calls answer `PartitionUnavailable`. A call already running on it ends the same way.
+  - The partition's feed hubs end, and their clients resume from their tokens.
+  - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
+  - A failed hash shows in the partition's error, and `close` again retries it.
+  - `unfence` reopens a closed partition.
+- **Copy the closed files to the new node** with `Admin.PartitionUpload`. They're staged in its `DIR/.phdb-incoming`, and nothing serves them yet.
+- **`phdb cluster relocate P --to ID --node URL`** moves P to node `ID`, whose staging holds its files. (`--node` is the node the command talks to, as in every `phdb cluster` command.)
+  - It checks that P is fenced or closed on the node serving it. `--old-unreachable` skips that check, for a node whose process you've stopped.
+  - The new node installs the files and takes the next epoch. Then the map gives it P, and it serves at once.
+  - An install interrupted by a crash finishes the next time the node is stamped or opens P.
+  - Run again once done, `relocate` answers that the map already gives P to that node.
+  - A move by file copy restarts the partition's feed history. Keeping it (`--copy`) comes with the next step.
+- **`phdb cluster drop-partition P --node URL`** moves P's files on the old node into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`. It's refused while the map still places P on that node, or while P is open there, so close it first.
+  - Nothing is deleted, and nothing is freed until you delete that directory, once you've checked the move.
+- **A node opens a partition while it serves** when a map gives it one. Its share of the node's `--shards`, `--compaction-threads` and `--engine-memory` is the share it would get at start for the new set of partitions, and the partitions already open keep theirs.
+  - It opens on the free cores, off every open partition's shard cores and their SMT siblings. If its shards don't fit there, the open is refused, naming how many would run unpinned, rather than put on a sibling.
+  - **The server's threads then move off the new shards' CPUs** (or back onto a closed partition's), and a log line names the new CPUs. Their counts stay as the server started them, since a runtime can't be resized. After a partition opens, the network, feed and blocking threads share fewer CPUs, and run more of them per CPU than a node started with that partition would. Restart the node to size them again.
+- **Errors:** `Fenced` (409, gRPC `FAILED_PRECONDITION`) means the write wasn't applied because its partition is fenced. Send it again once the partition is unfenced or has moved: a node that takes it reroutes to the new owner.
 
 ### Backup and restore
 - **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json`.

@@ -328,7 +328,7 @@
   - A single node takes `--compaction-threads` too, as its database's `compaction_cores`.
 - **Shards first (perf287's g75):** with several partitions, the node reserves its compaction CPUs before any engine opens: the `--compaction-threads` CPUs that come after all the partitions' shards in the engine's pin order. Every partition's compaction threads are confined to them (`compaction_cpu_set`). So each engine's pin plan holds only its shards, and the shards take the first CPUs together, as one engine's would. Opened one after another without this, each engine pinned its shards and then its compaction threads, interleaving them. The network mask was then split across the AX102's two L3 domains, and its threads ran at 0.70 IPC against 0.91 at one partition (25% less Get throughput). A partition whose feed keeps more shards than its share pins the extra ones onto the reserved CPUs.
 - **The pinning check:** after each open, the node prints the partition's shard and compaction threads, pinned, confined and unpinned. On Linux, an engine with unpinned threads is a warning naming the reason. `/metrics` has `pigeonhole_serve_partition_unpinned_shard_threads` and `pigeonhole_serve_partition_unpinned_compaction_threads`, labelled `pigeonhole_partition`.
-- **The network mask** (D313's R1, #1697) leaves out the shards' CPUs of every partition on the node: the union of their shard threads' CPUs and SMT siblings. The engines' compaction CPUs stay in the mask. g72 (#1703 comment 6787495064) measured leaving them out too: on one node it cost the network side about 3x its throughput, and #1703 stays open for 1.3.0 (the coordinator's call). The startup line counts the shard CPUs left out and the compaction CPUs not. Recomputing the mask after a relocation opens a partition is ticket 6's.
+- **The network mask** (D313's R1, #1697) leaves out the shards' CPUs of every partition on the node: the union of their shard threads' CPUs and SMT siblings. The engines' compaction CPUs stay in the mask. g72 (#1703 comment 6787495064) measured leaving them out too: on one node it cost the network side about 3x its throughput, and #1703 stays open for 1.3.0 (the coordinator's call). The startup line counts the shard CPUs left out and the compaction CPUs not (the reserved ones, where compaction is confined). Ticket 6 reapplies the masks when a partition opens or closes on a running node.
 
 **Engine memory (§10; cli692's M3, perf287's A3):**
 - **`--engine-memory BYTES`** covers the memtables, block cache and row cache. Unset, every database takes the library's defaults (64 MiB of memtable per shard, a 256 MiB block cache, a 64 MiB row cache), as before.
@@ -340,6 +340,77 @@
 - **Reported:** each partition's resolved numbers are on its startup line, and in `/metrics` as `pigeonhole_serve_partition_memtable_bytes`, `pigeonhole_serve_partition_block_cache_bytes` and `pigeonhole_serve_partition_row_cache_bytes`, labelled `pigeonhole_partition`.
 
 **Not changed:** a single node answers as before, with the same mask. Its startup line adds the shard and compaction CPU counts, and it takes the two new flags.
+
+## Ticket 6 PR 1: fencing, close, stamp and relocation
+**A node writes P only while its newest map names it for P at P's file's epoch, and P isn't fenced** (D317, amendment 2).
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- **`Cluster` RPCs:**
+  - `Fence`, `Unfence`, `Close` and `DropPartition` take `PartitionRequest { partition }` and answer the partition's `LocalPartition`. They're admin scope.
+  - `Stamp(StampRequest)` answers `LocalPartition`, with `files` set to the set it installed. It's cluster or admin scope.
+- **`LocalPartition`** gains three fields:
+  - `state = 10`: a `LocalPartitionState`, one of `SERVING`, `FENCED`, `CLOSED` or `OPENING`;
+  - `files = 11`: a closed partition's files once hashed, as `PartitionFile`;
+  - `fence_reason = 12`: a `FenceReason`, `OPERATOR` or `AWAITING_PEER_MAP`, set only when `FENCED`.
+- **`StampRequest`** has six fields: `cluster_id`, `partition`, `from_epoch`, `to_epoch`, `restore` and `restore_from_cluster_id`.
+- **A new code, `Fenced`:** gRPC `FAILED_PRECONDITION`, HTTP 409. Nothing is written. The sender passes it through unchanged and never retries it.
+
+**The write gate:** each partition's writes take a gate: an in-flight count, a fence flag and a `Notify`, with `SeqCst` admission (Dekker-style).
+- **What takes it:**
+  - every write;
+  - a transaction's `Commit` when the transaction wrote or the commit carries rows;
+  - bulk loads, text and vector index builds and rebalances;
+  - the schema reconcile. It skips an operator-fenced partition, and its unfence runs it.
+- **Lock order:** the gate comes after the service's admission (budget, scope) and is held until the write's commit ends, past its reply for a write that runs detached.
+- **`Fence`** sets the flag, persists `DIR/fenced.json`, and waits up to 30 s for the writes admitted before it.
+- **`Unfence`** checks that the map names the node at the file's epoch, persists `fenced.json`, reconciles the schema, and clears the flag last.
+- **Start:** every partition opens fenced. A peer's map at least as new as the node's own, naming the node at the file's epoch, unfences it. The sources are `sync_on_start`, a push from a peer, and a retry loop (250 ms up to 5 s). A one-node cluster unfences on its own map. An operator's fence stays.
+- **Not stopped by a fence:** a text index rebuild runs to its end, since the library rebuilds an index in one call. The fence's drain waits for it within its deadline. A per-batch hook in pigeonhole-text is a 1.3.0 follow-up.
+
+**Opening on a running node:** `Parts` is an `ArcSwap` of id to service, swapped under the node's open lock.
+- **When:**
+  - a map that gives the node a partition not open there opens it, then unfences it on that map;
+  - `unfence` reopens a closed partition.
+- **Its share** is the node's totals split for the new set. Open engines keep theirs; resharing an open engine is out of scope.
+- **Where it opens (the coordinator's mask directive):** on a fresh thread that first takes the narrow free-core mask (`Placement::enter`). `pin_plan` plans from the calling thread's mask, so the new shards land off every open partition's shard cores and their SMT siblings.
+- **Too few free cores:** where the new partition's shards don't fit, the open is refused, never pinned onto a sibling or left unpinned.
+- **The mask reapply:** each runtime's masks sit in an `ArcSwap` with a generation, published before the bump.
+  - A thread records its role and reapplies its mask when the generation moved.
+  - The triggers are the request, feed and hub runtimes' park and unpark hooks, each `Service::call`, and each blocking task's start, so a busy worker takes it at its next call.
+  - Thread counts stay as started (Tokio can't resize a runtime), so a mask that shrank has more threads per CPU (cli692 on #1745).
+
+**Close (amendment 2):**
+- **It refuses an unfenced partition,** then waits 30 s for the fence's writes.
+- **Then, in order:**
+  1. it swaps the partition out of `Parts`;
+  2. its feed hubs fail (their clients resume from their tokens);
+  3. its bulk load, text rebuilds and index threads end;
+  4. its database closes.
+- **It answers `CLOSED` at once.** Each file is hashed on a blocking thread (SHA-256, then `posix_fadvise(DONTNEED)` on Linux).
+  - A failed hash sets `error`, and `close` again retries it.
+  - A call already running on the partition answers `PartitionUnavailable`, not the engine's `Closed`.
+
+**Stamp:** refused while P is open here.
+1. **The staged set is checked** (upload's `ready_set`): the header against the request, and each staged file's size and SHA-256 against the manifest, before any rename (feed1248's F2).
+2. **The install is resumable (F1):**
+   - it writes `.phdb-incoming/<P>.installing` (the header) first;
+   - it moves P's files outside the manifest aside to `<file>.replaced`, renames the staged files in, and syncs the directory;
+   - it removes the marker last, then P's leftover staged files (N2).
+   - A stamp or an open that finds the marker rolls it forward, checking the files already renamed against the manifest. P never opens while the marker is there.
+3. **The identity row is raised** from `from_epoch` to `to_epoch`.
+   - Already at `to_epoch`: success, nothing done.
+   - A stale file is refused unless `restore`.
+   - With `restore_from_cluster_id`, the file must name that cluster, and is rewritten to this one.
+
+**CLI:**
+- **`phdb cluster fence | unfence | close | drop-partition P --node URL`.**
+- **`phdb cluster relocate P --to ID --node URL [--old-unreachable]`.** The target is `--to ID`, since `--node` is the URL every `phdb cluster` command reaches a node by.
+  - It checks that P is fenced or closed on its node (cli692's S7; closed for an in-place restore), unless `--old-unreachable`.
+  - Then it stamps the target from `e` to `e + 1`, and sets the map through the writer.
+  - Run again once done, it answers done.
+  - `--copy` (keeping the feed history, `SetMapRequest.copies = 4`) comes with feed1248's #1729, ticket 6 PR 2.
+- **`drop-partition`** moves P's files and any `.replaced` ones into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`, deleting nothing. It refuses while the map places P on the node or P is open there.
+- **`phdb cluster status`** gives each partition's state, for example `fenced (operator)`.
 
 ## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
 **`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
