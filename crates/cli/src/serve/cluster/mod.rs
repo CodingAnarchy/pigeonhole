@@ -1701,6 +1701,27 @@ pub(crate) fn partition_options(
     options
 }
 
+/// Opens the database at `path` for writing, retrying a moment while a read-only open of
+/// the file holds its writer lock (an operator's `phdb info`, another node's tooling): 50 ms,
+/// doubling, about 1.5 s in all, then the refusal stands (#1770).
+pub(crate) fn open_retrying(
+    path: &Path,
+    options: &pigeonhole::Options,
+) -> pigeonhole::Result<pigeonhole::Pigeonhole> {
+    let mut wait = std::time::Duration::from_millis(50);
+    loop {
+        match pigeonhole::Pigeonhole::open(path, options.clone()) {
+            Err(e)
+                if e.code() == pigeonhole::ErrorCode::WriterLocked && wait.as_millis() <= 800 =>
+            {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            opened => return opened,
+        }
+    }
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -1722,21 +1743,7 @@ fn open_partition(
             path.display()
         )));
     }
-    // A read-only open of the file (an operator's `phdb info`, say) holds the writer lock
-    // briefly and refuses this open: retried for a moment, rather than leaving the partition
-    // unopened until the next map (#1770).
-    let mut wait = std::time::Duration::from_millis(50);
-    let db = loop {
-        match pigeonhole::Pigeonhole::open(&path, options.clone()) {
-            Err(e)
-                if e.code() == pigeonhole::ErrorCode::WriterLocked && wait.as_millis() <= 800 =>
-            {
-                std::thread::sleep(wait);
-                wait *= 2;
-            }
-            opened => break opened.map_err(|e| Failure::db("open the partition", &e))?,
-        }
-    };
+    let db = open_retrying(&path, &options).map_err(|e| Failure::db("open the partition", &e))?;
     let want = identity::Identity {
         cluster_id: cluster_id.to_owned(),
         partition_id: partition.to_owned(),
