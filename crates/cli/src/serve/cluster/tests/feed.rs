@@ -695,3 +695,86 @@ fn a_partition_whose_node_never_answers_doesnt_hold_up_the_others() {
     rt.shutdown_background();
     let _ = db_a.map(pigeonhole::Pigeonhole::close);
 }
+
+/// `phdb cluster move` (D317 ticket 6): p1 moves from a to c with its files copied whole, so
+/// a token taken before the move resumes after it, through another node, with no gap and no
+/// repeat. `--drop-source` moves a's files aside once the copy checks out. Run again, the
+/// move is done.
+#[test]
+fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
+    let t = Three::start();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        let mut s = subscribe(c, users()).await.unwrap();
+        let before = rows("before", 8);
+        for row in &before {
+            put(c, row, "v").await;
+        }
+        let (seen, _) = commits(&mut s, before.len()).await;
+        drop(s);
+        // The last checkpoint, and the commits after it that a resume delivers.
+        let at = seen.iter().rposition(|x| x.token.is_some()).unwrap();
+        let token = seen[at].token.clone().unwrap();
+        let mut want: Vec<String> = seen[at + 1..].iter().flat_map(|x| x.rows.clone()).collect();
+
+        let r = super::super::moving::run(&args, "p1", "c", true)
+            .await
+            .unwrap();
+        assert_eq!(r.document["verified"], true, "{:?}", r.document);
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let source = r.document["source"].as_str().unwrap();
+        assert!(source.starts_with("moved aside"), "{source}");
+        let copied: Vec<&str> = r.document["copied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(copied.contains(&""), "the main file: {copied:?}");
+        assert!(copied.contains(&"-feed"), "the feed's file: {copied:?}");
+        assert!(!t.dirs[0].join("p1.phdb").exists(), "a's files went aside");
+        assert!(t.dirs[2].join("p1.phdb").exists());
+
+        // Writes reach p1 on c, through a.
+        let after = rows("after", 8);
+        for row in &after {
+            put(a, row, "v").await;
+        }
+        want.extend(after.iter().cloned());
+
+        // The token from before the move resumes through b: every commit after it, once.
+        let mut s = subscribe(
+            b,
+            SubscribeRequest {
+                start: Some(Start::Resume(token)),
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        let (seen, _) = commits(&mut s, want.len()).await;
+        in_order(&seen);
+        let mut got: Vec<String> = seen.iter().flat_map(|x| x.rows.clone()).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "no gap and no repeat across the move");
+        if let Ok(Ok(Some(e))) = tokio::time::timeout(Duration::from_millis(500), s.message()).await
+        {
+            assert!(
+                !matches!(e.event, Some(Event::Commit(_))),
+                "nothing more: {e:?}"
+            );
+        }
+
+        // Again: done.
+        let r = super::super::moving::run(&args, "p1", "c", true)
+            .await
+            .unwrap();
+        assert!(r.document.contains_key("done"), "{:?}", r.document);
+    });
+}

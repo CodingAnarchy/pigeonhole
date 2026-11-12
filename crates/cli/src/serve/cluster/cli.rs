@@ -149,6 +149,28 @@ pub(crate) enum ClusterCommand {
         #[arg(long, conflicts_with = "old_unreachable")]
         copy: bool,
     },
+    /// Move a partition to node `--to` with its files copied whole, so its change-feed
+    /// history and tokens carry over: fence and close it on the node serving it, copy every
+    /// file (the main file, the WAL files a clean close keeps, the feed's) to `--to`, stamp
+    /// it there at the next epoch, check the installed set against the closed one (name,
+    /// size, SHA-256), set the map (`relocate --copy`) and wait for `--to` to serve it.
+    /// Writes answer `Fenced` from the fence until the map moves; reads are down from the
+    /// close until `--to` serves. Both grow with the files' size, so with the feed's
+    /// retention. Run it again to resume one that stopped. The old node's files stay
+    /// unless `--drop-source`.
+    Move {
+        partition: String,
+        /// The node id it moves to.
+        #[arg(long, value_name = "ID")]
+        to: String,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Once the copy is checked and `--to` serves the partition, move the old node's
+        /// files aside there (`drop-partition`: nothing is deleted). Skipped when a rerun
+        /// finds the copy made earlier, which it can't check again.
+        #[arg(long)]
+        drop_source: bool,
+    },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
     /// is deleted: delete that directory once the move is checked. It frees no space
@@ -231,6 +253,12 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
         ClusterCommand::Close { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Close))
         }
+        ClusterCommand::Move {
+            partition,
+            to,
+            node,
+            drop_source,
+        } => runtime()?.block_on(super::moving::run(node, partition, to, *drop_source)),
         ClusterCommand::DropPartition { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Drop))
         }
@@ -540,10 +568,13 @@ pub(super) fn column(name: &'static str) -> Column {
     Column { name, brief: true }
 }
 
-type Client = proto::cluster_client::ClusterClient<tonic::transport::Channel>;
+pub(super) type Client = proto::cluster_client::ClusterClient<tonic::transport::Channel>;
 
 /// A client for the node at `url`, and the token to present.
-async fn connect(args: &NodeArgs, url: &str) -> Result<(Client, Option<String>), Failure> {
+pub(super) async fn connect(
+    args: &NodeArgs,
+    url: &str,
+) -> Result<(Client, Option<String>), Failure> {
     let (channel, token) = channel(args, url).await?;
     Ok((proto::cluster_client::ClusterClient::new(channel), token))
 }
@@ -602,7 +633,7 @@ pub(super) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Reque
 }
 
 /// A node's URL from its map address, in the scheme `--node` uses.
-fn url_of(args: &NodeArgs, address: &str) -> String {
+pub(super) fn url_of(args: &NodeArgs, address: &str) -> String {
     let scheme = if args.node.starts_with("https://") {
         "https"
     } else {
