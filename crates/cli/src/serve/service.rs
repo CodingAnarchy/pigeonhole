@@ -619,6 +619,10 @@ pub(crate) struct Metrics {
     duration_sum_us: [AtomicU64; RPCS.len()],
     pub(crate) shed: AtomicU64,
     pub(crate) replies_lost: AtomicU64,
+    /// Feed subscriptions ended at `--stream-idle-ms`: a client that left an event untaken
+    /// (a single node), or took nothing (a cluster subscription's watchdog, #1758's B).
+    /// A cluster subscription's parts aren't counted: the subscription is, once.
+    pub(crate) feed_idle_drops: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -629,6 +633,7 @@ impl Default for Metrics {
             duration_sum_us: std::array::from_fn(|_| AtomicU64::new(0)),
             shed: AtomicU64::new(0),
             replies_lost: AtomicU64::new(0),
+            feed_idle_drops: AtomicU64::new(0),
         }
     }
 }
@@ -716,6 +721,12 @@ impl Metrics {
             out,
             "pigeonhole_serve_replies_lost_total {}",
             self.replies_lost.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "# TYPE pigeonhole_serve_feed_idle_drops_total counter");
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_feed_idle_drops_total {}",
+            self.feed_idle_drops.load(Ordering::Relaxed)
         );
         out
     }
@@ -3532,7 +3543,14 @@ impl Service {
                 announce,
             },
             slot,
-            move |e| metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed()),
+            move |e| {
+                // A client's own subscription that hit the idle limit; a cluster
+                // subscription's part (`announce`) is counted with its subscription.
+                if !announce && e.is_some_and(|e| e.code == "DeadlineExceeded") {
+                    metrics.feed_idle_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed());
+            },
         )
     }
 
