@@ -4552,6 +4552,11 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **B3 across the hop:** a forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`.
 - **Recovery when the writer is down:** `phdb cluster set-map --force` at any node, refused without the flag. Its version goes above every reachable node's, and it must name a reachable writer: remove the down node, or let another id be the smallest. A node that restarts with a map changes none as the writer until it has taken its peers' newer maps, so a writer back after a forced recovery follows the forced map. Force is for a writer that's down: one that's up but cut off can make a change the forced map then loses, and the guide says so.
 
+**D317 amendment 2 (coordinator, 2026-11-11; ticket 6, ICR 0117's ticket 6 section): `phdb cluster close`.** A fence alone keeps a partition's reads served and its flushes and compactions running, so its files keep changing, and a raw copy of them isn't consistent.
+- **`phdb cluster close P --node N`** takes a fenced partition to closed: its database closes and its files are final. Its calls answer `PartitionUnavailable`, and `unfence` reopens it.
+- **`Cluster.Status`** lists a closed partition's files with their SHA-256 (ICR 0135's `database_files`), hashed after the close answers.
+- **The manual order (owner-approved):** fence, then close, then copy or restore, then `relocate`. `relocate` stamps the new node's file from the map's epoch `e` to `e + 1`, then sets the map with P on the new node at `e + 1`.
+
 <a id="d318"></a>
 ## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
 

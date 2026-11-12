@@ -249,21 +249,29 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
 /// N1 on #1720), on the installing thread, before the map's routes serve, and that service's
 /// cached handles go. Runs once now, for the map the node starts with.
 pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
-    let Some(cluster) = shared.router.cluster.as_ref() else {
-        return;
-    };
-    if cluster.parts.is_empty() {
+    // Attached on a node that only routes too: a partition may open there later (ticket 6).
+    if shared.router.cluster.is_none() {
         return;
     }
     let weak = Arc::downgrade(shared);
     let run = move |map: &ClusterMap| -> Option<Vec<(String, Outcome)>> {
         let shared = weak.upgrade()?;
-        let parts = &shared.router.cluster.as_ref()?.parts;
+        let parts = shared.router.cluster.as_ref()?.parts.load_full();
         let mut outcomes = Vec::with_capacity(parts.len());
         for (partition, service) in parts.iter() {
             let Ok(part) = service.part() else {
                 continue;
             };
+            // An operator's fence (D317 ticket 6) leaves the files as they are: the
+            // partition takes the map's schema when it's unfenced or reopened, and Status
+            // shows its reconcile behind the map meanwhile. A start fence doesn't: the
+            // partition's tables must be there when it's unfenced. Counted on the gate
+            // first, then the fence read, so a fence's drain waits for a reconcile it
+            // didn't stop.
+            let held = service.gate().map(|g| g.hold());
+            if let Some((_, Some(crate::serve::gate::Fence::Operator))) = held {
+                continue;
+            }
             // The partition's schema lock, as a single node's create and drop take it: no
             // create or drop of its own runs across a reconcile.
             let _schema = part.schema.blocking_lock();

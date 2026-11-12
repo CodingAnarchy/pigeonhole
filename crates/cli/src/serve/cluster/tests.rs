@@ -563,6 +563,32 @@ fn data_node_full(
     (stop, dbs.pop())
 }
 
+/// Runs `body` for the test `test` in module `module` (its `module_path!()`) in a child
+/// process of the test binary filtered `--exact` to that test alone, so the process-wide
+/// CPU pin claims are its own whatever other tests pin (#1741). In the child, it runs
+/// `body`. The parent checks the child ran it: a filter that matches nothing passes too.
+#[cfg(target_os = "linux")]
+fn run_alone(module: &str, test: &str, body: fn()) {
+    const ALONE: &str = "PHDB_PIN_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some() {
+        return body();
+    }
+    // The test's path without the crate's name, as the harness filters it.
+    let name = format!("{}::{test}", module.split_once("::").unwrap().1);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(ALONE, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the test alone failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("1 passed"), "{stdout}");
+}
+
 /// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
 /// epoch 1, with a change feed and the `users` table.
 fn test_partition(dir: &Path, p: &str) -> pigeonhole::Pigeonhole {
@@ -615,8 +641,39 @@ fn data_node_many(
     tokio::sync::oneshot::Sender<()>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    // Unpinned: the rig's partitions share the test process's CPUs.
+    let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+    let (stop, dbs, _) = data_node_placed(
+        rt, dir, id, locals, listener, tokens, limits, restart, placement, None,
+    );
+    (stop, dbs)
+}
+
+/// [`data_node_many`] with `placement` for the partitions it opens while it serves (D317
+/// ticket 6), returning its node too. `engine_memory`: the node's `--engine-memory`, split
+/// across `locals` at start as `run` splits it ([`super::start_budget`]), and what a
+/// partition opened later gets what's left of.
+#[allow(clippy::too_many_arguments)]
+fn data_node_placed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+    placement: crate::serve::placement::Placement,
+    engine_memory: Option<u64>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+    Arc<Node>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
+    // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
+    node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
     let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
     let backup_dir = dir.join(format!("backups-{id}"));
@@ -624,13 +681,31 @@ fn data_node_many(
     let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
     let mut dbs = Vec::new();
     let mut parts = Vec::new();
-    for (p, db) in locals {
+    // Each partition's memory as `run` plans it, one shard each.
+    let mine: Vec<(String, u64)> = locals.iter().map(|(p, _)| ((*p).to_owned(), 1)).collect();
+    let (_, memories) = super::start_budget(
+        node.get_map().ok().as_ref(),
+        &mine,
+        mine.len().max(1),
+        0,
+        engine_memory,
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message()));
+    for (i, (p, db)) in locals.into_iter().enumerate() {
         let db = db.unwrap_or_else(|| test_partition(dir, p));
         let pinning = crate::serve::service::Pinning::default();
-        let memory = crate::serve::placement::Memory::defaults(1);
+        let memory = memories
+            .as_ref()
+            .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
+        // Fenced as `run` opens it (D317 ticket 6). A restarted node waits for its peers'
+        // maps to unfence it; a fresh one stands for a node already serving.
+        let gate = node.open_gate(p, 1);
+        if !restart {
+            gate.unfence();
+        }
         parts.push((
             p.to_owned(),
-            service.for_partition(db.clone(), p, &backups, pinning, memory),
+            service.for_partition(db.clone(), p, &backups, pinning, memory, gate),
         ));
         dbs.push(db);
     }
@@ -639,7 +714,25 @@ fn data_node_many(
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
+        feed_runtimes: std::sync::OnceLock::new(),
     });
+    // Partitions a map gives it while it serves open as `run` has them.
+    super::open::attach_opener(
+        &node,
+        super::open::Opener {
+            shared: Arc::downgrade(&shared),
+            placement: Arc::new(placement),
+            backups: Arc::clone(&backups),
+            options: Box::new(|share, _| {
+                pigeonhole::Options::default()
+                    .default_shards(share.shards)
+                    .compaction_cores(share.compaction)
+            }),
+            shards: 1,
+            compaction: 0,
+            engine_memory,
+        },
+    );
     super::schema::attach(&node, &shared);
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
     let start = if restart {
@@ -672,7 +765,7 @@ fn data_node_many(
         let _in = rt.enter();
         start();
     }
-    (stop, dbs)
+    (stop, dbs, node)
 }
 
 async fn data(port: u16) -> super::proto::data_client::DataClient<tonic::transport::Channel> {
@@ -3577,7 +3670,11 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
 
 mod backup;
 mod charge;
+mod close;
 mod feed;
+mod fence;
 mod metrics;
+mod open;
 mod several;
+mod stamp;
 mod upload;

@@ -23,6 +23,8 @@
 //!   worker inherits the wide mask too, so a partition opened at run time (D317 ticket 6)
 //!   must open off the workers.
 
+use std::sync::Arc;
+
 use pigeonhole::Pigeonhole;
 
 /// Each runtime's CPUs, sorted; `None` runs it where the OS puts it (`--affinity off`,
@@ -279,6 +281,92 @@ pub(crate) struct Placement {
     /// the network side 3x its throughput for them (#1703). For the startup line.
     pub shard_cpus: usize,
     pub compaction_cpus: usize,
+    /// The masks the threads take now, which a reapply replaces when a cluster node opens or
+    /// closes a partition (D317 ticket 6): shared by every clone.
+    live: Arc<Live>,
+}
+
+/// The masks reapplied while the server runs (D317 ticket 6, cli692's (b)): published, then
+/// the generation bumped, so a thread that sees the new generation loads the new masks.
+/// Each thread reapplies its runtime's mask when the generation moved: as a worker parks or
+/// unparks, and as a call or blocking task of ours starts on it ([`refresh`]), since a busy
+/// worker may not park for a while (the coordinator, 2026-11-11). Thread counts stay as the
+/// server started them (Tokio can't resize a runtime): a mask that shrinks leaves its
+/// threads more of them per CPU (cli692 on #1745).
+#[derive(Debug, Default)]
+struct Live {
+    masks: arc_swap::ArcSwap<RuntimeMasks>,
+    generation: std::sync::atomic::AtomicU64,
+    /// The process's CPUs, which a thread masked to `None` gets back.
+    process: Vec<usize>,
+}
+
+/// Which runtime's mask a thread takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Network,
+    Blocking,
+    Feed,
+    Hub,
+}
+
+impl RuntimeMasks {
+    fn of(&self, role: Role) -> Option<&[usize]> {
+        match role {
+            Role::Network => self.network.as_deref(),
+            Role::Blocking => self.blocking.as_deref(),
+            Role::Feed => self.feed.as_deref(),
+            Role::Hub => self.hub.as_deref(),
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's placement, its role and the generation of the mask it last applied.
+    static THREAD: std::cell::RefCell<Option<(Arc<Live>, Role, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Reapplies the calling thread's mask if a reapply published a newer one since it last
+/// did: one atomic load against a thread-local when nothing changed. Called as each call
+/// and blocking task of ours starts, and from the runtimes' park and unpark hooks. A thread
+/// no placement entered does nothing.
+pub(crate) fn refresh() {
+    THREAD.with_borrow_mut(|t| {
+        let Some((live, role, seen)) = t else {
+            return;
+        };
+        let now = live.generation.load(std::sync::atomic::Ordering::Acquire);
+        if now != *seen {
+            *seen = now;
+            apply_to(&live.process, live.masks.load().of(*role));
+        }
+    });
+}
+
+/// Masks the calling thread to `cpus` (Linux). `None` means where the OS puts it, so the
+/// thread gets `process`'s CPUs back: a reapply after a recompute that lands on no
+/// mask (D317 ticket 6: `--affinity off`, or too few free cores once a partition opens)
+/// must not leave a thread on an old mask that may now hold a new shard's CPU (ai1249's
+/// N1 on #1738). Without a process set (another OS, a node that only routes), it leaves
+/// the thread be.
+fn apply_to(process: &[usize], cpus: Option<&[usize]>) {
+    #[cfg(target_os = "linux")]
+    {
+        let cpus = cpus.unwrap_or(process);
+        if cpus.is_empty() {
+            return;
+        }
+        let mut mask = nix::sched::CpuSet::new();
+        for &c in cpus {
+            let _ = mask.set(c);
+        }
+        // The calling thread: pid 0. A failure leaves the thread where the OS put it,
+        // which is correct, only slower.
+        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &mask);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (process, cpus);
 }
 
 impl Placement {
@@ -345,8 +433,14 @@ impl Placement {
             note,
             shard_cpus: pinned.len(),
             compaction_cpus,
+            live: Arc::default(),
         };
         plan.masks = plan.masks(&pinned);
+        plan.live = Arc::new(Live {
+            masks: arc_swap::ArcSwap::from_pointee(plan.masks.clone()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            process: plan.process.clone(),
+        });
         plan
     }
 
@@ -383,7 +477,37 @@ impl Placement {
             note: None,
             shard_cpus: 0,
             compaction_cpus: 0,
+            live: Arc::default(),
         }
+    }
+
+    /// Recomputes every runtime's mask for `pinned`, the shard CPUs of the partitions open
+    /// now, and publishes it: each thread takes it at its next [`refresh`] (D317 ticket 6).
+    /// The new masks.
+    pub(crate) fn reapply(&self, pinned: &[usize]) -> RuntimeMasks {
+        let masks = self.masks(pinned);
+        self.live.masks.store(Arc::new(masks.clone()));
+        self.live
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        masks
+    }
+
+    /// The masks the threads take now: the start's, or the last reapply's.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn current(&self) -> RuntimeMasks {
+        (**self.live.masks.load()).clone()
+    }
+
+    /// Masks the calling thread to `role`'s CPUs now, and records it, so its [`refresh`]
+    /// follows later reapplies.
+    fn enter_as(&self, role: Role) {
+        let now = self
+            .live
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        apply_to(&self.live.process, self.live.masks.load().of(role));
+        THREAD.with_borrow_mut(|t| *t = Some((Arc::clone(&self.live), role, now)));
     }
 
     /// The CPUs the server's own heavy threads may run on, as a CPU list (`2-7,10`), when the
@@ -403,7 +527,7 @@ impl Placement {
     /// Called on each of the server's own heavy threads as it starts (bulk loads, index
     /// builds and rebalancers, `Replication.Follow`, embedding): the free cores only.
     pub(crate) fn enter(&self) {
-        self.apply(self.masks.blocking.as_deref());
+        self.enter_as(Role::Blocking);
     }
 
     /// Called on each request runtime thread as it starts. Tokio runs it on the runtime's
@@ -424,51 +548,38 @@ impl Placement {
     /// Nothing may call `tokio::task::block_in_place` (nothing in the workspace or its
     /// dependencies does, ai1249 on #1738): a worker that gives up its core there goes back
     /// to the blocking pool still widened, and a pool thread would then run heavy calls on
-    /// the siblings. A reapply (D317 ticket 6) can't re-widen workers through this hook
-    /// either, since `WIDENED` stays set: it masks workers and pool threads apart.
+    /// the siblings. After the first, it reapplies a newer mask a reapply published (D317
+    /// ticket 6), as [`refresh`] does.
     pub(crate) fn unpark_network(&self) {
-        thread_local! {
-            static WIDENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        let widened = THREAD.with_borrow(|t| matches!(t, Some((_, Role::Network, _))));
+        if widened {
+            refresh();
+        } else {
+            self.enter_as(Role::Network);
         }
-        if !WIDENED.get() {
-            WIDENED.set(true);
-            self.apply(self.masks.network.as_deref());
-        }
+    }
+
+    /// Counts `cpus`, the node's reserved compaction CPUs its partitions' compaction threads
+    /// are confined to (ICR 0134), among the compaction CPUs the mask doesn't leave out, as
+    /// pinned ones are.
+    pub(crate) fn confined_compaction(&mut self, cpus: &[usize]) {
+        self.compaction_cpus += cpus.len();
+    }
+
+    /// Whether the server's own threads are masked to the free cores ([`Placement::enter`]):
+    /// pinning works here, and the shards are pinned.
+    pub(crate) fn masked(&self) -> bool {
+        self.masks.blocking.is_some()
     }
 
     /// Called on each feed runtime worker as it starts.
     pub(crate) fn enter_feed(&self) {
-        self.apply(self.masks.feed.as_deref());
+        self.enter_as(Role::Feed);
     }
 
     /// Called on each feed hub runtime worker as it starts.
     pub(crate) fn enter_hub(&self) {
-        self.apply(self.masks.hub.as_deref());
-    }
-
-    /// Masks the calling thread to `cpus` (Linux). `None` means where the OS puts it, so the
-    /// thread gets the process's CPUs back: a reapply after a recompute that lands on no
-    /// mask (D317 ticket 6: `--affinity off`, or too few free cores once a partition opens)
-    /// must not leave a thread on an old mask that may now hold a new shard's CPU (ai1249's
-    /// N1 on #1738). Without a process set (another OS, a node that only routes), it leaves
-    /// the thread be.
-    pub(crate) fn apply(&self, cpus: Option<&[usize]>) {
-        #[cfg(target_os = "linux")]
-        {
-            let cpus = cpus.unwrap_or(&self.process);
-            if cpus.is_empty() {
-                return;
-            }
-            let mut mask = nix::sched::CpuSet::new();
-            for &c in cpus {
-                let _ = mask.set(c);
-            }
-            // The calling thread: pid 0. A failure leaves the thread where the OS put it,
-            // which is correct, only slower.
-            let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &mask);
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = cpus;
+        self.enter_as(Role::Hub);
     }
 }
 
@@ -655,7 +766,7 @@ fn too_few_cores(cpus: usize, pinned: usize) -> String {
 
 /// `cpu`'s SMT siblings, from sysfs (`0-1` or `0,8` style lists); none if unreadable.
 #[cfg(target_os = "linux")]
-fn siblings(cpu: usize) -> Vec<usize> {
+pub(crate) fn siblings(cpu: usize) -> Vec<usize> {
     let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
     std::fs::read_to_string(path)
         .map(|s| parse_cpu_list(s.trim()))
@@ -663,8 +774,7 @@ fn siblings(cpu: usize) -> Vec<usize> {
 }
 
 /// `cpus` (sorted) as a CPU list, runs joined: `[0, 1, 2, 8]` is `0-2,8`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn format_cpu_list(cpus: &[usize]) -> String {
+pub(crate) fn format_cpu_list(cpus: &[usize]) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < cpus.len() {
@@ -874,6 +984,16 @@ mod tests {
     /// D317 ticket 8a: a node's budget splits into equal shares, the remainder to the first
     /// partitions, and pinned compaction threads never exceed the node's total.
     #[test]
+    fn the_reserved_compaction_cpus_count_on_the_serving_line() {
+        // perf287's 8b run: confined compaction counted nothing, so the line said "0
+        // compaction CPUs not" with four of them on 8-11.
+        let mut p = Placement::routes_only(Some(2), Some(2));
+        assert_eq!(p.compaction_cpus, 0);
+        p.confined_compaction(&[8, 9, 10, 11]);
+        assert_eq!(p.compaction_cpus, 4);
+    }
+
+    #[test]
     fn a_nodes_budget_splits_across_its_partitions() {
         use super::{Share, split};
         let s = |shards, compaction, confined| Share {
@@ -990,7 +1110,8 @@ mod tests {
         );
         // On Linux, the masks a thread really gets: a request runtime thread starts on the
         // free cores (its blocking pool stays there, ai1249's S1), a worker widens to
-        // `network` as it first unparks, `apply(None)` gives back the process's CPUs, and
+        // `network` as it first unparks, a reapply with no shard pinned (the last partition
+        // closed, D317 ticket 6) gives it back the process's CPUs at its next refresh, and
         // the feed and hub runtimes' threads run on the free cores.
         #[cfg(target_os = "linux")]
         if let Some(blocking) = plan.masks.blocking.clone() {
@@ -1002,20 +1123,6 @@ mod tests {
             };
             let process = now();
             let p = plan.clone();
-            let (network, after) = std::thread::spawn(move || {
-                p.enter_network();
-                let start = now();
-                p.unpark_network();
-                let widened = now();
-                p.apply(None);
-                (start, (widened, now()))
-            })
-            .join()
-            .unwrap();
-            assert_eq!(network, blocking, "{plan:?}");
-            assert_eq!(Some(after.0), plan.masks.network, "{plan:?}");
-            assert_eq!(after.1, process, "{plan:?}");
-            let p = plan.clone();
             let feed = std::thread::spawn(move || {
                 p.enter_feed();
                 let feed = now();
@@ -1024,7 +1131,23 @@ mod tests {
             })
             .join()
             .unwrap();
-            assert_eq!(feed, (blocking.clone(), blocking), "{plan:?}");
+            assert_eq!(feed, (blocking.clone(), blocking.clone()), "{plan:?}");
+            // Last: the reapply changes the plan's masks for every clone.
+            let p = plan.clone();
+            let (network, after) = std::thread::spawn(move || {
+                p.enter_network();
+                let start = now();
+                p.unpark_network();
+                let widened = now();
+                p.reapply(&[]);
+                super::refresh();
+                (start, (widened, now()))
+            })
+            .join()
+            .unwrap();
+            assert_eq!(network, blocking, "{plan:?}");
+            assert_eq!(Some(after.0), plan.masks.network, "{plan:?}");
+            assert_eq!(after.1, process, "{plan:?}");
         }
         // Entering the plan on a thread (the mask, on Linux) never fails the thread.
         for enter in [

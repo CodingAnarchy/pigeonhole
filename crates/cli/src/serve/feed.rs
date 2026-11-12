@@ -501,6 +501,9 @@ impl Driver {
 fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         loop {
+            // A mask a partition's open or close published (D317 ticket 6): a busy hub
+            // may not park for the whole load (perf287's P1 on #1755).
+            super::placement::refresh();
             // A poll that finds nothing records how far the feed got, so the ring's `passed`
             // follows other tables' writes (the engine wakes the hub on each frontier move).
             let item = std::future::poll_fn(|cx| {
@@ -1193,6 +1196,8 @@ impl Client {
         // Reused across wakes: one allocation per client, not one per commit.
         let mut batch: Vec<Arc<Entry>> = Vec::with_capacity(64);
         loop {
+            // Per delivery batch, as the hub does per read (perf287's P1 on #1755).
+            super::placement::refresh();
             self.tracker.set(ON_RING, at);
             let (behind, failed) = {
                 let r = hub.ring();
@@ -1261,6 +1266,7 @@ impl Client {
     ) -> Result<Source, ApiError> {
         let mut hub_retry: Option<Instant> = None;
         loop {
+            super::placement::refresh();
             // A failed hub: take the key's current one, opening a new one if none (F2), at
             // most once a second so a hub that keeps failing isn't reopened in a loop.
             let mut hub = self.hub();

@@ -545,7 +545,7 @@ pub(crate) const RPCS: [&str; 50] = [
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
 /// `other` for a code a newer engine adds.
-pub(crate) const OUTCOMES: [&str; 49] = [
+pub(crate) const OUTCOMES: [&str; 50] = [
     "ok",
     "Io",
     "Corruption",
@@ -596,6 +596,7 @@ pub(crate) const OUTCOMES: [&str; 49] = [
     "WrongPartition",
     "CrossPartition",
     "PartitionUnavailable",
+    "Fenced",
     "other",
 ];
 
@@ -965,6 +966,10 @@ pub(crate) struct Service {
     placement: Option<Arc<super::placement::Placement>>,
     /// The unary read replies' charges (#1567).
     pub(crate) replies: Arc<super::charge::ReplyStats>,
+    /// A cluster partition's write gate (D317 ticket 6): its writes answer `Fenced` while
+    /// it's fenced. The node's fences hold it too. `None` on a single node and on the
+    /// node's routing service.
+    gate: Option<Arc<super::gate::WriteGate>>,
     /// The partition served here: the database and what's opened on it (D317's S1, cli692's
     /// split of node and partition state). `None` on a cluster node the map gives no
     /// partition, which only routes (D317 ticket 2); always `Some` on a single node.
@@ -1078,7 +1083,7 @@ impl Partition {
             pinning: Pinning::default(),
             engine_memory: None,
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
-            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None)),
+            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None, None)),
             bulk: super::bulk::BulkLoads::default(),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
             memory: None,
@@ -1163,8 +1168,14 @@ impl Service {
         backups: &Arc<super::backup::Backups>,
         pinning: Pinning,
         memory: super::placement::Memory,
+        gate: Arc<super::gate::WriteGate>,
     ) -> Self {
         let mut part = Partition::new(db, Some(id), &self.limits, &self.feed_shared);
+        part.indexes = Arc::new(super::indexes::Indexes::new(
+            part.db.clone(),
+            None,
+            Some(Arc::clone(&gate)),
+        ));
         part.backups = Arc::clone(backups);
         part.pinning = pinning;
         part.engine_memory = Some(memory);
@@ -1189,6 +1200,7 @@ impl Service {
             replica: None,
             placement: None,
             replies: Arc::clone(&self.replies),
+            gate: Some(gate),
             part: Some(part),
         }
     }
@@ -1234,6 +1246,7 @@ impl Service {
             metrics,
             replica: None,
             placement: None,
+            gate: None,
             part,
         }
     }
@@ -1344,8 +1357,11 @@ impl Service {
     pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
         let paused = self.replica.is_some();
         if let Some(part) = &mut self.part {
-            let indexes =
-                super::indexes::Indexes::new(part.db.clone(), Some(Arc::clone(placement)));
+            let indexes = super::indexes::Indexes::new(
+                part.db.clone(),
+                Some(Arc::clone(placement)),
+                self.gate.clone(),
+            );
             // A replica's pause survives the rebuild, whichever is set first.
             indexes.pause_rebalancing(paused);
             part.indexes = Arc::new(indexes);
@@ -1424,15 +1440,43 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
+        // A mask a partition's open or close published (D317 ticket 6), taken by a busy
+        // worker that hasn't parked since.
+        super::placement::refresh();
         let budget = self.admit(&op.admit(), caller, prepaid).await?;
+        // A fenced partition's writes (D317 ticket 6), once admitted, so a fence's drain
+        // never waits behind a write's wait for the budget. Held until the call answers;
+        // a write that runs on past its request extends it.
+        let held = match &self.gate {
+            Some(gate) if op.writes() => Some(gate.enter()?),
+            _ => None,
+        };
         let reply = self.answer(op, caller, budget).await;
+        drop(held);
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.
             (Err(e), Some(replica)) if e.code == "ReadOnly" => {
                 Err(ApiError::replica_read_only(replica.primary()))
             }
+            // A cluster partition closed under the call (D317 ticket 6's close, S5): the
+            // partition is unavailable here, and the client routes again.
+            (Err(e), _)
+                if e.code == "Closed"
+                    && let Some(gate) = &self.gate =>
+            {
+                Err(ApiError::partition_unavailable(format!(
+                    "partition {:?} closed on this node while the call ran: {}",
+                    gate.partition(),
+                    e.message
+                )))
+            }
             (reply, _) => reply,
         }
+    }
+
+    /// The partition's write gate, on a cluster partition's service.
+    pub(crate) fn gate(&self) -> Option<&Arc<super::gate::WriteGate>> {
+        self.gate.as_ref()
     }
 
     /// Every call's rules, before it runs, in one place (D313 §7 as amended by ticket 8c):
@@ -1817,7 +1861,7 @@ impl Service {
                 let index = self.index(&op.index).await?;
                 self.part()?
                     .bulk
-                    .run(index, op)
+                    .run(index, op, self.gate.as_ref())
                     .await
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }
@@ -2573,10 +2617,13 @@ impl Service {
     ) -> Result<T, ApiError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metrics = Arc::clone(&self.metrics);
+        // The fence's drain waits for the write, not just its request (`call` admitted it).
+        let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
         tokio::spawn(async move {
             let outcome = write.await;
             // The write is done: its bytes leave the budget now, not when its request did.
             drop(budget);
+            drop(held);
             if let Err(lost) = tx.send(outcome) {
                 metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
                 match lost {
@@ -3025,12 +3072,16 @@ impl Service {
         };
         let placement = self.part()?.bulk.placement.clone();
         let (tx, rx) = oneshot::channel();
+        // One library call that rewrites the whole index: a fence waits for it to end
+        // (within its deadline), since it can't stop part way.
+        let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
         self.part()?.texts.spawn_rebuild(move || {
             if let Some(p) = placement {
                 p.enter();
             }
             let r = index.rebuild();
             drop(index);
+            drop(held);
             drop(slot);
             let _ = tx.send(r);
         })?;
@@ -3595,6 +3646,9 @@ impl Service {
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }
+        if !rows.is_empty() {
+            g.wrote_now();
+        }
         Ok(proto::Empty {})
     }
 
@@ -3619,6 +3673,12 @@ impl Service {
                 });
             }
         };
+        // A commit that writes is a write to a fenced partition (D317 ticket 6); a
+        // read-only one is a consistent read. Refused, the transaction stays open.
+        let held = match &self.gate {
+            Some(gate) if g.wrote() || !rows.is_empty() => Some(gate.enter()?),
+            _ => None,
+        };
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }
@@ -3640,6 +3700,7 @@ impl Service {
             };
             ticket.finish(outcome.clone());
             drop(budget);
+            drop(held);
             if tx.send(outcome).is_err() {
                 metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
             }
@@ -3849,9 +3910,13 @@ async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
+    tokio::task::spawn_blocking(|| {
+        // A reused pool thread takes a mask published since it started (D317 ticket 6).
+        super::placement::refresh();
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
 /// A table's scan, ready to start: see [`Service::scan_opener`].

@@ -14,7 +14,7 @@ use crate::serve::proto::{
 };
 
 /// A client stream fed by a channel, so a test controls when it ends.
-struct Chunks(tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
+pub(super) struct Chunks(tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
 
 impl futures_core::Stream for Chunks {
     type Item = PartitionUploadChunk;
@@ -23,7 +23,7 @@ impl futures_core::Stream for Chunks {
     }
 }
 
-async fn admin(port: u16) -> AdminClient<tonic::transport::Channel> {
+pub(super) async fn admin(port: u16) -> AdminClient<tonic::transport::Channel> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect()
@@ -50,7 +50,7 @@ fn header(partition: &str, data: &[u8]) -> PartitionUploadHeader {
 }
 
 /// Sends `chunks` (the first with `header`) and ends the stream.
-async fn upload(
+pub(super) async fn upload(
     port: u16,
     header: &PartitionUploadHeader,
     chunks: &[(u64, &[u8])],

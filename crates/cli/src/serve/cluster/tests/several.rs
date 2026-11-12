@@ -483,28 +483,11 @@ fn a_nodes_feed_limits_are_the_nodes_across_its_partitions() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_nodes_shards_pin_together_before_its_compaction_threads() {
-    const ALONE: &str = "PHDB_PIN_TEST_ALONE";
-    if std::env::var_os(ALONE).is_some() {
-        return shards_pin_together_alone();
-    }
-    // The test's path without the crate's name, as the harness filters it.
-    let name = format!(
-        "{}::a_nodes_shards_pin_together_before_its_compaction_threads",
-        module_path!().split_once("::").unwrap().1
+    run_alone(
+        module_path!(),
+        "a_nodes_shards_pin_together_before_its_compaction_threads",
+        shards_pin_together_alone,
     );
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-        .env(ALONE, "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "the test alone failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // The filter matched it: a filter that matches nothing passes too.
-    assert!(stdout.contains("1 passed"), "{stdout}");
 }
 
 /// The test's body, run in a process where no other test claims CPUs.
