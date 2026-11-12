@@ -97,6 +97,32 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "N", default_value_t = 4)]
         parallel: usize,
     },
+    /// Put a `backup` back: each partition's copy is uploaded to the node the backup's map
+    /// (or `--map`) gives it, installed there at a new epoch, and the map set by the forced
+    /// path, with every table as the backup has it. Fence every partition first, and close
+    /// each on the node it's restored to. Writes since the backup are lost, and feed tokens
+    /// from before it expire. Run again after a failure.
+    Restore {
+        /// A complete backup's directory (`manifest.json`, `map.json`, `<partition>.phdb`).
+        dir: PathBuf,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// The map to install in place of the backup's `map.json`: the same partitions and
+        /// tables, its nodes at other addresses or other nodes holding them.
+        #[arg(long, value_name = "FILE")]
+        map: Option<PathBuf>,
+        /// Restore under another cluster id (beside the live cluster, onto nodes of no
+        /// cluster yet): every file is stamped with it.
+        #[arg(long, value_name = "ID")]
+        cluster_id: Option<String>,
+        /// A node the live map gives a partition to can't be reached (its process is
+        /// stopped): skip the check that it isn't serving it.
+        #[arg(long)]
+        old_unreachable: bool,
+        /// Partitions uploaded at once.
+        #[arg(long, value_name = "N", default_value_t = 4)]
+        parallel: usize,
+    },
     /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
     /// through every node until it's unfenced, relocated or closed; reads go on. Answers
     /// once the writes admitted before the fence have finished. Kept across a restart.
@@ -242,6 +268,23 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             durable,
             parallel,
         } => runtime()?.block_on(super::backup::backup(node, dir, *durable, *parallel)),
+        ClusterCommand::Restore {
+            dir,
+            node,
+            map,
+            cluster_id,
+            old_unreachable,
+            parallel,
+        } => runtime()?.block_on(super::restore::restore(
+            node,
+            &super::restore::RestoreArgs {
+                dir: dir.clone(),
+                map: map.clone(),
+                cluster_id: cluster_id.clone(),
+                old_unreachable: *old_unreachable,
+                parallel: *parallel,
+            },
+        )),
         ClusterCommand::Fence { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Fence))
         }

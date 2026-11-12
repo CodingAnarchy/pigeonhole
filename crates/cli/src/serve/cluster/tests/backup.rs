@@ -8,7 +8,7 @@ use crate::serve::cluster::backup::{backup, backup_then};
 use crate::serve::cluster::cli::NodeArgs;
 use crate::serve::proto::{BackupDownloadRequest, admin_client::AdminClient};
 
-fn args(port: u16) -> NodeArgs {
+pub(super) fn args(port: u16) -> NodeArgs {
     NodeArgs {
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
@@ -26,7 +26,7 @@ async fn admin(port: u16) -> AdminClient<tonic::transport::Channel> {
 }
 
 /// Writes `n` rows of `users` through node a, spread over the three partitions.
-fn load(rt: &tokio::runtime::Runtime, port: u16, n: usize) -> Vec<Vec<u8>> {
+pub(super) fn load(rt: &tokio::runtime::Runtime, port: u16, n: usize) -> Vec<Vec<u8>> {
     let rows: Vec<Vec<u8>> = (0..n)
         .map(|i| format!("{}{i:03}", ["a", "h", "x"][i % 3]).into_bytes())
         .collect();

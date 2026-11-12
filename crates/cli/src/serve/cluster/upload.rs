@@ -446,6 +446,9 @@ impl Writing {
             }
         }
         std::fs::rename(&self.part, &ready).map_err(|e| io_error("stage", &ready, &e))?;
+        // The bytes' rename is durable before the header's (cli692's N5 on #1728): a crash
+        // never keeps a header over a rename it lost.
+        sync_dir(dir);
         if let Err(e) = write_header(&ready_header, &self.header) {
             // Back where it was, so a resume (with nothing left to send) finishes it again.
             let _ = std::fs::rename(&ready, &self.part);

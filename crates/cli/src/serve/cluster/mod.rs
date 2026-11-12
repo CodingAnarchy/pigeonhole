@@ -20,6 +20,7 @@ pub(crate) mod map;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
+mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
 pub(crate) mod stamp;
@@ -1361,7 +1362,7 @@ pub(crate) fn run(
     // shards' cores, so the network side's mask spanned both L3 domains of the AX102 and
     // its threads ran at 0.70 IPC against 0.91 with one partition (perf287's g75 on #1482).
     let reserved = (mine.len() > 1)
-        .then(|| super::placement::compaction_reserve(total_shards, total_compaction))
+        .then(|| super::placement::compaction_reserve(&shares, total_compaction))
         .flatten();
     let opened = open_partitions(
         dir,
