@@ -79,6 +79,16 @@ pub(crate) struct Followed {
 /// How many of a subscriber's errors [`Followed::error_messages`] keeps.
 pub(crate) const KEPT_ERRORS: usize = 4;
 
+/// Keeps `what` in `out`'s first [`KEPT_ERRORS`], and prints it while there's room: a feed
+/// that keeps failing every poll prints the same first few the record keeps, not a line per
+/// poll (ai1249's N1 on #1774).
+fn keep(out: &mut Followed, what: String) {
+    if out.error_messages.len() < KEPT_ERRORS {
+        eprintln!("phdb-bench: a feed subscriber's error: {what}");
+        out.error_messages.push(what);
+    }
+}
+
 /// Follows `feed` until `stop` says so, recording each commit's delivery latency. An expired
 /// feed is counted and reopened at now (the row is void anyway, [`FeedReport::expired`]).
 pub(crate) fn follow(
@@ -104,10 +114,7 @@ pub(crate) fn follow(
                     e.code(),
                     feed.progress().covered_seqno()
                 );
-                eprintln!("phdb-bench: a feed subscriber's error: {what}");
-                if out.error_messages.len() < KEPT_ERRORS {
-                    out.error_messages.push(what);
-                }
+                keep(&mut out, what);
                 if e.code() == ErrorCode::FeedExpired {
                     out.expired += 1;
                 } else {
@@ -115,7 +122,10 @@ pub(crate) fn follow(
                 }
                 match reopen() {
                     Ok(f) => feed = f,
-                    Err(_) => {
+                    Err(e) => {
+                        // The reopen's own error is kept too: if it's what keeps failing,
+                        // it's the one that says why (ai1249's N1 on #1774).
+                        keep(&mut out, format!("reopen: {:?}: {e}", e.code()));
                         // Wait out a writer restart or close without spinning.
                         std::thread::sleep(POLL);
                     }
@@ -234,7 +244,11 @@ impl Running {
         }
         let (mut expired, mut errors, mut drain_timeouts) = (0, 0, 0);
         let mut error_messages = Vec::new();
-        let mut join = |handles: Vec<JoinHandle<Followed>>| -> Result<(u32, Histogram), String> {
+        // Each entry names its subscriber's kind (ai1249's N2 on #1774), as a reader
+        // process's does.
+        let mut join = |kind: &str,
+                        handles: Vec<JoinHandle<Followed>>|
+         -> Result<(u32, Histogram), String> {
             let n = handles.len() as u32;
             let mut hist = Histogram::new();
             for h in handles {
@@ -243,12 +257,12 @@ impl Running {
                 expired += f.expired;
                 errors += f.errors;
                 drain_timeouts += f.drain_timeouts;
-                error_messages.extend(f.error_messages);
+                error_messages.extend(f.error_messages.into_iter().map(|m| format!("{kind}: {m}")));
             }
             Ok((n, hist))
         };
-        let (durable_subscribers, durable) = join(std::mem::take(&mut self.durable))?;
-        let (visible_subscribers, visible) = join(std::mem::take(&mut self.visible))?;
+        let (durable_subscribers, durable) = join("durable", std::mem::take(&mut self.durable))?;
+        let (visible_subscribers, visible) = join("visible", std::mem::take(&mut self.visible))?;
         let (retained_wal_peak, held_blob_peak) = self
             .sampler
             .take()
