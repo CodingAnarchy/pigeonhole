@@ -113,12 +113,10 @@ impl Router {
 
     /// `--max-uploads`: a cluster node's partition uploads at once.
     pub(crate) fn max_uploads(mut self, max: usize) -> Self {
-        if let Some(u) = self
-            .cluster
-            .as_mut()
-            .and_then(|c| Arc::get_mut(&mut c.uploads))
-        {
-            u.set_max(max);
+        if let Some(c) = self.cluster.as_mut() {
+            Arc::get_mut(&mut c.uploads)
+                .expect("--max-uploads is set before the router is shared")
+                .set_max(max);
         }
         self
     }

@@ -20,6 +20,7 @@ pub(crate) mod idle;
 pub(crate) mod map;
 pub(crate) mod open;
 pub(crate) mod position;
+mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
 pub(crate) mod stamp;

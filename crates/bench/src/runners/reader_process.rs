@@ -250,6 +250,9 @@ struct FeedChildReport {
     /// 1 if the drain's deadline stopped it short of the parent's seqno.
     #[serde(default)]
     drain_timeouts: u64,
+    /// [`Followed::error_messages`](super::feed::Followed::error_messages).
+    #[serde(default)]
+    error_messages: Vec<String>,
     secs: f64,
     /// User + system CPU seconds over the run (Linux), `None` elsewhere.
     cpu_secs: Option<f64>,
@@ -271,6 +274,7 @@ pub(crate) struct FeedChildrenReport {
     pub(crate) expired: u64,
     pub(crate) errors: u64,
     pub(crate) drain_timeouts: u64,
+    pub(crate) error_messages: Vec<String>,
     pub(crate) cpu_per_sec: Option<f64>,
     pub(crate) wakeups_per_sec: Option<f64>,
 }
@@ -330,6 +334,7 @@ impl FeedChildren {
             expired: 0,
             errors: 0,
             drain_timeouts: 0,
+            error_messages: Vec::new(),
             cpu_per_sec: Some(0.0),
             wakeups_per_sec: Some(0.0),
         };
@@ -345,6 +350,7 @@ impl FeedChildren {
             out.expired += r.expired;
             out.errors += r.errors;
             out.drain_timeouts += r.drain_timeouts;
+            out.error_messages.extend(r.error_messages);
             let secs = r.secs.max(1e-9);
             out.cpu_per_sec = out.cpu_per_sec.zip(r.cpu_secs).map(|(a, c)| a + c / secs);
             out.wakeups_per_sec = out
@@ -427,6 +433,7 @@ pub fn child_feed(path: &Path) -> Result<(), String> {
         expired: followed.expired,
         errors: followed.errors,
         drain_timeouts: followed.drain_timeouts,
+        error_messages: followed.error_messages,
         secs,
         cpu_secs: cpu0.zip(cpu_secs()).map(|(a, b)| b - a),
         wakeups: wake0.zip(wakeups()).map(|(a, b)| b.saturating_sub(a)),
