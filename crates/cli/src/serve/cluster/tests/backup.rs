@@ -8,7 +8,7 @@ use crate::serve::cluster::backup::{backup, backup_then};
 use crate::serve::cluster::cli::NodeArgs;
 use crate::serve::proto::{BackupDownloadRequest, admin_client::AdminClient};
 
-fn args(port: u16) -> NodeArgs {
+pub(super) fn args(port: u16) -> NodeArgs {
     NodeArgs {
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
@@ -26,7 +26,7 @@ async fn admin(port: u16) -> AdminClient<tonic::transport::Channel> {
 }
 
 /// Writes `n` rows of `users` through node a, spread over the three partitions.
-fn load(rt: &tokio::runtime::Runtime, port: u16, n: usize) -> Vec<Vec<u8>> {
+pub(super) fn load(rt: &tokio::runtime::Runtime, port: u16, n: usize) -> Vec<Vec<u8>> {
     let rows: Vec<Vec<u8>> = (0..n)
         .map(|i| format!("{}{i:03}", ["a", "h", "x"][i % 3]).into_bytes())
         .collect();
@@ -232,6 +232,47 @@ fn a_table_created_during_a_backup_is_in_the_map_it_keeps() {
         super::super::map::parse_json(&std::fs::read_to_string(out.join("map.json")).unwrap())
             .unwrap();
     assert!(map.tables.iter().any(|t| t.name == "orders"), "V′ is kept");
+}
+
+#[test]
+fn a_table_dropped_and_created_again_during_a_backup_fails_it() {
+    // simp724's N2 on #1711: `users` dropped (v2) and created again under its name with the
+    // same placement (v3) while the copies are taken. Some copies may hold the old table and
+    // others the new, so the backup fails, naming it, and writes no manifest.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    load(&rt, ports[0], 6);
+    let out = test_dir().join("backup");
+    let e = rt
+        .block_on(backup_then(&args(ports[0]), &out, false, 3, async || {
+            let start = three_way(&[ports[0], ports[1], ports[2]]);
+            let mut dropped = start.clone();
+            dropped.map_version = 2;
+            dropped.tables.clear();
+            let mut again = start.clone();
+            again.map_version = 3;
+            again.tables[0].created = 3;
+            for (expected, m) in [(1, dropped), (2, again)] {
+                client(ports[0])
+                    .await
+                    .set_map(SetMapRequest {
+                        force: false,
+                        expected_map_version: expected,
+                        map: Some(m),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }))
+        .err()
+        .expect("the backup fails");
+    assert!(
+        e.message()
+            .contains("table users was dropped and created again"),
+        "{}",
+        e.message()
+    );
+    assert!(!out.join("manifest.json").exists(), "no manifest");
 }
 
 #[test]

@@ -15,7 +15,34 @@ use super::proto::{
 use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
 
-fn test_dir() -> PathBuf {
+/// The directories [`test_dir`] made on this thread, removed when it ends: a test's thread
+/// ends after its servers, runtimes and databases are dropped, so its files are closed by
+/// then. Each partition's WAL files are 64 MiB (a shard's first slot): kept, a full run left
+/// ~100 GB of them, sparse on macOS and Linux but not on Windows, whose CI disk filled
+/// partway through the cli tests ("no space left on device").
+struct Made(std::cell::RefCell<Vec<PathBuf>>);
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        for dir in self.0.take() {
+            // A handle a stopped server's thread is still closing: Windows refuses to remove
+            // an open file, so a few tries.
+            for _ in 0..20 {
+                if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static MADE: Made = const { Made(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// A new directory for a test, removed when the test's thread ends.
+pub(super) fn test_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,11 +54,12 @@ fn test_dir() -> PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    MADE.with(|m| m.0.borrow_mut().push(dir.clone()));
     dir
 }
 
 /// A node over `dir` (its persisted map loaded, as `run` loads it), without tokens or TLS.
-fn node(dir: &Path, id: &str) -> Arc<Node> {
+pub(super) fn node(dir: &Path, id: &str) -> Arc<Node> {
     node_with(dir, id, "")
 }
 
@@ -604,8 +632,12 @@ fn test_partition_with(
 ) -> pigeonhole::Pigeonhole {
     let db = pigeonhole::Pigeonhole::open(
         dir.join(format!("{p}.phdb")),
+        // 1 MiB WAL segments rather than 64 MiB (ai1249): a stream keeps the size it was made
+        // with, so the partition's reopens keep it, and a test's files stay small on a disk
+        // that doesn't keep them sparse (Windows).
         options
             .create_if_missing(true)
+            .wal_segment_size(1 << 20)
             .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
     )
     .unwrap();
@@ -3806,8 +3838,10 @@ mod charge;
 mod close;
 mod feed;
 mod fence;
+mod idle;
 mod metrics;
 mod open;
+mod restore;
 mod several;
 mod stamp;
 mod upload;

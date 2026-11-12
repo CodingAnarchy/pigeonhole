@@ -32,7 +32,7 @@ use crate::output::Report;
 use crate::serve::proto::{self, BackupDownloadRequest, ClusterMap, GetMapRequest};
 
 /// A copy's stream may break this many times; each break resumes from what was written.
-const RESUMES: u32 = 5;
+pub(super) const RESUMES: u32 = 5;
 
 /// What the backup of one partition gave.
 #[derive(Debug, Clone)]
@@ -314,7 +314,7 @@ impl Job {
 }
 
 /// Whether a download's error is a break to resume from, not a refusal.
-fn resumable(s: &tonic::Status) -> bool {
+pub(super) fn resumable(s: &tonic::Status) -> bool {
     matches!(
         s.code(),
         tonic::Code::Unavailable
@@ -367,7 +367,7 @@ fn write_new(path: &PathBuf, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|e| Failure::io(&format!("write {}", path.display()), &e))
 }
 
-fn digest(path: &Path) -> Result<[u8; 32], Failure> {
+pub(super) fn digest(path: &Path) -> Result<[u8; 32], Failure> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(path)
         .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
@@ -385,7 +385,7 @@ fn digest(path: &Path) -> Result<[u8; 32], Failure> {
     Ok(h.finalize().into())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
@@ -395,8 +395,10 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Why the map at the end (`end`) can't stand for the copies taken under `start`, if it
 /// can't: a partition added, removed, moved or re-epoched, or a table both hold placed
-/// differently (ai1249's (c)). Tables created or dropped in between are fine: `map.json` is
-/// `end`, so a restore's reconcile treats them by ticket 5's rules.
+/// differently (ai1249's (c)), or dropped and created again under its name (its `created`
+/// differs, simp724's N2 on #1711): some copies may hold the old table and others the new.
+/// Tables created or dropped in between are fine: `map.json` is `end`, so a restore's
+/// reconcile treats them by ticket 5's rules.
 pub(crate) fn moved(start: &ClusterMap, end: &ClusterMap) -> Option<String> {
     if start.cluster_id != end.cluster_id {
         return Some(format!(
@@ -427,9 +429,13 @@ pub(crate) fn moved(start: &ClusterMap, end: &ClusterMap) -> Option<String> {
         return Some(format!("partition {id} was added"));
     }
     for t in &start.tables {
-        if let Some(u) = end.tables.iter().find(|u| u.name == t.name)
-            && (u.splits != t.splits || u.partitions != t.partitions || u.group != t.group)
-        {
+        let Some(u) = end.tables.iter().find(|u| u.name == t.name) else {
+            continue;
+        };
+        if u.created != t.created {
+            return Some(format!("table {} was dropped and created again", t.name));
+        }
+        if u.splits != t.splits || u.partitions != t.partitions || u.group != t.group {
             return Some(format!("table {} was placed differently", t.name));
         }
     }
@@ -507,5 +513,13 @@ mod tests {
         let mut resplit = map(9, 1, &["m"]);
         resplit.tables[0].splits[0].key = Some(proto::split_key::Key::Text("n".into()));
         assert!(moved(&a, &resplit).is_some_and(|w| w.contains("placed differently")));
+        // Dropped and created again under its name, placed the same: a new `created`.
+        let mut recreated = map(9, 1, &["m"]);
+        recreated.tables[0].created = 7;
+        assert!(
+            moved(&a, &recreated).is_some_and(|w| w.contains("dropped and created again")),
+            "{:?}",
+            moved(&a, &recreated)
+        );
     }
 }

@@ -16,9 +16,11 @@ pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod identity;
+pub(crate) mod idle;
 pub(crate) mod map;
 pub(crate) mod open;
 pub(crate) mod position;
+mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
 pub(crate) mod stamp;
@@ -577,6 +579,14 @@ impl Node {
             })
             .unwrap_or_default();
         files.sort();
+        // The partitions this node has open: their identity comes from their own handle,
+        // since a read-only open of a file a writer holds is refused (#1767).
+        let open: std::collections::BTreeMap<String, crate::serve::router::PartRef> = self
+            .opener
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .map(|shared| shared.router.partitions().into_iter().collect())
+            .unwrap_or_default();
         for path in files {
             let file = path
                 .file_name()
@@ -594,7 +604,11 @@ impl Node {
                 error: String::new(),
                 ..Default::default()
             };
-            match identity::read_file(&path) {
+            let read = match open.get(&named) {
+                Some(part) => identity::read(&part.db),
+                None => identity::read_file(&path),
+            };
+            match read {
                 Ok(None) => lp.error = "no identity row: run phdb cluster init-partition".into(),
                 Err(e) => lp.error = e,
                 Ok(Some(id)) => {
