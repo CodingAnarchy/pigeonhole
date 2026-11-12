@@ -1,5 +1,5 @@
 ### Added
-- **`phdb serve`: `Data.Scan`** (D313 ticket 3b, ICR 0112, #1397). A scan streams byte-budgeted pages: a gRPC server stream, or over HTTP one JSON page per line (NDJSON) or server-sent events.
+- **`phdb serve`: `Data.Scan`** (D313, ICR 0112, #1397). A scan streams byte-budgeted pages: a gRPC server stream, or over HTTP one JSON page per line (NDJSON) or server-sent events.
   - A scan that fails partway ends with a final error message.
   - Its row `limit` counts each row once, even when a page cuts inside a row.
   - `--max-scans` (default 64) caps the scans streaming at once; more are refused with `Overloaded`.

@@ -1,2 +1,2 @@
 ### Fixed
-- A change feed far behind its frontier no longer slows down as it falls further behind: `FeedReader`'s resume token costs O(streams), not O(streams × undelivered commits), so a `phdb serve` feed hub that falls behind catches up again (#1397 ticket 5).
+- A change feed far behind no longer slows down as it falls further behind: each step's resume position costs the same however much is still undelivered, so a feed that falls behind catches up again (#1397).
