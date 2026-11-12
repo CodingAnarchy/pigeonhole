@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: 1.x.** [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
+> **Maturity: 1.x.** [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1), [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
@@ -105,7 +105,7 @@ The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2
 - **Releases from `release/0.2.x`, also in 0.3.0:** [0.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.1) (D209) and [0.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.2) (the cross-shard close fixes, [D225](design/decisions/phase-3.md#d225), #591, #597) and [0.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.3) (the cross-shard timestamp order, D244 and D245 without the room refusal).
 
 ## 1.1.0
-Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0) (2026-11-04), on `main` since 1.0.0. [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) (2026-10-31, from `release/1.0.x`) backported the D300 fix (#1208), and [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1) (2026-11-05, from `release/1.1.x`) the async nearest search's column-limit fix and the engine `ScanCursor`'s mid-row fix (#1550). The per-change list is the [changelog](../CHANGELOG.md).
+Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0) (2026-11-04), on `main` since 1.0.0. [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) (2026-10-31, from `release/1.0.x`) backported the D300 fix (#1208), [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1) (2026-11-05, from `release/1.1.x`) the async nearest search's column-limit fix and the engine `ScanCursor`'s mid-row fix (#1550), and [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2) (2026-11-10, the same branch) the backup-size fix (#1615, #1672). The per-change list is the [changelog](../CHANGELOG.md).
 - **Wide rows, multi-get and traversal** (#489): a row walked cell by cell or in pages with resumable positions ([D297](design/decisions/phase-3.md#d297)), multi-get over a `KeySet` ([D299](design/decisions/phase-3.md#d299)), breadth-first traversal inside the engine ([D304](design/decisions/phase-3.md#d304)), sync and async; the guide's [Graphs](guide/graphs.md).
 - **Vectors** (#490, [D303](design/decisions/phase-3.md#d303), ICR 0098): vector families (`f32`, `i8`, bits, and `f16`/`bf16`, ICR 0104), exact `nearest_*` search ([D296](design/decisions/phase-3.md#d296)); and **`pigeonhole-vector`**, an IVF index ([D306](design/decisions/phase-3.md#d306), ICR 0100) with bulk loads, background rebalancing, reader processes, writes in a caller's transaction and prefixed searches; the guide's [Vectors](guide/vectors.md).
 - **Byte-budgeted reads** (#1250, [D308](design/decisions/phase-3.md#d308), ICR 0103): `read_within` on scans and multi-gets, and `Nearest::run_within`, with resumable positions; [Scans and filters](guide/scans-and-filters.md).
@@ -127,10 +127,42 @@ Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
 ## On main for 1.2.0
-1.2.0's scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). What has merged is listed here as it lands, with the changelog's fragments in [`changelog.d/`](../changelog.d/README.md).
-- **`pigeonhole-otel`** ([D316](design/decisions/phase-3.md#d316), #1458, ICR 0115): the engine's metrics through OpenTelemetry, to Prometheus, Grafana or an OTLP collector, on its own 0.N version line. It includes the public `LatencyHistogram` behind engine-side commit latency ([Observability](guide/observability.md)). A2–A4 (memtable bytes, group-sync time, feed lag) follow under ICR 0116.
-- **Ruby under fiber schedulers** (#1574, ICR 0126): commits, the change feed's and memory watch's waits, and the memory store's writes, recall and consolidation-loop step let the thread's other fibers run under Async, Falcon or any `Fiber::Scheduler`, with `Fiber.blocking` and `Pigeonhole.fiber_scheduler = false` as opt-outs ([Ruby guide](guide/ruby.md#fiber-schedulers)). Recall moves onto `Recall::run_async` after #1560.
-- **`pigeonhole-embed`** ([D318](design/decisions/phase-3.md#d318), #1345, ICR 0119): local embeddings for `pigeonhole-memory`, with `BAAI/bge-small-en-v1.5` pinned to a revision and run on the CPU in-process, its files downloaded once and checked against pinned SHA-256s. It's on its own 0.N version line. `phdb mcp` and `phdb serve --memory` take `--embed-local` with the `embed-local` feature ([Agent memory](guide/agent-memory.md#which-embeddings)).
+1.2.0's scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). This lists what has merged; the per-change list is in the changelog's fragments, [`changelog.d/`](../changelog.d/README.md).
+- **`phdb serve`** ([D313](design/decisions/phase-3.md#d313), #1397, [ICR 0112](design/icr/0112-network-api.md)), behind the `pigeonhole-cli` crate's `serve` feature; the guide is [Serving a database](guide/serve.md):
+  - **The API:** gRPC and HTTP/JSON on one port, and remote MCP at `/mcp`. It covers data, schema and admin, sessions with transactions and pinned snapshots, graphs and nearest search, the IVF vector index with bulk loads, full-text search, and agent memory with `--memory` (and `--embed-local`).
+  - **Security:** TLS, and `read`, `write` and `admin` tokens, optionally limited to namespaces.
+  - **The change feed:** one engine subscription per hub, fanned out to every client, with prefix filters.
+  - **Backups:** made and downloaded through the server.
+  - **Read replicas:** `--replica-of`, read-your-writes and `phdb promote` (#1583, #1594).
+  - **Running it:** `/metrics` with the engine's metrics through `pigeonhole-otel`'s `Collector` ([D323](design/decisions/phase-3.md#d323), #1687); thread placement and `--affinity` (#1697); a default shard count kept across restarts (#1699); WAL rings sized at start-up (#1681, ICR 0130); and jemalloc in the `phdb` binary (#1670, [D322](design/decisions/phase-3.md#d322)).
+- **Clusters** ([D317](design/decisions/phase-3.md#d317), #1482, [ICR 0117](design/icr/0117-static-partitions.md)): one database split across `phdb serve --cluster` nodes by static key-range partitions, with routing, fan-out, transactions, feeds, schema, backups and `phdb cluster`. Still in progress; [Clusters](guide/serve.md#clusters) lists what's still to come.
+- **Replication in the library** ([D315](design/decisions/phase-3.md#d315), #1436, ICR 0125):
+  - `backup_at` and a replica's bootstrap and promotion (#1578), behind `__unstable-replication`;
+  - a feed of every table that delivers catalog changes (#1515, #1539).
+- **The engine and `pigeonhole`:**
+  - a true read-only open, with `Options::read_only(true)` (#1348, #1570);
+  - `commit_if_returning` and `return_previous` ([D314](design/decisions/phase-3.md#d314), #1566, #1517);
+  - async walks within a row and async key-set cells (#1625, #1665, ICR 0124);
+  - caller-runs, an opt-in commit mode in which a committing thread runs its idle shard ([D321](design/decisions/phase-3.md#d321), ICR 0128, #1502);
+  - a public `Options::shard_spin` (#1680) and `Options::default_shards` (ICR 0132, #1699).
+- **`pigeonhole-otel`** ([D316](design/decisions/phase-3.md#d316), #1458, ICR 0115): the engine's metrics through OpenTelemetry, to Prometheus, Grafana or an OTLP collector, on its own 0.N version line. It includes:
+  - the public `LatencyHistogram` behind engine-side commit latency;
+  - memtable bytes, group-sync time and feed lag (A2–A4, ICR 0116);
+  - a backend-neutral `Collector` for Prometheus text (D323, ICR 0131).
+
+  See [Observability](guide/observability.md).
+- **`pigeonhole-embed`** ([D318](design/decisions/phase-3.md#d318), #1345, ICR 0119): local embeddings for `pigeonhole-memory`, on its own 0.N version line.
+  - `BAAI/bge-small-en-v1.5` is pinned to a revision and run on the CPU in-process.
+  - Its files are downloaded once and checked against pinned SHA-256s.
+  - `phdb mcp` and `phdb serve --memory` take `--embed-local` with the `embed-local` feature ([Agent memory](guide/agent-memory.md#which-embeddings)).
+- **Python:**
+  - native asyncio for commits, transactions, the change feed and the memory store (#1479, ICR 0121, ICR 0123);
+  - async recall (#1657);
+  - `Table.scan(...).to_arrow()` (#1480, ICR 0120);
+  - `return_previous` and `commit_if_returning` (#1445, #1446).
+- **Ruby:**
+  - Fiber schedulers (#1574, ICR 0126): commits, the change feed's and memory watch's waits, and the memory store's writes, recall and consolidation-loop step let the thread's other fibers run under Async, Falcon or any `Fiber::Scheduler`, with `Fiber.blocking` and `Pigeonhole.fiber_scheduler = false` as opt-outs ([Ruby guide](guide/ruby.md#fiber-schedulers)).
+  - `return_previous` and `commit_if_returning` (#1445, #1446).
 
 ## Tracked follow-ups
 Deferred work is one GitHub issue each, labeled with its crate and phase and assigned to the phase's milestone (D62). The open list is the milestone itself:
