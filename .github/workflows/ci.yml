@@ -199,6 +199,8 @@ jobs:
       # The two version lines (D295): the internal crates share one version, the public crates
       # take the workspace's, and every pin follows its line.
       - run: python3 scripts/versions.py check
+      # The release check's version comparisons (a version never goes back).
+      - run: python3 scripts/test_versions.py
       - name: semver checks (published crates only)
         shell: bash
         run: |
