@@ -3884,8 +3884,10 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap_err();
         assert_eq!(code(&e), "WrongPartition", "{e:?}");
         assert!(e.message().contains("node b"), "{e:?}");
-        // A schema call through a reaches b. b and c end on one map, none divergent; a,
-        // no longer in the map, isn't pushed to, and stays at the forced map: it wrote none.
+        // A schema call through a reaches b. b and c end on one map, none divergent. a,
+        // no longer in the map, isn't pushed to and writes no map; its unconfirmed start
+        // fence keeps it fetching its peers' maps, so it holds the forced map or b's later
+        // one, never another (#1778).
         schema(ports[0])
             .await
             .create_table(create("t2", "p3"))
@@ -3893,7 +3895,8 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap();
         let last = version(ports[1]).await;
         assert_eq!(last, newest + 1);
-        assert_eq!(version(ports[0]).await, newest);
+        let at_a = version(ports[0]).await;
+        assert!(at_a == newest || at_a == last, "a at map {at_a}");
         let mut maps = Vec::new();
         for &port in &ports[1..] {
             eventually("every node to take the last map", async || {
