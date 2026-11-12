@@ -1381,6 +1381,141 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
     let _ = db_b.close();
 }
 
+/// #1775: a cluster partition opens with the options a single node's database does, for
+/// every flag, so the next option `serve` gains can't be left out of a cluster's (WAL
+/// preallocation was: a partition's logs grew while its commits waited on them, put p99
+/// 4–6 ms at 55K puts/s against 0.25 ms, perf287's g89). Each flag of `phdb` and `phdb serve`
+/// is set alone, to each value it takes, and the two options compared whole. Only what's per
+/// database differs, set the same on both before comparing: the shard count and compaction
+/// threads (the node's totals, split across its partitions) and `--create`.
+#[test]
+fn a_partition_takes_every_option_a_single_node_does() {
+    use clap::{CommandFactory, Parser};
+    let cmd = crate::args::Cli::command();
+    let serve = cmd.find_subcommand("serve").expect("phdb serve");
+    // Flags `phdb serve` doesn't take alone (each needs another with it): the agent memory
+    // and embedding front-end's, a replica's and a cluster node's own. None sets an engine
+    // option (`served_options` and `single_options` read none of them). A new flag that
+    // doesn't parse alone must be added here, once that's checked.
+    const ALONE_NOT: &[&str] = &[
+        "memory-model",
+        "memory-dim",
+        "memory-element",
+        "memory-normalization",
+        "memory-episodic-ttl",
+        "memory-calls",
+        "embed-url",
+        "embed-model",
+        "embed-key-env",
+        "embed-local",
+        "embed-model-dir",
+        "embed-offline",
+        "embed-timeout-ms",
+        "replica-token-file",
+        "replica-run",
+        "cluster",
+        "cluster-token-file",
+        "cluster-ca",
+        "cluster-push-timeout-ms",
+        "tls-key",
+        "tls-cert",
+    ];
+    let compare = |argv: &[String]| -> bool {
+        let Ok(cli) = crate::args::Cli::try_parse_from(argv) else {
+            return false;
+        };
+        let crate::args::Command::Serve(args) = &cli.command else {
+            unreachable!("parsed as serve")
+        };
+        // The node's totals, as `cluster::serve` splits them for its one partition.
+        let shards = args
+            .shards
+            .unwrap_or_else(crate::serve::placement::default_shards);
+        let compaction = args
+            .compaction_threads
+            .unwrap_or_else(|| crate::serve::placement::default_compaction_threads(shards));
+        let share = crate::serve::placement::split(shards, compaction, 1)[0];
+        let same = |o: pigeonhole::Options| {
+            format!(
+                "{:?}",
+                o.shards(shards)
+                    .default_shards(shards)
+                    .compaction_cores(share.compaction)
+                    .create_if_missing(args.create)
+            )
+        };
+        let single = same(crate::serve::single_options(&cli, args));
+        let part = same(super::partition_options(
+            crate::serve::served_options(&cli, args),
+            share,
+        ));
+        assert_eq!(part, single, "{argv:?}: a partition's options differ");
+        true
+    };
+    let base = |extra: &[&str]| -> Vec<String> {
+        ["phdb", "serve", "db.phdb"]
+            .iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned())
+            .collect()
+    };
+    assert!(compare(&base(&[])), "no flags");
+    let (mut compared, mut unparsed, mut listed) = (0, Vec::new(), Vec::new());
+    for arg in cmd.get_arguments().chain(serve.get_arguments()) {
+        let Some(long) = arg.get_long() else { continue };
+        if arg.is_positional() || ["help", "version"].contains(&long) {
+            continue;
+        }
+        let flag = format!("--{long}");
+        let values: Vec<String> = if !arg.get_action().takes_values() {
+            vec![]
+        } else if !arg.get_possible_values().is_empty() {
+            arg.get_possible_values()
+                .iter()
+                .map(|v| v.get_name().to_owned())
+                .collect()
+        } else {
+            [
+                "7",
+                "65536",
+                "/tmp/phdb-1775",
+                "http://127.0.0.1:1",
+                "127.0.0.1:1",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        };
+        let parsed = if values.is_empty() {
+            compare(&base(&[&flag]))
+        } else {
+            // Every value that parses, so an enum's each.
+            values
+                .iter()
+                .map(|v| compare(&base(&[&flag, v])))
+                .fold(false, |a, b| a | b)
+        };
+        if parsed {
+            compared += 1;
+        } else if ALONE_NOT.contains(&long) {
+            listed.push(long);
+        } else {
+            unparsed.push(long);
+        }
+    }
+    let mut stale: Vec<&str> = ALONE_NOT.to_vec();
+    stale.retain(|l| !listed.contains(l));
+    assert!(
+        stale.is_empty(),
+        "ALONE_NOT lists {stale:?}, which parse alone or are gone"
+    );
+    assert!(
+        unparsed.is_empty(),
+        "{unparsed:?} don't parse alone: give each a value here, or list it in ALONE_NOT once \
+         it's checked to set no engine option"
+    );
+    assert!(compared > 20, "only {compared} flags compared");
+}
+
 #[test]
 fn a_partition_opens_with_the_servers_shard_poll() {
     // cli692's M1 on #1686: a cluster node's partition takes `--shard-spin` as a single node's
@@ -1388,9 +1523,7 @@ fn a_partition_opens_with_the_servers_shard_poll() {
     let dir = test_dir();
     let share = crate::serve::placement::split(2, 1, 1)[0];
     let options = super::partition_options(
-        crate::serve::config::ShardSpin::Micros(0),
-        None,
-        None,
+        crate::serve::config::ShardSpin::Micros(0).apply(pigeonhole::Options::default()),
         share,
     )
     .create_if_missing(true);

@@ -364,9 +364,7 @@ fn a_partitions_share_of_the_budget_keeps_its_feeds_shard_count() {
         },
         |share, memory| {
             let o = super::super::partition_options(
-                crate::serve::config::ShardSpin::Micros(0),
-                None,
-                None,
+                crate::serve::config::ShardSpin::Micros(0).apply(pigeonhole::Options::default()),
                 share,
             );
             memory.map_or(o.clone(), |m| m.apply(o))
