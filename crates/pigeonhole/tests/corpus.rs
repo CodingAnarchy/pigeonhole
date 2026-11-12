@@ -39,7 +39,12 @@ fn corpus_dir() -> PathBuf {
 
 /// The release corpora: written by each release's build, then frozen. A directory holding
 /// only its README is a placeholder until that release writes it.
-const RELEASE_CORPORA: [&str; 2] = ["1.0.0", "1.1.0"];
+const RELEASE_CORPORA: [&str; 3] = ["1.0.0", "1.1.0", "1.2.0"];
+
+/// Entries only a build with a feature has: `replica` needs `__unstable-replication`, which
+/// `scripts/release-corpus.sh` writes the release corpus with. A build without the feature
+/// still checks such an entry's files against `frozen.txt`, but skips opening it.
+const FEATURE_ENTRIES: [&str; 1] = ["replica"];
 
 /// The frozen hash list's name inside a release corpus.
 const FROZEN: &str = "frozen.txt";
@@ -1829,11 +1834,14 @@ fn generate_corpus() {
         }
         std::fs::write(dir.join("expected.txt"), &expected).unwrap();
         if e.feed_resumes_by_1_1 {
-            std::fs::write(
-                dir.join(FEED_RESUMES),
-                "compat-reader-1.1 resumes this entry's stored table feed token (D315 amendment)\n",
-            )
-            .unwrap();
+            let marker =
+                "compat-reader-1.1 resumes this entry's stored table feed token (D315 amendment)\n";
+            std::fs::write(dir.join(FEED_RESUMES), marker).unwrap();
+            // Frozen like the other markers: a release corpus lists every file it holds.
+            frozen.push(frozen_line(
+                &format!("{}/{FEED_RESUMES}", e.name),
+                marker.as_bytes(),
+            ));
         }
         if let Some(extra) = &extra {
             std::fs::write(dir.join(EXTRA), extra).unwrap();
@@ -2061,13 +2069,17 @@ fn release_corpus_entries_open_read_check_and_write() {
             "v{version} no longer matches {FROZEN}: a release corpus never changes"
         );
         for entry in entries {
-            // A release corpus's entries are this build's too: entries are never removed.
-            let extra = crate::entries()
-                .into_iter()
-                .find(|e| e.name == entry)
-                .unwrap_or_else(|| panic!("v{version}/{entry}: not an entry of this build"))
-                .extra;
-            check_entry(&format!("v{version}/{entry}"), &dir.join(entry), extra);
+            // A release corpus's entries are this build's too: entries are never removed. One
+            // behind a feature this build lacks is skipped (its files were checked above).
+            let Some(e) = crate::entries().into_iter().find(|e| e.name == entry) else {
+                assert!(
+                    FEATURE_ENTRIES.contains(&entry),
+                    "v{version}/{entry}: not an entry of this build"
+                );
+                eprintln!("v{version}/{entry}: behind a feature this build lacks; skipped");
+                continue;
+            };
+            check_entry(&format!("v{version}/{entry}"), &dir.join(entry), e.extra);
         }
     }
 }
