@@ -242,19 +242,35 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "DIR", requires = "node_id")]
     pub cluster: Option<PathBuf>,
     /// This node's id in the cluster's map (`[a-z0-9_-]`, up to 64).
-    #[arg(long, value_name = "ID", requires = "cluster")]
+    #[arg(long, value_name = "ID", requires = "cluster", conflicts_with = "file")]
     pub node_id: Option<String>,
     /// The bearer token this node presents to the other nodes (`cluster` scope there), alone
     /// in the file. Also from `PHDB_CLUSTER_TOKEN`. Never a flag's value.
-    #[arg(long, value_name = "FILE", requires = "cluster")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
     pub cluster_token_file: Option<PathBuf>,
     /// A PEM file of the CA certificates this node trusts for its peers' TLS, beside the
     /// system's roots.
-    #[arg(long, value_name = "PEM", requires = "cluster")]
+    #[arg(
+        long,
+        value_name = "PEM",
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
     pub cluster_ca: Option<PathBuf>,
     /// How long `SetMap` waits for each other node to take the map, in milliseconds. A node
     /// that doesn't pulls it later.
-    #[arg(long, value_name = "MS", default_value_t = 2_000, requires = "cluster")]
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 2_000,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
     pub cluster_push_timeout_ms: u64,
     /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
     /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
@@ -438,6 +454,8 @@ impl ShardSpin {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
     use super::{ShardSpin, check_bind};
 
     #[test]
@@ -458,6 +476,36 @@ mod tests {
             "{e}"
         );
         assert!(check_bind("[::1]:7448".parse().unwrap(), false, false, false).is_ok());
+    }
+
+    /// A cluster flag beside a database file is an error, not ignored. `requires = "cluster"`
+    /// alone lets it pass there, since clap drops a requirement that conflicts with a given
+    /// argument (the file conflicts with `--cluster`).
+    #[test]
+    fn a_cluster_flag_needs_cluster() {
+        let parse = |argv: &[&str]| crate::args::Cli::try_parse_from(argv);
+        let cluster = ["phdb", "serve", "--cluster", "d", "--node-id", "a"];
+        assert!(parse(&cluster).is_ok());
+        assert!(parse(&["phdb", "serve", "db.phdb"]).is_ok());
+        for flag in [
+            ["--node-id", "a"],
+            ["--cluster-token-file", "t"],
+            ["--cluster-ca", "ca.pem"],
+            ["--cluster-push-timeout-ms", "7"],
+        ] {
+            if flag[0] != "--node-id" {
+                assert!(
+                    parse(&[&cluster[..], &flag[..]].concat()).is_ok(),
+                    "{flag:?}"
+                );
+            }
+            let e = parse(&["phdb", "serve", "db.phdb", flag[0], flag[1]]).unwrap_err();
+            assert!(e.to_string().contains(flag[0]), "{e}");
+            assert!(
+                parse(&["phdb", "serve", flag[0], flag[1]]).is_err(),
+                "{flag:?}"
+            );
+        }
     }
 
     #[test]

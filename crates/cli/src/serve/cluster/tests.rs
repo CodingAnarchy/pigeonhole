@@ -1446,6 +1446,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "replica-token-file",
         "replica-run",
         "cluster",
+        "node-id",
         "cluster-token-file",
         "cluster-ca",
         "cluster-push-timeout-ms",
