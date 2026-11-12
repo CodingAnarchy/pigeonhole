@@ -283,9 +283,12 @@ pub(crate) struct Placement {
 
 impl Placement {
     /// The threads' counts: given, or by default from the CPUs the shards don't use. The
-    /// feed threads' default (a quarter, at least 1) is carved out of the network threads'
-    /// default rather than added, so the two runtimes don't oversubscribe the CPUs (perf287's
-    /// D2 on #1397). An explicit `--io-threads` is taken as given.
+    /// network threads' default is the CPUs their mask holds, the free cores and the shards'
+    /// SMT siblings (#1745: 6 threads for a 12-CPU mask held an 8-core node to 280K ops/s,
+    /// where 10 gave 381K at a lower p99, perf287's 8bio). The feed threads' default (a
+    /// quarter of the free cores, at least 1) is carved out of it rather than added, so the
+    /// two runtimes don't oversubscribe the CPUs (perf287's D2 on #1397). An explicit
+    /// `--io-threads` is taken as given.
     ///
     /// Without `affinity` (`--affinity off`), the counts are the same but no mask is set: the
     /// threads run where the OS puts them (ICR 0131).
@@ -309,6 +312,7 @@ impl Placement {
         #[cfg(target_os = "linux")]
         let Layout {
             free,
+            network,
             siblings: sibling_cpus,
             mode,
             note,
@@ -320,20 +324,17 @@ impl Placement {
         #[cfg(not(target_os = "linux"))]
         let Layout {
             free,
+            network,
             siblings: sibling_cpus,
             mode,
             note,
             ..
         } = Layout::unpinned(&pinned);
         let default = free.max(2);
-        // A quarter. perf287 on #1397: a floor of 4 (8 network + 4 feed on a 12-CPU slice)
-        // left the network side short and every split run fell behind; 9 + 3 kept up.
-        let feed_threads = feed.unwrap_or(free / 4).max(1);
+        let (io_threads, feed_threads) = network_and_feed_threads(free, network, io, feed);
         let mut plan = Self {
             hub_threads: hubs.unwrap_or_else(|| feed_threads.div_ceil(4)).max(1),
-            io_threads: io
-                .unwrap_or(free.saturating_sub(feed_threads).max(2))
-                .max(1),
+            io_threads,
             blocking_threads: blocking.unwrap_or(default).max(1),
             feed_threads,
             masks: RuntimeMasks::default(),
@@ -491,6 +492,26 @@ fn process_cpus() -> Option<Vec<usize>> {
     }
 }
 
+/// The request runtime's and the feed runtime's thread counts, `--io-threads` and
+/// `--feed-threads` or their defaults, for `free` free cores' CPUs and `network` CPUs in the
+/// request runtime's mask (the free cores and the shards' SMT siblings).
+///
+/// The feed threads run on the free cores (g82), a quarter of them by default, at least 1:
+/// perf287 on #1397, a floor of 4 (8 network + 4 feed on a 12-CPU slice) left the network
+/// side short and every split run fell behind; 9 + 3 kept up. The network threads take the
+/// rest of their mask, at least 2 (#1745): sized from the free cores only, an 8-core node
+/// ran 6 workers on a 12-CPU mask and saturated them with part of the mask idle.
+fn network_and_feed_threads(
+    free: usize,
+    network: usize,
+    io: Option<usize>,
+    feed: Option<usize>,
+) -> (usize, usize) {
+    let feed = feed.unwrap_or(free / 4).max(1);
+    let io = io.unwrap_or(network.saturating_sub(feed).max(2)).max(1);
+    (io, feed)
+}
+
 /// A plan's masks, counts and startup wording.
 #[derive(Debug, PartialEq, Eq)]
 struct Layout {
@@ -499,6 +520,10 @@ struct Layout {
     masks: RuntimeMasks,
     /// The free cores' CPUs, for the threads' counts.
     free: usize,
+    /// The CPUs the request runtime's workers may run on, for their count (#1745): the free
+    /// cores and the shards' SMT siblings. Kept under `--affinity off`, which changes only
+    /// the masks, not the counts (ICR 0131).
+    network: usize,
     /// The shards' SMT siblings the request runtime's workers also run on.
     siblings: usize,
     mode: &'static str,
@@ -509,11 +534,13 @@ impl Layout {
     /// No masks: nothing pinned, or no hard affinity on this OS. The counts take the CPUs no
     /// shard holds.
     fn unpinned(pinned: &[usize]) -> Self {
+        let free = std::thread::available_parallelism()
+            .map_or(2, std::num::NonZero::get)
+            .saturating_sub(pinned.len());
         Self {
             masks: RuntimeMasks::default(),
-            free: std::thread::available_parallelism()
-                .map_or(2, std::num::NonZero::get)
-                .saturating_sub(pinned.len()),
+            free,
+            network: free,
             siblings: 0,
             mode: "unpinned",
             note: None,
@@ -541,6 +568,7 @@ fn layout(
         MaskPlan::Unpinned { free } => Layout {
             masks: RuntimeMasks::default(),
             free,
+            network: free,
             siblings: 0,
             mode: "unpinned",
             note: None,
@@ -557,6 +585,7 @@ fn layout(
                     hub: Some(cores.clone()),
                 },
                 free: cores.len(),
+                network: wide.len(),
                 siblings: siblings.len(),
                 mode: "off the shards' cores",
                 note: None,
@@ -565,6 +594,7 @@ fn layout(
         MaskPlan::TooFewCores { free, cpus, pinned } => Layout {
             masks: RuntimeMasks::default(),
             free,
+            network: free,
             siblings: 0,
             mode: "unmasked (too few free cores)",
             note: Some(too_few_cores(cpus, pinned)),
@@ -796,8 +826,8 @@ mod tests {
         );
         assert_eq!(format_cpu_list(&wide), "4-9,16-25");
         assert_eq!(
-            (l.free, l.siblings, l.mode),
-            (12, 4, "off the shards' cores")
+            (l.free, l.network, l.siblings, l.mode),
+            (12, 16, 4, "off the shards' cores")
         );
         // A shard on each of a core's two CPUs: the other's sibling is a shard's CPU, never
         // free (CPU `c`'s sibling `c ^ 4`, sysfs-style).
@@ -811,13 +841,14 @@ mod tests {
         off_the_shards(&l.masks, &[0, 1]);
         assert_eq!(l.masks.blocking, Some(vec![2, 3, 6, 7]));
         assert_eq!(l.masks.network, Some(vec![2, 3, 5, 6, 7]));
-        assert_eq!((l.free, l.siblings), (4, 1));
+        assert_eq!((l.free, l.network, l.siblings), (4, 5, 1));
         // `--affinity off`: the same counts, no masks.
         let off = layout(&process, &[0, 1, 2, 3], sysfs, false);
         assert_eq!(off.masks, RuntimeMasks::default());
+        // The network threads' CPUs are still counted (ICR 0131: `off` keeps the counts).
         assert_eq!(
-            (off.free, off.siblings, off.mode),
-            (12, 0, "unmasked (--affinity off)")
+            (off.free, off.network, off.siblings, off.mode),
+            (12, 16, 0, "unmasked (--affinity off)")
         );
         // Too few cores: no masks, the siblings included (#1697).
         let few = layout(&(0..8).collect::<Vec<_>>(), &[0, 1, 2, 3], pairs, true);
@@ -828,6 +859,57 @@ mod tests {
             layout(&process, &[], sysfs, true).masks,
             RuntimeMasks::default()
         );
+    }
+
+    /// #1745: the network threads' default fills their mask, the free cores and the shards'
+    /// SMT siblings, less the feed threads, on perf287's shapes; without SMT, or with too few
+    /// free cores, it's today's free cores less the feed threads; `--affinity off` keeps the
+    /// counts; given counts are taken as given.
+    #[test]
+    fn the_network_threads_fill_their_mask() {
+        use super::{layout, network_and_feed_threads};
+        let smt = |c: usize| vec![c % 16, c % 16 + 16];
+        let count = |process: Vec<usize>, shards: usize, affinity: bool| {
+            let l = layout(&process, &(0..shards).collect::<Vec<_>>(), smt, affinity);
+            network_and_feed_threads(l.free, l.network, None, None)
+        };
+        // (network, feed): the AX102 single-node default (0-9,16-25, 4 shards), 9 before;
+        // 8bio's 8-core node (0-7,16-23, 4 shards), 6 before, 10 measured best; 8b's 12-core
+        // node (0-11,16-27, 8 shards), 6 before.
+        assert_eq!(count((0..10).chain(16..26).collect(), 4, true), (13, 3));
+        assert_eq!(count((0..8).chain(16..24).collect(), 4, true), (10, 2));
+        assert_eq!(count((0..12).chain(16..28).collect(), 8, true), (14, 2));
+        // `--affinity off`: the same counts, no masks (ICR 0131).
+        assert_eq!(count((0..10).chain(16..26).collect(), 4, false), (13, 3));
+        // 2 cores of 4 CPUs, 1 shard: 3 CPUs in the mask, 1 feed thread.
+        assert_eq!(count(vec![0, 1, 16, 17], 1, true), (2, 1));
+        // No SMT: no siblings, 12 free CPUs less 3 feed threads.
+        let l = layout(
+            &(0..16).collect::<Vec<_>>(),
+            &[0, 1, 2, 3],
+            |c| vec![c],
+            true,
+        );
+        assert_eq!((l.free, l.network), (12, 12));
+        assert_eq!(
+            network_and_feed_threads(l.free, l.network, None, None),
+            (9, 3)
+        );
+        // Too few free cores (no mask): the CPUs no shard holds, at least 2.
+        let l = layout(
+            &(0..8).collect::<Vec<_>>(),
+            &[0, 1, 2, 3],
+            |c| vec![c & 3, (c & 3) + 4],
+            true,
+        );
+        assert_eq!((l.free, l.network), (4, 4));
+        assert_eq!(
+            network_and_feed_threads(l.free, l.network, None, None),
+            (3, 1)
+        );
+        // Given counts win; the floors hold.
+        assert_eq!(network_and_feed_threads(12, 16, Some(5), Some(2)), (5, 2));
+        assert_eq!(network_and_feed_threads(1, 1, None, None), (2, 1));
     }
 
     /// D317 ticket 8a (cli692's M3): a share's memory goes to the memtables first, at most
@@ -925,11 +1007,12 @@ mod tests {
             plan.io_threads >= 1 && plan.blocking_threads >= 1 && plan.feed_threads >= 1,
             "{plan:?}"
         );
-        // The feed threads come out of the network threads' default, not on top of it.
+        // The feed threads come out of the network threads' default, not on top of it: the
+        // two fill the network threads' mask, the free cores and the shards' siblings (#1745).
         if plan.free_cpus >= 4 {
             assert_eq!(
                 plan.io_threads + plan.feed_threads,
-                plan.free_cpus,
+                plan.free_cpus + plan.sibling_cpus,
                 "{plan:?}"
             );
         }
