@@ -227,7 +227,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     rt.block_on(async {
         put(b, "alice", "1").await;
         // Not fenced on a: refused.
-        let e = super::super::cli::relocate(&args, "p1", "c", false)
+        let e = super::super::cli::relocate(&args, "p1", "c", false, false)
             .await
             .err()
             .expect("refused");
@@ -237,7 +237,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             e.message()
         );
         // --old-unreachable still asks a, which answers and serves p1 (cli692's S3).
-        let e = super::super::cli::relocate(&args, "p1", "c", true)
+        let e = super::super::cli::relocate(&args, "p1", "c", true, false)
             .await
             .err()
             .expect("refused");
@@ -246,13 +246,36 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             "{}",
             e.message()
         );
+        // A copy is taken from the old node's closed files, so it's never unreachable.
+        let e = super::super::cli::relocate(&args, "p1", "c", true, true)
+            .await
+            .err()
+            .expect("refused");
+        assert!(e.message().contains("--copy needs"), "{}", e.message());
         client(a).await.fence(req()).await.unwrap();
         client(a).await.close(req()).await.unwrap();
         upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
-        let r = super::super::cli::relocate(&args, "p1", "c", false)
+        // Its files were copied whole (`--copy`): p1 keeps its feed history (D317 ticket 6).
+        let r = super::super::cli::relocate(&args, "p1", "c", false, true)
             .await
             .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert_eq!(r.document["copied"], true, "{:?}", r.document);
+        for port in ports {
+            let m = client(port)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+            assert_eq!(
+                (p1.node.as_str(), p1.epoch, p1.history_epoch),
+                ("c", 2, 0),
+                "on {port}: the copy keeps p1's history (0: the first map's, unmoved); a \
+                 move that isn't a copy starts another at 2"
+            );
+        }
         assert!(r.document["installed_files"].as_u64().unwrap() >= 1);
         eventually("c to serve p1", async || {
             get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
@@ -262,7 +285,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
         put(a, "alice", "2").await;
         assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"2".to_vec()));
         // Again: done.
-        let r = super::super::cli::relocate(&args, "p1", "c", false)
+        let r = super::super::cli::relocate(&args, "p1", "c", false, true)
             .await
             .unwrap();
         assert!(r.document.contains_key("done"), "{:?}", r.document);

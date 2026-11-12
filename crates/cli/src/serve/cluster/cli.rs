@@ -141,6 +141,13 @@ pub(crate) enum ClusterCommand {
         /// check that it's fenced or closed there.
         #[arg(long)]
         old_unreachable: bool,
+        /// The files on `--to` are the partition's own, copied whole from the node serving
+        /// it (`phdb cluster move` does this): its change-feed history carries over, and
+        /// tokens from before the move resume on the new node. Without it the move starts a
+        /// new history (a promotion, a restore), and older tokens expire. Not with
+        /// `--old-unreachable`: a copy is taken from that node's closed files.
+        #[arg(long, conflicts_with = "old_unreachable")]
+        copy: bool,
     },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
@@ -166,7 +173,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 .map_err(|e| Failure::io(&format!("read {}", file.display()), &e))?;
             let m = map::parse_json(&json).map_err(|e| Failure::usage(&e))?;
             map::validate(&m, false).map_err(|e| Failure::usage(&e))?;
-            runtime()?.block_on(set_map(node, m, *force))
+            runtime()?.block_on(set_map(node, m, *force, Vec::new()))
         }
         ClusterCommand::ShowMap {
             file,
@@ -232,7 +239,8 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             to,
             node,
             old_unreachable,
-        } => runtime()?.block_on(relocate(node, partition, to, *old_unreachable)),
+            copy,
+        } => runtime()?.block_on(relocate(node, partition, to, *old_unreachable, *copy)),
     }
 }
 
@@ -304,14 +312,22 @@ pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
 }
 
 /// `phdb cluster relocate P --to NEW` (D317 ticket 6): stamp NEW from the map's epoch `e`
-/// to `e + 1`, then set the map with P on NEW at `e + 1` through the writer. Run again
-/// once done (the map names NEW, and P isn't closed there), it answers so and does nothing.
+/// to `e + 1`, then set the map with P on NEW at `e + 1` through the writer, marked as
+/// copied (`SetMapRequest.copies`) with `copy`, so P keeps its feed history. Run again once
+/// done (the map names NEW, and P isn't closed there), it answers so and does nothing.
 pub(crate) async fn relocate(
     args: &NodeArgs,
     partition: &str,
     to: &str,
     old_unreachable: bool,
+    copy: bool,
 ) -> Result<Report, Failure> {
+    if copy && old_unreachable {
+        return Err(Failure::usage(
+            "--copy needs the old node's closed files, so it can't be unreachable: a move \
+             away from a stopped node is a promotion, which starts a new feed history",
+        ));
+    }
     let (mut c, token) = connect(args, &args.node).await?;
     let mut m = c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
@@ -410,7 +426,12 @@ pub(crate) async fn relocate(
         q.epoch = p.epoch + 1;
     }
     m.map_version += 1;
-    let set = set_map(args, m, false).await?;
+    let copies = if copy {
+        vec![partition.to_owned()]
+    } else {
+        Vec::new()
+    };
+    let set = set_map(args, m, false, copies).await?;
     let mut r = report(
         "cluster relocate",
         vec![
@@ -418,6 +439,7 @@ pub(crate) async fn relocate(
             ("from", json!(p.node)),
             ("node", json!(to)),
             ("epoch", json!(p.epoch + 1)),
+            ("copied", json!(copy)),
             ("installed_files", json!(stamped.files.len())),
             (
                 "map_version",
@@ -593,7 +615,13 @@ pub(crate) async fn set_map(
     args: &NodeArgs,
     mut m: ClusterMap,
     force: bool,
+    copies: Vec<String>,
 ) -> Result<Report, Failure> {
+    // A copy is a planned move, through the writer; never part of a recovery.
+    debug_assert!(
+        !force || copies.is_empty(),
+        "a forced map marks nothing copied"
+    );
     let (mut c, token) = connect(args, &args.node).await?;
     let current = match c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
@@ -695,7 +723,7 @@ pub(crate) async fn set_map(
         }
         c.set_map(request(
             SetMapRequest {
-                copies: Vec::new(),
+                copies,
                 expected_map_version: expected,
                 map: Some(m),
                 force: false,

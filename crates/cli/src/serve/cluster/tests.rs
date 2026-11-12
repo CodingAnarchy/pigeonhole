@@ -3657,7 +3657,8 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap()
             .into_inner();
         // A forced map that still names a as its writer is refused, and changes nothing.
-        let Err(e) = super::cli::set_map(&args(ports[1]), current.clone(), true).await else {
+        let Err(e) = super::cli::set_map(&args(ports[1]), current.clone(), true, Vec::new()).await
+        else {
             panic!("a forced map naming a writer that's down was set");
         };
         assert!(format!("{e:?}").contains("can't be"), "{e:?}");
@@ -3697,7 +3698,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             "{e:?}"
         );
         let p1_epoch = history(&forced, "p1").0;
-        let report = match super::cli::set_map(&args(ports[1]), forced, true).await {
+        let report = match super::cli::set_map(&args(ports[1]), forced, true, Vec::new()).await {
             Ok(r) => r,
             Err(e) => panic!("the forced map: {e:?}"),
         };
@@ -3869,7 +3870,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
             (with_p3(&v1, 3, "b", 2), "without a new epoch"),
         ] {
             assert_eq!(version(ports[0]).await, 1, "a is still behind");
-            let Err(e) = super::cli::set_map(&args(ports[0]), map, true).await else {
+            let Err(e) = super::cli::set_map(&args(ports[0]), map, true, Vec::new()).await else {
                 panic!("a forced map reusing an epoch b and c have was set ({why})");
             };
             let e = format!("{e:?}");
@@ -3883,7 +3884,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
             assert!(version(port).await <= 2, "no forced map was set");
         }
         // An epoch above every node's is set, and nothing is unchecked: all three answered.
-        let r = super::cli::set_map(&args(ports[0]), with_p3(&v1, 3, "b", 3), true)
+        let r = super::cli::set_map(&args(ports[0]), with_p3(&v1, 3, "b", 3), true, Vec::new())
             .await
             .unwrap();
         assert_eq!(r.document["unchecked"], serde_json::json!([]));
