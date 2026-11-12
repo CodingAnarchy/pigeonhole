@@ -51,6 +51,9 @@ pub(crate) const MAX_EVERY: u64 = SKIP_LIMIT;
 /// Token bytes per event the checkpoint cadence aims for, on average.
 const TOKEN_BYTES_PER_EVENT: usize = 150;
 
+/// The keepalive's shortest interval ([`Merging`]).
+const ALIVE_FLOOR: Duration = Duration::from_millis(10);
+
 /// How long an unavailable partition waits between attempts to open it again.
 const RETRY: Duration = Duration::from_secs(1);
 
@@ -317,7 +320,10 @@ impl Merging {
         quiet: Duration,
         idle: Duration,
     ) -> Self {
-        let alive_every = (idle / 2).max(Duration::from_millis(1));
+        // Half the limit, so a poll always lands inside it; at least 10 ms, so a limit set
+        // near zero doesn't spin the stream (simp724's N1 on #1777). A higher floor would
+        // break the half-limit guarantee for limits under twice it.
+        let alive_every = (idle / 2).max(ALIVE_FLOOR);
         let mut alive = Timer::new();
         alive.set(Some(tokio::time::Instant::now() + alive_every));
         Self {
