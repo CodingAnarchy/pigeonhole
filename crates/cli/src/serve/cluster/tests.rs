@@ -3291,6 +3291,34 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             })
             .collect()
     };
+    // Every node at the writer's map, each of its partitions reconciled to it: a schema
+    // call returns once the writer has set the map, before every node has reconciled
+    // (a missed push catches up by a pull), so the files are checked after it (#1771).
+    let settled = async || {
+        let want = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .map_version;
+        eventually("every partition to reconcile to the map", async || {
+            for &port in &ports {
+                let s = client(port)
+                    .await
+                    .status(StatusRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let here: Vec<_> = s.partitions.iter().filter(|lp| lp.ok).collect();
+                if s.map_version != want || here.iter().any(|lp| lp.reconciled_version != want) {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+    };
     rt.block_on(async {
         let schema = |port: u16| async move {
             let channel =
@@ -3392,6 +3420,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             .create_table(create("orders", fams(&["f", "g"]), None, true))
             .await
             .unwrap();
+        settled().await;
         for db in [&dbs[0], &dbs[2]] {
             let t = db.table("orders").unwrap().open().unwrap();
             assert!(t.families().contains(&"g"));
@@ -3404,12 +3433,14 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             })
             .await
             .unwrap();
+        settled().await;
         assert!(!has(&dbs[0], "orders") && !has(&dbs[2], "orders"));
         schema(ports[1])
             .await
             .create_table(create("orders", fams(&["f"]), on(&[], &["p2"]), false))
             .await
             .unwrap();
+        settled().await;
         assert!(has(&dbs[1], "orders") && !has(&dbs[0], "orders") && !has(&dbs[2], "orders"));
         // A create over the hand-made `collide` in p2: the map takes it over, and says so.
         schema(ports[0])

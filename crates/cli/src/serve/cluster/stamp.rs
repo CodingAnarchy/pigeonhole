@@ -249,7 +249,8 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         .memtable_budget(1 << 20)
         .block_cache(1 << 20)
         .row_cache(0);
-    let db = pigeonhole::Pigeonhole::open(&main, options)
+    // A Status read of the file at this moment holds its lock briefly: retried (#1770).
+    let db = super::open_retrying(&main, &options)
         .map_err(|e| ApiError::internal(format!("open {}: {e}", main.display())))?;
     let stamped = (|| {
         let id = identity::read(&db)
