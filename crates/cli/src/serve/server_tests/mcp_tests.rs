@@ -795,3 +795,44 @@ fn a_memory_tool_spelled_with_escapes_still_takes_a_memory_place() {
     let reply: Json = resp.body_mut().read_json().unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
 }
+
+#[test]
+fn a_namespace_scoped_token_gets_only_the_memory_tools_on_mcp() {
+    // audit120's F5: `/mcp` neither lists the data tools to a token with `ns=` nor answers
+    // them, at any scope.
+    let s = memory_mcp("admin all\nadmin ns=a boss\nwrite ns=a scoped\n");
+    for token in ["boss", "scoped"] {
+        let id = session(&s, Some(token));
+        let names = tool_names(&s, Some(token), &id);
+        assert!(
+            !names.is_empty() && names.iter().all(|n| n.starts_with("memory_")),
+            "{token}: {names:?}"
+        );
+        for (tool, args) in [
+            ("list_tables", json!({})),
+            ("read_row", json!({"table": "t", "row": "r"})),
+            ("scan", json!({"table": "t"})),
+            ("write", json!({"table": "t", "writes": []})),
+            ("create_table", json!({"table": "x", "families": ["f"]})),
+        ] {
+            let (e, err) = call(&s, Some(token), &id, tool, args);
+            assert!(err, "{token} {tool}: {e}");
+            assert_eq!(
+                e["error"]["code"], "PermissionDenied",
+                "{token} {tool}: {e}"
+            );
+        }
+        let (out, err) = call(
+            &s,
+            Some(token),
+            &id,
+            "memory_remember",
+            json!({"namespace": "a", "text": "still mine"}),
+        );
+        assert!(!err, "{token}: {out}");
+    }
+    // An unscoped token keeps the data tools.
+    let id = session(&s, Some("all"));
+    let names = tool_names(&s, Some("all"), &id);
+    assert!(names.contains(&"read_row".to_owned()), "{names:?}");
+}

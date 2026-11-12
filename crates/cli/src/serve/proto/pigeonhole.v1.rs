@@ -87,7 +87,8 @@ pub struct Row {
     pub cells: ::prost::alloc::vec::Vec<Cell>,
 }
 /// What an aggregate family's cell reads as (D294, D298). Which field is set follows the
-/// family's kind; `quantiles` and `bloom` answer the request's `AggregateQuery`.
+/// family's kind, and only an aggregate family's cells have one; `quantiles`, `bloom` and
+/// `set_members` answer the request's `AggregateQuery`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregateView {
     #[prost(uint64, optional, tag = "1")]
@@ -128,7 +129,9 @@ pub struct BloomReading {
     #[prost(bool, repeated, tag = "2")]
     pub contains: ::prost::alloc::vec::Vec<bool>,
 }
-/// Questions for aggregate cells, answered in `AggregateView`.
+/// Questions for aggregate cells, answered in `AggregateView`. At most 1,024 quantiles,
+/// and at most 1,024 bloom probes (`bloom_i64` and `bloom_bytes` together); more is
+/// `InvalidArgument`. Every answer counts against a page's `page_bytes`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregateQuery {
     #[prost(double, repeated, tag = "1")]
@@ -137,6 +140,10 @@ pub struct AggregateQuery {
     pub bloom_i64: ::prost::alloc::vec::Vec<i64>,
     #[prost(bytes = "bytes", repeated, tag = "3")]
     pub bloom_bytes: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    /// A set family's members (`AggregateView.set_members`), which are left out unless asked
+    /// for: they can be about 32 times the stored value.
+    #[prost(bool, tag = "4")]
+    pub set_members: bool,
 }
 /// A commit's result.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

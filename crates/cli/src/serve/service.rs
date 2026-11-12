@@ -295,6 +295,16 @@ impl ServiceOp {
             scope: self.scope(),
             writes: self.writes(),
             size: self.size(),
+            memory: matches!(
+                self,
+                Self::Remember(_)
+                    | Self::Recall(_)
+                    | Self::MarkUsed(_)
+                    | Self::Supersede(_)
+                    | Self::Link(_)
+                    | Self::Forget(_)
+                    | Self::MemoryWatch(_)
+            ),
         }
     }
 
@@ -446,6 +456,17 @@ pub(crate) struct Admit {
     pub scope: Scope,
     pub writes: bool,
     pub size: usize,
+    /// A memory call (`Memory`'s RPCs, `/mcp`'s memory tools): the only calls a token
+    /// limited to namespaces may make (audit120's F5).
+    pub memory: bool,
+}
+
+/// `PermissionDenied` for a call other than a memory call by a token limited to namespaces
+/// (audit120's F5).
+pub(crate) fn namespaced_denied(what: &str) -> ApiError {
+    ApiError::permission_denied(&format!(
+        "{what}: a token limited to namespaces (ns=) reaches only the memory calls"
+    ))
 }
 
 /// `Admin.BackupDownload`'s index in `RPCS`: counted when its stream ends.
@@ -1558,6 +1579,8 @@ impl Service {
     /// Every call's rules, before it runs, in one place (D313 §7 as amended by ticket 8c):
     /// gRPC and HTTP calls come through [`call`](Self::call), and `/mcp`'s tools call it
     /// directly. In order:
+    /// - **a token limited to namespaces:** `PermissionDenied` for anything but a memory call
+    ///   (audit120's F5);
     /// - **a replica's write refusal:** a write a caller may make is refused with `ReadOnly`
     ///   naming the primary, rather than a permission error;
     /// - **the caller's scope:** `PermissionDenied` below it;
@@ -1586,6 +1609,9 @@ impl Service {
     /// [`admit`](Self::admit)'s checks without its reservation: a `/mcp` tool call, whose
     /// request's bytes are its POST's, already reserved (ai1249's S1 on #1666).
     pub(crate) fn check(&self, call: &Admit, caller: &Caller) -> Result<(), ApiError> {
+        if caller.memory_only() && !call.memory {
+            return Err(namespaced_denied(&format!("call {}", call.what)));
+        }
         if let Some(replica) = self.replica.as_ref().filter(|r| r.refuses_writes())
             && call.writes
             && caller.scope.allows(call.scope)
@@ -2785,6 +2811,7 @@ impl Service {
         r: proto::GetRequest,
         caller: &Caller,
     ) -> Result<proto::GetResponse, ApiError> {
+        convert::check_aggregate(r.aggregate.as_ref())?;
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let cell = match &pinned {
@@ -2797,7 +2824,10 @@ impl Service {
         };
         drop(pinned);
         Ok(proto::GetResponse {
-            cell: cell.map(|c| convert::cell(&r.family, &r.qualifier, &c, r.aggregate.as_ref())),
+            cell: cell.map(|c| {
+                let kind = convert::Kinds::new(&table).of(&r.family);
+                convert::cell(&r.family, &r.qualifier, &c, kind, r.aggregate.as_ref())
+            }),
         })
     }
 
@@ -2817,27 +2847,42 @@ impl Service {
                 let at = pinned.as_ref().map(|p| p.snapshot().clone());
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
                 let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
-                let mut read = select.keys(table.keys(&keys))?;
-                let after;
-                if !r.after.is_empty() {
+                let after = if r.after.is_empty() {
+                    None
+                } else {
                     super::cluster::position::refuse_on_a_single_node(&r.after)?;
-                    after = KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?;
-                    read = read.resume_after(&after);
-                }
-                let page = read.read_within(budget)?;
+                    Some(KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?)
+                };
                 let q = select.aggregate();
-                Ok(proto::MultiGetResponse {
-                    missing: Vec::new(),
-                    rows: page
+                let kinds = convert::Kinds::new(&table);
+                // Read again with a smaller budget while the aggregate views take the page
+                // over its budget (audit120's F4): each read keeps fewer columns.
+                let mut within = budget;
+                let (page, rows) = loop {
+                    let mut read = select.keys(table.keys(&keys))?;
+                    if let Some(after) = &after {
+                        read = read.resume_after(after);
+                    }
+                    let page = read.read_within(within)?;
+                    let rows: Vec<proto::Row> = page
                         .rows()
                         .iter()
-                        .map(|row| convert::row(row.view(), q))
-                        .collect(),
+                        .map(|row| convert::row(row.view(), &kinds, q))
+                        .collect();
+                    match convert::probe_cut(&rows, budget) {
+                        Some(cut) if cut < within => within = cut,
+                        _ => break (page, rows),
+                    }
+                };
+                let bytes = rows.iter().map(row_bytes).sum();
+                Ok(proto::MultiGetResponse {
+                    missing: Vec::new(),
+                    rows,
                     next: page
                         .resume()
                         .map(|p| p.to_bytes().into())
                         .unwrap_or_default(),
-                    bytes: page.bytes(),
+                    bytes,
                 })
             })()?;
             Ok((reply, r))
@@ -3297,6 +3342,7 @@ impl Service {
                     read = read.resume_after(&after);
                 }
                 let q = select.aggregate();
+                let kinds = convert::Kinds::new(&table);
                 // One column per engine page, so the byte budget is checked at every column
                 // boundary: a page is cut before the column that wouldn't fit, and only a
                 // single column larger than the budget goes over it (D308's rule).
@@ -3306,7 +3352,7 @@ impl Service {
                 let mut next = Vec::new();
                 let mut more = false;
                 while let Some(page) = pages.next()? {
-                    let part = convert::row(page, q);
+                    let part = convert::row(page, &kinds, q);
                     let part_bytes: u64 = part.cells.iter().map(convert::cell_bytes).sum();
                     let first = out.is_none();
                     if !first
@@ -3743,7 +3789,10 @@ impl Service {
             .await?;
         drop(g);
         Ok(proto::GetResponse {
-            cell: cell.map(|c| convert::cell(&r.family, &r.qualifier, &c, None)),
+            cell: cell.map(|c| {
+                let kind = convert::Kinds::new(&table).of(&r.family);
+                convert::cell(&r.family, &r.qualifier, &c, kind, None)
+            }),
         })
     }
 
@@ -3760,9 +3809,10 @@ impl Service {
         let (txn, row) = self
             .blocking(move || {
                 let families: Vec<&str> = r.families.iter().map(String::as_str).collect();
+                let kinds = convert::Kinds::new(&table);
                 let row = txn
                     .get_row(&table, &r.row, &families)
-                    .map(|row| row.map(|row| convert::row(row, None)));
+                    .map(|row| row.map(|row| convert::row(row, &kinds, None)));
                 Ok((txn, row))
             })
             .await?;
@@ -4194,26 +4244,33 @@ impl ScanTask {
                 .map_err(|_| ApiError::internal("the scan threads closed"))?;
             let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
                 let select = convert::Select::new(req.selection.as_ref())?.at(at);
-                let mut scan = select.scan(&table, req.range.as_ref())?;
-                if let Some(n) = limit {
-                    scan = scan.limit(n);
-                }
-                if let Some(p) = &pos {
-                    scan = scan.resume_after(p);
-                }
-                let page = scan.read_within(budget)?;
                 let q = select.aggregate();
-                let rows: Vec<proto::Row> = page
-                    .rows()
-                    .iter()
-                    .map(|row| convert::row(row.view(), q))
-                    .collect();
-                Ok((
-                    rows,
-                    page.resume().cloned(),
-                    page.bytes(),
-                    page.cut_by_budget(),
-                ))
+                let kinds = convert::Kinds::new(&table);
+                // Read again with a smaller budget while the aggregate views take the page
+                // over its budget (audit120's F4): each read keeps fewer columns.
+                let mut within = budget;
+                loop {
+                    let mut scan = select.scan(&table, req.range.as_ref())?;
+                    if let Some(n) = limit {
+                        scan = scan.limit(n);
+                    }
+                    if let Some(p) = &pos {
+                        scan = scan.resume_after(p);
+                    }
+                    let page = scan.read_within(within)?;
+                    let rows: Vec<proto::Row> = page
+                        .rows()
+                        .iter()
+                        .map(|row| convert::row(row.view(), &kinds, q))
+                        .collect();
+                    match convert::probe_cut(&rows, budget) {
+                        Some(cut) if cut < within => within = cut,
+                        _ => {
+                            let bytes = rows.iter().map(row_bytes).sum();
+                            break Ok((rows, page.resume().cloned(), bytes, page.cut_by_budget()));
+                        }
+                    }
+                }
             })
             .await?;
             drop(thread);

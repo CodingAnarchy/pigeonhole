@@ -940,3 +940,83 @@ fn the_served_memory_store_s_tables_cannot_be_dropped() {
         assert_eq!(status, 200, "{table}: {e}");
     }
 }
+
+#[test]
+fn a_namespace_scoped_token_reaches_nothing_but_the_memory_calls() {
+    // audit120's F5: `ns=` bounds the memory store only, so a token with it is refused every
+    // other call, whatever its scope, rather than reaching the whole database.
+    let s = memory_server("admin all\nadmin ns=a boss\nwrite ns=a scoped\nread ns=a reader\n");
+    let row = json!({"table": "t", "row": b64(b"r")});
+    let cell = json!({"table": "t", "row": b64(b"r"), "family": "f", "qualifier": b64(b"q")});
+    let calls: Vec<(&str, Json)> = vec![
+        ("Data/Get", cell.clone()),
+        ("Data/MultiGet", json!({"table": "t", "keys": [b64(b"r")]})),
+        ("Data/ReadRow", json!({"table": "t", "row": b64(b"r")})),
+        ("Data/Scan", json!({"table": "t"})),
+        (
+            "Data/Mutate",
+            json!({"writes": {"row": row, "writes": [
+                {"put": {"family": "f", "qualifier": b64(b"q"), "value": {"bytes": b64(b"v")}}}
+            ]}}),
+        ),
+        ("Transactions/Begin", json!({})),
+        ("Snapshots/Open", json!({})),
+        ("Schema/ListTables", json!({})),
+        ("Schema/DescribeTable", json!({"name": "t"})),
+        (
+            "Schema/CreateTable",
+            json!({"name": "x", "families": [{"name": "f"}]}),
+        ),
+        ("Feed/Subscribe", json!({"tables": ["t"]})),
+        (
+            "Graph/Traverse",
+            json!({"table": "t", "family": "f", "seeds": [b64(b"r")]}),
+        ),
+        (
+            "Vectors/Nearest",
+            json!({"table": "t", "family": "v", "k": 1}),
+        ),
+        ("Vectors/Search", json!({"index": "i", "k": 1})),
+        ("Text/Search", json!({"index": "i", "query": "x"})),
+        ("Admin/Info", json!({})),
+        ("Admin/Metrics", json!({})),
+        ("Admin/Flush", json!({})),
+    ];
+    for token in ["boss", "scoped", "reader"] {
+        for (path, req) in &calls {
+            let (status, e) = s.rpc(path, req, Some(token));
+            assert_eq!(
+                (status, e["code"].as_str()),
+                (403, Some("PermissionDenied")),
+                "{token} {path}: {e}"
+            );
+        }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let metrics = agent
+            .get(format!("{}/metrics", s.url))
+            .header("Authorization", format!("Bearer {token}"))
+            .call()
+            .unwrap();
+        assert_eq!(metrics.status().as_u16(), 403, "{token} /metrics");
+    }
+    // gRPC answers the same.
+    let mut c = s.grpc();
+    let mut req = tonic::Request::new(proto::GetRequest {
+        table: "t".into(),
+        row: b"r".to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert("authorization", "Bearer boss".parse().unwrap());
+    let err = s.block_on(c.get(req)).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+    // The memory calls still answer, and an unscoped token still reads data.
+    assert_eq!(remember(&s, "a", "kept", Some("scoped")).0, 200);
+    let (status, body) = s.rpc("Data/Get", &cell, Some("all"));
+    assert_eq!(status, 200, "{body}");
+}

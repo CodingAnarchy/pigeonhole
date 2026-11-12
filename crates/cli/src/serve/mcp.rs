@@ -88,8 +88,13 @@ impl McpSession {
                 slot.max_recall(),
             )
         });
+        let tools = Tools::new(Box::new(backend), writable, shared.limits.mcp, memory);
         Self {
-            tools: Tools::new(Box::new(backend), writable, shared.limits.mcp, memory),
+            tools: if caller.memory_only() {
+                tools.memory_only()
+            } else {
+                tools
+            },
             protocol: protocol::Session::default(),
             requests: Arc::new(Semaphore::new(shared.limits.mcp_session_requests)),
             catalog: AtomicU64::new(service.catalog()),
@@ -280,6 +285,7 @@ impl Host for Gate<'_> {
             writes: scope == Scope::Write,
             // The request's bytes are the POST's, reserved before its body was read.
             size: 0,
+            memory: what.starts_with("memory_"),
         };
         // The checks only: the request's bytes are its POST's, already reserved (ai1249's S1).
         if let Err(e) = service.check(&admit, self.caller) {
@@ -353,15 +359,22 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let text = match axum::body::to_bytes(req.into_body(), length).await {
-        Ok(b) => match String::from_utf8(b.to_vec()) {
-            Ok(t) => t,
-            Err(_) => return ApiError::invalid("the body isn't UTF-8").into_response(),
-        },
-        Err(_) => {
-            return ApiError::invalid("the body is longer than its Content-Length").into_response();
-        }
-    };
+    // Within the request's one deadline (audit120's S-S1).
+    let until = arrived + shared.limits.request_timeout;
+    let text =
+        match tokio::time::timeout_at(until.into(), axum::body::to_bytes(req.into_body(), length))
+            .await
+        {
+            Ok(Ok(b)) => match String::from_utf8(b.to_vec()) {
+                Ok(t) => t,
+                Err(_) => return ApiError::invalid("the body isn't UTF-8").into_response(),
+            },
+            Ok(Err(_)) => {
+                return ApiError::invalid("the body is longer than its Content-Length")
+                    .into_response();
+            }
+            Err(_) => return ApiError::deadline_exceeded().into_response(),
+        };
     // A session this request starts, ended again unless its `initialize` succeeds: a
     // refused one mustn't hold a place against the token's cap for its idle lease
     // (ai1249's nit on #1666).
