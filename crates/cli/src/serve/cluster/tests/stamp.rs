@@ -370,7 +370,7 @@ fn a_move_run_again_after_its_stamp_finishes_but_drops_nothing() {
             .into_inner();
         assert!(!lp.files.is_empty(), "installed: {lp:?}");
 
-        let r = within(super::super::moving::run(&args, "p1", "c", true))
+        let r = within(super::super::moving::run(&args, "p1", "c", true, None))
             .await
             .unwrap();
         assert_eq!(r.document["verified"], false, "{:?}", r.document);

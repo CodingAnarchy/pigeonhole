@@ -50,7 +50,7 @@ const DEFAULT_CHUNK: u64 = 512 << 10;
 type Admin = proto::admin_client::AdminClient<tonic::transport::Channel>;
 
 /// A node's channel, as the move uses it.
-struct At {
+pub(super) struct At {
     id: String,
     args: NodeArgs,
     token: Option<String>,
@@ -58,7 +58,7 @@ struct At {
 }
 
 impl At {
-    async fn new(args: &NodeArgs, id: &str, address: &str) -> Result<Self, Failure> {
+    pub(super) async fn new(args: &NodeArgs, id: &str, address: &str) -> Result<Self, Failure> {
         let args = NodeArgs {
             node: url_of(args, address),
             ..args.clone()
@@ -111,38 +111,91 @@ impl At {
     }
 }
 
-/// Says every [`SAY_EVERY`] that a wait goes on.
+/// A wait for a node: says every [`SAY_EVERY`] that it goes on, and gives up at
+/// `--timeout` (#1784), naming the step, the node's last answer and where that leaves the
+/// partition.
 struct Waiting {
     what: String,
-    since: Instant,
-    said: Instant,
+    since: tokio::time::Instant,
+    said: tokio::time::Instant,
+    limit: Option<Duration>,
+    /// What the node last said (its `status` line for the partition, or the error).
+    last: String,
+    /// Where the partition stands if the wait gives up, and what to do.
+    then: String,
 }
 
 impl Waiting {
-    fn new(what: String) -> Self {
-        let now = Instant::now();
+    fn new(what: String, limit: Option<Duration>, then: String) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
             what,
             since: now,
             said: now,
+            limit,
+            last: "no answer yet".to_owned(),
+            then,
         }
     }
 
-    async fn tick(&mut self, now: &str) {
+    /// The time left, `None` without a limit.
+    fn left(&self) -> Option<Duration> {
+        self.limit.map(|l| l.saturating_sub(self.since.elapsed()))
+    }
+
+    fn gave_up(&self) -> Failure {
+        Failure::timed_out(format!(
+            "gave up {} after {:?} (--timeout): {}. {}",
+            self.what,
+            self.limit.unwrap_or_default(),
+            self.last,
+            self.then
+        ))
+    }
+
+    /// A call to the node, bounded by the time left: a node that never answers can't hold
+    /// the wait past its limit. The outer error is the wait given up; the inner, the
+    /// call's own.
+    async fn ask<T>(&mut self, call: impl Future<Output = T>) -> Result<T, Failure> {
+        match self.left() {
+            None => Ok(call.await),
+            Some(left) => match tokio::time::timeout(left, call).await {
+                Ok(r) => Ok(r),
+                Err(_) => {
+                    self.last = "the node didn't answer".to_owned();
+                    Err(self.gave_up())
+                }
+            },
+        }
+    }
+
+    /// The node said `now`: wait a poll, or give up at the limit.
+    async fn tick(&mut self, now: &str) -> Result<(), Failure> {
+        now.clone_into(&mut self.last);
+        if self.left() == Some(Duration::ZERO) {
+            return Err(self.gave_up());
+        }
         if self.said.elapsed() >= SAY_EVERY {
-            self.said = Instant::now();
+            self.said = tokio::time::Instant::now();
             eprintln!(
-                "phdb cluster move: {} ({}s){}",
+                "phdb cluster move: {} ({}s): {now}",
                 self.what,
                 self.since.elapsed().as_secs(),
-                if now.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {now}")
-                }
             );
         }
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(self.left().map_or(POLL, |l| l.min(POLL))).await;
+        Ok(())
+    }
+}
+
+/// A partition's `status` line in a wait's words: its state, then its error if any.
+fn said(lp: &LocalPartition) -> String {
+    let state = super::cli::state_text(lp);
+    let state = if state.is_empty() { "not open" } else { &state };
+    if lp.error.is_empty() {
+        state.to_owned()
+    } else {
+        format!("{state}: {}", lp.error)
     }
 }
 
@@ -152,6 +205,7 @@ pub(super) async fn run(
     partition: &str,
     to: &str,
     drop_source: bool,
+    timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     let m = c
@@ -255,7 +309,7 @@ pub(super) async fn run(
     if lp.state() != LocalPartitionState::Closed {
         old.call(partition, "close").await?;
     }
-    let files = closed_files(&old, partition).await?;
+    let files = closed_files(&old, partition, timeout).await?;
     stop_after(args, Step::Closed)?;
 
     // 2 and 3. Copied and stamped, unless an earlier run stamped it already.
@@ -296,22 +350,7 @@ pub(super) async fn run(
     stop_after(args, Step::Mapped)?;
 
     // 5. Serving on NEW.
-    let mut wait = Waiting::new(format!(
-        "waiting for node {to:?} to serve {partition} at epoch {}",
-        e + 1
-    ));
-    loop {
-        match new.local(partition).await {
-            // A node serves P only at the map's epoch for it, which is `e + 1` now. Until #1767,
-            // `Status` can't read an open file's epoch (its read-only open is refused), so
-            // the state is the check; once it lands, this can check `lp.epoch == e + 1` too
-            // (simp724's N1 on #1729).
-            Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving => break,
-            Ok(Some(lp)) => wait.tick(&lp.error).await,
-            Ok(None) => wait.tick("not listed yet").await,
-            Err(f) => wait.tick(f.message()).await,
-        }
-    }
+    serving(&new, partition, e + 1, timeout).await?;
     let serving_at = Instant::now();
     stop_after(args, Step::Serving)?;
 
@@ -421,16 +460,55 @@ fn stop_after(args: &NodeArgs, step: Step) -> Result<(), Failure> {
     Ok(())
 }
 
-/// OLD's closed files once their hash is done: a failed hash is retried by closing again.
-async fn closed_files(old: &At, p: &str) -> Result<Vec<PartitionFile>, Failure> {
-    let mut wait = Waiting::new(format!(
-        "waiting for node {:?} to hash {p}'s closed files",
-        old.id
-    ));
+/// Waits for NEW to serve `p`, which the map now gives it at epoch `e`.
+pub(super) async fn serving(
+    new: &At,
+    p: &str,
+    e: u64,
+    timeout: Option<Duration>,
+) -> Result<(), Failure> {
+    let mut wait = Waiting::new(
+        format!("waiting for node {:?} to serve {p} at epoch {e}", new.id),
+        timeout,
+        format!(
+            "The map already gives {p} to node {:?} at epoch {e}, and its writes go there: \
+             check that node (phdb cluster status --node {}). The old node's files are kept",
+            new.id, new.args.node
+        ),
+    );
     loop {
-        let lp = old
-            .local(p)
-            .await?
+        match wait.ask(new.local(p)).await? {
+            // A node serves P only at the map's epoch for it, which is `e` now. Until #1767,
+            // `Status` can't read an open file's epoch (its read-only open is refused), so
+            // the state is the check; once it lands, this can check `lp.epoch == e` too
+            // (simp724's N1 on #1729).
+            Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving => return Ok(()),
+            Ok(Some(lp)) => wait.tick(&said(&lp)).await?,
+            Ok(None) => wait.tick("not listed yet").await?,
+            Err(f) => wait.tick(f.message()).await?,
+        }
+    }
+}
+
+/// OLD's closed files once their hash is done: a failed hash is retried by closing again.
+async fn closed_files(
+    old: &At,
+    p: &str,
+    timeout: Option<Duration>,
+) -> Result<Vec<PartitionFile>, Failure> {
+    let mut wait = Waiting::new(
+        format!("waiting for node {:?} to hash {p}'s closed files", old.id),
+        timeout,
+        format!(
+            "The map still gives {p} to node {:?}, closed there: run the move again to go on \
+             waiting, or phdb cluster unfence {p} --node {} to serve it there again",
+            old.id, old.args.node
+        ),
+    );
+    loop {
+        let lp = wait
+            .ask(old.local(p))
+            .await??
             .ok_or_else(|| Failure::usage(&format!("node {:?} no longer lists {p}", old.id)))?;
         if lp.state() != LocalPartitionState::Closed {
             return Err(Failure::usage(&format!(
@@ -452,9 +530,9 @@ async fn closed_files(old: &At, p: &str) -> Result<Vec<PartitionFile>, Failure> 
             return Ok(lp.files);
         }
         if lp.error.contains("close it again") {
-            old.call(p, "close").await?;
+            wait.ask(old.call(p, "close")).await??;
         }
-        wait.tick(&lp.error).await;
+        wait.tick(&said(&lp)).await?;
     }
 }
 
@@ -665,6 +743,83 @@ fn compare(installed: &[PartitionFile], closed: &[PartitionFile]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paused() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_wait_gives_up_at_its_limit_naming_the_step_and_the_last_answer() {
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let mut wait = Waiting::new(
+                "waiting for node \"c\" to serve p1 at epoch 2".into(),
+                Some(Duration::from_millis(1000)),
+                "The map already gives p1 to node \"c\"".into(),
+            );
+            let mut ticks = 0;
+            let e = loop {
+                match wait.tick("opening").await {
+                    Ok(()) => ticks += 1,
+                    Err(e) => break e,
+                }
+            };
+            // Polled every 200 ms, and the last sleep is cut to the limit: given up at it.
+            assert_eq!(start.elapsed(), Duration::from_millis(1000));
+            assert_eq!(ticks, 5);
+            assert_eq!(e.status(), crate::ExitStatus::ERROR);
+            assert_eq!(
+                e.message(),
+                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 1s (--timeout): \
+                 opening. The map already gives p1 to node \"c\""
+            );
+        });
+    }
+
+    #[test]
+    fn a_call_that_never_answers_ends_the_wait_at_its_limit() {
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let mut wait = Waiting::new("waiting".into(), Some(Duration::from_secs(3)), "".into());
+            wait.tick("closed").await.unwrap();
+            let e = wait
+                .ask(std::future::pending::<()>())
+                .await
+                .expect_err("given up");
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+            assert!(
+                e.message().contains("the node didn't answer"),
+                "{}",
+                e.message()
+            );
+            // A call that answers gives its own result, an error included.
+            let mut wait = Waiting::new("waiting".into(), Some(Duration::from_secs(3)), "".into());
+            let r = wait
+                .ask(async { Err::<(), _>(Failure::usage("refused")) })
+                .await
+                .expect("not given up");
+            assert_eq!(r.unwrap_err().message(), "refused");
+        });
+    }
+
+    #[test]
+    fn without_a_limit_a_wait_goes_on() {
+        paused().block_on(async {
+            let mut wait = Waiting::new("waiting".into(), None, "".into());
+            for _ in 0..1000 {
+                wait.tick("opening").await.unwrap();
+            }
+            let slow = async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                7
+            };
+            assert_eq!(wait.ask(slow).await.unwrap(), 7);
+        });
+    }
 
     fn file(name: &str, bytes: u64, sha: u8) -> PartitionFile {
         PartitionFile {

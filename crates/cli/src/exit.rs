@@ -159,6 +159,17 @@ impl Failure {
         self
     }
 
+    /// A wait given up at its limit (`phdb cluster move --timeout`, exit 1).
+    #[cfg(feature = "serve")]
+    pub(crate) fn timed_out(message: String) -> Self {
+        Self {
+            code: "TimedOut".into(),
+            code_num: None,
+            message,
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// The same failure, naming the part of a request it came from (`ops[3]: …`).
     pub(crate) fn within(mut self, what: &str) -> Self {
         self.message = format!("{what}: {}", self.message);

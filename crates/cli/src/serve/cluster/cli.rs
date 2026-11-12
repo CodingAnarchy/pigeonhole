@@ -196,6 +196,13 @@ pub(crate) enum ClusterCommand {
         /// finds the copy made earlier, which it can't check again.
         #[arg(long)]
         drop_source: bool,
+        /// Give up a wait for a node after SECS: OLD hashing the closed files, or `--to`
+        /// serving the partition once the map gives it to it. The error names the step and
+        /// the node's last `status` line for the partition. It bounds each wait, not the
+        /// copy, which takes as long as the files do. Without it, a wait goes on as long as
+        /// it takes, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
     },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
@@ -301,7 +308,14 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             to,
             node,
             drop_source,
-        } => runtime()?.block_on(super::moving::run(node, partition, to, *drop_source)),
+            timeout,
+        } => runtime()?.block_on(super::moving::run(
+            node,
+            partition,
+            to,
+            *drop_source,
+            timeout.map(Duration::from_secs),
+        )),
         ClusterCommand::DropPartition { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Drop))
         }
