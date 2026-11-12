@@ -524,6 +524,9 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .thread_name("phdb-serve")
         .on_thread_start(move || enter.enter_network())
         .on_thread_unpark(move || unpark.unpark_network())
+        // A mask a partition's open or close published (D317 ticket 6), taken as a worker
+        // goes idle too.
+        .on_thread_park(placement::refresh)
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the runtime", &e))?;
@@ -536,6 +539,8 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .worker_threads(placement.feed_threads)
         .thread_name("phdb-serve-feed")
         .on_thread_start(move || enter.enter_feed())
+        .on_thread_park(placement::refresh)
+        .on_thread_unpark(placement::refresh)
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed runtime", &e))?;
@@ -549,6 +554,8 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         .worker_threads(placement.hub_threads)
         .thread_name("phdb-serve-feed-hub")
         .on_thread_start(move || enter.enter_hub())
+        .on_thread_park(placement::refresh)
+        .on_thread_unpark(placement::refresh)
         .enable_all()
         .build()
         .map_err(|e| Failure::io("start the feed hub runtime", &e))?;

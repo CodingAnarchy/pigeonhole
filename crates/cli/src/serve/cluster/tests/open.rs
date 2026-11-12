@@ -191,6 +191,22 @@ fn opened_off_the_others_cores_alone() {
     map.map_version = 2;
     map.partitions.extend([part("p3"), part("p4")]);
     let shared = node.opener.get().unwrap().shared.upgrade().unwrap();
+    // A thread of the server's own, on the free cores before p3 opens: it takes the mask
+    // the open reapplies at its next refresh.
+    let placement = Arc::clone(&node.opener.get().unwrap().placement);
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let worker = {
+        let placement = Arc::clone(&placement);
+        std::thread::spawn(move || {
+            placement.enter();
+            wait.recv().unwrap();
+            crate::serve::placement::refresh();
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+            (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect::<Vec<usize>>()
+        })
+    };
     rt.block_on(async {
         client(port)
             .await
@@ -221,6 +237,20 @@ fn opened_off_the_others_cores_alone() {
                 "p3's shard on {c}, off the free cores {free:?}"
             );
         }
+        // The masks were reapplied without p3's shard and its siblings, and a thread of
+        // ours takes them.
+        let now = placement.current();
+        let blocking = now.blocking.clone().expect("still masked");
+        let mut off: Vec<usize> = new.iter().flat_map(|&c| siblings(c)).collect();
+        off.extend(&new);
+        assert!(
+            blocking
+                .iter()
+                .all(|c| !off.contains(c) && !taken.contains(c)),
+            "the free cores {blocking:?} after p3's shard {new:?}"
+        );
+        go.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), blocking);
         let e = node.open_part("p4").await.unwrap_err();
         assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
         assert!(

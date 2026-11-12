@@ -46,6 +46,33 @@ impl std::fmt::Debug for Opener {
     }
 }
 
+/// Reapplies the server's masks for the shard CPUs of `parts`, the partitions open now
+/// (D317 ticket 6), and says so. The runtimes keep the thread counts they started with
+/// (Tokio can't resize one): a mask that shrank has more of them per CPU (cli692 on #1745).
+pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMap, why: &str) {
+    let mut pinned: Vec<usize> = parts
+        .values()
+        .filter_map(|s| s.part_opt())
+        .flat_map(|p| p.db.pinned_shard_cpus())
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    let masks = placement.reapply(&pinned);
+    let list = |m: &Option<Vec<usize>>| {
+        m.as_deref().map_or_else(
+            || "any CPU".to_owned(),
+            crate::serve::placement::format_cpu_list,
+        )
+    };
+    eprintln!(
+        "phdb serve: {why}: the server's threads now run on {} (request workers on {}), off \
+         the shards' {} CPUs; the thread counts stay as the server started them",
+        list(&masks.blocking),
+        list(&masks.network),
+        pinned.len()
+    );
+}
+
 /// Lets `node` open partitions while `shared` serves (a node's start, and the test rig's).
 pub(crate) fn attach_opener(node: &Arc<Node>, opener: Opener) {
     let _ = node.opener.set(opener);
@@ -215,6 +242,7 @@ impl Node {
         }
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
+        remask(&opener.placement, &parts, &format!("partition {id} opened"));
         cluster.parts.store(Arc::new(parts));
         // Its schema follows the map before it's unfenced (D317 ticket 5).
         let node = Arc::clone(self);

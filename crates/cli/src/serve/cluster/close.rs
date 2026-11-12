@@ -96,7 +96,7 @@ impl Node {
         // Out of the parts first: no new call reaches it from here.
         let mut parts = (*cluster.parts.load_full()).clone();
         let service = parts.remove(id).ok_or_else(|| super::fence::not_here(id))?;
-        cluster.parts.store(Arc::new(parts));
+        cluster.parts.store(Arc::new(parts.clone()));
         self.fences.forget(id);
         self.fences.closed().insert(
             id.to_owned(),
@@ -121,6 +121,10 @@ impl Node {
         .map_err(|e| ApiError::internal(e.to_string()))?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
+        }
+        // Its shards' CPUs are free now: the server's threads take them back.
+        if let Some(opener) = self.opener.get() {
+            super::open::remask(&opener.placement, &parts, &format!("partition {id} closed"));
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);

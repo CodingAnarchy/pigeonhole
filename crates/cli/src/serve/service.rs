@@ -1426,6 +1426,9 @@ impl Service {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
     ) -> Result<ServiceReply, ApiError> {
+        // A mask a partition's open or close published (D317 ticket 6), taken by a busy
+        // worker that hasn't parked since.
+        super::placement::refresh();
         let budget = self.admit(&op.admit(), caller, prepaid).await?;
         // A fenced partition's writes (D317 ticket 6), once admitted, so a fence's drain
         // never waits behind a write's wait for the budget. Held until the call answers;
@@ -3893,9 +3896,13 @@ async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
+    tokio::task::spawn_blocking(|| {
+        // A reused pool thread takes a mask published since it started (D317 ticket 6).
+        super::placement::refresh();
+        f()
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
 /// A table's scan, ready to start: see [`Service::scan_opener`].
