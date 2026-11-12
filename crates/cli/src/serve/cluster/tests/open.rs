@@ -19,7 +19,11 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
     let mut map = the_map(1, &ports);
     map.partitions.retain(|p| p.id != "p3");
     let dirs = [test_dir(), test_dir(), test_dir()];
-    test_partition(&dirs[2], "p3").close().unwrap();
+    // One shard: a light open, so the wait below measures the open path, not a slow
+    // engine under the whole module's load.
+    test_partition_with(&dirs[2], "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
     for ((l, dir), (id, local)) in

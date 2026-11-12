@@ -108,7 +108,8 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
     }
     // p3's files, as another node closed them.
     let source = test_dir();
-    let p3 = test_partition(&source, "p3");
+    // One shard: one WAL file to upload and open.
+    let p3 = test_partition_with(&source, "p3", pigeonhole::Options::default().shards(1));
     p3.close().unwrap();
     let main = source.join("p3.phdb");
     let c = ports[2];
