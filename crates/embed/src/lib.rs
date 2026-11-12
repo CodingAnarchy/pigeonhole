@@ -39,6 +39,9 @@
 //!   `pigeonhole/models/<model>@<revision>/`. A file missing from the cache is downloaded once
 //!   from the model's pinned revision on huggingface.co (the `download` feature, on by
 //!   default), unless [`LoadOptions::offline`] or `PIGEONHOLE_EMBED_OFFLINE=1` says not to.
+//!   A download has no total time limit, however slow the link: it fails only when nothing
+//!   arrives for 60 seconds, or the connection takes more than 30 to open. It doesn't resume:
+//!   a failed one starts again at the next `open`.
 //!
 //! **Every file is checked against a SHA-256 pinned in this crate** before it's used, wherever
 //! it came from, so a load either runs exactly the model its [`EmbeddingModel`] id names or

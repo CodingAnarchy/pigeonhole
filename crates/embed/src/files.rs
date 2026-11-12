@@ -164,6 +164,8 @@ mod download {
     const MAX_REDIRECTS: usize = 5;
     /// The largest file accepted (the weights are 133 MB).
     const MAX_BYTES: u64 = 1 << 30;
+    /// How long a download may go without receiving anything before it fails.
+    const STALL: Duration = Duration::from_secs(60);
 
     /// Whether `host` is Hugging Face's: `huggingface.co`, `hf.co`, or a subdomain of either.
     pub(super) fn trusted(host: &str) -> bool {
@@ -203,7 +205,10 @@ mod download {
             .build();
         Ok(ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_body(Some(Duration::from_secs(60)))
+            // A stall, not a total (the audit's S-B3): ureq's body timeout is for the whole
+            // body, and the weights are 133 MB, so a link under about 18 Mbit/s could never
+            // finish. Each read may wait `STALL`; `MAX_BYTES` bounds the size.
+            .timeout_per_read(Some(STALL))
             // Redirects are followed here, each checked against `trusted`.
             .max_redirects(0)
             .http_status_as_error(false)
