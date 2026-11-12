@@ -1448,7 +1448,6 @@ impl Sink {
     pub(crate) async fn put(&self, event: Out) -> Result<(), ApiError> {
         let bytes = event.encoded_len().clamp(1, self.client_bytes);
         let n = u32::try_from(bytes).unwrap_or(u32::MAX);
-        let gone = || ApiError::internal("the client went away");
         // The fast path: room in the buffer and a place in the channel at once, with no
         // timer or waiter registered. Arming them on every send was 64% of the samples in
         // futex calls at 256 subscribers (perf287's profile on #1397).
@@ -1461,7 +1460,19 @@ impl Sink {
             Err(tokio::sync::TryAcquireError::NoPermits) => (event, None),
             Err(tokio::sync::TryAcquireError::Closed) => return Err(gone()),
         };
-        // The slow path: wait for whichever was missing.
+        // The slow path, boxed: its timer and waits made this future 1.2 KB, built (and
+        // copied) for every event though the fast path needs none of it (#1758's g86c).
+        Box::pin(self.wait_to_put(event, held, n)).await
+    }
+
+    /// [`Sink::put`]'s slow path: waits for room in the buffer (unless `held`) and a place in
+    /// the channel, within the idle limit.
+    async fn wait_to_put(
+        &self,
+        event: Out,
+        held: Option<OwnedSemaphorePermit>,
+        n: u32,
+    ) -> Result<(), ApiError> {
         let budget = Arc::clone(&self.budget);
         let queued = async {
             let room = match held {
@@ -1503,6 +1514,11 @@ impl Sink {
             }
         }
     }
+}
+
+/// The error a send to a client that went away ends with.
+fn gone() -> ApiError {
+    ApiError::internal("the client went away")
 }
 
 /// `commit` as the client sees it: its changes to rows under `prefix`, or `None` when it has
@@ -1886,6 +1902,28 @@ mod tests {
             rt(delivery_threads, Some("phdb-serve-feed")),
             rt(1, Some("phdb-serve-feed-hub")),
         )
+    }
+
+    #[test]
+    fn a_put_with_room_builds_a_small_future() {
+        // #1758's g86c: a cluster subscription puts every event through a `Sink`, and with
+        // the slow path's timer and waits inline the future was 1.2 KB, built and copied per
+        // event though a put with room needs none of it. Boxed, the slow path costs only
+        // when the client is behind.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sink, _events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+            let put = sink.put(Out::Spliced {
+                body: prost::bytes::Bytes::from_static(b"x"),
+                tail: prost::bytes::Bytes::new(),
+            });
+            let size = std::mem::size_of_val(&put);
+            assert!(size <= 512, "Sink::put's future is {size} bytes");
+            put.await.unwrap();
+        });
     }
 
     fn limits_solo_after(solo_after: Duration) -> FeedLimits {
