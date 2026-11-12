@@ -3675,6 +3675,7 @@ mod feed;
 mod fence;
 mod metrics;
 mod open;
+mod restore;
 mod several;
 mod stamp;
 mod upload;
