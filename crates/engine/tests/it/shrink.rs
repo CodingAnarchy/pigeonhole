@@ -319,6 +319,52 @@ fn shrink_moves_the_manifest_once_a_pin_of_its_first_round_is_gone() {
 }
 
 #[test]
+fn shrink_right_after_a_compaction_finds_its_inputs_free() {
+    // #1765's CI failure: the compaction task reported to its shard (so `compact` returned)
+    // while it still held its inputs' view, which the runtime dropped only once the task
+    // ended. A `shrink` in between found the SSTs the compaction had just retired pinned, left
+    // the manifest above them, and the file kept 4 MiB with no row left. The hook runs the
+    // shrink at that point, on the task's thread, before the task ends.
+    let vfs = SimVfs::new(1765);
+    let rig = Rig::open(&vfs);
+    let db = &rig.db;
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    write_rows(&rig, &t, 0..3000);
+    rig.flush();
+    rig.compact(None);
+    delete_rows(&rig, t.id, 0..3000);
+    rig.flush();
+    let before = file_len(&vfs);
+    assert!(before >= 4 << 20, "the load grew the file: {before}");
+
+    let (db2, vfs2) = (Arc::clone(db), Arc::clone(&vfs));
+    let after = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&after);
+    db.on_next(
+        pigeonhole_engine::HookSite::CompactionReported,
+        Box::new(move || {
+            db2.shrink().unwrap();
+            *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(file_len(&vfs2));
+        }),
+    );
+    rig.compact(None);
+    assert_eq!(row_count(db, &t), 0);
+    let after = after
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("the hook ran after the compaction reported");
+    assert!(
+        after <= 512 << 10,
+        "only the manifest is live, yet the file is {after} bytes"
+    );
+    assert_eq!(db.unreferenced_bytes(), 0);
+    rig.close();
+}
+
+#[test]
 fn shrink_skips_an_sst_a_compaction_retired_under_it() {
     // 7 F7-5: a compaction that committed between shrink's catalog read and its relocation
     // retired the input, and `relocate` refused it: shrink failed with "relocate of an
