@@ -388,9 +388,9 @@ The calls that wait have native `asyncio` forms (#1479, ICR 0121), so a coroutin
   - `remember_async`'s near-dedup lookup (on a store with near dedup) and an IVF store's settle run on a worker thread.
   - `Store.watch(...)` gives a `Watch` of the store's memory events, with `next`, `try_next` and `next_async`, under the same rules as `Feed.next_async`. `next_async` works in the writer process only: a reader's watch (`ReadStore.watch`) raises `Unsupported` there, so use `next` on a thread of its own.
   - `Store.consolidate_loop(...)` gives a `ConsolidateLoop`. Its `run_once_async` awaits new memories without holding a thread, and a timeout loses no events. It runs the due passes, and so your consolidator, on a worker thread. It returns after the first commit with memory events, where the sync `run_once` reads until its timeout, so call it in a loop.
-  - Recall isn't async yet (#1560).
+  - `Store.recall_async` and `recall_with_stats_async` (and `ReadStore`'s) run recall on a small pool of their own: see **Async recall** above.
 - **An awaited write is a commit:** finish or drop snapshots, scans and Arrow streams before you await a write. A `remember_async`'s settle may commit splits too. Holding a snapshot across them is [Don't hold a snapshot across your own commit](transactions.md#dont-hold-a-snapshot-across-your-own-commit) with the event loop as the thread: the write waits for room only your snapshot holds, and ends in `Busy`.
-- **Not yet async:** reads outside a transaction, and memory recall (#1560). Call them through `asyncio.to_thread` meanwhile.
+- **Not yet async:** reads outside a transaction. Call them through `asyncio.to_thread` meanwhile. Memory recall has its own async form, `recall_async`: prefer it to `to_thread(store.recall, ...)` on a loop that also commits or serves requests (the table under **Async recall**).
 
 ```python
 import asyncio
