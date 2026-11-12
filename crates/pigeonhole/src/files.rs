@@ -23,6 +23,10 @@ impl Pigeonhole {
     /// The list is a snapshot of the directory. While the database is open, its files keep
     /// changing, so copy them only once it's closed.
     ///
+    /// The directory is scanned, not the main file read: sidecars whose main file is gone
+    /// are listed (what a removal left half done, so a caller can finish it), and a path
+    /// with no files at all answers an empty list.
+    ///
     /// ```
     /// use pigeonhole::{Options, Pigeonhole};
     ///
@@ -50,7 +54,9 @@ impl Pigeonhole {
         let mut wal = Vec::new();
         let mut feed = None;
         for entry in std::fs::read_dir(dir).map_err(io)? {
-            let file = entry.map_err(io)?.path();
+            // Named beside `path` as given, so a bare relative path (`data.phdb`, read from
+            // `.`) matches its own files.
+            let file = path.with_file_name(entry.map_err(io)?.file_name());
             match Self::database_file_suffix(path, &file) {
                 Some("") => main = Some(file),
                 Some(FEED_SUFFIX) => feed = Some(file),
@@ -195,6 +201,22 @@ mod tests {
                 Some(format!("-wal-{n}").as_str())
             );
         }
+    }
+
+    /// A removal that stopped after the main file (feed1248's #1748: a replica bootstrap's
+    /// side copy): its sidecars are still listed, so they can be removed too.
+    #[test]
+    fn sidecars_whose_main_file_is_gone_are_listed() {
+        let dir = crate::doc_support::temp_dir();
+        let path = dir.join("p1.phdb.bootstrap");
+        for name in [
+            "p1.phdb.bootstrap-wal-0",
+            "p1.phdb.bootstrap-feed",
+            "p1.phdb",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        assert_eq!(suffixes(&path), ["-wal-0", "-feed"]);
     }
 
     #[test]
