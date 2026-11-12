@@ -688,6 +688,9 @@ impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::compact_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
 pub fn pigeonhole::Pigeonhole::flush_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
 impl pigeonhole::Pigeonhole
+pub fn pigeonhole::Pigeonhole::database_file_suffix<'a>(&std::path::Path, &'a std::path::Path) -> core::option::Option<&'a str>
+pub fn pigeonhole::Pigeonhole::database_files(impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<alloc::vec::Vec<std::path::PathBuf>>
+impl pigeonhole::Pigeonhole
 pub fn pigeonhole::Pigeonhole::transact<T, E>(&self, &pigeonhole::RetryPolicy, impl core::ops::function::FnMut(&mut pigeonhole::Transaction) -> core::result::Result<T, E>) -> core::result::Result<(T, pigeonhole::CommitInfo), E> where E: core::convert::From<pigeonhole::Error>
 pub struct pigeonhole::PigeonholeReader
 impl pigeonhole::PigeonholeReader

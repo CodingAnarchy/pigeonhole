@@ -92,6 +92,7 @@ mod check;
 mod db;
 mod error;
 mod feed;
+mod files;
 mod info;
 mod merge;
 mod metrics;
