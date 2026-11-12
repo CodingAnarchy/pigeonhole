@@ -317,3 +317,21 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         let _ = db.close();
     }
 }
+
+/// #1767: a partition the node serves shows its identity in Status, read from its own
+/// handle; a read-only open of the file is refused while the node holds it for writing,
+/// which listed it at epoch 0 with "the writer lock is held".
+#[test]
+fn status_shows_a_served_partitions_identity_from_its_handle() {
+    let t = Three::start(["", "", ""]);
+    let [a, b, _] = t.ports;
+    t.rt.block_on(async {
+        for (port, p) in [(a, "p1"), (b, "p2")] {
+            let lp = local(port, p).await;
+            assert_eq!(lp.epoch, 1, "{lp:?}");
+            assert!(lp.ok, "{lp:?}");
+            assert!(lp.error.is_empty(), "{lp:?}");
+            assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        }
+    });
+}
