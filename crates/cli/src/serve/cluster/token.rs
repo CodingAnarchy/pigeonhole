@@ -164,39 +164,85 @@ fn unzigzag(v: u64) -> i64 {
 /// count (`u32`), the last seqno delivered and the writer session (`u64` each).
 const HEAD: usize = 1 + 16 + 4 + 8 + 8;
 
-/// A cluster token's bytes, appended to `out`, from its parts as a subscription holds them,
-/// so a checkpoint (one per event on a one-partition subscription) builds no
-/// [`ClusterToken`] and allocates nothing once `out` and `scratch` have grown (#1758).
-/// `scratch` holds each compacted component on its way.
-pub(crate) fn encode_into<'a>(
-    cluster_id: &str,
-    map_version: u64,
-    subscription: u64,
-    components: impl ExactSizeIterator<Item = (&'a str, u64, &'a At)>,
-    out: &mut Vec<u8>,
-    scratch: &mut Vec<u8>,
-) {
+/// A subscription's last checkpoint, by part: the token's prefix (everything before the
+/// components) and each component's bytes, each kept with the values it was encoded from and
+/// rebuilt only when they differ (#1758's 2a). Keyed by value rather than invalidated where
+/// things change, so a change it isn't told about can't leave a stale token: a checkpoint
+/// equals the token built fresh from the same parts, whatever happened between
+/// (`a_cached_token_equals_one_built_fresh_whatever_changes`).
+#[derive(Debug, Default)]
+pub(crate) struct TokenCache {
+    /// The prefix, and the map version it was built for (the rest of it is fixed for the
+    /// subscription).
+    prefix: Vec<u8>,
+    prefix_for: Option<u64>,
+    parts: Vec<CachedPart>,
+    scratch: Vec<u8>,
+}
+
+/// A part's component as [`TokenCache`] holds it: its bytes, and the epoch and position they
+/// were built from (none yet).
+#[derive(Debug, Default)]
+struct CachedPart {
+    made_from: Option<(u64, At)>,
+    bytes: Vec<u8>,
+}
+
+impl TokenCache {
+    /// The token of a subscription (`cluster_id`, `subscription`) at `map_version` whose
+    /// parts are `components`, always the same parts in the same order, into `out`.
+    pub(crate) fn encode<'a>(
+        &mut self,
+        cluster_id: &str,
+        map_version: u64,
+        subscription: u64,
+        components: impl ExactSizeIterator<Item = (&'a str, u64, &'a At)>,
+        out: &mut Vec<u8>,
+    ) {
+        let n = components.len();
+        if self.prefix_for != Some(map_version) || self.parts.len() != n {
+            self.prefix.clear();
+            put_prefix(cluster_id, map_version, subscription, n, &mut self.prefix);
+            self.prefix_for = Some(map_version);
+            self.parts.resize_with(n, Default::default);
+        }
+        out.extend_from_slice(&self.prefix);
+        for ((partition, epoch, at), part) in components.zip(&mut self.parts) {
+            if !matches!(&part.made_from, Some((e, a)) if *e == epoch && a == at) {
+                part.bytes.clear();
+                put_component(partition, epoch, at, &mut part.bytes, &mut self.scratch);
+                part.made_from = Some((epoch, at.clone()));
+            }
+            out.extend_from_slice(&part.bytes);
+        }
+    }
+}
+
+/// A cluster token's bytes before its components.
+fn put_prefix(cluster_id: &str, map_version: u64, subscription: u64, n: usize, out: &mut Vec<u8>) {
     out.push(MAGIC);
     out.push(VERSION);
     put_bytes(out, cluster_id.as_bytes());
     encode_varint(map_version, out);
     out.extend_from_slice(&subscription.to_le_bytes());
-    encode_varint(components.len() as u64, out);
-    for (partition, epoch, at) in components {
-        put_bytes(out, partition.as_bytes());
-        encode_varint(epoch, out);
-        match at {
-            At::Now => out.push(NOW),
-            At::Oldest => out.push(OLDEST),
-            At::Token(token) => {
-                scratch.clear();
-                if compact_into(token, scratch) {
-                    out.push(COMPACT);
-                    put_bytes(out, scratch);
-                } else {
-                    out.push(RAW);
-                    put_bytes(out, token);
-                }
+    encode_varint(n as u64, out);
+}
+
+/// One component's bytes; `scratch` holds its compacted token on the way.
+fn put_component(partition: &str, epoch: u64, at: &At, out: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+    put_bytes(out, partition.as_bytes());
+    encode_varint(epoch, out);
+    match at {
+        At::Now => out.push(NOW),
+        At::Oldest => out.push(OLDEST),
+        At::Token(token) => {
+            scratch.clear();
+            if compact_into(token, scratch) {
+                out.push(COMPACT);
+                put_bytes(out, scratch);
+            } else {
+                out.push(RAW);
+                put_bytes(out, token);
             }
         }
     }
@@ -300,6 +346,24 @@ pub(crate) fn expand(small: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// A cluster token's bytes, appended to `out`, from its parts as a subscription holds them,
+    /// so a checkpoint (one per event on a one-partition subscription) builds no
+    /// [`ClusterToken`] and allocates nothing once `out` and `scratch` have grown (#1758).
+    /// `scratch` holds each compacted component on its way.
+    fn encode_into<'a>(
+        cluster_id: &str,
+        map_version: u64,
+        subscription: u64,
+        components: impl ExactSizeIterator<Item = (&'a str, u64, &'a At)>,
+        out: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
+    ) {
+        put_prefix(cluster_id, map_version, subscription, components.len(), out);
+        for (partition, epoch, at) in components {
+            put_component(partition, epoch, at, out, scratch);
+        }
+    }
+
     fn compact(raw: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         compact_into(raw, &mut out).then_some(out)
@@ -339,6 +403,84 @@ mod tests {
             t.extend_from_slice(&4u64.to_le_bytes());
         }
         t
+    }
+
+    #[test]
+    fn a_cached_token_equals_one_built_fresh_whatever_changes() {
+        // simp724's test for #1758's 2a: whatever happens to a subscription's parts between
+        // checkpoints, the cached token is the one built fresh. Seeded (`PHDB_TOKEN_SEED`);
+        // the seed and step print on failure.
+        let seed: u64 = std::env::var("PHDB_TOKEN_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x2a_1758);
+        let mut x = seed;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for parts in [1usize, 3] {
+            let mut cache = TokenCache::default();
+            let mut map_version = 4u64;
+            let mut comps: Vec<(String, u64, At)> =
+                (0..parts).map(|i| (format!("p{i}"), 1, At::Now)).collect();
+            for step in 0..3000 {
+                let i = (next() % parts as u64) as usize;
+                let what = match next() % 10 {
+                    // A part's next position: mostly a token that compacts, sometimes one
+                    // carried raw.
+                    0..=4 => {
+                        let raw = if next() % 5 == 0 {
+                            (0..40).map(|_| next() as u8).collect()
+                        } else {
+                            d310(1, 4, next() % 5000)
+                        };
+                        comps[i].2 = At::Token(Bytes::from(raw));
+                        "position"
+                    }
+                    // Moved, by copy (#1729): a reopen records the new epoch.
+                    5 => {
+                        comps[i].1 += 1;
+                        "move"
+                    }
+                    // A reopen took a newer map.
+                    6 => {
+                        map_version += 1 + next() % 3;
+                        "map"
+                    }
+                    // Back to no position (opened from its own now or oldest).
+                    7 => {
+                        comps[i].2 = if next() % 2 == 0 { At::Now } else { At::Oldest };
+                        "reopen"
+                    }
+                    // skip_through: passed over by the part's node, nothing in the token.
+                    _ => "skip_through",
+                };
+                let mut cached = Vec::new();
+                cache.encode(
+                    "c1",
+                    map_version,
+                    77,
+                    comps.iter().map(|(p, e, a)| (p.as_str(), *e, a)),
+                    &mut cached,
+                );
+                let mut fresh = Vec::new();
+                encode_into(
+                    "c1",
+                    map_version,
+                    77,
+                    comps.iter().map(|(p, e, a)| (p.as_str(), *e, a)),
+                    &mut fresh,
+                    &mut Vec::new(),
+                );
+                assert_eq!(
+                    cached, fresh,
+                    "seed {seed}, {parts} parts, step {step} ({what} on part {i})"
+                );
+            }
+        }
     }
 
     #[test]

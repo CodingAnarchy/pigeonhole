@@ -213,7 +213,7 @@ pub(crate) async fn subscribe(
         moved: false,
         states: Vec::new(),
         token: Vec::new(),
-        scratch: Vec::new(),
+        cache: super::token::TokenCache::default(),
         tail: tail_buffer(),
         opens: tokio::task::JoinSet::new(),
     };
@@ -302,10 +302,11 @@ struct Merge {
     moved: bool,
     /// `PartitionState` events to send.
     states: Vec<proto::FeedEvent>,
-    /// The last checkpoint's token ([`Merge::checkpoint`]), and its components' compacted
-    /// bytes on their way: kept, so a checkpoint per event allocates nothing (#1758).
+    /// The last checkpoint's token ([`Merge::checkpoint`]), kept so a checkpoint per event
+    /// allocates nothing (#1758), and what it was built from: only a part that moved is
+    /// encoded again (2a).
     token: Vec<u8>,
-    scratch: Vec<u8>,
+    cache: super::token::TokenCache,
     /// Each commit's tail is written here and split off ([`Merge::cover`]).
     tail: prost::bytes::BytesMut,
     /// Parts opening again in the background, each bounded by the request timeout, so
@@ -539,7 +540,7 @@ impl Merge {
     /// the parts in reused buffers (#1758).
     fn checkpoint(&mut self) {
         self.token.clear();
-        super::token::encode_into(
+        self.cache.encode(
             &self.cluster_id,
             self.map_version,
             self.subscription,
@@ -547,7 +548,6 @@ impl Merge {
                 .iter()
                 .map(|p| (p.partition.as_str(), p.epoch, &p.at)),
             &mut self.token,
-            &mut self.scratch,
         );
         let token = &self.token;
         self.since_checkpoint = 0;
