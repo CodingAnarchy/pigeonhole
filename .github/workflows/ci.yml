@@ -230,7 +230,17 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Free space where the build and the tests write (the work dir, and TEMP, where the
+      # tests make their databases), before the tests and after them, pass or fail: #1729's
+      # Windows job ran out of space in the cli tests.
+      - name: free space before the tests
+        shell: bash
+        run: df -h . "${TEMP:-${TMPDIR:-/tmp}}"
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
+      - name: free space after the tests
+        if: always()
+        shell: bash
+        run: df -h . "${TEMP:-${TMPDIR:-/tmp}}"
 
   # The bench crate's own tests, beside the workspace tests rather than after them (#1156):
   # its group-commit and scaling tests take about a minute each, so on Windows they pushed
