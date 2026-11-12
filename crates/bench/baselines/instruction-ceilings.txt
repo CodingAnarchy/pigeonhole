@@ -300,7 +300,11 @@ as-written 1936 0.3
 flushed 1692 0.3
 compacted 1216 0.3
 get-mem 5699 0.1
-get-sst 16701 0.5
+# Raised by D195 (coordinator 2026-11-12): get-sst 16701 -> 16784 (+0.50%). CI's stable
+# toolchain moved to Rust 1.100, and main 74ce971f counts 16736 (base) and 16737 (head) in
+# dispatched run 43305014612 (16732-16733 in #1793's run 43300710857). The head count times
+# 1.005 would be +0.72%, so the raise stops at 0.5%, leaving 0.28% headroom.
+get-sst 16784 0.5
 get-miss 3402 0.3
 row 2247 1.0
 scan 1290 0.3
