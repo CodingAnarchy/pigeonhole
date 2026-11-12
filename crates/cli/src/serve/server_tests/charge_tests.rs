@@ -64,6 +64,22 @@ fn reply_bytes(s: &Server) -> u64 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The replies dropped for an idle client, once at least one is counted. The watchdog frees
+/// a reply's share before it counts the drop, so a test that has seen the share come back
+/// can read the count a moment early (#1744).
+fn counted_idle_drops(s: &Server) -> u64 {
+    let drops = || {
+        s.shared
+            .router
+            .service
+            .replies
+            .idle_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    wait_for("the idle drop counted", || drops() > 0);
+    drops()
+}
+
 /// A reply holds its share until it's written: a client that doesn't read keeps a large
 /// reply charged, so another large read meanwhile gets `Overloaded` (the bound), and a read
 /// once it's written gets its share back.
@@ -136,14 +152,7 @@ fn a_reply_its_client_never_reads_is_dropped_after_the_idle_limit() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(since.elapsed() >= idle / 2, "{:?}", since.elapsed());
-    let drops = s
-        .shared
-        .router
-        .service
-        .replies
-        .idle_drops
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(drops, 1);
+    assert_eq!(counted_idle_drops(&s), 1);
     assert!(
         s.shared
             .router
@@ -254,15 +263,7 @@ fn a_grpc_reply_whose_window_stays_shut_is_dropped_after_the_idle_limit() {
     assert!(drops_while_shut);
     assert_eq!(grpc_status.as_deref(), Some("4"), "DEADLINE_EXCEEDED");
     assert_eq!(reply_bytes(&s), 0, "the share came back");
-    assert_eq!(
-        s.shared
-            .router
-            .service
-            .replies
-            .idle_drops
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
+    assert_eq!(counted_idle_drops(&s), 1);
 }
 
 /// cli692's R1 on #1661: an HTTP/2 client whose initial window is 0, which receives none of
@@ -328,15 +329,7 @@ fn a_reply_to_a_client_with_a_zero_initial_window_is_dropped_after_the_idle_limi
         .await
         .expect("within 30 s");
     });
-    assert_eq!(
-        s.shared
-            .router
-            .service
-            .replies
-            .idle_drops
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
+    assert_eq!(counted_idle_drops(&s), 1);
 }
 
 /// The g46 revision: a read within the default page builds first and takes its share after.
