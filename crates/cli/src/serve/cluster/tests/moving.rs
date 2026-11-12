@@ -323,3 +323,26 @@ fn a_move_persists_its_fence_on_a_partition_fenced_since_its_node_started() {
         );
     });
 }
+
+#[test]
+fn a_close_by_hand_persists_the_fence_of_a_partition_fenced_since_its_node_started() {
+    // simp724's S1 on #1800: p1, fenced on a since a started, is closed by hand, so a move
+    // finds it closed and fences nothing itself. The close persisted the fence: a restart
+    // of a mid-move reopens p1 under it, and no peer's map lifts it.
+    let t = Cluster::start_with(2, true);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        client(a)
+            .await
+            .close(crate::serve::proto::PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::fence::read_fenced(&t.dirs[0]).unwrap(),
+            ["p1".to_owned()].into()
+        );
+    });
+}

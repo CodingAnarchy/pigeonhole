@@ -635,6 +635,7 @@ A node writes a partition only while its newest map names it for the partition a
   - **`--force`** lifts it without a peer's map. Use it only when no peer can answer and you know P hasn't moved. If a peer's newer map gave P to another node, both would then take writes.
   - **Don't unfence P during a relocation.** Between `relocate`'s check and its map change, the old node's map still names it, so an unfence there resumes its writes.
 - **`phdb cluster close P --node URL`** closes a fenced partition. Its database closes, so its files are final, and its calls answer `PartitionUnavailable`. A call already running on it ends the same way.
+  - A close keeps the partition's fence in `DIR/fenced.json`, whichever fence it was: a closed partition stays fenced across a restart until `unfence`.
   - The partition's feed hubs end, and their clients resume from their tokens.
   - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
   - A failed hash shows in the partition's error, and `close` again retries it.

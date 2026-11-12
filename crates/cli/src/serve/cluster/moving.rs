@@ -306,6 +306,13 @@ pub(super) async fn run(
     // Fenced by this move whenever P is open here, already fenced or not: a fence since
     // the node started isn't persisted, and a restart of OLD mid-move would lift it on a
     // peer's map, which names OLD until step 4.
+    if lp.state() == LocalPartitionState::Opening {
+        return Err(Failure::usage(&format!(
+            "partition {partition} is still opening on node {:?}: run the move again once \
+             it's open there (phdb cluster status --node {})",
+            old.id, old.args.node
+        )));
+    }
     let mut fenced_here = None;
     let closed_at = Instant::now();
     if lp.state() != LocalPartitionState::Closed {

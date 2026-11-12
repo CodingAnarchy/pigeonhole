@@ -192,10 +192,11 @@ impl Node {
             .await
             .map_err(|e| ApiError::internal(e.to_string()))??;
         // An operator's fence here was on the copy this node held before (a move away
-        // fences it): the file is now another copy, at another epoch, and opens fenced
-        // until a peer's map confirms it, like any other. A restore's partitions keep the
-        // operator's fence, which the restore lifts itself once its map is set.
-        if !restore {
+        // fences it): a set installed now is another copy, at another epoch. It opens
+        // fenced, and serves once the map gives it here. A stamp that installs nothing
+        // leaves the copy the operator fenced, and its fence. A restore's partitions keep
+        // the operator's fence, which the restore lifts itself once its map is set.
+        if !restore && !installed.is_empty() {
             let mut fenced = self.fences.operator().clone();
             if fenced.remove(&p) {
                 self.persist_fences(fenced).await?;

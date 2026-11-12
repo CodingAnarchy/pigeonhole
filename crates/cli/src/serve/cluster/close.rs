@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::Node;
 use crate::serve::errors::ApiError;
+use crate::serve::gate::Fence;
 use crate::serve::proto::{LocalPartition, LocalPartitionState, PartitionFile};
 
 /// How long a close waits for the writes a fence admitted to finish.
@@ -130,6 +131,15 @@ impl Node {
             return Err(ApiError::failed_precondition(format!(
                 "partition {id:?} is serving writes: fence it first (phdb cluster fence)"
             )));
+        }
+        // Its fence is the operator's from here, and persisted, as `fence`'s is (simp724's S1
+        // on #1800): a fence since the node started is kept nowhere, and a closed partition
+        // reopens at a restart while the map still names this node. A peer's map would then
+        // lift that fence, in the middle of a move that copied the closed files.
+        gate.fence(Fence::Operator);
+        let mut fenced = self.fences.operator().clone();
+        if fenced.insert(id.to_owned()) {
+            self.persist_fences(fenced).await?;
         }
         gate.drained(DRAIN).await.map_err(|n| {
             ApiError::failed_precondition(format!(
