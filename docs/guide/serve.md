@@ -490,7 +490,8 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - a table's split keys are fixed once its ranges hold data (#1499);
   - a restarted node unfences a partition on one peer's map (#1760);
   - a partition opened on a running node doesn't re-split the node's `--engine-memory`, `--shards` and `--compaction-threads`, and the running threads keep their old affinity mask (#1761, #1762);
-  - `--change-feed` is each partition's, not the node's (#1786).
+  - `--change-feed` is each partition's, not the node's (#1786);
+  - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798).
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
