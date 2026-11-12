@@ -83,6 +83,27 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
             })
             .await
             .unwrap();
+        // c holds p3: a write through a goes to c, which answers for the table only once
+        // it has reconciled to the writer's map (the call answers before then, #1778).
+        let want = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .map_version;
+        eventually("c's p3 to reconcile to the map with items", async || {
+            client(c)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p3" && lp.reconciled_version == want)
+        })
+        .await;
         let mut w = put_row("pen", "1");
         w.row.as_mut().unwrap().table = "items".into();
         data(a)
