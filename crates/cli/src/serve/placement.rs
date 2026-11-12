@@ -221,8 +221,10 @@ pub(crate) fn memory(
 }
 
 /// The CPUs a node with several partitions reserves for its compaction threads (D317
-/// ticket 8a, perf287's g75): the `compaction` CPUs that come after `shards` of them in the
-/// engine's pin order (one per physical core first, then their SMT siblings), so that every
+/// ticket 8a, perf287's g75): the `compaction` CPUs that come after the partitions' shards,
+/// the sum of their `shares` (`split` floors each at one, so with `--shards` below the
+/// partition count it's more than `--shards`, cli692's N6 on #1718), in the engine's pin
+/// order (one per physical core first, then their SMT siblings), so that every
 /// partition's shards, pinned next, take the first ones contiguously and the network side's
 /// mask stays in one place (one L3 domain on the AX102), as with one partition. The plan is
 /// released at once: the engines claim their shards' CPUs themselves as they open. `None`
@@ -230,7 +232,8 @@ pub(crate) fn memory(
 ///
 /// A partition whose change feed keeps more shards than its share pins the extra ones past
 /// the planned shards, onto the reserved CPUs: rare, and the startup line shows it.
-pub(crate) fn compaction_reserve(shards: usize, compaction: usize) -> Option<Vec<usize>> {
+pub(crate) fn compaction_reserve(shares: &[Share], compaction: usize) -> Option<Vec<usize>> {
+    let shards: usize = shares.iter().map(|s| s.shards).sum();
     if compaction == 0 {
         return None;
     }

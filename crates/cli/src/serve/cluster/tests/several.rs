@@ -509,7 +509,7 @@ fn shards_pin_together_alone() {
     };
     // Two partitions of one shard each, and the node's one compaction thread.
     let shares = crate::serve::placement::split(2, 1, 2);
-    let reserved = crate::serve::placement::compaction_reserve(2, 1)
+    let reserved = crate::serve::placement::compaction_reserve(&shares, 1)
         .expect("the CPUs a plan of three just had are free");
     assert_eq!(reserved, [order[2]]);
     let mine = [("p1".to_owned(), 1), ("p3".to_owned(), 1)];
@@ -622,4 +622,41 @@ fn a_schema_change_reconciles_every_partition_on_a_node() {
             .unwrap();
         assert!(!has(&dbs[0], "orders") && !has(&dbs[1], "orders"));
     });
+}
+
+/// cli692's N6 on #1718: with `--shards` below the partition count, `split` gives every
+/// partition one shard anyway, so the node's compaction CPUs are reserved after that sum,
+/// not after `--shards`: one CPU after three shards for `--shards 2` over three partitions,
+/// never one the third partition's shard pins on. Linux only, alone in its process (pin
+/// plans are process-wide, #1741).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_compaction_reserve_follows_the_shards_the_partitions_get() {
+    run_alone(
+        module_path!(),
+        "the_compaction_reserve_follows_the_shards_the_partitions_get",
+        reserve_after_the_shares_alone,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_after_the_shares_alone() {
+    // The pin order's first four free CPUs, released before the reserve plans.
+    let order: Vec<usize> = match pigeonhole_io::sys::pin_plan(4) {
+        Ok(plan) => (0..4).filter_map(|i| plan.cpu(i)).collect(),
+        Err(why) => {
+            println!("skipped: nothing pins here ({})", why.as_str());
+            return;
+        }
+    };
+    let shares = crate::serve::placement::split(2, 1, 3);
+    assert_eq!(shares.iter().map(|s| s.shards).sum::<usize>(), 3);
+    let reserved = crate::serve::placement::compaction_reserve(&shares, 1)
+        .expect("the CPUs a plan of four just had are free");
+    assert_eq!(
+        reserved,
+        [order[3]],
+        "after the three shards {:?}",
+        &order[..3]
+    );
 }
