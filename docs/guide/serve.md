@@ -604,7 +604,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 ### Fencing and relocation
 A node writes a partition only while its newest map names it for the partition at the file's epoch, and the partition isn't fenced (D317). `phdb cluster move` does a whole move. The commands after it are its steps, for doing one by hand or for a node that's down.
 
-- **`phdb cluster move P --to ID --node URL [--drop-source]`** (admin scope) moves P to node `ID` with its files copied whole, so its change-feed history carries over: tokens taken before the move resume after it, through any node.
+- **`phdb cluster move P --to ID --node URL [--drop-source] [--timeout SECS]`** (admin scope) moves P to node `ID` with its files copied whole, so its change-feed history carries over: tokens taken before the move resume after it, through any node.
   - **Its steps:**
     1. It fences and closes P on the node serving it, and waits for the close to hash its files.
     2. It copies each file to `ID`: the main file, every WAL file a clean close keeps, and the feed's.
@@ -612,6 +612,11 @@ A node writes a partition only while its newest map names it for the partition a
     4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
   - **A mismatch** stops the move before the map changes, so the old node still holds P: `unfence` serves it there again.
   - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
+  - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
+    - **The hash:** the map still gives P to the old node, closed there. Run the move again to go on waiting, or `unfence` P there.
+    - **Serving:** the map already gives P to `ID`, so check that node.
+
+    The copy has no limit, since it takes as long as the files do. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
   - **Run it again** to resume a move that stopped. A copy picks up from what arrived. A move that's finished answers that the map already gives P to `ID`.
   - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P.
     - A rerun after the stamp can't check the copy again, because the stamp installs nothing the second time. It finishes the move, says the copy isn't re-verified, and drops nothing. Its report gives the `drop-partition` command to run once you've checked.

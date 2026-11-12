@@ -79,7 +79,7 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
         let [a, b, _] = t.ports;
         t.rt.block_on(async {
             STOP.lock().unwrap().push((t.args.node.clone(), step));
-            let e = within(super::super::moving::run(&t.args, "p1", "c", true))
+            let e = within(super::super::moving::run(&t.args, "p1", "c", true, None))
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{step:?}: not stopped"));
@@ -89,7 +89,7 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
                 e.message()
             );
 
-            let r = within(super::super::moving::run(&t.args, "p1", "c", true))
+            let r = within(super::super::moving::run(&t.args, "p1", "c", true, None))
                 .await
                 .unwrap_or_else(|e| panic!("{step:?}: the rerun failed: {}", e.message()));
             let doc = &r.document;
@@ -149,4 +149,69 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
             );
         });
     }
+}
+
+#[test]
+fn a_move_s_wait_for_the_new_node_gives_up_at_its_timeout() {
+    // c holds no p1 and never will: the wait for it to serve p1 ends at the limit, with the
+    // step, c's last answer and where the move leaves p1 (#1784).
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        let at = super::super::moving::At::new(&t.args, "c", &format!("127.0.0.1:{c}"))
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        let e = within(super::super::moving::serving(
+            &at,
+            "p1",
+            2,
+            Some(Duration::from_secs(3)),
+        ))
+        .await
+        .expect_err("c never serves p1");
+        let took = start.elapsed();
+        assert!(took >= Duration::from_secs(3), "{took:?}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert_eq!(e.status(), crate::ExitStatus::ERROR);
+        let m = e.message();
+        assert!(
+            m.starts_with(
+                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 3s (--timeout): \
+                 not listed yet. The map already gives p1 to node \"c\""
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains(&format!("phdb cluster status --node http://127.0.0.1:{c}")),
+            "{m}"
+        );
+    });
+}
+
+#[test]
+fn a_node_serving_an_older_epoch_isnt_taken_for_the_move_done() {
+    // a serves p1 at epoch 1: a wait for it at epoch 2 goes on, and says so when it gives up
+    // (simp724's N1 on #1787).
+    let t = Cluster::start();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let at = super::super::moving::At::new(&t.args, "a", &format!("127.0.0.1:{a}"))
+            .await
+            .unwrap();
+        let e = within(super::super::moving::serving(
+            &at,
+            "p1",
+            2,
+            Some(Duration::from_secs(3)),
+        ))
+        .await
+        .expect_err("a serves epoch 1, not 2");
+        assert!(
+            e.message()
+                .contains("to serve p1 at epoch 2 after 3s (--timeout): serving at epoch 1."),
+            "{}",
+            e.message()
+        );
+    });
 }
