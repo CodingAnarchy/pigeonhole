@@ -566,6 +566,7 @@ async fn give_c_p3(ports: &[u16; 3]) {
             force: false,
             expected_map_version: 1,
             map: Some(the_map(2, ports)),
+            copies: Vec::new(),
         })
         .await
         .unwrap();

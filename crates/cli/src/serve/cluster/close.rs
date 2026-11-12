@@ -443,6 +443,7 @@ mod tests {
             files,
             generation: 0,
             error: None,
+            db_open: false,
         }
     }
 

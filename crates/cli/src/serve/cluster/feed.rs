@@ -1686,7 +1686,7 @@ mod tests {
             let (p0, events) = fed();
             m.merge.opens.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                (0, Ok(events))
+                (0, Ok((events, 1)))
             });
             p0.send(Ok(event(b"t1", Some(5)))).unwrap();
             assert_eq!(

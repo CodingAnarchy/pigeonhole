@@ -356,6 +356,7 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
                 force: true,
                 expected_map_version: 0,
                 map: Some(m),
+                copies: Vec::new(),
             })
             .await
             .unwrap();

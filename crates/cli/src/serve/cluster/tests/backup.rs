@@ -271,6 +271,7 @@ fn a_table_dropped_and_created_again_during_a_backup_fails_it() {
                         force: false,
                         expected_map_version: expected,
                         map: Some(m),
+                        copies: Vec::new(),
                     })
                     .await
                     .unwrap();
