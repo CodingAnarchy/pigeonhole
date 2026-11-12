@@ -1,0 +1,2 @@
+### Changed
+- `phdb serve`: on Linux with pinned shards, the default network thread count now counts the shards' SMT siblings the network threads run on (#1738): one thread per CPU in their mask, less the feed threads. On an 8-core node that's 10 threads instead of 6, which raised capacity 34–43% at a lower p99 (#1745); on the AX102's single-node default it's 13 instead of 9. Hosts without SMT, unpinned servers and an explicit `--io-threads` are unchanged.
