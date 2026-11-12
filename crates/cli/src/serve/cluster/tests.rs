@@ -298,7 +298,9 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
             })
             .await
             .unwrap();
-        assert_eq!(version(ports[1]).await, 2);
+        // The push to b is the writer's own, but answers before b has installed it on a
+        // slow runner: waited for (#1778).
+        eventually("b to take version 2", async || version(ports[1]).await == 2).await;
         // A newer map clears the divergence.
         assert!(
             client(ports[1])
@@ -3448,6 +3450,8 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             .create_table(create("collide", fams(&["f"]), on(&[], &["p2"]), false))
             .await
             .unwrap();
+        // b reconciles p2 to it at the writer's push (#1778).
+        settled().await;
         let status = client(ports[1])
             .await
             .status(StatusRequest {})
@@ -3650,14 +3654,22 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             panic!("the forced map: {e:?}");
         }
         let v = current.map_version + 1;
-        assert_eq!((version(ports[1]).await, version(ports[2]).await), (v, v));
+        // b sets it; c takes it by b's push (#1778).
+        eventually("b and c to take the forced map", async || {
+            (version(ports[1]).await, version(ports[2]).await) == (v, v)
+        })
+        .await;
         // Schema calls work again, through b, the writer now.
         schema(ports[2])
             .await
             .create_table(create("t1", "p3"))
             .await
             .unwrap();
-        assert!(dbs[2].as_ref().unwrap().tables().iter().any(|t| t == "t1"));
+        // c's file takes it at c's reconcile of b's push (#1778).
+        eventually("p3's file on c to have t1", async || {
+            dbs[2].as_ref().unwrap().tables().iter().any(|t| t == "t1")
+        })
+        .await;
     });
     // a comes back with its old map, takes the forced one, and follows it.
     let l = std::net::TcpListener::bind(("127.0.0.1", ports[0])).unwrap();
