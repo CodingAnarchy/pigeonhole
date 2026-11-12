@@ -498,7 +498,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 
 **A rerun** finds where the last run stopped:
 - the map already names NEW: it's done, and nothing is compared or dropped;
-- NEW's file is at `e + 1` (the stamp ran): it skips the copy and the stamp. The comparison can't be made again, because the stamp installs nothing a second time. It reports "not re-verified", drops nothing, and prints the `drop-partition` command.
+- NEW's file is at `e + 1` (the stamp ran): it copies OLD's closed set and stamps again, as a first run does. The stamp installs the staged set over the earlier copy, which moves aside, and the move compares it. An earlier copy is never taken for this run's: OLD may have been unfenced and written to between the runs, and the stamp's identity row changed the main file, so the earlier copy can't be compared with what OLD closed now (audit120's F1, 2026-11-12).
 
 Nothing is persisted client-side. The report gives the write downtime (fence to map, when this run fenced), the read downtime (close to serving), each file's size and bytes sent, whether the copy was verified, and what happened to the source.
 

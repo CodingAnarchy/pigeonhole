@@ -103,7 +103,7 @@ impl Fences {
         self.served.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+    pub(super) fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
         self.operator.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -265,7 +265,7 @@ impl Node {
         Ok(())
     }
 
-    async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
+    pub(super) async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
         let dir = self.dir.clone();
         let written = fenced.clone();
         tokio::task::spawn_blocking(move || write_fenced(&dir, &written))

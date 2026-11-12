@@ -1,7 +1,8 @@
 //! `phdb cluster move` stopped after each step, as a killed process would be, then run
-//! again: the rerun finishes the move from where it was, and drops the old node's files only
-//! when it could check the copy itself. Otherwise it says where they are and how to drop
-//! them once checked.
+//! again: the rerun finishes the move from where it was. Up to the map, it copies and
+//! compares the old node's closed set itself, whatever an earlier run left on the new node,
+//! and then drops the old node's files. After the map, it says where they are and how to
+//! drop them.
 
 use super::*;
 use crate::serve::cluster::moving::{STOP, Step};
@@ -18,6 +19,14 @@ struct Cluster {
 
 impl Cluster {
     fn start() -> Self {
+        let t = Self::start_with(1, false);
+        t.rt.block_on(put(t.ports[1], "alice", "1"));
+        t
+    }
+
+    /// The cluster with p1 at `p1_epoch` in the map (its file is at 1), and a's p1 fenced
+    /// as a node's start leaves it (`restarted`), else serving. No row.
+    fn start_with(p1_epoch: u64, restarted: bool) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -25,6 +34,7 @@ impl Cluster {
         let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
         let mut map = the_map(1, &ports);
         map.partitions.retain(|p| p.id != "p3");
+        map.partitions[0].epoch = p1_epoch;
         let dirs = [test_dir(), test_dir(), test_dir()];
         let mut stops = Vec::new();
         let mut dbs = Vec::new();
@@ -34,7 +44,9 @@ impl Cluster {
             ("c", None),
         ]) {
             super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+            let limits = crate::serve::server_tests::limits();
+            let restart = restarted && id == "a";
+            let (stop, db) = data_node_full(&rt, dir, id, local, l, "", limits, None, restart);
             stops.push(stop);
             dbs.extend(db);
         }
@@ -43,7 +55,6 @@ impl Cluster {
             token_file: None,
             ca: None,
         };
-        rt.block_on(put(ports[1], "alice", "1"));
         Self {
             rt,
             ports,
@@ -95,27 +106,23 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
             let doc = &r.document;
             let a_kept = t.dirs[0].join("p1.phdb").exists();
             match step {
-                // Before the stamp: the rerun copies (what's left), stamps and checks the
-                // copy itself, so it drops a's files.
-                Step::Closed | Step::Copied => {
+                // Up to the map: the rerun copies (what's left to send, or all of it
+                // again once the stamp installed the set), stamps and checks the copy
+                // itself, so it drops a's files.
+                Step::Closed | Step::Copied | Step::Stamped => {
                     assert_eq!(doc["verified"], true, "{step:?}: {doc:?}");
                     let source = doc["source"].as_str().unwrap();
                     assert!(source.starts_with("moved aside"), "{step:?}: {source}");
                     assert!(!a_kept, "{step:?}: a's files went aside");
-                    if step == Step::Copied {
-                        // Every upload was complete: nothing sent again.
-                        for f in doc["copied"].as_array().unwrap() {
-                            assert_eq!(f["sent"], 0, "{step:?}: {f}");
+                    for f in doc["copied"].as_array().unwrap() {
+                        match step {
+                            // Every upload was complete and still staged: nothing sent.
+                            Step::Copied => assert_eq!(f["sent"], 0, "{step:?}: {f}"),
+                            // The earlier stamp installed the set: all of it again.
+                            Step::Stamped => assert_eq!(f["sent"], f["bytes"], "{step:?}: {f}"),
+                            _ => {}
                         }
                     }
-                }
-                // After the stamp: the move finishes, but its copy can't be checked again.
-                Step::Stamped => {
-                    assert_eq!(doc["verified"], false, "{step:?}: {doc:?}");
-                    let source = doc["source"].as_str().unwrap();
-                    assert!(source.contains("not re-verified"), "{source}");
-                    assert!(source.contains("drop-partition p1"), "{source}");
-                    assert!(a_kept, "{step:?}: a's files stay");
                 }
                 // After the map: done, and the advice names a's closed copy and its drop.
                 Step::Mapped | Step::Serving => {
@@ -212,6 +219,107 @@ fn a_node_serving_an_older_epoch_isnt_taken_for_the_move_done() {
                 .contains("to serve p1 at epoch 2 after 3s (--timeout): serving at epoch 1."),
             "{}",
             e.message()
+        );
+    });
+}
+
+#[test]
+fn a_rerun_after_an_unfence_serves_the_writes_made_since_the_first_copy() {
+    // audit120's F1: a move dies after its stamp, c holding a copy at epoch 2. The operator
+    // backs out (unfence on a, which the map still names), and a takes a write. A later
+    // move must not take c's earlier copy for this one's: it copies a's closed set again,
+    // so the write is there once c serves p1.
+    let t = Cluster::start();
+    let [a, b, _] = t.ports;
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let e = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("stopped after the stamp");
+        assert!(e.message().contains("stopped after"), "{}", e.message());
+
+        client(a)
+            .await
+            .unfence(crate::serve::proto::PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        put(b, "bob", "2").await;
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        assert_eq!(r.document["node"], "c", "{:?}", r.document);
+        assert_eq!(
+            get_row(b, "bob").await.unwrap(),
+            Some(b"2".to_vec()),
+            "the write a acknowledged between the runs"
+        );
+        assert_eq!(r.document["verified"], true, "{:?}", r.document);
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+}
+
+#[test]
+fn a_partition_moved_back_to_a_node_that_held_it_takes_writes_there() {
+    // audit120's F2: the move away fenced p1 on a, in a's fenced.json. Moved back, p1 is a
+    // new copy at a new epoch: that fence isn't its own, and it serves writes once a peer's
+    // map confirms it, with no unfence by hand.
+    let t = Cluster::start();
+    let [a, b, _] = t.ports;
+    let wait = Some(Duration::from_secs(20));
+    t.rt.block_on(async {
+        within(super::super::moving::run(&t.args, "p1", "c", false, wait))
+            .await
+            .unwrap_or_else(|e| panic!("the move to c failed: {}", e.message()));
+        put(b, "bob", "2").await;
+        let r = within(super::super::moving::run(&t.args, "p1", "a", false, wait))
+            .await
+            .unwrap_or_else(|e| panic!("the move back to a failed: {}", e.message()));
+        assert_eq!(r.document["epoch"], 3, "{:?}", r.document);
+        put(b, "carol", "3").await;
+        for (row, value) in [("alice", "1"), ("bob", "2"), ("carol", "3")] {
+            assert_eq!(
+                get_row(a, row).await.unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "{row}"
+            );
+        }
+        assert!(
+            !super::super::fence::read_fenced(&t.dirs[0])
+                .unwrap()
+                .contains("p1"),
+            "the earlier move's fence went with its copy"
+        );
+    });
+}
+
+#[test]
+fn a_move_persists_its_fence_on_a_partition_fenced_since_its_node_started() {
+    // audit120's F3: p1 is fenced on a since a started, which nothing persists (here no
+    // peer's map confirms it: the map has p1 at epoch 2, a's file at 1). The move fences
+    // it itself, so a restart of a mid-move can't lift the fence on a peer's map, which
+    // names a until the move's last step.
+    let t = Cluster::start_with(2, true);
+    t.rt.block_on(async {
+        // The move ends at the close's report of that epoch; its fence came first.
+        let e = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("the close reports the file's epoch");
+        assert!(
+            e.message().contains("the map has it at epoch 2"),
+            "{}",
+            e.message()
+        );
+        assert_eq!(
+            super::super::fence::read_fenced(&t.dirs[0]).unwrap(),
+            ["p1".to_owned()].into()
         );
     });
 }

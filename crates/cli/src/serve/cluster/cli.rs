@@ -192,8 +192,7 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         node: NodeArgs,
         /// Once the copy is checked and `--to` serves the partition, move the old node's
-        /// files aside there (`drop-partition`: nothing is deleted). Skipped when a rerun
-        /// finds the copy made earlier, which it can't check again.
+        /// files aside there (`drop-partition`: nothing is deleted).
         #[arg(long)]
         drop_source: bool,
         /// Give up a wait for a node after SECS (at least 1): OLD hashing the closed files, or `--to`

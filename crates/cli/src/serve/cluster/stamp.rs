@@ -187,9 +187,20 @@ impl Node {
             )));
         }
         let dir = self.dir.clone();
+        let restore = req.restore;
         let installed = tokio::task::spawn_blocking(move || stamp_files(&dir, &req))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))??;
+        // An operator's fence here was on the copy this node held before (a move away
+        // fences it): the file is now another copy, at another epoch, and opens fenced
+        // until a peer's map confirms it, like any other. A restore's partitions keep the
+        // operator's fence, which the restore lifts itself once its map is set.
+        if !restore {
+            let mut fenced = self.fences.operator().clone();
+            if fenced.remove(&p) {
+                self.persist_fences(fenced).await?;
+            }
+        }
         // Its files changed: a close's hashes of them go, and a map that gives it here
         // opens it.
         self.fences.closed().remove(&p);
