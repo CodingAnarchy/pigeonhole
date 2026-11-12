@@ -595,7 +595,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 
 #### Expiry and what isn't supported
 - **Expired tokens:**
-  - A token can't resume after a partition it follows starts a new history: a `relocate` without `--copy` (`--old-unreachable` included) does, as a restore does. `move` and `relocate --copy` copy the files whole and keep the history, so tokens resume across them ([Fencing and relocation](#fencing-and-relocation)).
+  - A token can't resume after a partition it follows starts a new history: a `relocate` without `--copy` (`--old-unreachable` included) does, as a restore does, and so does a `set-map --force` that raises its epoch ([Running a cluster](#running-a-cluster)). `move` and `relocate --copy` copy the files whole and keep the history, so tokens resume across them ([Fencing and relocation](#fencing-and-relocation)).
   - It can't resume after the map changed which partitions the subscription covers either. That happens only when a new table joins a subscription of every table.
   - Both answer `FeedExpired`: subscribe again.
 - **After a restore:** a token from before it answers `FeedExpired`. Each restored partition is at a new epoch, and its history starts at the restore ([Backup and restore](#backup-and-restore)).

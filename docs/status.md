@@ -127,7 +127,7 @@ Everything below shipped in [1.1.0](https://github.com/CodingAnarchy/pigeonhole/
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
 ## On main for 1.2.0
-1.2.0's scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). This lists what has merged; the per-change list is in the changelog's fragments, [`changelog.d/`](../changelog.d/README.md).
+1.2.0's scope is the [1.2.0 milestone](https://github.com/CodingAnarchy/pigeonhole/milestone/15). This lists what has merged; the per-change list is in the changelog's fragments, [`changelog.d/`](../changelog.d/README.md). The internal crates' line is at 3.0.0 on main ([D295](design/decisions/phase-3.md#d295)); the public crates stay on 1.x.
 - **`phdb serve`** ([D313](design/decisions/phase-3.md#d313), #1397, [ICR 0112](design/icr/0112-network-api.md)), behind the `pigeonhole-cli` crate's `serve` feature; the guide is [Serving a database](guide/serve.md):
   - **The API:** gRPC and HTTP/JSON on one port, and remote MCP at `/mcp`. It covers data, schema and admin, sessions with transactions and pinned snapshots, graphs and nearest search, the IVF vector index with bulk loads, full-text search, and agent memory with `--memory` (and `--embed-local`).
   - **Security:** TLS, and `read`, `write` and `admin` tokens, optionally limited to namespaces.
