@@ -250,8 +250,9 @@ fn misfit(spec: &pigeonhole::VectorSpec, e: &Elements) -> Option<String> {
 /// unwritten.
 const SAMPLE_FLOOR: u64 = 50_000;
 const PENDING_PER_LIST: u64 = 255;
-/// What a held vector costs beyond its elements and id: the id's `Bytes` and the elements'
-/// `Vec` headers, the pair, and a pending batch's entry for the id.
+/// What a held vector costs beyond its elements and its id's two copies (the pair's, and the
+/// crate's `waiting` map's, audit120's nit on #1802): the id's `Bytes` and the elements'
+/// `Vec` headers, the pair, and the map's entry.
 const PER_VECTOR: u64 = 96;
 /// The id length the up-front check assumes; a longer id grows the reservation as it comes.
 const ID_ALLOWANCE: u64 = 32;
@@ -278,7 +279,7 @@ impl Need {
 }
 
 /// What a load of `expected` vectors into an index of `spec`, with lists of `target`
-/// vectors, holds at most, its ids `id` bytes long. Saturating: a huge `expected` comes out
+/// vectors, holds at most, its ids `id` bytes long (each held twice). Saturating: a huge `expected` comes out
 /// as `u64::MAX`, and is refused.
 pub(crate) fn need(spec: &pigeonhole::VectorSpec, target: u64, expected: u64, id: u64) -> Need {
     use pigeonhole::Element as E;
@@ -290,13 +291,15 @@ pub(crate) fn need(spec: &pigeonhole::VectorSpec, target: u64, expected: u64, id
         E::Bit => (dim.div_ceil(8), dim.div_ceil(8)),
         _ => (dim * 4, dim * 4),
     };
-    let each = held + id + PER_VECTOR;
+    let each = held
+        .saturating_add(id.saturating_mul(2))
+        .saturating_add(PER_VECTOR);
     let lists = expected.div_ceil(target.max(1)).max(1);
     let sample_vectors = lists.max(SAMPLE_FLOOR);
     Need {
         lists,
         sample_vectors,
-        sample: sample_vectors.saturating_mul(each + placed),
+        sample: sample_vectors.saturating_mul(each.saturating_add(placed)),
         pending: lists.saturating_mul(PENDING_PER_LIST).saturating_mul(each),
     }
 }
@@ -775,24 +778,24 @@ mod tests {
         // serve.md's examples, at the default target list length of 1,000 and 1 GiB.
         let gib = 1u64 << 30;
         let f32s = |dim| VectorSpec::new(dim, Element::F32, Metric::L2).unwrap();
-        // 768-dim: the sample of 50,000 is about 314 MB, held and its clustering copy.
+        // 768-dim: the sample of 50,000 is about 315 MB, held and its clustering copy.
         let n = need(&f32s(768), 1000, 1_000_000, ID_ALLOWANCE);
         assert_eq!(n.lists, 1000);
-        assert_eq!(n.sample, 50_000 * (3072 + 32 + 96 + 3072));
+        assert_eq!(n.sample, 50_000 * (3072 + 64 + 96 + 3072));
         assert!(n.bytes() < gib, "{n:?}");
         // 1536-dim: a million vectors make 1,000 lists, whose pending batches are over.
         let n = need(&f32s(1536), 1000, 1_000_000, ID_ALLOWANCE);
-        assert_eq!(n.pending, 1000 * 255 * (6144 + 32 + 96));
+        assert_eq!(n.pending, 1000 * 255 * (6144 + 64 + 96));
         assert!(n.bytes() > gib, "{n:?}");
         assert!(need(&f32s(1536), 1000, 500_000, ID_ALLOWANCE).bytes() < gib);
         // Saturating, never overflowing.
-        let n = need(&f32s(4096), 1, u64::MAX, u64::MAX / 2);
+        let n = need(&f32s(4096), 1, u64::MAX, u64::MAX);
         assert_eq!(n.bytes(), u64::MAX);
         // A bit index holds a vector's bytes, and clusters them as bits.
         let bits = VectorSpec::new(1024, Element::Bit, Metric::Hamming).unwrap();
         assert_eq!(
             need(&bits, 1000, 1, ID_ALLOWANCE).sample,
-            50_000 * (128 + 32 + 96 + 128)
+            50_000 * (128 + 64 + 96 + 128)
         );
     }
 }

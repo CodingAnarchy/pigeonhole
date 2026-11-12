@@ -688,7 +688,7 @@ fn a_bulk_load_over_bulk_load_bytes_is_refused_before_it_starts() {
 
 #[test]
 fn a_768_dim_load_fits_the_default_bulk_load_bytes() {
-    // The default 1 GiB holds a 768-dim f32 load's sample (about 314 MB) and its pending
+    // The default 1 GiB holds a 768-dim f32 load's sample (about 315 MB) and its pending
     // batches up to about 1,300 lists. The reservation is the load's worst case while it
     // runs, and comes back when it ends.
     assert_eq!(limits().bulk_load_bytes, 1 << 30);
