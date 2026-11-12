@@ -4,6 +4,23 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Upgrading from 1.1.x
+- **Upgrade reader processes together with the writer.** The shared-memory layout is now version 9 (1.1.x used version 8): it adds the hold that keeps a feed of every table behind a catalog change it can't see yet (D315). A reader process against a writer from a build on another layout fails with `ShmVersionMismatch`, never misreading: restart the readers after the writer.
+- **Rolling back to 1.1.x after a schema change expires some change feeds.** After a 1.2 session that created, dropped or extended a table with the change feed on, a 1.1 build opening the database expires the feeds whose history runs across that change (`FeedExpired`), since 1.1 doesn't know the records 1.2 writes for schema changes. Nothing is skipped and no data is affected: start those feeds again from a snapshot. Without schema changes, 1.1 resumes a 1.2 feed. Files stay in format 4 and move freely between 1.1.x and 1.2.0.
+- **A replica's file opens read-only in 1.1.x.** A `phdb serve --replica-of` copy sets the file's `ro_compat` feature bit 0 (D315), so 1.1.x opens it read-only only. Promoting the replica clears the bit.
+- **The internal crates move to 3.0.0** (D295), for breaking changes to the change feed's types (`FeedEntry` is non-exhaustive; `Next::Catalog`, `FeedStart::Snapshot`). `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected.
+- **Behaviour changes to know:**
+  - **Read-only opens:** `Options::read_only(true)` now opens the files read-only and takes the writer lock shared, so it works on read-only media and several run at once. A reader process can't attach to a read-only handle (#1348).
+  - **Ruby fibers:** under a `Fiber::Scheduler` (Async, Falcon), commits, feed and memory-watch waits and the memory store's calls now yield to the thread's other fibers, so finish snapshots and scans before a commit. `Pigeonhole.fiber_scheduler = false` keeps every call blocking (#1574).
+  - **`phdb` uses jemalloc** on every platform but Windows; building it needs a C compiler and `make` (D322).
+
+## [1.1.2] - 2026-11-10
+
+A fix for the size of backups. Upgrade if you back up databases with data still in memtables, or back up while writes continue. The file format and the shared-memory layout are unchanged, so a 1.1.2 writer and 1.1.0 or 1.1.1 reader processes work together, and files move freely between 1.1.x releases.
+
+### Fixed
+- A backup (`Pigeonhole::backup`, `backup_durable` and `phdb backup`) is about the size of what it holds again. Each SST it wrote from memtables, or rewrote without commits above its snapshot, took a 64 MiB-aligned slot of the copy, so a small database with several families made a copy of hundreds of MiB, nearly all free (#1595, backport of #1615).
+
 ## [1.1.1] - 2026-11-05
 
 A correctness fix for the async nearest-neighbour search. Upgrade if you combine it with a value filter and a column limit. The file format and the shared-memory layout are unchanged, so a 1.1.1 writer and 1.1.0 reader processes work together, and files move freely between 1.1.0 and 1.1.1.
@@ -753,7 +770,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
 [1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1

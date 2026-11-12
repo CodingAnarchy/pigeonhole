@@ -1,2 +1,0 @@
-### Changed
-- `phdb serve`: a change-feed hub's ring keeps each commit as its encoded event only, with the resume token held once inside it, instead of also keeping the decoded commit and a second copy of the token. A commit costs about 380 ring bytes instead of 636 (with 100-byte values and 4 shards), so each table set's share of `--feed-ring-bytes` holds about 1.7 times as many seconds of commits. With 16 table sets at 54.8K commits/s, streams fell off their ring after under half a second (#1397). A stream with a row `prefix` now filters the encoded event's changes.

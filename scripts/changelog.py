@@ -112,8 +112,11 @@ def check(directory=FRAGMENTS):
 
 
 def section_order(heading, appearance):
-    """Keep a Changelog order; a variant (`Changed (breaking)`) right after its section, and
-    any other heading after them all, in order of appearance."""
+    """An `Upgrading ...` heading first, as the release notes lead with it; then Keep a
+    Changelog order, a variant (`Changed (breaking)`) right after its section; and any other
+    heading after them all, in order of appearance."""
+    if heading.startswith("Upgrading"):
+        return (-1, False, appearance)
     base = heading.split(" (")[0]
     if base in SECTIONS:
         return (SECTIONS.index(base), heading != base, appearance)
