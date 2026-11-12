@@ -267,19 +267,6 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     for n in &m.nodes {
         nodes.insert(n.id.clone(), url_of(args, &n.address));
     }
-    let mut states: BTreeMap<String, Option<Vec<proto::LocalPartition>>> = BTreeMap::new();
-    for (id, url) in &nodes {
-        let got = async {
-            let (c, _) = channel(args, url).await?;
-            proto::cluster_client::ClusterClient::new(c)
-                .status(request(StatusRequest {}, token.as_deref())?)
-                .await
-                .map(|r| r.into_inner().partitions)
-                .map_err(|s| Failure::usage(s.message()))
-        };
-        let got = tokio::time::timeout(Duration::from_secs(10), got).await;
-        states.insert(id.clone(), got.ok().and_then(Result::ok));
-    }
     let live_version = live.as_ref().map_or(0, |l| l.map_version);
     let progress = read_progress(&r.dir).filter(|p| p.cluster_id == target);
     // An earlier run set the map, and the live map still places every partition as it did:
@@ -315,6 +302,22 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         out.document
             .insert("resumed".into(), json!("the map was set by an earlier run"));
         return Ok(out);
+    }
+    // Each node's partitions, after the resume above: `Status` opens each file it lists
+    // (read-only, for its identity), which a node opening that partition at the same moment
+    // would find holding its lock, so nothing here reads it once a map may be opening them.
+    let mut states: BTreeMap<String, Option<Vec<proto::LocalPartition>>> = BTreeMap::new();
+    for (id, url) in &nodes {
+        let got = async {
+            let (c, _) = channel(args, url).await?;
+            proto::cluster_client::ClusterClient::new(c)
+                .status(request(StatusRequest {}, token.as_deref())?)
+                .await
+                .map(|r| r.into_inner().partitions)
+                .map_err(|s| Failure::usage(s.message()))
+        };
+        let got = tokio::time::timeout(Duration::from_secs(10), got).await;
+        states.insert(id.clone(), got.ok().and_then(Result::ok));
     }
     let progress =
         progress.filter(|p| p.live_map_version == live_version && p.map_version.is_none());
@@ -568,39 +571,29 @@ fn restored_report(target: &str, jobs: &[Job], map_version: Value, missed: Value
 }
 
 /// Waits (up to [`OPEN_WAIT`]) for `job`'s partition to open on its node, and unfences it
-/// there if it opened fenced.
+/// there (a partition open and not fenced unfences as a no-op).
 async fn serve(args: &NodeArgs, token: Option<&str>, job: &Job) -> Result<(), Failure> {
     let p = &job.copy.partition;
     let (ch, _) = channel(args, &job.url).await?;
     let mut c = proto::cluster_client::ClusterClient::new(ch);
     let until = tokio::time::Instant::now() + OPEN_WAIT;
     let mut last = String::from("not open");
+    // `Unfence` until it answers: it does once the partition is open here (lifting a fence,
+    // if any). Never `Status`, which opens the files it lists to read their identity, and so
+    // can make the node's open of this one find its lock held and give up.
     while tokio::time::Instant::now() < until {
-        let state = c
-            .status(request(StatusRequest {}, token)?)
+        match c
+            .unfence(request(
+                proto::PartitionRequest {
+                    partition: p.clone(),
+                    force: false,
+                },
+                token,
+            )?)
             .await
-            .ok()
-            .and_then(|r| r.into_inner().partitions.into_iter().find(|lp| lp.id == *p))
-            .map(|lp| lp.state());
-        match state {
-            Some(LocalPartitionState::Serving) => return Ok(()),
-            Some(LocalPartitionState::Fenced) => {
-                match c
-                    .unfence(request(
-                        proto::PartitionRequest {
-                            partition: p.clone(),
-                            force: false,
-                        },
-                        token,
-                    )?)
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(s) => last = s.message().to_owned(),
-                }
-            }
-            Some(s) => last = format!("{s:?}"),
-            None => {}
+        {
+            Ok(_) => return Ok(()),
+            Err(s) => last = s.message().to_owned(),
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
