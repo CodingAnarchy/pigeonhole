@@ -310,6 +310,10 @@ pub(crate) struct Limits {
     pub feed_client_bytes: usize,
     pub request_timeout: Duration,
     pub stream_idle: Duration,
+    /// A test's hold seam (#1753): a fanned-out scan's entry waits after each partition's
+    /// page until the partition's next page has taken its share.
+    #[cfg(test)]
+    pub hold_after_part_page: bool,
     pub leases: Leases,
     /// The remote MCP tools' result limits and a session's cursor cache.
     pub mcp: crate::mcp::Limits,
@@ -340,6 +344,8 @@ impl ServeArgs {
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
+            #[cfg(test)]
+            hold_after_part_page: false,
             leases: Leases {
                 txn_idle: Duration::from_millis(self.txn_idle_ms.max(1)),
                 txn_lifetime: Duration::from_millis(self.txn_lifetime_ms.max(1)),

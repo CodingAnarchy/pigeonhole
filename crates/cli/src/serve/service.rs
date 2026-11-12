@@ -183,18 +183,21 @@ impl ScanPages {
             end: Some(end),
         }
     }
-}
 
-impl futures_core::Stream for ScanPages {
-    type Item = Result<proto::ScanPage, ApiError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    /// The next page with its share of the in-flight budget, which the caller then holds: a
+    /// fanned-out scan's entry node sends a local partition's page on as its own, with the
+    /// share it already has (#1753). Given back and taken again, the share could go to the
+    /// partition's next page in between, and the entry's page would then wait for bytes held
+    /// by the page only the entry could take.
+    pub(crate) fn poll_next_charged(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<(proto::ScanPage, OwnedSemaphorePermit), ApiError>>> {
         loop {
             match self.pages.poll_recv(cx) {
                 Poll::Ready(Some(slot)) => {
                     let taken = slot.lock().ok().and_then(|mut s| s.take());
-                    if let Some((page, budget)) = taken {
-                        drop(budget);
+                    if let Some(page) = taken {
                         return Poll::Ready(Some(Ok(page)));
                     }
                     // The task took it back (idle timeout): its error follows.
@@ -213,6 +216,17 @@ impl futures_core::Stream for ScanPages {
         };
         self.end = None;
         Poll::Ready(out)
+    }
+}
+
+impl futures_core::Stream for ScanPages {
+    type Item = Result<proto::ScanPage, ApiError>;
+
+    /// The next page; its share of the budget goes back as it's handed to the transport.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut()
+            .poll_next_charged(cx)
+            .map(|next| next.map(|page| page.map(|(page, _share)| page)))
     }
 }
 

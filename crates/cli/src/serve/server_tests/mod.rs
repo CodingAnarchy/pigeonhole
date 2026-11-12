@@ -86,6 +86,7 @@ pub(super) fn limits() -> Limits {
         feed_client_bytes: super::feed::CLIENT_BYTES,
         request_timeout: Duration::from_secs(5),
         stream_idle: Duration::from_secs(5),
+        hold_after_part_page: false,
         leases: super::sessions::Leases {
             txn_idle: Duration::from_secs(30),
             txn_lifetime: Duration::from_secs(300),
