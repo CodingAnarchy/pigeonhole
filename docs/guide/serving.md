@@ -1,6 +1,6 @@
 # Sharing a database across processes and hosts
 
-> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](serve.md), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is in progress for 1.2.0, behind the `serve` feature.
+> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](serve.md), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is new in 1.2.0, behind the `serve` feature: use it unless you want to own the server and its API.
 
 Pigeonhole is embedded: one process opens the file and writes it. When several containers or hosts need the same data (a job queue, workflow state, coordination between workers), **one process owns the database and serves it over the network, and the others call it.** This page shows that pattern with a runnable example, [`examples/serving`](../../examples/serving), and covers what makes it correct under failures:
 - paging that resumes anywhere;
@@ -115,7 +115,7 @@ let applied = client.transfer("invoice-2041", "alice", "bob", 30, 5)?;
 - **Each event's `id` is the feed's position after it** (`FeedToken`, as hex). An SSE client that reconnects sends it as `Last-Event-ID`, and the stream continues exactly after the last event it saw: none skipped, none repeated.
 - **Positions are opaque.** A resumed stream's ids are positions too, but don't compare them byte for byte with the first stream's.
 - **A client that stays away longer than the feed's retention** gets one last `error` event, `FeedExpired`. It then re-reads the state it needs and subscribes from now.
-- **The server holds one feed per connected client.** That's fine for a handful of watchers. For many, share one subscription in the server and fan it out, which is what `phdb serve` will do (D313).
+- **The server holds one feed per connected client.** That's fine for a handful of watchers. For many, share one subscription in the server and fan it out, which is what `phdb serve` does ([The change feed](serve.md#the-change-feed)).
 
 ## Threads
 The example serves on Tokio with axum.
@@ -127,7 +127,7 @@ The example serves on Tokio with axum.
 - **The example's server refuses a non-loopback address unless a token is set** (`SERVING_TOKEN`, from the environment, never a flag, so it doesn't show in process listings or shell history). Every request must then carry `Authorization: Bearer <token>`, compared in constant time.
 - **The token alone isn't enough off-host.** Put TLS in front: a reverse proxy (nginx, Caddy, Envoy) terminating TLS for the server on loopback is the simple setup.
 - **Configure the proxy not to retry writes:** many retry a 503 or a reset connection by default, which would replay a write whose outcome is unknown.
-- **Separate tokens for readers and writers** are a small extension of the example's middleware. `phdb serve` will have them built in.
+- **Separate tokens for readers and writers** are a small extension of the example's middleware. `phdb serve` has them built in: `read`, `write` and `admin` tokens, optionally limited to namespaces ([Security](serve.md#security)).
 
 ## Backups and restore
 - **Take a backup of the live database** with `phdb backup <file> <dest>`, or with `Pigeonhole::backup` from an admin endpoint of your own. It's a consistent copy at a point in time, taken while writes continue ([`phdb backup`](cli.md#phdb-backup-and-phdb-compact)).
@@ -135,10 +135,10 @@ The example serves on Tokio with axum.
 - **To restore,** stop the server, put the copy in place, and start the server again. Commits after the backup's point are lost, so take backups as often as you can afford to lose work.
 
 ## The limits
-- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)); partitioning across nodes (#1482, D317) is in progress ([Clusters](serve.md#clusters)).
+- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)); partitioning across nodes (D317) is on `main`, with what's still to come listed under [Clusters](serve.md#clusters).
 - **The file is on the server's local disk.** Network filesystems are refused at open.
 - **Throughput is one machine's.**
-- **Your server is your API.** Versioning, auth beyond a token, and rate limits are yours to add, or to get from `phdb serve` once it lands.
+- **Your server is your API.** Versioning, auth beyond a token, and rate limits are yours to add. `phdb serve` has a versioned API ([ICR 0112](../design/icr/0112-network-api.md)), scoped tokens and TLS, and limits on connections, requests and sessions ([Limits](serve.md#limits)).
 
 ## Next
 - [Transactions](transactions.md): what conflicts, and `transact`'s retry policy.

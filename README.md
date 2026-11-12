@@ -9,7 +9,7 @@
 
 > **Maturity: 1.x.** The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver, from 1.0.0 or a crate's first release ([D282](docs/design/decisions/phase-3.md#d282)), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) is the compatibility promise). All four phases are complete: the core engine (Phase 1), the wide-column model (Phase 2), the latency engine (Phase 3) and hardening (Phase 4), each with its performance gate on the reference machine. The 1.0 release gate passed on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0): the Phase 2 floors, and within 1.5× of RocksDB on every workload. 1.0 ships with documented gaps, listed in [`docs/status.md`](docs/status.md).
 
-> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 1.1.0 (see the [changelog](CHANGELOG.md)): every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
+> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is on the [releases page](https://github.com/CodingAnarchy/pigeonhole/releases), and the [changelog](CHANGELOG.md) says what each one changed. Every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
@@ -17,7 +17,7 @@ SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missin
 ```sh
 cargo add pigeonhole
 ```
-or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [1.1.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0).
+or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [latest release](https://github.com/CodingAnarchy/pigeonhole/releases/latest).
 
 ```rust
 use pigeonhole::{Pigeonhole, Options, Family};
@@ -122,6 +122,9 @@ Every option, with its default and limits, is in the agent reference's [`Options
 | `pigeonhole-cli` | The `phdb` tool. | semver for commands, flags, exit statuses and output |
 | `pigeonhole-vector` | An IVF vector index, built on the public API (1.1.0, D306). | semver |
 | `pigeonhole-text` | Full-text search with BM25 and phrases, built on the public API (1.1.0, D309). | semver |
+| `pigeonhole-memory` | Long-term memory for AI agents: dedup, links, hybrid recall within a byte budget, consolidation; built on the public API (1.1.0, D311). | semver |
+| `pigeonhole-otel` | The engine's metrics through OpenTelemetry, and a Prometheus collector that `phdb serve` uses (D316, D323). | its own 0.N line, following `opentelemetry`'s minors; metric names stable (D316) |
+| `pigeonhole-embed` | Local embeddings for `pigeonhole-memory`: a pinned model run on the CPU in-process (D318). | its own 0.N line (D318) |
 | `pigeonhole-engine` | Tablets, shards, MVCC, recovery. | internal: none |
 | `pigeonhole-{format,io,pager,wal,memtable,cache,runtime,shm,sst,compaction}` | Engine components. | internal: none |
 | `pigeonhole-sim` | Deterministic simulation and reference model. | internal: none |

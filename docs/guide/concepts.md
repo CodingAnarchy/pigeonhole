@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.1.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
+> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
@@ -99,7 +99,8 @@ From 1.0.0 (D282):
   - They're published only because `pigeonhole` depends on them, and they make **no stability promise of their own**.
   - `pigeonhole` pins each one exactly (`=`), so a `pigeonhole` release always builds with the internal crates it was tested with.
   - An internal crate may change incompatibly in any `pigeonhole` release. Depend on `pigeonhole`, not on them.
-- **Two version lines (D295).** The public crates (`pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli`) share one version, under semver. The 12 internal crates share another, which takes a new major whenever any of them changes incompatibly, while `pigeonhole` stays 1.x. The numbers don't track each other: `pigeonhole` 1.1.0 may ship with the internal crates at 2.0.0, and the release notes name both. A release's tag and changelog follow `pigeonhole`'s version.
+- **Version lines (D295).** The public crates (`pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `pigeonhole-cli`) share one version, under semver. The 12 internal crates share another, which takes a new major whenever any of them changes incompatibly, while `pigeonhole` stays 1.x. The numbers don't track each other: `pigeonhole` 1.1.0 may ship with the internal crates at 2.0.0, and the release notes name both. A release's tag and changelog follow `pigeonhole`'s version.
+- **Two crates have 0.N lines of their own,** outside the 1.x line: `pigeonhole-otel`, because its API takes `opentelemetry` types, so each `opentelemetry` minor is a new minor of it (its metric names are a stable contract on their own, D316); and `pigeonhole-embed`, until its API has been used for a while (D318). Under Cargo's rules a new 0.N minor may change their API.
 - **The file format has its own promise,** separate from the API's: [`FORMAT.md` §13](../../FORMAT.md#13-compatibility-promise), summarized in [File format and upgrades](#file-format-and-upgrades). The shared-memory layout between a writer and its reader processes is in neither promise (stop the readers before upgrading the writer).
 
 ## Where next

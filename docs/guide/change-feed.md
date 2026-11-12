@@ -1,6 +1,6 @@
 # Change feed
 
-> **Status:** this guide describes `main`. The current release on crates.io is 1.1.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. The change feed (D310) is new in 1.1.0. Code samples run as doctests (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`. The [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. The change feed (D310) is new in 1.1.0. Code samples run as doctests (lines starting with `#` are hidden setup).
 
 A change feed delivers the committed changes of some tables to a subscriber: whole commits, once each, in commit order. It's resumable from a stored token, in the same open of the database or a later one. Use it to keep a cache, a search index or another store in step with a database, or to drive work from what was written. The writer never waits for subscribers. A commit costs the same whether ten feeds follow the table or none does.
 

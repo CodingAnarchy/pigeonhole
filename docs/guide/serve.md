@@ -425,9 +425,10 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - change feeds across partitions;
   - schema through the cluster: tables and families live in the map, made and dropped through any node;
   - fencing, and relocation onto a node that holds the partition's files;
+  - whole moves (`phdb cluster move`, `relocate --copy`), which keep the partition's change-feed history;
   - backups and restore;
   - several partitions per node.
-- **Still to come:** `relocate --copy` and `move` (#1729). The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
+- **Still to come:** the index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -585,7 +586,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
   - The node tries the partition again every second, each try bounded by `--request-timeout-ms`, without holding up the others. When it's back, a `partition_state` event says so, and its commits continue from where they stopped, with none skipped.
   - A partition that was down since a subscription "from now" began starts at its own "now" when it comes back. One subscribed "from the oldest" starts at its oldest commit.
   - An expired position, or a refusal such as a revoked token, still ends the stream.
-- **A partition moved to another node** (a newer map, once moves come with D317's ticket 6) is opened again where the map then puts it, through any node, with nothing skipped.
+- **A partition moved to another node** (a newer map, from `phdb cluster move` or `relocate`: [Fencing and relocation](#fencing-and-relocation)) is opened again where the map then puts it, through any node, with nothing skipped, unless the move started a new history ([Expiry and what isn't supported](#expiry-and-what-isnt-supported)).
 
 #### Limits
 - **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
@@ -594,7 +595,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 
 #### Expiry and what isn't supported
 - **Expired tokens:**
-  - A token can't resume after a partition it follows was relocated onto a copy with another history. [Fencing and relocation](#fencing-and-relocation) will say which moves those are.
+  - A token can't resume after a partition it follows starts a new history: a `relocate` without `--copy` (`--old-unreachable` included) does, as a restore does, and so does a `set-map --force` that raises its epoch ([Running a cluster](#running-a-cluster)). `move` and `relocate --copy` copy the files whole and keep the history, so tokens resume across them ([Fencing and relocation](#fencing-and-relocation)).
   - It can't resume after the map changed which partitions the subscription covers either. That happens only when a new table joins a subscription of every table.
   - Both answer `FeedExpired`: subscribe again.
 - **After a restore:** a token from before it answers `FeedExpired`. Each restored partition is at a new epoch, and its history starts at the restore ([Backup and restore](#backup-and-restore)).
